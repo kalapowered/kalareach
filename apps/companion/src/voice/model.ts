@@ -18,7 +18,12 @@
  * when nothing can reach the service.
  */
 
-import type { VoicePrepareResult, VoiceSessionDescriptor } from '@kalareach/protocol'
+import type {
+  VoiceManagedTerms,
+  VoicePrepareResult,
+  VoiceRate,
+  VoiceSessionDescriptor
+} from '@kalareach/protocol'
 
 import type { VoiceCallState } from '../host/port'
 
@@ -77,22 +82,27 @@ export interface WithheldItem {
  * fields here rather than prose in a component, so a test can assert they were shown rather than
  * assert that a paragraph exists.
  *
- * Every field is something a host answered. The screen is not the place where the provider, the
- * disclosure or the scope are decided, and a copy of any of them written here would be a second
- * version of a fact that has an authoritative one.
+ * Every field is something a host answered. The scope is the host's own, and the model, the
+ * disclosure, the rate and the limits are the managed service's, carried through the host in the
+ * service's own words. The screen decides none of them, and a copy of any of them written here
+ * would be a second version of a fact that has an authoritative one.
  */
 export interface ProviderChoice {
-  /** The model a call would run on, or null when the host names none before the call exists. */
-  readonly model: string | null
   /** The service that brokers the call, by origin. */
   readonly brokerOrigin: string
   /**
-   * What the provider and the managed operator can see.
-   *
-   * The host's own disclosure list, carried to the screen untouched. A second wording of the same
-   * facts is a second thing to keep true.
+   * What the managed service publishes about a call started now, or null when the host could not
+   * show it. A managed call is never offered without it: a start names the rate it shows.
    */
-  readonly disclosure: readonly string[]
+  readonly managed: VoiceManagedTerms | null
+  /** Why no managed call can start from here, in the host's words, when `managed` is null. */
+  readonly unavailable: string | null
+  /**
+   * The rate the person was shown before the one `managed` now carries, when a start was refused
+   * because the rate changed. Shown beside the new one, so the change is visible before they
+   * accept it.
+   */
+  readonly previousRate: VoiceRate | null
   /** What a call would carry, class by class. */
   readonly context: readonly ContextItem[]
   /** What it would leave out, and why. */
@@ -105,8 +115,8 @@ export interface ProviderChoice {
   readonly sessions: readonly string[]
   /** What the voice grant would permit, in the host's own sentences. */
   readonly permits: readonly string[]
-  /** What an append acknowledgement does not establish, in the host's own words. */
-  readonly admissionMeans: string
+  /** Whether any of those actions asks for a confirmation on this device's unlocked screen. */
+  readonly needsUnlockedScreen: boolean
 }
 
 /** How a content class reads to a person. */
@@ -133,9 +143,13 @@ function classSummary(kind: string): string {
  */
 export function choiceFromPreparation(preparation: VoicePrepareResult): ProviderChoice {
   return {
-    model: preparation.model,
     brokerOrigin: preparation.broker_origin,
-    disclosure: preparation.disclosure,
+    managed: preparation.managed,
+    unavailable: preparation.managed
+      ? null
+      : (preparation.managed_unavailable ??
+        'This host did not say what a managed call would cost, so one cannot start from here.'),
+    previousRate: null,
     context: [
       {
         kind: 'the session',
@@ -150,8 +164,95 @@ export function choiceFromPreparation(preparation: VoicePrepareResult): Provider
     messageCount: preparation.message_count,
     sessions: preparation.session_ids,
     permits: preparation.statement.statements,
-    admissionMeans: preparation.admission_note
+    needsUnlockedScreen: preparation.statement.unlocked_screen_actions.length > 0
   }
+}
+
+/**
+ * The same choice under the rate a refused start was answered with.
+ *
+ * Only the rate moves. Everything else the person read is still what the host answered, and the
+ * rate they read before is kept beside the new one so the change is visible before they accept it.
+ */
+export function choiceWithRate(choice: ProviderChoice, rate: VoiceRate): ProviderChoice {
+  if (!choice.managed) return choice
+  return {
+    ...choice,
+    managed: { ...choice.managed, rate },
+    previousRate: choice.managed.rate
+  }
+}
+
+/**
+ * How long a call is asked to be authorised for, in seconds.
+ *
+ * Half an hour, or the longest call the service authorises when that is shorter: a request past
+ * the published maximum is refused. Null when even the shortest call the service sells is longer
+ * than it allows, which is a service no call can be asked of.
+ */
+export function requestedSeconds(terms: VoiceManagedTerms): number | null {
+  const seconds = Math.min(CALL_SECONDS, terms.maximum_session_seconds)
+  return seconds >= terms.minimum_request_seconds ? seconds : null
+}
+
+/** The call length the screen asks for when the service allows it: half an hour. */
+const CALL_SECONDS = 1800
+
+/** A rate as a person reads it, in their own locale's spelling of the service's currency. */
+export interface RateWords {
+  /** The price of one second, for example "US$0.02". */
+  readonly perSecond: string
+  /** The price of one minute, or null when the amount is not one this screen can multiply. */
+  readonly perMinute: string | null
+  /** The most a call of `seconds` can be charged, or null for the same reason. */
+  readonly ceiling: (seconds: number) => string | null
+}
+
+/**
+ * The words for one rate.
+ *
+ * The service quotes whole minor units a second in an ISO 4217 currency, so the amount is shifted
+ * by that currency's own number of decimal places and written the way the person's locale writes
+ * money. A currency the platform does not know is written as minor units with its code, rather
+ * than guessed at.
+ */
+export function rateWords(rate: VoiceRate, locale?: string): RateWords {
+  const currency = rate.currency.toUpperCase()
+  // The host carries the amount as a decimal string of whole minor units. Anything else is not an
+  // amount this screen can do arithmetic on, so it is shown as the host wrote it.
+  if (!/^[0-9]+$/.test(rate.minor_units_per_second)) {
+    return {
+      perSecond: `${rate.minor_units_per_second} minor units of ${currency}`,
+      perMinute: null,
+      ceiling: () => null
+    }
+  }
+  const minor = BigInt(rate.minor_units_per_second)
+  let format: Intl.NumberFormat | null = null
+  try {
+    format = new Intl.NumberFormat(locale, { style: 'currency', currency })
+  } catch {
+    format = null
+  }
+  const written = (units: bigint): string => {
+    if (!format) return `${units.toString()} minor units of ${currency}`
+    const digits = format.resolvedOptions().maximumFractionDigits ?? 2
+    return format.format(Number(units) / 10 ** digits)
+  }
+  return {
+    perSecond: written(minor),
+    perMinute: written(minor * 60n),
+    ceiling: (seconds: number) => written(minor * BigInt(Math.max(seconds, rate.minimum_seconds)))
+  }
+}
+
+/** A whole number of seconds as a person reads a call length. */
+export function callLength(seconds: number): string {
+  if (seconds % 60 === 0) {
+    const minutes = seconds / 60
+    return minutes === 1 ? '1 minute' : `${minutes} minutes`
+  }
+  return seconds === 1 ? '1 second' : `${seconds} seconds`
 }
 
 /** What happened to one context request this client sent. */

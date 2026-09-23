@@ -6,12 +6,14 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-15.01 | `a_call_runs_on_either_provider_through_one_interface`, `an_unknown_creation_is_a_state_and_leaves_no_grant` |
+//! | KR-REQ-15.01 | `a_call_runs_on_either_provider_through_one_interface`, `an_unknown_creation_is_a_state_and_leaves_no_grant`, `a_start_names_the_rate_the_person_was_shown`, `a_changed_rate_leaves_nothing_behind_and_carries_the_new_rate` |
 //! | KR-REQ-15.02 | `stopping_a_voice_session_leaves_the_terminal_sessions_running` |
+//! | KR-REQ-15.09 | `the_terms_a_person_reads_before_a_call_are_the_services_own`, `the_context_for_a_call_goes_under_the_services_words_for_it` |
 //! | KR-REQ-15.11 | `a_delegation_runs_under_the_intersection_of_both_grants`, `a_delegation_outside_this_calls_timeline_or_already_spent_is_refused`, `a_delegation_carries_no_task_text` |
 //! | KR-REQ-15.13 | `the_five_unlocked_screen_classes_are_refused_without_a_confirmation`, `provider_text_cannot_create_a_confirmation`, `a_confirmation_for_one_action_does_not_authorise_another` |
 //! | KR-REQ-15.14 | `stopping_a_voice_session_revokes_its_grant_before_the_broker_is_told` |
 //! | KR-REQ-15.17 | `a_result_that_was_admitted_and_not_performed_is_reported_as_admitted` |
+//! | KR-REQ-15.19 | `the_terms_a_person_reads_before_a_call_are_the_services_own`, `a_host_without_the_services_terms_says_why`, `a_preparation_is_refused_where_a_start_would_be` |
 //! | KR-REQ-15.20 | `context_selection_uses_the_requesting_devices_scope_and_nothing_wider` |
 //! | KR-REQ-15.21 | `the_default_voice_grant_permits_four_things_and_names_them`, `submitting_a_prompt_needs_the_spoken_destination` |
 //! | KR-REQ-15.22 | `cancelling_a_turn_needs_the_typed_request_and_the_current_turn` |
@@ -21,7 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use kr_client::services::ServiceFuture;
 use kr_client::services::voice::{
-    ManagedVoiceService, VoiceClosure, VoiceHold, VoiceRateQuote, VoiceSession,
+    ManagedVoiceService, VoiceClosure, VoiceHold, VoiceMetadata, VoiceRateQuote, VoiceSession,
     VoiceSessionRequest, VoiceStart, VoiceStartLatency,
 };
 use kr_crypto::keys::AuthorisationKeyPair;
@@ -37,7 +39,8 @@ use kr_protocol::scalars::{
 use kr_protocol::voice::{
     SpokenDestination, VerifiedApprovalAnswer, VoiceAction, VoiceActionPlan, VoiceContextClass,
     VoiceContextParams, VoiceDelegateParams, VoiceDelegationId, VoiceDelegationOutcome,
-    VoiceGrantParams, VoiceRefusal, VoiceStartOutcome, VoiceStartParams, VoiceStopParams,
+    VoiceGrantParams, VoicePrepareParams, VoiceRefusal, VoiceStartOutcome, VoiceStartParams,
+    VoiceStopParams,
 };
 use kr_voice::seams::{
     ActionSubmitter, ContextItem, ContextRequest, ContextSource, GatheredContext, HostReceipt,
@@ -155,6 +158,11 @@ impl Authority {
         if let Some(grant) = held.as_mut() {
             grant.actions = actions.iter().copied().collect();
         }
+    }
+
+    /// How many grants have been written, standing and session-bound alike.
+    fn issued(&self) -> usize {
+        self.store.lock().expect("the store").grants.len()
     }
 
     fn is_revoked(&self, grant_id: GrantId) -> bool {
@@ -466,6 +474,8 @@ enum Answer {
     Replayed,
     CreationUnknown,
     Capacity,
+    /// The rate moved on after the person was shown it.
+    RateChanged,
 }
 
 /// A stand-in for the managed broker. It makes no network call.
@@ -474,6 +484,10 @@ struct ManagedFake {
     answer: Mutex<Answer>,
     closed: Mutex<Vec<String>>,
     offers: Mutex<Vec<String>>,
+    /// The rate version each start named.
+    versions: Mutex<Vec<Option<String>>>,
+    /// Whether the terms read fails, as it does when the service cannot be reached.
+    terms_unreachable: Mutex<bool>,
     /// Held creations, for a test that needs one start to still be waiting while another arrives.
     ///
     /// A real creation takes as long as a network round trip, and the window this opens is that
@@ -488,6 +502,8 @@ impl ManagedFake {
             answer: Mutex::new(answer),
             closed: Mutex::new(Vec::new()),
             offers: Mutex::new(Vec::new()),
+            versions: Mutex::new(Vec::new()),
+            terms_unreachable: Mutex::new(false),
             holding: tokio::sync::Semaphore::new(0),
             held: Mutex::new(false),
         }
@@ -509,6 +525,35 @@ impl ManagedFake {
 
     fn offers(&self) -> Vec<String> {
         self.offers.lock().expect("the offers").clone()
+    }
+
+    fn versions(&self) -> Vec<Option<String>> {
+        self.versions.lock().expect("the versions").clone()
+    }
+}
+
+/// The terms the fake service publishes, in words no host keeps a copy of.
+fn published_terms() -> VoiceMetadata {
+    VoiceMetadata {
+        enabled: true,
+        model: "gpt-live-1".to_owned(),
+        disclosure: vec![
+            "Audio travels directly between this device and the provider.".to_owned(),
+            "This service's own channel still receives transcripts.".to_owned(),
+        ],
+        admission_note: "The model received this context, and nothing more.".to_owned(),
+        delegation_note: "Submit the delegation to the host over the device connection.".to_owned(),
+        alternatives: vec!["The coding agent already running on the host.".to_owned()],
+        rate: VoiceRateQuote {
+            version: "2026-09".to_owned(),
+            minor_units_per_second: "1".to_owned(),
+            minimum_seconds: 15,
+            currency: "usd".to_owned(),
+        },
+        maximum_session_seconds: 1_800,
+        minimum_request_seconds: 60,
+        heartbeat_seconds: 20,
+        context_bytes: 500,
     }
 }
 
@@ -547,6 +592,21 @@ fn running_call(name: &str) -> VoiceSession {
 }
 
 impl ManagedVoiceService for ManagedFake {
+    fn metadata(&self) -> ServiceFuture<'_, Option<VoiceMetadata>> {
+        let unreachable = *self.terms_unreachable.lock().expect("the switch");
+        Box::pin(async move {
+            if unreachable {
+                return Err(kr_client::error::ClientError::Host(
+                    kr_protocol::error::ProtocolError::new(
+                        kr_protocol::error::ErrorCode::UpstreamUnavailable,
+                        "the managed service did not answer".to_owned(),
+                    ),
+                ));
+            }
+            Ok(Some(published_terms()))
+        })
+    }
+
     fn provider(&self) -> String {
         "the managed broker".to_owned()
     }
@@ -556,6 +616,10 @@ impl ManagedVoiceService for ManagedFake {
             .lock()
             .expect("the offers")
             .push(request.offer_sdp.clone());
+        self.versions
+            .lock()
+            .expect("the versions")
+            .push(request.expected_rate_version.clone());
         let answer = self.answer.lock().expect("the answer").clone();
         let held = *self.held.lock().expect("the hold");
         Box::pin(async move {
@@ -575,6 +639,16 @@ impl ManagedVoiceService for ManagedFake {
                 Answer::CreationUnknown => VoiceStart::CreationUnknown {
                     attempt_id: Some("attempt-unknown".to_owned()),
                     message: "The provider may hold a session for that attempt.".to_owned(),
+                },
+                Answer::RateChanged => VoiceStart::RateChanged {
+                    rate: VoiceRateQuote {
+                        version: "2026-10".to_owned(),
+                        minor_units_per_second: "3".to_owned(),
+                        minimum_seconds: 15,
+                        currency: "usd".to_owned(),
+                    },
+                    message: "The rate changed after it was shown.".to_owned(),
+                    call_id: None,
                 },
                 Answer::Capacity => {
                     VoiceStart::Refused(Box::new(kr_client::services::voice::VoiceRefusal {
@@ -617,6 +691,11 @@ struct OwnBackend {
 }
 
 impl ManagedVoiceService for OwnBackend {
+    fn metadata(&self) -> ServiceFuture<'_, Option<VoiceMetadata>> {
+        // Not the managed service: it quotes no managed rate and publishes no managed terms.
+        Box::pin(async move { Ok(None) })
+    }
+
     fn provider(&self) -> String {
         "a backend of the person's own".to_owned()
     }
@@ -759,6 +838,7 @@ fn start_params() -> VoiceStartParams {
         offer_sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n".to_owned(),
         duration_seconds: 600,
         reasoning_budget_minor: Nullable::some(U64::new(100)),
+        expected_rate_version: Nullable::some("2026-09".to_owned()),
     }
 }
 
@@ -2289,12 +2369,10 @@ async fn context_selection_uses_the_requesting_devices_scope_and_nothing_wider()
             .iter()
             .any(|run| run.reason.contains("lower bound"))
     );
-    assert!(
-        result
-            .disclosure
-            .iter()
-            .any(|line| line.contains("transcripts")),
-        "the host states what the managed operator can see"
+    assert_eq!(
+        result.disclosure,
+        running_call("managed").disclosure,
+        "the selection goes under the service's own statement of what it can see"
     );
 
     // Selecting the class brings it in, and the secret pattern inside it is replaced.
@@ -2345,4 +2423,236 @@ async fn context_cannot_reach_a_session_outside_the_voice_session() {
         error.reason(),
         Some(VoiceRefusal::SessionOutsideVoiceSession)
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-15.19 and 15.09: what a person reads before a call, and the rate a start accepts
+// ---------------------------------------------------------------------------------------------
+
+fn prepare_params(selected: &[VoiceContextClass]) -> VoicePrepareParams {
+    VoicePrepareParams {
+        session_ids: [session(SESSION_A)].into_iter().collect(),
+        selected: selected.iter().copied().collect(),
+    }
+}
+
+/// KR-REQ-15.19 and 15.09: before any call exists, the host answers with its own scope and the
+/// managed service's terms in the service's own words, and creates nothing to do it.
+#[tokio::test]
+async fn the_terms_a_person_reads_before_a_call_are_the_services_own() {
+    let fixture = fixture();
+    fixture
+        .coordinator
+        .grant(
+            &grant_params(None),
+            AuthorityRevision::new(1),
+            10_000,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("a standing voice grant");
+    let written = fixture.authority.issued();
+
+    let prepared = fixture
+        .coordinator
+        .prepare(
+            device(PHONE),
+            &prepare_params(&[
+                VoiceContextClass::FileContents,
+                VoiceContextClass::TerminalScrollback,
+            ]),
+            10_000,
+        )
+        .await
+        .expect("a preparation");
+
+    let published = published_terms();
+    let terms = prepared.managed.0.expect("the managed service's terms");
+    assert_eq!(terms.disclosure, published.disclosure, "carried verbatim");
+    assert_eq!(terms.admission_note, published.admission_note);
+    assert_eq!(terms.delegation_note, published.delegation_note);
+    assert_eq!(terms.alternatives, published.alternatives);
+    assert_eq!(terms.model, "gpt-live-1");
+    assert_eq!(terms.rate.version, "2026-09");
+    assert_eq!(terms.rate.minor_units_per_second.get(), 1);
+    assert_eq!(terms.maximum_session_seconds, 1_800);
+    assert!(prepared.managed_unavailable.0.is_none());
+
+    assert_eq!(
+        prepared.session_ids,
+        [session(SESSION_A)].into_iter().collect()
+    );
+    assert_eq!(prepared.broker_origin, "https://reach.example");
+    // This device's grant carries no file right, so file contents would not be carried whatever
+    // the person selected; scrollback needs none and would be.
+    assert_eq!(
+        prepared.selected,
+        [VoiceContextClass::TerminalScrollback]
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(prepared.excluded.len(), VoiceContextClass::ALL.len());
+
+    // Nothing was created to answer it.
+    assert!(fixture.broker.offers().is_empty(), "no call was asked for");
+    assert_eq!(fixture.coordinator.live_sessions(), 0);
+    assert_eq!(fixture.authority.issued(), written, "no grant was written");
+}
+
+/// KR-REQ-15.19: a host that has no managed terms to show says why, and offers none in their
+/// place: no service at all, a provider that is not the managed one, and a service that could not
+/// be read are three different things to tell a person.
+#[tokio::test]
+async fn a_host_without_the_services_terms_says_why() {
+    async fn prepared(
+        provider: Option<Arc<dyn ManagedVoiceService>>,
+    ) -> kr_protocol::voice::VoicePrepareResult {
+        let key = AuthorisationKeyPair::generate().expect("a device identity key");
+        let authority = Arc::new(Authority::new(
+            device_grant(&[ActionRight::SessionView]),
+            *key.public(),
+        ));
+        let coordinator = Coordinator::new(
+            Arc::new(Context::new(gathered())) as Arc<dyn ContextSource>,
+            Arc::clone(&authority) as Arc<dyn VoiceAuthority>,
+            Arc::new(Submitter::new()) as Arc<dyn ActionSubmitter>,
+            provider,
+            device(HOST),
+            environment(),
+            "https://reach.example",
+        );
+        coordinator
+            .grant(
+                &grant_params(None),
+                AuthorityRevision::new(1),
+                10_000,
+                &kr_voice::Unbounded,
+            )
+            .await
+            .expect("a standing voice grant");
+        coordinator
+            .prepare(device(PHONE), &prepare_params(&[]), 10_000)
+            .await
+            .expect("a preparation")
+    }
+
+    let none = prepared(None).await;
+    assert!(none.managed.0.is_none());
+    let said = none.managed_unavailable.0.clone().expect("a reason");
+    assert!(said.starts_with("This host has no voice service"), "{said}");
+
+    let own = prepared(Some(
+        Arc::new(OwnBackend::default()) as Arc<dyn ManagedVoiceService>
+    ))
+    .await;
+    assert!(own.managed.0.is_none());
+    let said = own.managed_unavailable.0.clone().expect("a reason");
+    assert!(said.contains("not the managed service"), "{said}");
+
+    let silent = Arc::new(ManagedFake::new(Answer::Started));
+    *silent.terms_unreachable.lock().expect("the switch") = true;
+    let unread = prepared(Some(silent as Arc<dyn ManagedVoiceService>)).await;
+    assert!(unread.managed.0.is_none());
+    let said = unread.managed_unavailable.0.clone().expect("a reason");
+    assert!(
+        said.contains("could not read the managed service's terms"),
+        "{said}"
+    );
+    assert!(said.contains("did not answer"), "{said}");
+
+    // Whatever the service did, the scope is still this host's to state.
+    for answer in [&none, &own, &unread] {
+        assert_eq!(
+            answer.session_ids,
+            [session(SESSION_A)].into_iter().collect()
+        );
+    }
+}
+
+/// KR-REQ-15.19: the preparation refuses where a start would, so a person is never shown a call
+/// that could not be made.
+#[tokio::test]
+async fn a_preparation_is_refused_where_a_start_would_be() {
+    let fixture = fixture();
+    let error = fixture
+        .coordinator
+        .prepare(device(PHONE), &prepare_params(&[]), 10_000)
+        .await
+        .expect_err("no voice grant, nothing to describe");
+    assert_eq!(error.reason(), Some(VoiceRefusal::OutsideVoiceGrant));
+    assert!(fixture.broker.offers().is_empty());
+}
+
+/// KR-REQ-15.01: a start names the rate version the person was shown, and the host passes it on
+/// unchanged.
+#[tokio::test]
+async fn a_start_names_the_rate_the_person_was_shown() {
+    let fixture = fixture();
+    started(&fixture, None).await;
+    assert_eq!(fixture.broker.versions(), vec![Some("2026-09".to_owned())]);
+}
+
+/// KR-REQ-15.01: a start the service refuses for a changed rate is a typed answer carrying the
+/// rate as it is now, and leaves no call, no grant and nothing to close behind it.
+#[tokio::test]
+async fn a_changed_rate_leaves_nothing_behind_and_carries_the_new_rate() {
+    let fixture = fixture_with(&[ActionRight::SessionView], Answer::RateChanged);
+    fixture
+        .coordinator
+        .grant(
+            &grant_params(None),
+            AuthorityRevision::new(1),
+            10_000,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("a standing voice grant");
+    let written = fixture.authority.issued();
+
+    let result = fixture
+        .coordinator
+        .start(
+            device(PHONE),
+            &start_params(),
+            AuthorityRevision::new(1),
+            10_000,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("an answer");
+    let VoiceStartOutcome::RateChanged { rate, message } = result.outcome else {
+        panic!("a changed rate is its own answer: {:?}", result.outcome);
+    };
+    assert_eq!(rate.version, "2026-10");
+    assert_eq!(rate.minor_units_per_second.get(), 3);
+    assert_eq!(message, "The rate changed after it was shown.");
+    assert_eq!(fixture.coordinator.live_sessions(), 0);
+    assert_eq!(fixture.authority.issued(), written, "no grant was written");
+    assert!(
+        fixture.broker.closed().is_empty(),
+        "nothing was created to close"
+    );
+}
+
+/// KR-REQ-15.09: the context selected for a call goes under the statement the service gave that
+/// call, not under a second wording this host keeps.
+#[tokio::test]
+async fn the_context_for_a_call_goes_under_the_services_words_for_it() {
+    let fixture = fixture();
+    let voice_session_id = started(&fixture, None).await;
+    let result = fixture
+        .coordinator
+        .context(
+            device(PHONE),
+            &VoiceContextParams {
+                voice_session_id,
+                session_id: session(SESSION_A),
+                selected: CanonicalSet::from_iter([]),
+                delegation_id: Nullable::null(),
+            },
+            10_100,
+        )
+        .await
+        .expect("a selection");
+    assert_eq!(result.disclosure, running_call("managed").disclosure);
 }

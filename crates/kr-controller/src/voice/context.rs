@@ -171,14 +171,12 @@ pub fn filtered(snapshot: SessionSnapshot, grant: &Grant) -> GatheredContext {
 
     // Selecting a class is a person saying they want it, not authority to read it. File contents
     // and attachment bytes need the grant's own file right on top of the history bound, which is
-    // the filter's `admit_attachment_bytes` question rather than its timestamp one.
+    // the filter's `admit_attachment_bytes` question rather than its timestamp one. The class says
+    // which right it needs, and the preparation that describes a call asks the class the same
+    // question.
     let mut selected: Vec<SelectedItem> = Vec::new();
     for entry in snapshot.selected {
-        let needs_file_right = matches!(
-            entry.class,
-            kr_protocol::voice::VoiceContextClass::FileContents
-                | kr_protocol::voice::VoiceContextClass::AttachmentBytes
-        );
+        let needs_file_right = entry.class.required_right().is_some();
         if needs_file_right
             && let Err(reason) = filter.admit_attachment_bytes(entry.item.produced_at_ms)
         {

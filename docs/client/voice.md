@@ -19,7 +19,8 @@ commands every other screen uses, and it draws only what an answer carried.
 
 | What the screen shows | Where it came from |
 | --- | --- |
-| The provider, the scope, the disclosure, the cap and the grant's sentences | `voice.prepare` |
+| The scope, the cap and the grant's sentences | `voice.prepare`, from the host's own grants |
+| The model, the disclosure, the rate and the call limits | `voice.prepare`, in the managed service's words |
 | The voice session, the model, the call and when it closes | `voice.start` |
 | The microphone, the speaker and the first audio | the call this device is holding |
 | A delegation's state and its words | `voice.delegate` |
@@ -36,11 +37,27 @@ Preparing creates nothing, reserves nothing and sends no context, so a person ca
 would be and then decline it.
 
 The provider choice screen states the voice model and the service that brokers the call, the
-managed content access in the host's own words, the classes a call would carry and the classes it
-would leave out, the host's cap on selected context, and what speaking would be allowed to do. It
-also states plainly that a statement from the model that you confirmed something is not a
-confirmation. The cap is the host's and so is the enforcement of it: a start the host will not make
-is shown in the host's own words.
+managed content access in the service's own words, the classes a call would carry and the classes
+it would leave out, the host's cap on selected context, and what speaking would be allowed to do.
+The cap is the host's and so is the enforcement of it: a start the host will not make is shown in
+the host's own words.
+
+The rate sits directly above the start control: the price of a second and of a minute in the
+service's currency, the least a call is charged, and the most this call can cost. Pressing start
+accepts that rate, and the start names the version shown. The host reads these terms from the
+service for the answer and passes them on unchanged, so the disclosure, the note on what an
+acknowledgement does not mean and the note on delegations each have one wording, the
+deployment's.
+
+Without the service's terms there is nothing to accept, so there is no start. The screen says why
+in the host's words: the host has no voice service, its provider is not the managed one, or the
+service did not answer. When an operator has closed managed voice, the screen lists what still
+works instead.
+
+If the rate changes between the reading and the start, the service refuses the start before
+anything is held or charged. The new rate replaces the old one on screen, the old one is named
+beside it, and the control reads "Start at the new rate". Nothing starts until the person presses
+it.
 
 ## What the person holds during a call
 

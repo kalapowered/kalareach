@@ -9,8 +9,16 @@ It runs on macOS, iOS and Android.
 `voice.prepare` is a read that creates nothing: no provider session, no reservation, no grant, and
 no context leaves the host for it. It answers with the sessions a call would reach, what the voice
 grant would permit action by action, the content classes the default context leaves out, the host's
-cap on selected context, the origin of the service the call would be brokered through, and the
-disclosure the person reads before deciding (KR-REQ-15.19, KR-REQ-15.09).
+cap on selected context and the origin of the service the call would be brokered through. Beside
+those it carries the managed service's own terms, which the host reads from the service's metadata
+route for the answer: the model, the disclosure, the rate with its version, the longest call the
+service authorises, and whether an operator has the service open (KR-REQ-15.19, KR-REQ-15.09). The
+terms travel in the service's words, and a host that could not read them says so instead.
+
+A start names the version of the rate the person was shown. The host passes it to the service
+unchanged, and a version that is no longer current comes back as `rate_changed` with the rate as
+it is now. Nothing was started, held or charged, and the host wrote no grant for it, so the device
+shows the new rate and starts again only when the person accepts it.
 
 It exists because the other two answers come too late. `voice.context` names a voice session, and
 there is none before a call; `voice.start` answers with the model and the disclosure, but by then
@@ -69,9 +77,8 @@ Whenever capture is in any state other than `capturing`, the UI displays:
 Selected context and host results travel from the paired device to the managed service as bounded
 context requests, and a request over `VOICE_CONTEXT_BYTES` (500) is refused before it is sent rather
 than truncated. A request the service answers with `context_admitted` is shown as **admission**,
-never as execution (KR-REQ-15.17):
-> "The model received this. It is not evidence that anything ran on a host; the host's own receipt is
-> what says that."
+never as execution (KR-REQ-15.17), with the service's own note on what admission does not
+establish beside it.
 
 Host action receipts remain the sole authority for what ran on a host.
 

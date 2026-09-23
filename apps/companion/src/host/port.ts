@@ -164,6 +164,13 @@ export interface VoiceStartRequest {
   readonly durationSeconds: number
   /** Minor units to hold for reasoning and tools, or null to ask for none. */
   readonly reasoningBudgetMinor: string | null
+  /**
+   * The version of the managed rate the person was shown, as the host's preparation answered it.
+   *
+   * A start names it so the call runs under the terms the person saw. The service refuses a
+   * version that is no longer current, and the answer carries the rate as it is now.
+   */
+  readonly expectedRateVersion: string
 }
 
 /** Which of the two local silences a control acts on. */

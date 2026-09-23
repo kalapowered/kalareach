@@ -16,7 +16,10 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import {
   CAPTURE_DISPLAY,
   STOP_MEANS,
+  callLength,
   controlAvailable,
+  rateWords,
+  requestedSeconds,
   speechCouldHaveBeenHeard,
   type ContextRequest,
   type Delegation,
@@ -92,6 +95,8 @@ export function VoiceSurface({
  * KR-REQ-15.19 wants the provider and the selected context scope shown before voice starts, and
  * KR-REQ-15.09 wants the managed content access stated in the provider choice. Both live above the
  * start control, because a disclosure below the button that acts on it has already been skipped.
+ * So does the rate, directly above it: starting is what accepts the rate, and the version on
+ * screen is the one the start names.
  */
 function ProviderChoiceScreen({
   choice,
@@ -106,34 +111,45 @@ function ProviderChoiceScreen({
   readonly notice: string | null
   readonly onStart: () => void
 }): React.ReactElement {
-  const disclosureId = useId()
+  const id = useId()
+  const terms = choice.managed
+  const seconds = terms ? requestedSeconds(terms) : null
+  const startable = terms !== null && terms.enabled && seconds !== null
 
   return (
-    <section className="kr-voice" aria-labelledby={`${disclosureId}-heading`}>
-      <h1 id={`${disclosureId}-heading`} className="kr-voice__title">
+    <section className="kr-voice" aria-labelledby={`${id}-heading`}>
+      <h1 id={`${id}-heading`} className="kr-voice__title">
         Start a voice session
       </h1>
 
-      <dl className="kr-voice__provider">
-        <dt>Voice model</dt>
-        <dd>{choice.model ?? 'named by the service when the call starts'}</dd>
-        <dt>Brokered by</dt>
-        <dd>{choice.brokerOrigin}</dd>
-      </dl>
+      {terms ? (
+        <dl className="kr-voice__provider">
+          <dt>Voice model</dt>
+          <dd>{terms.model}</dd>
+          <dt>Brokered by</dt>
+          <dd>{choice.brokerOrigin}</dd>
+        </dl>
+      ) : (
+        <p className="kr-voice__refusal" role="status">
+          {choice.unavailable}
+        </p>
+      )}
 
       {/* The deployed service's own words, listed rather than summarised. A second wording of the
           same facts is a second thing to keep true. */}
-      <section className="kr-voice__panel" aria-labelledby={`${disclosureId}-access`}>
-        <h2 id={`${disclosureId}-access`}>What this gives access to</h2>
-        <ul className="kr-voice__list">
-          {choice.disclosure.map((line) => (
-            <li key={line}>{line}</li>
-          ))}
-        </ul>
-      </section>
+      {terms && (
+        <section className="kr-voice__panel" aria-labelledby={`${id}-access`}>
+          <h2 id={`${id}-access`}>What this gives access to</h2>
+          <ul className="kr-voice__list">
+            {terms.disclosure.map((line) => (
+              <li key={line}>{line}</li>
+            ))}
+          </ul>
+        </section>
+      )}
 
-      <section className="kr-voice__panel" aria-labelledby={`${disclosureId}-scope`}>
-        <h2 id={`${disclosureId}-scope`}>What will be sent</h2>
+      <section className="kr-voice__panel" aria-labelledby={`${id}-scope`}>
+        <h2 id={`${id}-scope`}>What will be sent</h2>
         <ul className="kr-voice__list">
           {choice.context.map((item) => (
             <li key={item.kind}>
@@ -158,18 +174,35 @@ function ProviderChoiceScreen({
         </ul>
       </section>
 
-      <section className="kr-voice__panel" aria-labelledby={`${disclosureId}-permits`}>
-        <h2 id={`${disclosureId}-permits`}>What speaking will be allowed to do</h2>
+      <section className="kr-voice__panel" aria-labelledby={`${id}-permits`}>
+        <h2 id={`${id}-permits`}>What speaking will be allowed to do</h2>
         <ul className="kr-voice__list">
           {choice.permits.map((line) => (
             <li key={line}>{line}</li>
           ))}
         </ul>
         <p className="kr-voice__note">
-          Anything beyond these asks for your confirmation on the unlocked screen of this device. A
-          statement from the model that you confirmed something is not a confirmation.
+          The host refuses anything not listed here.
+          {choice.needsUnlockedScreen &&
+            ' Some of these ask for your confirmation on the unlocked screen of this device each time.'}
         </p>
       </section>
+
+      {terms && !terms.enabled && (
+        <section className="kr-voice__panel" aria-labelledby={`${id}-closed`}>
+          <h2 id={`${id}-closed`}>Managed voice is closed at the moment</h2>
+          <p className="kr-voice__note">These still work:</p>
+          <ul className="kr-voice__list">
+            {terms.alternatives.map((line) => (
+              <li key={line}>{line}</li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {terms && terms.enabled && seconds !== null && (
+        <CostPanel id={`${id}-cost`} choice={choice} seconds={seconds} />
+      )}
 
       {notice && (
         <p className="kr-voice__refusal" role="status">
@@ -177,9 +210,52 @@ function ProviderChoiceScreen({
         </p>
       )}
 
-      <button type="button" className="kr-voice__start" onClick={onStart} disabled={busy}>
-        {busy ? 'Starting…' : 'Start voice session'}
-      </button>
+      {startable && (
+        <button type="button" className="kr-voice__start" onClick={onStart} disabled={busy}>
+          {busy ? 'Starting…' : choice.previousRate ? 'Start at the new rate' : 'Start voice session'}
+        </button>
+      )}
+    </section>
+  )
+}
+
+/**
+ * What a call costs, directly above the control that accepts it.
+ *
+ * When a start was refused because the rate moved on, the new rate is what this shows and the
+ * one the person read before is named beside it, so nobody accepts a change they did not see.
+ */
+function CostPanel({
+  id,
+  choice,
+  seconds
+}: {
+  readonly id: string
+  readonly choice: ProviderChoice
+  readonly seconds: number
+}): React.ReactElement | null {
+  const terms = choice.managed
+  if (!terms) return null
+  const words = rateWords(terms.rate)
+  const ceiling = words.ceiling(seconds)
+  const before = choice.previousRate ? rateWords(choice.previousRate) : null
+  return (
+    <section className="kr-voice__panel" aria-labelledby={id}>
+      <h2 id={id}>What it costs</h2>
+      {before && (
+        <p className="kr-voice__refusal" role="status">
+          The rate changed after you read it. It was {before.perSecond} a second. Nothing was
+          started or charged.
+        </p>
+      )}
+      <p className="kr-voice__rate">
+        {words.perSecond} a second{words.perMinute && <> ({words.perMinute} a minute)</>}
+      </p>
+      <p className="kr-voice__note">
+        Every call is charged for at least {callLength(terms.rate.minimum_seconds)}. This call can
+        last up to {callLength(seconds)}
+        {ceiling ? <>, so it can cost at most {ceiling}.</> : '.'}
+      </p>
     </section>
   )
 }

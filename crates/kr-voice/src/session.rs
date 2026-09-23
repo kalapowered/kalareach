@@ -46,6 +46,12 @@ pub struct VoiceSessionRecord {
     pub started_at_ms: u64,
     /// When the call's own deadline falls, in UTC milliseconds.
     pub closes_at_ms: u64,
+    /// What the provider and the managed service can see, in the words the service gave this call
+    /// when it started.
+    ///
+    /// Kept so the context this host selects for the call is sent under the same statement the
+    /// person was given, rather than under a second wording this host keeps.
+    pub disclosure: Vec<String>,
     /// The delegations submitted to this call, in the order they arrived, each with the action
     /// identifier it arrived under.
     ///
@@ -151,6 +157,8 @@ pub struct NewVoiceSession {
     pub started_at_ms: u64,
     /// When the call's own deadline falls, in UTC milliseconds.
     pub closes_at_ms: u64,
+    /// What the provider and the managed service can see, in the service's words for this call.
+    pub disclosure: Vec<String>,
 }
 
 /// The voice sessions this host holds.
@@ -178,6 +186,7 @@ impl VoiceSessions {
             provider,
             started_at_ms,
             closes_at_ms,
+            disclosure,
         } = started;
         let record = VoiceSessionRecord {
             voice_session_id,
@@ -189,6 +198,7 @@ impl VoiceSessions {
             provider,
             started_at_ms,
             closes_at_ms,
+            disclosure,
             announced: Vec::new(),
         };
         self.live
@@ -338,6 +348,7 @@ mod tests {
             provider: None,
             started_at_ms: 1_000,
             closes_at_ms: 2_000,
+            disclosure: vec!["The service can read this call.".to_owned()],
         })
     }
 
@@ -401,6 +412,7 @@ mod tests {
             provider: None,
             started_at_ms: 1_000,
             closes_at_ms: 2_000,
+            disclosure: Vec::new(),
         });
         let ended = sessions.stop_under(grant(4));
         assert_eq!(ended.len(), 2);

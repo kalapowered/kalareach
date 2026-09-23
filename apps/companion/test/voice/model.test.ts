@@ -1,15 +1,19 @@
 import { describe, expect, it } from 'vitest'
 
-import type { VoicePrepareResult } from '@kalareach/protocol'
+import type { VoiceManagedTerms, VoicePrepareResult } from '@kalareach/protocol'
 
 import {
   CAPTURE_DISPLAY,
   LOCAL_ONLY_CONTROLS,
   STOP_MEANS,
   asCaptureState,
+  callLength,
   choiceFromPreparation,
+  choiceWithRate,
   controlAvailable,
   needsHost,
+  rateWords,
+  requestedSeconds,
   runningCallFrom,
   speechCouldHaveBeenHeard,
   type CaptureState,
@@ -21,6 +25,24 @@ import {
 /** What the host says an append acknowledgement does not establish. */
 const ADMISSION_MEANS =
   'The model received this context. It is not evidence that a host action ran or that audio was played; host action receipts are the authority for that.'
+
+/** The managed service's terms, as a host carries them. */
+function terms(over: Partial<VoiceManagedTerms> = {}): VoiceManagedTerms {
+  return {
+    enabled: true,
+    model: 'gpt-live-1',
+    disclosure: ['Audio travels directly between this device and the provider.'],
+    admission_note: ADMISSION_MEANS,
+    delegation_note: 'A provider delegation identifier is correlation data.',
+    alternatives: ['The coding agent already running on the host.'],
+    rate: { version: '2026-09-a', minor_units_per_second: '2', minimum_seconds: 15, currency: 'usd' },
+    maximum_session_seconds: 1800,
+    minimum_request_seconds: 60,
+    heartbeat_seconds: 20,
+    context_bytes: 500,
+    ...over
+  }
+}
 
 /** One preparation, as a host answers it. */
 function preparation(over: Partial<VoicePrepareResult> = {}): VoicePrepareResult {
@@ -36,9 +58,8 @@ function preparation(over: Partial<VoicePrepareResult> = {}): VoicePrepareResult
     token_cap: 8000,
     message_count: 20,
     broker_origin: 'https://reach.kala.to',
-    model: 'gpt-live-1',
-    disclosure: ['Audio travels directly between the paired device and the provider.'],
-    admission_note: ADMISSION_MEANS,
+    managed: terms(),
+    managed_unavailable: null,
     ...over
   }
 }
@@ -72,9 +93,10 @@ function call(over: Partial<RunningCall> = {}): RunningCall {
 
 function choice(over: Partial<ProviderChoice> = {}): ProviderChoice {
   return {
-    model: 'gpt-live-1',
     brokerOrigin: 'https://reach.kala.to',
-    disclosure: ['Audio travels directly between this device and the provider.'],
+    managed: terms(),
+    unavailable: null,
+    previousRate: null,
     context: [{ kind: 'the session', summary: 'its description and the last 20 messages' }],
     withheld: [
       { kind: 'file_contents', summary: 'the contents of files', reason: 'not selected' }
@@ -83,7 +105,7 @@ function choice(over: Partial<ProviderChoice> = {}): ProviderChoice {
     messageCount: 20,
     sessions: ['s-1'],
     permits: ['navigate sessions', 'ask for status'],
-    admissionMeans: ADMISSION_MEANS,
+    needsUnlockedScreen: false,
     ...over
   }
 }
@@ -111,30 +133,51 @@ describe('what the microphone’s state means', () => {
 describe('the provider choice', () => {
   // KR-REQ-15.09: the managed content access is stated where the choice is made, in the deployed
   // service's own words rather than a second wording of them.
-  it('carries the service’s own disclosure list rather than restating it', () => {
-    const made = choice({
+  it('carries the service’s own terms rather than restating them', () => {
+    const published = terms({
       disclosure: [
         'Audio travels directly between this device and the provider, not through this service.',
         'The provider and this service can process the speech and the context the host selects.'
       ]
     })
-    expect(made.disclosure).toHaveLength(2)
-    expect(made.disclosure[0]).toContain('directly between this device and the provider')
+    const made = choiceFromPreparation(preparation({ managed: published }))
+    expect(made.managed).toEqual(published)
+    expect(made.unavailable).toBeNull()
   })
 
   // KR-REQ-15.19: the context scope is shown before voice starts, with the host's cap.
   it('takes the scope, the cap and the provider from what the host answered', () => {
     const made = choiceFromPreparation(preparation())
-    expect(made.model).toBe('gpt-live-1')
+    expect(made.managed?.model).toBe('gpt-live-1')
     expect(made.brokerOrigin).toBe('https://reach.kala.to')
     expect(made.tokenCap).toBe(8000)
     expect(made.sessions).toEqual(['s-1'])
     expect(made.permits).toEqual(preparation().statement.statements)
-    expect(made.admissionMeans).toBe(ADMISSION_MEANS)
+    expect(made.needsUnlockedScreen).toBe(false)
   })
 
-  it('names a provider only when the host named one', () => {
-    expect(choiceFromPreparation(preparation({ model: null })).model).toBeNull()
+  // KR-REQ-15.19: without the service's terms there is nothing to accept, and the host's reason is
+  // what the person reads.
+  it('carries the host’s reason when it has no terms to show', () => {
+    const made = choiceFromPreparation(
+      preparation({ managed: null, managed_unavailable: 'The managed service did not answer.' })
+    )
+    expect(made.managed).toBeNull()
+    expect(made.unavailable).toBe('The managed service did not answer.')
+
+    const silent = choiceFromPreparation(preparation({ managed: null, managed_unavailable: null }))
+    expect(silent.unavailable).toBeTruthy()
+  })
+
+  // A refused start moves only the rate, and the rate the person read before stays beside it.
+  it('replaces the rate after a refusal and keeps the one read before', () => {
+    const before = choice()
+    const rate = { version: '2026-10-b', minor_units_per_second: '3', minimum_seconds: 15, currency: 'usd' }
+    const after = choiceWithRate(before, rate)
+    expect(after.managed?.rate.version).toBe('2026-10-b')
+    expect(after.previousRate?.version).toBe('2026-09-a')
+    expect(after.managed?.disclosure).toEqual(before.managed?.disclosure)
+    expect(choiceWithRate(choice({ managed: null }), rate).managed).toBeNull()
   })
 
   // KR-REQ-15.19: what is excluded is listed beside what is carried.
@@ -241,5 +284,59 @@ describe('what an append acknowledgement means', () => {
     expect(ADMISSION_MEANS).toContain('not evidence')
     expect(ADMISSION_MEANS).toContain('receipt')
     expect(ADMISSION_MEANS).not.toMatch(/\bdone\b|\bcompleted\b|\bexecuted\b/i)
+  })
+})
+
+describe('what a call costs', () => {
+  // KR-REQ-15.19: the rate is shown in the service's currency, the way the person's locale writes
+  // money, from whole minor units a second.
+  it('writes the rate a second and a minute from minor units', () => {
+    const words = rateWords(
+      { version: 'v', minor_units_per_second: '2', minimum_seconds: 15, currency: 'usd' },
+      'en-GB'
+    )
+    expect(words.perSecond).toBe('US$0.02')
+    expect(words.perMinute).toBe('US$1.20')
+    expect(words.ceiling(1800)).toBe('US$36.00')
+    // A call shorter than the provider's minimum is charged the minimum.
+    expect(words.ceiling(5)).toBe('US$0.30')
+  })
+
+  it('shifts by the currency’s own decimal places', () => {
+    const yen = rateWords(
+      { version: 'v', minor_units_per_second: '3', minimum_seconds: 15, currency: 'jpy' },
+      'en-GB'
+    )
+    expect(yen.perSecond).toBe('JP¥3')
+    expect(yen.perMinute).toBe('JP¥180')
+  })
+
+  it('does not guess at an amount or a currency it cannot read', () => {
+    const odd = rateWords(
+      { version: 'v', minor_units_per_second: '2.5', minimum_seconds: 15, currency: 'usd' },
+      'en-GB'
+    )
+    expect(odd.perSecond).toBe('2.5 minor units of USD')
+    expect(odd.perMinute).toBeNull()
+    expect(odd.ceiling(60)).toBeNull()
+
+    const unknown = rateWords(
+      { version: 'v', minor_units_per_second: '2', minimum_seconds: 15, currency: 'not-a-code' },
+      'en-GB'
+    )
+    expect(unknown.perSecond).toBe('2 minor units of NOT-A-CODE')
+  })
+
+  // A start never asks for longer than the service authorises, which it would refuse.
+  it('asks for half an hour or the service’s maximum, whichever is shorter', () => {
+    expect(requestedSeconds(terms())).toBe(1800)
+    expect(requestedSeconds(terms({ maximum_session_seconds: 600 }))).toBe(600)
+    expect(requestedSeconds(terms({ maximum_session_seconds: 30 }))).toBeNull()
+  })
+
+  it('names a call length the way a person says it', () => {
+    expect(callLength(1800)).toBe('30 minutes')
+    expect(callLength(60)).toBe('1 minute')
+    expect(callLength(15)).toBe('15 seconds')
   })
 })

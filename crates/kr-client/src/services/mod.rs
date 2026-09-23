@@ -972,6 +972,10 @@ impl SyncBackupService for NullService {
 }
 
 impl ManagedVoiceService for NullService {
+    fn metadata(&self) -> ServiceFuture<'_, Option<voice::VoiceMetadata>> {
+        unconfigured(ManagedService::ManagedInference.as_str())
+    }
+
     fn provider(&self) -> String {
         "none".to_owned()
     }

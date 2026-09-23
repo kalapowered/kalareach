@@ -15,6 +15,8 @@ import { VoiceSurface, type VoiceSurfaceActions } from './VoiceSurface'
 import {
   asCaptureState,
   choiceFromPreparation,
+  choiceWithRate,
+  requestedSeconds,
   runningCallFrom,
   type ContextRequest,
   type Delegation,
@@ -35,14 +37,6 @@ function failureMessage(value: unknown): string {
 function failureCode(value: unknown): string | null {
   return portFailureCode(value instanceof AskFailed ? value.payload : value)
 }
-
-/**
- * How long a call is asked to be authorised for, in seconds.
- *
- * Half an hour. It is what the request asks for; the service's answer carries the moment the call
- * actually closes, and that is what the screen counts against.
- */
-const CALL_SECONDS = 1800
 
 /**
  * How often the screen re-reads the call it is holding, in milliseconds.
@@ -247,12 +241,25 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
   const actions = useMemo<VoiceSurfaceActions>(
     () => ({
       start: () => {
-        if (busy) return
+        // A managed call starts only under terms the person was shown: the start names the
+        // version of the rate on screen, and there is no start without one.
+        const terms = choice?.managed
+        if (busy || !terms) return
+        const seconds = requestedSeconds(terms)
+        if (seconds === null) {
+          setNotice('The managed service allows no call length this screen can ask for.')
+          return
+        }
         setBusy(true)
         setNotice(null)
         void ask(() =>
           port.voiceStart(
-            { sessionIds, durationSeconds: CALL_SECONDS, reasoningBudgetMinor: null },
+            {
+              sessionIds,
+              durationSeconds: seconds,
+              reasoningBudgetMinor: null,
+              expectedRateVersion: terms.rate.version
+            },
             {}
           )
         )
@@ -261,6 +268,14 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
             if (!outcome) {
               setNotice(
                 'This host has not said whether that call was created. Nothing is running here.'
+              )
+              return
+            }
+            if ('rate_changed' in outcome) {
+              // Nothing was started, held or charged. The new rate replaces the one on screen,
+              // the old one stays beside it, and starting again is the person's decision.
+              setChoice((current) =>
+                current ? choiceWithRate(current, outcome.rate_changed.rate) : current
               )
               return
             }
@@ -281,7 +296,7 @@ export function VoiceRoute({ surface }: { readonly surface: Surface }): ReactNod
                 first_audio_ms: null
               })
             )
-            setCall(runningCallFrom(session, state, choice?.admissionMeans ?? ''))
+            setCall(runningCallFrom(session, state, terms.admission_note))
             setBrokerReachable(true)
           })
           .catch((error: unknown) => {

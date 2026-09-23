@@ -59,7 +59,8 @@ a reader can tell which is which without knowing where the value came from.
 
 The coordinator returns the selection and its results **to the paired client**. The client is what
 sends them to the managed service, as bounded context requests. The host does not reach the managed
-service with content at all; the only calls it makes are creating a call and ending one.
+service with content at all; the only calls it makes are reading the terms the service publishes,
+creating a call and ending one.
 
 ## What the managed operator can see
 
@@ -68,8 +69,10 @@ the provider receives transcripts and copies of the audio so it can meter the ca
 discarded before telemetry and are not stored, which reduces what is kept rather than making the
 operator unable to read a call.
 
-The host states this where the choice is made rather than in a policy page: a voice session carries
-the disclosure, and so does every context selection.
+The service states this in its own words, and the host carries them to where the choice is made
+rather than to a policy page. The preparation a person reads before a call carries them, the call
+carries them when it starts, and every context selection for that call carries them too. The host
+keeps no wording of its own for this.
 
 Using a provider credential of your own changes who can read it, and nothing else about how the
 host decides what a call may do.
@@ -146,6 +149,17 @@ two requests can never each decide about the authority the other is writing.
 It has its own identity and its own end. Stopping a voice session names the terminal sessions it
 reached and closes none of them; nothing in the coordinator can close one without an unlocked-screen
 confirmation of its own. Voice can stop while the agent keeps working.
+
+## The rate a call runs under
+
+Before a call, `voice.prepare` reads the managed service's published terms and hands them to the
+device unchanged: the model, the disclosure, the rate with its version, the longest call the service
+authorises and whether an operator has it open. Reading them creates nothing on either side.
+
+A start for a managed call names the version of the rate the person was shown, and the host passes
+it on as the service's `expectedRateVersion`. The service compares it with the rate it would charge
+now. When the two differ it refuses before anything is held, and the host answers `rate_changed`
+with the rate as it is now; no voice session and no grant are written for that start.
 
 ## The account token
 

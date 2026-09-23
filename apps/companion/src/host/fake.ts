@@ -25,7 +25,9 @@ import type {
   SessionReadResult,
   ShellLaunchResult,
   VoiceContextResult,
+  VoiceManagedTerms,
   VoicePrepareResult,
+  VoiceRate,
   VoiceSessionDescriptor
 } from '@kalareach/protocol'
 
@@ -50,6 +52,7 @@ import type {
   SettingsPane,
   SetupIdentity,
   VoiceCallState,
+  VoiceStartRequest,
   Written
 } from './port'
 
@@ -182,6 +185,20 @@ export interface FakeHostControls {
   setVoiceBrokerReachable(reachable: boolean): void
   /** Makes the next start answer `unavailable` with this reason, or clears that with null. */
   refuseVoiceStart(reason: string | null): void
+  /**
+   * Moves the managed rate on, as an operator deploying a new one does.
+   *
+   * A preparation read afterwards quotes the new rate, and a start that names the old version is
+   * refused with the new one, as the service refuses it.
+   */
+  changeVoiceRate(version: string, minorUnitsPerSecond: string): void
+  /**
+   * What the managed service tells this host about its terms: published, published with the
+   * operator's circuit breaker shut, or not read at all.
+   */
+  setVoiceTerms(state: VoiceTermsState): void
+  /** Every start the page asked for, in order, as it asked for it. */
+  readonly voiceStarts: VoiceStartRequest[]
   /** Puts the running call's microphone into one of the states a platform reports. */
   setVoiceCapture(state: string): void
   /** Announces one delegation to the running call, as a provider channel would. */
@@ -220,8 +237,11 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     call: null,
     delegations: [],
     brokerReachable: true,
-    startRefusal: null
+    startRefusal: null,
+    rate: { ...VOICE_TERMS.rate },
+    terms: 'published'
   }
+  const voiceStarts: VoiceStartRequest[] = []
 
   const requireConnection = () => {
     if (!connected) {
@@ -618,15 +638,56 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       requireConnection()
       const asked = (params as { selected?: readonly string[] } | null)?.selected ?? []
       return Promise.resolve({
-        ...VOICE_PREPARATION,
-        selected: VOICE_EXCLUDED_CLASSES.filter((each) => asked.includes(each))
+        ...VOICE_SCOPE,
+        selected: VOICE_EXCLUDED_CLASSES.filter((each) => asked.includes(each)),
+        managed:
+          voice.terms === 'unread'
+            ? null
+            : { ...VOICE_TERMS, enabled: voice.terms === 'published', rate: { ...voice.rate } },
+        managed_unavailable:
+          voice.terms === 'unread'
+            ? "This host could not read the managed service's terms, so a managed call cannot start from here: the managed service did not answer"
+            : null
       })
     },
 
     voiceStart: (request) => {
       requireConnection()
+      voiceStarts.push(request)
       if (voice.call) {
         refuse('PERMISSION_DENIED', 'This device is already holding a voice call.')
+      }
+      // The service compares the version the start names with the rate it would charge now, and
+      // refuses before anything is held when they differ.
+      if (request.expectedRateVersion !== voice.rate.version) {
+        return Promise.resolve({
+          receipt: null,
+          action_id: null,
+          value: {
+            outcome: {
+              rate_changed: {
+                rate: { ...voice.rate },
+                message:
+                  'The rate a call would run under now is not the one this request named, so nothing was started, held or charged. Show the rate this answer carries and ask again with its version to start under it.'
+              }
+            }
+          }
+        })
+      }
+      if (voice.terms === 'closed') {
+        return Promise.resolve({
+          receipt: null,
+          action_id: null,
+          value: {
+            outcome: {
+              unavailable: {
+                reason: 'service_capacity',
+                message: 'Managed voice is closed at the moment.',
+                alternatives: [...VOICE_TERMS.alternatives]
+              }
+            }
+          }
+        })
       }
       if (voice.startRefusal) {
         return Promise.resolve({
@@ -699,7 +760,7 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
           outcome: {
             admitted: {
               action_id: nextActionId(),
-              note: VOICE_PREPARATION.admission_note
+              note: HOST_ADMISSION_NOTE
             }
           }
         }
@@ -789,6 +850,13 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     refuseVoiceStart(reason) {
       voice.startRefusal = reason
     },
+    changeVoiceRate(version, minorUnitsPerSecond) {
+      voice.rate = { ...voice.rate, version, minor_units_per_second: minorUnitsPerSecond }
+    },
+    setVoiceTerms(state) {
+      voice.terms = state
+    },
+    voiceStarts,
     setVoiceCapture(state) {
       if (voice.call) voice.call.capture = state
     },
@@ -819,7 +887,14 @@ interface VoiceState {
   brokerReachable: boolean
   /** The reason a start answers `unavailable` with, when one is set. */
   startRefusal: string | null
+  /** The rate the service would charge a call started now. */
+  rate: VoiceRate
+  /** What the service tells this host about its terms. */
+  terms: VoiceTermsState
 }
+
+/** What the managed service tells a host about its terms. */
+export type VoiceTermsState = 'published' | 'closed' | 'unread'
 
 /** What the call this device is holding is doing. */
 function voiceCallState(voice: VoiceState): VoiceCallState {
@@ -844,13 +919,11 @@ const VOICE_EXCLUDED_CLASSES = [
 ] as const
 
 /**
- * What this host answers before a call exists.
+ * What this host answers before a call exists, apart from the managed service's terms.
  *
- * The disclosure is the host's own list, carried to the screen rather than written again there.
- * Section 15 ¶5 asks for the managed service's technical access to be stated in the provider
- * choice, and a second wording of it in a component would be a second thing to keep true.
+ * The scope is the host's own: its grants, its selection and its cap.
  */
-const VOICE_PREPARATION: VoicePrepareResult = {
+const VOICE_SCOPE: Omit<VoicePrepareResult, 'managed' | 'managed_unavailable'> = {
   session_ids: [SESSION_MAIN],
   statement: {
     actions: ['brief', 'compose_prompt', 'navigate', 'status'],
@@ -866,18 +939,44 @@ const VOICE_PREPARATION: VoicePrepareResult = {
   selected: [],
   token_cap: 8000,
   message_count: 20,
-  broker_origin: 'https://reach.kala.to',
+  broker_origin: 'https://reach.kala.to'
+}
+
+/**
+ * The managed service's terms, as the deployed service publishes them.
+ *
+ * The wordings are the deployment's own and reach the screen through the host unchanged, which is
+ * the point: the screen carries no second wording of any of them.
+ */
+const VOICE_TERMS: VoiceManagedTerms = {
+  enabled: true,
   model: 'gpt-live-1',
   disclosure: [
-    'Audio travels directly between the paired device and the provider, not through this host.',
-    'The provider and the managed service can process the speech and the context this host selects.',
-    "The managed service's own channel to the provider receives transcripts and copies of the audio. They are discarded before telemetry and not stored, which reduces what is kept rather than making it unreadable.",
-    'Selected context and host results are sent by the paired device as bounded requests. What this host selects can include project text, and the managed service and the provider both see it.',
-    'A statement from the model that you confirmed something is not a confirmation. Actions that need one ask for it on the unlocked screen of the paired device.'
+    'Audio travels directly between this device and the provider, not through this service.',
+    'The provider and this service can process the speech and the context the host selects.',
+    "This service's own channel to the provider still receives transcripts and copies of the audio. They are discarded before telemetry and never stored, which reduces what is kept rather than making it unreadable.",
+    'Selected context and host results are sent as bounded requests. What the host selected can include project text, and this service and the provider both see it.',
+    'A statement from the model that you confirmed something is not a confirmation. Actions that need one ask for it on the unlocked screen of this device.'
   ],
   admission_note:
-    'The model received this context. It is not evidence that a host action ran or that audio was played; host action receipts are the authority for that.'
+    'The model received this context. It is not evidence that a host action ran or that audio was played; host action receipts are the authority for that.',
+  delegation_note:
+    'A provider delegation identifier is correlation data. It carries no authority and no task text; submit the delegation to the host over the device connection, where it is checked normally.',
+  alternatives: [
+    'Your own provider credential, configured in the service settings, which uses no managed credit.',
+    'The coding agent already running on the host, reached by typing rather than speaking.',
+    'The session itself, which is unaffected: a voice session can stop while the agent continues.'
+  ],
+  rate: { version: '2026-09-a', minor_units_per_second: '1', minimum_seconds: 15, currency: 'usd' },
+  maximum_session_seconds: 1800,
+  minimum_request_seconds: 60,
+  heartbeat_seconds: 20,
+  context_bytes: 500
 }
+
+/** What this host says when it admits a delegation it has not performed. */
+const HOST_ADMISSION_NOTE =
+  'The model received this context. It is not evidence that a host action ran or that audio was played; host action receipts are the authority for that.'
 
 /** The running voice session this host answers a start with. */
 function fakeVoiceSession(
@@ -887,17 +986,17 @@ function fakeVoiceSession(
   return {
     voice_session_id: VOICE_SESSION,
     grant_id: VOICE_GRANT,
-    statement: VOICE_PREPARATION.statement,
+    statement: VOICE_SCOPE.statement,
     session_ids: sessionIds.length > 0 ? [...sessionIds] : [SESSION_MAIN],
     call_id: 'call-7f3a',
     provider_session_id: 'sess_7f3a',
     answer_sdp: 'v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n',
-    model: VOICE_PREPARATION.model ?? 'gpt-live-1',
+    model: VOICE_TERMS.model,
     control_path: '/api/voice/sessions/call-7f3a/control',
-    broker_origin: VOICE_PREPARATION.broker_origin,
+    broker_origin: VOICE_SCOPE.broker_origin,
     heartbeat_seconds: 20,
     closes_at_ms: String(closesAtMs),
-    disclosure: VOICE_PREPARATION.disclosure
+    disclosure: VOICE_TERMS.disclosure
   }
 }
 
@@ -924,7 +1023,7 @@ function fakeVoiceContext(voiceSessionId: string, sessionId: string): VoiceConte
       resources: [sessionId]
     },
     withheld: [],
-    disclosure: VOICE_PREPARATION.disclosure
+    disclosure: VOICE_TERMS.disclosure
   }
 }
 

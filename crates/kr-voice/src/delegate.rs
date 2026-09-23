@@ -35,21 +35,64 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
-use kr_client::services::voice::{ManagedVoiceService, VoiceStart};
-use kr_protocol::ids::{ActionId, DeviceId, EnvironmentId, GrantId, SessionId, VoiceSessionId};
+use kr_client::services::voice::{ManagedVoiceService, VoiceMetadata, VoiceRateQuote, VoiceStart};
+use kr_protocol::grant::Grant;
+use kr_protocol::ids::{
+    ActionId, AuthorityRevision, DeviceId, EnvironmentId, GrantId, SessionId, VoiceSessionId,
+};
 use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable, TimestampMs, U64};
 use kr_protocol::voice::{
-    VOICE_ADMISSION_NOTE, VOICE_APPEND_BYTES, VOICE_DELEGATION_NOTE, VOICE_DISCLOSURE, VoiceAction,
-    VoiceActionPlan, VoiceConfirmationRequest, VoiceDelegateParams, VoiceDelegateResult,
-    VoiceDelegationId, VoiceDelegationOutcome, VoiceGrantParams, VoiceGrantResult,
-    VoiceGrantStatement, VoiceRefusal, VoiceSessionDescriptor, VoiceStartOutcome, VoiceStartParams,
-    VoiceStartResult, VoiceStopParams, VoiceStopResult,
+    VOICE_ADMISSION_NOTE, VOICE_APPEND_BYTES, VOICE_CONTEXT_MESSAGE_COUNT, VOICE_CONTEXT_TOKEN_CAP,
+    VOICE_DELEGATION_NOTE, VoiceAction, VoiceActionPlan, VoiceConfirmationRequest,
+    VoiceContextClass, VoiceDelegateParams, VoiceDelegateResult, VoiceDelegationId,
+    VoiceDelegationOutcome, VoiceGrantParams, VoiceGrantResult, VoiceGrantStatement,
+    VoiceManagedTerms, VoicePrepareParams, VoicePrepareResult, VoiceRate, VoiceRefusal,
+    VoiceSessionDescriptor, VoiceStartOutcome, VoiceStartParams, VoiceStartResult, VoiceStopParams,
+    VoiceStopResult,
 };
 
 use crate::confirm::{ConfirmationLedger, issue_confirmation, verify_confirmation};
 use crate::context::{SecretPatterns, select_context};
 use crate::error::{Result, VoiceError};
-use crate::grant::{GrantBinding, call_expiry, permits, permitted_actions, plan_voice_grant};
+use crate::grant::{
+    GrantBinding, PlannedVoiceGrant, call_expiry, permits, permitted_actions, plan_voice_grant,
+};
+
+/// What a person is told when this host has no voice service to broker a call through.
+///
+/// One sentence for the start that is refused and the preparation that explains why no start is
+/// offered, so the two never describe the same host differently.
+const NO_VOICE_SERVICE: &str = "this host has no voice service configured. A provider credential \
+                                of your own, or the agent already running in the session, both \
+                                still work.";
+
+/// A call planned against the grants a device holds now, and not written.
+///
+/// A start and the preparation that describes one are planned by the same function, so the scope
+/// a person is shown before a call is the scope a start would be given.
+struct PlannedCall {
+    /// The device's ordinary grant.
+    device_grant: Grant,
+    /// The standing voice grant the call's own grant would be delegated from.
+    standing: Grant,
+    /// The session-bound grant a start would write.
+    planned: PlannedVoiceGrant,
+    /// The sessions the call would reach. Never empty.
+    session_ids: CanonicalSet<SessionId>,
+}
+
+/// What a planned call is for.
+#[derive(Clone, Copy)]
+enum PlanFor {
+    /// A start, whose grant is written with the call's own deadline at this revision.
+    Start {
+        closes_at_ms: u64,
+        authority_revision: AuthorityRevision,
+    },
+    /// A description of a start. Nothing is written, so the expiry and revision the plan carries
+    /// are the standing grant's own and are never read.
+    Description,
+}
 use crate::seams::{ActionSubmitter, Admission, ContextRequest, ContextSource, VoiceAuthority};
 use crate::session::{NewVoiceSession, VoiceSessions};
 
@@ -354,6 +397,192 @@ impl Coordinator {
     }
 
     /* ---------------------------------------------------------------- */
+    /* voice.prepare                                                     */
+    /* ---------------------------------------------------------------- */
+
+    /// Answers what a voice session started now would be, before one exists.
+    ///
+    /// The checks a start makes and none of its effects: the device's grant and its standing
+    /// voice grant are read and planned exactly as a start plans them, and nothing is written,
+    /// reserved or created. The managed service is asked for its terms, which is a read that
+    /// creates nothing on its side either, and they are carried in its own words.
+    ///
+    /// A service that cannot be read is an answer rather than a failure: the scope is this host's
+    /// and is still worth showing, and the person is told why no managed call can start.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal a start would give when the device holds no grant or no voice grant,
+    /// or when the scope asked for is not one a call could be bound to.
+    pub async fn prepare(
+        &self,
+        device_id: DeviceId,
+        params: &VoicePrepareParams,
+        now_ms: u64,
+    ) -> Result<VoicePrepareResult> {
+        let PlannedCall {
+            device_grant,
+            planned,
+            session_ids,
+            ..
+        } = self.plan_call(device_id, &params.session_ids, PlanFor::Description, now_ms)?;
+        // What a person selected and the host's context filter would let through. Selecting a
+        // class is not authority to read it, and a class the grant cannot read is left out here
+        // for the same reason the filter would leave it out of the call.
+        let selected: CanonicalSet<VoiceContextClass> = params
+            .selected
+            .iter()
+            .copied()
+            .filter(|class| {
+                class
+                    .required_right()
+                    .is_none_or(|right| device_grant.permits(right))
+            })
+            .collect();
+
+        let (managed, managed_unavailable) = match self.provider() {
+            None => (None, Some(capitalised(NO_VOICE_SERVICE))),
+            Some(provider) => match provider.metadata().await {
+                Ok(Some(terms)) => match managed_terms(terms) {
+                    Some(terms) => (Some(terms), None),
+                    None => (
+                        None,
+                        Some(
+                            "The managed service quoted a rate this host cannot show, so a managed \
+                             call cannot start from here."
+                                .to_owned(),
+                        ),
+                    ),
+                },
+                Ok(None) => (
+                    None,
+                    Some(
+                        "This host's voice provider is not the managed service and quotes no \
+                         managed terms."
+                            .to_owned(),
+                    ),
+                ),
+                Err(error) => (
+                    None,
+                    Some(format!(
+                        "This host could not read the managed service's terms, so a managed call \
+                         cannot start from here: {error}"
+                    )),
+                ),
+            },
+        };
+
+        Ok(VoicePrepareResult {
+            session_ids,
+            statement: VoiceGrantStatement::of(&planned.plan.actions),
+            excluded: VoiceContextClass::ALL.iter().copied().collect(),
+            selected,
+            token_cap: VOICE_CONTEXT_TOKEN_CAP,
+            message_count: VOICE_CONTEXT_MESSAGE_COUNT,
+            broker_origin: self.broker_origin.clone(),
+            managed: Nullable(managed),
+            managed_unavailable: Nullable(managed_unavailable),
+        })
+    }
+
+    /// Plans a call for one device against the grants it holds now, and writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal when the device holds no grant or no voice grant, when the plan would
+    /// reach sessions its grant does not cover, or when it would reach none.
+    fn plan_call(
+        &self,
+        device_id: DeviceId,
+        requested: &CanonicalSet<SessionId>,
+        purpose: PlanFor,
+        now_ms: u64,
+    ) -> Result<PlannedCall> {
+        let device_grant = self
+            .authority
+            .device_grant(device_id, None, now_ms)?
+            .ok_or_else(|| {
+                VoiceError::refused(
+                    VoiceRefusal::OutsideDeviceGrant,
+                    "this device holds no grant on this host",
+                )
+            })?;
+        let standing = self
+            .authority
+            .standing_voice_grant(device_id, now_ms)?
+            .ok_or_else(|| {
+                VoiceError::refused(
+                    VoiceRefusal::OutsideVoiceGrant,
+                    "this device has no voice grant. Create one before starting a voice session.",
+                )
+            })?;
+
+        let (expiry, authority_revision) = match purpose {
+            // The call's grant expires on this host's own clock. A host that took its expiry from
+            // a timestamp the service wrote would be letting the service decide how long its
+            // authority lasts.
+            PlanFor::Start {
+                closes_at_ms,
+                authority_revision,
+            } => (call_expiry(closes_at_ms), authority_revision),
+            PlanFor::Description => (standing.expiry, standing.authority_revision),
+        };
+        let planned = plan_voice_grant(
+            &device_grant,
+            Some(&permitted_actions(&standing)),
+            &GrantBinding {
+                parent_grant_id: Some(standing.grant_id),
+                issuer_device_id: self.host_device_id,
+                environment_id: self.environment_id,
+                // An empty request takes the standing voice grant's own sessions, not the wider
+                // set the device's ordinary grant covers: the child narrows both, and the standing
+                // grant is the narrower of the two by construction.
+                session_ids: if requested.is_empty() {
+                    match &standing.session_selector {
+                        kr_protocol::grant::SessionSelector::These { session_ids } => {
+                            session_ids.clone()
+                        }
+                        _ => CanonicalSet::from_iter([]),
+                    }
+                } else {
+                    requested.clone()
+                },
+                expiry,
+                authority_revision,
+            },
+        )?;
+
+        let session_ids = match &planned.plan.session_selector {
+            kr_protocol::grant::SessionSelector::These { session_ids } => session_ids.clone(),
+            // A voice session names what it reaches. A grant over every session cannot be turned
+            // into that list here, and answering with an empty one would be a call that reaches
+            // nothing, so the caller is asked to name them.
+            kr_protocol::grant::SessionSelector::Any => {
+                return Err(VoiceError::refused(
+                    VoiceRefusal::SessionOutsideVoiceSession,
+                    "name the sessions this voice session may reach; a voice grant over every \
+                     session is not one a call can be bound to",
+                ));
+            }
+            kr_protocol::grant::SessionSelector::None => CanonicalSet::from_iter([]),
+        };
+        if session_ids.is_empty() {
+            // Checked before the provider is asked, so a call is never created for a voice session
+            // that could reach nothing.
+            return Err(VoiceError::refused(
+                VoiceRefusal::OutsideDeviceGrant,
+                "this device's grant covers no session, so a voice session would reach none",
+            ));
+        }
+        Ok(PlannedCall {
+            device_grant,
+            standing,
+            planned,
+            session_ids,
+        })
+    }
+
+    /* ---------------------------------------------------------------- */
     /* voice.start                                                       */
     /* ---------------------------------------------------------------- */
 
@@ -399,11 +628,7 @@ impl Coordinator {
         admission: &dyn Admission,
     ) -> Result<VoiceStartResult> {
         let Some(provider) = self.provider() else {
-            return Err(VoiceError::NotConfigured(
-                "this host has no voice service configured. A provider credential of your own, or \
-                 the agent already running in the session, both still work."
-                    .to_owned(),
-            ));
+            return Err(VoiceError::NotConfigured(NO_VOICE_SERVICE.to_owned()));
         };
         // One start at a time for one device. The broker call sits between reading this device's
         // authority and recording the call that came back, and two starts crossing in that window
@@ -420,76 +645,21 @@ impl Coordinator {
                 },
             });
         };
-        let device_grant = self
-            .authority
-            .device_grant(device_id, None, now_ms)?
-            .ok_or_else(|| {
-                VoiceError::refused(
-                    VoiceRefusal::OutsideDeviceGrant,
-                    "this device holds no grant on this host",
-                )
-            })?;
-        let standing = self
-            .authority
-            .standing_voice_grant(device_id, now_ms)?
-            .ok_or_else(|| {
-                VoiceError::refused(
-                    VoiceRefusal::OutsideVoiceGrant,
-                    "this device has no voice grant. Create one before starting a voice session.",
-                )
-            })?;
-
         let closes_at_ms = now_ms.saturating_add(u64::from(params.duration_seconds) * 1_000);
-        // The call's grant expires on this host's own clock. A host that took its expiry from a
-        // timestamp the service wrote would be letting the service decide how long its authority
-        // lasts.
-        let planned = plan_voice_grant(
-            &device_grant,
-            Some(&permitted_actions(&standing)),
-            &GrantBinding {
-                parent_grant_id: Some(standing.grant_id),
-                issuer_device_id: self.host_device_id,
-                environment_id: self.environment_id,
-                // An empty request takes the standing voice grant's own sessions, not the wider
-                // set the device's ordinary grant covers: the child narrows both, and the standing
-                // grant is the narrower of the two by construction.
-                session_ids: if params.session_ids.is_empty() {
-                    match &standing.session_selector {
-                        kr_protocol::grant::SessionSelector::These { session_ids } => {
-                            session_ids.clone()
-                        }
-                        _ => CanonicalSet::from_iter([]),
-                    }
-                } else {
-                    params.session_ids.clone()
-                },
-                expiry: call_expiry(closes_at_ms),
+        let PlannedCall {
+            standing,
+            planned,
+            session_ids,
+            ..
+        } = self.plan_call(
+            device_id,
+            &params.session_ids,
+            PlanFor::Start {
+                closes_at_ms,
                 authority_revision,
             },
+            now_ms,
         )?;
-
-        let session_ids = match &planned.plan.session_selector {
-            kr_protocol::grant::SessionSelector::These { session_ids } => session_ids.clone(),
-            // A voice session names what it reaches. A grant over every session cannot be turned
-            // into that list here, and answering with an empty one would be a call that reaches
-            // nothing, so the caller is asked to name them.
-            kr_protocol::grant::SessionSelector::Any => {
-                return Err(VoiceError::refused(
-                    VoiceRefusal::SessionOutsideVoiceSession,
-                    "name the sessions this voice session may reach; a voice grant over every \
-                     session is not one a call can be bound to",
-                ));
-            }
-            kr_protocol::grant::SessionSelector::None => CanonicalSet::from_iter([]),
-        };
-        if session_ids.is_empty() {
-            // Checked before the provider is asked, so a call is never created for a voice session
-            // that could reach nothing.
-            return Err(VoiceError::refused(
-                VoiceRefusal::OutsideDeviceGrant,
-                "this device's grant covers no session, so a voice session would reach none",
-            ));
-        }
 
         let request = kr_client::services::voice::VoiceSessionRequest {
             offer_sdp: params.offer_sdp.clone(),
@@ -497,6 +667,10 @@ impl Coordinator {
             duration_seconds: params.duration_seconds,
             reasoning_budget_minor: params.reasoning_budget_minor.0.map(U64::get),
             device_id: Some(device_id.to_string()),
+            // The version the person was shown, passed on unchanged. The service is what knows
+            // the rate it would charge now, so the comparison is its to make; this host only
+            // makes sure the version that reaches it is the one the device named.
+            expected_rate_version: params.expected_rate_version.0.clone(),
         };
         // Asked immediately before the broker, after the reads above, because creating the call
         // is the first thing a start does that costs anything: a call created for a start the
@@ -515,6 +689,22 @@ impl Coordinator {
                     outcome: VoiceStartOutcome::CreationUnknown {
                         attempt_id: attempt_id.unwrap_or_default(),
                         message,
+                    },
+                });
+            }
+            VoiceStart::RateChanged { rate, message, .. } => {
+                // Nothing was created, so there is nothing to close and no grant to write. The
+                // person is shown the rate as it is now and decides again.
+                return Ok(VoiceStartResult {
+                    outcome: match protocol_rate(&rate) {
+                        Some(rate) => VoiceStartOutcome::RateChanged { rate, message },
+                        None => VoiceStartOutcome::Unavailable {
+                            reason: "rate_changed".to_owned(),
+                            message,
+                            alternatives: vec![
+                                "Read the terms again before starting a voice session.".to_owned(),
+                            ],
+                        },
                     },
                 });
             }
@@ -626,6 +816,7 @@ impl Coordinator {
                                     provider: Some(Arc::clone(&provider)),
                                     started_at_ms: now_ms,
                                     closes_at_ms,
+                                    disclosure: session.disclosure.clone(),
                                 });
                                 Ok(Some(written))
                             }
@@ -674,14 +865,9 @@ impl Coordinator {
                     broker_origin: self.broker_origin.clone(),
                     heartbeat_seconds: session.heartbeat_seconds,
                     closes_at_ms: TimestampMs::new(closes_at_ms),
-                    disclosure: if session.disclosure.is_empty() {
-                        VOICE_DISCLOSURE
-                            .iter()
-                            .map(|line| (*line).to_owned())
-                            .collect()
-                    } else {
-                        session.disclosure.clone()
-                    },
+                    // The service's own words for this call, carried as they came. A host copy put
+                    // in their place would be a second statement of what the operator can see.
+                    disclosure: session.disclosure.clone(),
                 }),
             },
         })
@@ -900,12 +1086,16 @@ impl Coordinator {
         params: &kr_protocol::voice::VoiceContextParams,
         now_ms: u64,
     ) -> Result<kr_protocol::voice::VoiceContextResult> {
-        let (voice_grant_id, reaches) = {
+        let (voice_grant_id, reaches, disclosure) = {
             let state = self.state.lock().expect("the coordinator's state");
             let record = state
                 .sessions
                 .of_device(params.voice_session_id, device_id)?;
-            (record.grant_id, record.reaches(params.session_id))
+            (
+                record.grant_id,
+                record.reaches(params.session_id),
+                record.disclosure.clone(),
+            )
         };
         if !reaches {
             return Err(VoiceError::refused(
@@ -983,7 +1173,9 @@ impl Coordinator {
             selection: selection.selection,
             provenance: selection.provenance,
             withheld: selection.withheld,
-            disclosure: selection.disclosure,
+            // What the service told this call about who can read it, so what is sent goes under
+            // the statement the person was given.
+            disclosure,
         })
     }
 
@@ -1393,6 +1585,45 @@ impl Coordinator {
     pub const fn delegation_note() -> &'static str {
         VOICE_DELEGATION_NOTE
     }
+}
+
+/// The service's rate in the protocol's shape, when every figure in it can be shown.
+fn protocol_rate(quote: &VoiceRateQuote) -> Option<VoiceRate> {
+    if !quote.readable() {
+        return None;
+    }
+    Some(VoiceRate {
+        version: quote.version.clone(),
+        minor_units_per_second: U64::new(quote.amount_per_second()?),
+        minimum_seconds: quote.minimum_seconds,
+        currency: quote.currency.clone(),
+    })
+}
+
+/// The service's terms in the protocol's shape, in its own words.
+fn managed_terms(terms: VoiceMetadata) -> Option<VoiceManagedTerms> {
+    let rate = protocol_rate(&terms.rate)?;
+    Some(VoiceManagedTerms {
+        enabled: terms.enabled,
+        model: terms.model,
+        disclosure: terms.disclosure,
+        admission_note: terms.admission_note,
+        delegation_note: terms.delegation_note,
+        alternatives: terms.alternatives,
+        rate,
+        maximum_session_seconds: terms.maximum_session_seconds,
+        minimum_request_seconds: terms.minimum_request_seconds,
+        heartbeat_seconds: terms.heartbeat_seconds,
+        context_bytes: terms.context_bytes,
+    })
+}
+
+/// A refusal's sentence as a person reads it on its own, with its first letter raised.
+fn capitalised(sentence: &str) -> String {
+    let mut characters = sentence.chars();
+    characters.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(characters).collect()
+    })
 }
 
 /// The device's grant with the narrower of the two history scopes.

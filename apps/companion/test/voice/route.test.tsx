@@ -22,8 +22,13 @@ type Watched = Record<
   ReturnType<typeof vi.fn>
 >
 
-function start(): { controls: FakeHostControls; port: HostPort; watched: Watched } {
+function start(setup?: (controls: FakeHostControls) => void): {
+  controls: FakeHostControls
+  port: HostPort
+  watched: Watched
+} {
   const { port, controls } = fakeHost()
+  setup?.(controls)
   // The host's own answers, kept before the screen can reach them, so the count is of what the
   // screen asked for rather than of a wrapper calling itself.
   const answers = {
@@ -298,5 +303,60 @@ describe('while a call is running', () => {
     expect(delegated).toHaveBeenCalledTimes(1)
     // KR-REQ-15.17: admission is not execution, and the words beside it say so.
     expect(screen.getByText(/It is not evidence that a host action ran/)).toBeInTheDocument()
+  })
+})
+
+describe('the rate a start accepts', () => {
+  // KR-REQ-15.19: the start names the version of the rate on screen, and asks for no longer a call
+  // than the service authorises.
+  it('names the rate the person was shown', async () => {
+    const user = userEvent.setup()
+    const { controls } = start()
+    await waitForChoice()
+    await user.click(screen.getByRole('button', { name: 'Start voice session' }))
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: 'Voice session' })).toBeInTheDocument()
+    })
+    expect(controls.voiceStarts).toHaveLength(1)
+    expect(controls.voiceStarts[0].expectedRateVersion).toBe('2026-09-a')
+    expect(controls.voiceStarts[0].durationSeconds).toBe(1800)
+  })
+
+  // A rate that moved on between the reading and the start: nothing starts, the new rate is shown
+  // beside the old one, and only a second press, naming the new version, starts the call.
+  it('shows a changed rate and starts only when the person accepts it', async () => {
+    const user = userEvent.setup()
+    const { controls, watched } = start()
+    await waitForChoice()
+    controls.changeVoiceRate('2026-10-b', '3')
+
+    await user.click(screen.getByRole('button', { name: 'Start voice session' }))
+    const accept = await screen.findByRole('button', { name: 'Start at the new rate' })
+    const cost = screen.getByRole('region', { name: 'What it costs' })
+    expect(within(cost).getByRole('status')).toHaveTextContent(/It was \S*0\.01 a second/)
+    expect(within(cost).getByText(/0\.03 a second/)).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Voice session' })).not.toBeInTheDocument()
+    expect(watched.voiceStart).toHaveBeenCalledTimes(1)
+
+    await user.click(accept)
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: 'Voice session' })).toBeInTheDocument()
+    })
+    expect(controls.voiceStarts.map((each) => each.expectedRateVersion)).toEqual([
+      '2026-09-a',
+      '2026-10-b'
+    ])
+  })
+
+  // KR-REQ-15.19: a host that could not read the service's terms offers no start, and says why.
+  it('offers no start when the host could not read the service’s terms', async () => {
+    const { watched } = start((controls) => {
+      controls.setVoiceTerms('unread')
+    })
+    await waitFor(() => {
+      expect(screen.getByText(/could not read the managed service's terms/)).toBeInTheDocument()
+    })
+    expect(screen.queryByRole('button', { name: /Start/ })).not.toBeInTheDocument()
+    expect(watched.voiceStart).not.toHaveBeenCalled()
   })
 })

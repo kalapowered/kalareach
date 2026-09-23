@@ -18,11 +18,29 @@ const DISCLOSURE = [
   'A statement from the model that you confirmed something is not a confirmation.'
 ]
 
+/** The managed service's terms, as the host carries them through. */
+const TERMS: NonNullable<ProviderChoice['managed']> = {
+  enabled: true,
+  model: 'gpt-live-1',
+  disclosure: DISCLOSURE,
+  admission_note: ADMISSION_MEANS,
+  delegation_note: 'A provider delegation identifier is correlation data.',
+  alternatives: [
+    'The coding agent already running on the host, reached by typing rather than speaking.'
+  ],
+  rate: { version: '2026-09-a', minor_units_per_second: '2', minimum_seconds: 15, currency: 'usd' },
+  maximum_session_seconds: 1800,
+  minimum_request_seconds: 60,
+  heartbeat_seconds: 20,
+  context_bytes: 500
+}
+
 function choice(over: Partial<ProviderChoice> = {}): ProviderChoice {
   return {
-    model: 'gpt-live-1',
     brokerOrigin: 'https://reach.kala.to',
-    disclosure: DISCLOSURE,
+    managed: TERMS,
+    unavailable: null,
+    previousRate: null,
     context: [
       { kind: 'the session', summary: 'its description, working directory and the last 20 messages' }
     ],
@@ -34,7 +52,7 @@ function choice(over: Partial<ProviderChoice> = {}): ProviderChoice {
     messageCount: 20,
     sessions: ['s-1'],
     permits: ['navigate sessions', 'ask for status', 'brief you', 'compose a prompt'],
-    admissionMeans: ADMISSION_MEANS,
+    needsUnlockedScreen: false,
     ...over
   }
 }
@@ -131,19 +149,103 @@ describe('before voice starts', () => {
     expect(screen.getByRole('button', { name: 'Starting…' })).toBeDisabled()
   })
 
-  it('says a model statement is not a confirmation, before any audio is captured', () => {
+  it('says a model statement is not a confirmation once, in the service’s words', () => {
     render(<VoiceSurface choice={choice()} call={null} currentTurn={null} busy={false}
         notice={null}
         actions={actions()} />)
-    // Said twice on purpose, and both are asserted: the service states it in its disclosure, and
-    // the screen states it again beside what speaking will be allowed to do, which is where a
-    // person is deciding.
+    // Once: the service states it in its disclosure, and a second wording on this screen would be
+    // a second thing to keep true. What the screen says beside the grant is the host's own rule.
+    expect(screen.getAllByText(/is not a confirmation/)).toHaveLength(1)
+    const access = screen.getByRole('region', { name: 'What this gives access to' })
+    expect(within(access).getByText(/is not a confirmation/)).toBeInTheDocument()
     const permits = screen.getByRole('region', {
       name: 'What speaking will be allowed to do'
     })
-    expect(within(permits).getByText(/is not a confirmation/)).toBeInTheDocument()
-    const access = screen.getByRole('region', { name: 'What this gives access to' })
-    expect(within(access).getByText(/is not a confirmation/)).toBeInTheDocument()
+    expect(within(permits).getByText(/refuses anything not listed/)).toBeInTheDocument()
+  })
+
+  // KR-REQ-15.19: the rate is shown before a call, directly above the control that accepts it.
+  it('shows what a call costs above the control that starts it', () => {
+    render(<VoiceSurface choice={choice()} call={null} currentTurn={null} busy={false}
+        notice={null}
+        actions={actions()} />)
+    const cost = screen.getByRole('region', { name: 'What it costs' })
+    expect(within(cost).getByText(/0\.02 a second/)).toBeInTheDocument()
+    expect(within(cost).getByText(/1\.20 a minute/)).toBeInTheDocument()
+    expect(within(cost).getByText(/at least 15 seconds/)).toBeInTheDocument()
+    expect(within(cost).getByText(/up to 30 minutes, so it can cost at most \S*36\.00/)).toBeInTheDocument()
+
+    const start = screen.getByRole('button', { name: 'Start voice session' })
+    // The rate sits before the start in reading order, so it is read before it is accepted.
+    expect(cost.compareDocumentPosition(start) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  // KR-REQ-15.19: without the service's terms there is nothing to accept, so there is no start,
+  // and the host's reason is what the person reads instead.
+  it('offers no start without the service’s terms, and says why', () => {
+    render(
+      <VoiceSurface
+        choice={choice({
+          managed: null,
+          unavailable: 'This host could not read the managed service’s terms.'
+        })}
+        call={null}
+        currentTurn={null}
+        busy={false}
+        notice={null}
+        actions={actions()}
+      />
+    )
+    expect(screen.getByText('This host could not read the managed service’s terms.')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Start/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('region', { name: 'What it costs' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('region', { name: 'What this gives access to' })).not.toBeInTheDocument()
+    // The scope is still the host's to state.
+    expect(screen.getByRole('region', { name: 'What will be sent' })).toBeInTheDocument()
+  })
+
+  // The operator's circuit breaker: no start, and what still works.
+  it('offers no start while managed voice is closed, and lists what still works', () => {
+    render(
+      <VoiceSurface
+        choice={choice({ managed: { ...TERMS, enabled: false } })}
+        call={null}
+        currentTurn={null}
+        busy={false}
+        notice={null}
+        actions={actions()}
+      />
+    )
+    const closed = screen.getByRole('region', { name: 'Managed voice is closed at the moment' })
+    expect(within(closed).getByText(TERMS.alternatives[0])).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Start/ })).not.toBeInTheDocument()
+  })
+
+  // A start refused because the rate moved on: the new rate is shown with the old one beside it,
+  // and starting again is a press that names what it accepts.
+  it('shows a changed rate beside the one read before, and asks again to start', () => {
+    render(
+      <VoiceSurface
+        choice={choice({
+          managed: {
+            ...TERMS,
+            rate: { ...TERMS.rate, version: '2026-10-b', minor_units_per_second: '3' }
+          },
+          previousRate: TERMS.rate
+        })}
+        call={null}
+        currentTurn={null}
+        busy={false}
+        notice={null}
+        actions={actions()}
+      />
+    )
+    const cost = screen.getByRole('region', { name: 'What it costs' })
+    expect(within(cost).getByRole('status')).toHaveTextContent(
+      /The rate changed after you read it\. It was \S*0\.02 a second\. Nothing was started or charged\./
+    )
+    expect(within(cost).getByText(/0\.03 a second/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Start at the new rate' })).toBeEnabled()
   })
 })
 

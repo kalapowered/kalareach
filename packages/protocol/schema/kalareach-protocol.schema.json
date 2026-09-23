@@ -29496,7 +29496,7 @@
       "description": "The result of `voice.context`.\n\nSection 15 ¶9: selected context and host results return from the paired client to the managed\nbroker as bounded context requests. This is what the host hands back to the paired client; the\nhost never sends it to the broker itself.",
       "properties": {
         "disclosure": {
-          "description": "What the person is told before a call about what is sent and who can read it.",
+          "description": "What the provider and the managed service can see of what is sent, in the words the\nservice gave this call when it started.",
           "items": {
             "type": "string"
           },
@@ -29961,6 +29961,84 @@
       ],
       "type": "object"
     },
+    "VoiceManagedTerms": {
+      "additionalProperties": false,
+      "description": "What the managed service publishes about a call started now, carried in its own words.\n\nThe service answers this without creating anything, and every value in it is the deployment's\nown configuration or a constant of its contract. The wordings are carried verbatim: the\ndisclosure a person reads is the list the deployment publishes, not a second list this host\nkeeps beside it.",
+      "properties": {
+        "admission_note": {
+          "description": "What an append acknowledgement establishes, and what it does not (section 15 ¶10).",
+          "type": "string"
+        },
+        "alternatives": {
+          "description": "Paths that cost no managed credit.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "context_bytes": {
+          "description": "The largest context append the service carries, in UTF-8 bytes.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "delegation_note": {
+          "description": "What a provider delegation identifier is, and what it is not.",
+          "type": "string"
+        },
+        "disclosure": {
+          "description": "What the provider and the managed service can see, stated where the choice is made.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "enabled": {
+          "description": "Whether an operator has managed voice open.\n\nFalse is the operator's circuit breaker: a call started now would be refused, and\n[`Self::alternatives`] is what still works.",
+          "type": "boolean"
+        },
+        "heartbeat_seconds": {
+          "description": "Seconds between heartbeats on the control socket.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maximum_session_seconds": {
+          "description": "The longest call the service authorises, in seconds.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "minimum_request_seconds": {
+          "description": "The shortest call a start may ask for, in seconds.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "model": {
+          "description": "The model a call started now would be asked for.",
+          "type": "string"
+        },
+        "rate": {
+          "$ref": "#/$defs/VoiceRate",
+          "description": "The rate a call started now would be quoted under."
+        }
+      },
+      "required": [
+        "enabled",
+        "model",
+        "disclosure",
+        "admission_note",
+        "delegation_note",
+        "alternatives",
+        "rate",
+        "maximum_session_seconds",
+        "minimum_request_seconds",
+        "heartbeat_seconds",
+        "context_bytes"
+      ],
+      "type": "object"
+    },
     "VoicePrepareParams": {
       "additionalProperties": false,
       "description": "Parameters of `voice.prepare`.",
@@ -29990,22 +30068,11 @@
     },
     "VoicePrepareResult": {
       "additionalProperties": false,
-      "description": "What `voice.prepare` answered: what a call started now would be, before one exists.\n\nSection 15 ¶12 asks for the provider and the selected context scope to be shown **before**\nvoice starts. The only other read of the voice surface, [`VoiceContextParams`], names a voice\nsession, and `voice.start` has already created the metered provider session by the time its\ndescriptor carries this. So the answer a person reads before deciding has to come from\nsomewhere that creates nothing, and this is it: no provider session, no reservation, no grant\nand no context leaves the host for this read.",
+      "description": "What `voice.prepare` answered: what a call started now would be, before one exists.\n\nSection 15 ¶12 asks for the provider and the selected context scope to be shown **before**\nvoice starts. The only other read of the voice surface, [`VoiceContextParams`], names a voice\nsession, and `voice.start` has already created the metered provider session by the time its\ndescriptor carries this. So the answer a person reads before deciding has to come from\nsomewhere that creates nothing, and this is it: no provider session, no reservation, no grant\nand no context leaves the host for this read.\n\nTwo sources, kept apart. The scope is this host's: its grants, its selection and its cap. What\nthe managed service would do with a call is the service's, read from it for this answer and\ncarried in [`Self::managed`] in its own words, so a person is shown the model, the disclosure,\nthe rate and the limits the deployment publishes rather than a copy this host keeps.",
       "properties": {
-        "admission_note": {
-          "description": "What an append acknowledgement establishes, and what it does not (section 15 ¶10).",
-          "type": "string"
-        },
         "broker_origin": {
           "description": "The origin of the managed service a call would be brokered through.",
           "type": "string"
-        },
-        "disclosure": {
-          "description": "What the provider and the managed operator can see, stated where the choice is made.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
         },
         "excluded": {
           "description": "Classes the default context leaves out unless the person selects them (section 15 ¶12).",
@@ -30015,13 +30082,18 @@
           "type": "array",
           "uniqueItems": true
         },
-        "message_count": {
-          "description": "How many semantic messages the default context carries.",
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
+        "managed": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VoiceManagedTerms"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the managed service answered about a call started now.\n\nNull for a provider that is not the managed service, and when this host could not read the\nservice's terms; [`Self::managed_unavailable`] then says which. A managed call is not\noffered without these terms, because a start names the rate version a person was shown\nand a person shown no rate has accepted none."
         },
-        "model": {
+        "managed_unavailable": {
           "anyOf": [
             {
               "type": "string"
@@ -30030,7 +30102,13 @@
               "type": "null"
             }
           ],
-          "description": "The model a call would be asked for, where this host is configured with one.\n\nNull when the host does not state one: the model a call actually runs on is the one the\nbroker's answer names, and a client that printed a guess here would be showing a person a\nprovider they had not been given."
+          "description": "Why a managed call cannot start from here, in words a person can act on.\n\nPresent exactly when [`Self::managed`] is null."
+        },
+        "message_count": {
+          "description": "How many semantic messages the default context carries.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
         },
         "selected": {
           "description": "Classes from the request that would actually be carried.\n\nA selection the grant does not reach is absent here rather than refused, because this read\nexists to show a person what a call would be before they make one.",
@@ -30067,9 +30145,39 @@
         "token_cap",
         "message_count",
         "broker_origin",
-        "model",
-        "disclosure",
-        "admission_note"
+        "managed",
+        "managed_unavailable"
+      ],
+      "type": "object"
+    },
+    "VoiceRate": {
+      "additionalProperties": false,
+      "description": "The managed rate, as the service quoted it.\n\nA start names [`Self::version`], and the service compares it with the rate it would charge: a\nversion that is no longer current is refused as [`VoiceStartOutcome::RateChanged`] with the\nrate as it is now, before anything is held or charged. So a call runs under the terms the\nperson was shown.",
+      "properties": {
+        "currency": {
+          "description": "The ISO 4217 code the amounts are in, as the service wrote it.",
+          "type": "string"
+        },
+        "minimum_seconds": {
+          "description": "The shortest duration the provider sells, charged whatever the call did, in seconds.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "minor_units_per_second": {
+          "$ref": "#/$defs/U64",
+          "description": "Minor units of [`Self::currency`] charged per second of call."
+        },
+        "version": {
+          "description": "The version of the rate table the quote is made under. Opaque, and compared exactly.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "minor_units_per_second",
+        "minimum_seconds",
+        "currency"
       ],
       "type": "object"
     },
@@ -30182,7 +30290,7 @@
           "type": "string"
         },
         "disclosure": {
-          "description": "What the provider and the managed operator can see, stated where the choice is made.",
+          "description": "What the provider and the managed service can see, in the words the service's answer to\nthis start gave.",
           "items": {
             "type": "string"
           },
@@ -30335,6 +30443,34 @@
             "unavailable"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The managed rate is no longer the version the start named.\n\nNothing was created, held or charged, and the voice session and its grant do not exist.\n`rate` is the rate a call started now would run under: a person who accepts it starts again\nnaming its version.",
+          "properties": {
+            "rate_changed": {
+              "additionalProperties": false,
+              "properties": {
+                "message": {
+                  "description": "What a person is told, in the service's words.",
+                  "type": "string"
+                },
+                "rate": {
+                  "$ref": "#/$defs/VoiceRate",
+                  "description": "The rate as the service quotes it now."
+                }
+              },
+              "required": [
+                "rate",
+                "message"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "rate_changed"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -30347,6 +30483,17 @@
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
+        },
+        "expected_rate_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The version of the managed rate the person was shown, as `voice.prepare` answered it.\n\nA managed call names it, and the host passes it on unchanged. A version that is no longer\ncurrent is refused as [`VoiceStartOutcome::RateChanged`] with the rate as it is now, so a\ncall never runs under terms the person was not shown. A provider that is not the managed\nservice quotes no rate, and a start through one names none."
         },
         "offer_sdp": {
           "description": "The caller's own SDP offer, as its WebRTC stack produced it.\n\nThe host forwards it to the managed broker unchanged and terminates no media: audio flows\nbetween the device and the provider. The host never generates an offer of its own.",
@@ -30376,7 +30523,8 @@
         "session_ids",
         "offer_sdp",
         "duration_seconds",
-        "reasoning_budget_minor"
+        "reasoning_budget_minor",
+        "expected_rate_version"
       ],
       "type": "object"
     },
@@ -33663,11 +33811,17 @@
     "voice_instructions": {
       "$ref": "#/$defs/VoiceInstructions"
     },
+    "voice_managed_terms": {
+      "$ref": "#/$defs/VoiceManagedTerms"
+    },
     "voice_prepare_params": {
       "$ref": "#/$defs/VoicePrepareParams"
     },
     "voice_prepare_result": {
       "$ref": "#/$defs/VoicePrepareResult"
+    },
+    "voice_rate": {
+      "$ref": "#/$defs/VoiceRate"
     },
     "voice_session_descriptor": {
       "$ref": "#/$defs/VoiceSessionDescriptor"

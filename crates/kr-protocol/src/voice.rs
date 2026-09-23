@@ -638,6 +638,11 @@ pub struct VoicePrepareParams {
 /// descriptor carries this. So the answer a person reads before deciding has to come from
 /// somewhere that creates nothing, and this is it: no provider session, no reservation, no grant
 /// and no context leaves the host for this read.
+///
+/// Two sources, kept apart. The scope is this host's: its grants, its selection and its cap. What
+/// the managed service would do with a call is the service's, read from it for this answer and
+/// carried in [`Self::managed`] in its own words, so a person is shown the model, the disclosure,
+/// the rate and the limits the deployment publishes rather than a copy this host keeps.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct VoicePrepareResult {
@@ -661,16 +666,72 @@ pub struct VoicePrepareResult {
     pub message_count: u32,
     /// The origin of the managed service a call would be brokered through.
     pub broker_origin: String,
-    /// The model a call would be asked for, where this host is configured with one.
+    /// What the managed service answered about a call started now.
     ///
-    /// Null when the host does not state one: the model a call actually runs on is the one the
-    /// broker's answer names, and a client that printed a guess here would be showing a person a
-    /// provider they had not been given.
-    pub model: Nullable<String>,
-    /// What the provider and the managed operator can see, stated where the choice is made.
+    /// Null for a provider that is not the managed service, and when this host could not read the
+    /// service's terms; [`Self::managed_unavailable`] then says which. A managed call is not
+    /// offered without these terms, because a start names the rate version a person was shown
+    /// and a person shown no rate has accepted none.
+    pub managed: Nullable<VoiceManagedTerms>,
+    /// Why a managed call cannot start from here, in words a person can act on.
+    ///
+    /// Present exactly when [`Self::managed`] is null.
+    pub managed_unavailable: Nullable<String>,
+}
+
+/// What the managed service publishes about a call started now, carried in its own words.
+///
+/// The service answers this without creating anything, and every value in it is the deployment's
+/// own configuration or a constant of its contract. The wordings are carried verbatim: the
+/// disclosure a person reads is the list the deployment publishes, not a second list this host
+/// keeps beside it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceManagedTerms {
+    /// Whether an operator has managed voice open.
+    ///
+    /// False is the operator's circuit breaker: a call started now would be refused, and
+    /// [`Self::alternatives`] is what still works.
+    pub enabled: bool,
+    /// The model a call started now would be asked for.
+    pub model: String,
+    /// What the provider and the managed service can see, stated where the choice is made.
     pub disclosure: Vec<String>,
     /// What an append acknowledgement establishes, and what it does not (section 15 ¶10).
     pub admission_note: String,
+    /// What a provider delegation identifier is, and what it is not.
+    pub delegation_note: String,
+    /// Paths that cost no managed credit.
+    pub alternatives: Vec<String>,
+    /// The rate a call started now would be quoted under.
+    pub rate: VoiceRate,
+    /// The longest call the service authorises, in seconds.
+    pub maximum_session_seconds: u32,
+    /// The shortest call a start may ask for, in seconds.
+    pub minimum_request_seconds: u32,
+    /// Seconds between heartbeats on the control socket.
+    pub heartbeat_seconds: u32,
+    /// The largest context append the service carries, in UTF-8 bytes.
+    pub context_bytes: u32,
+}
+
+/// The managed rate, as the service quoted it.
+///
+/// A start names [`Self::version`], and the service compares it with the rate it would charge: a
+/// version that is no longer current is refused as [`VoiceStartOutcome::RateChanged`] with the
+/// rate as it is now, before anything is held or charged. So a call runs under the terms the
+/// person was shown.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceRate {
+    /// The version of the rate table the quote is made under. Opaque, and compared exactly.
+    pub version: String,
+    /// Minor units of [`Self::currency`] charged per second of call.
+    pub minor_units_per_second: U64,
+    /// The shortest duration the provider sells, charged whatever the call did, in seconds.
+    pub minimum_seconds: u32,
+    /// The ISO 4217 code the amounts are in, as the service wrote it.
+    pub currency: String,
 }
 
 /* -------------------------------------------------------------------------- */
@@ -692,6 +753,13 @@ pub struct VoiceStartParams {
     pub duration_seconds: u32,
     /// Minor units to hold for reasoning and tools, held separately from the call.
     pub reasoning_budget_minor: Nullable<U64>,
+    /// The version of the managed rate the person was shown, as `voice.prepare` answered it.
+    ///
+    /// A managed call names it, and the host passes it on unchanged. A version that is no longer
+    /// current is refused as [`VoiceStartOutcome::RateChanged`] with the rate as it is now, so a
+    /// call never runs under terms the person was not shown. A provider that is not the managed
+    /// service quotes no rate, and a start through one names none.
+    pub expected_rate_version: Nullable<String>,
 }
 
 /// What `voice.start` answered.
@@ -731,6 +799,17 @@ pub enum VoiceStartOutcome {
         /// Paths that still work. A voice session stopping leaves the agent running.
         alternatives: Vec<String>,
     },
+    /// The managed rate is no longer the version the start named.
+    ///
+    /// Nothing was created, held or charged, and the voice session and its grant do not exist.
+    /// `rate` is the rate a call started now would run under: a person who accepts it starts again
+    /// naming its version.
+    RateChanged {
+        /// The rate as the service quotes it now.
+        rate: VoiceRate,
+        /// What a person is told, in the service's words.
+        message: String,
+    },
 }
 
 /// The result of `voice.start`.
@@ -769,7 +848,8 @@ pub struct VoiceSessionDescriptor {
     pub heartbeat_seconds: u32,
     /// When the broker closes the call, whatever else happens, in UTC milliseconds.
     pub closes_at_ms: TimestampMs,
-    /// What the provider and the managed operator can see, stated where the choice is made.
+    /// What the provider and the managed service can see, in the words the service's answer to
+    /// this start gave.
     pub disclosure: Vec<String>,
 }
 
@@ -1046,6 +1126,21 @@ impl VoiceContextClass {
             Self::AttachmentBytes => "attachment_bytes",
         }
     }
+
+    /// The right a grant needs before content of this class is read at all, on top of the history
+    /// bound every item is held to.
+    ///
+    /// Selecting a class is a person saying they want it, not authority to read it. File contents
+    /// and attachment bytes are file reads, so they need the grant's own file right. The host's
+    /// context filter and the preparation that describes a call both ask this, so what a person is
+    /// told a call would carry is what the filter would let it carry.
+    #[must_use]
+    pub const fn required_right(self) -> Option<ActionRight> {
+        match self {
+            Self::FileContents | Self::AttachmentBytes => Some(ActionRight::FilesRead),
+            Self::EnvironmentVariables | Self::TerminalScrollback => None,
+        }
+    }
 }
 
 /// Ordered by the wire string, for the same reason [`VoiceAction`] is.
@@ -1087,7 +1182,8 @@ pub struct VoiceContextResult {
     pub provenance: VoiceContextProvenance,
     /// What the grant's history bound kept out, so a gap is visible rather than silent.
     pub withheld: Vec<VoiceWithheld>,
-    /// What the person is told before a call about what is sent and who can read it.
+    /// What the provider and the managed service can see of what is sent, in the words the
+    /// service gave this call when it started.
     pub disclosure: Vec<String>,
 }
 
@@ -1197,24 +1293,6 @@ pub const VOICE_DELEGATION_NOTE: &str = "A provider delegation identifier is cor
 pub const VOICE_STRIPPING_NOTE: &str = "Configured secret patterns were replaced as a secondary measure. Filtering does not prove \
      the remaining content contains no secrets.";
 
-/// What the managed operator and the provider can see, stated where the choice is made.
-///
-/// Section 15 ¶5: the trusted sideband receives transcripts and reflected audio, so managed voice
-/// gives the operator technical access to that content. The host states it rather than leaving it
-/// to a policy page.
-pub const VOICE_DISCLOSURE: &[&str] = &[
-    "Audio travels directly between the paired device and the provider, not through this host.",
-    "The provider and the managed service can process the speech and the context this host selects.",
-    "The managed service's own channel to the provider receives transcripts and copies of the \
-     audio. They are discarded before telemetry and not stored, which reduces what is kept rather \
-     than making it unreadable.",
-    "Selected context and host results are sent by the paired device as bounded requests. What \
-     this host selects can include project text, and the managed service and the provider both \
-     see it.",
-    "A statement from the model that you confirmed something is not a confirmation. Actions that \
-     need one ask for it on the unlocked screen of the paired device.",
-];
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1258,6 +1336,16 @@ mod tests {
         }
 
         let voice_session_id = VoiceSessionId::new(Uuid::from_bytes([0xa0; 16]));
+        let disclosure = vec![
+            "Audio travels directly between this device and the provider.".to_owned(),
+            "The provider and this service can process the speech.".to_owned(),
+        ];
+        let rate = VoiceRate {
+            version: "2026-09-a".to_owned(),
+            minor_units_per_second: U64::new(2),
+            minimum_seconds: 15,
+            currency: "usd".to_owned(),
+        };
         let descriptor = VoiceSessionDescriptor {
             voice_session_id,
             grant_id: GrantId::new(Uuid::from_bytes([0xb0; 16])),
@@ -1273,14 +1361,17 @@ mod tests {
             broker_origin: "https://reach.example".to_owned(),
             heartbeat_seconds: 20,
             closes_at_ms: TimestampMs::new(1_700_000_000_000),
-            disclosure: VOICE_DISCLOSURE
-                .iter()
-                .map(|line| (*line).to_owned())
-                .collect(),
+            disclosure: disclosure.clone(),
         };
         round_trip(&VoiceStartResult {
             outcome: VoiceStartOutcome::Started {
                 session: Box::new(descriptor),
+            },
+        });
+        round_trip(&VoiceStartResult {
+            outcome: VoiceStartOutcome::RateChanged {
+                rate: rate.clone(),
+                message: "The rate changed after it was shown.".to_owned(),
             },
         });
         round_trip(&VoiceStartResult {
@@ -1323,12 +1414,31 @@ mod tests {
             token_cap: VOICE_CONTEXT_TOKEN_CAP,
             message_count: VOICE_CONTEXT_MESSAGE_COUNT,
             broker_origin: "https://reach.example".to_owned(),
-            model: Nullable::some("gpt-live-1".to_owned()),
-            disclosure: VOICE_DISCLOSURE
-                .iter()
-                .map(|line| (*line).to_owned())
-                .collect(),
-            admission_note: VOICE_ADMISSION_NOTE.to_owned(),
+            managed: Nullable::some(VoiceManagedTerms {
+                enabled: true,
+                model: "gpt-live-1".to_owned(),
+                disclosure,
+                admission_note: "The model received this context.".to_owned(),
+                delegation_note: "A delegation identifier is correlation data.".to_owned(),
+                alternatives: vec!["Type to the agent instead.".to_owned()],
+                rate,
+                maximum_session_seconds: 1_800,
+                minimum_request_seconds: 60,
+                heartbeat_seconds: 20,
+                context_bytes: 500,
+            }),
+            managed_unavailable: Nullable::null(),
+        });
+        round_trip(&VoicePrepareResult {
+            session_ids: CanonicalSet::from_iter([]),
+            statement: VoiceGrantStatement::of(&VoiceAction::default_scope()),
+            excluded: VoiceContextClass::ALL.iter().copied().collect(),
+            selected: CanonicalSet::from_iter([]),
+            token_cap: VOICE_CONTEXT_TOKEN_CAP,
+            message_count: VOICE_CONTEXT_MESSAGE_COUNT,
+            broker_origin: String::new(),
+            managed: Nullable::null(),
+            managed_unavailable: Nullable::some("This host has no voice service.".to_owned()),
         });
     }
 

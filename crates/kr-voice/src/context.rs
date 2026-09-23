@@ -31,9 +31,8 @@
 use kr_protocol::grant::Grant;
 use kr_protocol::scalars::{CanonicalSet, TimestampMs, U64};
 use kr_protocol::voice::{
-    VOICE_CONTEXT_MESSAGE_COUNT, VOICE_CONTEXT_TOKEN_CAP, VOICE_DISCLOSURE, VOICE_STRIPPING_NOTE,
-    VoiceContextClass, VoiceContextProvenance, VoiceContextSelection, VoiceSelectedContent,
-    VoiceWithheld,
+    VOICE_CONTEXT_MESSAGE_COUNT, VOICE_CONTEXT_TOKEN_CAP, VOICE_STRIPPING_NOTE, VoiceContextClass,
+    VoiceContextProvenance, VoiceContextSelection, VoiceSelectedContent, VoiceWithheld,
 };
 
 use crate::seams::{ContextItem, GatheredContext, SelectedItem};
@@ -47,8 +46,6 @@ pub struct Selection {
     pub provenance: VoiceContextProvenance,
     /// What was kept out, by reason.
     pub withheld: Vec<VoiceWithheld>,
-    /// What the person is told about who can read it.
-    pub disclosure: Vec<String>,
 }
 
 /// The reason an item outside the grant's history bound is reported under.
@@ -509,10 +506,6 @@ pub fn select_context(
             resources: gathered.resources.clone(),
         },
         withheld,
-        disclosure: VOICE_DISCLOSURE
-            .iter()
-            .map(|line| (*line).to_owned())
-            .collect(),
     }
 }
 
@@ -784,22 +777,6 @@ mod tests {
         assert_eq!(selection.provenance.from_ms.get(), 2_000);
         assert!(selection.provenance.to_ms.get() >= 2_100);
         assert_eq!(selection.provenance.resources, vec!["session:1".to_owned()]);
-    }
-
-    #[test]
-    fn a_selection_states_what_the_operator_can_see() {
-        let selection = select_context(
-            &gathered(),
-            &grant(Some(1_000)),
-            &CanonicalSet::from_iter([]),
-            &SecretPatterns::default(),
-        );
-        assert!(
-            selection
-                .disclosure
-                .iter()
-                .any(|line| line.contains("transcripts"))
-        );
     }
 
     #[test]

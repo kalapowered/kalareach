@@ -197,9 +197,9 @@ use crate::transfer::{
 use crate::voice::{
     VoiceActionPlan, VoiceConfirmationProof, VoiceConfirmationRequest, VoiceContextParams,
     VoiceContextResult, VoiceContextSelection, VoiceDelegateParams, VoiceDelegateResult,
-    VoiceGrantParams, VoiceGrantResult, VoiceGrantStatement, VoiceInstructions, VoicePrepareParams,
-    VoicePrepareResult, VoiceSessionDescriptor, VoiceStartParams, VoiceStartResult,
-    VoiceStopParams, VoiceStopResult,
+    VoiceGrantParams, VoiceGrantResult, VoiceGrantStatement, VoiceInstructions, VoiceManagedTerms,
+    VoicePrepareParams, VoicePrepareResult, VoiceRate, VoiceSessionDescriptor, VoiceStartParams,
+    VoiceStartResult, VoiceStopParams, VoiceStopResult,
 };
 use crate::worker::{
     AuthorityRevisionAck, AuthorityRevisionNotice, ControllerGenerationToken, GenerationAccepted,
@@ -668,8 +668,10 @@ pub fn protocol_schema() -> Value {
         "voice_grant_result" => VoiceGrantResult,
         "voice_grant_statement" => VoiceGrantStatement,
         "voice_instructions" => VoiceInstructions,
+        "voice_managed_terms" => VoiceManagedTerms,
         "voice_prepare_params" => VoicePrepareParams,
         "voice_prepare_result" => VoicePrepareResult,
+        "voice_rate" => VoiceRate,
         "voice_session_descriptor" => VoiceSessionDescriptor,
         "voice_start_params" => VoiceStartParams,
         "voice_start_result" => VoiceStartResult,

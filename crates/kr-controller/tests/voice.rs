@@ -7,11 +7,13 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-09.09, 09.12, 26.16 | `a_voice_change_is_not_written_while_a_fence_is_owed`, `a_voice_start_that_waited_writes_nothing_once_a_fence_is_owed` |
+//! | KR-REQ-15.01 | `a_start_refused_for_a_changed_rate_reaches_the_device_with_the_new_rate` |
 //! | KR-REQ-15.02 | `stopping_voice_leaves_the_session_running` |
 //! | KR-REQ-15.11 | `a_delegation_runs_under_the_grant_the_host_already_holds` |
 //! | KR-REQ-15.13 | `an_unlocked_screen_action_is_refused_without_a_signed_confirmation` |
 //! | KR-REQ-15.14 | `stopping_voice_revokes_the_grant_in_the_hosts_own_store` |
 //! | KR-REQ-15.17 | `an_effect_this_host_does_not_dispatch_is_reported_as_admitted` |
+//! | KR-REQ-15.19 | `a_start_refused_for_a_changed_rate_reaches_the_device_with_the_new_rate` |
 //! | KR-REQ-15.20 | `context_is_filtered_by_the_requesting_devices_own_history_bound` |
 //! | KR-REQ-15.21 | `the_default_voice_grant_is_written_into_the_hosts_own_store` |
 //! | KR-REQ-23.51 | `a_voice_method_is_unreachable_from_local_ipc`, `voice_needs_a_paired_device_and_a_voice_grant` |
@@ -26,7 +28,8 @@ use std::sync::Arc;
 
 use kr_client::services::ServiceFuture;
 use kr_client::services::voice::{
-    ManagedVoiceService, VoiceClosure, VoiceHold, VoiceRateQuote, VoiceSession,
+    AccountToken, AccountTokenSource, ManagedVoiceBroker, ManagedVoiceService, ServiceHttp,
+    ServiceHttpAnswer, VoiceClosure, VoiceHold, VoiceMetadata, VoiceRateQuote, VoiceSession,
     VoiceSessionRequest, VoiceStart, VoiceStartLatency,
 };
 use kr_controller::service::{Controller, ControllerSetup};
@@ -47,8 +50,8 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, U64};
 use kr_protocol::voice::{
     VoiceAction, VoiceContextParams, VoiceDelegateParams, VoiceDelegationId,
-    VoiceDelegationOutcome, VoiceGrantParams, VoiceRefusal, VoiceStartOutcome, VoiceStartParams,
-    VoiceStopParams,
+    VoiceDelegationOutcome, VoiceGrantParams, VoicePrepareParams, VoicePrepareResult, VoiceRefusal,
+    VoiceStartOutcome, VoiceStartParams, VoiceStopParams,
 };
 use kr_voice::seams::VoiceAuthority as _;
 
@@ -119,6 +122,12 @@ impl OfflineProvider {
 }
 
 impl ManagedVoiceService for OfflineProvider {
+    fn metadata(&self) -> ServiceFuture<'_, Option<VoiceMetadata>> {
+        // This stand-in quotes nothing. The test that needs the service's terms scripts the
+        // service's own wire instead, so what it proves is what a real answer does.
+        Box::pin(async move { Ok(None) })
+    }
+
     fn provider(&self) -> String {
         "the offline provider".to_owned()
     }
@@ -342,6 +351,7 @@ impl Host {
                     offer_sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n".to_owned(),
                     duration_seconds: 600,
                     reasoning_budget_minor: Nullable::null(),
+                    expected_rate_version: Nullable::some("2026-09".to_owned()),
                 },
                 self.revision(),
                 3,
@@ -502,6 +512,7 @@ async fn a_voice_method_is_unreachable_from_local_ipc() {
                 offer_sdp: "v=0\r\n".to_owned(),
                 duration_seconds: 600,
                 reasoning_budget_minor: Nullable::null(),
+                expected_rate_version: Nullable::some("2026-09".to_owned()),
             },
         )
         .await
@@ -532,6 +543,7 @@ async fn voice_needs_a_paired_device_and_a_voice_grant() {
                 offer_sdp: "v=0\r\n".to_owned(),
                 duration_seconds: 600,
                 reasoning_budget_minor: Nullable::null(),
+                expected_rate_version: Nullable::some("2026-09".to_owned()),
             },
             host.revision(),
             3,
@@ -938,6 +950,7 @@ async fn a_paired_device_reaches_voice_over_its_own_connection() {
             offer_sdp: "v=0\r\n".to_owned(),
             duration_seconds: 600,
             reasoning_budget_minor: Nullable::null(),
+            expected_rate_version: Nullable::some("2026-09".to_owned()),
         },
     )
     .await
@@ -990,6 +1003,7 @@ async fn a_paired_device_reaches_voice_over_its_own_connection() {
             offer_sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n".to_owned(),
             duration_seconds: 600,
             reasoning_budget_minor: Nullable::null(),
+            expected_rate_version: Nullable::some("2026-09".to_owned()),
         },
     )
     .await
@@ -1158,6 +1172,7 @@ async fn a_voice_start_that_waited_writes_nothing_once_a_fence_is_owed() {
         offer_sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n".to_owned(),
         duration_seconds: 600,
         reasoning_budget_minor: Nullable::null(),
+        expected_rate_version: Nullable::some("2026-09".to_owned()),
     };
     let starting = remote_voice(&session, environment_id, Method::VoiceStart, &start);
     // Only once the start is waiting for the broker: it was admitted before the fence was owed.
@@ -1261,5 +1276,319 @@ async fn a_retry_is_not_answered_from_its_record_while_a_fence_is_owed() {
     );
     clear_the_fault(&registry);
     raw.close();
+    host.stop().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The managed service's own wire, scripted: the terms a person is shown and the rate a start
+// accepts
+// ---------------------------------------------------------------------------------------------
+
+/// A managed voice service that answers from a script, in the service's own JSON, and records
+/// every request it was sent.
+///
+/// It stands where the deployed service stands: the host's broker client builds the real requests
+/// and reads the real answers, so what the test proves is the host's side of that wire.
+#[derive(Debug, Default)]
+struct ScriptedService {
+    script: std::sync::Mutex<std::collections::VecDeque<(String, u16, serde_json::Value)>>,
+    sent: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+}
+
+impl ScriptedService {
+    fn answering(script: Vec<(&str, u16, serde_json::Value)>) -> Arc<Self> {
+        let service = Self::default();
+        for (path, status, body) in script {
+            service
+                .script
+                .lock()
+                .expect("the script")
+                .push_back((path.to_owned(), status, body));
+        }
+        Arc::new(service)
+    }
+
+    /// Each request's path and body, in the order they arrived.
+    fn sent(&self) -> Vec<(String, serde_json::Value)> {
+        self.sent.lock().expect("what was sent").clone()
+    }
+}
+
+impl ServiceHttp for ScriptedService {
+    fn post_json<'a>(
+        &'a self,
+        url: &'a str,
+        body: &'a [u8],
+        _headers: &'a [(&'a str, &'a str)],
+    ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        let path = url
+            .strip_prefix("https://reach.example")
+            .unwrap_or(url)
+            .to_owned();
+        let body = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+        self.sent
+            .lock()
+            .expect("what was sent")
+            .push((path.clone(), body));
+        // An answer out of order is a refusal the test then sees, rather than a panic inside the
+        // daemon's own task.
+        let answer = match self.script.lock().expect("the script").pop_front() {
+            Some((expected, status, body)) if expected == path => ServiceHttpAnswer {
+                status,
+                body: serde_json::to_vec(&body).expect("an answer"),
+            },
+            _ => ServiceHttpAnswer {
+                status: 500,
+                body: br#"{"ok":false,"error":{"code":"INTERNAL","message":"out of script"}}"#
+                    .to_vec(),
+            },
+        };
+        Box::pin(async move { Ok(answer) })
+    }
+}
+
+#[derive(Debug)]
+struct VoiceToken;
+
+impl AccountTokenSource for VoiceToken {
+    fn token(&self) -> kr_client::error::Result<AccountToken> {
+        AccountToken::new("a-voice-token")
+    }
+}
+
+fn quoted(version: &str, per_second: &str) -> serde_json::Value {
+    serde_json::json!({
+        "version": version,
+        "minorUnitsPerSecond": per_second,
+        "minimumSeconds": 15,
+        "currency": "usd"
+    })
+}
+
+/// KR-REQ-15.19 and 15.01, end to end over a paired device's own connection: the device reads the
+/// terms before any call exists, starts under the rate it was shown, is refused because the rate
+/// moved on, is shown the new rate, and starts again under that one. The service is scripted on
+/// its own wire; the host's broker client, the daemon and the device's connection are real.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_refused_for_a_changed_rate_reaches_the_device_with_the_new_rate() {
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner).await;
+    let (_device, session) = net_support::paired_device(
+        &host,
+        &owner,
+        &[ActionRight::SessionView, ActionRight::AgentPrompt],
+    )
+    .await;
+    let environment_id = host.environment_id;
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+
+    let disclosure = vec![
+        "Audio travels directly between this device and the provider, not through this service."
+            .to_owned(),
+        "This service's own channel to the provider still receives transcripts and copies of the \
+         audio."
+            .to_owned(),
+    ];
+    let running = serde_json::json!({
+        "callId": "call-7",
+        "attemptId": "attempt-7",
+        "providerSessionId": "sess_7",
+        "answerSdp": "v=0\r\n",
+        "model": "gpt-live-1",
+        "closesAt": "2026-09-23T13:30:00Z",
+        "reservationEndsAt": "2026-09-23T13:30:15Z",
+        "controlPath": "/api/voice/sessions/call-7/control",
+        "heartbeatSeconds": 20,
+        "sidebandReady": true,
+        "hold": {"reservationId": "hold-7", "reserved": "600", "ceiling": "1800",
+                 "deadline": "2026-09-23T13:30:15Z"},
+        "reasoningHold": null,
+        "rate": quoted("2026-10-b", "3"),
+        "latency": {"creationToAnswerMs": 300, "sidebandReadyMs": 100},
+        "replayed": false,
+        "disclosure": disclosure
+    });
+    let service = ScriptedService::answering(vec![
+        (
+            "/api/voice/metadata",
+            200,
+            serde_json::json!({"ok": true, "data": {
+                "enabled": true,
+                "model": "gpt-live-1",
+                "disclosure": disclosure,
+                "admissionNote": "The model received this context.",
+                "delegationNote": "Submit the delegation to the host over the device connection.",
+                "alternatives": ["The coding agent already running on the host."],
+                "rate": quoted("2026-09-a", "2"),
+                "maximumSessionSeconds": 1800,
+                "minimumRequestSeconds": 60,
+                "heartbeatSeconds": 20,
+                "contextBytes": 500
+            }}),
+        ),
+        (
+            "/api/voice/sessions",
+            409,
+            serde_json::json!({"ok": false, "error": {
+                "code": "CONFLICT",
+                "reason": "rate_changed",
+                "message": "The rate for managed voice changed after it was shown.",
+                "rate": quoted("2026-10-b", "3")
+            }}),
+        ),
+        (
+            "/api/voice/sessions",
+            200,
+            serde_json::json!({"ok": true, "data": running}),
+        ),
+        (
+            "/api/voice/sessions/call-7/close",
+            200,
+            serde_json::json!({"ok": true, "data": {
+                "callId": "call-7", "state": "closed", "usageSeconds": 12,
+                "usageProvisional": false
+            }}),
+        ),
+    ]);
+    let broker = ManagedVoiceBroker::new(
+        "https://reach.example",
+        Arc::clone(&service) as Arc<dyn ServiceHttp>,
+        Arc::new(VoiceToken),
+    )
+    .expect("a broker client");
+    host.controller()
+        .voice()
+        .attach_provider(Some(Arc::new(broker) as Arc<dyn ManagedVoiceService>));
+
+    let device_id = host
+        .controller()
+        .devices()
+        .devices()
+        .expect("the device directory answers")
+        .into_iter()
+        .find(|record| record.is_paired())
+        .expect("the paired device")
+        .device_id;
+    let _: kr_protocol::voice::VoiceGrantResult = remote_voice(
+        &session,
+        environment_id,
+        Method::VoiceGrant,
+        &VoiceGrantParams {
+            device_id,
+            session_ids: [session_id].into_iter().collect(),
+            actions: Nullable::null(),
+        },
+    )
+    .await
+    .expect("the voice grant is written")
+    .to_typed()
+    .expect("a voice grant result");
+
+    // What a call would be, read before one exists.
+    let prepared: VoicePrepareResult = session
+        .read(
+            Method::VoicePrepare,
+            &VoicePrepareParams {
+                session_ids: [session_id].into_iter().collect(),
+                selected: CanonicalSet::from_iter([]),
+            },
+        )
+        .await
+        .expect("the host answers what a call would be");
+    let terms = prepared.managed.0.expect("the service's terms");
+    assert_eq!(
+        terms.disclosure, disclosure,
+        "the service's words, verbatim"
+    );
+    assert_eq!(terms.rate.version, "2026-09-a");
+    assert_eq!(terms.rate.minor_units_per_second.get(), 2);
+    assert_eq!(prepared.session_ids, [session_id].into_iter().collect());
+    assert_eq!(host.controller().voice().coordinator().live_sessions(), 0);
+
+    // A start under the rate the person was shown, which the service has since changed.
+    let start = |version: &str| VoiceStartParams {
+        session_ids: [session_id].into_iter().collect(),
+        offer_sdp: "v=0\r\no=- 7 7 IN IP4 127.0.0.1\r\n".to_owned(),
+        duration_seconds: 600,
+        reasoning_budget_minor: Nullable::null(),
+        expected_rate_version: Nullable::some(version.to_owned()),
+    };
+    let refused: kr_protocol::voice::VoiceStartResult = remote_voice(
+        &session,
+        environment_id,
+        Method::VoiceStart,
+        &start(&terms.rate.version),
+    )
+    .await
+    .expect("the host answers")
+    .to_typed()
+    .expect("a start result");
+    let VoiceStartOutcome::RateChanged { rate, message } = refused.outcome else {
+        panic!(
+            "a changed rate reaches the device as one: {:?}",
+            refused.outcome
+        );
+    };
+    assert_eq!(rate.version, "2026-10-b");
+    assert_eq!(rate.minor_units_per_second.get(), 3);
+    assert!(message.contains("changed"), "{message}");
+    assert_eq!(
+        host.controller().voice().coordinator().live_sessions(),
+        0,
+        "a refused start leaves no voice session and no grant behind"
+    );
+
+    // The person accepts the new rate, and the start names it.
+    let started: kr_protocol::voice::VoiceStartResult = remote_voice(
+        &session,
+        environment_id,
+        Method::VoiceStart,
+        &start(&rate.version),
+    )
+    .await
+    .expect("the call is created")
+    .to_typed()
+    .expect("a start result");
+    let VoiceStartOutcome::Started { session: call } = started.outcome else {
+        panic!(
+            "the call runs under the accepted rate: {:?}",
+            started.outcome
+        );
+    };
+    assert_eq!(
+        call.disclosure, disclosure,
+        "the service's words for this call"
+    );
+
+    let stopped: kr_protocol::voice::VoiceStopResult = remote_voice(
+        &session,
+        environment_id,
+        Method::VoiceStop,
+        &VoiceStopParams {
+            voice_session_id: call.voice_session_id,
+        },
+    )
+    .await
+    .expect("the call stops")
+    .to_typed()
+    .expect("a stop result");
+    assert_eq!(stopped.revoked_grant_id, call.grant_id);
+
+    // What the host sent the service: an empty terms read, then each start naming the version the
+    // device named, then the close.
+    let sent = service.sent();
+    let paths: Vec<&str> = sent.iter().map(|(path, _)| path.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec![
+            "/api/voice/metadata",
+            "/api/voice/sessions",
+            "/api/voice/sessions",
+            "/api/voice/sessions/call-7/close",
+        ]
+    );
+    assert_eq!(sent[0].1, serde_json::json!({}));
+    assert_eq!(sent[1].1["expectedRateVersion"], "2026-09-a");
+    assert_eq!(sent[2].1["expectedRateVersion"], "2026-10-b");
     host.stop().await;
 }

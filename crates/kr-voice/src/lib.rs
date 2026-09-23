@@ -25,14 +25,14 @@
 //!
 //! **Where it sends it.** To the paired client that asked, and nowhere else. The host does not
 //! reach the managed broker with context: section 15 ¶9 routes selected context and host results
-//! from the paired client to the broker as bounded context requests, and the only broker call this
-//! crate makes is creating and ending the call itself.
+//! from the paired client to the broker as bounded context requests, and the only broker calls this
+//! crate makes are reading the terms it publishes, creating the call and ending it.
 //!
 //! **What the managed operator can see.** The trusted sideband receives transcripts and reflected
 //! audio, so the operator has technical access to the conversation even though media travels
-//! directly between the device and the provider, and it can see whatever this host selected.
-//! [`kr_protocol::voice::VOICE_DISCLOSURE`] is that statement, and a voice session carries it
-//! where the choice is made rather than in a policy page.
+//! directly between the device and the provider, and it can see whatever this host selected. The
+//! service states that in its own words, and this crate carries them unchanged to where the choice
+//! is made rather than to a policy page: before a call, with the call, and beside every selection.
 //!
 //! **What is never authority.** A transcript, a provider delegation identifier and a model
 //! statement that the user agreed to something are all content, and section 19 says content is

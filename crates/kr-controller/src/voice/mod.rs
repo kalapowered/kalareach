@@ -12,9 +12,9 @@
 //! | `VoiceAuthority` | The grant store this host already keeps, and the device record that holds the identity key a confirmation is checked against |
 //! | `ActionSubmitter` | The host's own dispatch, which validates a spoken proposal exactly as a typed one |
 //!
-//! Nothing here reaches the managed broker with content. The broker client is used to create and
-//! to end a call; selected context and host results go back to the paired client, which is what
-//! sends them.
+//! Nothing here reaches the managed broker with content. The broker client is used to read the terms
+//! the service publishes, and to create and to end a call; selected context and host results go
+//! back to the paired client, which is what sends them.
 
 mod authority;
 mod context;
@@ -159,6 +159,7 @@ impl VoiceModule {
                 | Method::VoiceGrant
                 | Method::VoiceDelegate
                 | Method::VoiceContext
+                | Method::VoicePrepare
         )
     }
 
@@ -201,7 +202,10 @@ impl VoiceModule {
         Ok(())
     }
 
-    /// Answers `voice.context`.
+    /// Answers one of the two voice reads.
+    ///
+    /// `voice.prepare` describes a call before one exists and creates nothing; `voice.context`
+    /// selects what a running call may be told. Both are this device's, under its own grants.
     pub async fn read_frame(
         &self,
         device_id: DeviceId,
@@ -209,13 +213,32 @@ impl VoiceModule {
         now_ms: u64,
     ) -> ControlFrame {
         let outcome = async {
-            let params: kr_protocol::voice::VoiceContextParams = parse(&request.params)?;
-            let result = self
-                .coordinator
-                .context(device_id, &params, now_ms)
-                .await
-                .map_err(voice_error)?;
-            value(&result)
+            match request.method.method() {
+                Some(Method::VoicePrepare) => {
+                    let params: kr_protocol::voice::VoicePrepareParams = parse(&request.params)?;
+                    value(
+                        &self
+                            .coordinator
+                            .prepare(device_id, &params, now_ms)
+                            .await
+                            .map_err(voice_error)?,
+                    )
+                }
+                Some(Method::VoiceContext) => {
+                    let params: kr_protocol::voice::VoiceContextParams = parse(&request.params)?;
+                    value(
+                        &self
+                            .coordinator
+                            .context(device_id, &params, now_ms)
+                            .await
+                            .map_err(voice_error)?,
+                    )
+                }
+                _ => Err(ControllerError::InvalidArgument(format!(
+                    "{} is not a voice read",
+                    request.method.as_str()
+                ))),
+            }
         }
         .await;
         frame(request.request_id, outcome)

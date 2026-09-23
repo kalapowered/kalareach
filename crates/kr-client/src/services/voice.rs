@@ -58,6 +58,13 @@ pub const VOICE_SCOPE: &str = "voice";
 /// Where brokered session creation answers.
 pub const VOICE_SESSIONS_PATH: &str = "/api/voice/sessions";
 
+/// Where the service answers what a call started now would be, before one exists.
+///
+/// The one voice route that creates nothing: no provider session, no reservation and no call
+/// record. A host reads it so a person is shown the model, the disclosure and the rate before they
+/// decide whether to speak at all.
+pub const VOICE_METADATA_PATH: &str = "/api/voice/metadata";
+
 /// Seconds between heartbeats on the control socket while a native call is active.
 pub const VOICE_HEARTBEAT_SECONDS: u32 = 20;
 
@@ -198,6 +205,12 @@ pub struct VoiceSessionRequest {
     pub reasoning_budget_minor: Option<u64>,
     /// The paired device asking, as the host knows it. Recorded, never authority.
     pub device_id: Option<String>,
+    /// The version of the rate the person was shown, as the metadata read answered it.
+    ///
+    /// The service starts a call only under the rate its request names, and answers a version that
+    /// is no longer current with the rate as it is now ([`VoiceStart::RateChanged`]). A request
+    /// that names none is refused here, before it is sent.
+    pub expected_rate_version: Option<String>,
 }
 
 impl fmt::Debug for VoiceSessionRequest {
@@ -208,6 +221,7 @@ impl fmt::Debug for VoiceSessionRequest {
             .debug_struct("VoiceSessionRequest")
             .field("host_id", &self.host_id)
             .field("duration_seconds", &self.duration_seconds)
+            .field("expected_rate_version", &self.expected_rate_version)
             .field("offer_sdp_bytes", &self.offer_sdp.len())
             .finish_non_exhaustive()
     }
@@ -220,6 +234,7 @@ struct CreationBody {
     offer_sdp: String,
     host_id: String,
     duration_seconds: u32,
+    expected_rate_version: String,
     /// Minor units are decimal strings on this service's wire, as every amount of money is.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_budget: Option<String>,
@@ -254,10 +269,24 @@ impl VoiceSessionRequest {
         {
             return Err(local("a device identifier is a short string"));
         }
+        // A start is accepted only under the rate it names. Sending one that names none would
+        // spend a request on a refusal, and choosing a version here on the person's behalf would
+        // accept terms they were never shown.
+        let Some(expected_rate_version) = self
+            .expected_rate_version
+            .clone()
+            .filter(|version| !version.is_empty())
+        else {
+            return Err(local(
+                "a managed call names the version of the rate the person was shown, as the \
+                 metadata read answered it",
+            ));
+        };
         Ok(CreationBody {
             offer_sdp: self.offer_sdp.clone(),
             host_id: self.host_id.clone(),
             duration_seconds: self.duration_seconds,
+            expected_rate_version,
             reasoning_budget: self.reasoning_budget_minor.map(|minor| minor.to_string()),
             device_id: self.device_id.clone(),
         })
@@ -294,6 +323,61 @@ pub struct VoiceRateQuote {
     pub minimum_seconds: u32,
     /// ISO 4217 code the amounts are in.
     pub currency: String,
+}
+
+impl VoiceRateQuote {
+    /// Minor units per second as a number, when the service wrote one this client can read.
+    ///
+    /// The service writes every amount as a decimal string of whole minor units. Anything else —
+    /// a sign, a fraction, an exponent, digits past what fits — is not a quote this client can
+    /// show a person, and a quote a person cannot be shown is one nobody accepted.
+    #[must_use]
+    pub fn amount_per_second(&self) -> Option<u64> {
+        let digits = self.minor_units_per_second.as_str();
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse().ok()
+    }
+
+    /// Returns true when every figure is one a person can be shown.
+    #[must_use]
+    pub fn readable(&self) -> bool {
+        !self.version.is_empty() && !self.currency.is_empty() && self.amount_per_second().is_some()
+    }
+}
+
+/// What the service answers about a call started now, before one exists.
+///
+/// Every value is the deployment's own configuration or a constant of its contract, and nothing in
+/// it is about the caller. The wordings are the deployment's own, and a host carries them to a
+/// person unchanged rather than keeping a second copy that could drift from them.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceMetadata {
+    /// Whether an operator has managed voice open. False is the circuit breaker: a call started
+    /// now would be refused, and [`Self::alternatives`] is what still works.
+    pub enabled: bool,
+    /// The model a call started now would be asked for.
+    pub model: String,
+    /// What the provider and the service can see.
+    pub disclosure: Vec<String>,
+    /// What an append acknowledgement does not establish.
+    pub admission_note: String,
+    /// What a provider delegation identifier is.
+    pub delegation_note: String,
+    /// Paths that cost no managed credit.
+    pub alternatives: Vec<String>,
+    /// The rate a call started now would be quoted under.
+    pub rate: VoiceRateQuote,
+    /// The longest call the deployment authorises, in seconds.
+    pub maximum_session_seconds: u32,
+    /// The shortest call a caller may ask for, in seconds.
+    pub minimum_request_seconds: u32,
+    /// Seconds between heartbeats on the control socket.
+    pub heartbeat_seconds: u32,
+    /// The largest context append the service carries, in UTF-8 bytes.
+    pub context_bytes: u32,
 }
 
 /// What the service recorded about how long starting the call took.
@@ -380,6 +464,11 @@ pub enum VoiceRefusalReason {
     ServiceCapacity,
     /// This account already has a managed call, and the offer is not that call's.
     SessionInProgress,
+    /// The rate the start would run under is not the version the request named.
+    ///
+    /// Nothing was recorded, held or charged. [`VoiceStart::RateChanged`] carries the quote as it
+    /// is now.
+    RateChanged,
     /// The provider refused the creation. Nothing was charged.
     ProviderRefused,
     /// The attempt was given back before it could start. Asking again starts a new one.
@@ -408,6 +497,7 @@ impl VoiceRefusalReason {
             Self::AccountAllowance => "account_allowance",
             Self::ServiceCapacity => "service_capacity",
             Self::SessionInProgress => "session_in_progress",
+            Self::RateChanged => "rate_changed",
             Self::ProviderRefused => "provider_refused",
             Self::AttemptReconciled => "attempt_reconciled",
             Self::CreationUnknown => "creation_unknown",
@@ -455,6 +545,19 @@ pub enum VoiceStart {
         /// What a person is told.
         message: String,
     },
+    /// The rate the request named is no longer the one the service would charge.
+    ///
+    /// Nothing was recorded, held or charged. `rate` is the quote as it is now: a caller shows it
+    /// to the person, and a request naming its version is that person's decision to make.
+    RateChanged {
+        /// The rate as the service quotes it now.
+        rate: VoiceRateQuote,
+        /// What a person is told.
+        message: String,
+        /// The running call whose own rate this is, when the same offer was presented again for
+        /// a call that already exists.
+        call_id: Option<String>,
+    },
     /// The service refused, and what still works.
     Refused(Box<VoiceRefusal>),
 }
@@ -465,18 +568,20 @@ impl VoiceStart {
     pub fn session(&self) -> Option<&VoiceSession> {
         match self {
             Self::Started(session) => Some(session),
-            Self::CreationUnknown { .. } | Self::Refused(_) => None,
+            Self::CreationUnknown { .. } | Self::RateChanged { .. } | Self::Refused(_) => None,
         }
     }
 
     /// Returns true when asking again with the same offer is safe.
     ///
     /// Only a refusal the service decided before it asked the provider. An unknown creation is
-    /// never one of them, which is the whole point of the state.
+    /// never one of them, which is the whole point of the state. Nor is a changed rate: the same
+    /// request is refused again, and one naming the new rate accepts terms, which only the person
+    /// shown them can do.
     #[must_use]
     pub fn may_ask_again(&self) -> bool {
         match self {
-            Self::Started(_) | Self::CreationUnknown { .. } => false,
+            Self::Started(_) | Self::CreationUnknown { .. } | Self::RateChanged { .. } => false,
             Self::Refused(refusal) => matches!(
                 refusal.reason,
                 VoiceRefusalReason::AttemptReconciled
@@ -684,7 +789,7 @@ pub enum VoiceControlEvent {
     ///
     /// **Admission is not execution.** It says the context reached the model, and nothing about a
     /// host action having run or audio having been played. Host action receipts are the authority
-    /// for that, and [`VOICE_ADMISSION_NOTE`] is the sentence that says so.
+    /// for that, and `note` is the service's own sentence saying so.
     ContextAdmitted {
         /// The request it answers.
         id: String,
@@ -736,10 +841,6 @@ pub enum VoiceControlEvent {
         frame_type: String,
     },
 }
-
-/// What a provider append acknowledgement does not establish.
-pub const VOICE_ADMISSION_NOTE: &str = "The model received this context. It is not evidence that a host action ran or that audio was \
-     played; host action receipts are the authority for that.";
 
 /// Reads one control-socket frame.
 ///
@@ -812,6 +913,17 @@ pub fn read_control_event(value: &serde_json::Value) -> Option<VoiceControlEvent
 /// The interface is deliberately this small, because it is the seam a BYOK backend, a local voice
 /// engine or another provider replaces. Nothing above it knows which one answered.
 pub trait ManagedVoiceService: Send + Sync + fmt::Debug {
+    /// What a call started now would be: the model, the disclosure, the rate and the limits.
+    ///
+    /// Reading it creates nothing and holds nothing. `None` is a provider that is not the managed
+    /// service: it publishes no managed terms, and a person is quoted no managed rate for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport or protocol error, or the service's refusal, and an answer whose rate
+    /// this client could not show a person.
+    fn metadata(&self) -> ServiceFuture<'_, Option<VoiceMetadata>>;
+
     /// Creates one managed call from the caller's own SDP offer.
     ///
     /// # Errors
@@ -1045,6 +1157,15 @@ impl ManagedVoiceBroker {
 }
 
 impl ManagedVoiceService for ManagedVoiceBroker {
+    fn metadata(&self) -> ServiceFuture<'_, Option<VoiceMetadata>> {
+        Box::pin(async move {
+            // An empty object. The service refuses any member, because a member it ignored would
+            // leave a caller believing it had asked for something.
+            let data = self.call(VOICE_METADATA_PATH, b"{}".to_vec()).await?;
+            read_metadata(data).map(Some)
+        })
+    }
+
     fn provider(&self) -> String {
         // The origin this client reaches, in one spelling. Two clients of the same service are the
         // same provider however each was configured, and a client of another service is not, so
@@ -1084,6 +1205,30 @@ impl ManagedVoiceService for ManagedVoiceBroker {
             })
         })
     }
+}
+
+/// Reads the service's terms, and refuses a rate this client could not show a person.
+///
+/// A start names the version of the rate a person was shown, so a quote that cannot be shown is
+/// one that could never be accepted: carrying it on would put a Start in front of somebody with
+/// nothing to agree to.
+fn read_metadata(data: serde_json::Value) -> Result<VoiceMetadata> {
+    let metadata: VoiceMetadata = serde_json::from_value(data).map_err(|error| {
+        unreadable(
+            200,
+            &format!(
+                "this client cannot read its terms: {}",
+                super::json_fault(&error)
+            ),
+        )
+    })?;
+    if !metadata.rate.readable() {
+        return Err(unreadable(
+            200,
+            "its terms quote a rate this client cannot show",
+        ));
+    }
+    Ok(metadata)
 }
 
 /// The `data` of a service envelope, or the refusal it carried.
@@ -1187,6 +1332,10 @@ pub fn read_start_answer(answer: &ServiceHttpAnswer) -> VoiceStart {
         .get("attemptId")
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
+    let call_id = error
+        .get("callId")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
 
     if reason == VoiceRefusalReason::CreationUnknown {
         // A state, not an error code. Nothing here retries, and the caller may not either.
@@ -1194,6 +1343,23 @@ pub fn read_start_answer(answer: &ServiceHttpAnswer) -> VoiceStart {
             attempt_id,
             message,
         };
+    }
+
+    if reason == VoiceRefusalReason::RateChanged {
+        // The quote as it is now, which is what a person is shown before they decide again.
+        // Without a readable one this stays an ordinary refusal: a rate nobody can be shown is
+        // not one anybody can accept.
+        if let Some(rate) = error
+            .get("rate")
+            .and_then(|value| serde_json::from_value::<VoiceRateQuote>(value.clone()).ok())
+            .filter(VoiceRateQuote::readable)
+        {
+            return VoiceStart::RateChanged {
+                rate,
+                message,
+                call_id,
+            };
+        }
     }
 
     VoiceStart::Refused(Box::new(VoiceRefusal {
@@ -1211,10 +1377,7 @@ pub fn read_start_answer(answer: &ServiceHttpAnswer) -> VoiceStart {
             })
             .unwrap_or_default(),
         attempt_id,
-        call_id: error
-            .get("callId")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
+        call_id,
     }))
 }
 
@@ -1577,11 +1740,12 @@ mod tests {
             duration_seconds: 300,
             reasoning_budget_minor: Some(500),
             device_id: Some("44444444-4444-4444-4444-444444444444".to_owned()),
+            expected_rate_version: Some("2026-09-a".to_owned()),
         };
         renders_only(
             &request,
             &format!(
-                r#"VoiceSessionRequest{{host_id:"33333333-3333-3333-3333-333333333333",duration_seconds:300,offer_sdp_bytes:{},..}}"#,
+                r#"VoiceSessionRequest{{host_id:"33333333-3333-3333-3333-333333333333",duration_seconds:300,expected_rate_version:Some("2026-09-a"),offer_sdp_bytes:{},..}}"#,
                 offer.len()
             ),
         );
@@ -1771,7 +1935,8 @@ mod tests {
         let value: serde_json::Value = serde_json::json!({
             "type": "context_admitted",
             "id": "request-1",
-            "note": VOICE_ADMISSION_NOTE,
+            "note": "The model received this context. It is not evidence that a host action ran \
+                     or that audio was played; host action receipts are the authority for that.",
         });
         let event = read_control_event(&value).expect("an event");
         let VoiceControlEvent::ContextAdmitted { note, .. } = event else {
@@ -1915,6 +2080,251 @@ mod tests {
         .expect("a token document");
         let bytes = stored.write().expect("bytes");
         assert_eq!(StoredAccountToken::read(&bytes).expect("read back"), stored);
+    }
+
+    /// A service that answers from a script and records what it was sent.
+    #[derive(Debug, Default)]
+    struct Scripted {
+        answers: std::sync::Mutex<std::collections::VecDeque<ServiceHttpAnswer>>,
+        sent: std::sync::Mutex<Vec<Sent>>,
+    }
+
+    /// One request as the service received it.
+    #[derive(Clone, Debug)]
+    struct Sent {
+        url: String,
+        body: serde_json::Value,
+        authorisation: Option<String>,
+    }
+
+    impl Scripted {
+        fn answering(answers: impl IntoIterator<Item = (u16, serde_json::Value)>) -> Arc<Self> {
+            let scripted = Self::default();
+            for (status, body) in answers {
+                scripted
+                    .answers
+                    .lock()
+                    .expect("the script")
+                    .push_back(ServiceHttpAnswer {
+                        status,
+                        body: serde_json::to_vec(&body).expect("an answer"),
+                    });
+            }
+            Arc::new(scripted)
+        }
+
+        fn sent(&self) -> Vec<Sent> {
+            self.sent.lock().expect("what was sent").clone()
+        }
+    }
+
+    impl ServiceHttp for Scripted {
+        fn post_json<'a>(
+            &'a self,
+            url: &'a str,
+            body: &'a [u8],
+            headers: &'a [(&'a str, &'a str)],
+        ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+            self.sent.lock().expect("what was sent").push(Sent {
+                url: url.to_owned(),
+                body: serde_json::from_slice(body).expect("a JSON body"),
+                authorisation: headers
+                    .iter()
+                    .find(|(name, _)| *name == "authorization")
+                    .map(|(_, value)| (*value).to_owned()),
+            });
+            let answer = self
+                .answers
+                .lock()
+                .expect("the script")
+                .pop_front()
+                .expect("the script has an answer for every request");
+            Box::pin(async move { Ok(answer) })
+        }
+    }
+
+    #[derive(Debug)]
+    struct Token;
+
+    impl AccountTokenSource for Token {
+        fn token(&self) -> Result<AccountToken> {
+            AccountToken::new("a-voice-token")
+        }
+    }
+
+    fn broker(service: &Arc<Scripted>) -> ManagedVoiceBroker {
+        ManagedVoiceBroker::new(
+            "https://reach.example",
+            Arc::clone(service) as Arc<dyn ServiceHttp>,
+            Arc::new(Token),
+        )
+        .expect("a broker client")
+    }
+
+    /// The answer `POST /api/voice/metadata` gives, in the spelling the deployed service writes.
+    fn published_terms() -> serde_json::Value {
+        serde_json::json!({
+            "ok": true,
+            "data": {
+                "enabled": true,
+                "model": "gpt-live-1",
+                "disclosure": ["Audio travels directly between this device and the provider."],
+                "admissionNote": "The model received this context.",
+                "delegationNote": "A provider delegation identifier is correlation data.",
+                "alternatives": ["The coding agent already running on the host."],
+                "rate": {
+                    "version": "2026-09-a",
+                    "minorUnitsPerSecond": "2",
+                    "minimumSeconds": 15,
+                    "currency": "usd"
+                },
+                "maximumSessionSeconds": 1800,
+                "minimumRequestSeconds": 60,
+                "heartbeatSeconds": 20,
+                "contextBytes": 500
+            }
+        })
+    }
+
+    fn start_request(version: Option<&str>) -> VoiceSessionRequest {
+        VoiceSessionRequest {
+            offer_sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n".to_owned(),
+            host_id: "33333333-3333-3333-3333-333333333333".to_owned(),
+            duration_seconds: 600,
+            reasoning_budget_minor: None,
+            device_id: None,
+            expected_rate_version: version.map(str::to_owned),
+        }
+    }
+
+    /// KR-REQ-15.19: the terms a person is shown come from the service's own read, asked with the
+    /// account token and an empty body, and carried in the service's words.
+    #[tokio::test]
+    async fn the_terms_a_person_is_shown_are_the_ones_the_service_publishes() {
+        let service = Scripted::answering([(200, published_terms())]);
+        let terms = broker(&service)
+            .metadata()
+            .await
+            .expect("the service answered")
+            .expect("the managed service publishes terms");
+        assert_eq!(terms.model, "gpt-live-1");
+        assert_eq!(terms.rate.version, "2026-09-a");
+        assert_eq!(terms.rate.amount_per_second(), Some(2));
+        assert_eq!(terms.maximum_session_seconds, 1800);
+        assert_eq!(
+            terms.disclosure,
+            vec!["Audio travels directly between this device and the provider.".to_owned()]
+        );
+
+        let sent = service.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].url, "https://reach.example/api/voice/metadata");
+        assert_eq!(sent[0].body, serde_json::json!({}));
+        assert_eq!(
+            sent[0].authorisation.as_deref(),
+            Some("Bearer a-voice-token")
+        );
+    }
+
+    /// A quote nobody can be shown is one nobody can accept, so it is refused rather than carried.
+    #[tokio::test]
+    async fn a_rate_this_client_cannot_show_is_refused() {
+        for amount in [
+            serde_json::json!(2),
+            serde_json::json!("-2"),
+            serde_json::json!("+2"),
+            serde_json::json!("2.5"),
+            serde_json::json!(""),
+            serde_json::json!("99999999999999999999999"),
+        ] {
+            let mut terms = published_terms();
+            terms["data"]["rate"]["minorUnitsPerSecond"] = amount.clone();
+            let service = Scripted::answering([(200, terms)]);
+            assert!(
+                broker(&service).metadata().await.is_err(),
+                "{amount} was read as an amount"
+            );
+        }
+        let mut unversioned = published_terms();
+        unversioned["data"]["rate"]["version"] = serde_json::json!("");
+        let service = Scripted::answering([(200, unversioned)]);
+        assert!(broker(&service).metadata().await.is_err());
+    }
+
+    /// A start names the rate version the person was shown, and a start naming none is refused
+    /// here without a request being sent.
+    #[tokio::test]
+    async fn a_start_names_the_rate_the_person_was_shown() {
+        let service = Scripted::answering([(
+            409,
+            serde_json::json!({"ok": false, "error": {
+                "code": "CONFLICT", "reason": "rate_changed",
+                "message": "The rate changed after it was shown."
+            }}),
+        )]);
+        let client = broker(&service);
+        assert!(client.start(&start_request(None)).await.is_err());
+        assert!(client.start(&start_request(Some(""))).await.is_err());
+        assert!(
+            service.sent().is_empty(),
+            "a start that names no rate is never sent"
+        );
+
+        let _ = client
+            .start(&start_request(Some("2026-09-a")))
+            .await
+            .expect("an answer");
+        let sent = service.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].url, "https://reach.example/api/voice/sessions");
+        assert_eq!(sent[0].body["expectedRateVersion"], "2026-09-a");
+    }
+
+    /// A refusal for a changed rate is a typed state carrying the rate as it is now, and it is
+    /// never something this client asks again about by itself.
+    #[test]
+    fn a_changed_rate_carries_the_rate_as_it_is_now() {
+        let answer = ServiceHttpAnswer {
+            status: 409,
+            body: br#"{"ok":false,"error":{"code":"CONFLICT","reason":"rate_changed",
+                "message":"The rate changed after it was shown.",
+                "rate":{"version":"2026-10-b","minorUnitsPerSecond":"3","minimumSeconds":15,
+                        "currency":"usd"}}}"#
+                .to_vec(),
+        };
+        let start = read_start_answer(&answer);
+        let VoiceStart::RateChanged {
+            rate,
+            message,
+            call_id,
+        } = &start
+        else {
+            panic!("a changed rate is its own state: {start:?}");
+        };
+        assert_eq!(rate.version, "2026-10-b");
+        assert_eq!(rate.amount_per_second(), Some(3));
+        assert_eq!(message, "The rate changed after it was shown.");
+        assert_eq!(call_id, &None);
+        assert!(start.session().is_none());
+        assert!(
+            !start.may_ask_again(),
+            "accepting a new rate is the person's decision"
+        );
+
+        // Without a rate that can be shown, it is an ordinary refusal: nothing here can offer a
+        // person terms it cannot state.
+        let answer = ServiceHttpAnswer {
+            status: 409,
+            body: br#"{"ok":false,"error":{"code":"CONFLICT","reason":"rate_changed",
+                "message":"The rate changed after it was shown.",
+                "rate":{"version":"2026-10-b","minorUnitsPerSecond":3,"minimumSeconds":15,
+                        "currency":"usd"}}}"#
+                .to_vec(),
+        };
+        let VoiceStart::Refused(refusal) = read_start_answer(&answer) else {
+            panic!("a refusal");
+        };
+        assert_eq!(refusal.reason, VoiceRefusalReason::RateChanged);
     }
 
     #[test]

@@ -669,10 +669,11 @@ impl RemoteConnection {
                     .read_frame(request, Some(self.device.grant.grant_id))
                     .await
             }
-            // The voice coordinator's own read. It runs on this host rather than on a worker: the
-            // selection is built from what this daemon holds about the session, filtered under
-            // this device's own grant, and what comes back goes to this device and nowhere else.
-            Method::VoiceContext => {
+            // The voice coordinator's own reads. They run on this host rather than on a worker:
+            // a selection is built from what this daemon holds about the session, filtered under
+            // this device's own grant, a preparation reads this device's grants and the managed
+            // service's published terms, and what comes back goes to this device and nowhere else.
+            Method::VoiceContext | Method::VoicePrepare => {
                 self.controller
                     .voice()
                     .read_frame(

@@ -1961,8 +1961,10 @@ export interface KalaReachProtocol {
   voice_grant_result?: VoiceGrantResult
   voice_grant_statement?: VoiceGrantStatement1
   voice_instructions?: VoiceInstructions
+  voice_managed_terms?: VoiceManagedTerms
   voice_prepare_params?: VoicePrepareParams
   voice_prepare_result?: VoicePrepareResult
+  voice_rate?: VoiceRate1
   voice_session_descriptor?: VoiceSessionDescriptor
   voice_start_params?: VoiceStartParams
   voice_start_result?: VoiceStartResult
@@ -22529,7 +22531,8 @@ export interface VoiceContextParams {
  */
 export interface VoiceContextResult {
   /**
-   * What the person is told before a call about what is sent and who can read it.
+   * What the provider and the managed service can see of what is sent, in the words the
+   * service gave this call when it started.
    */
   disclosure: string[]
   provenance: VoiceContextProvenance
@@ -23021,6 +23024,81 @@ export interface VoiceInstructions {
   text: string
 }
 /**
+ * What the managed service publishes about a call started now, carried in its own words.
+ *
+ * The service answers this without creating anything, and every value in it is the deployment's
+ * own configuration or a constant of its contract. The wordings are carried verbatim: the
+ * disclosure a person reads is the list the deployment publishes, not a second list this host
+ * keeps beside it.
+ */
+export interface VoiceManagedTerms {
+  /**
+   * What an append acknowledgement establishes, and what it does not (section 15 ¶10).
+   */
+  admission_note: string
+  /**
+   * Paths that cost no managed credit.
+   */
+  alternatives: string[]
+  /**
+   * The largest context append the service carries, in UTF-8 bytes.
+   */
+  context_bytes: number
+  /**
+   * What a provider delegation identifier is, and what it is not.
+   */
+  delegation_note: string
+  /**
+   * What the provider and the managed service can see, stated where the choice is made.
+   */
+  disclosure: string[]
+  /**
+   * Whether an operator has managed voice open.
+   *
+   * False is the operator's circuit breaker: a call started now would be refused, and
+   * [`Self::alternatives`] is what still works.
+   */
+  enabled: boolean
+  /**
+   * Seconds between heartbeats on the control socket.
+   */
+  heartbeat_seconds: number
+  /**
+   * The longest call the service authorises, in seconds.
+   */
+  maximum_session_seconds: number
+  /**
+   * The shortest call a start may ask for, in seconds.
+   */
+  minimum_request_seconds: number
+  /**
+   * The model a call started now would be asked for.
+   */
+  model: string
+  rate: VoiceRate
+}
+/**
+ * The rate a call started now would be quoted under.
+ */
+export interface VoiceRate {
+  /**
+   * The ISO 4217 code the amounts are in, as the service wrote it.
+   */
+  currency: string
+  /**
+   * The shortest duration the provider sells, charged whatever the call did, in seconds.
+   */
+  minimum_seconds: number
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  minor_units_per_second: string
+  /**
+   * The version of the rate table the quote is made under. Opaque, and compared exactly.
+   */
+  version: string
+}
+/**
  * Parameters of `voice.prepare`.
  */
 export interface VoicePrepareParams {
@@ -23043,36 +23121,40 @@ export interface VoicePrepareParams {
  * descriptor carries this. So the answer a person reads before deciding has to come from
  * somewhere that creates nothing, and this is it: no provider session, no reservation, no grant
  * and no context leaves the host for this read.
+ *
+ * Two sources, kept apart. The scope is this host's: its grants, its selection and its cap. What
+ * the managed service would do with a call is the service's, read from it for this answer and
+ * carried in [`Self::managed`] in its own words, so a person is shown the model, the disclosure,
+ * the rate and the limits the deployment publishes rather than a copy this host keeps.
  */
 export interface VoicePrepareResult {
-  /**
-   * What an append acknowledgement establishes, and what it does not (section 15 ¶10).
-   */
-  admission_note: string
   /**
    * The origin of the managed service a call would be brokered through.
    */
   broker_origin: string
   /**
-   * What the provider and the managed operator can see, stated where the choice is made.
-   */
-  disclosure: string[]
-  /**
    * Classes the default context leaves out unless the person selects them (section 15 ¶12).
    */
   excluded: VoiceContextClass[]
   /**
+   * What the managed service answered about a call started now.
+   *
+   * Null for a provider that is not the managed service, and when this host could not read the
+   * service's terms; [`Self::managed_unavailable`] then says which. A managed call is not
+   * offered without these terms, because a start names the rate version a person was shown
+   * and a person shown no rate has accepted none.
+   */
+  managed: VoiceManagedTerms | null
+  /**
+   * Why a managed call cannot start from here, in words a person can act on.
+   *
+   * Present exactly when [`Self::managed`] is null.
+   */
+  managed_unavailable: string | null
+  /**
    * How many semantic messages the default context carries.
    */
   message_count: number
-  /**
-   * The model a call would be asked for, where this host is configured with one.
-   *
-   * Null when the host does not state one: the model a call actually runs on is the one the
-   * broker's answer names, and a client that printed a guess here would be showing a person a
-   * provider they had not been given.
-   */
-  model: string | null
   /**
    * Classes from the request that would actually be carried.
    *
@@ -23114,6 +23196,32 @@ export interface VoiceGrantStatement2 {
   unlocked_screen_actions: VoiceAction[]
 }
 /**
+ * The managed rate, as the service quoted it.
+ *
+ * A start names [`Self::version`], and the service compares it with the rate it would charge: a
+ * version that is no longer current is refused as [`VoiceStartOutcome::RateChanged`] with the
+ * rate as it is now, before anything is held or charged. So a call runs under the terms the
+ * person was shown.
+ */
+export interface VoiceRate1 {
+  /**
+   * The ISO 4217 code the amounts are in, as the service wrote it.
+   */
+  currency: string
+  /**
+   * The shortest duration the provider sells, charged whatever the call did, in seconds.
+   */
+  minimum_seconds: number
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  minor_units_per_second: string
+  /**
+   * The version of the rate table the quote is made under. Opaque, and compared exactly.
+   */
+  version: string
+}
+/**
  * A running voice session, as the paired device needs to see it.
  */
 export interface VoiceSessionDescriptor {
@@ -23138,7 +23246,8 @@ export interface VoiceSessionDescriptor {
    */
   control_path: string
   /**
-   * What the provider and the managed operator can see, stated where the choice is made.
+   * What the provider and the managed service can see, in the words the service's answer to
+   * this start gave.
    */
   disclosure: string[]
   /**
@@ -23196,6 +23305,15 @@ export interface VoiceStartParams {
    */
   duration_seconds: number
   /**
+   * The version of the managed rate the person was shown, as `voice.prepare` answered it.
+   *
+   * A managed call names it, and the host passes it on unchanged. A version that is no longer
+   * current is refused as [`VoiceStartOutcome::RateChanged`] with the rate as it is now, so a
+   * call never runs under terms the person was not shown. A provider that is not the managed
+   * service quotes no rate, and a start through one names none.
+   */
+  expected_rate_version: string | null
+  /**
    * The caller's own SDP offer, as its WebRTC stack produced it.
    *
    * The host forwards it to the managed broker unchanged and terminates no media: audio flows
@@ -23252,6 +23370,15 @@ export interface VoiceStartResult {
           reason: string
         }
       }
+    | {
+        rate_changed: {
+          /**
+           * What a person is told, in the service's words.
+           */
+          message: string
+          rate: VoiceRate2
+        }
+      }
 }
 /**
  * Everything the device needs to use it.
@@ -23278,7 +23405,8 @@ export interface VoiceSessionDescriptor1 {
    */
   control_path: string
   /**
-   * What the provider and the managed operator can see, stated where the choice is made.
+   * What the provider and the managed service can see, in the words the service's answer to
+   * this start gave.
    */
   disclosure: string[]
   /**
@@ -23306,6 +23434,27 @@ export interface VoiceSessionDescriptor1 {
    * The host's identity for this voice session.
    */
   voice_session_id: string
+}
+/**
+ * The rate as the service quotes it now.
+ */
+export interface VoiceRate2 {
+  /**
+   * The ISO 4217 code the amounts are in, as the service wrote it.
+   */
+  currency: string
+  /**
+   * The shortest duration the provider sells, charged whatever the call did, in seconds.
+   */
+  minimum_seconds: number
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  minor_units_per_second: string
+  /**
+   * The version of the rate table the quote is made under. Opaque, and compared exactly.
+   */
+  version: string
 }
 /**
  * Parameters of `voice.stop`.
