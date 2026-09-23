@@ -109,7 +109,9 @@ facts, and writing down an address is not authority over session content.
 
 The host delivers to webhooks: a message is the composed document, sent as JSON to the address the
 owner configured, and a destination that deduplicates by a delivery identifier receives it under
-the header that destination names. A Slack, Discord, Telegram or email destination is refused when
+the header that destination names. A webhook's status code never counts as "already delivered": a
+2xx is delivered, a request for later is nothing taken, and any other refusal, a 409 included, is a
+refusal. A Slack, Discord, Telegram or email destination is refused when
 it is configured, with the reason. Each needs a credential from the host's secret store - a Slack or
 Discord webhook address is itself a bearer secret, Telegram sends through a bot token and email
 through a mail account - and a destination's address is never a credential.

@@ -3793,8 +3793,10 @@ fn a_webhook_answer_is_read_as_what_it_says() {
         fn(&ExternalOutcome) -> bool,
     );
     let cases: Vec<Case<'_>> = vec![
+        // A conflict is the receiver's own answer about its own records, not a confirmation that
+        // it already had this delivery, even from a destination that deduplicates by identifier.
         (&deduplicating, Ok((409, Vec::new())), |outcome| {
-            *outcome == ExternalOutcome::Duplicate
+            matches!(outcome, ExternalOutcome::Refused { .. })
         }),
         (&plain, Ok((409, Vec::new())), |outcome| {
             matches!(outcome, ExternalOutcome::Refused { .. })

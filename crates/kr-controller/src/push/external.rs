@@ -11,13 +11,18 @@
 //! | Answer | Outcome |
 //! | --- | --- |
 //! | A 2xx | Delivered |
-//! | A 409 from a destination that deduplicates by identifier | It already had this delivery |
 //! | 408, 425 or 429 | Nothing was taken: the destination asked for later |
-//! | Any other 4xx | Refused, and a retry cannot change that |
+//! | Any other 4xx, a 409 included | Refused, and a retry cannot change that |
 //! | A 5xx, an unreadable answer, a failure after the request left | Nobody knows |
 //! | A failure before a byte was written | Nothing was sent |
 //!
-//! What a retry is allowed to do with each is section 25's rule and not this adapter's:
+//! No status code says "I already had this". A webhook that deduplicates by the identifier this
+//! host sends says what it does with a repeat, not how it answers one, and a 409 is as likely to be
+//! a conflict in the receiver's own records on the first delivery; reading it as a duplicate would
+//! record a delivery nobody confirmed. So a webhook is never reported as a duplicate from its
+//! status code.
+//!
+//! What a retry is allowed to do with each answer is section 25's rule and not this adapter's:
 //! [`kr_delivery::external::decide_external`] retries only a destination that deduplicates by the
 //! identifier, and marks the duplicate-delivery uncertainty otherwise.
 //!
@@ -128,7 +133,6 @@ impl ExternalSender for WebhookSender {
         }
         match answer.status {
             200..=299 => ExternalOutcome::Delivered,
-            409 if destination.idempotency.supports_retry() => ExternalOutcome::Duplicate,
             408 | 425 | 429 => ExternalOutcome::NotDispatched {
                 detail: format!(
                     "the destination asked for later ({}) without taking the message",
