@@ -348,9 +348,10 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
 /// attachment would learn only that its connection had stopped.
 ///
 /// The endpoint goes on answering while this waits, so a client that asks how the session ended is
-/// told by the worker that ended it. Nothing it accepts can add to what is owed: a closed session
-/// admits no attachment, and every one it had was counted when it closed. The accept loop stops
-/// once nothing is owed, and is awaited, so no connection is taken after that.
+/// told by the worker that ended it. A connection it accepts cannot attach to a closed session, and
+/// every attachment the session had was counted when it closed; the only notice still handed out
+/// is one such an attachment asks for again by subscribing, and the wait counts that too. The
+/// accept loop stops once nothing is owed, and is awaited, so no connection is taken after that.
 async fn finish(
     runtime: &Arc<kr_worker::runtime::SessionRuntime>,
     serving: tokio::task::JoinHandle<kr_worker::Result<()>>,
