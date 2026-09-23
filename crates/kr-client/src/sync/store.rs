@@ -208,16 +208,19 @@ pub enum RequestState {
         /// What the service called the copy it kept of the refused write, when it kept one.
         retained: Nullable<SyncConflictId>,
     },
-    /// The service applied the write into a history the object's own record does not name.
+    /// The service applied the write into a history this device's records do not follow.
     ///
-    /// One write sequence names one write for the life of a collection, so two answers claiming one
-    /// place in the order come from two histories and the object's record can name only one of
-    /// them. This write left this device all the same, and this record is what accounts for it.
+    /// One write sequence names one write for the life of a collection, and a write takes the next
+    /// place after the one it replaced. So an answer at the place the write replaced, or behind it,
+    /// is not a later state of the history the request was made against, and two answers claiming
+    /// one place in the order come from two histories of which the object's record can name only
+    /// one. This write left this device all the same, and this record is what accounts for it; it is
+    /// never recorded as applied.
     ///
-    /// It is written once, when the settlement finds the object's record already given to another
-    /// history, and nothing reclassifies it afterwards: a later publication of the object moves
-    /// that record on, and an account that was re-decided against it would be dropped for looking
-    /// like ordinary older news.
+    /// It is written once, when the settlement finds the answer behind what the request replaced
+    /// or the object's record already given to another history, and nothing reclassifies it
+    /// afterwards: a later publication of the object moves that record on, and an account that was
+    /// re-decided against it would be dropped for looking like ordinary older news.
     Diverged {
         /// Where the service put this write, in the order of the history that took it.
         position: SyncPosition,
@@ -429,17 +432,25 @@ pub enum Outcome {
 pub struct Settled {
     /// Whether the answer was applied under the generation in force.
     pub settlement: Settlement,
-    /// The place this device's own record already gave to another write, when it had given it away.
+    /// Where this device's own records put the object, when the answer does not follow from it.
     ///
-    /// One write sequence names one write for the life of a collection, so two answers claiming one
-    /// place come from two histories. Two of this device's records can find that, and the caller is
-    /// owed it whichever did: the note beside the object, and the object's publication record. They
-    /// are not the same comparison, because a fetch moves the note while a publication is still
-    /// out and a fenced generation writes no note at all.
+    /// One write sequence names one write for the life of a collection, and a write takes the next
+    /// place after the one it replaced, so an answer this device's records cannot follow comes from
+    /// another history. Three of those records can find that, and the caller is owed it whichever
+    /// did. The request's own record names the place the write replaced, and an answer at that place
+    /// or behind it did not advance the object: the same write sequence is two histories claiming
+    /// one place, and a smaller one is a service that went back. The note beside the object and the
+    /// object's publication record each name a place another write already holds, and an answer
+    /// claiming that place under another name is two histories as well. The note and the
+    /// publication record are not the same comparison, because a fetch moves the note while a
+    /// publication is still out and a fenced generation writes no note at all.
     ///
-    /// Nothing where neither found one, including where there was nothing to compare: a refusal
+    /// Which of the two it is follows from the two positions: a smaller write sequence in the
+    /// answer than here is a service that went back, and the same one is a fork.
+    ///
+    /// Nothing where none found one, including where there was nothing to compare: a refusal
     /// replaced nothing, and a request something else had already settled has nothing left.
-    pub forked: Option<SyncPosition>,
+    pub diverged: Option<SyncPosition>,
 }
 
 /// What applying one fetch's answer did.
@@ -622,9 +633,10 @@ pub enum SyncError {
     /// The service holds an earlier write of the object than this device's note names.
     ///
     /// A service that was reset or replaced leaves one, and so does one restored from a backup.
-    /// Write sequences only ever go forward, so a smaller one is provable rather than guessed at.
-    /// The publication is refused and there is nothing to fetch; forgetting the checkpoint is the
-    /// explicit recovery, and nothing does it automatically.
+    /// Write sequences only ever go forward, so a smaller one is provable rather than guessed at,
+    /// whether a fetch shows it or the answer to one of this device's own writes puts the write
+    /// behind the place it replaced. The publication is refused and there is nothing to fetch;
+    /// forgetting the checkpoint is the explicit recovery, and nothing does it automatically.
     #[error(
         "object {object_id} reached write {expected} on the service, which now holds write {found}; forget its checkpoint to start again"
     )]
@@ -654,7 +666,8 @@ pub enum SyncError {
     /// The service holds a different write of the object under the same place in its order.
     ///
     /// Two devices cannot produce this: one write sequence names one write for the life of a
-    /// collection. A service whose history forked can, and so can a collection rebuilt from
+    /// collection, and a write takes the next place after the one it replaced, so an answer that
+    /// puts one of this device's writes at the very place that write replaced is this case too. A service whose history forked can, and so can a collection rebuilt from
     /// somewhere else, and neither is something this device may write a note from. The recovery is
     /// the same as for a service that went back: forget the checkpoint and start the object again.
     #[error(
@@ -1478,45 +1491,25 @@ impl SyncStore {
             let privacy = self.read_privacy()?;
             let in_force = privacy.generation.get() == held.produced_under.get();
 
-            let (settled, forked) = match outcome {
+            let (settled, diverged) = match outcome {
                 Outcome::Accepted { position } => {
                     // An accepted write of this object was produced by a write of it, so it names
                     // one. A position that names none is the removal of the object, and a place in
                     // the order counts from one; neither is somewhere a write this device sent can
                     // have landed, and an answer this device cannot read is one it declines.
                     a_write_landed_at(held.object_id, position)?;
-                    // The note first, because it is the one thing here that is not an account. It
-                    // is production state a fenced generation has already had removed, so the
-                    // generation rule gates it; a stop between the two leaves the note ahead of a
-                    // request that is still counted, and the next reconciliation writes it again.
-                    let note = if in_force {
-                        Some(self.write_checkpoint(
-                            held.object_id,
-                            SyncCheckpoint {
-                                position,
-                                published_revision: Nullable::some(held.revision),
-                            },
-                        )?)
+                    // A write takes the next place after the one it replaced, so an answer at that
+                    // place or behind it is not a later state of the history this request was
+                    // made against: a smaller write sequence is a service that went back, and the
+                    // same one is two histories claiming one place. It is recorded as that and
+                    // never as applied. The request's own record is the account of what left, and
+                    // nothing else is written from it: no note and no publication record, because
+                    // both would describe a history this device cannot follow.
+                    if let Some(replaced) = not_past(held.expected.as_ref().copied(), position) {
+                        (RequestState::Diverged { position }, Some(replaced))
                     } else {
-                        None
-                    };
-                    // Whether this write went into a history the object's record already gives to
-                    // another write is decided **here**, in the same hold and written into the same
-                    // replacement. Deciding it after the terminal state was durable left a window
-                    // where a stop, and then a later publication of the object, turned the fork
-                    // into ordinary older news and dropped the account of what left.
-                    //
-                    // Both of this device's records are asked, because they answer at different
-                    // times: a fetch can move the note past a publication that is still out, so the
-                    // note reads this answer as ordinary older news while the publication record
-                    // still holds the place another write took.
-                    let publication = self.publication_standing(&held, position)?;
-                    let state = if matches!(publication, Standing::Forked { .. }) {
-                        RequestState::Diverged { position }
-                    } else {
-                        RequestState::Applied { position }
-                    };
-                    (state, forked_at([note, Some(publication)]))
+                        self.accepted_at(&held, position, in_force)?
+                    }
                 }
                 Outcome::Refused { retained } => (
                     RequestState::Refused {
@@ -1542,11 +1535,58 @@ impl SyncStore {
                         current: privacy.generation.get(),
                     }
                 },
-                forked,
+                diverged,
             })
         })();
         drop(guard);
         settled
+    }
+
+    /// Decides what one accepted write that follows the place it replaced becomes, and moves the
+    /// note when the generation that admitted it is still in force.
+    ///
+    /// Returns the terminal state and the place this device's records already give to another
+    /// write, when either of them does.
+    ///
+    /// The caller holds the lock.
+    fn accepted_at(
+        &self,
+        held: &RequestRecord,
+        position: SyncPosition,
+        in_force: bool,
+    ) -> Result<(RequestState, Option<SyncPosition>)> {
+        // The note first, because it is the one thing here that is not an account. It
+        // is production state a fenced generation has already had removed, so the
+        // generation rule gates it; a stop between the two leaves the note ahead of a
+        // request that is still counted, and the next reconciliation writes it again.
+        let note = if in_force {
+            Some(self.write_checkpoint(
+                held.object_id,
+                SyncCheckpoint {
+                    position,
+                    published_revision: Nullable::some(held.revision),
+                },
+            )?)
+        } else {
+            None
+        };
+        // Whether this write went into a history the object's record already gives to
+        // another write is decided **here**, in the same hold and written into the same
+        // replacement. Deciding it after the terminal state was durable left a window
+        // where a stop, and then a later publication of the object, turned the fork
+        // into ordinary older news and dropped the account of what left.
+        //
+        // Both of this device's records are asked, because they answer at different
+        // times: a fetch can move the note past a publication that is still out, so the
+        // note reads this answer as ordinary older news while the publication record
+        // still holds the place another write took.
+        let publication = self.publication_standing(held, position)?;
+        let state = if matches!(publication, Standing::Forked { .. }) {
+            RequestState::Diverged { position }
+        } else {
+            RequestState::Applied { position }
+        };
+        Ok((state, forked_at([note, Some(publication)])))
     }
 
     /// Finishes one settled request, writing what its answer still owes the store.
@@ -1650,7 +1690,7 @@ impl SyncStore {
                     current: privacy.generation.get(),
                 }
             },
-            forked: None,
+            diverged: None,
         })
     }
 
@@ -2488,6 +2528,19 @@ fn a_write_landed_at(object_id: SyncObjectId, position: SyncPosition) -> Result<
         });
     }
     Ok(())
+}
+
+/// Returns the place a write replaced, when the answer says the write landed at it or behind it.
+///
+/// A write takes the next place after the one it replaced, so an accepted answer has to be past
+/// it. The same write sequence is two histories claiming one place, and a smaller one is a
+/// service that went back; neither is the write this device sent advancing the object. A write
+/// that replaced nothing can land anywhere in the order, so there is nothing to hold it to.
+///
+/// It is a rule about a write's own answer and nothing else. An answer to a read may name exactly
+/// the place this device already holds, which is the same write said again.
+fn not_past(replaced: Option<SyncPosition>, landed: SyncPosition) -> Option<SyncPosition> {
+    replaced.filter(|replaced| landed.write_sequence <= replaced.write_sequence)
 }
 
 fn storage(path: &Path, source: std::io::Error) -> SyncError {

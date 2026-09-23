@@ -1982,6 +1982,122 @@ async fn a_service_that_has_gone_back_behind_the_note_says_so() {
     ));
 }
 
+#[tokio::test]
+async fn an_accepted_write_answered_at_or_behind_the_place_it_replaced_is_never_applied() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let collection = sync_collection(SyncObjectKind::Settings, object_id);
+    let mut mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+
+    // The note names write five, which is where the service holds the object. A write takes the
+    // next place after the one it replaced, so a write sent against write five can only have landed
+    // at write six or later, whatever the note says by the time the answer arrives.
+    client
+        .store()
+        .record_checkpoint(
+            object_id,
+            SyncCheckpoint {
+                position: at(5),
+                published_revision: Nullable::null(),
+            },
+        )
+        .expect("a note");
+    let expected_diverged = |client: &SyncClient, found: SyncPosition| {
+        let left = client.store().what_left().expect("what left");
+        assert!(
+            left.requests
+                .items
+                .iter()
+                .any(|record| record.state == RequestState::Diverged { position: found }),
+            "the request's own record is the account of what left under {found}"
+        );
+        assert_eq!(
+            client
+                .store()
+                .checkpoint(object_id)
+                .expect("a note")
+                .expect("one stands")
+                .position,
+            at(5),
+            "nothing writes a note from an answer that does not follow it"
+        );
+        assert!(
+            left.publications.is_empty(),
+            "no publication record claims a write that did not advance the object"
+        );
+    };
+
+    // An answer behind the place the write replaced is a service that went back.
+    service
+        .hold(&collection, at(5), b"what the service holds".to_vec())
+        .await;
+    service.applies_the_next_write_at(at(3)).await;
+    let refused = client
+        .publish(object_id, TimestampMs::new(NOW + 1))
+        .await
+        .expect_err("write three is behind the write five this replaced");
+    assert!(
+        matches!(
+            refused,
+            SyncError::StaleCheckpoint {
+                expected: 5,
+                found: 3,
+                ..
+            }
+        ),
+        "{refused}"
+    );
+    expected_diverged(&client, at(3));
+
+    // An answer at the very place the write replaced is two histories claiming one place: a write
+    // never takes the place of the write it replaced.
+    mine.revision = fresh_revision().expect("a revision");
+    client.store().put_object(&mine).expect("stored");
+    service
+        .hold(&collection, at(5), b"what the service holds".to_vec())
+        .await;
+    service.applies_the_next_write_at(at(5)).await;
+    let refused = client
+        .publish(object_id, TimestampMs::new(NOW + 2))
+        .await
+        .expect_err("write five is the place this write replaced");
+    assert!(
+        matches!(refused, SyncError::ForkedHistory { .. }),
+        "{refused}"
+    );
+    expected_diverged(&client, at(5));
+
+    // A reconciliation that learns of such a write from its receipt settles it the same way: the
+    // barrier releases and the account stays, and nothing is recorded as applied.
+    mine.revision = fresh_revision().expect("a revision");
+    client.store().put_object(&mine).expect("stored");
+    service
+        .hold(&collection, at(5), b"what the service holds".to_vec())
+        .await;
+    service.applies_the_next_write_at(at(4)).await;
+    service.lose_the_next_answer().await;
+    client
+        .publish(object_id, TimestampMs::new(NOW + 3))
+        .await
+        .expect_err("the answer never came back");
+    let reconciled = client
+        .reconcile_unsettled(TimestampMs::new(NOW + 4))
+        .await
+        .expect("reconciled");
+    assert_eq!(reconciled.settled, 1);
+    assert_eq!(reconciled.diverged, 1, "counted rather than refused");
+    assert_eq!(reconciled.unsettled, 0);
+    expected_diverged(&client, at(4));
+    assert_eq!(client.outstanding().expect("a count"), 0);
+}
+
 // ---------------------------------------------------------------------------
 // KR-REQ-18.05: encrypted settings sync, named beside the rest of the feature
 // ---------------------------------------------------------------------------
@@ -2654,7 +2770,7 @@ async fn a_lost_answer_to_a_write_the_service_applied_is_settled_by_asking_about
         reconciled,
         Reconciled {
             settled: 1,
-            forked: 0,
+            diverged: 0,
             fenced: 0,
             accounts_kept: 0,
             unresolved: 0,
@@ -2894,7 +3010,7 @@ async fn a_request_the_service_has_no_receipt_for_stays_counted_while_its_genera
         reconciled,
         Reconciled {
             settled: 0,
-            forked: 0,
+            diverged: 0,
             fenced: 0,
             accounts_kept: 0,
             unresolved: 1,
@@ -3184,7 +3300,7 @@ async fn one_window_never_decides_what_became_of_another_windows_live_dispatch()
         reconciled,
         Reconciled {
             settled: 0,
-            forked: 0,
+            diverged: 0,
             fenced: 0,
             accounts_kept: 0,
             unresolved: 1,
@@ -4955,10 +5071,29 @@ async fn a_publication_record_two_histories_claim_is_reported_even_when_the_note
         .await
         .expect("published");
 
-    // The note beside the object is moved past write one, which is what a fetch of a later state
-    // does while a publication is still out. A second request is then answered at write one under
-    // another name: the note reads that as ordinary older news, and the object's publication
-    // record is the one that still holds the place another write took.
+    // A second request, from a device that has forgotten where the object stands, so it names no
+    // position and no place in the order is behind it. While it is out, the note beside the object
+    // is moved past write one, which is what a fetch of a later state does. The request is then
+    // answered at write one under another name: the note reads that as ordinary older news, and
+    // the object's publication record is the one that still holds the place another write took.
+    client
+        .store()
+        .forget_checkpoint(object_id)
+        .expect("forgotten");
+    let forked = SyncPosition::at(1, SyncRevision::new(Uuid::from_bytes([0xbb; 16])));
+    let staged = client
+        .store()
+        .admit(object_id, |object| {
+            Ok(kr_cbor::to_canonical_vec(object).expect("canonical bytes"))
+        })
+        .expect("admitted");
+    assert_eq!(staged.expected, Nullable::null());
+    drop(
+        client
+            .store()
+            .begin_dispatch(staged.work_id, object_id, TimestampMs::new(NOW + 1))
+            .expect("dispatched"),
+    );
     client
         .store()
         .record_checkpoint(
@@ -4969,19 +5104,6 @@ async fn a_publication_record_two_histories_claim_is_reported_even_when_the_note
             },
         )
         .expect("a note");
-    let forked = SyncPosition::at(1, SyncRevision::new(Uuid::from_bytes([0xbb; 16])));
-    let staged = client
-        .store()
-        .admit(object_id, |object| {
-            Ok(kr_cbor::to_canonical_vec(object).expect("canonical bytes"))
-        })
-        .expect("admitted");
-    drop(
-        client
-            .store()
-            .begin_dispatch(staged.work_id, object_id, TimestampMs::new(NOW + 1))
-            .expect("dispatched"),
-    );
     let settled = client
         .store()
         .settle(
@@ -4991,7 +5113,7 @@ async fn a_publication_record_two_histories_claim_is_reported_even_when_the_note
         )
         .expect("settled");
     assert_eq!(
-        settled.forked,
+        settled.diverged,
         Some(at(1)),
         "the caller is owed the fork whichever of this device's records found it"
     );
@@ -5051,7 +5173,7 @@ async fn a_reconciliation_counts_a_place_two_histories_claim_rather_than_refusin
         .await
         .expect("reconciled");
     assert_eq!(reconciled.settled, 1);
-    assert_eq!(reconciled.forked, 1);
+    assert_eq!(reconciled.diverged, 1);
     assert_eq!(reconciled.unresolved, 0);
     assert_eq!(client.outstanding().expect("a count"), 0);
     let exported = client.exported().expect("exported");

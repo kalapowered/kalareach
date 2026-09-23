@@ -185,14 +185,15 @@ pub struct Reconciled {
     /// generation in force are both this: the work stays counted, and the next reconciliation asks
     /// again.
     pub unresolved: u64,
-    /// How many answers claimed a place in the order another history already holds.
+    /// How many answers put a write where this device's records cannot follow: behind or at the
+    /// place the write replaced, or at a place another history already holds.
     ///
     /// The request is settled either way and its own record keeps the account of the ciphertext
-    /// that left under it, because the object's record can name only one of two histories. The note
-    /// beside the object is not moved, so this device is still comparing against a collection the
-    /// service it is talking to may never have held; `SyncStore::forget_checkpoint` is the
-    /// recovery, and nothing does it automatically.
-    pub forked: u64,
+    /// that left under it, because the object's record can name only one history. The note beside
+    /// the object is not moved, so this device is still comparing against a collection the service
+    /// it is talking to may never have held; `SyncStore::forget_checkpoint` is the recovery, and
+    /// nothing does it automatically.
+    pub diverged: u64,
     /// How many refusals were settled without bringing down the content the service holds.
     ///
     /// The refusal is settled either way, because the service answered the comparison. What the
@@ -420,15 +421,11 @@ impl SyncClient {
                 let settled =
                     self.store
                         .settle(&dispatch, &staged, Outcome::Accepted { position })?;
-                // The settlement is durable before this is raised. A place two histories both claim
-                // is one this device may not carry on from, and the caller is told rather than
-                // left to meet it at some later comparison that may never come.
-                if let Some(held) = settled.forked {
-                    return Err(SyncError::ForkedHistory {
-                        object_id,
-                        expected: held,
-                        found: position,
-                    });
+                // The settlement is durable before this is raised. An answer this device's records
+                // cannot follow is one it may not carry on from, and the caller is told which it
+                // is rather than left to meet it at some later comparison that may never come.
+                if let Some(held) = settled.diverged {
+                    return Err(diverged(object_id, held, position));
                 }
                 Ok(match settled.settlement {
                     Settlement::Published | Settlement::AlreadySettled => {
@@ -905,8 +902,8 @@ impl SyncClient {
     /// Settles one accepted write a reconciliation learned about, and counts what it found.
     ///
     /// A pass reports rather than refuses: it is ending a barrier rather than answering a caller
-    /// who is waiting for one publication, so a note two histories both claim is counted and the
-    /// account of the write that lost is kept by its own record.
+    /// who is waiting for one publication, so an answer this device's records cannot follow is
+    /// counted and the account of the write is kept by its own record.
     fn settle_acceptance(
         &self,
         dispatch: &super::store::Dispatch,
@@ -918,8 +915,8 @@ impl SyncClient {
             .store
             .settle(dispatch, staged, Outcome::Accepted { position })?;
         report.settled = report.settled.saturating_add(1);
-        if settled.forked.is_some() {
-            report.forked = report.forked.saturating_add(1);
+        if settled.diverged.is_some() {
+            report.diverged = report.diverged.saturating_add(1);
         }
         Ok(())
     }
@@ -1335,11 +1332,6 @@ fn fresh_uuid() -> crate::Result<Uuid> {
     Ok(kr_transport::random::fresh_uuid_v4()?)
 }
 
-/// Returns the copy the service kept of one refused write, when it kept one.
-///
-/// Only a refusal names one, and only a refusal the service kept something of. What the service
-/// keeps is ciphertext this device sent, so the record that names it is an account of what left
-/// rather than a record of a write that did not land.
 /// Refuses an answer that claims a place in the order this device has already given to another.
 ///
 /// One write sequence names one write for the life of a collection, so two answers under one place
@@ -1357,6 +1349,32 @@ fn forked(object_id: SyncObjectId, note: Standing, found: SyncPosition) -> Resul
     }
 }
 
+/// Says where an answer stands against a place this device's records hold, when it does not follow.
+///
+/// Two answers are provably wrong rather than merely surprising, and the error says which: a smaller
+/// write sequence than this device's is a service that went back, and the same one is two histories
+/// claiming one place.
+fn diverged(object_id: SyncObjectId, held: SyncPosition, found: SyncPosition) -> SyncError {
+    if found.write_sequence < held.write_sequence {
+        SyncError::StaleCheckpoint {
+            object_id,
+            expected: held.write_sequence,
+            found: found.write_sequence,
+        }
+    } else {
+        SyncError::ForkedHistory {
+            object_id,
+            expected: held,
+            found,
+        }
+    }
+}
+
+/// Returns the copy the service kept of one refused write, when it kept one.
+///
+/// Only a refusal names one, and only a refusal the service kept something of. What the service
+/// keeps is ciphertext this device sent, so the record that names it is an account of what left
+/// rather than a record of a write that did not land.
 fn kept_copy(record: &RequestRecord) -> Option<SyncConflictId> {
     match &record.state {
         RequestState::Refused { retained } => retained.as_ref().copied(),
