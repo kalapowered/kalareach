@@ -1019,6 +1019,13 @@ impl RemoteConnection {
                     );
                 }
                 let actor_id = self.device.principal();
+                // The admission travels with the change, as it does with a project or an
+                // automation mutation, and the voice service asks it again where it writes.
+                let carried = crate::authority::AdmittedMutation {
+                    connection_id: self.connection_id(),
+                    admitted_revision: validated,
+                    deadline: Some(accepted.deadline),
+                };
                 match self
                     .controller
                     .voice_mutation(
@@ -1027,7 +1034,7 @@ impl RemoteConnection {
                         mutation,
                         entry.method,
                         validated,
-                        accepted,
+                        carried,
                     )
                     .await
                 {

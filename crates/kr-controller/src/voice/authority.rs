@@ -63,11 +63,18 @@ impl GrantAuthority {
     }
 }
 
-/// The refusal a change gets when its admitted lifetime ran out before the write.
-fn expired() -> VoiceError {
+/// What a change is told when the admission it arrived under no longer stands at its write.
+///
+/// The seam only says no. The daemon's own admission keeps the refusal its check gave, a fence
+/// this host owes, a registration it has replaced or a deadline that has passed, and that is what
+/// the daemon tells the caller in place of this.
+const LAPSED: &str = "the admission this change arrived under no longer stands";
+
+/// The refusal a change gets when the admission it arrived under no longer stands at its write.
+fn lapsed() -> VoiceError {
     VoiceError::Host(kr_protocol::error::ProtocolError::new(
         kr_protocol::error::ErrorCode::PermissionDenied,
-        "the deadline this action was admitted under passed before it could run".to_owned(),
+        LAPSED.to_owned(),
     ))
 }
 
@@ -143,34 +150,35 @@ impl VoiceAuthority for GrantAuthority {
         plan: &VoiceGrantPlan,
         admission: &dyn kr_voice::Admission,
     ) -> kr_voice::Result<Grant> {
-        // Asked immediately before the write, which is the last thing this host does with the
-        // window the change arrived under. The store's own transaction reads the parent and
-        // writes in one step, so nothing of this host's waits between here and the record.
-        if !admission.still_admitted() {
-            return Err(expired());
-        }
         let grant_id = GrantId::new(kr_ipc::new_uuid());
         let grant = plan.grant(grant_id);
         let now_ms = now_ms();
         // Written active: a voice grant is not an invitation somebody redeems later. The device it
         // is issued to is the one that asked for it on an authenticated connection, which is the
         // redemption an invitation exists to perform.
-        self.sharing
-            .grants()
-            .issue(&GrantRecord {
-                grant: grant.clone(),
-                session_id: match &plan.session_selector {
-                    kr_protocol::grant::SessionSelector::These { session_ids } => {
-                        session_ids.iter().copied().next()
-                    }
-                    _ => None,
-                },
-                issued_at_ms: now_ms,
-                activated_at_ms: Some(now_ms),
-                revoked_at_ms: None,
-                revoked_by_parent: None,
-            })
-            .map_err(store)?;
+        let record = GrantRecord {
+            grant: grant.clone(),
+            session_id: match &plan.session_selector {
+                kr_protocol::grant::SessionSelector::These { session_ids } => {
+                    session_ids.iter().copied().next()
+                }
+                _ => None,
+            },
+            issued_at_ms: now_ms,
+            activated_at_ms: Some(now_ms),
+            revoked_at_ms: None,
+            revoked_by_parent: None,
+        };
+        // Asked with the record already built, so nothing of this host's own comes between the
+        // answer and the store. The admission a voice mutation carries is the check every service
+        // asks from inside its work: a fence this host owes, a registration it has replaced and a
+        // deadline that has passed each stop the write. The store takes its own lock and opens
+        // its transaction after this answer, because its issue offers no place to ask inside them
+        // the way its revocation does.
+        if !admission.still_admitted() {
+            return Err(lapsed());
+        }
+        self.sharing.grants().issue(&record).map_err(store)?;
         Ok(grant)
     }
 
@@ -186,7 +194,7 @@ impl VoiceAuthority for GrantAuthority {
         // the coordinator has already decided: it revokes only the grant of a voice session this
         // device holds, and it has just taken that session out of its own registry.
         // The store's own admission hook, inside the transaction that performs the revocation and
-        // after it has read the subtree: the window this change arrived under is asked at the
+        // after it has read the subtree: the admission this change arrived under is asked at the
         // moment the record changes rather than before the read that precedes it.
         let revocation: GrantRevocation = self
             .sharing
@@ -195,10 +203,8 @@ impl VoiceAuthority for GrantAuthority {
                 if admission.still_admitted() {
                     Ok(())
                 } else {
-                    Err(crate::error::ControllerError::WindowExpired {
-                        detail: "the deadline this action was admitted under passed before it \
-                                 could run"
-                            .to_owned(),
+                    Err(crate::error::ControllerError::PermissionDenied {
+                        detail: LAPSED.to_owned(),
                     })
                 }
             })

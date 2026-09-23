@@ -6,6 +6,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
+//! | KR-REQ-09.09, 09.12, 26.16 | `a_voice_change_is_not_written_while_a_fence_is_owed`, `a_voice_start_that_waited_writes_nothing_once_a_fence_is_owed` |
 //! | KR-REQ-15.02 | `stopping_voice_leaves_the_session_running` |
 //! | KR-REQ-15.11 | `a_delegation_runs_under_the_grant_the_host_already_holds` |
 //! | KR-REQ-15.13 | `an_unlocked_screen_action_is_refused_without_a_signed_confirmation` |
@@ -71,12 +72,49 @@ impl WorkerSupervisor for RefusingSupervisor {
 #[derive(Debug, Default)]
 struct OfflineProvider {
     closed: std::sync::Mutex<Vec<String>>,
+    /// Where a start waits before it answers, for a provider that holds its starts.
+    gate: Option<BrokerGate>,
+}
+
+/// Where a held start waits: it says it has arrived, then waits to be let go.
+#[derive(Debug, Default)]
+struct BrokerGate {
+    reached: tokio::sync::Notify,
+    released: tokio::sync::Notify,
 }
 
 impl OfflineProvider {
+    /// A provider that holds every start until the test lets it answer, the way a broker that is
+    /// slow to create a call holds the start waiting for it.
+    fn holding() -> Self {
+        Self {
+            gate: Some(BrokerGate::default()),
+            ..Self::default()
+        }
+    }
+
     /// The calls this provider was told to close.
     fn closed(&self) -> Vec<String> {
         self.closed.lock().expect("what was closed").clone()
+    }
+
+    /// Waits until a start has arrived and is being held.
+    async fn reached(&self) {
+        self.gate
+            .as_ref()
+            .expect("a provider that holds its starts")
+            .reached
+            .notified()
+            .await;
+    }
+
+    /// Lets the start being held answer.
+    fn release(&self) {
+        self.gate
+            .as_ref()
+            .expect("a provider that holds its starts")
+            .released
+            .notify_one();
     }
 }
 
@@ -87,6 +125,10 @@ impl ManagedVoiceService for OfflineProvider {
 
     fn start<'a>(&'a self, _request: &'a VoiceSessionRequest) -> ServiceFuture<'a, VoiceStart> {
         Box::pin(async move {
+            if let Some(gate) = &self.gate {
+                gate.reached.notify_one();
+                gate.released.notified().await;
+            }
             Ok(VoiceStart::Started(Box::new(VoiceSession {
                 call_id: "call-1".to_owned(),
                 attempt_id: "attempt-1".to_owned(),
@@ -757,6 +799,148 @@ async fn context_is_filtered_by_the_requesting_devices_own_history_bound() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// A fence this host owes and could not raise
+// ---------------------------------------------------------------------------------------------
+
+/// Writes one configuration document where this host reads it.
+fn write_configuration(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    document: &kr_protocol::hostinfo::configuration::ConfigurationDocument,
+) {
+    let path = kr_worker::config::document_path(environment);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("the state directory");
+    }
+    kr_ipc::paths::write_owner_only_file(
+        &path,
+        kr_protocol::hostinfo::configuration::contents(document).as_bytes(),
+    )
+    .expect("the document");
+}
+
+/// A configuration document that narrows the rights a grant may carry to `rights`, which withdraws
+/// authority and owes a fence.
+fn narrowing_document(
+    rights: &[ActionRight],
+) -> kr_protocol::hostinfo::configuration::ConfigurationDocument {
+    let mut narrowed = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
+    narrowed.revision = 1;
+    narrowed.ceilings.grant_rights = Nullable::some(
+        rights
+            .iter()
+            .map(|right| right.as_str().to_owned())
+            .collect(),
+    );
+    narrowed
+}
+
+/// Makes this environment's registry refuse the revision advance a fence needs, as a full disk or
+/// a damaged file would, until the returned connection drops the trigger.
+fn refuse_fences(environment: &kr_ipc::paths::EnvironmentPaths) -> rusqlite::Connection {
+    let registry =
+        rusqlite::Connection::open(environment.registry_database()).expect("opens the registry");
+    registry
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    registry
+        .execute_batch(
+            "CREATE TRIGGER refuse_fence BEFORE UPDATE OF authority_revision ON environment
+             BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("the fault is in place");
+    registry
+}
+
+/// Puts a configuration that withdraws authority into force on a registry that refuses the fence
+/// the withdrawal owes, so this host owes a fence it could not raise.
+async fn owe_a_fence(
+    controller: &Controller,
+    environment: &kr_ipc::paths::EnvironmentPaths,
+) -> rusqlite::Connection {
+    let registry = refuse_fences(environment);
+    // Every right the grants in this suite carry is still allowed, so the fence is the only thing
+    // that can refuse a voice change.
+    write_configuration(
+        environment,
+        &narrowing_document(&[
+            ActionRight::SessionView,
+            ActionRight::AgentPrompt,
+            ActionRight::TerminalInput,
+            ActionRight::VoiceUse,
+        ]),
+    );
+    let effective = controller.effective_configuration().await;
+    assert!(
+        effective
+            .not_in_force
+            .as_ref()
+            .is_some_and(|problem| problem.as_str().contains("dispatch could not be fenced")),
+        "{:?}",
+        effective.not_in_force
+    );
+    registry
+}
+
+/// The voice grants one device holds in the host's own store.
+fn voice_grants_of(controller: &Controller, device_id: DeviceId) -> Vec<Grant> {
+    controller
+        .sharing()
+        .grants()
+        .records_for_device(device_id)
+        .expect("the store answers")
+        .into_iter()
+        .map(|record| record.grant)
+        .filter(|grant| grant.permits(ActionRight::VoiceUse))
+        .collect()
+}
+
+/// KR-REQ-09.12 and 26.16: a withdrawal whose fence could not be raised stops a voice change the
+/// person at this machine asks for on the host's own socket. The daemon admits the change, and the
+/// voice service asks the check every service asks from inside its work, which asks that fence
+/// first: the refusal is the one the other services give, and no voice grant is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_voice_change_is_not_written_while_a_fence_is_owed() {
+    let host = host().await;
+    let environment = host._temp.environment();
+    let mut control = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects to the control endpoint");
+    let registry = owe_a_fence(&host.controller, &environment).await;
+
+    let refusal = control
+        .mutate(
+            Method::VoiceGrant,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &VoiceGrantParams {
+                device_id: host.device_id,
+                session_ids: [host.session_id].into_iter().collect(),
+                actions: Nullable::some([VoiceAction::Status].into_iter().collect()),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect_err("the fence stops the voice change");
+    assert_eq!(
+        refusal.code,
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "{refusal:?}"
+    );
+    assert!(
+        refusal.message.contains("could not be raised"),
+        "{refusal:?}"
+    );
+    assert!(
+        voice_grants_of(&host.controller, host.device_id).is_empty(),
+        "no voice grant was written"
+    );
+    registry
+        .execute_batch("DROP TRIGGER refuse_fence;")
+        .expect("the fault is cleared");
+    host.clients.abort();
+}
+
+// ---------------------------------------------------------------------------------------------
 // The paired device's own path: a real connection, over iroh, to the daemon's own voice service
 // ---------------------------------------------------------------------------------------------
 
@@ -992,5 +1176,103 @@ async fn a_paired_device_reaches_voice_over_its_own_connection() {
     .expect("a stop result");
     assert_eq!(stopped.revoked_grant_id, call.grant_id);
     assert_eq!(broker.closed(), vec!["call-1".to_owned()]);
+    host.stop().await;
+}
+
+/// KR-REQ-09.09, 09.12 and 26.16: a voice start that waited writes nothing once a fence is owed.
+///
+/// The paired device's start passes the daemon's checks and waits for the broker to create its
+/// call. Meanwhile a configuration narrows the rights a grant may carry, and the registry refuses
+/// the revision advance the fence needs. When the broker answers, the admission the start arrived
+/// under is asked again before the call's grant is written: it refuses with the refusal every other
+/// service gives, no grant is written, and the call the broker created is closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_voice_start_that_waited_writes_nothing_once_a_fence_is_owed() {
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner).await;
+    let (_device, session) = net_support::paired_device(
+        &host,
+        &owner,
+        &[ActionRight::SessionView, ActionRight::AgentPrompt],
+    )
+    .await;
+    let environment = host.tree().environment();
+    let environment_id = host.environment_id;
+    let broker = Arc::new(OfflineProvider::holding());
+    host.controller()
+        .voice()
+        .attach_provider(Some(Arc::clone(&broker) as Arc<dyn ManagedVoiceService>));
+    let device_id = host
+        .controller()
+        .devices()
+        .devices()
+        .expect("the device directory answers")
+        .into_iter()
+        .find(|record| record.is_paired())
+        .expect("the paired device")
+        .device_id;
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let standing: kr_protocol::voice::VoiceGrantResult = remote_voice(
+        &session,
+        environment_id,
+        Method::VoiceGrant,
+        &VoiceGrantParams {
+            device_id,
+            session_ids: [session_id].into_iter().collect(),
+            actions: Nullable::null(),
+        },
+    )
+    .await
+    .expect("the voice grant is written")
+    .to_typed()
+    .expect("a voice grant result");
+
+    let start = VoiceStartParams {
+        session_ids: [session_id].into_iter().collect(),
+        offer_sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n".to_owned(),
+        duration_seconds: 600,
+        reasoning_budget_minor: Nullable::null(),
+    };
+    let starting = remote_voice(&session, environment_id, Method::VoiceStart, &start);
+    // Only once the start is waiting for the broker: it was admitted before the fence was owed.
+    let fencing = async {
+        broker.reached().await;
+        let registry = owe_a_fence(host.controller(), &environment).await;
+        broker.release();
+        registry
+    };
+    let (started, registry) = tokio::join!(starting, fencing);
+
+    let refused = started.expect_err("the fence stops the start before its grant is written");
+    let kr_client::error::ClientError::Host(refusal) = refused else {
+        panic!("the host refuses it: {refused:?}");
+    };
+    assert_eq!(
+        refusal.code,
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "{refusal:?}"
+    );
+    assert!(
+        refusal.message.contains("could not be raised"),
+        "{refusal:?}"
+    );
+    let held = voice_grants_of(host.controller(), device_id);
+    assert!(
+        held.iter().all(|grant| grant.grant_id == standing.grant_id),
+        "the standing voice grant and nothing written for the call: {held:?}"
+    );
+    assert_eq!(
+        host.controller().voice().coordinator().live_sessions(),
+        0,
+        "no voice session was recorded"
+    );
+    assert_eq!(
+        broker.closed(),
+        vec!["call-1".to_owned()],
+        "the call the broker created is closed"
+    );
+    registry
+        .execute_batch("DROP TRIGGER refuse_fence;")
+        .expect("the fault is cleared");
     host.stop().await;
 }

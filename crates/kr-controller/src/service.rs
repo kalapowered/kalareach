@@ -2825,6 +2825,11 @@ impl Controller {
     /// retained answer are the same ones this host already keeps for an authority change, because
     /// a voice grant is a grant in that same store.
     ///
+    /// `carried` is the admission the mutation was accepted under: the connection it arrived on,
+    /// the authority revision that connection was admitted at and the deadline this host accepted.
+    /// It is asked again through the check every service asks from inside its work, before
+    /// anything is claimed and wherever the coordinator and the grant store write.
+    ///
     /// # Errors
     ///
     /// Returns the refusal the caller is given.
@@ -2835,18 +2840,17 @@ impl Controller {
         mutation: &MutationRequest,
         method: Method,
         authority_revision: AuthorityRevision,
-        accepted: kr_transport::window::AcceptedDeadline,
+        carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
-        // The deadline this mutation was admitted under, as a question the coordinator can ask
+        // The admission this mutation was accepted under, as a question the coordinator can ask
         // rather than a figure it has to convert. Everything after this waits — for the claim, for
         // the coordinator's own lock, for the store, for the broker — and the write at the end of
-        // those waits is what has to be inside the lifetime the host accepted, not merely the
-        // dispatch that began it. The reading is this daemon's own continuous clock, which is the
-        // clock the deadline is measured on and the one nothing outside this process can move.
-        let admission = AdmittedUntil {
-            controller: Arc::clone(self),
-            deadline: accepted.deadline,
-        };
+        // those waits is what has to stand on that admission, not merely the dispatch that began
+        // it. The question is the one every service asks from inside its work: whether this host
+        // owes a fence it could not raise, whether the connection's registration still stands
+        // under the revision the mutation was admitted at, and whether the deadline has passed on
+        // this daemon's own continuous clock.
+        let admission = VoiceAdmission::new(Arc::clone(self), carried);
         // A delegation does not go through this host's action store at all, and cannot yet: the
         // answer to a first submission of an action that needs a confirmation is the challenge, a
         // claim taken before that answer is held for longer than the confirmation itself lives,
@@ -2869,6 +2873,9 @@ impl Controller {
         // kept for the provider profile's replay window, across a call ending and across a host
         // restart.
         if method == Method::VoiceDelegate {
+            // Nothing retains a delegation, so every one is a first admission, and it is asked
+            // before the coordinator decides anything.
+            admission.check()?;
             return self
                 .voice()
                 .answer(
@@ -2879,12 +2886,22 @@ impl Controller {
                     wall_clock_ms(),
                     &admission,
                 )
-                .await;
+                .await
+                .map_err(|error| admission.refused_or(error));
         }
         // What this action already produced, if it produced anything. Answered before the claim,
         // so a retry of a completed change is its own result rather than a conflict.
         if let Some(answered) = self.voice_answered(actor_id, mutation).await? {
             return Ok(answered);
+        }
+        // A first admission is asked before anything is claimed or created. A start asks the
+        // broker for a call before it writes the call's grant, and a call created for a start this
+        // host then refuses is a metered call nobody can use. A stop is not asked. It takes
+        // authority away rather than exercising it: section 15 ends a call's grant the moment the
+        // call ends, and a fence this host owes is a reason to withdraw authority, never a reason
+        // to keep a call's grant alive.
+        if method != Method::VoiceStop {
+            admission.check()?;
         }
         match self.claim_voice_action(actor_id, mutation)? {
             Ok(()) => {}
@@ -2900,7 +2917,8 @@ impl Controller {
                 wall_clock_ms(),
                 &admission,
             )
-            .await?;
+            .await
+            .map_err(|error| admission.refused_or(error))?;
         self.retain_authority_change(actor_id, mutation, &result)?;
         Ok(result)
     }
@@ -3861,6 +3879,21 @@ impl Controller {
                     error.to_string(),
                 );
             }
+            let Some(admitted_revision) = admitted else {
+                return error_reply(
+                    mutation.request_id,
+                    ErrorCode::PermissionDenied,
+                    "the authority this connection was admitted under has been withdrawn; open a \
+                     new connection",
+                );
+            };
+            // The admission travels with the change, as it does with a project or an automation
+            // mutation, and the voice service asks it again where it writes.
+            let carried = crate::authority::AdmittedMutation {
+                connection_id,
+                admitted_revision,
+                deadline: Some(accepted.deadline),
+            };
             // The revision this daemon is at, read now: a voice grant is written under the
             // authority in force at the moment of the write rather than the one a connection was
             // admitted under.
@@ -3876,7 +3909,7 @@ impl Controller {
                     mutation,
                     method,
                     authority_revision,
-                    accepted,
+                    carried,
                 )
                 .await,
             );
@@ -7636,28 +7669,78 @@ fn remaining_deadline(
     kr_ipc::clock::transferred_deadline(shared_now, remaining).map(U64::new)
 }
 
-/// The admission one voice mutation arrived under, as the coordinator asks about it.
+/// The admission one voice mutation arrived under, as the coordinator and the grant store ask
+/// about it.
 ///
-/// The deadline is on this daemon's own continuous clock, which is what section 9 measures a
-/// mutation's lifetime on and the only clock nothing outside this process can move. The
-/// coordinator asks rather than converting, so no reading of the wall clock comes between the
-/// admission and the effect.
-struct AdmittedUntil {
+/// Every answer is the check each service asks from inside the work a mutation has begun,
+/// [`Controller::check_registration`]: a fence this host owes and could not raise, then the
+/// connection's registration under the revision the mutation was admitted at, then the accepted
+/// deadline on this daemon's own continuous clock. A voice change waits for the coordinator's
+/// lock, for the store and for the broker; the coordinator asks once its lock and the broker have
+/// answered, and the grant store's seam asks again immediately before it writes. A deadline alone
+/// would let a change that waited write while a fence is owed, or after the authority it was
+/// admitted under was replaced.
+///
+/// The coordinator's seam answers only yes or no, so the refusal the check gave is kept here. That
+/// refusal is what the caller is told, the same one the project service and the workflow journal
+/// give, rather than the coordinator's own words for a window that ran out.
+struct VoiceAdmission {
     controller: Arc<Controller>,
-    deadline: kr_transport::clock::ContinuousInstant,
+    carried: crate::authority::AdmittedMutation,
+    /// The first refusal the check gave. The coordinator and the store stop at the first answer
+    /// that is no, so this is what stopped the change.
+    refusal: std::sync::Mutex<Option<ControllerError>>,
 }
 
-impl std::fmt::Debug for AdmittedUntil {
+impl VoiceAdmission {
+    fn new(controller: Arc<Controller>, carried: crate::authority::AdmittedMutation) -> Self {
+        Self {
+            controller,
+            carried,
+            refusal: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Asks the check, and answers with its own refusal.
+    fn check(&self) -> Result<()> {
+        self.controller.check_registration(&self.carried)
+    }
+
+    /// What a voice change that failed reaches its caller as: the refusal this admission gave,
+    /// when it gave one, and otherwise the error the change failed with.
+    fn refused_or(&self, error: ControllerError) -> ControllerError {
+        self.refusal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or(error)
+    }
+}
+
+impl std::fmt::Debug for VoiceAdmission {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("AdmittedUntil")
+            .debug_struct("VoiceAdmission")
+            .field("carried", &self.carried)
             .finish_non_exhaustive()
     }
 }
 
-impl kr_voice::Admission for AdmittedUntil {
+impl kr_voice::Admission for VoiceAdmission {
     fn still_admitted(&self) -> bool {
-        self.controller.clock.now() < self.deadline
+        match self.check() {
+            Ok(()) => true,
+            Err(refusal) => {
+                let mut kept = self
+                    .refusal
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if kept.is_none() {
+                    *kept = Some(refusal);
+                }
+                false
+            }
+        }
     }
 }
 
@@ -9548,6 +9631,143 @@ mod a_create_that_launches_nothing {
             "{refused:?}"
         );
         assert!(!parent.join("fenced").exists(), "no repository was made");
+    }
+
+    /// A standing voice grant as the coordinator plans one: for a device of its own, over one
+    /// session, permitting status.
+    fn voice_plan(controller: &Controller) -> kr_voice::VoiceGrantPlan {
+        kr_voice::VoiceGrantPlan {
+            parent_grant_id: None,
+            issuer_device_id: controller.sharing.host_device_id(),
+            recipient_device_id: kr_protocol::ids::DeviceId::new(kr_ipc::new_uuid()),
+            environment_id: controller.paths.environment_id(),
+            session_selector: kr_protocol::grant::SessionSelector::These {
+                session_ids: [kr_protocol::ids::SessionId::new(kr_ipc::new_uuid())]
+                    .into_iter()
+                    .collect(),
+            },
+            actions: [kr_protocol::voice::VoiceAction::Status]
+                .into_iter()
+                .collect(),
+            rights: [
+                kr_protocol::rights::ActionRight::VoiceUse,
+                kr_protocol::rights::ActionRight::SessionView,
+            ]
+            .into_iter()
+            .collect(),
+            history: kr_protocol::grant::HistoryScope {
+                lower_bound_ms: Nullable::null(),
+                include_live_screen: true,
+                named_questions: kr_protocol::scalars::CanonicalSet::from_iter([]),
+                named_approvals: kr_protocol::scalars::CanonicalSet::from_iter([]),
+            },
+            expiry: kr_protocol::grant::GrantExpiry::Never,
+            authority_revision: controller.policy().authority_revision(),
+        }
+    }
+
+    /// The voice service's grant seam writes and withdraws only under the admission every service
+    /// asks from inside its work. While a fence is owed it writes no voice grant and withdraws
+    /// none, and what the caller is told is the fence's own refusal; once the fence is no longer
+    /// owed, the same admission writes. A registration this host withdrew after the admission stops
+    /// the write as well, which a deadline alone would not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_voice_grant_seam_writes_only_under_the_admission_every_service_asks() {
+        use kr_voice::seams::VoiceAuthority as _;
+
+        let (_temp, controller, _asked) = daemon().await;
+        let (connection_id, _actor_id) = admitted(&controller).await;
+        let authority = crate::voice::GrantAuthority::new(
+            Arc::clone(&controller.sharing),
+            Arc::clone(&controller.devices),
+            controller.sharing.host_device_id(),
+        );
+        let plan = voice_plan(&controller);
+        let held = |device_id| {
+            controller
+                .sharing
+                .grants()
+                .records_for_device(device_id)
+                .expect("the store answers")
+        };
+        let admission = |carried| super::VoiceAdmission::new(Arc::clone(&controller), carried);
+        let not_this = || ControllerError::InvalidArgument("not the refusal".to_owned());
+
+        // A fence owed after the admission: nothing is written, and the fence is what the caller
+        // is told.
+        let fenced = admission(live_admission(&controller, connection_id));
+        controller
+            .fence_unraised
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let refused = authority
+            .issue(&plan, &fenced)
+            .expect_err("the fence stops the write");
+        assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+        let told = fenced.refused_or(not_this());
+        assert!(
+            matches!(told, ControllerError::PermissionDenied { .. }),
+            "{told:?}"
+        );
+        assert!(told.to_string().contains("could not be raised"), "{told}");
+        assert!(
+            held(plan.recipient_device_id).is_empty(),
+            "no voice grant was written"
+        );
+
+        // The same admission once the fence is no longer owed.
+        controller
+            .fence_unraised
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let written = authority
+            .issue(
+                &plan,
+                &admission(live_admission(&controller, connection_id)),
+            )
+            .expect("the admission stands again once the fence is no longer owed");
+
+        // A withdrawal under a fence owed is refused inside the store's own transaction, and the
+        // grant stays as it was.
+        controller
+            .fence_unraised
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let withdrawing = admission(live_admission(&controller, connection_id));
+        authority
+            .revoke(written.grant_id, 5, &withdrawing)
+            .expect_err("the fence stops the withdrawal");
+        let told = withdrawing.refused_or(not_this());
+        assert!(told.to_string().contains("could not be raised"), "{told}");
+        assert!(
+            held(plan.recipient_device_id)
+                .iter()
+                .all(|record| record.revoked_at_ms.is_none()),
+            "nothing was withdrawn"
+        );
+        controller
+            .fence_unraised
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        // A registration withdrawn after the admission: the deadline still has time on it, and the
+        // write is refused all the same.
+        let carried = live_admission(&controller, connection_id);
+        controller.deregister(connection_id);
+        let deregistered = admission(carried);
+        let other = voice_plan(&controller);
+        authority
+            .issue(&other, &deregistered)
+            .expect_err("a withdrawn registration stops the write");
+        let told = deregistered.refused_or(not_this());
+        assert!(
+            matches!(told, ControllerError::PermissionDenied { .. }),
+            "{told:?}"
+        );
+        assert_eq!(
+            told.to_string(),
+            crate::authority::AdmissionLapse::Deregistered.to_string()
+        );
+        assert!(
+            held(other.recipient_device_id).is_empty(),
+            "no voice grant was written"
+        );
     }
 }
 
