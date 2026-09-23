@@ -9817,67 +9817,116 @@ mod a_create_that_launches_nothing {
         );
     }
 
-    /// A voice grant that waited for the grant store is refused once a fence becomes owed while it
-    /// waited. A second connection holds the store's write lock, the way another writer does; the
-    /// seam's issue waits for it; a fence becomes owed; the lock is let go. Asked inside the store's
-    /// own transaction, the admission refuses and nothing is written. Asked before the store's
-    /// lock, it would already have answered yes, and the grant would stand.
+    /// The voice admission, asked through a probe that first records whether the grant store held
+    /// its write lock at that moment.
+    ///
+    /// A second connection to the store's database tries to take the write lock without waiting.
+    /// It is refused only while another writer holds that lock, and the only writer here is the
+    /// store itself.
+    #[derive(Debug)]
+    struct AskedUnderTheStoreLock {
+        admission: super::VoiceAdmission,
+        database: std::path::PathBuf,
+        held: Mutex<Vec<bool>>,
+    }
+
+    impl kr_voice::Admission for AskedUnderTheStoreLock {
+        fn still_admitted(&self) -> bool {
+            let other =
+                rusqlite::Connection::open(&self.database).expect("opens the store's database");
+            other
+                .busy_timeout(Duration::ZERO)
+                .expect("asks without waiting");
+            let held = match other.execute_batch("BEGIN IMMEDIATE") {
+                Ok(()) => {
+                    other
+                        .execute_batch("ROLLBACK")
+                        .expect("gives the lock back");
+                    false
+                }
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::DatabaseBusy =>
+                {
+                    true
+                }
+                Err(error) => panic!("the probe could not ask the store: {error}"),
+            };
+            self.held.lock().expect("the record").push(held);
+            self.admission.still_admitted()
+        }
+    }
+
+    /// The voice grant seam asks its admission while the grant store holds its write lock: inside
+    /// the transaction that writes, after the wait for that lock and before the record changes. A
+    /// fence that becomes owed while a write waits for the lock is therefore what the admission
+    /// sees. Asked before the store, as the seam once asked for an issue, the probe finds the lock
+    /// free.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_voice_grant_waiting_for_the_store_is_refused_once_a_fence_is_owed() {
+    async fn the_voice_grant_seam_asks_its_admission_while_the_store_holds_its_write_lock() {
         use kr_voice::seams::VoiceAuthority as _;
 
         let (_temp, controller, _asked) = daemon().await;
         let (connection_id, _actor_id) = admitted(&controller).await;
-        let plan = voice_plan(&controller);
-        let device_id = plan.recipient_device_id;
-        let writer = rusqlite::Connection::open(controller.paths.registry_database())
-            .expect("opens the grant store's database");
-        writer
-            .busy_timeout(Duration::from_secs(5))
-            .expect("waits for the daemon's own writes");
-        writer
-            .execute_batch("BEGIN IMMEDIATE")
-            .expect("another writer holds the store");
-
         let authority = crate::voice::GrantAuthority::new(
             Arc::clone(&controller.sharing),
             Arc::clone(&controller.devices),
             controller.sharing.host_device_id(),
         );
-        let admission = super::VoiceAdmission::new(
-            Arc::clone(&controller),
-            live_admission(&controller, connection_id),
+        let probe = |carried| AskedUnderTheStoreLock {
+            admission: super::VoiceAdmission::new(Arc::clone(&controller), carried),
+            database: controller.paths.registry_database(),
+            held: Mutex::new(Vec::new()),
+        };
+        let asked = |probe: &AskedUnderTheStoreLock| probe.held.lock().expect("the record").clone();
+
+        // An admission that stands: asked once, under the lock, and the grant is written.
+        let standing = probe(live_admission(&controller, connection_id));
+        let plan = voice_plan(&controller);
+        let written = authority
+            .issue(&plan, &standing)
+            .expect("a standing admission writes");
+        assert_eq!(asked(&standing), vec![true], "an issue asks under the lock");
+
+        // A withdrawal is asked the same way.
+        let withdrawing = probe(live_admission(&controller, connection_id));
+        authority
+            .revoke(written.grant_id, 5, &withdrawing)
+            .expect("a standing admission withdraws");
+        assert_eq!(
+            asked(&withdrawing),
+            vec![true],
+            "a revocation asks under the lock"
         );
-        let issuing = std::thread::spawn(move || {
-            let issued = authority.issue(&plan, &admission);
-            (issued, admission)
-        });
-        // Time for the issue to reach the store and wait for its lock. An admission asked before
-        // that lock has answered long before this, which is the order this refuses.
-        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // A fence owed: asked under the lock all the same, refused with the fence's own refusal,
+        // and nothing written.
         controller
             .fence_unraised
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        writer
-            .execute_batch("COMMIT")
-            .expect("the other writer finishes");
-
-        let (issued, admission) = issuing.join().expect("the issue returns");
-        let refused = issued.expect_err("the fence owed while the issue waited stops it");
-        assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
-        let told = admission.refused_or(ControllerError::InvalidArgument(
-            "not the refusal".to_owned(),
-        ));
+        let fenced = probe(live_admission(&controller, connection_id));
+        let other = voice_plan(&controller);
+        authority
+            .issue(&other, &fenced)
+            .expect_err("the fence stops the write");
+        assert_eq!(asked(&fenced), vec![true]);
+        let told = fenced
+            .admission
+            .refused_or(ControllerError::InvalidArgument(
+                "not the refusal".to_owned(),
+            ));
         assert!(told.to_string().contains("could not be raised"), "{told}");
         assert!(
             controller
                 .sharing
                 .grants()
-                .records_for_device(device_id)
+                .records_for_device(other.recipient_device_id)
                 .expect("the store answers")
                 .is_empty(),
             "no voice grant was written"
         );
+        controller
+            .fence_unraised
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// A mutation forwarded to a worker is asked the admission it arrived under at the last point
