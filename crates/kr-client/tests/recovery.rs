@@ -1207,6 +1207,75 @@ async fn a_receipt_and_a_read_that_disagree_under_one_place_in_the_order_are_two
 }
 
 #[tokio::test]
+async fn an_applied_receipt_is_held_to_the_bundle_read_back_at_its_place() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let other = AuthorisationKeyPair::generate().expect("another writer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+
+    service.interrupt_the_next_exchange(Interruption::LoseTheAnswerAfterTheWrite);
+    assert!(matches!(
+        store
+            .enable_writer(
+                &seed,
+                &mut bundle,
+                trusted(&writer),
+                TimestampMs::new(1_000)
+            )
+            .await,
+        Err(RecoveryError::BundleOutcomeUnknown { .. })
+    ));
+    let sent = service.attempts().pop().expect("the write");
+
+    // The store keeps the digest of what it sent and not the bundle, so a receipt that the write
+    // applied is read back. The service now serves other content, authentic and under the very
+    // place the receipt names.
+    let mut theirs = BundleStore::empty(TimestampMs::new(1));
+    theirs.revision = U64::new(1);
+    theirs.trusted_writers = [trusted(&other)].into_iter().collect();
+    let key = seed
+        .bundle_key_for(&context(ORIGIN))
+        .expect("the bundle key");
+    service.substitute(
+        LOCATOR,
+        kr_crypto::archive::encrypt_recovery_bundle(&key, &theirs).expect("the ciphertext"),
+    );
+
+    // One place holds one write, and this one does not carry what the receipt's write carried: two
+    // histories, refused, with nothing of the refused content taken as the baseline.
+    assert!(matches!(
+        store.end_lost_write(&seed).await,
+        Err(RecoveryError::BundleHistoryForked { expected, found }) if expected == at(1) && found == at(1)
+    ));
+    assert!(matches!(
+        store.lost_write(),
+        Some(LostWrite::Unsettled { .. })
+    ));
+    assert_eq!(store.position(), None);
+    assert!(store.writer_enabled(other.key_id()).is_none());
+
+    // Where the place holds what the write carried, the same receipt settles it, and the store's
+    // baseline is that write's own content.
+    service.substitute(LOCATOR, sent.ciphertext.clone());
+    assert_eq!(
+        store
+            .end_lost_write(&seed)
+            .await
+            .expect("the fence is made"),
+        Some(LostWrite::Applied)
+    );
+    assert_eq!(store.position(), Some(at(1)));
+    assert!(store.writer_enabled(writer.key_id()).is_some());
+    assert_eq!(
+        service.fences().len(),
+        2,
+        "one identity, fenced twice and answered alike"
+    );
+}
+
+#[tokio::test]
 async fn a_first_write_that_never_arrived_leaves_the_locator_writable_again() {
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");
