@@ -2553,6 +2553,11 @@ async fn a_record_carrying_the_key_of_a_candidate_that_never_applied_is_refused(
         seen[..installed_at].iter().all(|(_, publishes)| !publishes),
         "{seen:?}"
     );
+    let done_at = seen
+        .iter()
+        .position(|(step, _)| *step == Step::Done)
+        .expect("the removal ends");
+    assert!(done_at > installed_at, "{seen:?}");
     assert!(
         owner.held(&collection, epoch + 1).is_none(),
         "the withdrawn key is never installed"
