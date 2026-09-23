@@ -14,11 +14,17 @@ use kr_protocol::archive::{
     KeyWrapContext, KeyWrapFormat, KeyWrapPurpose, RecoveryContext, SealedKeyWrap,
     key_wrap_plaintext,
 };
+use kr_protocol::collection_keys::{
+    COLLECTION_KEY_RECORD_DOMAIN, CollectionKeyRecord, CollectionKeyRecordPayload,
+    CollectionKeyWrapContext, CollectionKeyWrapFormat, CollectionMember, SealedCollectionKeyWrap,
+    collection_key_wrap_plaintext,
+};
 use kr_protocol::ids::{
     ArchiveId, BackupGeneration, BackupObjectId, EnvelopeId, EnvironmentId, GrantId, SessionEpoch,
     SessionId,
 };
 use kr_protocol::ids::{DeviceId, RevocationRequestId};
+use kr_protocol::ids::{SyncCollectionId, SyncKeyEpoch, SyncKeyRecordRevision};
 use kr_protocol::mailbox::{
     EnvelopePlaintext, EnvelopeRouting, EnvelopeVersion, ForwardedAuthority, MailboxPayloadType,
     SealedEnvelope, mailbox_size_bucket, notification_size_bucket,
@@ -27,6 +33,7 @@ use kr_protocol::pairing::{KeyPurpose, RevocationRequest, RevocationTarget};
 use kr_protocol::scalars::{
     Bytes, CanonicalSet, Digest256, Nonce192, Nullable, Signature64, TimestampMs, U64, Uuid,
 };
+use kr_protocol::service::installation_id;
 use serde_json::{Value, json};
 
 use crate::error::{CryptoError, Result};
@@ -49,6 +56,9 @@ pub const KDF_FILE_NAME: &str = "kdf.json";
 
 /// The relay signature vectors.
 pub const RELAY_FILE_NAME: &str = "relay.json";
+
+/// The collection-key vectors: key wraps and signed key records.
+pub const COLLECTION_KEYS_FILE_NAME: &str = "collection-keys.json";
 
 /// The test authorisation seed of the host side.
 const HOST_AUTHORISATION_SEED: [u8; 32] = [0xa1; 32];
@@ -74,6 +84,10 @@ const RELAY_INSTANCE_SEED: [u8; 32] = [0xf1; 32];
 const SERVICE_ADMISSION_SEED: [u8; 32] = [0xf2; 32];
 /// The test object key of the key wrap vector.
 const OBJECT_KEY: [u8; 32] = [0xe8; 32];
+/// The test collection key.
+const COLLECTION_KEY: [u8; 32] = [0xe9; 32];
+/// The fixed nonces of the collection-key wraps: the first record's, then the second record's two.
+const COLLECTION_WRAP_NONCES: [[u8; 24]; 3] = [[0xca; 24], [0xcb; 24], [0xcc; 24]];
 
 /// The host's authorisation keypair in the vectors.
 ///
@@ -146,6 +160,7 @@ pub fn generated_files(repository_root: &Path) -> Result<Vec<(&'static str, Stri
         (ENVELOPES_FILE_NAME, render(&envelopes()?)),
         (KDF_FILE_NAME, render(&derivations()?)),
         (RELAY_FILE_NAME, render(&relay_signatures(repository_root)?)),
+        (COLLECTION_KEYS_FILE_NAME, render(&collection_keys()?)),
     ])
 }
 
@@ -792,6 +807,174 @@ fn envelopes() -> Result<Value> {
                 {"plaintext_bytes": 204800, "bucket_bytes": mailbox_size_bucket(204800)},
             ],
         },
+    }))
+}
+
+/// Seals one collection-key wrap under a fixed nonce, as a reproducible vector must.
+///
+/// A real wrap draws its own nonce, which a vector cannot use; everything else is the ordinary
+/// plaintext, and the vector is checked through the ordinary opening path before it is published.
+fn fixed_collection_wrap(
+    sender: &StoredEnvelopeKeyPair,
+    recipient: &StoredEnvelopeKeyPair,
+    context: CollectionKeyWrapContext,
+    nonce: [u8; 24],
+) -> Result<SealedCollectionKeyWrap> {
+    let mut plaintext = collection_key_wrap_plaintext(&context, &COLLECTION_KEY)?;
+    let sealed = sodium::box_easy(
+        &plaintext,
+        &nonce,
+        recipient.public().as_bytes(),
+        sender.secret().expose(),
+    );
+    sodium::memzero(&mut plaintext);
+    Ok(SealedCollectionKeyWrap {
+        context,
+        nonce: Nonce192::from_bytes(nonce),
+        ciphertext: Bytes::new(sealed?),
+    })
+}
+
+/// Describes one member's keys in a vector document.
+fn collection_member_keys(
+    authorisation: &AuthorisationKeyPair,
+    authorisation_seed: [u8; 32],
+    envelope: &StoredEnvelopeKeyPair,
+    envelope_seed: [u8; 32],
+) -> Value {
+    json!({
+        "authorisation_seed_hex": hex::encode(authorisation_seed),
+        "authorisation_public_key_hex": hex::encode(authorisation.public().as_bytes()),
+        "authorisation_key_id_hex": hex::encode(authorisation.key_id().as_bytes()),
+        "stored_envelope_seed_hex": hex::encode(envelope_seed),
+        "stored_envelope_public_key_hex": hex::encode(envelope.public().as_bytes()),
+        "stored_envelope_key_id_hex": hex::encode(envelope.key_id().as_bytes()),
+        "installation_id": serde_json::to_value(installation_id(authorisation.public()))
+            .expect("an installation identifier is serialisable"),
+    })
+}
+
+/// Describes one record in a vector document.
+fn collection_record(name: &str, record: &CollectionKeyRecord) -> Result<Value> {
+    Ok(json!({
+        "name": name,
+        "record_json": serde_json::to_value(record).expect("a record is serialisable"),
+        "signing_input_hex": hex::encode(record.payload.signing_input()?),
+        "canonical_hex": hex::encode(kr_cbor::to_canonical_vec(record)?),
+        "digest_hex": hex::encode(record.digest()?.as_bytes()),
+    }))
+}
+
+/// The collection-key vectors: one wrap and the first two records of one collection.
+///
+/// Member A creates the collection alone, then adds member B at the same epoch: the second record
+/// wraps the same key for both, follows the first by its digest, and is signed by A. Both records
+/// pass the ordinary checks, and B's wrap opens through the ordinary path, before anything is
+/// written.
+fn collection_keys() -> Result<Value> {
+    let a_authorisation = client_authorisation_key()?;
+    let a_envelope = envelope_sender_key()?;
+    let b_authorisation = host_authorisation_key()?;
+    let b_envelope = envelope_recipient_key()?;
+    let collection_id = SyncCollectionId::new(Uuid::from_bytes([0x41; 16]));
+    let key_epoch = SyncKeyEpoch::new(0);
+    let context_for = |recipient: &StoredEnvelopeKeyPair| CollectionKeyWrapContext {
+        format: CollectionKeyWrapFormat::V1,
+        collection_id,
+        key_epoch,
+        sender_key_id: a_envelope.key_id(),
+        recipient_key_id: recipient.key_id(),
+    };
+    let member = |authorisation: &AuthorisationKeyPair,
+                  envelope: &StoredEnvelopeKeyPair,
+                  nonce: [u8; 24]|
+     -> Result<CollectionMember> {
+        Ok(CollectionMember {
+            authorisation: *authorisation.public(),
+            stored_envelope: *envelope.public(),
+            wrap: fixed_collection_wrap(&a_envelope, envelope, context_for(envelope), nonce)?,
+        })
+    };
+
+    let first_payload = CollectionKeyRecordPayload {
+        collection_id,
+        home: installation_id(a_authorisation.public()),
+        key_epoch,
+        revision: SyncKeyRecordRevision::new(1),
+        previous: Nullable::null(),
+        issuer_key_id: a_authorisation.key_id(),
+        issued_at_ms: TimestampMs::new(1_790_000_000_000),
+        members: vec![member(
+            &a_authorisation,
+            &a_envelope,
+            COLLECTION_WRAP_NONCES[0],
+        )?],
+    };
+    let first = CollectionKeyRecord {
+        signature: crate::sign::sign_object(
+            &a_authorisation,
+            COLLECTION_KEY_RECORD_DOMAIN,
+            &first_payload,
+        )?,
+        payload: first_payload,
+    };
+    let second_payload = CollectionKeyRecordPayload {
+        collection_id,
+        home: first.payload.home,
+        key_epoch,
+        revision: SyncKeyRecordRevision::new(2),
+        previous: Nullable::some(first.digest()?),
+        issuer_key_id: a_authorisation.key_id(),
+        issued_at_ms: TimestampMs::new(1_790_000_060_000),
+        members: vec![
+            member(&a_authorisation, &a_envelope, COLLECTION_WRAP_NONCES[2])?,
+            member(&b_authorisation, &b_envelope, COLLECTION_WRAP_NONCES[1])?,
+        ],
+    };
+    let second = CollectionKeyRecord {
+        signature: crate::sign::sign_object(
+            &a_authorisation,
+            COLLECTION_KEY_RECORD_DOMAIN,
+            &second_payload,
+        )?,
+        payload: second_payload,
+    };
+
+    crate::envelope::check_genesis(&first)?;
+    crate::envelope::check_successor(&first, &second)?;
+    let b_wrap = second.payload.members[1].wrap.clone();
+    let opened = crate::envelope::open_collection_key(
+        &b_envelope,
+        a_envelope.public(),
+        &b_wrap,
+        &context_for(&b_envelope),
+    )?;
+    if opened.expose() != &COLLECTION_KEY {
+        return Err(CryptoError::BindingMismatch {
+            what: "the collection key a published vector wraps",
+        });
+    }
+
+    Ok(json!({
+        "name": "collection-keys",
+        "description": "One synchronised collection's first two key records: member A creates it alone, then adds member B at the same epoch. Every wrap is CBOR([context, key]) sealed with crypto_box_easy from A's stored-envelope key.",
+        "note": "A real wrap always uses a fresh random 24-byte nonce. These nonces are fixed so the vector is reproducible. signing_input_hex is CBOR([\"kr-collection-keys/1\", payload]); digest_hex is the SHA-256 of the whole record's canonical encoding, which the next record names as its previous record.",
+        "domain": COLLECTION_KEY_RECORD_DOMAIN,
+        "collection_key_hex": hex::encode(COLLECTION_KEY),
+        "members": {
+            "a": collection_member_keys(&a_authorisation, CLIENT_AUTHORISATION_SEED, &a_envelope, SENDER_ENVELOPE_SEED),
+            "b": collection_member_keys(&b_authorisation, HOST_AUTHORISATION_SEED, &b_envelope, RECIPIENT_ENVELOPE_SEED),
+        },
+        "wrap": {
+            "description": "Member B's wrap in the second record.",
+            "context_json": serde_json::to_value(&b_wrap.context).expect("a context is serialisable"),
+            "canonical_hex": hex::encode(collection_key_wrap_plaintext(&b_wrap.context, &COLLECTION_KEY)?),
+            "sealed_json": serde_json::to_value(&b_wrap).expect("a wrap is serialisable"),
+        },
+        "records": [
+            collection_record("first", &first)?,
+            collection_record("second", &second)?,
+        ],
     }))
 }
 

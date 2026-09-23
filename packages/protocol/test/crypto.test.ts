@@ -367,3 +367,94 @@ describe('derivation vectors', () => {
     expect(document.recovery.recipient_subkey_id).toBe(2)
   })
 })
+
+describe('collection key vectors', () => {
+  const document = loadCryptoFixture('collection-keys.json')
+
+  /** Returns one entry of a decoded canonical map. */
+  function entry (value: ReturnType<typeof decodeCanonical>, key: string) {
+    if (value.kind !== 'map') throw new Error('a map was expected')
+    const found = value.entries.find(([name]) => name === key)
+    if (found === undefined) throw new Error(`the map has no ${key}`)
+    return found[1]
+  }
+
+  /** The identifier of an authorisation key, derived the way every key identifier is. */
+  function authorisationKeyId (raw: Uint8Array): string {
+    return sha256(signingInput('kr-key-id/1', [krText('authorisation'), krBytes(raw)]))
+  }
+
+  it('reproduces the wrap plaintext from its context', () => {
+    const canonical = hexToBytes(document.wrap.canonical_hex)
+    const value = decodeCanonical(canonical)
+    expect(value.kind).toBe('array')
+    if (value.kind !== 'array') throw new Error('unreachable')
+    expect(value.items).toHaveLength(2)
+    const key = value.items[1]
+    expect(key.kind).toBe('bytes')
+    if (key.kind !== 'bytes') throw new Error('unreachable')
+    expect(bytesToHex(key.value)).toBe(document.collection_key_hex)
+    expect(bytesToHex(encodeCanonical(value))).toBe(document.wrap.canonical_hex)
+
+    // The context inside the box is the one the wrap declares beside it: the format, the
+    // collection, the epoch and both key identifiers.
+    const context = value.items[0]
+    const declared = document.wrap.context_json
+    expect(entry(context, 'format')).toEqual(krText('kr-collection-key-wrap/1'))
+    expect(entry(context, 'collection_id')).toEqual(krBytes(uuidToBytes(declared.collection_id)))
+    expect(entry(context, 'key_epoch')).toEqual({ kind: 'int', value: BigInt(declared.key_epoch) })
+    expect(entry(context, 'sender_key_id')).toEqual(krBytes(fromBase64url(declared.sender_key_id)))
+    expect(entry(context, 'recipient_key_id')).toEqual(
+      krBytes(fromBase64url(declared.recipient_key_id))
+    )
+    expect(declared.sender_key_id).toBe(
+      Buffer.from(hexToBytes(document.members.a.stored_envelope_key_id_hex)).toString('base64url')
+    )
+    expect(declared.recipient_key_id).toBe(
+      Buffer.from(hexToBytes(document.members.b.stored_envelope_key_id_hex)).toString('base64url')
+    )
+
+    // crypto_box_easy adds its sixteen-byte tag and nothing else.
+    expect(fromBase64url(document.wrap.sealed_json.ciphertext).length).toBe(canonical.length + 16)
+  })
+
+  it('verifies each record under the member it names as issuer, and chains them', () => {
+    for (const record of document.records) {
+      const signing = hexToBytes(record.signing_input_hex)
+      const transcript = decodeCanonical(signing)
+      expect(transcript.kind).toBe('array')
+      if (transcript.kind !== 'array') throw new Error('unreachable')
+      expect(transcript.items).toHaveLength(2)
+      expect(transcript.items[0]).toEqual(krText(document.domain))
+
+      // The transcript's payload is the record's own payload, byte for byte.
+      const whole = decodeCanonical(hexToBytes(record.canonical_hex))
+      expect(transcript.items[1]).toEqual(entry(whole, 'payload'))
+
+      // The issuer is found among the members by the key identifier the record names, and the
+      // signature verifies under that member's authorisation key and no other.
+      const payload = record.record_json.payload
+      const issuerKeyId = bytesToHex(fromBase64url(payload.issuer_key_id))
+      const issuer = payload.members.find(
+        (member: { authorisation: string }) =>
+          authorisationKeyId(fromBase64url(member.authorisation)) === issuerKeyId
+      )
+      expect(issuer).toBeDefined()
+      const signature = Buffer.from(fromBase64url(record.record_json.signature))
+      const publicKey = ed25519PublicKey(fromBase64url(issuer.authorisation))
+      expect(verify(null, Buffer.from(signing), publicKey, signature)).toBe(true)
+      const altered = new Uint8Array(signing)
+      altered[altered.length - 1] ^= 0x01
+      expect(verify(null, Buffer.from(altered), publicKey, signature)).toBe(false)
+
+      // The digest the next record names is the SHA-256 of the whole canonical record.
+      expect(sha256(hexToBytes(record.canonical_hex))).toBe(record.digest_hex)
+    }
+
+    const [first, second] = document.records
+    expect(first.record_json.payload.previous).toBeNull()
+    expect(bytesToHex(fromBase64url(second.record_json.payload.previous))).toBe(first.digest_hex)
+    expect(second.record_json.payload.key_epoch).toBe(first.record_json.payload.key_epoch)
+    expect(second.record_json.payload.members).toHaveLength(2)
+  })
+})
