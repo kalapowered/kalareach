@@ -4155,8 +4155,9 @@ async fn kr_req_12_11_a_subscription_its_peer_could_not_receive_is_refused_whole
     // same answer before the state grows and after it. A connection that is refused was refused on
     // its first subscription, which is what keeps a refusal from ever taking a stream away: there
     // is no state of this session in which this connection subscribes and no later state in which
-    // it is refused.
-    for index in 0..40_u32 {
+    // it is refused. The state grows past what one page carries, so the peer served below reads it
+    // in more than one.
+    for index in 0..kr_worker::broker::MAX_SNAPSHOT_RESOURCES {
         owner
             .from_upstream(
                 format!(
@@ -4193,7 +4194,9 @@ async fn kr_req_12_11_a_subscription_its_peer_could_not_receive_is_refused_whole
     );
 
     // And a peer whose frame is the usual one subscribes over the same state and is served,
-    // resources and all, which is the other half of that claim.
+    // resources and all, which is the other half of that claim. The state is larger than one
+    // page, so the answer continues, and the pages together carry every resource the host holds,
+    // each once and each as the host holds it.
     let mut roomy = kr_ipc::client::LocalClient::connect(
         &endpoint,
         kr_protocol::local::LocalClientKind::Cli,
@@ -4203,13 +4206,9 @@ async fn kr_req_12_11_a_subscription_its_peer_could_not_receive_is_refused_whole
     .expect("connects");
     let roomy_attachment = attach_terminal(&mut roomy, session(), host.environment_id()).await;
     let served_answer = subscribe(&mut roomy, session(), roomy_attachment).await;
-    let mut installed: std::collections::BTreeSet<_> = served_answer
-        .agent_resources
-        .resources
-        .iter()
-        .map(|resource| resource.resource_id)
-        .collect();
+    let mut installed = served_answer.agent_resources.resources.clone();
     let mut after = served_answer.agent_resources.continue_after.0;
+    let mut pages = 1_usize;
     while let Some(resource_id) = after {
         let page = snapshot_page(
             &mut roomy,
@@ -4222,17 +4221,22 @@ async fn kr_req_12_11_a_subscription_its_peer_could_not_receive_is_refused_whole
         .await
         .expect("the rest of it is read")
         .agent_resources;
-        installed.extend(page.resources.iter().map(|resource| resource.resource_id));
         after = page.continue_after.0;
+        installed.extend(page.resources);
+        pages += 1;
+        assert!(pages < 1_000, "the paging makes progress");
     }
-    let held: std::collections::BTreeSet<_> = broker
-        .pending_resources()
-        .iter()
-        .map(|resource| resource.resource_id)
-        .collect();
+    assert!(
+        pages > 1,
+        "a state larger than one page is read in more than one"
+    );
+    let mut held = broker.pending_resources();
+    held.sort_by_key(|resource| resource.resource_id);
+    installed.sort_by_key(|resource| resource.resource_id);
     assert_eq!(
         installed, held,
-        "a peer that can receive a recovery is given the whole of it"
+        "a peer that can receive a recovery is given the whole of it, every resource once and \
+         whole"
     );
 
     // The refusal took nothing with it: the cramped connection still answers, and a snapshot of
