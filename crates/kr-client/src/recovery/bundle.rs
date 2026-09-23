@@ -483,18 +483,12 @@ impl BundleStore {
     }
 
     /// Reads the bundle, settles a lost write it recognises, and makes it this store's baseline.
-    ///
-    /// The bytes alone do not recognise a write at any place. A write lands past the place it
-    /// compared against, so its bytes read back anywhere else are a service answering with
-    /// something no write of it can be, and that is refused rather than settled.
     async fn adopt(&mut self, seed: &RecoverySeed) -> Result<Baseline> {
         let read = self.read(seed).await?;
-        if let Some(expected) = self
+        if self
             .unsettled()
-            .filter(|record| record.sent == read.sealed)
-            .map(|record| record.expected.0)
+            .is_some_and(|record| record.sent == read.sealed)
         {
-            diagnose_applied(expected, read.position)?;
             self.settle(LostWrite::Applied);
         }
         self.baseline = Some(read.clone());
@@ -515,6 +509,12 @@ impl BundleStore {
     /// a silent replacement of the bundle this store authenticated there, which is the one thing a
     /// compare-and-swap exists to prevent, and the settlement of a lost write already holds a
     /// receipt to the same rule.
+    ///
+    /// **And the bytes of this store's last write are only where that write can have landed.** A
+    /// write lands past the place it compared against, so its bytes read back at that place or
+    /// before it are a service answering with something no write of it can be. That holds whatever
+    /// the store knows of the write, answered and settled alike, and it is refused before anything
+    /// is taken from the read.
     async fn read(&self, seed: &RecoverySeed) -> Result<Baseline> {
         let read = read_bundle(self.service.as_ref(), &self.context, self.seen(), seed).await?;
         if let Some(baseline) = &self.baseline
@@ -525,6 +525,11 @@ impl BundleStore {
                 expected: baseline.position,
                 found: read.position,
             });
+        }
+        if let Some(write) = &self.last_write
+            && write.sent == read.sealed
+        {
+            diagnose_applied(write.expected.0, read.position)?;
         }
         Ok(read)
     }
@@ -1020,11 +1025,6 @@ impl BundleStore {
             }
         };
         let read = self.read(seed).await?;
-        // The write's own bytes are its own only at a place it can have landed at, past the one it
-        // compared against. Anywhere else they are a service answering the impossible.
-        if read.sealed == record.sent {
-            diagnose_applied(record.expected.0, read.position)?;
-        }
         if let Some(receipt) = receipt {
             // The receipt names the place this write took. A read behind it is a service that has
             // gone back, and that one place holding other bytes is two histories rather than a

@@ -2015,6 +2015,60 @@ async fn a_store_opened_after_a_restart_holds_reads_to_the_place_its_lost_write_
     store.fetch(&seed).await.expect("the bundle");
     assert_eq!(store.lost_write(), Some(LostWrite::Applied));
     assert_eq!(store.position(), Some(at(3)));
+
+    // Settling the write changes where it can be no more than answering it would: after the next
+    // restart its bytes at the place it compared against are refused all the same.
+    let mut store = store.restart(Arc::clone(&service) as Arc<_>);
+    assert_eq!(store.lost_write(), Some(LostWrite::Applied));
+    service.next_fetch_answers(at(2));
+    assert!(matches!(
+        store.fetch(&seed).await,
+        Err(RecoveryError::BundleDidNotMoveOn { found }) if found == at(2)
+    ));
+    assert_eq!(
+        store.position(),
+        None,
+        "nothing refused became the baseline"
+    );
+}
+
+#[tokio::test]
+async fn a_restarted_store_refuses_its_answered_writes_bytes_at_the_place_that_write_compared_against()
+ {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let second = AuthorisationKeyPair::generate().expect("another writer key");
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    for (enrolled, now) in [(&writer, 1_000), (&second, 2_000)] {
+        store
+            .enable_writer(&seed, &mut bundle, trusted(enrolled), TimestampMs::new(now))
+            .await
+            .expect("the bundle commits");
+    }
+
+    // The second write was answered, and a store opened after a restart knows that. Its bytes at
+    // the first place, the one it compared against, are still no place that write can be.
+    let mut store = store.restart(Arc::clone(&service) as Arc<_>);
+    assert_eq!(store.lost_write(), None);
+    service.next_fetch_answers(at(1));
+    assert!(matches!(
+        store.fetch(&seed).await,
+        Err(RecoveryError::BundleDidNotMoveOn { found }) if found == at(1)
+    ));
+    assert_eq!(
+        store.position(),
+        None,
+        "nothing refused became the baseline"
+    );
+
+    // Where the service holds them, they are read as ever.
+    assert_eq!(
+        store.fetch(&seed).await.expect("the bundle").revision.get(),
+        2
+    );
+    assert_eq!(store.position(), Some(at(2)));
 }
 
 #[tokio::test]
