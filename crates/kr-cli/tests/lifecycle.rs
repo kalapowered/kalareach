@@ -2582,13 +2582,17 @@ const BOUND_SLACK: Duration = Duration::from_millis(500);
 /// can have become closed, for its end to count as held to the bound.
 const EXIT_ALLOWANCE: Duration = Duration::from_secs(2);
 
-/// How far past its bound a worker may still be running, counted the same way, before that is a
-/// failure whatever the machine was doing.
+/// How far past its bound a worker may still be running, counted the same way, before the test
+/// takes it that the worker does not keep to its bound.
 ///
-/// The moment the wait begins is a moment after the session becomes closed, and nothing outside
-/// the worker sees it. Between the allowance and this limit a late end cannot be told from a late
-/// start, and the attempt shows nothing either way; a worker that waits too long every time is
-/// missed in every attempt, which fails the test all the same.
+/// This is a watchdog, and it rests on an assumption about the host: that no machine this suite
+/// runs on starts a worker's wait, or ends the worker once the wait is over, this late. Nothing
+/// outside the worker sees when the wait begins, so a late end cannot be told from a late start;
+/// between the allowance and this limit an attempt shows nothing either way, and a worker that
+/// waits too long every time is missed in every attempt, which fails the test all the same. The
+/// limit applies only to an attempt whose readings of `kr status` place the closure. One they
+/// cannot place shows nothing either way, and the watch's own liveness bound still fails a worker
+/// that never ends.
 const EXIT_LIMIT: Duration = Duration::from_secs(10);
 
 /// How closely the readings of `kr status` have to place the moment the session became closed for
@@ -2607,8 +2611,9 @@ const PLACEMENT: Duration = Duration::from_secs(1);
 /// the worker owes can end it sooner than that time and the bound. The readings of `kr status`
 /// place the moment the session became closed between the last one that found it open and the one
 /// that found it closed. Measured from the earlier of the two, an end within the bound and an
-/// allowance is held to the bound, and a worker still running long after that fails; an end in
-/// between, or readings too far apart to place the moment, shows nothing either way.
+/// allowance is held to the bound, and where the readings place the moment a worker still running
+/// long after that fails; an end in between, or readings too far apart to place the moment, shows
+/// nothing either way.
 ///
 /// Both connections are made to hold far more output than any local transport this product runs
 /// on holds: two megabytes, where a socket or a pipe takes a few hundred kilobytes at the most. A
@@ -2723,12 +2728,14 @@ fn stalled_attachments(host: &Host) -> (SessionId, Result<(), String>) {
          still owed the closure had not read it",
         since(end.gone_at)
     );
-    assert!(
-        after_became(end.running_at) <= NOTICE_BOUND + EXIT_LIMIT,
-        "the worker was still running {:?} after its session became closed, long past its bound",
-        after_became(end.running_at)
-    );
-    if !placed {
+    if placed {
+        assert!(
+            after_became(end.running_at) <= NOTICE_BOUND + EXIT_LIMIT,
+            "the worker was still running {:?} after its session became closed, long past its \
+             bound",
+            after_became(end.running_at)
+        );
+    } else {
         missed.push(format!(
             "the readings of kr status could not place when the session became closed: between \
              {:?} and {:?} after the closure's record",
