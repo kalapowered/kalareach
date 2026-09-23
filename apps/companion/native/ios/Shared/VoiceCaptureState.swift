@@ -123,10 +123,13 @@ public struct VoiceAuthorityGate: Sendable {
 /// - the person has not muted the microphone;
 /// - the system has not taken it: an interruption such as a phone call, or capture suspended;
 /// - the audio route is settled on a device that has an input;
+/// - the platform's recorder reports itself running. Until it starts, and after it stops or fails,
+///   nothing is being recorded, and the display says the microphone is unavailable rather than on;
 /// - the call has not been stopped. A stopped gate never opens again.
 ///
 /// It also keeps the intervals in which capture was on, so a claim that something was said when
-/// nothing could have been heard is refused from this device's own record.
+/// nothing could have been heard is refused from this device's own record. The record answers for
+/// the past only: an instant later than the time it is asked at is not one anything was heard in.
 ///
 /// Every method takes the time from its caller, in milliseconds on the monotonic clock, so tests
 /// drive time instead of waiting for it. Every method holds one lock: the system reports
@@ -158,6 +161,7 @@ public final class VoiceCaptureGate: @unchecked Sendable {
     private var taken = Taken.none
     private var routeChanging = false
     private var inputAvailable = true
+    private var recorderRunning = false
     private var stopped = false
     private var openedAtMs: UInt64?
     private var openedUntilMs: UInt64 = .max
@@ -225,6 +229,17 @@ public final class VoiceCaptureGate: @unchecked Sendable {
         }
     }
 
+    /// Whether the platform's recorder is running, as the platform reports it.
+    ///
+    /// Reported by the audio device itself: when it starts, when it stops and when it fails. A
+    /// recorder that has not started heard nothing, whatever the call was permitted to do.
+    public func recorder(running: Bool, nowMs: UInt64) {
+        locked {
+            recorderRunning = running
+            settle(nowMs)
+        }
+    }
+
     /// Stops the gate for good.
     public func stop(nowMs: UInt64) {
         locked {
@@ -250,7 +265,7 @@ public final class VoiceCaptureGate: @unchecked Sendable {
         locked {
             settle(nowMs)
             guard !stopped, let held = permit, nowMs < held.deadlineMs else { return .idle }
-            if !inputAvailable { return .unavailable }
+            if !inputAvailable || !recorderRunning { return .unavailable }
             if routeChanging { return .routeChanging }
             switch taken {
             case .interrupted: return .interrupted
@@ -260,21 +275,36 @@ public final class VoiceCaptureGate: @unchecked Sendable {
         }
     }
 
-    /// Whether the microphone was carrying speech at `atMs`.
+    /// Whether the microphone was carrying speech at `atMs`, asked at `nowMs`.
     ///
-    /// Answered from the intervals this gate kept. An instant older than the oldest kept interval
-    /// answers false: a record that no longer reaches back that far cannot vouch for it.
-    public func couldHaveHeard(atMs: UInt64) -> Bool {
+    /// Answered from the intervals this gate kept. An instant later than `nowMs` answers false: a
+    /// permit that is still running is permission to capture, not a record that anything was heard.
+    /// An instant older than the oldest kept interval answers false too: a record that no longer
+    /// reaches back that far cannot vouch for it.
+    public func couldHaveHeard(atMs: UInt64, nowMs: UInt64) -> Bool {
         locked {
+            settle(nowMs)
+            if atMs > nowMs { return false }
             if let open = openedAtMs, atMs >= open, atMs < openedUntilMs { return true }
             return heard.contains { $0.contains(atMs) }
+        }
+    }
+
+    /// Whether a permit is running: given, not withdrawn, not stopped and not past its deadline.
+    ///
+    /// What the platform's audio device is allowed to run for. Whether the microphone carries
+    /// speech is ``captureEnabled(nowMs:)``'s, which asks everything else as well.
+    public func live(nowMs: UInt64) -> Bool {
+        locked {
+            guard !stopped, let held = permit else { return false }
+            return nowMs < held.deadlineMs
         }
     }
 
     private func enabled(_ nowMs: UInt64) -> Bool {
         guard let held = permit else { return false }
         return !stopped && nowMs < held.deadlineMs && !mutedByPerson && taken == .none
-            && !routeChanging && inputAvailable
+            && !routeChanging && inputAvailable && recorderRunning
     }
 
     /// Opens or closes the interval capture is in, to match what is true now.
@@ -293,6 +323,238 @@ public final class VoiceCaptureGate: @unchecked Sendable {
             openedAtMs = nil
             openedUntilMs = .max
         }
+    }
+
+    private func locked<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
+    }
+}
+
+/// The switches a call's media runs through on the platform.
+///
+/// ``VoiceCallControl`` sets every one of them, from its gate, in one place, and nothing else sets
+/// them. An implementation holds every switch off from the moment its connection exists, before
+/// anything is negotiated, so there is no window in which WebRTC could start recording on its own.
+public protocol VoiceMediaSwitches: AnyObject {
+    /// Whether the platform's audio device runs at all: the recorder, and the player beside it.
+    func setAudioDevice(_ on: Bool)
+    /// Whether what the recorder hears is carried to the provider.
+    func setMicrophone(_ on: Bool)
+    /// Whether the provider's voice comes out of this device.
+    func setPlayback(_ on: Bool)
+}
+
+/// What a call needs from the platform besides its media.
+public protocol VoiceCallPlatform: AnyObject {
+    /// This device's monotonic clock, in milliseconds.
+    func nowMs() -> UInt64
+    /// The wall clock, in milliseconds since the epoch.
+    func epochMs() -> UInt64
+    /// Opens the audio session for the call. Throws when the platform refuses it.
+    func activate() throws
+    /// Gives the audio session back.
+    func deactivate()
+    /// Runs `task` once at `atMs` on the monotonic clock, on a queue of the call's own rather than
+    /// the main queue. The answer cancels it.
+    func schedule(atMs: UInt64, _ task: @escaping () -> Void) -> () -> Void
+    /// Tells the screen what the microphone is doing.
+    func publish(_ state: VoiceCaptureState)
+    /// The call has ended: whatever the platform holds for it, the connection first, goes now.
+    func ended()
+}
+
+/// A call's hold on the microphone, from the host's answer to the end of the call.
+///
+/// Every decision about the microphone is made here, and the platform code around it only carries
+/// the decisions out, so the tests run the same code the application does. A permitted call goes
+/// through two steps, and capture waits for both:
+///
+/// 1. ``permit(voiceSessionId:closesAtEpochMs:)`` takes the host's answer: the voice session and
+///    the moment the service closes the call. It refuses a stopped or already permitted call and
+///    an answer whose moment has passed, and opens the audio session; a refusal ends the call. The
+///    gate is permitted with the clock read again after the session opened, so time the platform
+///    took counts against the deadline instead of extending it, and the call's end is scheduled for
+///    that moment on the call's own queue.
+/// 2. The platform's recorder reports itself running (``recorder(running:)``). Only then may
+///    capture carry speech.
+///
+/// Every change ends in `apply`, the one place a switch is set. Any change made after the deadline
+/// ends the call there and then, so a late timer never leaves the microphone open.
+public final class VoiceCallControl: @unchecked Sendable {
+    /// The furthest deadline a call is given: a day. No call runs that long.
+    public static let longestCallMs: UInt64 = 86_400_000
+
+    private let platform: VoiceCallPlatform
+    private let switches: VoiceMediaSwitches
+    private let gate: VoiceCaptureGate
+    /// Recursive, because the platform can report a route change on the thread that is opening or
+    /// closing the audio session, and that report takes this lock too.
+    private let lock = NSRecursiveLock()
+    private var deviceOn = false
+    private var sessionOpen = false
+    private var cancelExpiry: (() -> Void)?
+    private var playbackMuted = false
+    private var interrupted = false
+    private var stopped = false
+
+    public init(platform: VoiceCallPlatform, switches: VoiceMediaSwitches, keptIntervals: Int = 64) {
+        self.platform = platform
+        self.switches = switches
+        gate = VoiceCaptureGate(keptIntervals: keptIntervals)
+        switches.setMicrophone(false)
+        switches.setPlayback(false)
+        switches.setAudioDevice(false)
+    }
+
+    /// Whether the person muted their own microphone.
+    public var isMutedByPerson: Bool { gate.isMutedByPerson }
+
+    /// Whether the person silenced the provider's voice on this device.
+    public var isPlaybackMuted: Bool { locked { playbackMuted } }
+
+    /// Whether the call has ended. It never starts again.
+    public var isStopped: Bool { locked { stopped } }
+
+    /// Takes the host's answer to the start: the voice session and the moment the service closes
+    /// the call, in milliseconds since the epoch.
+    ///
+    /// - Returns: true when the gate is permitted; capture then waits for the recorder to start.
+    ///   False when the call is stopped or already permitted, and false with the call ended when
+    ///   the moment has passed or the platform refused the audio session.
+    public func permit(voiceSessionId: String, closesAtEpochMs: UInt64) -> Bool {
+        locked {
+            guard !stopped, gate.current == nil else { return false }
+            let wall = platform.epochMs()
+            guard closesAtEpochMs > wall else {
+                stopLocked()
+                return false
+            }
+            let deadline = platform.nowMs() + min(closesAtEpochMs - wall, Self.longestCallMs)
+            do {
+                try platform.activate()
+            } catch {
+                stopLocked()
+                return false
+            }
+            sessionOpen = true
+            let now = platform.nowMs()
+            guard gate.permit(voiceSessionId: voiceSessionId, deadlineMs: deadline, nowMs: now) != nil else {
+                stopLocked()
+                return false
+            }
+            cancelExpiry = platform.schedule(atMs: deadline) { [weak self] in self?.stop() }
+            applyLocked(now)
+            return true
+        }
+    }
+
+    /// The platform's recorder started, stopped or failed. A start counts only while the audio
+    /// device is on; one reported while it is off is from before, or from a device this call did
+    /// not turn on.
+    public func recorder(running: Bool) {
+        change { now in gate.recorder(running: running && deviceOn, nowMs: now) }
+    }
+
+    /// The person's own mute. Nothing the system does changes it.
+    public func setMutedByPerson(_ muted: Bool) {
+        change { now in gate.setMutedByPerson(muted, nowMs: now) }
+    }
+
+    /// The person silencing the provider's voice, which changes playback and nothing else.
+    public func setPlaybackMuted(_ muted: Bool) {
+        change { _ in playbackMuted = muted }
+    }
+
+    /// An interruption began or ended; `mayResume` is the system's own word on resuming. Without it
+    /// the microphone and the speaker stay closed until a new call.
+    public func interruption(began: Bool, mayResume: Bool) {
+        change { now in
+            interrupted = began || !mayResume
+            let taken: VoiceCaptureGate.Taken = began ? .interrupted : (mayResume ? .none : .suspended)
+            gate.taken(taken, nowMs: now)
+        }
+    }
+
+    /// The audio services were reset, and everything the session held is gone.
+    public func reset() {
+        change { now in
+            interrupted = true
+            gate.taken(.suspended, nowMs: now)
+        }
+    }
+
+    /// The audio route, as the platform reports it.
+    public func route(changing: Bool, inputAvailable: Bool) {
+        change { now in gate.route(changing: changing, inputAvailable: inputAvailable, nowMs: now) }
+    }
+
+    /// Something about the media changed, such as a track arriving, and the switches are set again.
+    public func refresh() {
+        change { _ in }
+    }
+
+    /// Whether the microphone was carrying speech at `atMs` on the monotonic clock. Never later
+    /// than now.
+    public func couldHaveHeard(atMs: UInt64) -> Bool {
+        gate.couldHaveHeard(atMs: atMs, nowMs: platform.nowMs())
+    }
+
+    /// What the microphone is doing now.
+    public func displayed() -> VoiceCaptureState { gate.displayed(nowMs: platform.nowMs()) }
+
+    /// Ends the call. Local and immediate, and the second time does nothing.
+    public func stop() {
+        locked { stopLocked() }
+    }
+
+    private func change(_ body: (UInt64) -> Void) {
+        locked {
+            guard !stopped else { return }
+            let now = platform.nowMs()
+            body(now)
+            applyLocked(now)
+        }
+    }
+
+    private func applyLocked(_ now: UInt64) {
+        if gate.current != nil, !gate.live(nowMs: now) {
+            // The deadline passed. The scheduled end may be late or may never run; this change is
+            // the call's end instead.
+            stopLocked()
+            return
+        }
+        let live = gate.live(nowMs: now)
+        if live != deviceOn {
+            // A recorder is heard from afresh each time the device comes on: until the platform
+            // reports it started, nothing is being recorded, and a report from before does not count.
+            gate.recorder(running: false, nowMs: now)
+            deviceOn = live
+        }
+        let shown = gate.displayed(nowMs: now)
+        switches.setAudioDevice(live)
+        switches.setMicrophone(gate.captureEnabled(nowMs: now))
+        switches.setPlayback(live && !playbackMuted && !interrupted)
+        platform.publish(shown)
+    }
+
+    private func stopLocked() {
+        guard !stopped else { return }
+        stopped = true
+        gate.stop(nowMs: platform.nowMs())
+        cancelExpiry?()
+        cancelExpiry = nil
+        switches.setMicrophone(false)
+        switches.setPlayback(false)
+        switches.setAudioDevice(false)
+        deviceOn = false
+        if sessionOpen {
+            platform.deactivate()
+            sessionOpen = false
+        }
+        platform.publish(.idle)
+        platform.ended()
     }
 
     private func locked<T>(_ body: () -> T) -> T {

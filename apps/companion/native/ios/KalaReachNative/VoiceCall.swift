@@ -34,12 +34,12 @@ public protocol VoiceCallObserver: AnyObject {
 /// in §15 ¶1's sense: a different provider replaces the signalling around this object and replaces
 /// nothing inside it.
 ///
-/// A call has two stages, and the microphone belongs only to the second. Building it makes the
-/// connection and a microphone track that is off, for the offer and the answer; no audio session
-/// is opened and nothing is captured. ``permit(voiceSessionId:closesAtEpochMs:)`` is given the
-/// host's answer to the start, and only then is the session opened and capture allowed. Whether
-/// the microphone is on is decided by one ``VoiceCaptureGate`` from the permit, the person's mute,
-/// what the system did and the route, and the call stops itself when its deadline comes.
+/// Every decision about the microphone is ``VoiceCallControl``'s; this class carries them out.
+/// WebRTC's audio unit is held off before the connection exists, so negotiating starts nothing on
+/// its own. ``permit(voiceSessionId:closesAtEpochMs:)`` is given the host's answer to the start;
+/// the control opens the audio session, turns the audio unit on, and lets the microphone carry
+/// speech once the recorder reports itself running. Timers and the platform's reports run on this
+/// call's own queue, never the main one.
 public final class VoiceCall: NSObject {
     /// Shared across calls, because building one is expensive and it holds the audio device.
     private static let factory: RTCPeerConnectionFactory = {
@@ -54,27 +54,25 @@ public final class VoiceCall: NSObject {
     private let microphone: RTCAudioTrack
     private weak var observer: VoiceCallObserver?
     private var announcedFirstAudio = false
-
-    /// Held by every change to what the microphone and the speaker are allowed to do.
-    ///
-    /// Recursive, because opening or closing the audio session can report a route change on the
-    /// thread that is doing it, and that report takes this lock too.
-    private let lock = NSRecursiveLock()
-    private let gate = VoiceCaptureGate()
-    private var stopped = false
-    private var expiry: DispatchWorkItem?
+    /// The call's own queue: its timer, and every report from the audio session and WebRTC.
+    private let queue: DispatchQueue
+    /// Every decision about the microphone, the speaker and the end of this call.
+    private var control: VoiceCallControl!
 
     /// Whether the person has muted their own microphone.
-    public var isMutedByPerson: Bool { gate.isMutedByPerson }
+    public var isMutedByPerson: Bool { control.isMutedByPerson }
 
-    /// Whether the remote voice is being played out of this device.
-    public private(set) var isPlaybackMuted = false
+    /// Whether the remote voice is silenced on this device.
+    public var isPlaybackMuted: Bool { control.isPlaybackMuted }
 
-    /// Builds a call for its offer and its answer, with the microphone off.
+    /// Builds a call for its offer and its answer, with the audio unit and the microphone off.
     ///
     /// No audio session is opened here: that waits for ``permit(voiceSessionId:closesAtEpochMs:)``,
     /// so nothing but a call the host permitted can open the microphone.
     public init(observer: VoiceCallObserver) throws {
+        // Before the factory or any connection exists, so the audio unit cannot start by itself.
+        AudioSession.shared.holdAudioUntilACallTurnsItOn()
+
         let configuration = RTCConfiguration()
         // The provider's answer names its own candidates. No KalaReach STUN or TURN server is
         // configured here: media travels between this device and the provider, and a relay of
@@ -107,69 +105,32 @@ public final class VoiceCall: NSObject {
             optionalConstraints: nil
         ))
         microphone = VoiceCall.factory.audioTrack(with: source, trackId: "kr-voice-microphone")
-        // Off until the call is permitted. The offer describes a track, and a described track
-        // carries nothing until the gate lets it.
+        // Off until the control turns it on. The offer describes a track, and a described track
+        // carries nothing until the control lets it.
         microphone.isEnabled = false
+        queue = DispatchQueue(label: "to.kala.reach.companion.voice-call")
         self.observer = observer
         super.init()
+        control = VoiceCallControl(platform: Platform(call: self), switches: Switches(call: self))
         connection.delegate = self
         connection.add(microphone, streamIds: ["kr-voice"])
     }
 
-    /// This device's monotonic clock, in milliseconds. The gate's deadlines are on it.
-    private static func nowMs() -> UInt64 { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
-
-    /// The furthest deadline a call is given, in milliseconds: a day.
-    private static let longestCallMs: UInt64 = 86_400_000
-
     /// Opens the microphone for a call the host started.
     ///
     /// Takes the host's answer: the voice session and the moment the service closes the call, in
-    /// UTC milliseconds. The audio session is opened here and nowhere else, and the call stops
-    /// itself when that moment comes, whether or not anything else happened.
+    /// UTC milliseconds. The audio session is opened here and nowhere else, the microphone waits
+    /// for the recorder to report itself running, and the call ends itself at that moment whether
+    /// or not anything else happened.
     ///
-    /// - Returns: false, and nothing opened, when this call is stopped, already permitted or past
-    ///   its deadline.
-    /// - Throws: ``VoiceAudioError/microphoneNotPermitted`` when the microphone is not available.
-    public func permit(voiceSessionId: String, closesAtEpochMs: UInt64) throws -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !stopped, gate.current == nil else { return false }
-        let wall = UInt64(Date().timeIntervalSince1970 * 1_000)
-        guard closesAtEpochMs > wall else { return false }
-        let now = VoiceCall.nowMs()
-        // No call runs for a day. A deadline further away than that closes the call at a day, never
-        // later, and keeps the arithmetic below inside its type whatever the answer said.
-        let deadline = now + min(closesAtEpochMs - wall, VoiceCall.longestCallMs)
-        try AudioSession.shared.activate(for: self)
-        guard gate.permit(voiceSessionId: voiceSessionId, deadlineMs: deadline, nowMs: now) != nil else {
-            try? AudioSession.shared.deactivate()
-            return false
-        }
-        let ends = DispatchWorkItem { [weak self] in self?.stop() }
-        expiry = ends
-        DispatchQueue.main.asyncAfter(
-            deadline: .now() + .milliseconds(Int(deadline - now)),
-            execute: ends
-        )
-        apply(now)
-        return true
+    /// - Returns: false, and the call ended, when the moment has passed or the audio session was
+    ///   refused; false and nothing changed when this call is stopped or already permitted.
+    public func permit(voiceSessionId: String, closesAtEpochMs: UInt64) -> Bool {
+        control.permit(voiceSessionId: voiceSessionId, closesAtEpochMs: closesAtEpochMs)
     }
 
     /// Whether the microphone was carrying speech at `atMs` on this device's monotonic clock.
-    public func couldHaveHeard(atMs: UInt64) -> Bool { gate.couldHaveHeard(atMs: atMs) }
-
-    /// Makes the microphone and the speaker what the gate says, and publishes the one state.
-    /// Called with ``lock`` held after every change.
-    private func apply(_ now: UInt64) {
-        microphone.isEnabled = gate.captureEnabled(nowMs: now)
-        let shown = gate.displayed(nowMs: now)
-        let speaker = !isPlaybackMuted && shown != .interrupted
-        for receiver in connection.receivers {
-            (receiver.track as? RTCAudioTrack)?.isEnabled = speaker
-        }
-        AudioSession.shared.publish(shown)
-    }
+    public func couldHaveHeard(atMs: UInt64) -> Bool { control.couldHaveHeard(atMs: atMs) }
 
     /// Makes this call's SDP offer.
     ///
@@ -187,7 +148,8 @@ public final class VoiceCall: NSObject {
         return description.sdp
     }
 
-    /// Applies the provider's SDP answer.
+    /// Applies the provider's SDP answer. It starts nothing: the audio unit stays off until the
+    /// call is permitted.
     public func accept(answerSdp: String) async throws {
         let answer = RTCSessionDescription(type: .answer, sdp: answerSdp)
         do {
@@ -200,73 +162,85 @@ public final class VoiceCall: NSObject {
     /// Stops the person's voice reaching the model, without ending the call.
     ///
     /// Local and immediate. Section 15 ¶10 requires local microphone and speaker mute to remain
-    /// available if the broker fails, so this touches the track and the audio session and nothing
-    /// that could be waiting on a network answer.
-    public func setMutedByPerson(_ muted: Bool) {
-        lock.lock()
-        defer { lock.unlock() }
-        let now = VoiceCall.nowMs()
-        gate.setMutedByPerson(muted, nowMs: now)
-        apply(now)
-    }
+    /// available if the broker fails, so this touches the track and nothing that could be waiting on
+    /// a network answer.
+    public func setMutedByPerson(_ muted: Bool) { control.setMutedByPerson(muted) }
 
     /// Stops the model's voice coming out of this device, without ending the call.
     ///
     /// This is **playback**, and §15 ¶13 is explicit that speech interruption stops playback and
     /// not a coding task. Nothing here cancels anything on a host.
-    public func setPlaybackMuted(_ muted: Bool) {
-        lock.lock()
-        defer { lock.unlock() }
-        isPlaybackMuted = muted
-        apply(VoiceCall.nowMs())
-    }
+    public func setPlaybackMuted(_ muted: Bool) { control.setPlaybackMuted(muted) }
 
     /// Ends the call and gives the microphone back.
     ///
     /// Local and immediate, for the same reason mute is.
-    public func stop() {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !stopped else { return }
-        stopped = true
-        gate.stop(nowMs: VoiceCall.nowMs())
-        expiry?.cancel()
-        expiry = nil
-        microphone.isEnabled = false
-        connection.close()
-        try? AudioSession.shared.deactivate()
+    public func stop() { control.stop() }
+
+    /// This device's monotonic clock, in milliseconds. The gate's deadlines are on it.
+    fileprivate static func nowMs() -> UInt64 { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
+
+    /// The platform, as the control sees it.
+    private final class Platform: VoiceCallPlatform {
+        private unowned let call: VoiceCall
+
+        init(call: VoiceCall) { self.call = call }
+
+        func nowMs() -> UInt64 { VoiceCall.nowMs() }
+
+        func epochMs() -> UInt64 { UInt64(Date().timeIntervalSince1970 * 1_000) }
+
+        func activate() throws { try AudioSession.shared.activate(for: call) }
+
+        func deactivate() { try? AudioSession.shared.deactivate() }
+
+        func schedule(atMs: UInt64, _ task: @escaping () -> Void) -> () -> Void {
+            let work = DispatchWorkItem(block: task)
+            // On the call's own queue, at the deadline on the same clock the gate uses.
+            call.queue.asyncAfter(deadline: DispatchTime(uptimeNanoseconds: atMs * 1_000_000), execute: work)
+            return { work.cancel() }
+        }
+
+        func publish(_ state: VoiceCaptureState) { AudioSession.shared.publish(state) }
+
+        func ended() { call.connection.close() }
+    }
+
+    /// The media, as the control sets it.
+    private final class Switches: VoiceMediaSwitches {
+        private unowned let call: VoiceCall
+
+        init(call: VoiceCall) { self.call = call }
+
+        func setAudioDevice(_ on: Bool) { AudioSession.shared.setAudioEnabled(on) }
+
+        func setMicrophone(_ on: Bool) { call.microphone.isEnabled = on }
+
+        func setPlayback(_ on: Bool) {
+            for receiver in call.connection.receivers {
+                (receiver.track as? RTCAudioTrack)?.isEnabled = on
+            }
+        }
     }
 }
 
 extension VoiceCall: AudioSessionEvents {
+    // Reported on the system's and WebRTC's own threads, and acted on on the call's queue.
+
     public func audioSessionInterruption(began: Bool, mayResume: Bool) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !stopped else { return }
-        let now = VoiceCall.nowMs()
-        // Began, or ended without the system's word to resume: the microphone stays closed. What
-        // the person chose, their own mute, is untouched either way and applies when it reopens.
-        let taken: VoiceCaptureGate.Taken = began ? .interrupted : (mayResume ? .none : .suspended)
-        gate.taken(taken, nowMs: now)
-        apply(now)
+        queue.async { [weak self] in self?.control.interruption(began: began, mayResume: mayResume) }
     }
 
     public func audioSessionRoute(changing: Bool, hasInput: Bool) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !stopped else { return }
-        let now = VoiceCall.nowMs()
-        gate.route(changing: changing, inputAvailable: hasInput, nowMs: now)
-        apply(now)
+        queue.async { [weak self] in self?.control.route(changing: changing, inputAvailable: hasInput) }
     }
 
     public func audioSessionReset() {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !stopped else { return }
-        let now = VoiceCall.nowMs()
-        gate.taken(.suspended, nowMs: now)
-        apply(now)
+        queue.async { [weak self] in self?.control.reset() }
+    }
+
+    public func audioSessionRecorder(running: Bool) {
+        queue.async { [weak self] in self?.control.recorder(running: running) }
     }
 }
 
@@ -279,7 +253,10 @@ extension VoiceCall: RTCPeerConnectionDelegate {
     }
 
     public func peerConnection(_: RTCPeerConnection, didAdd receiver: RTCRtpReceiver, streams _: [RTCMediaStream]) {
-        guard receiver.track is RTCAudioTrack, !announcedFirstAudio else { return }
+        guard receiver.track is RTCAudioTrack else { return }
+        // A track arrives playing; the control decides whether it may.
+        queue.async { [weak self] in self?.control.refresh() }
+        guard !announcedFirstAudio else { return }
         announcedFirstAudio = true
         observer?.voiceCallReceivedFirstAudio(self)
     }

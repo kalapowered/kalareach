@@ -16,11 +16,14 @@ package to.kala.reach.companion.mobile
  * - the system has not taken it: audio focus lost to another application or a phone call, or
  *   capture suspended;
  * - the audio route is settled on a device that has an input;
+ * - the platform's recorder reports itself running. Until it starts, and after it stops or fails,
+ *   nothing is being recorded, and the display says the microphone is unavailable rather than on;
  * - the call has not been stopped. A stopped gate never opens again.
  *
  * It also keeps the intervals in which capture was on, so a claim that something was said when
  * nothing could have been heard is refused from this device's own record rather than from anything
- * that arrived over the call.
+ * that arrived over the call. The record answers for the past only: an instant later than the time
+ * it is asked at is not one anything was heard in.
  *
  * Every method takes the time from its caller, on the monotonic clock, so the tests drive time
  * instead of waiting for it, and nothing here touches an Android class. Every method is
@@ -49,6 +52,7 @@ class VoiceCaptureGate(private val keptIntervals: Int = 64) {
     private var taken = Taken.NONE
     private var routeChanging = false
     private var inputAvailable = true
+    private var recorderRunning = false
     private var stopped = false
 
     /** Where the interval capture is in now began, and the deadline it cannot outlast. */
@@ -119,6 +123,18 @@ class VoiceCaptureGate(private val keptIntervals: Int = 64) {
         settle(nowMs)
     }
 
+    /**
+     * Whether the platform's recorder is running, as the platform reports it.
+     *
+     * Reported by the audio device itself: when it starts, when it stops and when it fails. A
+     * recorder that has not started heard nothing, whatever the call was permitted to do.
+     */
+    @Synchronized
+    fun recorder(running: Boolean, nowMs: Long) {
+        recorderRunning = running
+        settle(nowMs)
+    }
+
     /** Stops the gate for good. */
     @Synchronized
     fun stop(nowMs: Long) {
@@ -146,7 +162,7 @@ class VoiceCaptureGate(private val keptIntervals: Int = 64) {
         val held = permit
         return when {
             stopped || held == null || nowMs >= held.deadlineMs -> VoiceCaptureState.IDLE
-            !inputAvailable -> VoiceCaptureState.UNAVAILABLE
+            !inputAvailable || !recorderRunning -> VoiceCaptureState.UNAVAILABLE
             routeChanging -> VoiceCaptureState.ROUTE_CHANGING
             taken == Taken.FOCUS_LOST -> VoiceCaptureState.FOCUS_LOST
             taken == Taken.SUSPENDED -> VoiceCaptureState.SUSPENDED_BY_SYSTEM
@@ -156,16 +172,32 @@ class VoiceCaptureGate(private val keptIntervals: Int = 64) {
     }
 
     /**
-     * Whether the microphone was carrying speech at `atMs`.
+     * Whether the microphone was carrying speech at `atMs`, asked at `nowMs`.
      *
-     * Answered from the intervals this gate kept. An instant older than the oldest kept interval
-     * answers false: a record that no longer reaches back that far cannot vouch for it.
+     * Answered from the intervals this gate kept. An instant later than `nowMs` answers false: a
+     * permit that is still running is permission to capture, not a record that anything was heard.
+     * An instant older than the oldest kept interval answers false too: a record that no longer
+     * reaches back that far cannot vouch for it.
      */
     @Synchronized
-    fun couldHaveHeard(atMs: Long): Boolean {
+    fun couldHaveHeard(atMs: Long, nowMs: Long): Boolean {
+        settle(nowMs)
+        if (atMs > nowMs) return false
         val open = openedAtMs
         if (open != null && atMs >= open && atMs < openedUntilMs) return true
         return heard.any { atMs in it }
+    }
+
+    /**
+     * Whether a permit is running: given, not withdrawn, not stopped and not past its deadline.
+     *
+     * What the platform's audio device is allowed to run for. Whether the microphone carries
+     * speech is [captureEnabled]'s, which asks everything else as well.
+     */
+    @Synchronized
+    fun live(nowMs: Long): Boolean {
+        val held = permit ?: return false
+        return !stopped && nowMs < held.deadlineMs
     }
 
     private fun enabled(nowMs: Long): Boolean {
@@ -175,7 +207,8 @@ class VoiceCaptureGate(private val keptIntervals: Int = 64) {
             !mutedByPerson &&
             taken == Taken.NONE &&
             !routeChanging &&
-            inputAvailable
+            inputAvailable &&
+            recorderRunning
     }
 
     /** Opens or closes the interval capture is in, to match what is true now. */

@@ -16,10 +16,12 @@ import org.junit.Test
  * this device kept.
  */
 class VoiceCaptureGateTest {
+    /** A permitted gate whose recorder reported itself running at the same moment. */
     private fun permitted(nowMs: Long = 1_000, deadlineMs: Long = 61_000): Pair<VoiceCaptureGate, VoiceCaptureGate.Permit> {
         val gate = VoiceCaptureGate()
         val permit = gate.permit("voice-session-1", deadlineMs, nowMs)
         assertNotNull("a current answer permits the call", permit)
+        gate.recorder(running = true, nowMs = nowMs)
         return gate to permit!!
     }
 
@@ -32,7 +34,31 @@ class VoiceCaptureGateTest {
         gate.setMutedByPerson(false, 1_100)
         gate.taken(VoiceCaptureGate.Taken.NONE, 1_200)
         gate.route(changing = false, inputAvailable = true, nowMs = 1_300)
+        gate.recorder(running = true, nowMs = 1_350)
         assertFalse("no event other than a permit opens the microphone", gate.captureEnabled(1_400))
+        assertFalse(gate.live(1_400))
+    }
+
+    /**
+     * KR-REQ-15.36: a permitted call captures nothing until the recorder reports itself running,
+     * and says the microphone is unavailable until then and once it fails.
+     */
+    @Test
+    fun capture_waits_for_the_recorder_and_ends_with_it() {
+        val gate = VoiceCaptureGate()
+        assertNotNull(gate.permit("voice-session-1", 61_000, 1_000))
+        assertTrue(gate.live(1_000))
+        assertFalse("the recorder has not started", gate.captureEnabled(1_000))
+        assertEquals(VoiceCaptureState.UNAVAILABLE, gate.displayed(1_000))
+        gate.recorder(running = true, nowMs = 1_200)
+        assertTrue(gate.captureEnabled(1_200))
+        assertEquals(VoiceCaptureState.CAPTURING, gate.displayed(1_200))
+        gate.recorder(running = false, nowMs = 5_000)
+        assertFalse("a recorder that failed hears nothing", gate.captureEnabled(5_000))
+        assertEquals(VoiceCaptureState.UNAVAILABLE, gate.displayed(5_000))
+        assertFalse(gate.couldHaveHeard(1_100, 6_000))
+        assertTrue(gate.couldHaveHeard(1_200, 6_000))
+        assertFalse(gate.couldHaveHeard(5_000, 6_000))
     }
 
     /** KR-REQ-15.34: a permit is given once, by an answer that is still current. */
@@ -54,9 +80,23 @@ class VoiceCaptureGateTest {
         val (gate, _) = permitted(nowMs = 1_000, deadlineMs = 11_000)
         assertTrue(gate.captureEnabled(10_999))
         assertFalse(gate.captureEnabled(11_000))
+        assertFalse(gate.live(11_000))
         assertEquals(VoiceCaptureState.IDLE, gate.displayed(15_000))
-        assertTrue(gate.couldHaveHeard(10_999))
-        assertFalse("capture ended at the deadline, not when it was next asked", gate.couldHaveHeard(12_000))
+        assertTrue(gate.couldHaveHeard(10_999, 15_000))
+        assertFalse(
+            "capture ended at the deadline, not when it was next asked",
+            gate.couldHaveHeard(12_000, 15_000),
+        )
+    }
+
+    /** KR-ACC-014: a running permit vouches for nothing that has not happened yet. */
+    @Test
+    fun a_future_instant_is_never_vouched_for() {
+        val (gate, _) = permitted(nowMs = 1_000, deadlineMs = 61_000)
+        assertTrue(gate.captureEnabled(1_000))
+        assertFalse("permission to capture is not a record of speech", gate.couldHaveHeard(50_000, 1_000))
+        assertTrue(gate.couldHaveHeard(1_000, 1_000))
+        assertTrue(gate.couldHaveHeard(20_000, 30_000))
     }
 
     /**
@@ -116,21 +156,25 @@ class VoiceCaptureGateTest {
         gate.setMutedByPerson(true, 5_000)
         gate.setMutedByPerson(false, 9_000)
 
-        assertTrue(gate.couldHaveHeard(1_000))
-        assertTrue(gate.couldHaveHeard(4_999))
-        assertFalse("muted from 5 s to 9 s", gate.couldHaveHeard(5_000))
-        assertFalse(gate.couldHaveHeard(8_999))
-        assertTrue("the interval capture is in now", gate.couldHaveHeard(9_000))
-        assertFalse("before the call was permitted", gate.couldHaveHeard(999))
+        assertTrue(gate.couldHaveHeard(1_000, 10_000))
+        assertTrue(gate.couldHaveHeard(4_999, 10_000))
+        assertFalse("muted from 5 s to 9 s", gate.couldHaveHeard(5_000, 10_000))
+        assertFalse(gate.couldHaveHeard(8_999, 10_000))
+        assertTrue("the interval capture is in now", gate.couldHaveHeard(9_000, 10_000))
+        assertFalse("before the call was permitted", gate.couldHaveHeard(999, 10_000))
 
         val bounded = VoiceCaptureGate(keptIntervals = 2)
         bounded.permit("s", 100_000, 0)
+        bounded.recorder(running = true, nowMs = 0)
         for (start in listOf(10_000L, 20_000L, 30_000L)) {
             bounded.setMutedByPerson(true, start)
             bounded.setMutedByPerson(false, start + 5_000)
         }
-        assertFalse("an interval older than the record reaches is not vouched for", bounded.couldHaveHeard(1_000))
-        assertTrue(bounded.couldHaveHeard(26_000))
+        assertFalse(
+            "an interval older than the record reaches is not vouched for",
+            bounded.couldHaveHeard(1_000, 40_000),
+        )
+        assertTrue(bounded.couldHaveHeard(26_000, 40_000))
     }
 
     /**
@@ -143,15 +187,19 @@ class VoiceCaptureGateTest {
             for (taken in VoiceCaptureGate.Taken.entries) {
                 for (changing in listOf(false, true)) {
                     for (input in listOf(false, true)) {
-                        val (gate, _) = permitted()
-                        gate.setMutedByPerson(muted, 2_000)
-                        gate.taken(taken, 2_000)
-                        gate.route(changing, input, 2_000)
-                        assertEquals(
-                            "muted=$muted taken=$taken changing=$changing input=$input",
-                            gate.captureEnabled(3_000),
-                            gate.displayed(3_000).speechCouldHaveBeenHeard,
-                        )
+                        for (recording in listOf(false, true)) {
+                            val (gate, _) = permitted()
+                            gate.setMutedByPerson(muted, 2_000)
+                            gate.taken(taken, 2_000)
+                            gate.route(changing, input, 2_000)
+                            gate.recorder(recording, 2_000)
+                            assertEquals(
+                                "muted=$muted taken=$taken changing=$changing input=$input " +
+                                    "recording=$recording",
+                                gate.captureEnabled(3_000),
+                                gate.displayed(3_000).speechCouldHaveBeenHeard,
+                            )
+                        }
                     }
                 }
             }

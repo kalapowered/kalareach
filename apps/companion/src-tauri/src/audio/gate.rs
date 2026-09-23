@@ -13,10 +13,13 @@
 //! - the person has not muted the microphone;
 //! - the system has not taken it: an interruption, or capture suspended;
 //! - the audio route is settled on a device that has an input;
+//! - the platform's recorder reports itself running. Until it starts, and after it stops or fails,
+//!   nothing is being recorded, and the display says the microphone is unavailable rather than on;
 //! - the call has not been stopped. A stopped gate never opens again.
 //!
 //! It also keeps the intervals in which capture was on, so a claim that something was said when
-//! nothing could have been heard is refused from this device's own record.
+//! nothing could have been heard is refused from this device's own record. The record answers for
+//! the past only: an instant later than the time it is asked at is not one anything was heard in.
 //!
 //! Every method takes the time from its caller, in milliseconds on the monotonic clock, so tests
 //! drive time instead of waiting for it, and every method holds one lock.
@@ -70,6 +73,7 @@ struct Inner {
     taken: Taken,
     route_changing: bool,
     input_available: bool,
+    recorder_running: bool,
     stopped: bool,
     opened_at: Option<u64>,
     opened_until: u64,
@@ -94,6 +98,7 @@ impl CaptureGate {
                 taken: Taken::None,
                 route_changing: false,
                 input_available: true,
+                recorder_running: false,
                 stopped: false,
                 opened_at: None,
                 opened_until: u64::MAX,
@@ -164,6 +169,16 @@ impl CaptureGate {
         inner.settle(now_ms, self.kept);
     }
 
+    /// Whether the platform's recorder is running, as the platform reports it.
+    ///
+    /// Reported by the audio device itself: when it starts, when it stops and when it fails. A
+    /// recorder that has not started heard nothing, whatever the call was permitted to do.
+    pub fn recorder(&self, running: bool, now_ms: u64) {
+        let mut inner = self.locked();
+        inner.recorder_running = running;
+        inner.settle(now_ms, self.kept);
+    }
+
     /// Stops the gate for good.
     pub fn stop(&self, now_ms: u64) {
         let mut inner = self.locked();
@@ -194,7 +209,7 @@ impl CaptureGate {
             .is_some_and(|held| now_ms < held.deadline_ms);
         if inner.stopped || !live {
             "idle"
-        } else if !inner.input_available {
+        } else if !inner.input_available || !inner.recorder_running {
             "unavailable"
         } else if inner.route_changing {
             "route_changing"
@@ -208,13 +223,19 @@ impl CaptureGate {
         }
     }
 
-    /// Whether the microphone was carrying speech at `at_ms`.
+    /// Whether the microphone was carrying speech at `at_ms`, asked at `now_ms`.
     ///
-    /// Answered from the intervals this gate kept. An instant older than the oldest kept interval
-    /// answers false: a record that no longer reaches back that far cannot vouch for it.
+    /// Answered from the intervals this gate kept. An instant later than `now_ms` answers false:
+    /// a permit that is still running is permission to capture, not a record that anything was
+    /// heard. An instant older than the oldest kept interval answers false too: a record that no
+    /// longer reaches back that far cannot vouch for it.
     #[must_use]
-    pub fn could_have_heard(&self, at_ms: u64) -> bool {
-        let inner = self.locked();
+    pub fn could_have_heard(&self, at_ms: u64, now_ms: u64) -> bool {
+        let mut inner = self.locked();
+        inner.settle(now_ms, self.kept);
+        if at_ms > now_ms {
+            return false;
+        }
         if let Some(open) = inner.opened_at
             && at_ms >= open
             && at_ms < inner.opened_until
@@ -222,6 +243,20 @@ impl CaptureGate {
             return true;
         }
         inner.heard.iter().any(|interval| interval.contains(&at_ms))
+    }
+
+    /// Whether a permit is running: given, not withdrawn, not stopped and not past its deadline.
+    ///
+    /// What the platform's audio device is allowed to run for. Whether the microphone carries
+    /// speech is [`Self::capture_enabled`]'s, which asks everything else as well.
+    #[must_use]
+    pub fn live(&self, now_ms: u64) -> bool {
+        let inner = self.locked();
+        !inner.stopped
+            && inner
+                .permit
+                .as_ref()
+                .is_some_and(|held| now_ms < held.deadline_ms)
     }
 
     /// The permit capture runs under now.
@@ -246,6 +281,7 @@ impl Inner {
                 && self.taken == Taken::None
                 && !self.route_changing
                 && self.input_available
+                && self.recorder_running
         })
     }
 
@@ -278,11 +314,13 @@ impl Inner {
 mod tests {
     use super::*;
 
+    /// A permitted gate whose recorder reported itself running at the same moment.
     fn permitted(now_ms: u64, deadline_ms: u64) -> (CaptureGate, Permit) {
         let gate = CaptureGate::default();
         let permit = gate
             .permit("voice-session-1", deadline_ms, now_ms)
             .expect("a current answer permits the call");
+        gate.recorder(true, now_ms);
         (gate, permit)
     }
 
@@ -295,10 +333,36 @@ mod tests {
         gate.set_muted_by_person(false, 1_100);
         gate.taken(Taken::None, 1_200);
         gate.route(false, true, 1_300);
+        gate.recorder(true, 1_350);
         assert!(
             !gate.capture_enabled(1_400),
             "no event other than a permit opens the microphone"
         );
+        assert!(!gate.live(1_400));
+    }
+
+    /// KR-REQ-15.36: a permitted call captures nothing until the recorder reports itself running,
+    /// and says the microphone is unavailable until then and once it fails.
+    #[test]
+    fn capture_waits_for_the_recorder_and_ends_with_it() {
+        let gate = CaptureGate::default();
+        gate.permit("voice-session-1", 61_000, 1_000)
+            .expect("a current answer permits the call");
+        assert!(gate.live(1_000));
+        assert!(!gate.capture_enabled(1_000), "the recorder has not started");
+        assert_eq!(gate.displayed(1_000), "unavailable");
+        gate.recorder(true, 1_200);
+        assert!(gate.capture_enabled(1_200));
+        assert_eq!(gate.displayed(1_200), "capturing");
+        gate.recorder(false, 5_000);
+        assert!(
+            !gate.capture_enabled(5_000),
+            "a recorder that failed hears nothing"
+        );
+        assert_eq!(gate.displayed(5_000), "unavailable");
+        assert!(!gate.could_have_heard(1_100, 6_000));
+        assert!(gate.could_have_heard(1_200, 6_000));
+        assert!(!gate.could_have_heard(5_000, 6_000));
     }
 
     /// KR-REQ-15.34: a permit is given once, by an answer that is still current.
@@ -318,9 +382,23 @@ mod tests {
         let (gate, _) = permitted(1_000, 11_000);
         assert!(gate.capture_enabled(10_999));
         assert!(!gate.capture_enabled(11_000));
+        assert!(!gate.live(11_000));
         assert_eq!(gate.displayed(15_000), "idle");
-        assert!(gate.could_have_heard(10_999));
-        assert!(!gate.could_have_heard(12_000));
+        assert!(gate.could_have_heard(10_999, 15_000));
+        assert!(!gate.could_have_heard(12_000, 15_000));
+    }
+
+    /// KR-ACC-014: a running permit vouches for nothing that has not happened yet.
+    #[test]
+    fn a_future_instant_is_never_vouched_for() {
+        let (gate, _) = permitted(1_000, 61_000);
+        assert!(gate.capture_enabled(1_000));
+        assert!(
+            !gate.could_have_heard(50_000, 1_000),
+            "permission to capture is not a record of speech"
+        );
+        assert!(gate.could_have_heard(1_000, 1_000));
+        assert!(gate.could_have_heard(20_000, 30_000));
     }
 
     /// KR-REQ-15.35: the person's mute and the system are kept apart. Unmuting while the system
@@ -369,20 +447,21 @@ mod tests {
         let (gate, _) = permitted(1_000, 100_000);
         gate.set_muted_by_person(true, 5_000);
         gate.set_muted_by_person(false, 9_000);
-        assert!(gate.could_have_heard(4_999));
-        assert!(!gate.could_have_heard(5_000));
-        assert!(!gate.could_have_heard(8_999));
-        assert!(gate.could_have_heard(9_000));
-        assert!(!gate.could_have_heard(999));
+        assert!(gate.could_have_heard(4_999, 10_000));
+        assert!(!gate.could_have_heard(5_000, 10_000));
+        assert!(!gate.could_have_heard(8_999, 10_000));
+        assert!(gate.could_have_heard(9_000, 10_000));
+        assert!(!gate.could_have_heard(999, 10_000));
 
         let bounded = CaptureGate::with_kept_intervals(2);
         bounded.permit("s", 100_000, 0);
+        bounded.recorder(true, 0);
         for start in [10_000, 20_000, 30_000] {
             bounded.set_muted_by_person(true, start);
             bounded.set_muted_by_person(false, start + 5_000);
         }
-        assert!(!bounded.could_have_heard(1_000));
-        assert!(bounded.could_have_heard(26_000));
+        assert!(!bounded.could_have_heard(1_000, 40_000));
+        assert!(bounded.could_have_heard(26_000, 40_000));
     }
 
     /// KR-REQ-15.36: what the person is told and whether anything could be heard never disagree.
@@ -392,15 +471,19 @@ mod tests {
             for taken in Taken::ALL {
                 for changing in [false, true] {
                     for input in [false, true] {
-                        let (gate, _) = permitted(1_000, 61_000);
-                        gate.set_muted_by_person(muted, 2_000);
-                        gate.taken(taken, 2_000);
-                        gate.route(changing, input, 2_000);
-                        assert_eq!(
-                            gate.capture_enabled(3_000),
-                            gate.displayed(3_000) == "capturing",
-                            "muted={muted} taken={taken:?} changing={changing} input={input}"
-                        );
+                        for recording in [false, true] {
+                            let (gate, _) = permitted(1_000, 61_000);
+                            gate.set_muted_by_person(muted, 2_000);
+                            gate.taken(taken, 2_000);
+                            gate.route(changing, input, 2_000);
+                            gate.recorder(recording, 2_000);
+                            assert_eq!(
+                                gate.capture_enabled(3_000),
+                                gate.displayed(3_000) == "capturing",
+                                "muted={muted} taken={taken:?} changing={changing} \
+                                 input={input} recording={recording}"
+                            );
+                        }
                     }
                 }
             }

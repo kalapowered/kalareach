@@ -11,7 +11,9 @@
 //  WebRTC's own audio device owns the category, the mode and the activation while a call is
 //  running: two owners setting the same session is how a call ends up with a route nobody chose.
 //  `useManualAudio` is what keeps the decision here — WebRTC does not start capture on its own, so
-//  the microphone opens when this application opens it for a call and at no other time.
+//  the microphone opens when this application opens it for a call and at no other time. It is set
+//  when this object is made, which a call does before it builds any connection, so there is no
+//  moment at which a negotiated connection could start the audio unit by itself.
 //
 
 import AVFoundation
@@ -29,6 +31,8 @@ public protocol AudioSessionEvents: AnyObject {
     func audioSessionRoute(changing: Bool, hasInput: Bool)
     /// The audio services were reset, and everything the session held is gone.
     func audioSessionReset()
+    /// WebRTC's audio unit started or stopped recording, or failed to start.
+    func audioSessionRecorder(running: Bool)
 }
 
 /// Configures and releases this application's audio session, and reports what the system does to it.
@@ -36,7 +40,7 @@ public protocol AudioSessionEvents: AnyObject {
 /// The reporting half is not decoration. Section 15 ¶21 and ¶22 name interruptions, route changes,
 /// phone calls and OS capture suspension as explicit states, and an audio session that only
 /// configured itself would leave the interface guessing at all four.
-public final class AudioSession: NSObject {
+public final class AudioSession: NSObject, RTCAudioSessionDelegate {
     /// Told whenever the microphone's state changes, on the main queue.
     public typealias CaptureObserver = (VoiceCaptureState) -> Void
 
@@ -80,6 +84,22 @@ public final class AudioSession: NSObject {
             name: AVAudioSession.mediaServicesWereResetNotification,
             object: nil
         )
+        // Before any connection exists: WebRTC starts no audio unit until a call turns audio on.
+        session.lockForConfiguration()
+        session.useManualAudio = true
+        session.isAudioEnabled = false
+        session.unlockForConfiguration()
+        session.add(self)
+    }
+
+    /// Holds WebRTC's audio unit off until a call turns it on. A call calls this before it builds
+    /// its connection; the first use of ``shared`` has already done it, and this says so where the
+    /// order matters.
+    public func holdAudioUntilACallTurnsItOn() {
+        session.lockForConfiguration()
+        defer { session.unlockForConfiguration() }
+        session.useManualAudio = true
+        if !activatedForCall { session.isAudioEnabled = false }
     }
 
     /// Watches the microphone's state. The returned closure stops watching.
@@ -91,16 +111,14 @@ public final class AudioSession: NSObject {
         return { [weak self] in self?.observers.removeValue(forKey: id) }
     }
 
-    /// Makes the session ready for recording and playback over whatever route is attached.
+    /// Makes the session ready for recording and playback over whatever route is attached: play and
+    /// record in the voice chat mode, Bluetooth headsets allowed, and the speaker by default.
     ///
-    /// `.mixWithOthers` is deliberate: an application that stops a person's music the moment it
-    /// starts is an application that takes something it was not given.
-    ///
-    /// This is the **only** path that opens the microphone, and its one caller is a call the host
-    /// has permitted. Section 15 ¶21 says the background audio support preserves an explicitly
+    /// This opens the session and nothing more. The audio unit, and with it the recorder, runs only
+    /// once the call turns audio on through ``setAudioEnabled(_:)``, and its one caller is a call the
+    /// host has permitted. Section 15 ¶21 says the background audio support preserves an explicitly
     /// started call and does not authorise unattended microphone activation, and §15 ¶22 says the
     /// microphone is never silently activated later without a fresh permitted active-call context.
-    /// `useManualAudio` plus this being the one caller is how that is true rather than intended.
     public func activate(for call: AudioSessionEvents) throws {
         guard AVAudioSession.sharedInstance().recordPermission == .granted else {
             capture = .unavailable
@@ -114,9 +132,16 @@ public final class AudioSession: NSObject {
         wanted.mode = AVAudioSession.Mode.voiceChat.rawValue
         wanted.categoryOptions = [.allowBluetooth, .allowBluetoothA2DP, .defaultToSpeaker]
         try session.setConfiguration(wanted, active: true)
-        session.isAudioEnabled = true
         activatedForCall = true
         self.call = call
+    }
+
+    /// Lets WebRTC run its audio unit, recorder and player, or stops it. The call's one switch for
+    /// the audio device; nothing else turns it on.
+    public func setAudioEnabled(_ on: Bool) {
+        session.lockForConfiguration()
+        defer { session.unlockForConfiguration() }
+        session.isAudioEnabled = on && activatedForCall
     }
 
     /// Gives the session back, and tells whatever was interrupted that it may resume.
@@ -196,6 +221,21 @@ public final class AudioSession: NSObject {
 
     private var hasInput: Bool {
         !AVAudioSession.sharedInstance().currentRoute.inputs.isEmpty
+    }
+
+    // What WebRTC's audio unit reports, on WebRTC's own threads. The call moves each report onto
+    // its own queue before acting on it.
+
+    public func audioSessionDidStartPlayOrRecord(_: RTCAudioSession) {
+        call?.audioSessionRecorder(running: true)
+    }
+
+    public func audioSessionDidStopPlayOrRecord(_: RTCAudioSession) {
+        call?.audioSessionRecorder(running: false)
+    }
+
+    public func audioSession(_: RTCAudioSession, audioUnitStartFailedWithError _: Error) {
+        call?.audioSessionRecorder(running: false)
     }
 }
 

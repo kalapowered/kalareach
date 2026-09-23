@@ -149,9 +149,13 @@ impl DesktopVoiceCall {
                 // Media path forwards captured PCM frames to encoder.
             }
         });
-        if started.is_err() {
+        match started {
+            // The recorder is running, so from here the gate may let it carry speech.
+            Ok(()) => self.gate.recorder(true, self.now_ms()),
             // A device that never started heard nothing, and the record must not say otherwise.
-            self.gate.revoke(permit.generation, self.now_ms());
+            Err(_) => {
+                self.gate.revoke(permit.generation, self.now_ms());
+            }
         }
         started
     }
@@ -162,10 +166,10 @@ impl DesktopVoiceCall {
         self.gate.displayed(self.now_ms())
     }
 
-    /// Whether the microphone was carrying speech `at_ms` into this call.
+    /// Whether the microphone was carrying speech `at_ms` into this call. Nothing later than now.
     #[must_use]
     pub fn could_have_heard(&self, at_ms: u64) -> bool {
-        self.gate.could_have_heard(at_ms)
+        self.gate.could_have_heard(at_ms, self.now_ms())
     }
 
     /// The offer this end would send to open a call.

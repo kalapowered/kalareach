@@ -5,7 +5,7 @@ import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.os.Handler
-import android.os.Looper
+import android.os.HandlerThread
 import android.os.SystemClock
 import android.telephony.TelephonyManager
 import org.webrtc.AudioTrack
@@ -20,8 +20,11 @@ import org.webrtc.PeerConnectionFactory
 import org.webrtc.RtpReceiver
 import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
-import to.kala.reach.companion.mobile.VoiceCaptureGate
+import org.webrtc.audio.JavaAudioDeviceModule
+import to.kala.reach.companion.mobile.VoiceCallControl
+import to.kala.reach.companion.mobile.VoiceCallPlatform
 import to.kala.reach.companion.mobile.VoiceCaptureState
+import to.kala.reach.companion.mobile.VoiceMediaSwitches
 import to.kala.reach.companion.push.AudioSession
 import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
@@ -40,17 +43,15 @@ import java.util.concurrent.atomic.AtomicLong
  * Section 15 paragraph 6 is the other constraint: the provider's data channel is read-only. This
  * connection creates no channel of its own and sends zero bytes on the one the provider opens.
  *
- * A call has two stages, and the microphone belongs only to the second. [start] builds the
- * connection and a microphone track that is off, for the offer and the answer; nothing is captured
- * and neither audio focus nor the foreground service is taken. [permit] is given the host's answer
- * to the start, the voice session and the moment the call closes, and only then is focus taken, the
- * service started and capture allowed. Whether the microphone is on is decided by one
- * [VoiceCaptureGate], under one lock, from the permit, the person's mute, what the system did to
- * focus and the route; every change goes to the screen and to the notification together.
+ * Every decision about the microphone is [VoiceCallControl]'s; this class carries them out. The
+ * platform's recorder is held off from the moment the connection exists, before anything is
+ * negotiated, so applying an answer starts nothing on its own. The control turns it on only for a
+ * call the host permitted whose foreground service holds the foreground, and every frame the
+ * recorder produces is asked about separately and silenced unless the control says it may be
+ * carried. Timers and the platform's reports run on this call's own thread, never the main one.
  */
 class VoiceCall private constructor(
     private val context: Context,
-    private val factory: PeerConnectionFactory,
     private val observer: Observer,
     /** This call's identity in the process, which the service's actions name. */
     val id: Long,
@@ -67,45 +68,96 @@ class VoiceCall private constructor(
         fun onFirstAudio()
     }
 
-    /** Held by every change to what the microphone and the speaker are allowed to do. */
+    /** The call's own thread: its timers, and everything the platform reports. */
+    private val thread = HandlerThread("kr-voice-call-$id").apply { start() }
+    private val handler = Handler(thread.looper)
+
+    /** Held by every change to the connection and the tracks; never while waiting on WebRTC. */
     private val lock = Any()
-    private val gate = VoiceCaptureGate()
     private var connection: PeerConnection? = null
     private var microphone: AudioTrack? = null
     private var announcedFirstAudio = false
     private var routeCallback: AudioDeviceCallback? = null
-    private val main = Handler(Looper.getMainLooper())
-    private var expiry: Runnable? = null
+    private var audioDeviceOn: Boolean? = null
 
     /**
-     * Whether [permit] started the foreground service for this call.
+     * The one focus request this call holds. Its listener reports on this call's thread.
      *
-     * Nothing talks to the service before that: a mute pressed before the host answered must not
-     * create a service with no call to keep, and a service started from the background is refused
-     * by the platform outright.
+     * The instance that asked for focus is the instance that gives it back.
      */
-    private var serviceStarted = false
+    private val audioSession =
+        AudioSession(context) { change -> handler.post { onFocusChange(change) } }
 
     /**
-     * The one focus request this call holds.
+     * The platform audio device, built for this call.
      *
-     * The instance that asked for focus is the instance that gives it back, and it carries the
-     * listener that turns a focus loss into a state the screen and the notification show.
+     * Its recorder reports starting, stopping and failing to the control, on this call's thread,
+     * and it hands every frame to [VoiceCallControl.carries] before the frame goes anywhere: a frame
+     * the control does not let through is replaced with silence where it lies.
      */
-    private val audioSession = AudioSession(context) { change -> onFocusChange(change) }
+    private val audioDevice: JavaAudioDeviceModule =
+        JavaAudioDeviceModule.builder(context)
+            .setAudioRecordStateCallback(
+                object : JavaAudioDeviceModule.AudioRecordStateCallback {
+                    override fun onWebRtcAudioRecordStart() {
+                        handler.post { control.recorder(true) }
+                    }
 
-    /** Whether this call has already been stopped. Stopping twice must do nothing the second time. */
-    @Volatile
-    private var stopped = false
+                    override fun onWebRtcAudioRecordStop() {
+                        handler.post { control.recorder(false) }
+                    }
+                },
+            )
+            .setAudioRecordErrorCallback(
+                object : JavaAudioDeviceModule.AudioRecordErrorCallback {
+                    override fun onWebRtcAudioRecordInitError(message: String) {
+                        handler.post { control.recorder(false) }
+                    }
+
+                    override fun onWebRtcAudioRecordStartError(
+                        code: JavaAudioDeviceModule.AudioRecordStartErrorCode,
+                        message: String,
+                    ) {
+                        handler.post { control.recorder(false) }
+                    }
+
+                    override fun onWebRtcAudioRecordError(message: String) {
+                        handler.post { control.recorder(false) }
+                    }
+                },
+            )
+            .setAudioBufferCallback { buffer, _, _, _, bytesRead, captureTimeNs ->
+                // On the audio thread, for every frame, before it reaches the encoder. Answered
+                // from the gate alone, so no switch is set from here.
+                if (!control.carries()) {
+                    for (index in 0 until minOf(bytesRead, buffer.capacity())) buffer.put(index, 0)
+                }
+                captureTimeNs
+            }
+            .createAudioDeviceModule()
+            .also { it.setMicrophoneMute(true) }
+
+    private val egl: EglBase = EglBase.create()
+    private val factory: PeerConnectionFactory =
+        PeerConnectionFactory.builder()
+            // Audio processing is the platform's where the device offers it: the audio device
+            // uses the built-in acoustic echo canceller and noise suppressor when they exist, and
+            // its own otherwise. Either way it is one canceller, not two fighting.
+            .setAudioDeviceModule(audioDevice)
+            .setVideoEncoderFactory(DefaultVideoEncoderFactory(egl.eglBaseContext, true, true))
+            .setVideoDecoderFactory(DefaultVideoDecoderFactory(egl.eglBaseContext))
+            .createPeerConnectionFactory()
+
+    /** Every decision about the microphone, the speaker and the end of this call. */
+    private val control = VoiceCallControl(Platform(), Switches())
 
     /** Whether the person has muted their own microphone. */
     val isMutedByPerson: Boolean
-        get() = gate.isMutedByPerson
+        get() = control.isMutedByPerson
 
     /** Whether the person has silenced the model's voice on this device. */
-    @Volatile
-    var isPlaybackMuted: Boolean = false
-        private set
+    val isPlaybackMuted: Boolean
+        get() = control.isPlaybackMuted
 
     companion object {
         /** How long a description may take to be created or applied before the call is closed. */
@@ -114,11 +166,11 @@ class VoiceCall private constructor(
         private val calls = AtomicLong()
 
         /**
-         * Builds a call for its offer and its answer, with the microphone off.
+         * Builds a call for its offer and its answer, with the recorder off.
          *
-         * The call is claimed as this process's one call before anything is built, in one step, so
-         * two starts cannot both pass a check and both publish. Nothing here opens the microphone:
-         * that waits for [permit].
+         * The call is claimed as this process's one call before anything is opened, in one step,
+         * so two starts cannot both pass a check and both publish. Nothing here opens the
+         * microphone: that waits for [permit], the foreground service and the recorder.
          */
         @JvmStatic
         fun start(context: Context, observer: Observer): VoiceCall {
@@ -126,20 +178,11 @@ class VoiceCall private constructor(
                 PeerConnectionFactory.InitializationOptions.builder(context.applicationContext)
                     .createInitializationOptions(),
             )
-            val egl = EglBase.create()
-            val factory = PeerConnectionFactory.builder()
-                // Audio processing is the platform's where the device offers it: libwebrtc's
-                // Android audio device uses the built-in acoustic echo canceller and noise
-                // suppressor when they exist, and its own otherwise. Either way it is one
-                // canceller, not two fighting.
-                .setVideoEncoderFactory(DefaultVideoEncoderFactory(egl.eglBaseContext, true, true))
-                .setVideoDecoderFactory(DefaultVideoDecoderFactory(egl.eglBaseContext))
-                .createPeerConnectionFactory()
-            val call = VoiceCall(context.applicationContext, factory, observer, calls.incrementAndGet())
+            val call = VoiceCall(context.applicationContext, observer, calls.incrementAndGet())
             // One microphone, one call. A second call started over a running one would leave the
             // first one's track and connection live with nothing owning them.
             if (!VoiceCallHolder.claim(call)) {
-                factory.dispose()
+                call.stop()
                 throw IllegalStateException("a voice call is already running on this device")
             }
             try {
@@ -154,7 +197,7 @@ class VoiceCall private constructor(
 
     private fun open() {
         synchronized(lock) {
-            if (stopped) throw IllegalStateException("this call was stopped while it was opening")
+            if (control.isStopped) throw IllegalStateException("this call was stopped while it was opening")
             val configuration = PeerConnection.RTCConfiguration(emptyList()).apply {
                 // The provider's answer names its own candidates. No KalaReach relay is
                 // configured: media travels between this device and the provider, and a relay of
@@ -165,54 +208,44 @@ class VoiceCall private constructor(
             }
             val made = factory.createPeerConnection(configuration, PeerObserver())
                 ?: throw IllegalStateException("this device could not open a connection")
+            // Off before anything is negotiated. Left on, applying the answer would start the
+            // recorder by itself, whether or not the host ever permitted the call.
+            made.setAudioRecording(false)
+            made.setAudioPlayout(false)
+            audioDeviceOn = false
             connection = made
             val source = factory.createAudioSource(MediaConstraints())
-            // Off until the call is permitted. The offer describes a track, and a described track
-            // carries nothing until the gate lets it.
+            // Off until the control turns it on. The offer describes a track, and a described
+            // track carries nothing until the control lets it.
             microphone = factory.createAudioTrack("kr-voice-microphone", source).also {
                 it.setEnabled(false)
                 made.addTrack(it, listOf("kr-voice"))
             }
-            observer.onCaptureState(VoiceCaptureState.IDLE)
         }
+        watchRoute()
     }
 
     /**
      * Opens the microphone for a call the host started.
      *
      * Takes the host's answer: the voice session and the moment the service closes the call, in
-     * UTC milliseconds. Audio focus and the foreground service are taken here and nowhere else, so
-     * nothing but a permitted call can open the microphone, and the call stops itself when that
-     * moment comes, whether or not anything else happened.
+     * UTC milliseconds. Focus and the foreground service are asked for here; the recorder waits
+     * for the service to hold the foreground and then for the recorder itself to report running.
      *
-     * @return false, and nothing opened, when this call is stopped, already permitted, past its
-     * deadline or refused audio focus.
+     * @return false, and the call ended, when the moment has passed or the platform refused focus
+     * or the service; false and nothing changed when this call is stopped or already permitted.
      */
-    fun permit(voiceSessionId: String, closesAtEpochMs: Long): Boolean {
-        synchronized(lock) {
-            if (stopped || gate.current != null) return false
-            val now = SystemClock.elapsedRealtime()
-            val deadline = now + (closesAtEpochMs - System.currentTimeMillis())
-            if (deadline <= now) return false
-            if (!audioSession.activate()) {
-                publish(VoiceCaptureState.UNAVAILABLE)
-                return false
-            }
-            gate.permit(voiceSessionId, deadline, now) ?: run {
-                audioSession.deactivate()
-                return false
-            }
-            // The service is what keeps capture alive once the screen locks, and it is started
-            // for a call the host permitted rather than by anything that could fire on its own.
-            VoiceCallService.start(context, id)
-            serviceStarted = true
-            watchRoute()
-            val ends = Runnable { stop() }
-            expiry = ends
-            main.postDelayed(ends, deadline - now)
-            apply(now)
-            return true
-        }
+    fun permit(voiceSessionId: String, closesAtEpochMs: Long): Boolean =
+        control.permit(voiceSessionId, closesAtEpochMs)
+
+    /** The foreground service holds the foreground. Called by the service, for this call only. */
+    fun servicePromoted() {
+        handler.post { control.servicePromoted() }
+    }
+
+    /** The foreground service could not enter the foreground. The call ends. */
+    fun serviceRefused() {
+        handler.post { control.serviceRefused() }
     }
 
     /**
@@ -232,7 +265,7 @@ class VoiceCall private constructor(
         return made.description
     }
 
-    /** Applies the provider's SDP answer. Opening the microphone is [permit]'s, not this. */
+    /** Applies the provider's SDP answer. It starts nothing: the recorder stays off until [permit]. */
     fun accept(answerSdp: String) {
         val answer = SessionDescription(SessionDescription.Type.ANSWER, answerSdp)
         val open = openConnection()
@@ -242,7 +275,7 @@ class VoiceCall private constructor(
     /** The connection, when the call is still open. */
     private fun openConnection(): PeerConnection =
         synchronized(lock) {
-            connection.takeIf { !stopped }
+            connection.takeIf { !control.isStopped }
                 ?: throw IllegalStateException("this voice call has ended")
         }
 
@@ -252,15 +285,9 @@ class VoiceCall private constructor(
      * Local and immediate. Section 15 paragraph 10 requires local microphone and speaker mute to
      * remain available if the broker fails, so this touches the track and nothing that could be
      * waiting on a network answer. Unmuting is the person's choice and nothing more: it does not
-     * open a microphone the system has taken or a call has not been permitted.
+     * open a microphone the system has taken or a call that has not been permitted.
      */
-    fun setMutedByPerson(muted: Boolean) {
-        synchronized(lock) {
-            val now = SystemClock.elapsedRealtime()
-            gate.setMutedByPerson(muted, now)
-            apply(now)
-        }
-    }
+    fun setMutedByPerson(muted: Boolean) = control.setMutedByPerson(muted)
 
     /**
      * Stops the model's voice coming out of this device, without ending the call.
@@ -268,122 +295,142 @@ class VoiceCall private constructor(
      * This is playback, and section 15 paragraph 13 is explicit that speech interruption stops
      * playback and not a coding task. Nothing here cancels anything on a host.
      */
-    fun setPlaybackMuted(muted: Boolean) {
-        synchronized(lock) {
-            isPlaybackMuted = muted
-            apply(SystemClock.elapsedRealtime())
-        }
-    }
+    fun setPlaybackMuted(muted: Boolean) = control.setPlaybackMuted(muted)
 
     /**
      * Whether the microphone was carrying speech at `atMs` on the monotonic clock.
      *
      * What a claim that something was said is checked against, from this device's own record.
      */
-    fun couldHaveHeard(atMs: Long): Boolean = gate.couldHaveHeard(atMs)
+    fun couldHaveHeard(atMs: Long): Boolean = control.couldHaveHeard(atMs)
 
     /** Ends the call and gives the microphone back. Local and immediate, as mute is. */
-    fun stop() {
-        synchronized(lock) {
-            if (stopped) return
-            stopped = true
-            gate.stop(SystemClock.elapsedRealtime())
-            expiry?.let { main.removeCallbacks(it) }
-            expiry = null
-            // Cleared only if this call is the one published: a call that was already replaced must
-            // not take its replacement's place in the holder with it.
-            VoiceCallHolder.claimStopped(this)
-            microphone?.setEnabled(false)
-            routeCallback?.let {
-                context.getSystemService(AudioManager::class.java)
-                    ?.unregisterAudioDeviceCallback(it)
-            }
-            routeCallback = null
-            connection?.close()
-            audioSession.deactivate()
-            if (serviceStarted) VoiceCallService.stop(context, id)
-            observer.onCaptureState(VoiceCaptureState.IDLE)
-        }
-    }
+    fun stop() = control.stop()
 
-    /**
-     * Acts on what the system did to the microphone, and then says so.
-     *
-     * Losing focus takes the microphone and the speaker away: the track is disabled rather than
-     * only relabelled, because a state that says the person is not being heard while the track is
-     * still live would be the claim section 15 paragraph 22 forbids. Regaining it restores what
-     * the person chose, which is their own mute if they set one, and nothing the person does while
-     * focus is gone opens the microphone early.
-     */
-    fun onFocusChange(change: Int) {
-        synchronized(lock) {
-            if (stopped) return
-            val now = SystemClock.elapsedRealtime()
-            when (change) {
-                AudioManager.AUDIOFOCUS_LOSS, AudioManager.AUDIOFOCUS_LOSS_TRANSIENT ->
-                    gate.taken(VoiceCaptureGate.Taken.FOCUS_LOST, now)
-                AudioManager.AUDIOFOCUS_GAIN -> gate.taken(VoiceCaptureGate.Taken.NONE, now)
-                else -> return
-            }
-            apply(now)
+    /** Acts on what the system did to audio focus. */
+    private fun onFocusChange(change: Int) {
+        when (change) {
+            AudioManager.AUDIOFOCUS_LOSS, AudioManager.AUDIOFOCUS_LOSS_TRANSIENT ->
+                control.focus(lost = true)
+            AudioManager.AUDIOFOCUS_GAIN -> control.focus(lost = false)
+            else -> Unit
         }
     }
 
     /** True while the platform reports a call on the cellular radio. */
+    @Suppress("DEPRECATION")
     fun isInPhoneCall(): Boolean =
         context.getSystemService(TelephonyManager::class.java)?.callState !=
             TelephonyManager.CALL_STATE_IDLE
 
-    /**
-     * Makes the microphone and the speaker what the gate says, and tells both surfaces.
-     *
-     * Called under [lock] after every change, so there is one place the tracks are set and one
-     * statement about capture, never one per event.
-     */
-    private fun apply(now: Long) {
-        microphone?.setEnabled(gate.captureEnabled(now))
-        val focused = gate.displayed(now) != VoiceCaptureState.FOCUS_LOST
-        connection?.receivers?.forEach {
-            (it.track() as? AudioTrack)?.setEnabled(!isPlaybackMuted && focused)
-        }
-        publish(gate.displayed(now))
-    }
-
-    /**
-     * Tells the application and the notification the same thing.
-     *
-     * While the screen is locked the notification is the only surface there is, so a state that
-     * reached the screen and not the notification would be a state half the surfaces disagree
-     * about.
-     */
-    private fun publish(state: VoiceCaptureState) {
-        observer.onCaptureState(state)
-        if (serviceStarted) VoiceCallService.publishCapture(context, id, state)
-    }
+    private fun hasInput(manager: AudioManager): Boolean =
+        manager.getDevices(AudioManager.GET_DEVICES_INPUTS).isNotEmpty()
 
     private fun watchRoute() {
         val manager = context.getSystemService(AudioManager::class.java) ?: return
         val callback = object : AudioDeviceCallback() {
             override fun onAudioDevicesAdded(added: Array<out AudioDeviceInfo>?) = changed()
+
             override fun onAudioDevicesRemoved(removed: Array<out AudioDeviceInfo>?) = changed()
 
             private fun changed() {
                 // A Bluetooth headset arriving or leaving. The state says so while capture is
-                // re-established rather than claiming the person is still being heard, and both
-                // surfaces are told.
-                synchronized(lock) {
-                    if (stopped) return
-                    val now = SystemClock.elapsedRealtime()
-                    gate.route(changing = true, inputAvailable = true, nowMs = now)
-                    apply(now)
-                    val hasInput = manager.getDevices(AudioManager.GET_DEVICES_INPUTS).isNotEmpty()
-                    gate.route(changing = false, inputAvailable = hasInput, nowMs = now)
-                    apply(now)
-                }
+                // re-established rather than claiming the person is still being heard.
+                control.route(changing = true, inputAvailable = true)
+                control.route(changing = false, inputAvailable = hasInput(manager))
             }
         }
-        routeCallback = callback
-        manager.registerAudioDeviceCallback(callback, null)
+        synchronized(lock) { routeCallback = callback }
+        // Reported on this call's own thread.
+        manager.registerAudioDeviceCallback(callback, handler)
+        handler.post { control.route(changing = false, inputAvailable = hasInput(manager)) }
+    }
+
+    /** The platform, as the control sees it. */
+    private inner class Platform : VoiceCallPlatform {
+        override fun nowMs(): Long = SystemClock.elapsedRealtime()
+
+        override fun epochMs(): Long = System.currentTimeMillis()
+
+        override fun acquireFocus(): Boolean = audioSession.activate()
+
+        override fun releaseFocus() = audioSession.deactivate()
+
+        override fun startService(): Boolean {
+            // The service is what keeps capture alive once the screen locks, and it is asked for
+            // for a call the host permitted rather than by anything that could fire on its own.
+            VoiceCallService.start(context, id)
+            return true
+        }
+
+        override fun stopService() {
+            try {
+                VoiceCallService.stop(context, id)
+            } catch (notRunning: IllegalStateException) {
+                // The platform refuses to reach a service it would have to start from the
+                // background, which means none is running for this call: nothing to stop.
+            }
+        }
+
+        override fun schedule(atMs: Long, task: () -> Unit): () -> Unit {
+            val runnable = Runnable { task() }
+            handler.postDelayed(runnable, maxOf(0L, atMs - SystemClock.elapsedRealtime()))
+            return { handler.removeCallbacks(runnable) }
+        }
+
+        override fun publish(state: VoiceCaptureState) = observer.onCaptureState(state)
+
+        override fun publishToService(state: VoiceCaptureState) {
+            try {
+                VoiceCallService.publishCapture(context, id, state)
+            } catch (notRunning: IllegalStateException) {
+                // No service is running for this call, so there is no notification to update.
+            }
+        }
+
+        override fun ended() {
+            val (open, callback) = synchronized(lock) {
+                val held = connection to routeCallback
+                connection = null
+                microphone = null
+                routeCallback = null
+                held
+            }
+            // Cleared only if this call is the one published: a call that was already replaced
+            // must not take its replacement's place in the holder with it.
+            VoiceCallHolder.claimStopped(this@VoiceCall)
+            callback?.let {
+                context.getSystemService(AudioManager::class.java)?.unregisterAudioDeviceCallback(it)
+            }
+            open?.dispose()
+            factory.dispose()
+            audioDevice.release()
+            egl.release()
+            thread.quitSafely()
+        }
+    }
+
+    /** The media, as the control sets it. */
+    private inner class Switches : VoiceMediaSwitches {
+        override fun setAudioDevice(on: Boolean) {
+            val open = synchronized(lock) {
+                if (audioDeviceOn == on) return
+                audioDeviceOn = on
+                connection
+            } ?: return
+            open.setAudioRecording(on)
+            open.setAudioPlayout(on)
+        }
+
+        override fun setMicrophone(on: Boolean) {
+            audioDevice.setMicrophoneMute(!on)
+            synchronized(lock) { microphone }?.setEnabled(on)
+        }
+
+        override fun setPlayback(on: Boolean) {
+            val receivers = synchronized(lock) { connection }?.receivers ?: return
+            receivers.forEach { (it.track() as? AudioTrack)?.setEnabled(on) }
+        }
     }
 
     private inner class PeerObserver : PeerConnection.Observer {
@@ -403,7 +450,10 @@ class VoiceCall private constructor(
         }
 
         override fun onAddTrack(receiver: RtpReceiver, streams: Array<out MediaStream>) {
-            if (receiver.track() !is AudioTrack || announcedFirstAudio) return
+            if (receiver.track() !is AudioTrack) return
+            // A track arrives playing; the control decides whether it may.
+            handler.post { control.refresh() }
+            if (announcedFirstAudio) return
             announcedFirstAudio = true
             observer.onFirstAudio()
         }
