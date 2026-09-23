@@ -3569,6 +3569,186 @@ mod tests {
         );
     }
 
+    /// An answer the worker decided and sends on its way.
+    fn text_answer(
+        request: &AttentionTextRequest,
+        generation: u64,
+        release_until: u64,
+    ) -> ControlFrame {
+        ControlFrame::AttentionTextAnswer(Box::new(AttentionTextAnswer {
+            request_id: request.request_id,
+            privacy_generation: Nullable::some(U64::new(generation)),
+            release_until_boot_ms: U64::new(release_until),
+            texts: request
+                .records
+                .iter()
+                .map(|record| AttentionRecordText {
+                    source: record.source,
+                    sequence: record.sequence,
+                    text: Nullable::some("which branch?".to_owned()),
+                })
+                .collect(),
+        }))
+    }
+
+    /// Reads the next text request the store sends a worker.
+    async fn text_request(reader: &mut FrameReader) -> AttentionTextRequest {
+        loop {
+            match reader
+                .read_message::<ControlFrame>()
+                .await
+                .expect("the store asks")
+            {
+                ControlFrame::AttentionText(request) => return request,
+                ControlFrame::AttentionBarrierAcknowledged(_) => {}
+                other => panic!("expected a text request, got {other:?}"),
+            }
+        }
+    }
+
+    /// KR-REQ-24.11: an answer that first reaches the daemon once its lease has ended, as one
+    /// still on its way when the worker committed without an acknowledgement does, is withheld,
+    /// though the daemon never heard of the transition and still records the answer's generation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answer_that_arrives_after_its_lease_is_withheld() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = module(&temp);
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let (link, mut reader, mut writer) = linked(&temp, 1, &module, session_id).await;
+        module
+            .take_page(session_id, &link, 0, 0, &question_page(session_id))
+            .expect("the page is taken");
+        let reading = {
+            let module = Arc::clone(&module);
+            tokio::spawn(async move {
+                module
+                    .read_released(
+                        &Stub { unaccounted: false },
+                        &Caller::Owner,
+                        &owner(),
+                        &inbox_request(),
+                    )
+                    .await
+            })
+        };
+        let request = text_request(&mut reader).await;
+        // Decided now with a lease past the margin, and delivered only once that lease has ended:
+        // a worker without an acknowledgement commits no earlier than that.
+        let until = kr_ipc::clock::boot_elapsed_ms() + RELEASE_MARGIN_MS + 300;
+        while kr_ipc::clock::boot_elapsed_ms() < until {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        writer
+            .write_message(&text_answer(&request, 0, until))
+            .await
+            .expect("answers");
+        let released = reading.await.expect("the read finishes");
+        let fence = fence_of(&module, session_id).await;
+        assert!(!fence.barrier);
+        assert_eq!(fence.recorded, Some(0));
+        let (mut owner_writer, mut owner_reader) = owner_connection(&temp, 2).await;
+        module
+            .write_released(&mut owner_writer, StreamKind::Control, released)
+            .await
+            .expect("an answer is written");
+        let ControlFrame::Response(response) = owner_reader
+            .read_message::<ControlFrame>()
+            .await
+            .expect("the reader gets an answer")
+        else {
+            panic!("a response");
+        };
+        let Outcome::Ok(value) = response.outcome else {
+            panic!("the read was refused");
+        };
+        let inbox: AttentionReadResult = value.to_typed().expect("decodes");
+        assert!(inbox.items.iter().all(|item| !item.summary.is_present()));
+    }
+
+    /// KR-REQ-24.11: a raise the daemon learns only after the commit it announces holds back even
+    /// text decided under the committed generation, until the statement that settles it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_raise_that_arrives_after_its_commit_stands_until_it_is_settled() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = module(&temp);
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let (_link, mut reader, mut writer) = linked(&temp, 1, &module, session_id).await;
+        // The commit reaches the daemon first, on a page, and the raise after it.
+        writer
+            .write_message(&ControlFrame::AttentionSourcePage(Box::new(
+                AttentionSourcePage {
+                    privacy_generation: Nullable::some(U64::new(1)),
+                    ..question_page(session_id)
+                },
+            )))
+            .await
+            .expect("pages");
+        writer
+            .write_message(&statement(1, true, Some(0)))
+            .await
+            .expect("raises");
+        let ControlFrame::AttentionBarrierAcknowledged(_) = reader
+            .read_message::<ControlFrame>()
+            .await
+            .expect("acknowledged")
+        else {
+            panic!("an acknowledgement");
+        };
+        let current = ticket(&[session_id], 1, lease_from_now().get());
+        let fence = fence_of(&module, session_id).await;
+        assert_eq!(fence.recorded, Some(1));
+        assert!(fence.barrier);
+        assert_eq!(module.release_delivery(&current, || 1).await, None);
+        writer
+            .write_message(&statement(2, false, Some(1)))
+            .await
+            .expect("settles");
+        let ControlFrame::AttentionBarrierAcknowledged(_) = reader
+            .read_message::<ControlFrame>()
+            .await
+            .expect("acknowledged")
+        else {
+            panic!("an acknowledgement");
+        };
+        assert_eq!(module.release_delivery(&current, || 1).await, Some(1));
+    }
+
+    /// A timer that has fallen due for a session whose pages have not certified that moment is not
+    /// a deadline the maintenance loop wakes for, and it is one once a certificate reaches it.
+    #[tokio::test]
+    async fn an_overdue_timer_without_a_certificate_is_not_a_deadline_to_wake_for() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = module(&temp);
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        module
+            .observe(&[SourceEvent::new(
+                EventCursor::in_session(session_id, AttentionSource::Receipts, 1),
+                kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get()),
+                EventKind::ApprovalRequested {
+                    request_id: kr_protocol::ids::ApprovalRequestId::new("req-1")
+                        .expect("an identifier"),
+                    session_id,
+                    summary: String::new(),
+                },
+            )])
+            .expect("the store records the approval");
+        let later = module.reading().advanced(10 * 60_000);
+        let due = module
+            .store()
+            .expect("the store")
+            .next_deadline_of(&Origin::Session(session_id), later)
+            .expect("the store answers")
+            .expect("the reminder is due");
+        assert!(due <= later.continuous_ms, "the reminder is overdue then");
+        assert_eq!(
+            module.next_decidable_deadline(later),
+            None,
+            "nothing certifies the moment it fell due"
+        );
+        module.origins().certified.insert(session_id, due);
+        assert_eq!(module.next_decidable_deadline(later), Some(due));
+    }
+
     /// A reach that connects to nothing, reads no journal, and counts how often it is asked about
     /// a closure.
     #[derive(Default)]

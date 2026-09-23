@@ -1593,3 +1593,163 @@ async fn a_settlement_whose_caller_stops_waiting_is_still_stated() {
     assert!(!settled.raised);
     assert_eq!(settled.generation, Nullable::some(U64::ZERO));
 }
+
+/// KR-REQ-24.11: a settlement that cannot be written ends the connection, and the next
+/// connection's first statement settles the transition at the generation committed.
+#[tokio::test]
+async fn a_settlement_that_cannot_be_written_is_stated_by_the_next_connection() {
+    let host = host().await;
+    for index in 0..256 {
+        notify(&host, &format!("{index} {}", "x".repeat(600)));
+    }
+    let mut older = daemon(&host, ControllerConnectionRole::Attention).await;
+    let raising = raise(&host);
+    let raised = older.statement(Duration::from_secs(5)).await;
+    older.acknowledge(&raised).await;
+    let transition = raising.await.expect("the raise finishes");
+    let mut attention = host.service.attention_privacy();
+    enable_with(&host, &mut attention);
+
+    // Pages nobody reads hold the connection's writer past the settlement's bound.
+    for round in 0..3_u64 {
+        older
+            .writer()
+            .write_message(&ControlFrame::AttentionSources(AttentionSourcesRequest {
+                request_id: RequestId::new(80 + round),
+                max_records: U64::new(256),
+                ..sources(0, 0, 0)
+            }))
+            .await
+            .expect("writes the request");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::timeout(Duration::from_secs(10), transition.settle())
+        .await
+        .expect("the settlement gives up at its bound");
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while older.client.recv().await.is_ok() {}
+    })
+    .await
+    .expect("the older connection ends");
+
+    let newer = daemon(&host, ControllerConnectionRole::Attention).await;
+    let first = &newer.statements[0];
+    assert!(!first.raised, "the next connection settles the transition");
+    assert_eq!(first.generation, Nullable::some(U64::new(1)));
+}
+
+/// KR-REQ-24.11: enable, disable and enable in quick succession, each enable raised and
+/// acknowledged, are stated in order, each settlement with the generation it committed.
+#[tokio::test]
+async fn enable_disable_and_enable_are_stated_in_order() {
+    let host = host().await;
+    let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
+    let mut attention = host.service.attention_privacy();
+
+    let raising = raise(&host);
+    let first = link.statement(Duration::from_secs(5)).await;
+    link.acknowledge(&first).await;
+    let transition = raising.await.expect("the first raise finishes");
+    enable_with(&host, &mut attention);
+    transition.settle().await;
+    let first_settled = link.statement(Duration::from_secs(5)).await;
+
+    disable_privacy(&host);
+
+    let raising = raise(&host);
+    let second = link.statement(Duration::from_secs(5)).await;
+    link.acknowledge(&second).await;
+    let transition = raising.await.expect("the second raise finishes");
+    enable_with(&host, &mut attention);
+    transition.settle().await;
+    let second_settled = link.statement(Duration::from_secs(5)).await;
+
+    let stated: Vec<(bool, Option<u64>)> = [&first, &first_settled, &second, &second_settled]
+        .iter()
+        .map(|statement| (statement.raised, statement.generation.0.map(U64::get)))
+        .collect();
+    assert_eq!(
+        stated,
+        vec![
+            (true, Some(0)),
+            (false, Some(1)),
+            (true, Some(2)),
+            (false, Some(3))
+        ]
+    );
+    let sequences: Vec<U64> = [&first, &first_settled, &second, &second_settled]
+        .iter()
+        .map(|statement| statement.sequence)
+        .collect();
+    assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
+}
+
+/// KR-REQ-24.11: a disable committed between a raise and its enable leaves the transition raised:
+/// no answer carries text until the enable is settled, and the settlement names the generation
+/// the enable committed.
+#[tokio::test]
+async fn a_disable_between_a_raise_and_its_enable_keeps_the_transition_raised() {
+    let host = host().await;
+    let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
+    let raising = raise(&host);
+    let raised = link.statement(Duration::from_secs(5)).await;
+    link.acknowledge(&raised).await;
+    let transition = raising.await.expect("the raise finishes");
+
+    disable_privacy(&host);
+    notify(&host, "after the disable");
+    // Named at the generation the disable committed, so nothing but the raise can withhold it.
+    link.writer()
+        .write_message(&ControlFrame::AttentionText(AttentionTextRequest {
+            recorded_generation: Nullable::some(U64::new(1)),
+            ..texts(&[(AttentionSource::HostEvents, 1)])
+        }))
+        .await
+        .expect("writes the request");
+    let Answer::Texts(during) = within(&mut link, Duration::from_secs(5)).await else {
+        panic!("expected text");
+    };
+    assert_eq!(during.privacy_generation, Nullable::some(U64::new(1)));
+    assert_eq!(
+        during.texts[0].text,
+        Nullable::null(),
+        "no text while the transition is raised"
+    );
+
+    let mut attention = host.service.attention_privacy();
+    enable_with(&host, &mut attention);
+    transition.settle().await;
+    let settled = link.statement(Duration::from_secs(5)).await;
+    assert!(!settled.raised);
+    assert_eq!(settled.generation, Nullable::some(U64::new(2)));
+}
+
+/// The same request once the transition is settled and privacy mode turned off again carries its
+/// text, so what withheld it above was the raise.
+#[tokio::test]
+async fn text_withheld_only_by_a_raise_is_served_once_it_is_settled() {
+    let host = host().await;
+    let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
+    let raising = raise(&host);
+    let raised = link.statement(Duration::from_secs(5)).await;
+    link.acknowledge(&raised).await;
+    let transition = raising.await.expect("the raise finishes");
+    disable_privacy(&host);
+    notify(&host, "after the disable");
+    transition.settle().await;
+    let _ = link.statement(Duration::from_secs(5)).await;
+    link.writer()
+        .write_message(&ControlFrame::AttentionText(AttentionTextRequest {
+            recorded_generation: Nullable::some(U64::new(1)),
+            ..texts(&[(AttentionSource::HostEvents, 1)])
+        }))
+        .await
+        .expect("writes the request");
+    let Answer::Texts(after) = within(&mut link, Duration::from_secs(5)).await else {
+        panic!("expected text");
+    };
+    assert_eq!(
+        after.texts[0].text,
+        Nullable::some(said("after the disable"))
+    );
+}

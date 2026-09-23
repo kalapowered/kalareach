@@ -270,6 +270,8 @@ struct TestReach {
     stalled: std::sync::Mutex<Option<String>>,
     /// Speaks for a later daemon generation, as a daemon that has restarted does.
     later: AtomicBool,
+    /// How often a closed session's journal was asked for.
+    journals_opened: std::sync::atomic::AtomicU64,
 }
 
 /// What reaching one worker of this suite takes.
@@ -358,6 +360,7 @@ impl Reach for TestReach {
     }
 
     fn closed_journal(&self, session_id: SessionId) -> Option<kr_worker::journal::Journal> {
+        self.journals_opened.fetch_add(1, Ordering::SeqCst);
         if self.unreadable.load(Ordering::SeqCst) {
             return None;
         }
@@ -959,6 +962,7 @@ async fn a_finished_session_is_not_read_again() {
     module.session_closed(&*reach, one.session_id).await;
     let finished = inbox(&module, &reach).await.items;
     reach.unreadable.store(false, Ordering::SeqCst);
+    let opened = reach.journals_opened.load(Ordering::SeqCst);
     let again = {
         let module = Arc::clone(&module);
         let reach = Arc::clone(&reach);
@@ -969,7 +973,49 @@ async fn a_finished_session_is_not_read_again() {
         .await
         .expect("handling the closure again ends")
         .expect("the task finishes");
+    assert_eq!(
+        reach.journals_opened.load(Ordering::SeqCst),
+        opened,
+        "a finished session's journal is not read again"
+    );
     assert_eq!(keys(&inbox(&module, &reach).await.items), keys(&finished));
+}
+
+/// More records than one text request carries are read from a finished session's journal in
+/// batches, each answered where it stood, and text read from the journal after a verified closure
+/// needs no release lease.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_finished_session_s_journal_serves_text_in_batches() {
+    let one = worker().await;
+    for index in 1..=300 {
+        notify(&one, &format!("step {index} finished"));
+    }
+    let temp = kr_ipc::testing::TempHost::create();
+    let module = store_at(&temp);
+    let reach = Arc::new(TestReach::default());
+    reach.add(&one);
+    module.session_closed(&*reach, one.session_id).await;
+    let records: Vec<kr_attention::EventCursor> = (1..=300)
+        .map(|sequence| {
+            kr_attention::EventCursor::in_session(
+                one.session_id,
+                AttentionSource::HostEvents,
+                sequence,
+            )
+        })
+        .collect();
+    let (texts, ticket) = module.delivery_texts(&*reach, &records).await;
+    assert_eq!(texts.len(), 300);
+    for (index, text) in texts.iter().enumerate() {
+        assert_eq!(
+            text.as_deref(),
+            Some(format!("Normal: step {} finished", index + 1).as_str())
+        );
+    }
+    assert!(
+        ticket.is_empty(),
+        "text from a finished journal carries no lease"
+    );
 }
 
 /// KR-REQ-24.11: the environment's store has one owner. While a daemon holds it, another opener is
@@ -2137,47 +2183,28 @@ async fn a_deadline_that_passes_while_the_store_is_busy_refuses_the_action() {
     let admitted_revision = controller.authority_revision().await.expect("the revision");
     let connection_id = control.acknowledgement().connection_id;
 
-    let holding = {
-        let controller = Arc::clone(controller);
-        let module = Arc::clone(controller.attention());
-        let held = AdmittedMutation {
-            connection_id,
-            admitted_revision,
-            deadline: controller
-                .continuous_now()
-                .checked_add(Duration::from_secs(60)),
-        };
-        tokio::spawn(async move {
-            controller
-                .enter_admitted(&held, move |_| {
-                    std::thread::sleep(Duration::from_millis(300));
-                    // Many records of another session, applied in one call that holds the store.
-                    let busy_session = SessionId::new(kr_ipc::new_uuid());
-                    let burden: Vec<_> = (1..=500)
-                        .map(|sequence| {
-                            approval_at(busy_session, sequence, &format!("busy-{sequence}"))
-                        })
-                        .collect();
-                    let busy = std::thread::spawn(move || {
-                        let started = Instant::now();
-                        module.observe(&burden).expect("the records are applied");
-                        started.elapsed()
-                    });
-                    std::thread::sleep(Duration::from_millis(50));
-                    Ok(busy)
-                })
-                .await
-                .expect("the holder's write stands")
-        })
-    };
+    // A long call on another thread holds the store: many records of another session, applied in
+    // one call.
+    let module = Arc::clone(controller.attention());
+    let busy_session = SessionId::new(kr_ipc::new_uuid());
+    let burden: Vec<_> = (1..=1_000)
+        .map(|sequence| approval_at(busy_session, sequence, &format!("busy-{sequence}")))
+        .collect();
+    let busy = std::thread::spawn(move || {
+        let started = Instant::now();
+        module.observe(&burden).expect("the records are applied");
+        started.elapsed()
+    });
     tokio::time::sleep(Duration::from_millis(50)).await;
+    // Admitted with half a second to spare, so its first check passes at once; the deadline then
+    // passes while it waits for the store.
+    let bound = Duration::from_millis(500);
     let admission = AdmittedMutation {
         connection_id,
         admitted_revision,
-        deadline: controller
-            .continuous_now()
-            .checked_add(Duration::from_millis(500)),
+        deadline: controller.continuous_now().checked_add(bound),
     };
+    let started = Instant::now();
     let refused = controller
         .attention()
         .write(
@@ -2189,14 +2216,15 @@ async fn a_deadline_that_passes_while_the_store_is_busy_refuses_the_action() {
             &admission,
         )
         .await;
-    let busy_for = holding
-        .await
-        .expect("the holder finishes")
-        .join()
-        .expect("the busy call finishes");
+    let waited = started.elapsed();
+    let busy_for = busy.join().expect("the busy call finishes");
     assert!(
-        busy_for > Duration::from_millis(700),
+        busy_for > bound,
         "the store was held past the deadline: {busy_for:?}"
+    );
+    assert!(
+        waited >= bound,
+        "the action passed its first check and waited for the store: {waited:?}"
     );
     let refused = refused.expect_err("the deadline passed while the action waited for the store");
     assert_eq!(refused.code, ErrorCode::PermissionDenied);
@@ -2752,10 +2780,12 @@ async fn a_link_replaced_during_the_transition_keeps_the_barrier_until_it_is_set
 }
 
 /// KR-REQ-24.11: a daemon restart during the transition. The new daemon acknowledges the raise at
-/// once, and still the commit waits out the text the earlier daemon was given, whose barrier is
-/// not the new daemon's to keep.
+/// once, and the commit still waits out the text the earlier daemon was given, whose barrier is
+/// not the new daemon's to keep; text the new daemon was given later is covered by its own barrier
+/// and not waited for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_new_daemon_s_acknowledgement_waits_out_what_the_earlier_one_was_given() {
+    let lease = kr_protocol::attention::ATTENTION_TEXT_LEASE_MS;
     let one = worker().await;
     ask(&one, "r-1", "which branch?");
     let temp = kr_ipc::testing::TempHost::create();
@@ -2766,23 +2796,86 @@ async fn a_new_daemon_s_acknowledgement_waits_out_what_the_earlier_one_was_given
     let _ = with_text(&earlier, &reach).await;
     let asked_at = kr_ipc::clock::boot_elapsed_ms();
     let read = inbox(&earlier, &reach).await;
+    let answered_by = kr_ipc::clock::boot_elapsed_ms();
     assert!(read.items.iter().any(|item| item.summary.is_present()));
     drop(earlier);
 
-    // The next daemon speaks for a later generation and opens the same store.
+    // The next daemon speaks for a later generation, opens the same store, and is given text of
+    // its own two seconds later, with a lease that ends two seconds after the earlier one.
     let restarted = Arc::new(TestReach::default());
     restarted.later.store(true, Ordering::SeqCst);
     restarted.add(&one);
     let later = reopen(&temp).await;
     later.watch(Arc::clone(&restarted) as Arc<dyn Reach>, one.known.clone());
+    while kr_ipc::clock::boot_elapsed_ms() < answered_by + 2_000 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let given_at = kr_ipc::clock::boot_elapsed_ms();
     let _ = with_text(&later, &restarted).await;
 
+    let raised_at = kr_ipc::clock::boot_elapsed_ms();
+    assert!(
+        raised_at + 500 < asked_at + lease,
+        "the earlier daemon's lease still holds when the raise begins"
+    );
     let transition = one.service.raise_privacy_transition().await;
     let returned = kr_ipc::clock::boot_elapsed_ms();
     assert!(
-        returned >= asked_at + kr_protocol::attention::ATTENTION_TEXT_LEASE_MS,
+        returned >= asked_at + lease,
         "returned at {returned}, before the earlier daemon's lease from {asked_at} ended"
+    );
+    assert!(
+        returned < given_at + lease,
+        "returned at {returned}: the later daemon acknowledged, so its own lease from {given_at} \
+         was not waited for"
     );
     let _attention = enable(&one);
     transition.settle().await;
+}
+
+/// KR-REQ-24.11: text held across enable, disable and enable in quick succession, each enable
+/// raised with the daemon and acknowledged, is withheld afterwards: the generation it was decided
+/// under is three transitions behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn text_held_across_enable_disable_and_enable_is_withheld() {
+    let one = worker().await;
+    ask(&one, "r-1", "which branch?");
+    let temp = kr_ipc::testing::TempHost::create();
+    let module = store_at(&temp);
+    let reach = Arc::new(TestReach::default());
+    reach.add(&one);
+    module.watch(Arc::clone(&reach) as Arc<dyn Reach>, one.known.clone());
+    let _ = with_text(&module, &reach).await;
+    let held = module
+        .read_released(&*reach, &Caller::Owner, &owner(), &read_request(None))
+        .await;
+
+    let first = tokio::time::timeout(
+        Duration::from_secs(2),
+        one.service.raise_privacy_transition(),
+    )
+    .await
+    .expect("the daemon acknowledges the first raise");
+    let _enabled = enable(&one);
+    first.settle().await;
+    one.service
+        .runtime()
+        .session()
+        .disable_privacy()
+        .expect("privacy mode is turned off");
+    let second = tokio::time::timeout(
+        Duration::from_secs(2),
+        one.service.raise_privacy_transition(),
+    )
+    .await
+    .expect("the daemon acknowledges the second raise");
+    let _again = enable(&one);
+    second.settle().await;
+
+    let read = released_to_the_reader(&temp, &module, held).await;
+    assert!(
+        summaries(&read).iter().all(Option::is_none),
+        "{:?}",
+        read.items
+    );
 }
