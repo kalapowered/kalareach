@@ -352,13 +352,39 @@ impl DeviceKeys {
 mod tests {
     use super::*;
 
+    /// KR-REQ-10.03: a device holds four independent keys, one per purpose: four separately drawn
+    /// seeds, four different public keys, and nothing shared with another device.
     #[test]
     fn the_four_purposes_produce_four_different_keys() {
         let keys = DeviceKeys::generate().expect("libsodium is available");
         let public = keys.public_keys();
         assert!(public.purposes_are_distinct());
+
+        // Each purpose drew its own seed. None is derived from, converted from or shared with
+        // another purpose's.
+        let seeds = [
+            keys.transport.seed().expose(),
+            keys.authorisation.seed().expose(),
+            keys.stored_envelope.seed().expose(),
+            keys.notification_preview.seed().expose(),
+        ];
+        for (index, left) in seeds.iter().enumerate() {
+            for right in &seeds[index + 1..] {
+                assert_ne!(left, right, "two purposes share a seed");
+            }
+        }
+
+        let other = DeviceKeys::generate()
+            .expect("libsodium is available")
+            .public_keys();
+        assert_ne!(public.transport, other.transport);
+        assert_ne!(public.authorisation, other.authorisation);
+        assert_ne!(public.stored_envelope, other.stored_envelope);
+        assert_ne!(public.notification_preview, other.notification_preview);
     }
 
+    /// KR-REQ-10.03: a key identifier names its purpose, so one key cannot pass as another
+    /// purpose's.
     #[test]
     fn a_key_identifier_covers_the_purpose() {
         let bytes = [9u8; 32];
@@ -376,6 +402,7 @@ mod tests {
         assert_eq!(first.public(), second.public());
     }
 
+    /// KR-REQ-10.03: even the same stored bytes give two different keys under two purposes.
     #[test]
     fn the_same_seed_bytes_under_two_purposes_still_give_two_public_keys() {
         // The seed types are separate, so this is only reachable by deliberately storing the same
@@ -394,6 +421,7 @@ mod tests {
         assert_ne!(signing.key_id(), boxed.key_id());
     }
 
+    /// KR-REQ-10.03: the one exported seed rebuilds only the transport key it came from.
     #[test]
     fn an_exported_transport_seed_cannot_become_another_purpose() {
         // `export_endpoint_seed` is the one export, and the only constructors that take raw bytes

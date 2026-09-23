@@ -76,6 +76,8 @@ fn generation_is_deterministic() {
     );
 }
 
+/// KR-REQ-23.06: the published signatures verify over their exact bytes and domain, and every
+/// altered case fails.
 #[test]
 fn every_signature_vector_verifies_and_every_negative_case_fails() {
     let document = fixture("signatures.json");
@@ -140,6 +142,8 @@ fn every_signature_vector_verifies_and_every_negative_case_fails() {
     }
 }
 
+/// KR-REQ-23.15: the published kr-connect/1 transcript carries both proofs, and neither stands in
+/// for the other.
 #[test]
 fn the_connection_proof_vector_needs_both_signatures() {
     let document = fixture("signatures.json");

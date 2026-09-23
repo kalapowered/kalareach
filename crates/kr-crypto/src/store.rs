@@ -1220,6 +1220,7 @@ mod tests {
         assert!(load_device_keys(&store, "host").is_err());
     }
 
+    /// KR-REQ-10.03: one stored seed under two purposes is refused rather than loaded.
     #[test]
     fn a_seed_shared_across_two_purposes_is_rejected() {
         let store = MemoryStore::new();
@@ -1292,6 +1293,8 @@ mod tests {
         base
     }
 
+    /// KR-REQ-10.47: the directory fallback exists only on Linux; every other platform uses its
+    /// protected store or fails.
     #[test]
     fn the_fallback_is_offered_only_where_section_10_offers_it() {
         // macOS, iOS, Android and Windows always have a protected store, so a missing one is an
@@ -1409,6 +1412,7 @@ mod tests {
         unix,
         not(any(target_os = "macos", target_os = "ios", target_os = "android"))
     ))]
+    /// KR-REQ-10.47: the Linux fallback is a 0700 directory holding 0600 files.
     #[test]
     fn the_fallback_directory_and_files_are_owner_only() {
         use std::os::unix::fs::PermissionsExt;

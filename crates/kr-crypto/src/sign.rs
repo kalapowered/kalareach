@@ -176,6 +176,7 @@ mod tests {
     use super::*;
     use crate::error::CryptoError;
 
+    /// KR-REQ-23.06: a signature verifies only under the domain it was made in.
     #[test]
     fn a_signature_verifies_under_its_own_domain_only() {
         let key = AuthorisationKeyPair::generate().expect("a keypair");
@@ -205,6 +206,7 @@ mod tests {
         );
     }
 
+    /// KR-REQ-23.06: only the exact canonical encoding of a domain-separated array can be signed.
     #[test]
     fn a_transcript_is_checked_against_the_domain_it_claims() {
         let bytes = SigningTranscript::from_elements("kr-test/1", vec![CanonicalValue::text("x")])
@@ -212,11 +214,17 @@ mod tests {
             .to_vec();
         assert!(SigningTranscript::from_canonical_bytes("kr-test/1", bytes.clone()).is_ok());
         assert!(matches!(
-            SigningTranscript::from_canonical_bytes("kr-test/2", bytes),
+            SigningTranscript::from_canonical_bytes("kr-test/2", bytes.clone()),
             Err(CryptoError::BindingMismatch {
                 what: "the domain of a signing transcript"
             })
         ));
+
+        // The bytes have to be the canonical encoding itself: the same array written with a longer
+        // head than necessary is refused, so nothing normalised or re-encoded is ever signed.
+        let mut longer = vec![0x98, 0x02];
+        longer.extend_from_slice(&bytes[1..]);
+        assert!(SigningTranscript::from_canonical_bytes("kr-test/1", longer).is_err());
 
         // A map is not a domain-separated transcript, so it cannot be signed at all.
         let mut map = kr_cbor::CanonicalMap::new();
@@ -233,6 +241,7 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-23.06: a signature covers every element of what it signs.
     #[test]
     fn a_changed_element_does_not_verify() {
         let key = AuthorisationKeyPair::generate().expect("a keypair");
