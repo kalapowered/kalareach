@@ -270,10 +270,9 @@ pub struct Exported {
     /// Whether this client holds a way to ask for the copy's removal.
     ///
     /// True for a copy the service kept of a refused write, which [`SyncClient::drop_kept_copy`]
-    /// asks the service to drop. False for everything else: a synchronisation service is a
-    /// compare-and-exchange store, and this client can replace an object's content but has no way
-    /// to ask for the object to be deleted, so saying otherwise would be claiming an action it
-    /// cannot perform.
+    /// asks the service to drop. False for everything else: this client publishes writes and offers
+    /// no operation that removes a published object, so saying otherwise would be claiming an
+    /// action it cannot perform.
     pub deletable: bool,
 }
 
