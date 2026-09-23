@@ -227,6 +227,55 @@ async fn a_session_runs_a_shell_and_its_output_reaches_an_attachment() {
 /// KR-REQ-06.12: the session root shell is not a superuser shell: the process a session launches
 /// as its root shell runs with the real and effective user of the host that started it.
 #[cfg(unix)]
+/// KR-REQ-07.52: a session that ends straight after writing still delivers the last of what it
+/// wrote before its closure. The engine holds the last character of a run back in case a combining
+/// mark follows it, and a session whose shell ends at that moment has nothing more to follow it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_last_character_a_session_wrote_reaches_its_attachment_before_the_closure() {
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(&host, "exec cat");
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let attachment_id = AttachmentId::new(kr_ipc::new_uuid());
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    requested.insert(AttachmentCapability::Input);
+    session
+        .attach(&terminal_attachment(session_id), requested, attachment_id)
+        .expect("attaches");
+    let mut stream = session.subscribe(attachment_id).expect("subscribes");
+
+    // Output that stops part way through a run of text, as a program that prints without a newline
+    // and exits leaves it, and the shell's own end straight after it.
+    session.ingest_output(b"kr-last-words");
+    session.note_shell_exit(kr_worker::pty::ShellExit {
+        code: 0,
+        signal: None,
+    });
+    let mut seen = Vec::new();
+    loop {
+        match tokio::time::timeout(LIVENESS_DEADLINE, stream.recv()).await {
+            Ok(Some(OutputDelivery::Bytes { bytes, .. })) => seen.extend_from_slice(&bytes),
+            Ok(Some(OutputDelivery::Closed(notice))) => {
+                assert_eq!(notice.record().reason, ClosureReason::RootExit);
+                break;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => panic!(
+                "the stream ended without the closure: {:?}",
+                String::from_utf8_lossy(&seen)
+            ),
+        }
+    }
+    assert!(
+        seen.ends_with(b"kr-last-words"),
+        "all of the output came before the closure, its last character included: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    let _ = session.force_close();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_root_shell_runs_as_the_hosts_own_user() {
     let host = kr_ipc::testing::TempHost::create();

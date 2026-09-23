@@ -765,6 +765,14 @@ impl SessionRuntime {
                         // The terminal is finished. Whether the root shell has ended is a separate
                         // question, answered by the child monitor: a descendant can hold the slave
                         // descriptor open after the shell exits, and a read error is not a death.
+                        //
+                        // Nothing more will arrive, so the screen settles now: the last character
+                        // the engine held back for a mark that could have followed it goes to every
+                        // attachment. The end is often queued straight behind the final output, and
+                        // then the settling above, which waits for a quiet queue, never runs.
+                        if let Ok(mut session) = ingest_session.lock() {
+                            session.quiesce_output();
+                        }
                         ingest_closed.notify_waiters();
                         break;
                     }

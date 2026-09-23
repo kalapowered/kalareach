@@ -3773,6 +3773,11 @@ impl Session {
         if let Some(existing) = self.closure.clone() {
             return existing;
         }
+        // The engine holds the last character of a run back until the output goes quiet, in case
+        // a combining mark follows it. Nothing follows a session that is closing, so what it holds
+        // is final: it is settled and delivered here, before the closure is, which is what lets
+        // the closure follow every byte of output an attachment is owed.
+        let _ = self.quiesce_output();
         // One last look before the record is written, so a process that started late is still
         // accounted for.
         if let Some(owned) = self.owned.as_mut() {
