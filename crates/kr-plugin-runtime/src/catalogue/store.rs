@@ -681,55 +681,87 @@ impl StagedPackage {
 
     /// Makes the staged package the activated one.
     ///
-    /// The staged package was checked as a whole before this. Whatever is at the destination was
-    /// not: an activation is asked for only after the package there, if any, failed its own check,
-    /// so it is moved aside into this attempt's staging area and the staged package takes its
-    /// place. A name that is already there never counts as the package.
+    /// The staged package was checked as a whole before this. Where nothing is at the destination
+    /// yet, the whole directory is renamed into place, so the package appears complete or not at
+    /// all. Where a package is already there, it failed its own check, and it is repaired where it
+    /// lies: each file that does not hold the checked bytes is replaced by a rename of its own. The
+    /// directory never disappears, a reader holding a file open keeps reading it, and a reader that
+    /// opens a file by name finds either the file that was there or the checked one. The name
+    /// alone never counts as the package.
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogueError::StorageUnavailable`] when nothing was moved, and
-    /// [`CatalogueError::PublicationUncertain`] when what was there was moved aside and the staged
-    /// package could not take its place, or when its directory did not confirm the rename.
+    /// Returns [`CatalogueError::StorageUnavailable`] when nothing was changed, and
+    /// [`CatalogueError::PublicationUncertain`] when part of the package was replaced and the rest
+    /// could not be, or when a directory did not confirm a rename.
     pub(crate) fn activate(self, _permit: &Permit) -> CatalogueResult<PathBuf> {
         if let Some(parent) = self.destination.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|source| CatalogueError::storage(parent, &source))?;
         }
         flush_tree(&self.path)?;
-        let mut replaced = self.path.clone().into_os_string();
-        replaced.push(".replaced");
-        let replaced = PathBuf::from(replaced);
-        let moved_aside = match std::fs::symlink_metadata(&self.destination) {
-            Ok(_) => {
-                std::fs::rename(&self.destination, &replaced)
+        match std::fs::symlink_metadata(&self.destination) {
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::rename(&self.path, &self.destination)
                     .map_err(|source| CatalogueError::storage(&self.destination, &source))?;
-                true
+                if let Some(parent) = self.destination.parent() {
+                    flushed_after_publication(parent, &self.destination)?;
+                }
             }
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => false,
             Err(source) => return Err(CatalogueError::storage(&self.destination, &source)),
-        };
-        if let Err(source) = std::fs::rename(&self.path, &self.destination) {
-            return Err(if moved_aside {
-                CatalogueError::PublicationUncertain {
+            Ok(metadata) if metadata.is_dir() => self.repair_in_place()?,
+            Ok(_) => {
+                return Err(CatalogueError::StorageUnavailable {
                     detail: format!(
-                        "{} was moved aside and the checked package could not take its place: \
-                         {source}",
+                        "{} is not a directory, and a package is not repaired over it",
                         self.destination.display()
                     ),
-                }
-            } else {
-                CatalogueError::storage(&self.destination, &source)
-            });
-        }
-        if moved_aside {
-            // What was there failed its check, and nothing reads a staging directory.
-            let _ = std::fs::remove_dir_all(&replaced);
-        }
-        if let Some(parent) = self.destination.parent() {
-            flushed_after_publication(parent, &self.destination)?;
+                });
+            }
         }
         Ok(self.destination.clone())
+    }
+
+    /// Replaces, one rename at a time, every file of the package already at the destination that
+    /// does not hold the checked bytes.
+    fn repair_in_place(&self) -> CatalogueResult<()> {
+        let mut replaced: Vec<PathBuf> = Vec::new();
+        for relative in self.written.keys() {
+            let staged = self.path.join(relative);
+            let target = self.destination.join(relative);
+            let checked = std::fs::read(&staged)
+                .map_err(|source| CatalogueError::storage(&staged, &source))?;
+            // A file that holds the checked bytes is left where it is, so whoever is reading it is
+            // not disturbed. A file that is missing, different or unreadable is replaced, and the
+            // replacement is what reports whether that can be done.
+            if std::fs::read(&target).is_ok_and(|held| held == checked) {
+                continue;
+            }
+            let outcome = target
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::rename(&staged, &target));
+            if let Err(source) = outcome {
+                return Err(if replaced.is_empty() {
+                    CatalogueError::storage(&target, &source)
+                } else {
+                    CatalogueError::PublicationUncertain {
+                        detail: format!(
+                            "{} of the package's files were replaced and {} could not be: {source}",
+                            replaced.len(),
+                            target.display()
+                        ),
+                    }
+                });
+            }
+            replaced.push(target);
+        }
+        let directories: BTreeSet<&Path> =
+            replaced.iter().filter_map(|path| path.parent()).collect();
+        for directory in directories {
+            flushed_after_publication(directory, &self.destination)?;
+        }
+        Ok(())
     }
 
     /// Discards the staged package.
@@ -1018,6 +1050,12 @@ mod tests {
 
     /// Activates the example package, whose manifest declares one presentation file.
     fn activated_example(store: &Store) -> (PayloadDigest, PathBuf) {
+        let (digest, activated) = activate_example(store);
+        (digest, activated.expect("activated"))
+    }
+
+    /// Stages the example package and asks for it to be activated.
+    fn activate_example(store: &Store) -> (PayloadDigest, CatalogueResult<PathBuf>) {
         let presentation = kr_plugin_sdk::example::example_presentation_json();
         let manifest = kr_plugin_sdk::example::example_manifest_for(presentation.as_bytes());
         let manifest_bytes = serde_json::to_vec(&manifest).expect("serialisable");
@@ -1035,8 +1073,7 @@ mod tests {
                 presentation.as_bytes(),
             )
             .expect("written");
-        let directory = owned(|permit| staged.activate(permit)).expect("activated");
-        (digest, directory)
+        (digest, owned(|permit| staged.activate(permit)))
     }
 
     #[test]
@@ -1208,6 +1245,91 @@ mod tests {
             std::fs::read_dir(&staging).expect("readable").count(),
             0,
             "nothing of either attempt is left in staging"
+        );
+    }
+
+    #[test]
+    fn a_repair_leaves_intact_files_and_their_readers_alone() {
+        use std::io::Read as _;
+
+        let (_directory, store) = store();
+        let (digest, directory) = activated_example(&store);
+        let manifest = directory.join(kr_plugin_sdk::package::MANIFEST_FILE);
+        let expected = std::fs::read(&manifest).expect("readable");
+        let mut reader = std::fs::File::open(&manifest).expect("a reader holds the manifest open");
+        #[cfg(unix)]
+        let before =
+            std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&manifest).expect("readable"));
+        std::fs::write(
+            directory.join(kr_plugin_sdk::package::PRESENTATION_FILE),
+            b"altered",
+        )
+        .expect("writable");
+
+        let (again, repaired) = activated_example(&store);
+        assert_eq!((again, &repaired), (digest, &directory));
+        assert!(matches!(
+            store.check_package(digest).expect("readable"),
+            PackageCheck::Complete(_)
+        ));
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&manifest).expect("readable")),
+            before,
+            "the intact manifest is the same file it was"
+        );
+        let mut read = Vec::new();
+        reader
+            .read_to_end(&mut read)
+            .expect("the open file still reads");
+        assert_eq!(read, expected);
+    }
+
+    #[test]
+    fn a_repair_that_cannot_replace_a_file_says_what_it_changed_and_is_tried_again() {
+        let (_directory, store) = store();
+        let (digest, directory) = activated_example(&store);
+        let presentation = directory.join(kr_plugin_sdk::package::PRESENTATION_FILE);
+        let manifest = directory.join(kr_plugin_sdk::package::MANIFEST_FILE);
+        // A name no file rename replaces: a directory with something in it.
+        std::fs::remove_file(&presentation).expect("removable");
+        std::fs::create_dir_all(presentation.join("in the way")).expect("a directory");
+
+        // Only the presentation needs replacing and it cannot be, so nothing changed.
+        let (_, outcome) = activate_example(&store);
+        assert!(
+            matches!(outcome, Err(CatalogueError::StorageUnavailable { .. })),
+            "{outcome:?}"
+        );
+        assert!(
+            directory.is_dir(),
+            "the package directory stays where it is"
+        );
+
+        // With the manifest altered too, the manifest is replaced first and the presentation still
+        // cannot be: part of the repair happened, and the answer says so.
+        std::fs::write(&manifest, b"altered").expect("writable");
+        let (_, outcome) = activate_example(&store);
+        assert!(
+            matches!(outcome, Err(CatalogueError::PublicationUncertain { .. })),
+            "{outcome:?}"
+        );
+        assert_ne!(std::fs::read(&manifest).expect("readable"), b"altered");
+
+        // Once the obstruction is gone, the same repair completes in the same process.
+        std::fs::remove_dir_all(&presentation).expect("removable");
+        let (_, outcome) = activate_example(&store);
+        outcome.expect("repaired");
+        assert!(matches!(
+            store.check_package(digest).expect("readable"),
+            PackageCheck::Complete(_)
+        ));
+        assert_eq!(
+            std::fs::read_dir(store.root.join("staging"))
+                .expect("readable")
+                .count(),
+            0,
+            "no attempt left anything in staging"
         );
     }
 

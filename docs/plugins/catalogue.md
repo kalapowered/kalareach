@@ -107,8 +107,10 @@ A package is staged in a directory of its own, every payload is verified as a se
 is renamed into place once all of them verify. A package is therefore never half installed.
 
 A package already here is used only after every file its manifest declares is checked where it
-lies. One that is incomplete or altered is fetched again and takes the place of what is there; the
-name of its directory never counts as the package. What an installation records, the capabilities
+lies; the name of its directory never counts as the package. One that is incomplete or altered is
+fetched and checked again, then repaired where it lies: each file that does not hold the checked
+bytes is replaced by a rename of its own. The directory never disappears, and a binding reading a
+file that was intact keeps reading the same file. What an installation records, the capabilities
 the package asks for and the payloads it consists of, is read from the manifest the package hash
 names. An index entry that says something else about the same hash is refused, whether the package
 was fetched just now or was already here.
