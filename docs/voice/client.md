@@ -75,17 +75,19 @@ Android's microphone foreground service:
   the microphone carries speech only once audio is arriving from it. Android takes that from its
   recorder's own start and stop, the desktop from the first captured frame, and iOS from the local
   source's count of audio taken in, read four times a second, which grows only while the microphone
-  delivers; when it stops growing, what was heard ends at the last reading that saw it grow. The
-  deadline is kept on the device's monotonic clock, read again after the platform's own steps so
-  their time counts against it. The call ends at the deadline on its own thread rather than the main
-  one, and any change after the deadline ends it at once. On Android and the desktop every frame
-  after the deadline is refused as well; iOS checks no frames, so there the microphone keeps its
-  state until the call's own queue runs the end or delivers a change. A stopped call never reopens,
-  and a second permit for the same call is refused.
+  delivers; there the record vouches for time only up to the last reading that saw it grow, however
+  capture ends and whatever the screen said while the stop was not yet noticed. The deadline is
+  kept on the device's monotonic clock, read again after the platform's own steps so their time
+  counts against it. The call ends at the deadline on its own thread rather than the main one, and
+  any change after the deadline ends it at once. On Android and the desktop every frame after the
+  deadline is refused as well; iOS checks no frames, so there the microphone keeps its state until
+  the call's own queue runs the end or delivers a change. A stopped call never reopens, and a second
+  permit for the same call is refused.
 - **One call at a time**: the audio belongs to one call. On iOS a second call is refused before its
-  control can change the shared audio, a change named for a call that does not hold the audio does
-  nothing, and the call that holds it is kept until it ends; on Android the process claims one call
-  at a time and refuses a second.
+  control can change the shared audio, and a change named for a call that does not hold the audio
+  does nothing. A call let go of before it opened the audio leaves it free; one that has opened it is
+  kept until it ends, and a call whose offer or answer fails ends. On Android the process claims one
+  call at a time and refuses a second.
 
 ## Capture states and unheard speech
 
