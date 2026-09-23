@@ -1853,7 +1853,6 @@ async fn two_confirmation_submissions_overlap_before_the_claim() {
         Arc::new(kr_controller::service::net::pairing::HostPairingClock::new(
             &kr_ipc::identity::boot_identity().expect("a boot identity"),
         )),
-        Arc::clone(owned.network.devices()),
     ));
     let service = Arc::clone(host.controller.project().service());
     let actor = kr_protocol::ids::ActorId::new("local:owner").expect("a principal");
@@ -1920,16 +1919,18 @@ async fn two_confirmation_submissions_overlap_before_the_claim() {
         locations(&mut control, host.environment_id).await,
         vec![location.clone()]
     );
-    // The challenge was spent exactly once: the owner's proof answers nothing now.
+    // The challenge was spent exactly once: the ledger holds it no more, and the owner's proof
+    // answers nothing now.
+    assert!(!authority.outstanding(&request));
     let spent = authority
-        .accept(
+        .verify(
             &kr_project::policy::Enlargement {
                 action_digest: request.action_digest,
                 rights: request.destination_rights.clone(),
             },
             &signed(&owner, &request),
         )
-        .expect_err("a spent challenge accepts nothing");
+        .expect_err("a spent challenge verifies nothing");
     assert_eq!(spent.code, ErrorCode::OwnerConfirmationRequired);
     drop(control);
     let _ = owned.stop().await;

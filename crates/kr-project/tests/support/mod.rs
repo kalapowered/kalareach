@@ -823,10 +823,11 @@ pub const fn include_everything() -> kr_protocol::project::InclusionPolicy {
 
 /// The daemon's owner, as the location tests stand it in.
 ///
-/// It issues challenges the way the daemon's ceremony does, keeps them outstanding, and accepts a
-/// proof only when it answers a challenge it issued for exactly the enlargement the service
-/// presents, carrying the signature [`sign`] makes. Each challenge is consumed once. Grants are the
-/// ones a test gives it, and a grant a test revokes is refused as the daemon would refuse it.
+/// It issues challenges the way the daemon's ceremony does, keeps them outstanding in a ledger of
+/// its own, verifies a proof only when it answers a challenge it issued for exactly the
+/// enlargement the service presents and carries the signature [`sign`] makes, and spends each
+/// challenge once. A test can make the ledger let every challenge go, as its deadline would, and
+/// can make the ledger let a challenge go between its verification and its spending.
 #[derive(Debug, Default)]
 pub struct TestOwner {
     outstanding: std::sync::Mutex<
@@ -835,36 +836,14 @@ pub struct TestOwner {
             kr_project::policy::Enlargement,
         )>,
     >,
-    grants: std::sync::Mutex<
-        std::collections::BTreeMap<kr_protocol::ids::GrantId, kr_project::policy::GrantReach>,
-    >,
     issued: std::sync::atomic::AtomicU64,
+    lapse_after_verifying: std::sync::atomic::AtomicBool,
 }
 
 /// The signature a test owner's proof carries.
 const TEST_SIGNATURE: [u8; 64] = [0x5a; 64];
 
 impl TestOwner {
-    /// Adds a grant this owner will say stands.
-    pub fn grant_to(
-        &self,
-        grant_id: kr_protocol::ids::GrantId,
-        actions: &[kr_protocol::rights::ActionRight],
-    ) {
-        self.grants.lock().expect("the grants").insert(
-            grant_id,
-            kr_project::policy::GrantReach {
-                recipient_device_id: kr_protocol::ids::DeviceId::new(grant_id.get()),
-                actions: actions.iter().copied().collect(),
-            },
-        );
-    }
-
-    /// Takes a grant away, as a revocation does.
-    pub fn revoke(&self, grant_id: kr_protocol::ids::GrantId) {
-        self.grants.lock().expect("the grants").remove(&grant_id);
-    }
-
     /// Returns how many challenges this owner has issued.
     #[must_use]
     pub fn issued(&self) -> u64 {
@@ -875,6 +854,24 @@ impl TestOwner {
     #[must_use]
     pub fn outstanding(&self) -> usize {
         self.outstanding.lock().expect("the challenges").len()
+    }
+
+    /// Lets every outstanding challenge go, as the ledger's own deadline does.
+    pub fn let_everything_go(&self) {
+        self.outstanding.lock().expect("the challenges").clear();
+    }
+
+    /// Makes the next verified challenge lapse before it can be spent.
+    pub fn lapse_after_verifying(&self) {
+        self.lapse_after_verifying
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn refused(why: &str) -> kr_protocol::error::ProtocolError {
+        kr_protocol::error::ProtocolError::new(
+            kr_protocol::error::ErrorCode::OwnerConfirmationRequired,
+            format!("the owner's confirmation does not authorise this: {why}"),
+        )
     }
 }
 
@@ -912,52 +909,59 @@ impl kr_project::policy::OwnerAuthority for TestOwner {
         Ok(request)
     }
 
-    fn accept(
+    fn outstanding(&self, request: &kr_protocol::pairing::OwnerConfirmationRequest) -> bool {
+        self.outstanding
+            .lock()
+            .expect("the challenges")
+            .iter()
+            .any(|(issued, _)| issued == request)
+    }
+
+    fn verify(
         &self,
         enlargement: &kr_project::policy::Enlargement,
         proof: &kr_protocol::pairing::OwnerConfirmationProof,
     ) -> Result<(), kr_protocol::error::ProtocolError> {
-        let refused = |why: &str| {
-            kr_protocol::error::ProtocolError::new(
-                kr_protocol::error::ErrorCode::OwnerConfirmationRequired,
-                format!("the owner's confirmation does not authorise this: {why}"),
-            )
-        };
         if proof.signature != kr_protocol::scalars::Signature64::from_bytes(TEST_SIGNATURE) {
-            return Err(refused("the signature is not the owner's"));
+            return Err(Self::refused("the signature is not the owner's"));
         }
         let mut outstanding = self.outstanding.lock().expect("the challenges");
         let Some(position) = outstanding
             .iter()
             .position(|(request, _)| request == &proof.request)
         else {
-            return Err(refused("no such challenge is outstanding"));
+            return Err(Self::refused("no such challenge is outstanding"));
         };
         if &outstanding[position].1 != enlargement
             || proof.request.action_digest != enlargement.action_digest
             || proof.request.destination_rights != enlargement.rights
         {
-            return Err(refused("the challenge was issued for something else"));
+            return Err(Self::refused("the challenge was issued for something else"));
         }
-        outstanding.remove(position);
+        if self
+            .lapse_after_verifying
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            outstanding.remove(position);
+        }
         Ok(())
     }
 
-    fn grant(
+    fn consume(
         &self,
-        grant_id: kr_protocol::ids::GrantId,
-    ) -> Result<kr_project::policy::GrantReach, kr_protocol::error::ProtocolError> {
-        self.grants
-            .lock()
-            .expect("the grants")
-            .get(&grant_id)
-            .cloned()
-            .ok_or_else(|| {
-                kr_protocol::error::ProtocolError::new(
-                    kr_protocol::error::ErrorCode::PermissionDenied,
-                    format!("grant {grant_id} was revoked or has expired"),
-                )
-            })
+        proof: &kr_protocol::pairing::OwnerConfirmationProof,
+    ) -> Result<(), kr_protocol::error::ProtocolError> {
+        let mut outstanding = self.outstanding.lock().expect("the challenges");
+        let Some(position) = outstanding
+            .iter()
+            .position(|(request, _)| request == &proof.request)
+        else {
+            return Err(Self::refused(
+                "the challenge has run out or was already spent",
+            ));
+        };
+        outstanding.remove(position);
+        Ok(())
     }
 }
 

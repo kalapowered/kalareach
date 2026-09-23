@@ -828,7 +828,6 @@ impl Controller {
                 signer,
                 enrolment,
                 Arc::new(net::pairing::HostPairingClock::new(&self.boot_identity)),
-                Arc::clone(network.devices()),
             )))
     }
 

@@ -34,19 +34,18 @@ use std::sync::{Arc, Mutex, OnceLock};
 use kr_pairing::confirm::{ConfirmationExpectation, ConfirmationLedger, HostEnrolment};
 use kr_pairing::platform::PairingClock;
 use kr_project::ProjectService;
-use kr_project::policy::{Enlargement, GrantReach, OwnerAuthority};
+use kr_project::policy::{Enlargement, OwnerAuthority};
 use kr_project::store::{Action, RetainedOutcome};
 use kr_protocol::envelope::{
     ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::{ActorId, DeviceId, GrantId, RequestId};
+use kr_protocol::ids::{ActorId, DeviceId, RequestId};
 use kr_protocol::method::{Method, MethodGroup};
 use kr_protocol::pairing::{OwnerConfirmationProof, OwnerConfirmationRequest, SensitiveAction};
 use kr_protocol::scalars::{AuthorisationKey, EndpointKey};
 
 use crate::error::{ControllerError, Result};
-use crate::service::net::devices::DeviceDirectory;
 
 /// What a project call answers with: the method's result, or the refusal the service decided.
 pub type Answer<T> = std::result::Result<T, ProtocolError>;
@@ -59,11 +58,18 @@ pub struct ProjectModule {
     owner: OnceLock<Arc<HostOwner>>,
 }
 
+/// How often expired owner challenges are let go, with the directories they held open.
+///
+/// A challenge lives as long as the ledger's own deadline, two minutes. Sweeping twice a minute
+/// means a challenge nobody answers holds its directory for at most half a minute beyond that.
+const CHALLENGE_SWEEP: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// This host's owner, as the project service's location decisions reach it.
 ///
-/// The challenge is issued and consumed here, against this host's own ledger, identity and
+/// The challenge is issued, verified and spent here, against this host's own ledger, identity and
 /// enrolled signer. A challenge the caller made up, one issued for another digest, another set of
-/// rights or another host, and one already spent are all refused before the service acts.
+/// rights or another host, one that has run out and one already spent are all refused before the
+/// service acts.
 pub struct HostOwner {
     host_device_id: DeviceId,
     host_endpoint_id: EndpointKey,
@@ -71,7 +77,6 @@ pub struct HostOwner {
     enrolment: HostEnrolment,
     clock: Arc<dyn PairingClock + Send + Sync>,
     ledger: Mutex<ConfirmationLedger>,
-    devices: Arc<DeviceDirectory>,
 }
 
 impl std::fmt::Debug for HostOwner {
@@ -93,7 +98,6 @@ impl HostOwner {
         signer: AuthorisationKey,
         enrolment: HostEnrolment,
         clock: Arc<dyn PairingClock + Send + Sync>,
-        devices: Arc<DeviceDirectory>,
     ) -> Self {
         Self {
             host_device_id,
@@ -102,7 +106,6 @@ impl HostOwner {
             enrolment,
             clock,
             ledger: Mutex::new(ConfirmationLedger::new()),
-            devices,
         }
     }
 
@@ -110,6 +113,19 @@ impl HostOwner {
         self.ledger
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// What a challenge for this enlargement has to say, member for member.
+    fn expectation<'a>(&self, enlargement: &'a Enlargement) -> ConfirmationExpectation<'a> {
+        ConfirmationExpectation {
+            action: SensitiveAction::EnlargeGrant,
+            action_digest: enlargement.action_digest,
+            host_device_id: self.host_device_id,
+            host_endpoint_id: self.host_endpoint_id,
+            // An owner location sends authority to no device, so its challenge names none.
+            destination_keys: None,
+            destination_rights: &enlargement.rights,
+        }
     }
 }
 
@@ -122,9 +138,6 @@ impl OwnerAuthority for HostOwner {
             self.clock.as_ref(),
             SensitiveAction::EnlargeGrant,
             enlargement.action_digest,
-            // The enlargement is named by its digest, which covers the grant and the device it was
-            // issued to where there is one. This host keeps no complete key set for a paired
-            // device, so it names none rather than one it would have to make up.
             None,
             enlargement.rights.iter().copied().collect(),
             self.host_device_id,
@@ -137,58 +150,44 @@ impl OwnerAuthority for HostOwner {
         Ok(request)
     }
 
-    fn accept(
+    fn outstanding(&self, request: &OwnerConfirmationRequest) -> bool {
+        let mut ledger = self.ledger();
+        // The ledger's own deadline, on the machine's continuous clock and bound to this boot, is
+        // the one that decides: a wall clock moved back does not keep a challenge alive.
+        ledger.expire(self.clock.as_ref());
+        ledger.outstanding(request.confirmation_id) == Some(request)
+    }
+
+    fn verify(
         &self,
         enlargement: &Enlargement,
         proof: &OwnerConfirmationProof,
     ) -> std::result::Result<(), ProtocolError> {
-        kr_pairing::confirm::accept_confirmation(
-            &mut self.ledger(),
+        self.expectation(enlargement)
+            .require(&proof.request)
+            .map_err(|error| refused(&error))?;
+        // The ledger's own copy has to be the challenge presented, so a challenge the caller
+        // composed is refused before its signature is believed.
+        if !self.outstanding(&proof.request) {
+            return Err(refused(
+                &kr_pairing::PairingError::OwnerConfirmationRequired,
+            ));
+        }
+        kr_pairing::confirm::verify_confirmation(
             self.clock.as_ref(),
-            // The ledger compares this with the challenge it issued, member for member, so a
-            // challenge the caller composed is refused before its signature is believed.
             &proof.request,
             proof,
             // This host's own enrolled signer, never one the proof supplies.
             &self.signer,
             self.enrolment,
-            &ConfirmationExpectation {
-                action: SensitiveAction::EnlargeGrant,
-                action_digest: enlargement.action_digest,
-                host_device_id: self.host_device_id,
-                host_endpoint_id: self.host_endpoint_id,
-                destination_keys: None,
-                destination_rights: &enlargement.rights,
-            },
         )
         .map_err(|error| refused(&error))
     }
 
-    fn grant(&self, grant_id: GrantId) -> std::result::Result<GrantReach, ProtocolError> {
-        let now_ms = kr_ipc::now_ms().get();
-        let records = self
-            .devices
-            .devices()
-            .map_err(|error| error.to_protocol_error())?;
-        let record = records
-            .into_iter()
-            .find(|record| crate::service::net::devices::grant_id_of(record) == grant_id)
-            .ok_or_else(|| {
-                ProtocolError::new(
-                    ErrorCode::PermissionDenied,
-                    format!("grant {grant_id} is not one this host issued to a paired device"),
-                )
-            })?;
-        if !record.is_paired() || !record.grant.expiry.is_valid_at(now_ms) {
-            return Err(ProtocolError::new(
-                ErrorCode::PermissionDenied,
-                format!("grant {grant_id} was revoked or has expired"),
-            ));
-        }
-        Ok(GrantReach {
-            recipient_device_id: record.device_id,
-            actions: record.grant.actions.clone(),
-        })
+    fn consume(&self, proof: &OwnerConfirmationProof) -> std::result::Result<(), ProtocolError> {
+        self.ledger()
+            .consume(&proof.request, self.clock.as_ref())
+            .map_err(|error| refused(&error))
     }
 }
 
@@ -241,11 +240,30 @@ impl ProjectModule {
     /// Returns [`ControllerError::NotConfigured`] when an owner is already enrolled: a host has one
     /// owner signer, and a second enrolment would be a second authority over the same decisions.
     pub fn enrol_owner(&self, owner: Arc<HostOwner>) -> Result<()> {
-        self.owner.set(owner).map_err(|_| {
+        self.owner.set(Arc::clone(&owner)).map_err(|_| {
             ControllerError::NotConfigured(
                 "this host's owner is already enrolled for its project locations".to_owned(),
             )
-        })
+        })?;
+        // A challenge nobody answers holds the directory it was issued for until the ledger lets
+        // it go. The service lets go of it the next time a location method runs, and this makes
+        // sure it does so even when none does. The task holds the service weakly, so it ends with
+        // the daemon.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let service = Arc::downgrade(&self.service);
+            runtime.spawn(async move {
+                let mut every = tokio::time::interval(CHALLENGE_SWEEP);
+                every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    every.tick().await;
+                    let Some(service) = service.upgrade() else {
+                        break;
+                    };
+                    let _ = service.expire_challenges(owner.as_ref());
+                }
+            });
+        }
+        Ok(())
     }
 
     fn owner(&self) -> Option<Arc<HostOwner>> {

@@ -23,37 +23,43 @@
 //!   `.attach`. Authorising a location and binding a repository to one enlarge what this host will
 //!   do, so each needs the owner's fresh confirmation, bound to the opened object.
 //!
+//! A location is the owner's. The rows have a grant column, and a location naming a grant admits
+//! nothing on this host: no paired device reaches a repository operation here, and an owner's
+//! confirmation of a device's location would have to be bound to that device's keys, which this
+//! host does not keep. So such a location is not authorised in the first place.
+//!
 //! ## The confirmation, in two submissions of one action
 //!
 //! The first submission carries no proof. This host opens what it would authorise, keeps that
 //! handle beside a challenge whose digest covers the request **and the identity read back through
 //! the handle**, and answers with the challenge. Nothing durable is written and no outcome is
 //! retained, so a repeat of the same request under the same action identifier is answered with the
-//! same outstanding challenge, and the challenge's own expiry ends it with the handle.
+//! same outstanding challenge. The challenge lives for as long as the daemon's own ledger holds it,
+//! on the ledger's own clock: once the ledger lets it go, so does this module, with the handle.
 //!
 //! The second submission carries the proof, and everything it does happens inside one serial
 //! transition for its actor and action identifier, taken before anything is looked up. Inside it:
 //! a retained answer is returned when there is one; otherwise the outstanding challenge has to be
-//! there, the proof has to answer it, and the challenge is consumed; then the effect and its
-//! answer commit in one transaction with the outbox row that announces it. A copy of the same
-//! submission that arrives meanwhile waits for the transition and then finds the answer, rather
-//! than meeting a spent challenge. Once the challenge is spent, a failure is this action's answer
-//! too and is retained, so a spent confirmation never needs a second ceremony to learn what
-//! happened.
+//! there and the proof has to answer it. Then, **before the challenge is spent, the action is
+//! claimed in the journal**, and only then is the challenge consumed and the effect performed; the
+//! effect and its answer commit in one transaction with the outbox row that announces it. A copy of
+//! the same submission that arrives meanwhile waits for the transition and then finds the answer.
+//! Because the claim is durable before the spend, no order of failures leaves a spent challenge
+//! with nothing recorded against its action: a repeat finds the answer, or the open claim, and
+//! never a challenge that is gone.
 //!
 //! ## Lock order
 //!
-//! The per-action transition, then the project journal, then this policy's own lock. A read
-//! admission takes only the last. Nothing here is held across a subprocess.
+//! The per-action transition, then the outstanding challenges, then the daemon's ledger; the
+//! per-action transition, then the project journal, then this policy's own lock. A read admission
+//! takes only the policy's lock. Nothing here is held across a subprocess.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::{
-    ActorId, DeviceId, EnvironmentId, GrantId, ProjectLocationId, ProjectRepositoryId,
-};
+use kr_protocol::ids::{ActorId, EnvironmentId, GrantId, ProjectLocationId, ProjectRepositoryId};
 use kr_protocol::pairing::{OwnerConfirmationProof, OwnerConfirmationRequest};
 use kr_protocol::project::{
     AuthorisedLocation, LocationAttachment, LocationAuthorisation, LocationPurpose, LocationState,
@@ -72,13 +78,15 @@ use crate::store::{Action, LocatedName, Performed, ProjectRow};
 
 /// How many challenges this host keeps outstanding at once.
 ///
-/// Each one holds an open directory until it is answered or expires, and an owner who asks for
-/// challenges and never signs them would otherwise hold descriptors without bound. A real owner
-/// confirms one decision at a time; this is far above that and far below what a process may open.
+/// Each one holds an open directory until it is answered or the ledger lets it go, and an owner
+/// who asks for challenges and never signs them would otherwise hold descriptors without bound. A
+/// real owner confirms one decision at a time; this is far above that and far below what a process
+/// may open. The bound is checked before a challenge is issued, so a refusal issues nothing.
 pub const MAX_OUTSTANDING_CHALLENGES: usize = 32;
 
-/// The rights a location can carry: a destination enables creating a repository and a working
-/// copy in it, and a source enables cloning one and taking a working copy of it.
+/// The rights a location carries: a destination enables creating a repository and a working copy
+/// in it, and a source enables cloning one and taking a working copy of it. An owner location
+/// carries both, and the owner is shown both.
 const LOCATION_RIGHTS: [ActionRight; 2] =
     [ActionRight::ProjectCreate, ActionRight::WorkspaceManage];
 
@@ -91,51 +99,48 @@ pub struct Enlargement {
     pub rights: CanonicalSet<ActionRight>,
 }
 
-/// What one grant reaches, as the daemon holds it now.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GrantReach {
-    /// The device the grant was issued to.
-    pub recipient_device_id: DeviceId,
-    /// The actions it carries.
-    pub actions: CanonicalSet<ActionRight>,
-}
-
 /// What the daemon lends this service for the owner's own decisions.
 ///
 /// The service knows its locations and its repositories. It does not know this host's owner, its
-/// enrolled signer or its grants, and it should not: those are the daemon's, and a service that
-/// kept its own copy would be one more place for them to disagree. So the ceremony and the question
-/// about a grant are asked of the daemon, which answers under its own codes.
+/// enrolled signer, its identity or its clock, and it should not: those are the daemon's, and a
+/// service that kept its own copy would be one more place for them to disagree. So the ceremony is
+/// the daemon's, and so is the ledger that decides how long a challenge lives.
+///
+/// Verifying a proof and spending the challenge it answers are two calls, so that the service can
+/// record the action durably in between: a spend with nothing recorded against it is the one state
+/// a repeat of the action could not be answered from.
 pub trait OwnerAuthority: Send + Sync {
     /// Issues a fresh challenge for one enlargement and records it as outstanding.
     ///
     /// # Errors
     ///
-    /// Returns the daemon's refusal, for example on a host with no enrolled owner.
+    /// Returns the daemon's refusal.
     fn challenge(
         &self,
         enlargement: &Enlargement,
     ) -> std::result::Result<OwnerConfirmationRequest, ProtocolError>;
 
-    /// Verifies a proof against the challenge this host issued for exactly this enlargement, and
-    /// consumes the challenge.
+    /// Returns whether the ledger still holds exactly this challenge, inside its own deadline.
+    fn outstanding(&self, request: &OwnerConfirmationRequest) -> bool;
+
+    /// Verifies a proof against an outstanding challenge issued for exactly this enlargement,
+    /// under the enrolled signer, without spending it.
     ///
     /// # Errors
     ///
-    /// Returns the daemon's refusal when the proof does not answer an outstanding challenge for
-    /// this enlargement under the enrolled signer.
-    fn accept(
+    /// Returns the daemon's refusal when the proof does not answer such a challenge.
+    fn verify(
         &self,
         enlargement: &Enlargement,
         proof: &OwnerConfirmationProof,
     ) -> std::result::Result<(), ProtocolError>;
 
-    /// Returns what a grant reaches, while its registration stands and it has not expired.
+    /// Spends the challenge a verified proof answers. It succeeds once.
     ///
     /// # Errors
     ///
-    /// Returns the daemon's refusal for a grant that is unknown, revoked or expired.
-    fn grant(&self, grant_id: GrantId) -> std::result::Result<GrantReach, ProtocolError>;
+    /// Returns the daemon's refusal when the challenge is no longer outstanding.
+    fn consume(&self, proof: &OwnerConfirmationProof) -> std::result::Result<(), ProtocolError>;
 }
 
 /// One active location: the handle this process opened for it, and its row.
@@ -168,7 +173,7 @@ impl HeldLocation {
 /// Whose use a location is admitted for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Admitting {
-    /// The owner deciding something about the location itself, whichever grant it admits.
+    /// The owner deciding something about the location itself.
     OwnerDecision,
     /// An operation performed for a caller, which the location has to admit exactly: the owner,
     /// who holds no grant and matches only a location that names none, or a caller bounded by one
@@ -214,48 +219,25 @@ impl LocationPolicy {
     /// Admits one read through a location, immediately before it starts.
     ///
     /// The location has to be active, of the purpose asked for, in the request's environment and,
-    /// for an operation, the caller's own. Where it names a grant, that grant's registration and
-    /// expiry are asked about as well; an owner location names none, and that absence is the
-    /// owner's own case rather than a failure. What comes back is the policy's own reference: the
+    /// for an operation, the caller's own. What comes back is the policy's own reference: the
     /// caller keeps it for as long as the read lasts, and a later transaction can prove that the
     /// location it relies on is still this one.
     ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::PermissionDenied`] when the location admits no such use now, or the
-    /// daemon's refusal of its grant.
+    /// Returns [`ProjectError::PermissionDenied`] when the location admits no such use now.
     pub fn admit(
         &self,
         location_id: ProjectLocationId,
         wanted: &LocationUse,
-        owner: Option<&dyn OwnerAuthority>,
     ) -> Result<Arc<HeldLocation>> {
-        let held = {
-            let map = self.lock()?;
-            let held = map
-                .get(&location_id)
-                .cloned()
-                .ok_or_else(|| not_active(location_id))?;
-            admits(&held, wanted)?;
-            held
-        };
-        if let Some(grant_id) = held.row.grant_id.0 {
-            let owner = owner.ok_or_else(|| ProjectError::PermissionDenied {
-                detail: format!(
-                    "location {location_id} admits grant {grant_id}, and this host cannot ask \
-                     whether that grant stands"
-                )
-                .into(),
-            })?;
-            owner.grant(grant_id).map_err(declined)?;
-        }
-        // The answer is the one under the lock. A withdrawal that committed while the grant was
-        // being asked about took the location away, and this is where that is seen.
         let map = self.lock()?;
-        match map.get(&location_id) {
-            Some(current) if Arc::ptr_eq(current, &held) => Ok(held),
-            _ => Err(not_active(location_id)),
-        }
+        let held = map
+            .get(&location_id)
+            .cloned()
+            .ok_or_else(|| not_active(location_id))?;
+        admits(&held, wanted)?;
+        Ok(held)
     }
 }
 
@@ -280,6 +262,17 @@ pub(crate) fn recheck(
 /// Refuses a use a held location does not admit.
 fn admits(held: &HeldLocation, wanted: &LocationUse) -> Result<()> {
     let row = &held.row;
+    if let Some(grant) = row.grant_id.0 {
+        // A grant's location admits nothing on this host, whoever asks: nothing here would bound
+        // what the Git program reaches for the device that holds the grant.
+        return Err(ProjectError::PermissionDenied {
+            detail: format!(
+                "location {} admits grant {grant}, and no location admits a grant on this host",
+                row.location_id
+            )
+            .into(),
+        });
+    }
     if row.purpose != wanted.purpose {
         return Err(ProjectError::PermissionDenied {
             detail: format!(
@@ -300,15 +293,11 @@ fn admits(held: &HeldLocation, wanted: &LocationUse) -> Result<()> {
             .into(),
         });
     }
-    if let Admitting::Caller(grant) = wanted.admitting
-        && row.grant_id.0 != grant
-    {
+    if let Admitting::Caller(Some(grant)) = wanted.admitting {
         return Err(ProjectError::PermissionDenied {
             detail: format!(
-                "location {} admits {}, and this request is {}",
-                row.location_id,
-                grant_text(row.grant_id.0),
-                grant_text(grant)
+                "location {} admits the owner, and this request is grant {grant}'s",
+                row.location_id
             )
             .into(),
         });
@@ -348,7 +337,7 @@ fn no_owner() -> ProjectError {
     }
 }
 
-// ----- outstanding challenges ---------------------------------------------------------------------
+// ----- outstanding challenges ----------------------------------------------------------------
 
 /// The key one submission's challenge is kept under: its actor and its action identifier.
 type ChallengeKey = (String, Uuid);
@@ -386,9 +375,12 @@ struct Pending {
 
 /// The challenges this host has issued for a location decision and not yet seen answered.
 ///
-/// Nothing here is durable. A restart ends every challenge together with the handle it held, and
-/// the owner starts again, which is right: a confirmation is bound to an object this process
-/// opened, and the next process has not opened it.
+/// Nothing here is durable, and nothing here decides how long a challenge lives: the daemon's
+/// ledger does, on its own clock, and an entry the ledger no longer holds is dropped with its
+/// handle the next time anything here is asked, or when the daemon sweeps. A restart ends every
+/// challenge together with the handle it held, and the owner starts again, which is right: a
+/// confirmation is bound to an object this process opened, and the next process has not opened
+/// it.
 #[derive(Debug, Default)]
 pub(crate) struct Challenges {
     outstanding: Mutex<BTreeMap<ChallengeKey, Pending>>,
@@ -407,32 +399,46 @@ impl Challenges {
 
     /// Returns the challenge still outstanding for this same request, when there is one.
     ///
-    /// A challenge that has run out is dropped here with its handle. One action identifier used
-    /// for a different request is refused as the journal would refuse it.
-    fn outstanding(
+    /// One action identifier used for a different request is refused as the journal would refuse
+    /// it.
+    fn repeated(
         &self,
         key: &ChallengeKey,
         request_digest: Digest256,
-        now_ms: TimestampMs,
+        owner: &dyn OwnerAuthority,
     ) -> Result<Option<OwnerConfirmationRequest>> {
         let mut outstanding = self.lock()?;
-        sweep(&mut outstanding, now_ms);
+        let_go(&mut outstanding, owner);
         match outstanding.get(key) {
             None => Ok(None),
             Some(pending) if pending.request_digest == request_digest => {
                 Ok(Some(pending.request.clone()))
             }
-            Some(_) => Err(ProjectError::IdConflict {
-                action: key.1.to_string().into(),
-                method: "a different request".to_owned().into(),
-            }),
+            Some(_) => Err(conflict(key)),
         }
     }
 
-    /// Keeps a challenge this host has just issued.
-    fn hold(&self, key: ChallengeKey, pending: Pending, now_ms: TimestampMs) -> Result<()> {
+    /// Issues a challenge for one enlargement and keeps it with what it holds.
+    ///
+    /// The bound is checked and the challenge issued under one hold, so a request the bound
+    /// refuses issues nothing, and two requests cannot both pass it.
+    fn issue(
+        &self,
+        key: ChallengeKey,
+        request_digest: Digest256,
+        enlargement: Enlargement,
+        subject: Subject,
+        owner: &dyn OwnerAuthority,
+    ) -> Result<OwnerConfirmationRequest> {
         let mut outstanding = self.lock()?;
-        sweep(&mut outstanding, now_ms);
+        let_go(&mut outstanding, owner);
+        if let Some(pending) = outstanding.get(&key) {
+            return if pending.request_digest == request_digest {
+                Ok(pending.request.clone())
+            } else {
+                Err(conflict(&key))
+            };
+        }
         if outstanding.len() >= MAX_OUTSTANDING_CHALLENGES {
             return Err(ProjectError::QuotaExceeded {
                 detail: format!(
@@ -442,8 +448,17 @@ impl Challenges {
                 .into(),
             });
         }
-        outstanding.insert(key, pending);
-        Ok(())
+        let request = owner.challenge(&enlargement).map_err(declined)?;
+        outstanding.insert(
+            key,
+            Pending {
+                request_digest,
+                request: request.clone(),
+                enlargement,
+                subject,
+            },
+        );
+        Ok(request)
     }
 
     /// Takes the outstanding challenge a proof answers, leaving it in place when it does not.
@@ -452,10 +467,10 @@ impl Challenges {
         key: &ChallengeKey,
         request_digest: Digest256,
         presented: &OwnerConfirmationRequest,
-        now_ms: TimestampMs,
+        owner: &dyn OwnerAuthority,
     ) -> Result<Pending> {
         let mut outstanding = self.lock()?;
-        sweep(&mut outstanding, now_ms);
+        let_go(&mut outstanding, owner);
         let Some(pending) = outstanding.get(key) else {
             return Err(ProjectError::Unconfirmed {
                 detail: "this host holds no outstanding challenge for this action; submit it \
@@ -489,20 +504,35 @@ impl Challenges {
             })
     }
 
-    /// Puts back a challenge whose proof the daemon did not accept, while it is still current.
-    fn restore(&self, key: ChallengeKey, pending: Pending, now_ms: TimestampMs) {
-        if pending.request.expires_at_ms.get() <= now_ms.get() {
+    /// Puts back a challenge nothing was spent against, while the ledger still holds it.
+    fn restore(&self, key: ChallengeKey, pending: Pending, owner: &dyn OwnerAuthority) {
+        if !owner.outstanding(&pending.request) {
             return;
         }
         if let Ok(mut outstanding) = self.lock() {
             outstanding.entry(key).or_insert(pending);
         }
     }
+
+    /// Drops every challenge the ledger no longer holds, with the handle each one held.
+    fn expire(&self, owner: &dyn OwnerAuthority) -> Result<usize> {
+        let mut outstanding = self.lock()?;
+        let before = outstanding.len();
+        let_go(&mut outstanding, owner);
+        Ok(before - outstanding.len())
+    }
 }
 
-/// Drops every challenge that has run out, and the handle each one held.
-fn sweep(outstanding: &mut BTreeMap<ChallengeKey, Pending>, now_ms: TimestampMs) {
-    outstanding.retain(|_, pending| pending.request.expires_at_ms.get() > now_ms.get());
+/// Drops every entry whose challenge the daemon's ledger has let go.
+fn let_go(outstanding: &mut BTreeMap<ChallengeKey, Pending>, owner: &dyn OwnerAuthority) {
+    outstanding.retain(|_, pending| owner.outstanding(&pending.request));
+}
+
+fn conflict(key: &ChallengeKey) -> ProjectError {
+    ProjectError::IdConflict {
+        action: key.1.to_string().into(),
+        method: "a different request".to_owned().into(),
+    }
 }
 
 // ----- the serial transition ------------------------------------------------------------------
@@ -765,16 +795,40 @@ pub(crate) fn load_dormant(store: &mut crate::store::Store, now_ms: TimestampMs)
     Ok(u64::try_from(active.len()).unwrap_or(u64::MAX))
 }
 
-/// Claims an action and settles it with its answer, inside the transaction of its effect.
-fn retain_answer<T: serde::Serialize>(
-    connection: &rusqlite::Transaction<'_>,
+// ----- the journal ---------------------------------------------------------------------------
+
+/// Claims an action in a transaction of its own, before anything is spent for it.
+fn claim(store: &mut crate::store::Store, action: &Action) -> Result<()> {
+    let transaction = store.transaction()?;
+    crate::store::claim_action(&transaction, action, None)?;
+    transaction.commit().map_err(ProjectError::store)
+}
+
+/// Settles an action with its answer, inside the transaction of its effect.
+///
+/// An action a challenge was spent for is claimed already, and one that needed no confirmation is
+/// claimed here; either way the effect, its outbox row and its answer commit together, so an
+/// absent answer never conceals an effect that happened.
+fn settle_answer<T: serde::Serialize>(
+    transaction: &rusqlite::Transaction<'_>,
     action: &Action,
     subject: Uuid,
     answer: &T,
+    claimed: bool,
 ) -> Result<()> {
     let encoded = kr_cbor::to_canonical_vec(answer).map_err(ProjectError::store)?;
-    crate::store::claim_action(connection, action, Some(subject))?;
-    crate::store::settle_claim(connection, action, Some(&encoded), None)?;
+    if !claimed {
+        crate::store::claim_action(transaction, action, Some(subject))?;
+    }
+    if crate::store::settle_claim(transaction, action, Some(&encoded), None)? != 1 {
+        return Err(ProjectError::StoreUnavailable {
+            detail: format!(
+                "action {} has no open claim for its answer to settle",
+                action.action_id
+            )
+            .into(),
+        });
+    }
     Ok(())
 }
 
@@ -802,13 +856,11 @@ fn attach_request_digest(params: &ProjectLocationAttachParams) -> Result<Digest2
 /// What an owner confirms when a location is authorised.
 ///
 /// The exact request, and the identity of the directory this host opened for it, read back through
-/// the handle that will be held. A proof for another path, another purpose, another grant or a
-/// directory that has since replaced the one opened is a proof of something else. A location that
-/// admits a grant also names the device that grant was issued to.
+/// the handle that will be held. A proof for another path, another purpose or a directory that has
+/// since replaced the one opened is a proof of something else.
 fn authorisation_digest(
     params: &ProjectLocationAuthoriseParams,
     opened: ObjectIdentity,
-    reach: Option<&GrantReach>,
 ) -> Result<Digest256> {
     digest_of(&(
         "kr-project-location-authorise/1",
@@ -819,7 +871,6 @@ fn authorisation_digest(
         &params.label,
         &params.path,
         (opened.device, opened.file_id),
-        reach.map(|reach| reach.recipient_device_id),
     ))
 }
 
@@ -832,7 +883,6 @@ fn attachment_digest(
     location_id: ProjectLocationId,
     relative: &RelativeName,
     resolved: ObjectIdentity,
-    reach: Option<&GrantReach>,
 ) -> Result<Digest256> {
     digest_of(&(
         "kr-project-location-attach/1",
@@ -840,17 +890,12 @@ fn attachment_digest(
         location_id,
         relative.as_str(),
         (resolved.device, resolved.file_id),
-        reach.map(|reach| reach.recipient_device_id),
     ))
 }
 
-/// The rights a location carries for its grant: both of them for an owner location, and those of
-/// the two the grant holds for a grant's.
-fn location_rights(reach: Option<&GrantReach>) -> CanonicalSet<ActionRight> {
-    LOCATION_RIGHTS
-        .into_iter()
-        .filter(|right| reach.is_none_or(|reach| reach.actions.contains(right)))
-        .collect()
+/// The rights an owner location carries, which the owner is shown unintersected.
+fn location_rights() -> CanonicalSet<ActionRight> {
+    LOCATION_RIGHTS.into_iter().collect()
 }
 
 /// Returns the name a recorded working tree has beneath a location's recorded path.
@@ -986,6 +1031,19 @@ impl ProjectService {
         &self.policy
     }
 
+    /// Drops every outstanding challenge the daemon's ledger has let go, with the handle each one
+    /// held, and returns how many.
+    ///
+    /// Every location method does this as it starts. The daemon also does it on a timer, so a
+    /// challenge nobody answers does not hold its directory open until somebody asks for another.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the challenges were left poisoned.
+    pub fn expire_challenges(&self, owner: &dyn OwnerAuthority) -> Result<usize> {
+        self.challenges.expire(owner)
+    }
+
     /// Serves `project.location.list`: the environment's locations, or one grant's.
     ///
     /// # Errors
@@ -1033,6 +1091,7 @@ impl ProjectService {
         {
             return Ok(answered);
         }
+        let owner = owner.ok_or_else(no_owner)?;
         let Some(proof) = params.owner_confirmation.as_ref() else {
             let request =
                 self.authorisation_challenge(key, params, &path, request_digest, owner)?;
@@ -1040,16 +1099,13 @@ impl ProjectService {
                 outcome: LocationAuthorisation::ConfirmationRequired { request },
             });
         };
-        let owner = owner.ok_or_else(no_owner)?;
-        let pending =
-            self.challenges
-                .take(&key, request_digest, &proof.request, self.clock.now_ms())?;
-        if let Err(refusal) = owner.accept(&pending.enlargement, proof) {
-            self.challenges.restore(key, pending, self.clock.now_ms());
-            return Err(declined(refusal));
-        }
-        // The challenge is spent. Whatever happens now is this action's answer, and is kept.
-        let outcome = match pending.subject {
+        let pending = self
+            .challenges
+            .take(&key, request_digest, &proof.request, owner)?;
+        let subject = self.spend(key, pending, proof, action, owner)?;
+        // The challenge is spent and the action is claimed. Whatever happens now is this action's
+        // answer, and is kept.
+        let outcome = match subject {
             Subject::Location { handle } => handle
                 .revalidate()
                 .map_err(ProjectError::from)
@@ -1060,7 +1116,7 @@ impl ProjectService {
                     .into(),
             }),
         };
-        self.kept(action, outcome)
+        self.answered(action, outcome, true)
     }
 
     /// Opens what an authorisation names and answers with the challenge the owner signs.
@@ -1070,11 +1126,23 @@ impl ProjectService {
         params: &ProjectLocationAuthoriseParams,
         path: &Path,
         request_digest: Digest256,
-        owner: Option<&dyn OwnerAuthority>,
+        owner: &dyn OwnerAuthority,
     ) -> Result<OwnerConfirmationRequest> {
-        let now = self.clock.now_ms();
-        if let Some(request) = self.challenges.outstanding(&key, request_digest, now)? {
+        if let Some(request) = self.challenges.repeated(&key, request_digest, owner)? {
             return Ok(request);
+        }
+        if let Some(grant) = params.grant_id.0 {
+            // The confirmation of a device's location has to name the keys of the device that
+            // holds the grant, and this host does not keep them; a location that named a grant
+            // would admit nothing here anyway.
+            return Err(ProjectError::PermissionDenied {
+                detail: format!(
+                    "a location is authorised for the owner alone on this host: confirming one for \
+                     grant {grant} would have to name the keys of the device that holds it, which \
+                     this host does not keep"
+                )
+                .into(),
+            });
         }
         if let Some(location_id) = params.location_id.0 {
             let row =
@@ -1085,33 +1153,53 @@ impl ProjectService {
                 })?;
             check_reauthorisable(&row, params)?;
         }
-        let owner = owner.ok_or_else(no_owner)?;
-        let reach = params
-            .grant_id
-            .0
-            .map(|grant| owner.grant(grant).map_err(declined))
-            .transpose()?;
         // Opened now, confined to the mount it is on, and kept: the confirmation is bound to this
         // object, and this object is what the location will hold. A platform that will not say
         // which mount a directory is on refuses the authorisation rather than approximating one.
         let handle =
             AuthorisedDirectory::open_root(self.environment_id, path)?.confined_to_one_mount()?;
         let enlargement = Enlargement {
-            action_digest: authorisation_digest(params, handle.identity(), reach.as_ref())?,
-            rights: location_rights(reach.as_ref()),
+            action_digest: authorisation_digest(params, handle.identity())?,
+            rights: location_rights(),
         };
-        let request = owner.challenge(&enlargement).map_err(declined)?;
-        self.challenges.hold(
+        self.challenges.issue(
             key,
-            Pending {
-                request_digest,
-                request: request.clone(),
-                enlargement,
-                subject: Subject::Location { handle },
-            },
-            now,
-        )?;
-        Ok(request)
+            request_digest,
+            enlargement,
+            Subject::Location { handle },
+            owner,
+        )
+    }
+
+    /// Verifies a proof, claims the action, and spends the challenge, in that order.
+    ///
+    /// A proof that does not verify spends nothing and records nothing, and the challenge stays
+    /// outstanding for the owner's own proof. A claim the journal refuses spends nothing either.
+    /// Once the claim is written the challenge is spent, and from then on whatever happens is this
+    /// action's answer: the claim is what a repeat finds if nothing else gets written.
+    fn spend(
+        &self,
+        key: ChallengeKey,
+        pending: Pending,
+        proof: &OwnerConfirmationProof,
+        action: &Action,
+        owner: &dyn OwnerAuthority,
+    ) -> Result<Subject> {
+        if let Err(refusal) = owner.verify(&pending.enlargement, proof) {
+            self.challenges.restore(key, pending, owner);
+            return Err(declined(refusal));
+        }
+        let claimed = self
+            .writable()
+            .and_then(|mut store| claim(&mut store, action));
+        if let Err(error) = claimed {
+            self.challenges.restore(key, pending, owner);
+            return Err(error);
+        }
+        if let Err(refusal) = owner.consume(proof) {
+            return self.answered(action, Err(declined(refusal)), true);
+        }
+        Ok(pending.subject)
     }
 
     /// Writes an authorised location, its outbox row and its answer in one transaction, and holds
@@ -1171,7 +1259,7 @@ impl ProjectService {
                 location: row.clone(),
             },
         };
-        retain_answer(&transaction, action, row.location_id.get(), &answer)?;
+        settle_answer(&transaction, action, row.location_id.get(), &answer, true)?;
         transaction.commit().map_err(ProjectError::store)?;
         held.insert(row.location_id, Arc::new(HeldLocation { handle, row }));
         Ok(answer)
@@ -1230,7 +1318,7 @@ impl ProjectService {
             location: row.clone(),
         };
         if let Some(action) = performed.action() {
-            retain_answer(&transaction, action, row.location_id.get(), &answer)?;
+            settle_answer(&transaction, action, row.location_id.get(), &answer, false)?;
         }
         transaction.commit().map_err(ProjectError::store)?;
         held.remove(&row.location_id);
@@ -1262,16 +1350,21 @@ impl ProjectService {
             return Ok(answered);
         }
         let Some(location_id) = params.location_id.0 else {
-            // Clearing a binding only reduces what the location's grant reaches.
-            if params.owner_confirmation.is_present() {
-                return Err(ProjectError::InvalidArgument(
+            // Clearing a binding only reduces what the location reaches, so it needs no
+            // confirmation and is an action like any other: its answer is kept whichever way it
+            // goes.
+            let outcome = if params.owner_confirmation.is_present() {
+                Err(ProjectError::InvalidArgument(
                     "clearing a binding reduces reach and carries no confirmation"
                         .to_owned()
                         .into(),
-                ));
-            }
-            return self.commit_binding(action, params.project_repository_id, None, performed);
+                ))
+            } else {
+                self.commit_binding(action, params.project_repository_id, None, performed, false)
+            };
+            return self.answered(action, outcome, false);
         };
+        let owner = owner.ok_or_else(no_owner)?;
         let Some(proof) = params.owner_confirmation.as_ref() else {
             let request =
                 self.attachment_challenge(key, params, location_id, request_digest, owner)?;
@@ -1279,15 +1372,11 @@ impl ProjectService {
                 outcome: LocationAttachment::ConfirmationRequired { request },
             });
         };
-        let owner = owner.ok_or_else(no_owner)?;
-        let pending =
-            self.challenges
-                .take(&key, request_digest, &proof.request, self.clock.now_ms())?;
-        if let Err(refusal) = owner.accept(&pending.enlargement, proof) {
-            self.challenges.restore(key, pending, self.clock.now_ms());
-            return Err(declined(refusal));
-        }
-        let outcome = match pending.subject {
+        let pending = self
+            .challenges
+            .take(&key, request_digest, &proof.request, owner)?;
+        let subject = self.spend(key, pending, proof, action, owner)?;
+        let outcome = match subject {
             Subject::Attachment {
                 held,
                 tree,
@@ -1301,6 +1390,7 @@ impl ProjectService {
                     relative: &relative,
                 }),
                 performed,
+                true,
             ),
             Subject::Location { .. } => Err(ProjectError::Unconfirmed {
                 detail: "the challenge for this action was issued for a location"
@@ -1308,7 +1398,7 @@ impl ProjectService {
                     .into(),
             }),
         };
-        self.kept(action, outcome)
+        self.answered(action, outcome, true)
     }
 
     /// Proves a binding and answers with the challenge the owner signs.
@@ -1323,10 +1413,9 @@ impl ProjectService {
         params: &ProjectLocationAttachParams,
         location_id: ProjectLocationId,
         request_digest: Digest256,
-        owner: Option<&dyn OwnerAuthority>,
+        owner: &dyn OwnerAuthority,
     ) -> Result<OwnerConfirmationRequest> {
-        let now = self.clock.now_ms();
-        if let Some(request) = self.challenges.outstanding(&key, request_digest, now)? {
+        if let Some(request) = self.challenges.repeated(&key, request_digest, owner)? {
             return Ok(request);
         }
         let (project, location) = {
@@ -1349,7 +1438,6 @@ impl ProjectService {
                     .into(),
             });
         }
-        let owner = owner.ok_or_else(no_owner)?;
         let held = self.policy.admit(
             location_id,
             &LocationUse {
@@ -1357,7 +1445,6 @@ impl ProjectService {
                 environment_id: project.environment_id,
                 admitting: Admitting::OwnerDecision,
             },
-            Some(owner),
         )?;
         let relative = relative_beneath(&held.row.path, &project.display_path)?;
         let tree = held.handle.subdirectory(&relative)?;
@@ -1374,38 +1461,26 @@ impl ProjectService {
                 .into(),
             });
         }
-        let reach = held
-            .row
-            .grant_id
-            .0
-            .map(|grant| owner.grant(grant).map_err(declined))
-            .transpose()?;
         let enlargement = Enlargement {
             action_digest: attachment_digest(
                 project.project_repository_id,
                 location_id,
                 &relative,
                 tree.identity(),
-                reach.as_ref(),
             )?,
-            rights: location_rights(reach.as_ref()),
+            rights: location_rights(),
         };
-        let request = owner.challenge(&enlargement).map_err(declined)?;
-        self.challenges.hold(
+        self.challenges.issue(
             key,
-            Pending {
-                request_digest,
-                request: request.clone(),
-                enlargement,
-                subject: Subject::Attachment {
-                    held,
-                    tree,
-                    relative,
-                },
+            request_digest,
+            enlargement,
+            Subject::Attachment {
+                held,
+                tree,
+                relative,
             },
-            now,
-        )?;
-        Ok(request)
+            owner,
+        )
     }
 
     /// Writes a repository's source binding, its outbox row and its answer in one transaction.
@@ -1419,6 +1494,7 @@ impl ProjectService {
         project_repository_id: ProjectRepositoryId,
         resolved: Option<Resolved<'_>>,
         performed: Performed<'_>,
+        claimed: bool,
     ) -> Result<ProjectLocationAttachResult> {
         let mut store = self.writable()?;
         let transaction = store.transaction()?;
@@ -1484,27 +1560,43 @@ impl ProjectService {
                 })),
             },
         };
-        retain_answer(&transaction, action, project_repository_id.get(), &answer)?;
+        settle_answer(
+            &transaction,
+            action,
+            project_repository_id.get(),
+            &answer,
+            claimed,
+        )?;
         transaction.commit().map_err(ProjectError::store)?;
         drop(held);
         Ok(answer)
     }
 
-    /// Keeps a failure that happened after a challenge was spent, as this action's answer.
+    /// Keeps a failure as this action's answer, and returns the outcome it was given.
     ///
-    /// The confirmation cannot be answered twice, so what became of the submission that spent it
-    /// has to be readable by a repeat of the action. A journal that refuses even that leaves the
-    /// failure unrecorded, and the caller is still told it.
-    fn kept<T>(&self, action: &Action, outcome: Result<T>) -> Result<T> {
+    /// A confirmed decision's failure after its challenge is spent is owed to a repeat, because
+    /// the confirmation cannot be answered twice; an ordinary action's failure is owed to a repeat
+    /// because it is an action. The claim a spent challenge left is settled; an action with none
+    /// is claimed and settled in one transaction. A journal that refuses even that leaves the
+    /// claim open, which a repeat is told about and a restart settles, and never a spent challenge
+    /// with nothing recorded.
+    fn answered<T>(&self, action: &Action, outcome: Result<T>, claimed: bool) -> Result<T> {
         let Err(error) = outcome else {
             return outcome;
         };
         let detail = error.to_string();
         if let Ok(mut store) = self.writable()
             && let Ok(transaction) = store.transaction()
-            && crate::store::claim_action(&transaction, action, None).is_ok()
-            && crate::store::settle_claim(&transaction, action, None, Some((error.code(), &detail)))
-                .is_ok()
+            && (claimed || crate::store::claim_action(&transaction, action, None).is_ok())
+            && matches!(
+                crate::store::settle_claim(
+                    &transaction,
+                    action,
+                    None,
+                    Some((error.code(), &detail))
+                ),
+                Ok(1)
+            )
         {
             let _ = transaction.commit();
         }
@@ -1523,6 +1615,26 @@ struct Resolved<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn held(grant: Option<GrantId>, purpose: LocationPurpose) -> HeldLocation {
+        let directory = tempfile::tempdir().expect("a directory");
+        let environment_id = EnvironmentId::new(Uuid::from_bytes([3; 16]));
+        HeldLocation {
+            handle: AuthorisedDirectory::open_root(environment_id, directory.path())
+                .expect("the directory opens"),
+            row: AuthorisedLocation {
+                location_id: ProjectLocationId::new(Uuid::from_bytes([4; 16])),
+                grant_id: Nullable(grant),
+                environment_id,
+                purpose,
+                label: "a location".to_owned(),
+                path: directory.path().display().to_string(),
+                state: LocationState::Active,
+                authorised_at_ms: TimestampMs::new(1),
+                withdrawn_at_ms: Nullable(None),
+            },
+        }
+    }
 
     #[test]
     fn a_working_tree_is_named_beneath_a_location_by_its_components_alone() {
@@ -1545,18 +1657,38 @@ mod tests {
     }
 
     #[test]
-    fn a_location_carries_both_rights_for_the_owner_and_those_a_grant_holds() {
-        let both: CanonicalSet<ActionRight> = LOCATION_RIGHTS.into_iter().collect();
-        assert_eq!(location_rights(None), both);
-        let reach = GrantReach {
-            recipient_device_id: DeviceId::new(Uuid::from_bytes([1; 16])),
-            actions: [ActionRight::WorkspaceManage, ActionRight::SessionView]
-                .into_iter()
-                .collect(),
+    fn an_owner_location_admits_the_owner_and_a_grant_location_admits_nobody() {
+        let environment_id = EnvironmentId::new(Uuid::from_bytes([3; 16]));
+        let grant = GrantId::new(Uuid::from_bytes([5; 16]));
+        let owners = held(None, LocationPurpose::Source);
+        let wanted = |admitting| LocationUse {
+            purpose: LocationPurpose::Source,
+            environment_id,
+            admitting,
         };
+        admits(&owners, &wanted(Admitting::Caller(None))).expect("the owner's own use");
+        admits(&owners, &wanted(Admitting::OwnerDecision)).expect("the owner's decision");
+        admits(&owners, &wanted(Admitting::Caller(Some(grant))))
+            .expect_err("a caller bounded by a grant is not the owner");
+        let grants = held(Some(grant), LocationPurpose::Source);
+        for admitting in [
+            Admitting::Caller(Some(grant)),
+            Admitting::Caller(None),
+            Admitting::OwnerDecision,
+        ] {
+            let refusal = admits(&grants, &wanted(admitting))
+                .expect_err("a grant's location admits nothing on this host");
+            assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+        }
+    }
+
+    #[test]
+    fn an_owner_location_carries_both_rights() {
         assert_eq!(
-            location_rights(Some(&reach)),
-            [ActionRight::WorkspaceManage].into_iter().collect()
+            location_rights(),
+            [ActionRight::ProjectCreate, ActionRight::WorkspaceManage]
+                .into_iter()
+                .collect()
         );
     }
 

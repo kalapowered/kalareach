@@ -323,12 +323,6 @@ fn location_matches_exact_grant_environment_and_purpose() {
     let fixture = Fixture::create();
     let owner = TestOwner::default();
     let grant = GrantId::new(Uuid::from_bytes([0x61; 16]));
-    let other_grant = GrantId::new(Uuid::from_bytes([0x62; 16]));
-    owner.grant_to(
-        grant,
-        &[ActionRight::WorkspaceManage, ActionRight::SessionView],
-    );
-    owner.grant_to(other_grant, &[ActionRight::ProjectCreate]);
     let root = fixture.work().join("shared");
     std::fs::create_dir(&root).expect("a directory to authorise");
     let environment = fixture.environment_id();
@@ -345,27 +339,22 @@ fn location_matches_exact_grant_environment_and_purpose() {
         &authorise_params(environment, &root, LocationPurpose::Destination, None),
         11,
     );
-    let grant_params = authorise_params(environment, &root, LocationPurpose::Source, Some(grant));
-    let grant_request = challenge_for(fixture.service(), &owner, &grant_params, 12);
-    // A grant's location carries only the rights the grant holds of the two.
-    assert_eq!(
-        grant_request.destination_rights,
-        [ActionRight::WorkspaceManage].into_iter().collect()
-    );
-    let grants_source = confirm(fixture.service(), &owner, &grant_params, &grant_request, 12)
-        .expect("the grant's location is authorised");
-    assert_eq!(grants_source.grant_id.0, Some(grant));
 
     let policy = fixture.service().locations();
-    let admitted = |location: &AuthorisedLocation, wanted: LocationUse| {
-        policy.admit(location.location_id, &wanted, Some(&owner))
-    };
-    // The owner's source admits the owner's own read of a source, and nothing else.
-    admitted(
-        &owners_source,
-        source_use(environment, Admitting::Caller(None)),
-    )
-    .expect("the owner's source admits the owner");
+    // The owner's source admits the owner's own read of a source, and the owner's decision.
+    policy
+        .admit(
+            owners_source.location_id,
+            &source_use(environment, Admitting::Caller(None)),
+        )
+        .expect("the owner's source admits the owner");
+    policy
+        .admit(
+            owners_source.location_id,
+            &source_use(environment, Admitting::OwnerDecision),
+        )
+        .expect("and the owner's decision about it");
+    // Nothing else: another purpose, another environment, or a caller bounded by a grant.
     for wanted in [
         LocationUse {
             purpose: LocationPurpose::Destination,
@@ -377,38 +366,156 @@ fn location_matches_exact_grant_environment_and_purpose() {
         ),
         source_use(environment, Admitting::Caller(Some(grant))),
     ] {
-        let refusal = admitted(&owners_source, wanted).expect_err("no other use is admitted");
+        let refusal = policy
+            .admit(owners_source.location_id, &wanted)
+            .expect_err("no other use is admitted");
         assert_eq!(refusal.code(), ErrorCode::PermissionDenied, "{wanted:?}");
     }
     // A destination is not a source, whoever asks.
-    let refusal = admitted(
-        &owners_destination,
-        source_use(environment, Admitting::OwnerDecision),
-    )
-    .expect_err("a destination does not admit a source's read");
+    let refusal = policy
+        .admit(
+            owners_destination.location_id,
+            &source_use(environment, Admitting::OwnerDecision),
+        )
+        .expect_err("a destination does not admit a source's read");
     assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
-    // The grant's source admits that grant's caller, and neither the owner nor another grant.
-    admitted(
-        &grants_source,
-        source_use(environment, Admitting::Caller(Some(grant))),
-    )
-    .expect("the grant's source admits its grant");
-    for admitting in [
-        Admitting::Caller(None),
-        Admitting::Caller(Some(other_grant)),
-    ] {
-        let refusal = admitted(&grants_source, source_use(environment, admitting))
-            .expect_err("another caller is not admitted");
-        assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+}
+
+#[test]
+fn a_location_for_a_grant_is_not_authorised_and_nothing_is_issued_for_it() {
+    // An owner's confirmation of a device's location has to name the keys of the device that
+    // holds the grant, and this host keeps no complete set of them. So no such location is
+    // authorised, no challenge is issued for one, and the refusal says why.
+    let fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let root = fixture.work().join("devices");
+    std::fs::create_dir(&root).expect("a directory");
+    let refusal = fixture
+        .service()
+        .project_location_authorise(
+            &actor(),
+            &authorise_params(
+                fixture.environment_id(),
+                &root,
+                LocationPurpose::Source,
+                Some(GrantId::new(Uuid::from_bytes([0x64; 16]))),
+            ),
+            Some(&submission(AUTHORISE, 12, false)),
+            Some(&owner),
+        )
+        .expect_err("a grant's location is not authorised");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    assert!(refusal.to_string().contains("keys"), "{refusal}");
+    assert_eq!(owner.issued(), 0, "no challenge was issued for it");
+}
+
+#[test]
+fn a_challenge_the_ledger_lets_go_is_dropped_with_its_directory() {
+    let fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let root = fixture.work().join("lapsing");
+    std::fs::create_dir(&root).expect("a directory");
+    let params = authorise_params(
+        fixture.environment_id(),
+        &root,
+        LocationPurpose::Source,
+        None,
+    );
+    let first = challenge_for(fixture.service(), &owner, &params, 13);
+    // The ledger's own deadline ends the challenge, whatever any wall clock says. The service
+    // lets go of it when asked, and a sweep lets go of it when nobody asks.
+    owner.let_everything_go();
+    assert_eq!(
+        fixture
+            .service()
+            .expire_challenges(&owner)
+            .expect("the sweep runs"),
+        1,
+        "the challenge the ledger let go is dropped, with the directory it held"
+    );
+    let refusal = confirm(fixture.service(), &owner, &params, &first, 13)
+        .expect_err("a challenge that ran out answers nothing");
+    assert_eq!(refusal.code(), ErrorCode::OwnerConfirmationRequired);
+    // A repeat of the request is given a fresh challenge rather than the one that ran out.
+    let second = challenge_for(fixture.service(), &owner, &params, 13);
+    assert_ne!(second, first);
+    confirm(fixture.service(), &owner, &params, &second, 13)
+        .expect("the fresh challenge's proof authorises the location");
+}
+
+#[test]
+fn the_challenge_bound_refuses_before_anything_is_issued() {
+    let fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let bound = kr_project::policy::MAX_OUTSTANDING_CHALLENGES;
+    for index in 0..bound {
+        let directory = fixture.work().join(format!("held-{index}"));
+        std::fs::create_dir(&directory).expect("a directory");
+        let seed = u8::try_from(100 + index).expect("a seed");
+        challenge_for(
+            fixture.service(),
+            &owner,
+            &authorise_params(environment, &directory, LocationPurpose::Source, None),
+            seed,
+        );
     }
-    // The grant's own registration is asked about at the admission: a revoked grant admits
-    // nothing, even to the owner deciding about the location.
-    owner.revoke(grant);
-    for admitting in [Admitting::Caller(Some(grant)), Admitting::OwnerDecision] {
-        let refusal = admitted(&grants_source, source_use(environment, admitting))
-            .expect_err("a revoked grant's location admits nothing");
-        assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
-    }
+    let issued = owner.issued();
+    let beyond = fixture.work().join("beyond");
+    std::fs::create_dir(&beyond).expect("a directory");
+    let refusal = fixture
+        .service()
+        .project_location_authorise(
+            &actor(),
+            &authorise_params(environment, &beyond, LocationPurpose::Source, None),
+            Some(&submission(AUTHORISE, 99, false)),
+            Some(&owner),
+        )
+        .expect_err("the bound refuses another challenge");
+    assert_eq!(refusal.code(), ErrorCode::QuotaExceeded);
+    assert_eq!(
+        owner.issued(),
+        issued,
+        "a refused challenge was never issued"
+    );
+    assert_eq!(owner.outstanding(), bound);
+}
+
+#[test]
+fn a_challenge_that_lapses_after_its_proof_is_verified_leaves_the_action_answered() {
+    // The action is claimed before the challenge is spent, so a spend that fails is this action's
+    // answer: a repeat is told what happened rather than that there is no challenge to answer.
+    let fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let root = fixture.work().join("lapse");
+    std::fs::create_dir(&root).expect("a directory");
+    let params = authorise_params(
+        fixture.environment_id(),
+        &root,
+        LocationPurpose::Destination,
+        None,
+    );
+    let request = challenge_for(fixture.service(), &owner, &params, 14);
+    owner.lapse_after_verifying();
+    let refusal = confirm(fixture.service(), &owner, &params, &request, 14)
+        .expect_err("the challenge lapsed before it could be spent");
+    assert_eq!(refusal.code(), ErrorCode::OwnerConfirmationRequired);
+    let repeated = confirm(fixture.service(), &owner, &params, &request, 14)
+        .expect_err("the repeat is given the kept answer");
+    assert_eq!(repeated.code(), refusal.code());
+    assert_eq!(repeated.to_string(), refusal.to_string());
+    assert!(
+        fixture
+            .service()
+            .project_location_list(&ProjectLocationListParams {
+                environment_id: fixture.environment_id(),
+                grant_id: Nullable(None),
+            })
+            .expect("the list reads")
+            .locations
+            .is_empty(),
+        "nothing was authorised"
+    );
 }
 
 #[test]
@@ -428,7 +535,7 @@ fn withdrawal_takes_a_location_out_of_every_later_admission_and_is_final() {
     let held = fixture
         .service()
         .locations()
-        .admit(location.location_id, &wanted, Some(&owner))
+        .admit(location.location_id, &wanted)
         .expect("an admission before the withdrawal");
     let withdrawn = fixture
         .service()
@@ -449,7 +556,7 @@ fn withdrawal_takes_a_location_out_of_every_later_admission_and_is_final() {
     let refusal = fixture
         .service()
         .locations()
-        .admit(location.location_id, &wanted, Some(&owner))
+        .admit(location.location_id, &wanted)
         .expect_err("nothing is admitted after a withdrawal");
     assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
     // A withdrawal is final: authorising the identifier again is refused, before and after a
@@ -513,7 +620,7 @@ fn reauthorisation_restores_a_dormant_location_in_place() {
     let wanted = source_use(environment, Admitting::Caller(None));
     replacement
         .locations()
-        .admit(location.location_id, &wanted, Some(&owner))
+        .admit(location.location_id, &wanted)
         .expect_err("a dormant location admits nothing");
 
     // Authorising the identifier again restores the same row, under a fresh confirmation.
@@ -526,7 +633,7 @@ fn reauthorisation_restores_a_dormant_location_in_place() {
     assert_eq!(restored.state, LocationState::Active);
     replacement
         .locations()
-        .admit(location.location_id, &wanted, Some(&owner))
+        .admit(location.location_id, &wanted)
         .expect("the restored location admits its reads again");
     // The binding that names it works as it did.
     let rebound = attach(&replacement, &owner, project, location.location_id, 34)
@@ -995,4 +1102,42 @@ fn policy_actions_and_outbox_survive_retry_and_crash() {
                 && about == &active.location_id.to_string()),
         "the restart announced the active location's dormancy: {events:?}"
     );
+}
+
+#[test]
+fn a_cleared_binding_is_an_action_whose_failure_is_kept() {
+    // Clearing a binding needs no confirmation, and it is an action like any other: what it
+    // answered, a failure included, is what a repeat is answered with, and its identifier is not
+    // free for another request afterwards.
+    let fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let root = fixture.work().join("clearing");
+    std::fs::create_dir(&root).expect("a directory");
+    let project = adopt(&fixture, &root, "repo", 120);
+    let unknown = ProjectRepositoryId::new(Uuid::from_bytes([0x73; 16]));
+    let clear = |project| {
+        fixture.service().project_location_attach(
+            &actor(),
+            &attach_params(project, None),
+            Some(&action(ATTACH, 121)),
+            Some(&owner),
+        )
+    };
+    let refusal = clear(unknown).expect_err("an unknown repository has no binding to clear");
+    assert_eq!(refusal.code(), ErrorCode::ResourceUnavailable);
+    let repeated = clear(unknown).expect_err("the repeat is given the kept answer");
+    assert_eq!(repeated.to_string(), refusal.to_string());
+    let reused = fixture
+        .service()
+        .project_location_attach(
+            &actor(),
+            &attach_params(project, None),
+            Some(&kr_project::store::Action {
+                payload_digest: kr_protocol::scalars::Digest256::from_bytes([0x74; 32]),
+                ..action(ATTACH, 121)
+            }),
+            Some(&owner),
+        )
+        .expect_err("the identifier is not free for another request");
+    assert_eq!(reused.code(), ErrorCode::IdConflict);
 }
