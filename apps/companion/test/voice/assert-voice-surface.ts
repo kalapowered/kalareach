@@ -129,12 +129,12 @@ function button(page: Page, name: string): Step {
   }
 }
 
-/** No button whose name contains `part`, in any letter case. */
+/** No button whose name contains `part`, in any letter case, counting hidden ones as well. */
 function noButton(page: Page, part: string): Step {
   return {
-    says: `no button whose name contains "${part}"`,
+    says: `no button whose name contains "${part}", hidden or not`,
     run: async () => {
-      const count = await page.getByRole('button', { name: part }).count()
+      const count = await page.getByRole('button', { name: part, includeHidden: true }).count()
       expect(count === 0, `found ${count} buttons whose name contains "${part}"`)
     }
   }
@@ -149,9 +149,10 @@ function heading(page: Page, name: string): Step {
 
 function noHeading(page: Page, name: string): Step {
   return {
-    says: `no "${name}" heading`,
+    says: `no "${name}" heading, hidden or not`,
     run: async () => {
-      expect((await page.getByRole('heading', { name, exact: true }).count()) === 0, `found the "${name}" heading`)
+      const count = await page.getByRole('heading', { name, exact: true, includeHidden: true }).count()
+      expect(count === 0, `found the "${name}" heading`)
     }
   }
 }
