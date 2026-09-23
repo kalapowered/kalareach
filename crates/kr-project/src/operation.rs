@@ -251,8 +251,9 @@ impl StagingSibling {
             return Err(ProjectError::Destination {
                 detail: format!(
                     "{} is not a directory only this account can change, so nothing is staged in \
-                     it: {refusal}",
-                    crate::git::redact(&path.display().to_string())
+                     it: {}",
+                    crate::git::redact(&path.display().to_string()),
+                    crate::git::redact(&refusal.to_string())
                 )
                 .into(),
             });
