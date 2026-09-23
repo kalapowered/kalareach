@@ -2795,7 +2795,9 @@ fn sync_directory(directory: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+/// The one test here is about how Unix shares a lock between the descriptors of one open file, so
+/// the module is built on Unix alone.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::sync::{SyncBody, SyncSettings};
@@ -2807,7 +2809,6 @@ mod tests {
     /// application starts receives a copy of each of its descriptors and keeps it until it replaces
     /// its own image, whichever thread started it. Made here with a duplicate rather than a process,
     /// so the case is deterministic rather than a matter of timing.
-    #[cfg(unix)]
     fn a_dispatch_and_a_copy_of_its_lock(store: &SyncStore) -> (Dispatch, Uuid, std::fs::File) {
         let object_id = SyncObjectId::new(Uuid::from_bytes([0x11; 16]));
         store
@@ -2837,7 +2838,6 @@ mod tests {
         (dispatch, staged.work_id, copy)
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_dispatch_that_ends_releases_its_claim_whatever_else_shares_its_lock() {
         let directory = tempfile::tempdir().expect("a directory");
