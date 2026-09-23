@@ -48,6 +48,9 @@ use crate::catalogue::repository::EnrolmentKey;
 /// The directory every enrolment's own directory sits in.
 const REPOSITORIES: &str = "repositories";
 
+/// The document in which the client keeps the latest time it has known.
+const TIME_CHECKPOINT: &str = "latest_known_time.json";
+
 /// One repository's directory.
 #[derive(Clone, Debug)]
 pub struct Store {
@@ -288,6 +291,35 @@ impl Store {
             }
         }
         Ok(working)
+    }
+
+    /// Keeps the time checkpoint the client moved on while it fetched a verified generation's
+    /// payloads.
+    ///
+    /// The client refuses a clock that stepped back behind the latest time it knows. It records
+    /// that time in its working copy every time it reads a target, after the checkpoint was
+    /// published, so what it saw last is written into the accepted checkpoint as well.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when nothing was written, and
+    /// [`CatalogueError::PublicationUncertain`] when its directory did not confirm it.
+    pub(crate) fn publish_time_checkpoint(
+        &self,
+        _permit: &Permit,
+        working: &WorkingDatastore,
+    ) -> CatalogueResult<()> {
+        let from = working.path.join(TIME_CHECKPOINT);
+        let bytes = match std::fs::read(&from) {
+            Ok(bytes) => bytes,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(CatalogueError::storage(&from, &source)),
+        };
+        write_atomically(
+            &self.root.join("staging"),
+            &self.datastore().join(TIME_CHECKPOINT),
+            &bytes,
+        )
     }
 
     /// Makes a verified working copy the accepted trust checkpoint, one document at a time.

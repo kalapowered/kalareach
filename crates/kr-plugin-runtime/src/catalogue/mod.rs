@@ -1042,7 +1042,14 @@ impl Catalogue {
         // previous generation in place rather than activating a new index it has no payloads for.
         let mut mirrored = 0usize;
         if enrolled.enrolment.budgets.full_offline_mirror {
-            mirrored = self.mirror(&enrolled, &store, &verified, authority).await?;
+            let fetched = self.mirror(&enrolled, &store, &verified, authority).await;
+            // The client moved its time checkpoint on while it fetched. That is kept whatever the
+            // mirror did, so a clock later set back to a time in between is refused.
+            let kept = committed(authority, &Effect::Checkpoint(id.clone()), |permit| {
+                store.publish_time_checkpoint(permit, &working)
+            });
+            mirrored = fetched?;
+            kept?;
             authority.check()?;
         }
 

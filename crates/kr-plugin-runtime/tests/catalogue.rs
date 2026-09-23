@@ -2797,6 +2797,91 @@ async fn a_verification_that_does_not_finish_leaves_the_accepted_checkpoint_as_i
     );
 }
 
+/// Reads the local repository and takes its time over every package file, so time passes while a
+/// mirror fetches.
+#[derive(Clone, Debug)]
+struct Slow {
+    absent: Option<&'static str>,
+    called: Arc<std::sync::Mutex<Vec<jiff::Timestamp>>>,
+}
+
+#[tough::async_trait]
+impl tough::Transport for Slow {
+    async fn fetch(&self, url: url::Url) -> Result<tough::TransportStream, tough::TransportError> {
+        if url.path().contains("/packages/") {
+            self.called
+                .lock()
+                .expect("the list")
+                .push(jiff::Timestamp::now());
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            if self
+                .absent
+                .is_some_and(|suffix| url.path().ends_with(suffix))
+            {
+                return Err(tough::TransportError::new(
+                    tough::TransportErrorKind::FileNotFound,
+                    url,
+                ));
+            }
+        }
+        tough::FilesystemTransport.fetch(url).await
+    }
+}
+
+/// The latest time the client saw while a mirror fetched is kept in the accepted checkpoint,
+/// whether the mirror finished or not.
+///
+/// The client refuses a clock set back behind the latest time it knows, and it moves that time on
+/// every time it reads a target. The checkpoint is published before the mirror starts, so the
+/// times the mirror saw are kept by a commit of their own; without it the accepted time would be
+/// the one from before the mirror, and a clock set back to a time in between would pass.
+#[tokio::test]
+async fn the_time_a_mirror_saw_is_kept_with_the_trust_checkpoint() {
+    for absent in [None, Some("presentation.json")] {
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+        let mut budgets = RepositoryBudgets::defaults();
+        budgets.full_offline_mirror = true;
+        let mut catalogue = enrolled(
+            home.path(),
+            &generation,
+            budgets,
+            CapabilityCeiling::default_ceiling(),
+        )
+        .await;
+        let slow = Slow {
+            absent,
+            called: Arc::default(),
+        };
+        catalogue.set_transport(Arc::new(slow.clone()));
+        let outcome = catalogue.sync(&repository()).await;
+        assert_eq!(outcome.is_ok(), absent.is_none(), "{absent:?}: {outcome:?}");
+        // The client reads its clock just before it asks for each file.
+        let last_fetch = *slow
+            .called
+            .lock()
+            .expect("the list")
+            .last()
+            .expect("the mirror fetched");
+        let kept: jiff::Timestamp = serde_json::from_slice(
+            &std::fs::read(
+                catalogue
+                    .store(&repository())
+                    .expect("enrolled")
+                    .datastore()
+                    .join("latest_known_time.json"),
+            )
+            .expect("a time checkpoint"),
+        )
+        .expect("a time");
+        assert!(
+            last_fetch.duration_since(kept) < jiff::SignedDuration::from_millis(100),
+            "{absent:?}: the kept time {kept} is from before the mirror's last fetch at \
+             {last_fetch}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // What is installed is the package this host checked, fetched as its accepted generation named it
 // ---------------------------------------------------------------------------------------------
