@@ -464,6 +464,7 @@ mod tests {
         .expect("a challenge")
     }
 
+    /// KR-REQ-10.05: a confirmation answers one challenge, down to its nonce and action digest.
     #[test]
     fn a_proof_answers_the_exact_challenge_and_nothing_else() {
         let clock = TestClock::new();
@@ -510,6 +511,7 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-10.07, KR-REQ-10.05: session, plugin and contact-tool channels never confirm.
     #[test]
     fn a_session_plugin_or_contact_tool_channel_is_refused() {
         let clock = TestClock::new();
@@ -535,6 +537,7 @@ mod tests {
         }
     }
 
+    /// KR-REQ-10.52, KR-REQ-10.53: the controlling terminal confirms only the initial bootstrap.
     #[test]
     fn the_controlling_terminal_is_the_bootstrap_exception_only() {
         let clock = TestClock::new();
@@ -568,6 +571,7 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-10.05: the channel is inside the signature and cannot be upgraded afterwards.
     #[test]
     fn a_channel_cannot_be_rewritten_after_the_ceremony() {
         let clock = TestClock::new();
@@ -593,6 +597,7 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-10.05: a challenge has a short expiry.
     #[test]
     fn a_challenge_expires() {
         let clock = TestClock::new();
@@ -617,6 +622,7 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-10.05: only the enrolled owner's signature confirms.
     #[test]
     fn another_signer_is_not_the_owner() {
         let clock = TestClock::new();
@@ -641,6 +647,44 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-10.52: a headless host with an owner accepts a confirmation from an enrolled
+    /// user-presence-capable signer or a separately paired owner device, and refuses the weaker
+    /// channels rather than downgrading to them: the bootstrap terminal, a session, a plugin or a
+    /// contact tool.
+    #[test]
+    fn a_headless_host_takes_an_enrolled_signer_or_a_paired_owner_and_nothing_weaker() {
+        let clock = TestClock::new();
+        let owner = DeviceKeys::generate().expect("keys");
+        let challenge = request(&clock);
+        for (channel, accepted) in [
+            (ConfirmationChannel::EnrolledPresenceSigner, true),
+            (ConfirmationChannel::PairedOwnerDevice, true),
+            (ConfirmationChannel::LocalBootstrapTerminal, false),
+            (ConfirmationChannel::Session, false),
+            (ConfirmationChannel::Plugin, false),
+            (ConfirmationChannel::ContactTool, false),
+        ] {
+            let proof =
+                sign_confirmation(&owner.authorisation, &challenge, channel).expect("a proof");
+            let outcome = verify_confirmation(
+                &clock,
+                &challenge,
+                &proof,
+                owner.authorisation.public(),
+                HostEnrolment::Enrolled,
+            );
+            if accepted {
+                assert!(outcome.is_ok(), "{channel:?} confirms on a headless host");
+            } else {
+                assert!(
+                    matches!(outcome, Err(PairingError::OwnerConfirmationRequired)),
+                    "{channel:?} is refused rather than accepted as a weaker confirmation"
+                );
+            }
+        }
+    }
+
+    /// KR-REQ-10.52: a host with no ceremony that answers refuses rather than downgrading.
     #[test]
     fn a_declining_ceremony_is_a_refusal_rather_than_a_downgrade() {
         let clock = TestClock::new();
@@ -658,6 +702,7 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-10.05: a confirmation is used once.
     #[test]
     fn a_challenge_is_consumed_once() {
         let clock = TestClock::new();
@@ -674,6 +719,7 @@ mod tests {
         assert!(ledger.is_empty());
     }
 
+    /// KR-REQ-10.05: the host's expiry is monotonic.
     #[test]
     fn a_challenge_runs_out_on_the_monotonic_clock() {
         let clock = TestClock::new();
@@ -719,6 +765,8 @@ mod tests {
         assert!(ledger.consume(&late, &clock).is_ok());
     }
 
+    /// KR-REQ-10.05: a confirmation binds the action, digest, host, destination keys and rights,
+    /// and is accepted once.
     #[test]
     fn a_proof_is_accepted_once_and_the_action_must_match() {
         let clock = TestClock::new();
@@ -800,6 +848,7 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-10.05: the host checks the challenge it issued, not the one presented.
     #[test]
     fn a_challenge_with_substituted_contents_is_not_the_one_the_host_issued() {
         let clock = TestClock::new();
@@ -872,6 +921,7 @@ mod tests {
         assert_eq!(ledger.len(), 1, "the owner's challenge is still answerable");
     }
 
+    /// KR-REQ-10.05: each of the six sensitive actions has its own short-lived challenge.
     #[test]
     fn every_action_that_needs_a_confirmation_can_ask_for_one() {
         let clock = TestClock::new();

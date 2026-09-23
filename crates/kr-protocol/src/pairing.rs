@@ -2188,6 +2188,7 @@ mod tests {
         assert!(RendezvousOrigin::new("https://reach.kala.to:99999").is_err());
     }
 
+    /// KR-REQ-10.20: `C` is a deterministic-CBOR array in the specified order.
     #[test]
     fn the_context_encodes_as_an_array_in_the_specified_order() {
         let context = PairingContext {
@@ -2207,6 +2208,7 @@ mod tests {
         assert_eq!(items[2].as_text(), Some("aB3x"));
     }
 
+    /// KR-REQ-10.20: the two role identities differ.
     #[test]
     fn the_role_identities_differ() {
         let context = PairingContext {
@@ -2220,6 +2222,7 @@ mod tests {
         assert_ne!(context.host_identity(), context.client_identity());
     }
 
+    /// KR-REQ-10.03: one key under two purposes is refused.
     #[test]
     fn distinct_purposes_reject_a_reused_key() {
         let keys = DevicePublicKeys {
@@ -2236,6 +2239,7 @@ mod tests {
         assert!(!reused.purposes_are_distinct());
     }
 
+    /// KR-REQ-10.28: the verification value is eight hexadecimal characters.
     #[test]
     fn a_verification_value_is_eight_hexadecimal_characters() {
         let value = verification_value(
@@ -2348,6 +2352,7 @@ mod tests {
         }
     }
 
+    /// KR-REQ-10.38: a QR payload names an explicit supported mode and version.
     #[test]
     fn a_qr_payload_round_trips_and_requires_a_supported_mode_and_version() {
         let payload = QrPayload::Code(CodeQrPayload {
@@ -2392,6 +2397,8 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-10.07, KR-REQ-10.52: only interactive channels confirm, and the terminal only at
+    /// bootstrap.
     #[test]
     fn only_interactive_channels_may_confirm() {
         for bootstrap in [false, true] {
@@ -2407,6 +2414,7 @@ mod tests {
         assert!(!ConfirmationChannel::LocalBootstrapTerminal.is_acceptable(false));
     }
 
+    /// KR-REQ-10.05: the signature covers the channel.
     #[test]
     fn the_confirmation_signature_covers_the_channel() {
         let request = OwnerConfirmationRequest {
@@ -2430,6 +2438,7 @@ mod tests {
         );
     }
 
+    /// KR-REQ-10.12: a short code never renders its secret half.
     #[test]
     fn a_short_code_redacts_its_secret_half() {
         let code = ShortCode::new("aB3x-Yz7-9Qw").expect("a code");
@@ -2442,6 +2451,7 @@ mod tests {
         assert!(ShortCode::new("aB3x-Yz7-9Q0").is_err());
     }
 
+    /// KR-REQ-10.35: a direct QR payload never renders its secret.
     #[test]
     fn a_direct_payload_redacts_its_secret() {
         let payload = DirectQrPayload {
@@ -2503,6 +2513,7 @@ mod tests {
         assert!(RendezvousOrigin::new("https://reach.kala.to:8443").is_ok());
     }
 
+    /// KR-REQ-10.22: the five HKDF information strings are the specified literals.
     #[test]
     fn the_five_information_strings_are_the_specified_literals() {
         assert_eq!(
@@ -2517,6 +2528,7 @@ mod tests {
         );
     }
 
+    /// KR-REQ-10.24: the additional data binds direction, sequence and type.
     #[test]
     fn the_bundle_aad_binds_direction_sequence_and_type() {
         let transcript = Digest256::from_bytes([7; 32]);

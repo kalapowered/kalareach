@@ -439,6 +439,8 @@ mod tests {
         }
     }
 
+    /// KR-REQ-10.26: host and client bundles carry their declared contents, each signed with its
+    /// own authorisation key, and a signature over another transcript is refused.
     #[test]
     fn a_bundle_round_trips_through_the_exchange() {
         let host_keys = DeviceKeys::generate().expect("keys");
@@ -486,6 +488,7 @@ mod tests {
         assert!(verify_client_bundle(&signed_client, Digest256::from_bytes([9; 32])).is_err());
     }
 
+    /// KR-REQ-10.25: a replayed sequence number is refused.
     #[test]
     fn a_replayed_frame_is_rejected() {
         let keys = DeviceKeys::generate().expect("keys");
@@ -523,6 +526,7 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-10.25: a frame from another phase is refused.
     #[test]
     fn a_frame_of_another_type_is_an_unexpected_phase() {
         let keys = DeviceKeys::generate().expect("keys");
@@ -551,6 +555,7 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-10.24: `T` is inside the additional data, so a frame from another attempt fails.
     #[test]
     fn a_frame_from_another_attempt_does_not_authenticate() {
         let keys = DeviceKeys::generate().expect("keys");
@@ -581,6 +586,7 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-10.25: a frame over 64 KiB is refused.
     #[test]
     fn a_frame_over_the_limit_is_refused_without_consuming_a_sequence_number() {
         let mut budget = ExchangeBudget::new();
@@ -595,6 +601,7 @@ mod tests {
         assert_eq!(budget.next_outbound(16).expect("a sequence").get(), 0);
     }
 
+    /// KR-REQ-10.25: the whole exchange stays within 256 KiB.
     #[test]
     fn the_exchange_is_bounded_as_a_whole() {
         let mut budget = ExchangeBudget::new();
@@ -611,6 +618,147 @@ mod tests {
         }
         assert_eq!(sent, MAX_PAIRING_EXCHANGE_LEN);
         assert_eq!(budget.used_bytes(), MAX_PAIRING_EXCHANGE_LEN);
+        assert_eq!(MAX_PAIRING_EXCHANGE_LEN, 256 * 1024);
+        assert_eq!(MAX_PAIRING_FRAME_LEN, 64 * 1024);
+    }
+
+    /// KR-REQ-10.24: each bundle message is XChaCha20-Poly1305 under a fresh 24-byte nonce and the
+    /// next sequence number, with CBOR([domain, T, direction, sequence, type]) as its additional
+    /// data. The ciphertext opens under exactly that data and under no other direction, sequence,
+    /// type or transcript.
+    #[test]
+    fn every_message_has_a_fresh_nonce_the_next_sequence_and_all_of_its_additional_data() {
+        let keys = DeviceKeys::generate().expect("keys");
+        let key = SymmetricKey::random().expect("a key");
+        let mut sender = ExchangeBudget::new();
+        let signed = sign_host_bundle(&keys.authorisation, host_bundle(&keys), transcript())
+            .expect("a signed bundle");
+        let first = seal_bundle(
+            &key,
+            transcript(),
+            BundleMessageType::HostBundle,
+            &mut sender,
+            &signed,
+        )
+        .expect("a frame");
+        let second = seal_bundle(
+            &key,
+            transcript(),
+            BundleMessageType::HostBundle,
+            &mut sender,
+            &signed,
+        )
+        .expect("a frame");
+        assert_eq!(first.nonce.as_bytes().len(), 24);
+        assert_ne!(first.nonce, second.nonce, "every message has a fresh nonce");
+        assert_eq!(first.sequence.get(), 0);
+        assert_eq!(second.sequence.get(), 1);
+        let plaintext = kr_cbor::to_canonical_vec(&signed).expect("canonical bytes");
+        assert_eq!(
+            first.ciphertext.len(),
+            plaintext.len() + aead::TAG_LEN,
+            "an AEAD ciphertext is the plaintext and its tag"
+        );
+
+        let aad = bundle_aad(
+            transcript(),
+            first.direction,
+            first.sequence,
+            first.message_type,
+        );
+        let CanonicalValue::Array(members) =
+            kr_cbor::decode(&aad, &kr_cbor::Limits::DEFAULT).expect("canonical")
+        else {
+            panic!("the additional data is an array");
+        };
+        assert_eq!(
+            members,
+            vec![
+                CanonicalValue::text(kr_protocol::pairing::PAIRING_DOMAIN),
+                CanonicalValue::bytes(transcript().as_bytes().as_slice()),
+                CanonicalValue::text("host_to_client"),
+                CanonicalValue::Integer(0u64.into()),
+                CanonicalValue::text(BundleMessageType::HostBundle.as_str()),
+            ]
+        );
+        assert!(aead::open(&key, &first.nonce, &aad, &first.ciphertext).is_ok());
+        for other in [
+            bundle_aad(
+                transcript(),
+                BundleDirection::ClientToHost,
+                first.sequence,
+                first.message_type,
+            ),
+            bundle_aad(
+                transcript(),
+                first.direction,
+                second.sequence,
+                first.message_type,
+            ),
+            bundle_aad(
+                transcript(),
+                first.direction,
+                first.sequence,
+                BundleMessageType::ClientBundle,
+            ),
+            bundle_aad(
+                Digest256::from_bytes([8; 32]),
+                first.direction,
+                first.sequence,
+                first.message_type,
+            ),
+        ] {
+            assert!(aead::open(&key, &first.nonce, &other, &first.ciphertext).is_err());
+        }
+    }
+
+    /// KR-REQ-10.26: each device signs exactly CBOR([domain, its bundle, T]) with the authorisation
+    /// key its bundle declares, so the signature binds the key-purpose declarations to that key and
+    /// to this transcript.
+    #[test]
+    fn a_bundle_signature_covers_the_declarations_and_the_transcript() {
+        let host_keys = DeviceKeys::generate().expect("keys");
+        let client_keys = DeviceKeys::generate().expect("keys");
+        let host = sign_host_bundle(
+            &host_keys.authorisation,
+            host_bundle(&host_keys),
+            transcript(),
+        )
+        .expect("a signed bundle");
+        let client = sign_client_bundle(
+            &client_keys.authorisation,
+            client_bundle(&client_keys),
+            transcript(),
+        )
+        .expect("a signed bundle");
+        for (domain, bundle, declared, signature) in [
+            (
+                HOST_BUNDLE_DOMAIN,
+                kr_cbor::to_canonical_value(&host.bundle).expect("a value"),
+                host.bundle.keys.authorisation,
+                host.signature,
+            ),
+            (
+                CLIENT_BUNDLE_DOMAIN,
+                kr_cbor::to_canonical_value(&client.bundle).expect("a value"),
+                client.bundle.keys.authorisation,
+                client.signature,
+            ),
+        ] {
+            let exact = SigningTranscript::from_elements(
+                domain,
+                vec![
+                    bundle.clone(),
+                    CanonicalValue::bytes(transcript().as_bytes().as_slice()),
+                ],
+            );
+            assert!(sign::verify(&declared, &exact, &signature).is_ok());
+            let elsewhere = SigningTranscript::from_elements(
+                domain,
+                vec![bundle, CanonicalValue::bytes([8u8; 32].as_slice())],
+            );
+            assert!(sign::verify(&declared, &elsewhere, &signature).is_err());
+        }
     }
 
     #[test]
@@ -633,6 +781,7 @@ mod tests {
         );
     }
 
+    /// KR-REQ-10.26: substituted keys or a substituted endpoint do not verify.
     #[test]
     fn a_bundle_whose_keys_were_substituted_does_not_verify() {
         let keys = DeviceKeys::generate().expect("keys");
@@ -655,6 +804,7 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-10.26: a bundle must declare its own transport key as its endpoint.
     #[test]
     fn a_bundle_must_declare_its_own_transport_key_as_its_endpoint() {
         let keys = DeviceKeys::generate().expect("keys");
@@ -678,6 +828,7 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-10.26, KR-REQ-10.03: a bundle declaring one key under two purposes is refused.
     #[test]
     fn a_bundle_that_reuses_one_key_under_two_purposes_is_refused() {
         let keys = DeviceKeys::generate().expect("keys");

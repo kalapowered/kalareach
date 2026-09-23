@@ -33,6 +33,8 @@ fn bytes(value: &Value, pointer: &str) -> Vec<u8> {
     hex::decode(text(value, pointer)).expect("a fixture hex string decodes")
 }
 
+/// KR-REQ-10.20, KR-REQ-10.22: the published pairing vectors are exactly what the Rust code
+/// derives.
 #[test]
 fn the_committed_vectors_match_the_rust_code() {
     for (name, expected) in generated_files().expect("the vectors are generated") {
@@ -56,6 +58,8 @@ fn generation_is_deterministic() {
     );
 }
 
+/// KR-REQ-10.20, KR-REQ-10.22: the vector names the context domain, the two role domains and the
+/// five literal HKDF information strings.
 #[test]
 fn the_transcript_vector_names_the_specified_domains_and_labels() {
     let document = fixture("transcript.json");
@@ -80,6 +84,7 @@ fn the_transcript_vector_names_the_specified_domains_and_labels() {
     );
 }
 
+/// KR-REQ-10.20: `C` is the seven-member array in the specified order, and `CH` is its hash.
 #[test]
 fn the_context_hashes_to_what_the_vector_publishes() {
     let document = fixture("transcript.json");
@@ -105,6 +110,7 @@ fn the_context_hashes_to_what_the_vector_publishes() {
     );
 }
 
+/// KR-REQ-10.22: `T` hashes `C` and both library messages, host first.
 #[test]
 fn the_transcript_hashes_the_context_and_both_messages_in_order() {
     let document = fixture("transcript.json");
@@ -127,6 +133,7 @@ fn the_transcript_hashes_the_context_and_both_messages_in_order() {
     );
 }
 
+/// KR-REQ-10.22, KR-REQ-10.23: five independent 32-byte keys, and distinct tags for each use.
 #[test]
 fn the_five_keys_and_both_tags_are_distinct() {
     let document = fixture("transcript.json");
@@ -154,6 +161,7 @@ fn the_five_keys_and_both_tags_are_distinct() {
     );
 }
 
+/// KR-REQ-10.24: the bundle additional data is CBOR([domain, T, direction, sequence, type]).
 #[test]
 fn every_bundle_additional_data_case_is_distinct() {
     let document = fixture("transcript.json");
@@ -178,6 +186,7 @@ fn every_bundle_additional_data_case_is_distinct() {
     }
 }
 
+/// KR-REQ-10.28, KR-REQ-10.37: both verification values are eight hexadecimal characters.
 #[test]
 fn the_verification_values_are_eight_hexadecimal_characters() {
     for (name, pointer) in [
@@ -190,6 +199,7 @@ fn the_verification_values_are_eight_hexadecimal_characters() {
     }
 }
 
+/// KR-REQ-10.36: `D` is the ten-member array section 10 lists, in order.
 #[test]
 fn the_direct_transcript_is_an_array_in_the_specified_order() {
     let document = fixture("direct.json");
@@ -211,6 +221,8 @@ fn the_direct_transcript_is_an_array_in_the_specified_order() {
     assert_eq!(items[0].as_text(), Some("kr-pair/direct/1"));
 }
 
+/// KR-REQ-10.11, KR-REQ-10.04: codes are Base58, displayed `XXXX-XXX-XXX`, and parse as the vector
+/// says.
 #[test]
 fn every_parsing_case_behaves_as_the_vector_says() {
     let document = fixture("codes.json");
@@ -245,6 +257,7 @@ fn every_parsing_case_behaves_as_the_vector_says() {
     }
 }
 
+/// KR-REQ-10.38: both QR payloads decode from, and re-encode to, their published canonical bytes.
 #[test]
 fn both_qr_payloads_round_trip_from_their_published_bytes() {
     let document = fixture("codes.json");
@@ -263,4 +276,33 @@ fn both_qr_payloads_round_trip_from_their_published_bytes() {
             mode
         );
     }
+}
+
+/// KR-REQ-10.09: the PAKE is the RustCrypto `spake2` crate, pinned to exactly 0.4.0 in the
+/// workspace and resolved to that one version, and its profile is `Spake2<Ed25519Group>`.
+#[test]
+fn the_pake_is_the_pinned_spake2_release() {
+    let manifest = std::fs::read_to_string(repository_root().join("Cargo.toml"))
+        .expect("the workspace manifest");
+    assert!(
+        manifest
+            .lines()
+            .any(|line| line.trim() == r#"spake2 = "=0.4.0""#),
+        "the workspace pins spake2 to exactly 0.4.0"
+    );
+    let lock =
+        std::fs::read_to_string(repository_root().join("Cargo.lock")).expect("the lock file");
+    let resolved: Vec<&str> = lock
+        .split("[[package]]")
+        .filter(|package| package.contains("\nname = \"spake2\"\n"))
+        .collect();
+    assert_eq!(resolved.len(), 1, "one spake2 in the dependency graph");
+    assert!(resolved[0].contains("\nversion = \"0.4.0\"\n"));
+    assert!(
+        resolved[0]
+            .contains("\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n"),
+        "the maintained crate from the public registry"
+    );
+    assert_eq!(kr_pairing::spake::SPAKE2_VERSION, "0.4.0");
+    assert_eq!(kr_pairing::spake::SPAKE2_PROFILE, "Spake2<Ed25519Group>");
 }

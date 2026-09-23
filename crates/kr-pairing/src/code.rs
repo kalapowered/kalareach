@@ -235,6 +235,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    /// KR-REQ-10.04, KR-REQ-10.11: a code is ten Base58 characters shown as `XXXX-XXX-XXX`.
     #[test]
     fn a_generated_code_is_ten_alphabet_characters() {
         let code = generate_code().expect("libsodium is available");
@@ -259,6 +260,7 @@ mod tests {
         );
     }
 
+    /// KR-REQ-10.11: rejection sampling draws every character uniformly.
     #[test]
     fn generation_covers_the_whole_alphabet_without_a_bias_towards_its_start() {
         // Rejection sampling is what keeps the distribution uniform. A modulo without it would
@@ -286,6 +288,7 @@ mod tests {
         }
     }
 
+    /// KR-REQ-10.11: the rejection bound keeps the draw unbiased.
     #[test]
     fn the_rejection_bound_is_the_last_whole_multiple_of_the_alphabet() {
         assert_eq!(REJECTION_BOUND, 231);
@@ -295,6 +298,7 @@ mod tests {
         );
     }
 
+    /// KR-REQ-10.11: parsing removes spaces and hyphens and preserves case.
     #[test]
     fn parsing_removes_separators_and_preserves_case() {
         let plain = EnteredCode::parse("aB3xYz79Qw").expect("a code");
@@ -310,6 +314,7 @@ mod tests {
         assert_ne!(other.normalised(), plain.normalised());
     }
 
+    /// KR-REQ-10.11, KR-REQ-10.04: parsing needs exactly ten Base58 characters.
     #[test]
     fn parsing_requires_exactly_ten_valid_characters() {
         assert!(EnteredCode::parse("aB3xYz79Q").is_err());
@@ -321,6 +326,7 @@ mod tests {
         assert!(EnteredCode::parse("aB3xYz79Q\u{00e9}").is_err());
     }
 
+    /// KR-REQ-10.12: the six secret characters never appear in a log or debug rendering.
     #[test]
     fn a_code_redacts_its_secret_half() {
         let code = EnteredCode::parse("aB3x-Yz7-9Qw").expect("a code");
@@ -333,6 +339,7 @@ mod tests {
         assert!(format!("{generated:?}").ends_with("-...-...)"));
     }
 
+    /// KR-REQ-10.11: the secret half is six Base58 characters.
     #[test]
     fn a_secret_is_six_alphabet_characters() {
         assert!(CodeSecret::new("Yz79Qw").is_ok());
@@ -341,6 +348,7 @@ mod tests {
         assert!(CodeSecret::new("Yz79Q0").is_err());
     }
 
+    /// KR-REQ-10.12: locators are drawn from the whole four-character space.
     #[test]
     fn locators_are_drawn_from_the_whole_space() {
         // A locator collision makes the host generate another one; this checks that generation

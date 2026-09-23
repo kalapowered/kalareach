@@ -250,13 +250,42 @@ fn run_redemption(
     Ok((candidate, client_value))
 }
 
+/// KR-REQ-10.35, KR-REQ-10.37, KR-REQ-23.26: a direct invitation carries what section 10 lists and
+/// grants nothing until redeemed; both devices compute the same value, and the owner's
+/// confirmation commits the device and the proposed grant.
 #[test]
 fn a_complete_direct_pairing_commits_the_device_and_the_proposed_grant() {
     let harness = Harness::new();
+    let issued_at = kr_pairing::platform::PairingClock::wall_clock_ms(&harness.clock);
     let mut invitation = harness.issue();
     let payload = harness.scan(&invitation);
     assert_eq!(payload.endpoint_id, *harness.host_keys.transport.public());
     assert_eq!(payload.proposed_grant, proposal());
+
+    // The QR carries the selected network configuration, a random 256-bit secret of its own and a
+    // five-minute expiry, and until a candidate proves the secret the invitation grants nothing.
+    assert_eq!(payload.network_config, harness.identity().network_config);
+    assert_eq!(payload.secret.expose().len(), 32);
+    let another = harness.issue();
+    assert_ne!(
+        harness.scan(&another).secret.expose(),
+        payload.secret.expose(),
+        "every invitation draws its own secret"
+    );
+    assert_eq!(
+        payload.expires_at_ms.get(),
+        issued_at + INVITATION_LIFETIME_MS
+    );
+    assert_eq!(invitation.record().state, InvitationState::Open);
+    assert_eq!(
+        kr_pairing::platform::InvitationStore::commitment(
+            &&harness.store,
+            invitation.invitation_id()
+        )
+        .expect("a read"),
+        None,
+        "an issued invitation has granted nothing"
+    );
 
     let (candidate, client_value) =
         run_redemption(&harness, &mut invitation, &payload).expect("a redemption");
@@ -293,6 +322,7 @@ fn a_complete_direct_pairing_commits_the_device_and_the_proposed_grant() {
     assert_eq!(invitation.record().state, InvitationState::Committed);
 }
 
+/// KR-REQ-10.36: a host challenge is single use, and a stale one is refused.
 #[test]
 fn a_challenge_is_single_use_and_a_stale_one_is_refused() {
     let harness = Harness::new();
@@ -328,6 +358,7 @@ fn a_challenge_is_single_use_and_a_stale_one_is_refused() {
     ));
 }
 
+/// KR-REQ-10.36: the submitted client endpoint must be the live authenticated peer.
 #[test]
 fn the_submitted_endpoint_must_be_the_live_peer() {
     let harness = Harness::new();
@@ -354,6 +385,8 @@ fn the_submitted_endpoint_must_be_the_live_peer() {
     assert_eq!(invitation.record().state, InvitationState::Open);
 }
 
+/// KR-REQ-10.36, KR-REQ-10.35: redemption needs both the secret's HMAC over `D` and the Ed25519
+/// signature over `D`.
 #[test]
 fn a_wrong_secret_or_a_tampered_signature_does_not_redeem() {
     let harness = Harness::new();
@@ -412,6 +445,7 @@ fn a_wrong_secret_or_a_tampered_signature_does_not_redeem() {
     ));
 }
 
+/// KR-REQ-10.35, KR-REQ-10.36: the proof goes only to the endpoint the QR pinned, never in 0-RTT.
 #[test]
 fn a_candidate_refuses_to_prove_itself_to_an_endpoint_the_qr_did_not_pin() {
     let harness = Harness::new();
@@ -450,6 +484,7 @@ fn a_candidate_refuses_to_prove_itself_to_an_endpoint_the_qr_did_not_pin() {
     ));
 }
 
+/// KR-REQ-10.36: a redemption in 0-RTT is refused and changes nothing.
 #[test]
 fn a_redemption_in_early_data_changes_nothing() {
     let harness = Harness::new();
@@ -483,6 +518,7 @@ fn a_redemption_in_early_data_changes_nothing() {
         .expect("a redemption");
 }
 
+/// KR-REQ-10.36: a challenge answers only its own invitation.
 #[test]
 fn a_challenge_from_another_host_or_another_invitation_is_refused() {
     let harness = Harness::new();
@@ -509,6 +545,8 @@ fn a_challenge_from_another_host_or_another_invitation_is_refused() {
         .expect("a challenge");
 }
 
+/// KR-REQ-10.35, KR-REQ-10.37: a reused, expired or cancelled invitation gives its own rejection,
+/// and `pair.cancel` consumes one without a grant.
 #[test]
 fn a_reused_expired_or_cancelled_invitation_gives_a_specific_rejection() {
     let harness = Harness::new();
@@ -556,6 +594,8 @@ fn a_reused_expired_or_cancelled_invitation_gives_a_specific_rejection() {
     ));
 }
 
+/// KR-REQ-10.37, KR-REQ-10.38: `pair.confirm` takes only the issuing owner, the exact transcript
+/// and the exact client keys, and a short-code confirmation does not approve a direct redemption.
 #[test]
 fn only_the_issuing_owner_confirms_the_exact_transcript_and_keys() {
     let harness = Harness::new();
@@ -646,6 +686,7 @@ fn only_the_issuing_owner_confirms_the_exact_transcript_and_keys() {
     ));
 }
 
+/// KR-REQ-10.37: a retried confirmation cannot change the keys or the rights.
 #[test]
 fn an_idempotent_retry_cannot_change_the_keys_or_the_rights() {
     let harness = Harness::new();
@@ -667,6 +708,7 @@ fn an_idempotent_retry_cannot_change_the_keys_or_the_rights() {
     assert_eq!(first, second);
 }
 
+/// KR-REQ-10.37: the commit is atomic and reported only once written.
 #[test]
 fn a_commitment_that_cannot_be_written_is_not_reported_as_a_pairing() {
     let harness = Harness::new();
@@ -692,6 +734,8 @@ fn a_commitment_that_cannot_be_written_is_not_reported_as_a_pairing() {
     );
 }
 
+/// KR-REQ-10.37, KR-REQ-10.35: `pair.status` answers only the candidate's own endpoint or the
+/// issuing owner, and never shows the secret.
 #[test]
 fn a_candidate_sees_only_its_own_status_and_no_secret() {
     let harness = Harness::new();
@@ -745,6 +789,7 @@ fn a_candidate_sees_only_its_own_status_and_no_secret() {
     ));
 }
 
+/// KR-REQ-10.38: neither entry mode replaces a candidate the other has locked.
 #[test]
 fn a_locked_candidate_is_not_replaced_by_the_other_entry_mode() {
     let harness = Harness::new();
@@ -769,6 +814,7 @@ fn a_locked_candidate_is_not_replaced_by_the_other_entry_mode() {
     ));
 }
 
+/// KR-REQ-10.38: both entry modes share one atomic candidate and consumption record.
 #[test]
 fn a_write_that_lost_a_race_does_not_undo_the_writer_that_won() {
     let harness = Harness::new();
@@ -812,6 +858,7 @@ fn a_write_that_lost_a_race_does_not_undo_the_writer_that_won() {
     );
 }
 
+/// KR-REQ-10.37: a commit that lost a race writes nothing.
 #[test]
 fn a_commit_that_lost_a_race_writes_nothing() {
     let harness = Harness::new();
@@ -842,6 +889,7 @@ fn a_commit_that_lost_a_race_writes_nothing() {
     );
 }
 
+/// KR-REQ-10.37: a retried redemption returns the same candidate and changes nothing.
 #[test]
 fn a_lost_response_does_not_strand_the_candidate() {
     let harness = Harness::new();
@@ -890,6 +938,7 @@ fn a_lost_response_does_not_strand_the_candidate() {
     ));
 }
 
+/// KR-REQ-10.37: the committed result is reported to the candidate's authenticated endpoint alone.
 #[test]
 fn a_candidate_that_never_learnt_its_attempt_is_still_told_it_is_paired() {
     let harness = Harness::new();
@@ -944,6 +993,7 @@ fn a_candidate_that_never_learnt_its_attempt_is_still_told_it_is_paired() {
     ));
 }
 
+/// KR-REQ-10.38: the two entry modes use different proof domains.
 #[test]
 fn the_two_entry_modes_use_different_proof_domains() {
     // The short code's transcript is separated by `kr-pair/spake2-ed25519/1` and the direct
@@ -958,6 +1008,7 @@ fn the_two_entry_modes_use_different_proof_domains() {
     );
 }
 
+/// KR-REQ-10.38: a code-mode payload is not an offline invitation.
 #[test]
 fn a_code_mode_payload_is_not_an_offline_invitation() {
     let harness = Harness::new();

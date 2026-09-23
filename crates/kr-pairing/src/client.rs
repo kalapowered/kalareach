@@ -663,6 +663,7 @@ mod tests {
         charge_attempt(store, clock, &origin(), code)
     }
 
+    /// KR-REQ-10.32: a device caps one entered code at five attempts.
     #[test]
     fn a_device_gets_five_attempts_per_code() {
         let store = TestClientBudgetStore::new().expect("a store");
@@ -679,6 +680,7 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-10.32: the count survives an application restart.
     #[test]
     fn the_counter_survives_a_restart_and_is_not_keyed_by_the_service() {
         let store = TestClientBudgetStore::new().expect("a store");
@@ -692,6 +694,7 @@ mod tests {
         );
     }
 
+    /// KR-REQ-10.32: the configured origin is part of the counter key.
     #[test]
     fn the_same_code_at_another_origin_is_another_entry() {
         let store = TestClientBudgetStore::new().expect("a store");
@@ -707,6 +710,7 @@ mod tests {
         );
     }
 
+    /// KR-REQ-10.32: the normalised code is part of the counter key.
     #[test]
     fn two_spellings_of_one_code_share_a_counter() {
         let store = TestClientBudgetStore::new().expect("a store");
@@ -720,6 +724,7 @@ mod tests {
         );
     }
 
+    /// KR-REQ-10.32: the five-minute window starts at first entry and a tombstone outlives it.
     #[test]
     fn the_window_starts_at_first_entry_and_a_tombstone_outlives_it() {
         let store = TestClientBudgetStore::new().expect("a store");
@@ -744,6 +749,7 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-10.32: a reboot expires the entry and leaves a tombstone.
     #[test]
     fn a_reboot_expires_the_entry_and_leaves_a_tombstone() {
         let store = TestClientBudgetStore::new().expect("a store");
@@ -765,6 +771,7 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-10.32: the window runs on monotonic time, not the wall clock.
     #[test]
     fn a_wall_clock_that_jumps_forward_does_not_restore_attempts() {
         let store = TestClientBudgetStore::new().expect("a store");
@@ -782,6 +789,7 @@ mod tests {
         assert_eq!(store.len(), 1, "the tombstone is still there");
     }
 
+    /// KR-REQ-10.32: a tombstone is kept for 24 hours and then dropped.
     #[test]
     fn a_tombstone_is_dropped_once_its_retention_ends() {
         let store = TestClientBudgetStore::new().expect("a store");
@@ -796,6 +804,8 @@ mod tests {
         assert!(charge(&store, &clock, &code()).is_ok());
     }
 
+    /// KR-REQ-10.32: the counter key reveals neither the code nor the origin, and differs per
+    /// device.
     #[test]
     fn the_counter_key_is_not_the_code_and_not_the_origin() {
         let store = TestClientBudgetStore::new().expect("a store");
@@ -809,6 +819,45 @@ mod tests {
         assert_ne!(key, budget_key(&other, &origin(), &code()).expect("a key"));
     }
 
+    /// KR-REQ-10.32: the counter key is HMAC-SHA256 under this device's own random local key over
+    /// the configured origin and the normalised full code, and nothing the service supplies is part
+    /// of it: two lookups that advertise different invitations and expiries share one budget.
+    #[test]
+    fn the_counter_is_keyed_by_origin_and_code_under_a_local_key_and_nothing_the_service_says() {
+        let store = TestClientBudgetStore::new().expect("a store");
+        let clock = TestClock::new();
+        let key = store.budget_key().expect("the local key");
+        let mut message = vec![0x83];
+        message.extend_from_slice(&kr_cbor::encode(&kr_cbor::CanonicalValue::text(
+            CLIENT_BUDGET_DOMAIN,
+        )));
+        message.extend_from_slice(&kr_cbor::encode(&kr_cbor::CanonicalValue::text(
+            origin().as_str(),
+        )));
+        message.extend_from_slice(&kr_cbor::encode(&kr_cbor::CanonicalValue::text(
+            code().normalised(),
+        )));
+        assert_eq!(
+            budget_key(&store, &origin(), &code()).expect("a key"),
+            kdf::hmac_sha256(&key, &message)
+        );
+
+        for (invitation, expiry) in [([1u8; 16], 9_999u64), ([2u8; 16], u64::MAX)] {
+            let rendezvous = TestClient::new(LocatorRecord {
+                invitation_id: InvitationId::new(Uuid::from_bytes(invitation)),
+                advertised_expires_at_ms: TimestampMs::new(expiry),
+            });
+            ClientAttempt::start(&store, &clock, &rendezvous, &origin(), &code())
+                .expect("an attempt");
+        }
+        assert_eq!(
+            charge(&store, &clock, &code()).expect("an attempt"),
+            MAX_CLIENT_ATTEMPTS - 3,
+            "two advertised invitations spent one budget"
+        );
+    }
+
+    /// KR-REQ-10.16: the lookup sends only the four locator characters.
     #[test]
     fn a_lookup_sends_only_the_locator() {
         let store = TestClientBudgetStore::new().expect("a store");
@@ -827,6 +876,7 @@ mod tests {
         assert!(!attempt.is_finished());
     }
 
+    /// KR-REQ-10.21: one attempt runs one exchange; its PAKE state is never reused.
     #[test]
     fn an_attempt_cannot_start_a_second_exchange() {
         let store = TestClientBudgetStore::new().expect("a store");

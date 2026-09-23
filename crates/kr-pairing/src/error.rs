@@ -203,6 +203,7 @@ impl PairingError {
 mod tests {
     use super::*;
 
+    /// KR-REQ-10.19: every authentication outcome reports the one ambiguous code.
     #[test]
     fn every_authentication_outcome_reports_one_ambiguous_code() {
         for error in [
@@ -222,6 +223,7 @@ mod tests {
         }
     }
 
+    /// KR-REQ-10.19: expiry, exhausted attempts and an owner's refusal report different codes.
     #[test]
     fn a_consumed_invitation_reports_how_it_was_consumed() {
         // A caller distinguishes "it ran out" from "it was refused", and an invitation consumed
@@ -262,6 +264,7 @@ mod tests {
         }
     }
 
+    /// KR-REQ-10.19: an authentication failure names no cause the host cannot establish.
     #[test]
     fn a_failure_never_says_which_half_of_the_code_was_wrong() {
         // The message is the contract: it names no cause a host cannot establish.

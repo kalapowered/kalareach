@@ -179,6 +179,7 @@ mod tests {
         }
     }
 
+    /// KR-REQ-10.22: HKDF-SHA256 derives five independent keys under the five information strings.
     #[test]
     fn the_five_keys_are_independent() {
         let transcript = context().transcript(b"message-a", b"message-b");
@@ -198,6 +199,8 @@ mod tests {
         assert_eq!(HKDF_INFO_STRINGS.len(), derived.len());
     }
 
+    /// KR-REQ-10.23: each confirmation tag verifies only over its own `T`, and neither stands in
+    /// for the other.
     #[test]
     fn a_confirmation_tag_verifies_only_over_its_own_transcript() {
         let context = context();
@@ -229,6 +232,7 @@ mod tests {
         );
     }
 
+    /// KR-REQ-10.23: a peer that entered another code cannot produce the confirmation tag.
     #[test]
     fn another_shared_key_gives_another_set_of_tags() {
         let transcript = context().transcript(b"a", b"b");
@@ -241,6 +245,7 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-10.27: the `iroh-bind` tag is its own tag over its own input.
     #[test]
     fn a_binding_tag_is_not_a_confirmation_tag() {
         let transcript = context().transcript(b"a", b"b");
@@ -254,6 +259,7 @@ mod tests {
         assert!(keys.verify_binding_tag(b"other", &binding).is_err());
     }
 
+    /// KR-REQ-10.22: `T` covers both library messages in order.
     #[test]
     fn the_transcript_covers_both_library_messages_in_order() {
         let context = context();
@@ -268,6 +274,7 @@ mod tests {
         );
     }
 
+    /// KR-REQ-10.20: both devices build `C` themselves and reject an inconsistent one.
     #[test]
     fn a_different_context_gives_a_different_transcript_and_identities() {
         let ours = context();

@@ -150,6 +150,8 @@ mod tests {
         CodeSecret::new(text).expect("six alphabet characters")
     }
 
+    /// KR-REQ-10.09: the host starts role A and the candidate role B, and the same code gives one
+    /// key.
     #[test]
     fn the_same_password_gives_the_same_key() {
         let context = context(2);
@@ -192,6 +194,7 @@ mod tests {
         );
     }
 
+    /// KR-REQ-10.09, KR-REQ-10.21: a message from the wrong role is refused by the library.
     #[test]
     fn a_wrong_role_is_rejected_through_the_library() {
         let context = context(2);
@@ -206,6 +209,7 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-10.21: malformed messages and invalid group elements are refused by the library.
     #[test]
     fn a_malformed_or_truncated_message_is_rejected() {
         let context = context(2);
@@ -238,6 +242,7 @@ mod tests {
         assert!(host.finish(peer.message()).is_ok());
     }
 
+    /// KR-REQ-10.21: every attempt draws fresh library randomness.
     #[test]
     fn every_attempt_draws_fresh_randomness() {
         let context = context(2);
@@ -247,6 +252,7 @@ mod tests {
         assert_ne!(first.message(), second.message());
     }
 
+    /// KR-REQ-10.21: a PAKE state is consumed by `finish` and cannot be reused.
     #[test]
     fn the_role_is_recorded_and_the_state_is_consumed_by_finishing() {
         let context = context(2);
@@ -260,6 +266,7 @@ mod tests {
         assert!(host.finish(&client_message).is_ok());
     }
 
+    /// KR-REQ-10.09: the profile and version this build uses are recorded.
     #[test]
     fn the_pinned_profile_is_recorded() {
         assert_eq!(SPAKE2_VERSION, "0.4.0");
