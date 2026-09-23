@@ -805,84 +805,9 @@ async fn context_is_filtered_by_the_requesting_devices_own_history_bound() {
 // A fence this host owes and could not raise
 // ---------------------------------------------------------------------------------------------
 
-/// Writes one configuration document where this host reads it.
-fn write_configuration(
-    environment: &kr_ipc::paths::EnvironmentPaths,
-    document: &kr_protocol::hostinfo::configuration::ConfigurationDocument,
-) {
-    let path = kr_worker::config::document_path(environment);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect("the state directory");
-    }
-    kr_ipc::paths::write_owner_only_file(
-        &path,
-        kr_protocol::hostinfo::configuration::contents(document).as_bytes(),
-    )
-    .expect("the document");
-}
+mod fence_support;
 
-/// A configuration document that narrows the rights a grant may carry to `rights`, which withdraws
-/// authority and owes a fence.
-fn narrowing_document(
-    rights: &[ActionRight],
-) -> kr_protocol::hostinfo::configuration::ConfigurationDocument {
-    let mut narrowed = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
-    narrowed.revision = 1;
-    narrowed.ceilings.grant_rights = Nullable::some(
-        rights
-            .iter()
-            .map(|right| right.as_str().to_owned())
-            .collect(),
-    );
-    narrowed
-}
-
-/// Makes this environment's registry refuse the revision advance a fence needs, as a full disk or
-/// a damaged file would, until the returned connection drops the trigger.
-fn refuse_fences(environment: &kr_ipc::paths::EnvironmentPaths) -> rusqlite::Connection {
-    let registry =
-        rusqlite::Connection::open(environment.registry_database()).expect("opens the registry");
-    registry
-        .busy_timeout(std::time::Duration::from_secs(5))
-        .expect("waits for the daemon's writes");
-    registry
-        .execute_batch(
-            "CREATE TRIGGER refuse_fence BEFORE UPDATE OF authority_revision ON environment
-             BEGIN SELECT RAISE(ABORT, 'no room'); END;",
-        )
-        .expect("the fault is in place");
-    registry
-}
-
-/// Puts a configuration that withdraws authority into force on a registry that refuses the fence
-/// the withdrawal owes, so this host owes a fence it could not raise.
-async fn owe_a_fence(
-    controller: &Controller,
-    environment: &kr_ipc::paths::EnvironmentPaths,
-) -> rusqlite::Connection {
-    let registry = refuse_fences(environment);
-    // Every right the grants in this suite carry is still allowed, so the fence is the only thing
-    // that can refuse a voice change.
-    write_configuration(
-        environment,
-        &narrowing_document(&[
-            ActionRight::SessionView,
-            ActionRight::AgentPrompt,
-            ActionRight::TerminalInput,
-            ActionRight::VoiceUse,
-        ]),
-    );
-    let effective = controller.effective_configuration().await;
-    assert!(
-        effective
-            .not_in_force
-            .as_ref()
-            .is_some_and(|problem| problem.as_str().contains("dispatch could not be fenced")),
-        "{:?}",
-        effective.not_in_force
-    );
-    registry
-}
+use fence_support::{clear_the_fault, owe_a_fence};
 
 /// The voice grants one device holds in the host's own store.
 fn voice_grants_of(controller: &Controller, device_id: DeviceId) -> Vec<Grant> {
@@ -937,9 +862,7 @@ async fn a_voice_change_is_not_written_while_a_fence_is_owed() {
         voice_grants_of(&host.controller, host.device_id).is_empty(),
         "no voice grant was written"
     );
-    registry
-        .execute_batch("DROP TRIGGER refuse_fence;")
-        .expect("the fault is cleared");
+    clear_the_fault(&registry);
     host.clients.abort();
 }
 
@@ -1274,8 +1197,6 @@ async fn a_voice_start_that_waited_writes_nothing_once_a_fence_is_owed() {
         vec!["call-1".to_owned()],
         "the call the broker created is closed"
     );
-    registry
-        .execute_batch("DROP TRIGGER refuse_fence;")
-        .expect("the fault is cleared");
+    clear_the_fault(&registry);
     host.stop().await;
 }

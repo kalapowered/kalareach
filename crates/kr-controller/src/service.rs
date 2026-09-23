@@ -2117,8 +2117,9 @@ impl Controller {
     /// The admission a service asks again from inside the work a mutation has begun.
     ///
     /// Every service that performs a mutation's effect after a wait is handed this one check, the
-    /// project service and the workflow journal alike: [`Self::check_registration`], which asks
-    /// the fence this host owes before the connection's registration and the accepted deadline.
+    /// project service, the transfer service and the workflow journal alike:
+    /// [`Self::check_registration`], which asks the fence this host owes before the connection's
+    /// registration and the accepted deadline.
     pub(crate) fn admission_in_service(
         self: &Arc<Self>,
         carried: crate::authority::AdmittedMutation,
@@ -2165,12 +2166,27 @@ impl Controller {
         &self,
         admission: &crate::authority::AdmittedMutation,
     ) -> Result<()> {
+        self.check_registration_in(&self.admitted_table(), admission)
+    }
+
+    /// [`Self::check_registration`], for a caller that already holds the connection table.
+    ///
+    /// A caller that writes a marker under that table, so that a revocation cannot withdraw the
+    /// registration between the answer and the marker, asks here rather than taking the table a
+    /// second time.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::check_registration`].
+    fn check_registration_in(
+        &self,
+        admitted: &BTreeMap<ConnectionId, AdmittedConnection>,
+        admission: &crate::authority::AdmittedMutation,
+    ) -> Result<()> {
         self.check_fence()?;
-        let admitted = self.admitted_table();
         let standing = admitted
             .get(&admission.connection_id)
             .map(|connection| connection.admitted_revision);
-        drop(admitted);
         let Some(standing) = standing else {
             return Err(ControllerError::PermissionDenied {
                 detail: crate::authority::AdmissionLapse::Deregistered.to_string(),
@@ -3800,9 +3816,9 @@ impl Controller {
     ) -> ControlFrame {
         if crate::transfer::TransferModule::serves(method) {
             // The stored subject is read first, because reading it waits: for a blocking thread
-            // and for the journal's lock. Then the admission is checked, so that check is the last
-            // thing between this mutation and its effect rather than one more thing with waits
-            // after it.
+            // and for the journal's lock. The admission is asked after it, inside the service's
+            // own work, so that answer is the last thing between this mutation and its effect
+            // rather than one more thing with waits after it.
             if let Err(error) = self
                 .transfer
                 .check_subject_of_record(actor_id, mutation, method)
@@ -3813,32 +3829,46 @@ impl Controller {
                     outcome: Outcome::Error(error),
                 });
             }
-            // Everything between the envelope check and this point can wait: for this task to be
-            // scheduled, for a blocking thread, for the subject read above. An action whose
-            // accepted deadline passed while it queued does not go on to write, and neither does
-            // one whose connection lost its authority in the meantime.
-            //
-            // A mutation carrying no freshness at all is refused here too. This service answers
-            // its own retained actions before this point, so anything still travelling is a first
+            // A mutation carrying no freshness at all is refused here. This service answers its
+            // own retained actions before this point, so anything still travelling is a first
             // admission, and a first admission needs a deadline it was admitted under.
-            if accepted.is_none_or(|accepted| self.clock.now() >= accepted.deadline) {
+            let Some(accepted) = accepted else {
                 return respond(
                     mutation.request_id,
                     Err(ControllerError::WindowExpired {
-                        detail: "the deadline this action was admitted under passed before it \
-                                 could run"
+                        detail: "this action carries no freshness, so it may be answered from \
+                                 what this host holds and may not write"
                             .to_owned(),
                     }),
                 );
-            }
-            if let Err(error) = self.authorised(connection_id) {
+            };
+            let Some(admitted_revision) = admitted else {
                 return error_reply(
                     mutation.request_id,
                     ErrorCode::PermissionDenied,
-                    error.to_string(),
+                    "the authority this connection was admitted under has been withdrawn; open a \
+                     new connection",
                 );
-            }
-            return self.transfer.write_frame(actor_id, mutation, method).await;
+            };
+            // The admission travels into the service's blocking work and is asked there, once no
+            // retained record has answered and immediately before the action: this task, a
+            // blocking thread and the journal are all waited for before it. It is the check every
+            // service asks from inside its work, so a fence this host owes, a registration it has
+            // withdrawn or replaced, and a deadline that has passed each stop the action.
+            let carried = crate::authority::AdmittedMutation {
+                connection_id,
+                admitted_revision,
+                deadline: Some(accepted.deadline),
+            };
+            return self
+                .transfer
+                .write_frame(
+                    actor_id,
+                    mutation,
+                    method,
+                    self.admission_in_service(carried),
+                )
+                .await;
         }
         if crate::voice::VoiceModule::serves(method) {
             // Section 23 gives `voice.grant` both ingresses: a paired device changes its own voice
@@ -4070,7 +4100,7 @@ impl Controller {
                 closed
             }
             Method::AgentToolsInstall | Method::AgentToolsRemove => {
-                self.agent_tools_change(actor_id, mutation, method, connection_id, accepted)
+                self.agent_tools_change(actor_id, mutation, method, carried)
                     .await
             }
             Method::GrantCreate
@@ -4674,13 +4704,14 @@ impl Controller {
     /// the same identifier with a different payload is `ID_CONFLICT`, and a marker written before
     /// the change with no outcome after it is `unknown` rather than something to do again. What
     /// can be refused without touching anything is refused before the marker.
+    ///
+    /// `carried` is the admission the change was accepted under, asked at the marker.
     async fn agent_tools_change(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
         method: Method,
-        connection_id: ConnectionId,
-        accepted: Option<AcceptedDeadline>,
+        carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
         let params: kr_protocol::skill::AgentToolsParams = parse(&mutation.params)?;
         let installer = self.installer()?;
@@ -4692,7 +4723,7 @@ impl Controller {
         // Waiting for that lock takes time, and what happens next is either a read of somebody's
         // completed action or a change to their files. Both need current authority, so it is
         // checked here rather than before the wait.
-        self.authorised(connection_id)?;
+        self.authorised(carried.connection_id)?;
         if let Some(retained) = installer.retained(actor_id, mutation.action_id, &digest)? {
             return Ok(retained);
         }
@@ -4710,29 +4741,25 @@ impl Controller {
                 )));
             }
         }
-        // Everything above can wait: for this task to be scheduled, for the lock, for the checks
-        // to read the agent's tree. The deadline this action was admitted under is read after
-        // those waits, and the dispatch marker is written while this daemon's authority store is
-        // held, so a revocation cannot complete between the check and the marker: withdrawing a
-        // registration takes the same lock.
-        let registrations = self.admitted_table();
-        if !registrations.contains_key(&connection_id) {
-            return Err(ControllerError::PermissionDenied {
-                detail: "the authority this connection was admitted under has been withdrawn; \
-                         open a new connection"
+        // A change carrying no freshness at all is refused. This path answers its own retained
+        // actions above, so anything still travelling is a first admission, and a first admission
+        // needs a deadline it was admitted under.
+        if carried.deadline.is_none() {
+            return Err(ControllerError::WindowExpired {
+                detail: "this installation carries no freshness, so it may be answered from what \
+                         this host holds and may not change anything"
                     .to_owned(),
             });
         }
-        // A change carrying no freshness at all is refused here as well. This path answers its own
-        // retained actions above, so anything still travelling is a first admission, and a first
-        // admission needs a deadline it was admitted under.
-        if accepted.is_none_or(|accepted| self.clock.now() >= accepted.deadline) {
-            return Err(ControllerError::WindowExpired {
-                detail: "the deadline this installation was admitted under passed before it could \
-                         run"
-                .to_owned(),
-            });
-        }
+        // Everything above can wait: for this task to be scheduled, for the lock, for the checks
+        // to read the agent's tree. The admission this change was accepted under is asked after
+        // those waits, and the dispatch marker is written while this daemon's connection table is
+        // held, so a revocation cannot complete between the answer and the marker: withdrawing a
+        // registration takes the same lock. The answer is the check every service asks from
+        // inside its work: a fence this host owes and could not raise, the connection's
+        // registration under the revision it was admitted at, then the deadline.
+        let registrations = self.admitted_table();
+        self.check_registration_in(&registrations, &carried)?;
         installer.mark_dispatching(actor_id, mutation.action_id, &digest)?;
         drop(registrations);
         let result = match method {
@@ -9830,6 +9857,71 @@ mod a_create_that_launches_nothing {
                 .expect("the store answers")
                 .is_empty(),
             "no voice grant was written"
+        );
+    }
+
+    /// A mutation forwarded to a worker is asked the admission it arrived under at the last point
+    /// before it is forwarded, after the lease: a fence this host owes stops it, and so does a
+    /// registration withdrawn after the admission. The envelope is a local one, which needs no
+    /// worker lease, so nothing but the admission can refuse it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_forward_to_a_worker_asks_the_admission_it_arrived_under() {
+        let (_temp, controller, _asked) = daemon().await;
+        let (connection_id, actor_id) = admitted(&controller).await;
+        let envelope = kr_protocol::actor::ActorEnvelope {
+            actor_id,
+            ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+            device_id: Nullable::null(),
+            grant_id: Nullable::null(),
+            grant_revision: Nullable::some(
+                controller
+                    .admitted_revision(connection_id)
+                    .expect("the connection is registered"),
+            ),
+            controller_generation: controller.generation,
+            connection_id,
+        };
+        let accepted = AcceptedDeadline {
+            deadline: controller
+                .clock
+                .now()
+                .checked_add(Duration::from_secs(60))
+                .expect("a deadline"),
+            bound: DeadlineBound::RequestedTtl,
+        };
+        let session_id = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid());
+        controller
+            .forwarded_deadline(session_id, &envelope, accepted)
+            .await
+            .expect("a standing admission is forwarded");
+
+        controller
+            .fence_unraised
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let refused = controller
+            .forwarded_deadline(session_id, &envelope, accepted)
+            .await
+            .expect_err("a fence this host owes stops the forward");
+        assert!(
+            matches!(refused, ControllerError::PermissionDenied { .. }),
+            "{refused:?}"
+        );
+        assert!(
+            refused.to_string().contains("could not be raised"),
+            "{refused}"
+        );
+        controller
+            .fence_unraised
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        controller.deregister(connection_id);
+        let refused = controller
+            .forwarded_deadline(session_id, &envelope, accepted)
+            .await
+            .expect_err("a withdrawn registration stops the forward");
+        assert_eq!(
+            refused.to_string(),
+            crate::authority::AdmissionLapse::Deregistered.to_string()
         );
     }
 }

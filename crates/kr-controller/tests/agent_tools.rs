@@ -154,3 +154,71 @@ async fn a_removal_the_daemon_will_not_do_leaves_no_dispatch_marker() {
         .expect_err("and is refused again");
     assert_eq!(again.code, refusal(), "{again:?}");
 }
+
+#[cfg(not(windows))]
+mod fence_support;
+
+/// KR-REQ-09.09, 09.12 and 26.16: a withdrawal whose fence could not be raised stops an
+/// installation before its dispatch marker. The daemon admits the change on its own socket; at the
+/// marker it asks the check every service asks from inside its work, under the connection table
+/// the marker is written beside, and the refusal is the fence's own. The installation is Codex's at
+/// project scope, into a directory of this test's own: nothing is written there, and no marker is
+/// left, so an exact retry is refused again rather than answered as an outcome nobody knows.
+///
+/// Not on Windows, which refuses every installation before the marker for a reason of its own.
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_installation_is_not_dispatched_while_a_fence_is_owed() {
+    let host = host().await;
+    let project = tempfile::TempDir::new().expect("a project directory on the internal disk");
+    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let registry = fence_support::owe_a_fence(&host._controller, &host._temp.environment()).await;
+    let target = ActionTarget {
+        environment_id: host.environment_id,
+        session_id: Nullable::null(),
+        session_epoch: Nullable::null(),
+        application_instance_id: Nullable::null(),
+        agent_binding_revision: Nullable::null(),
+    };
+    let params = AgentToolsParams {
+        agent: AgentTarget::Codex,
+        scope: InstallScope::Project,
+        project_dir: Nullable::some(project.path().display().to_string()),
+    };
+
+    let refused = client
+        .mutate(
+            Method::AgentToolsInstall,
+            ActionId::new(kr_ipc::new_uuid()),
+            target,
+            &params,
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect_err("the fence stops the installation");
+
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(
+        refused.message.contains("could not be raised"),
+        "{refused:?}"
+    );
+    assert!(
+        std::fs::read_dir(project.path())
+            .expect("reads the project directory")
+            .next()
+            .is_none(),
+        "nothing was written into the project"
+    );
+    let actions = host.state_dir.join("agent-tools/actions");
+    assert!(
+        !actions.exists()
+            || std::fs::read_dir(&actions)
+                .expect("reads the directory")
+                .next()
+                .is_none(),
+        "a refusal before the change writes no marker"
+    );
+    fence_support::clear_the_fault(&registry);
+}

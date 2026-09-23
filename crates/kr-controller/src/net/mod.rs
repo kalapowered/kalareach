@@ -1386,10 +1386,15 @@ impl Controller {
     /// the worker is given, and the result is on the machine's own continuous clock, which is the
     /// clock the worker reads.
     ///
+    /// This is the last thing this host decides before the mutation is forwarded, so the admission
+    /// it was accepted under is asked here, after the lease: the connection and the revision it
+    /// was admitted at are the ones `actor` carries.
+    ///
     /// # Errors
     ///
-    /// Returns an error when no lease can be taken, or when the accepted deadline has already
-    /// passed: a spent deadline is never forwarded as though it had time left.
+    /// Returns an error when no lease can be taken, when the admission no longer stands, or when
+    /// the accepted deadline has already passed: a spent deadline is never forwarded as though it
+    /// had time left.
     pub(crate) async fn forwarded_deadline(
         self: &Arc<Self>,
         session_id: kr_protocol::ids::SessionId,
@@ -1407,6 +1412,25 @@ impl Controller {
                 self.dispatch_lease(session_id, actor).await?
             }
         };
+        // Taking the lease can wait for the worker to acknowledge the revision, and the mutation
+        // waited for its link before that. The check every service asks from inside its work is
+        // asked after those waits: a fence this host owes and could not raise leaves the revision
+        // and the lease where they were, so only this refuses the forward while it is owed; a
+        // registration withdrawn or replaced meanwhile, and a deadline that has passed, refuse it
+        // as well. A worker already holding a forwarded mutation decides it under its own lease.
+        let admitted_revision =
+            actor
+                .grant_revision
+                .0
+                .ok_or_else(|| ControllerError::PermissionDenied {
+                    detail: "this request carries no authority revision it was admitted at"
+                        .to_owned(),
+                })?;
+        self.check_registration(&crate::authority::AdmittedMutation {
+            connection_id: actor.connection_id,
+            admitted_revision,
+            deadline: Some(accepted.deadline),
+        })?;
         crate::service::remaining_deadline(
             &*self.shared_clock,
             &*self.clock,

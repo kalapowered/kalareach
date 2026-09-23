@@ -795,6 +795,55 @@ async fn an_action_whose_admitted_deadline_passed_is_refused_before_it_writes() 
     );
 }
 
+mod fence_support;
+
+/// KR-REQ-09.09, 09.12 and 26.16: a withdrawal whose fence could not be raised stops a transfer
+/// mutation. The daemon admits `draft.create` on its own socket; the transfer service asks the
+/// check every service asks from inside its work, once it has looked for a retained record and
+/// immediately before it acts, and the refusal is the fence's own.
+///
+/// A draft and the record of the action that created it are committed together, so an action that
+/// wrote nothing has no record: the same action asked again is refused again rather than answered
+/// with a draft.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transfer_writes_nothing_while_a_fence_is_owed() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let registry = fence_support::owe_a_fence(&host.controller, &host.temp.environment()).await;
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let params = DraftCreateParams {
+        environment_id: host.environment_id,
+        device_id: Nullable::null(),
+        session_id: Nullable::null(),
+        application_instance_id: Nullable::null(),
+        text: "admitted while a fence is owed".to_owned(),
+    };
+    for attempt in ["the first submission", "the same action again"] {
+        let refusal = failure(
+            control
+                .mutate(
+                    Method::DraftCreate,
+                    action_id,
+                    ActionTarget::environment(host.environment_id),
+                    &params,
+                )
+                .await
+                .expect("the call reaches the daemon"),
+        );
+        assert_eq!(
+            refusal.code,
+            ErrorCode::PermissionDenied,
+            "{attempt}: {refusal:?}"
+        );
+        assert!(
+            refusal.message.contains("could not be raised"),
+            "{attempt}: {refusal:?}"
+        );
+    }
+    fence_support::clear_the_fault(&registry);
+    host.stop().await;
+}
+
 /// KR-REQ-23.41: a mutation whose envelope names a different session from the transfer it acts on
 /// is refused, whoever owns the transfer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

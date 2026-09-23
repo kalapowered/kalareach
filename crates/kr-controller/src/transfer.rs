@@ -267,16 +267,22 @@ impl TransferModule {
     }
 
     /// Serves one transfer mutation and returns the frame it answers with.
+    ///
+    /// `admission` is as [`Self::write`].
     #[must_use]
-    pub async fn write_frame(
+    pub async fn write_frame<A>(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
         method: Method,
-    ) -> ControlFrame {
+        admission: A,
+    ) -> ControlFrame
+    where
+        A: Fn() -> std::result::Result<(), ProtocolError> + Send + 'static,
+    {
         frame(
             mutation.request_id,
-            self.write(actor_id, mutation, method).await,
+            self.write(actor_id, mutation, method, admission).await,
         )
     }
 
@@ -384,15 +390,24 @@ impl TransferModule {
     /// to `upload.finish` resolvable without publishing a second file, and what makes a repeated
     /// chunk or cancellation cost nothing.
     ///
+    /// `admission` is the daemon's answer to whether the admission the mutation was accepted under
+    /// still stands. It is asked inside the blocking work, once no retained record has answered
+    /// and immediately before the action, the way the project service asks it.
+    ///
     /// # Errors
     ///
-    /// Returns the refusal the service decided, under the service's own code.
-    pub async fn write(
+    /// Returns the refusal the service decided, under the service's own code, or the admission's
+    /// refusal.
+    pub async fn write<A>(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
         method: Method,
-    ) -> Answer<ParamsValue> {
+        admission: A,
+    ) -> Answer<ParamsValue>
+    where
+        A: Fn() -> std::result::Result<(), ProtocolError> + Send + 'static,
+    {
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
         let service = Arc::clone(&self.service);
@@ -415,6 +430,16 @@ impl TransferModule {
                     }
                 };
             }
+            // Nothing retained, so this is a first admission and it is about to act. The admission
+            // is asked here rather than before the blocking task started: the task had to be
+            // scheduled and the journal read, both of which wait, and a first admission may not
+            // begin while this host owes a fence it could not raise, under a registration it has
+            // withdrawn or replaced, or after its deadline. The refusal is not retained, so the
+            // same action submitted again under a window that still stands is decided again. A
+            // retry of a completed action never reaches this, because the record above answered
+            // it. What this does not cover is the service's own lock and transaction, which each
+            // action takes inside the call below.
+            admission()?;
             // The action this mutation is performed under. The three methods whose idempotency is
             // their own identifier commit it beside the state they change, which is what makes a
             // crash between the mutation and its record impossible.
