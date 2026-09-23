@@ -33,6 +33,13 @@ public protocol VoiceCallObserver: AnyObject {
 /// account, the control socket — is outside it, which is what keeps the provider interface modular
 /// in §15 ¶1's sense: a different provider replaces the signalling around this object and replaces
 /// nothing inside it.
+///
+/// A call has two stages, and the microphone belongs only to the second. Building it makes the
+/// connection and a microphone track that is off, for the offer and the answer; no audio session
+/// is opened and nothing is captured. ``permit(voiceSessionId:closesAtEpochMs:)`` is given the
+/// host's answer to the start, and only then is the session opened and capture allowed. Whether
+/// the microphone is on is decided by one ``VoiceCaptureGate`` from the permit, the person's mute,
+/// what the system did and the route, and the call stops itself when its deadline comes.
 public final class VoiceCall: NSObject {
     /// Shared across calls, because building one is expensive and it holds the audio device.
     private static let factory: RTCPeerConnectionFactory = {
@@ -48,21 +55,26 @@ public final class VoiceCall: NSObject {
     private weak var observer: VoiceCallObserver?
     private var announcedFirstAudio = false
 
+    /// Held by every change to what the microphone and the speaker are allowed to do.
+    ///
+    /// Recursive, because opening or closing the audio session can report a route change on the
+    /// thread that is doing it, and that report takes this lock too.
+    private let lock = NSRecursiveLock()
+    private let gate = VoiceCaptureGate()
+    private var stopped = false
+    private var expiry: DispatchWorkItem?
+
     /// Whether the person has muted their own microphone.
-    public private(set) var isMutedByPerson = false
+    public var isMutedByPerson: Bool { gate.isMutedByPerson }
 
     /// Whether the remote voice is being played out of this device.
     public private(set) var isPlaybackMuted = false
 
-    /// Builds a call and opens the microphone.
+    /// Builds a call for its offer and its answer, with the microphone off.
     ///
-    /// The audio session is activated first and on the same path, so there is no window in which a
-    /// track exists and the session that governs it does not.
-    ///
-    /// - Throws: ``VoiceAudioError/microphoneNotPermitted`` when the microphone is not available.
+    /// No audio session is opened here: that waits for ``permit(voiceSessionId:closesAtEpochMs:)``,
+    /// so nothing but a call the host permitted can open the microphone.
     public init(observer: VoiceCallObserver) throws {
-        try AudioSession.shared.activate()
-
         let configuration = RTCConfiguration()
         // The provider's answer names its own candidates. No KalaReach STUN or TURN server is
         // configured here: media travels between this device and the provider, and a relay of
@@ -95,10 +107,68 @@ public final class VoiceCall: NSObject {
             optionalConstraints: nil
         ))
         microphone = VoiceCall.factory.audioTrack(with: source, trackId: "kr-voice-microphone")
+        // Off until the call is permitted. The offer describes a track, and a described track
+        // carries nothing until the gate lets it.
+        microphone.isEnabled = false
         self.observer = observer
         super.init()
         connection.delegate = self
         connection.add(microphone, streamIds: ["kr-voice"])
+    }
+
+    /// This device's monotonic clock, in milliseconds. The gate's deadlines are on it.
+    private static func nowMs() -> UInt64 { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
+
+    /// The furthest deadline a call is given, in milliseconds: a day.
+    private static let longestCallMs: UInt64 = 86_400_000
+
+    /// Opens the microphone for a call the host started.
+    ///
+    /// Takes the host's answer: the voice session and the moment the service closes the call, in
+    /// UTC milliseconds. The audio session is opened here and nowhere else, and the call stops
+    /// itself when that moment comes, whether or not anything else happened.
+    ///
+    /// - Returns: false, and nothing opened, when this call is stopped, already permitted or past
+    ///   its deadline.
+    /// - Throws: ``VoiceAudioError/microphoneNotPermitted`` when the microphone is not available.
+    public func permit(voiceSessionId: String, closesAtEpochMs: UInt64) throws -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !stopped, gate.current == nil else { return false }
+        let wall = UInt64(Date().timeIntervalSince1970 * 1_000)
+        guard closesAtEpochMs > wall else { return false }
+        let now = VoiceCall.nowMs()
+        // No call runs for a day. A deadline further away than that closes the call at a day, never
+        // later, and keeps the arithmetic below inside its type whatever the answer said.
+        let deadline = now + min(closesAtEpochMs - wall, VoiceCall.longestCallMs)
+        try AudioSession.shared.activate(for: self)
+        guard gate.permit(voiceSessionId: voiceSessionId, deadlineMs: deadline, nowMs: now) != nil else {
+            try? AudioSession.shared.deactivate()
+            return false
+        }
+        let ends = DispatchWorkItem { [weak self] in self?.stop() }
+        expiry = ends
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .milliseconds(Int(deadline - now)),
+            execute: ends
+        )
+        apply(now)
+        return true
+    }
+
+    /// Whether the microphone was carrying speech at `atMs` on this device's monotonic clock.
+    public func couldHaveHeard(atMs: UInt64) -> Bool { gate.couldHaveHeard(atMs: atMs) }
+
+    /// Makes the microphone and the speaker what the gate says, and publishes the one state.
+    /// Called with ``lock`` held after every change.
+    private func apply(_ now: UInt64) {
+        microphone.isEnabled = gate.captureEnabled(nowMs: now)
+        let shown = gate.displayed(nowMs: now)
+        let speaker = !isPlaybackMuted && shown != .interrupted
+        for receiver in connection.receivers {
+            (receiver.track as? RTCAudioTrack)?.isEnabled = speaker
+        }
+        AudioSession.shared.publish(shown)
     }
 
     /// Makes this call's SDP offer.
@@ -133,9 +203,11 @@ public final class VoiceCall: NSObject {
     /// available if the broker fails, so this touches the track and the audio session and nothing
     /// that could be waiting on a network answer.
     public func setMutedByPerson(_ muted: Bool) {
-        isMutedByPerson = muted
-        microphone.isEnabled = !muted
-        AudioSession.shared.setMutedByPerson(muted)
+        lock.lock()
+        defer { lock.unlock() }
+        let now = VoiceCall.nowMs()
+        gate.setMutedByPerson(muted, nowMs: now)
+        apply(now)
     }
 
     /// Stops the model's voice coming out of this device, without ending the call.
@@ -143,19 +215,58 @@ public final class VoiceCall: NSObject {
     /// This is **playback**, and §15 ¶13 is explicit that speech interruption stops playback and
     /// not a coding task. Nothing here cancels anything on a host.
     public func setPlaybackMuted(_ muted: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
         isPlaybackMuted = muted
-        for receiver in connection.receivers {
-            (receiver.track as? RTCAudioTrack)?.isEnabled = !muted
-        }
+        apply(VoiceCall.nowMs())
     }
 
     /// Ends the call and gives the microphone back.
     ///
     /// Local and immediate, for the same reason mute is.
     public func stop() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !stopped else { return }
+        stopped = true
+        gate.stop(nowMs: VoiceCall.nowMs())
+        expiry?.cancel()
+        expiry = nil
         microphone.isEnabled = false
         connection.close()
         try? AudioSession.shared.deactivate()
+    }
+}
+
+extension VoiceCall: AudioSessionEvents {
+    public func audioSessionInterruption(began: Bool, mayResume: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !stopped else { return }
+        let now = VoiceCall.nowMs()
+        // Began, or ended without the system's word to resume: the microphone stays closed. What
+        // the person chose, their own mute, is untouched either way and applies when it reopens.
+        let taken: VoiceCaptureGate.Taken = began ? .interrupted : (mayResume ? .none : .suspended)
+        gate.taken(taken, nowMs: now)
+        apply(now)
+    }
+
+    public func audioSessionRoute(changing: Bool, hasInput: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !stopped else { return }
+        let now = VoiceCall.nowMs()
+        gate.route(changing: changing, inputAvailable: hasInput, nowMs: now)
+        apply(now)
+    }
+
+    public func audioSessionReset() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !stopped else { return }
+        let now = VoiceCall.nowMs()
+        gate.taken(.suspended, nowMs: now)
+        apply(now)
     }
 }
 

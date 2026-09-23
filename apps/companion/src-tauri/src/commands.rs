@@ -492,7 +492,7 @@ pub async fn voice_start(
         )),
     };
 
-    let call = crate::audio::DesktopVoiceCall::with_duration_seconds(u64::from(duration_seconds))?;
+    let call = crate::audio::DesktopVoiceCall::new()?;
     let offer_sdp = call.offer().await?;
 
     let params = kr_protocol::voice::VoiceStartParams {
@@ -545,8 +545,13 @@ pub async fn voice_start(
     // Only a started call has an answer to apply. The other two outcomes are answers in their own
     // right: nothing was created, so there is nothing to hold.
     if let kr_protocol::voice::VoiceStartOutcome::Started { session } = &started.outcome {
-        call.set_closes_at_ms(session.closes_at_ms.get());
         call.accept(&session.answer_sdp).await?;
+        // The microphone opens for this answer's voice session, until this answer's deadline, and
+        // for nothing else.
+        call.permit(
+            &session.voice_session_id.to_string(),
+            session.closes_at_ms.get(),
+        )?;
         crate::audio::hold_call(call)?;
     }
     Ok(VoiceStarted {

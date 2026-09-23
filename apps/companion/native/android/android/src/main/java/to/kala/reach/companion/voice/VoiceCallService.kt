@@ -50,6 +50,14 @@ class VoiceCallService : android.app.Service() {
         /** The capture state carried by [ACTION_CAPTURE]. */
         const val EXTRA_CAPTURE = "capture"
 
+        /**
+         * The call an action is for.
+         *
+         * Every action names it, so one that arrives late, after its call ended and another
+         * started, reaches the call it was for or nothing.
+         */
+        const val EXTRA_CALL = "call"
+
         /** The notification this service is in the foreground with. */
         const val NOTIFICATION_ID = 0x4B56
 
@@ -60,8 +68,10 @@ class VoiceCallService : android.app.Service() {
          * the microphone opens for a call and at no other time.
          */
         @JvmStatic
-        fun start(context: Context) {
-            val intent = Intent(context, VoiceCallService::class.java).setAction(ACTION_START)
+        fun start(context: Context, call: Long) {
+            val intent = Intent(context, VoiceCallService::class.java)
+                .setAction(ACTION_START)
+                .putExtra(EXTRA_CALL, call)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
             } else {
@@ -71,9 +81,11 @@ class VoiceCallService : android.app.Service() {
 
         /** Ends a call's service. */
         @JvmStatic
-        fun stop(context: Context) {
+        fun stop(context: Context, call: Long) {
             context.startService(
-                Intent(context, VoiceCallService::class.java).setAction(ACTION_STOP),
+                Intent(context, VoiceCallService::class.java)
+                    .setAction(ACTION_STOP)
+                    .putExtra(EXTRA_CALL, call),
             )
         }
 
@@ -84,10 +96,11 @@ class VoiceCallService : android.app.Service() {
          * screen is locked the notification is the only one of the two a person can read.
          */
         @JvmStatic
-        fun publishCapture(context: Context, state: VoiceCaptureState) {
+        fun publishCapture(context: Context, call: Long, state: VoiceCaptureState) {
             context.startService(
                 Intent(context, VoiceCallService::class.java)
                     .setAction(ACTION_CAPTURE)
+                    .putExtra(EXTRA_CALL, call)
                     .putExtra(EXTRA_CAPTURE, state.name),
             )
         }
@@ -102,6 +115,9 @@ class VoiceCallService : android.app.Service() {
 
     private var running = false
 
+    /** The call this service was started for. Nothing else is its to stop or mute. */
+    private var call: Long = 0
+
     /**
      * Whether the person has muted their own microphone.
      *
@@ -109,21 +125,25 @@ class VoiceCallService : android.app.Service() {
      * time mute is pressed somewhere else.
      */
     private val muted: Boolean
-        get() = VoiceCallHolder.current?.isMutedByPerson == true
+        get() = VoiceCallHolder.current(call)?.isMutedByPerson == true
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val named = intent?.getLongExtra(EXTRA_CALL, 0) ?: 0
         when (intent?.action) {
             ACTION_STOP -> {
-                VoiceCallHolder.current?.stop()
+                // A stop for a call that is not this service's is a stop that arrived late, and
+                // the call running now is not what it was about.
+                if (running && named != call) return START_NOT_STICKY
+                VoiceCallHolder.current(named)?.stop()
                 stopCall()
                 return START_NOT_STICKY
             }
             ACTION_TOGGLE_MUTE -> {
-                val call = VoiceCallHolder.current
-                if (call != null) {
-                    call.setMutedByPerson(!call.isMutedByPerson)
+                val held = VoiceCallHolder.current(call)
+                if (held != null) {
+                    held.setMutedByPerson(!held.isMutedByPerson)
                 } else {
                     // No call owns this notification any more, so the microphone is not this
                     // service's to change and the notification should not suggest it is.
@@ -132,15 +152,24 @@ class VoiceCallService : android.app.Service() {
                 return START_NOT_STICKY
             }
             ACTION_CAPTURE -> {
-                val named = intent.getStringExtra(EXTRA_CAPTURE)
-                val state = VoiceCaptureState.entries.firstOrNull { it.name == named }
-                if (state != null && running) capture = state
+                val word = intent.getStringExtra(EXTRA_CAPTURE)
+                val state = VoiceCaptureState.entries.firstOrNull { it.name == word }
+                if (state != null && running && named == call) capture = state
                 return START_NOT_STICKY
             }
             ACTION_START -> {
+                call = named
+                // What the microphone is doing arrives from the call itself, straight after.
+                capture = VoiceCaptureState.IDLE
                 running = true
-                capture = VoiceCaptureState.CAPTURING
+                // Started as a foreground service, so it enters the foreground whatever it finds:
+                // the platform ends an application whose service stops before doing so.
                 startInForeground()
+                if (VoiceCallHolder.current(named) == null) {
+                    // Started for a call that ended in the meantime, so there is no microphone for
+                    // this service to keep.
+                    stopCall()
+                }
                 return START_NOT_STICKY
             }
             else -> {
@@ -159,9 +188,7 @@ class VoiceCallService : android.app.Service() {
         // service has been destroyed would be a call with no foreground service holding its
         // capture open, which is the state section 15 paragraph 22 asks to be shown rather than
         // silently carried.
-        VoiceCallHolder.current?.let { call ->
-            call.stop()
-        }
+        VoiceCallHolder.current(call)?.stop()
         super.onDestroy()
     }
 
@@ -230,7 +257,9 @@ class VoiceCallService : android.app.Service() {
         PendingIntent.getService(
             this,
             code,
-            Intent(this, VoiceCallService::class.java).setAction(action),
+            Intent(this, VoiceCallService::class.java)
+                .setAction(action)
+                .putExtra(EXTRA_CALL, call),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
 }

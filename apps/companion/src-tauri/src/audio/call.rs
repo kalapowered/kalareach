@@ -18,6 +18,7 @@ use webrtc::peer_connection::RTCSessionDescription;
 
 use crate::audio::buffer::PcmRingBuffer;
 use crate::audio::device::AudioDevice;
+use crate::audio::gate::CaptureGate;
 use crate::error::{CommandError, Result};
 
 /// How many provider events are held before the oldest is dropped.
@@ -30,9 +31,13 @@ pub const MAX_PENDING_PROVIDER_EVENTS: usize = 256;
 pub const MAX_PROVIDER_EVENT_BYTES: usize = 4096;
 
 /// A running desktop voice call.
+///
+/// Whether its microphone may carry speech is decided by one [`CaptureGate`]: nothing is captured
+/// until [`Self::permit`] binds the call to the host's answer, and capture ends at that answer's
+/// deadline whatever else happens. The call grants itself no deadline of its own.
 pub struct DesktopVoiceCall {
-    /// Whether the person has muted their own microphone locally.
-    is_muted_by_person: Arc<AtomicBool>,
+    /// Whether the microphone may carry speech, and the record of when it could.
+    gate: Arc<CaptureGate>,
     /// Whether the model's voice is silenced locally.
     is_playback_muted: Arc<AtomicBool>,
     /// The bounded PCM ring buffer for playback.
@@ -41,10 +46,8 @@ pub struct DesktopVoiceCall {
     audio_device: Arc<Mutex<AudioDevice>>,
     /// Milliseconds from answer acceptance to first received audio.
     first_audio_ms: Arc<AtomicU64>,
-    /// Time when the call was initiated.
+    /// Time when the call was initiated. The gate's clock counts from here.
     start_time: Instant,
-    /// Deadline in unix epoch milliseconds when this session expires.
-    closes_at_ms: Arc<AtomicU64>,
     /// Whether the call has been stopped.
     is_stopped: Arc<AtomicBool>,
     /// The local description a negotiated connection produced.
@@ -61,21 +64,12 @@ pub struct DesktopVoiceCall {
 }
 
 impl DesktopVoiceCall {
-    /// Creates a new desktop voice call with default 30-minute validity.
+    /// Creates a desktop voice call for its offer and its answer, with nothing captured.
     ///
     /// # Errors
     ///
     /// Returns an error if the underlying WebRTC or audio subsystem cannot be created.
     pub fn new() -> Result<Self> {
-        Self::with_duration_seconds(1800)
-    }
-
-    /// Creates a new desktop voice call with an explicit authorised duration.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the underlying WebRTC or audio subsystem cannot be created.
-    pub fn with_duration_seconds(duration_seconds: u64) -> Result<Self> {
         let render_ring = Arc::new(Mutex::new(PcmRingBuffer::new()));
 
         #[cfg(target_os = "macos")]
@@ -83,19 +77,13 @@ impl DesktopVoiceCall {
         #[cfg(not(target_os = "macos"))]
         let audio_device = Arc::new(Mutex::new(AudioDevice::new()));
 
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-
         Ok(Self {
-            is_muted_by_person: Arc::new(AtomicBool::new(false)),
+            gate: Arc::new(CaptureGate::default()),
             is_playback_muted: Arc::new(AtomicBool::new(false)),
             render_ring,
             audio_device,
             first_audio_ms: Arc::new(AtomicU64::new(0)),
             start_time: Instant::now(),
-            closes_at_ms: Arc::new(AtomicU64::new(now_ms + duration_seconds * 1000)),
             is_stopped: Arc::new(AtomicBool::new(false)),
             local_description: Mutex::new(None),
             answer_sdp: Mutex::new(None),
@@ -103,9 +91,81 @@ impl DesktopVoiceCall {
         })
     }
 
-    /// Sets the deadline in milliseconds when this call session closes.
-    pub fn set_closes_at_ms(&self, closes_at_ms: u64) {
-        self.closes_at_ms.store(closes_at_ms, Ordering::SeqCst);
+    /// This call's monotonic clock, in milliseconds from its start.
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.start_time.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Opens the microphone for a call the host started.
+    ///
+    /// Takes the host's answer: the voice session and the moment the service closes the call, in
+    /// UTC milliseconds. Only an answer that was applied can be permitted, and the platform device
+    /// starts here and nowhere else, so nothing but a call the host permitted can capture.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a stopped call, a call whose answer was not applied, an answer whose deadline has
+    /// passed and a second permit; returns the device's own refusal when it cannot start.
+    pub fn permit(&self, voice_session_id: &str, closes_at_epoch_ms: u64) -> Result<()> {
+        let mut device = self
+            .audio_device
+            .lock()
+            .map_err(|_| CommandError::local_failure("internal audio device lock poisoned"))?;
+        if self.is_stopped.load(Ordering::SeqCst) {
+            return Err(CommandError::refused("the call has already been stopped"));
+        }
+        let applied = self
+            .answer_sdp
+            .lock()
+            .map(|held| held.is_some())
+            .unwrap_or(false);
+        if !applied {
+            return Err(CommandError::refused(
+                "a call is permitted once its answer has been applied",
+            ));
+        }
+        let wall_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        if closes_at_epoch_ms <= wall_now {
+            return Err(CommandError::refused("the voice call session has expired"));
+        }
+        let now = self.now_ms();
+        let deadline = now.saturating_add(closes_at_epoch_ms - wall_now);
+        let permit = self
+            .gate
+            .permit(voice_session_id, deadline, now)
+            .ok_or_else(|| CommandError::refused("this call has already been permitted"))?;
+
+        // Captured audio goes nowhere unless the gate says the microphone may carry it now: after
+        // the deadline, while muted, or once the system takes the device, a frame is dropped here
+        // rather than trusted to a flag somewhere else.
+        let gate = Arc::clone(&self.gate);
+        let start = self.start_time;
+        let started = device.start(move |_captured_pcm| {
+            let now = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if gate.capture_enabled(now) {
+                // Media path forwards captured PCM frames to encoder.
+            }
+        });
+        if started.is_err() {
+            // A device that never started heard nothing, and the record must not say otherwise.
+            self.gate.revoke(permit.generation, self.now_ms());
+        }
+        started
+    }
+
+    /// What the microphone is doing now, in the words the surface draws.
+    #[must_use]
+    pub fn capture_state(&self) -> &'static str {
+        self.gate.displayed(self.now_ms())
+    }
+
+    /// Whether the microphone was carrying speech `at_ms` into this call.
+    #[must_use]
+    pub fn could_have_heard(&self, at_ms: u64) -> bool {
+        self.gate.could_have_heard(at_ms)
     }
 
     /// The offer this end would send to open a call.
@@ -134,12 +194,15 @@ impl DesktopVoiceCall {
 
     /// Applies the provider's SDP answer to establish the media path.
     ///
+    /// Capture does not start here: that is [`Self::permit`]'s, once the host's answer names the
+    /// voice session and its deadline.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the answer cannot be parsed or applied, if the session has expired,
-    /// or if the call has been stopped.
+    /// Returns an error if the answer cannot be parsed or applied, or if the call has been stopped.
     pub async fn accept(&self, answer_sdp: &str) -> Result<()> {
-        let mut device = self
+        // Held across the whole acceptance, so a stop cannot interleave with it.
+        let _device = self
             .audio_device
             .lock()
             .map_err(|_| CommandError::local_failure("internal audio device lock poisoned"))?;
@@ -148,18 +211,9 @@ impl DesktopVoiceCall {
             return Err(CommandError::refused("the call has already been stopped"));
         }
 
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let closes_at = self.closes_at_ms.load(Ordering::SeqCst);
-        if closes_at > 0 && now_ms >= closes_at {
-            return Err(CommandError::refused("the voice call session has expired"));
-        }
-
         // An answer answers a local description, and only a negotiated connection has one. The
-        // order matters: a stopped or expired call is refused for what it is, and only a call that
-        // could still carry audio is refused for having nothing to carry it on.
+        // order matters: a stopped call is refused for what it is, and only a call that could
+        // still carry audio is refused for having nothing to carry it on.
         let negotiated = self
             .local_description
             .lock()
@@ -174,23 +228,11 @@ impl DesktopVoiceCall {
         let _parsed = RTCSessionDescription::answer(answer_sdp.to_owned())
             .map_err(|error| CommandError::invalid(format!("invalid SDP answer: {error}")))?;
 
-        {
-            let mut lock = self
-                .answer_sdp
-                .lock()
-                .map_err(|_| CommandError::local_failure("internal state lock poisoned"))?;
-            *lock = Some(answer_sdp.to_owned());
-        }
-
-        // Start platform audio capture and playback. Calls device.start() unconditionally,
-        // which initiates VoiceProcessingIO on macOS and returns UNAVAILABLE on non-macOS.
-        let is_muted = Arc::clone(&self.is_muted_by_person);
-        device.start(move |_captured_pcm| {
-            if !is_muted.load(Ordering::Relaxed) {
-                // Media path forwards captured PCM frames to encoder.
-            }
-        })?;
-
+        let mut lock = self
+            .answer_sdp
+            .lock()
+            .map_err(|_| CommandError::local_failure("internal state lock poisoned"))?;
+        *lock = Some(answer_sdp.to_owned());
         Ok(())
     }
 
@@ -199,7 +241,7 @@ impl DesktopVoiceCall {
     /// Local and immediate. Section 15 paragraph 10 requires local microphone and speaker
     /// mute to remain available if the broker fails.
     pub fn set_muted_by_person(&self, muted: bool) {
-        self.is_muted_by_person.store(muted, Ordering::SeqCst);
+        self.gate.set_muted_by_person(muted, self.now_ms());
     }
 
     /// Stops the model's voice coming out of this device, without ending the call.
@@ -216,7 +258,7 @@ impl DesktopVoiceCall {
     /// Whether the person's microphone is muted.
     #[must_use]
     pub fn is_muted_by_person(&self) -> bool {
-        self.is_muted_by_person.load(Ordering::SeqCst)
+        self.gate.is_muted_by_person()
     }
 
     /// Whether playback is muted.
@@ -269,6 +311,7 @@ impl DesktopVoiceCall {
     ///
     /// Local and immediate. Serialised against acceptance so capture cannot start after closure.
     pub fn stop(&self) {
+        self.gate.stop(self.now_ms());
         if let Ok(mut device) = self.audio_device.lock() {
             if self.is_stopped.swap(true, Ordering::SeqCst) {
                 return;
@@ -378,15 +421,32 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn expired_call_acceptance_is_refused() {
+    /// KR-REQ-15.34: nothing is captured until the host's answer is applied and permitted, and a
+    /// call grants itself no deadline: the only deadline is the one the host's answer names.
+    #[test]
+    fn nothing_is_captured_until_the_host_permits_the_call() {
         let call = DesktopVoiceCall::new().expect("call creates");
-        call.set_closes_at_ms(1); // Expired timestamp
+        assert_eq!(call.capture_state(), "idle");
+        call.set_muted_by_person(false);
+        assert_eq!(call.capture_state(), "idle", "unmuting opens nothing");
 
-        let refusal = call.accept("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n").await.expect_err("an expired call refuses");
-        // Named, so this test fails if the deadline guard goes and another refusal covers for it.
+        let refusal = call
+            .permit("voice-session-1", u64::MAX)
+            .expect_err("an answer that was never applied permits nothing");
         assert!(
-            refusal.message.contains("expired"),
+            refusal.message.contains("once its answer has been applied"),
+            "refused for the wrong reason: {}",
+            refusal.message
+        );
+        assert_eq!(call.capture_state(), "idle");
+        assert!(!call.could_have_heard(0));
+
+        call.stop();
+        let refusal = call
+            .permit("voice-session-1", u64::MAX)
+            .expect_err("a stopped call permits nothing");
+        assert!(
+            refusal.message.contains("already been stopped"),
             "refused for the wrong reason: {}",
             refusal.message
         );

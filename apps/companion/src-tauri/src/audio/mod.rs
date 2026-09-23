@@ -19,6 +19,7 @@ pub mod ceremony;
 pub mod codec;
 pub mod control;
 pub mod device;
+pub mod gate;
 
 pub use buffer::PcmRingBuffer;
 pub use call::DesktopVoiceCall;
@@ -152,13 +153,10 @@ fn state_of(call: Option<&DesktopVoiceCall>) -> VoiceCallState {
     };
     VoiceCallState {
         running: true,
-        // The person's own mute is a separate thing from the call running: a muted microphone
-        // heard nothing, which is what the refusal of an unheard claim is built on.
-        capture: if call.is_muted_by_person() {
-            "muted_by_person"
-        } else {
-            "capturing"
-        },
+        // The call's own gate: nothing before the host permitted it, and the person's mute kept
+        // apart from the call running, because a muted microphone heard nothing, which is what the
+        // refusal of an unheard claim is built on.
+        capture: call.capture_state(),
         playing: !call.is_playback_muted(),
         first_audio_ms: call.first_audio_ms(),
         // A desktop call opens no control channel to the voice service.
@@ -218,7 +216,8 @@ mod tests {
 
         let running = state_of(Some(&call));
         assert!(running.running);
-        assert_eq!(running.capture, "capturing");
+        // Held, and not permitted by any host answer, so it captures nothing.
+        assert_eq!(running.capture, "idle");
         assert!(running.playing);
 
         call.set_muted_by_person(true);
@@ -226,7 +225,8 @@ mod tests {
         let silenced = state_of(Some(&call));
         // The person's own mute is not the call ending: it is still running, and it heard nothing.
         assert!(silenced.running);
-        assert_eq!(silenced.capture, "muted_by_person");
+        assert!(call.is_muted_by_person());
+        assert_eq!(silenced.capture, "idle");
         assert!(!silenced.playing);
 
         call.stop();
@@ -286,10 +286,15 @@ mod tests {
 
         hold_in(&mut holder, DesktopVoiceCall::new().expect("a call")).expect("a call");
         let muted = mute_in(&holder, Silence::Microphone, true).expect("the call is silenced");
-        assert_eq!(muted.capture, "muted_by_person");
+        // No host answer permitted this call, so there is nothing to capture either way.
+        assert_eq!(muted.capture, "idle");
         let playing = mute_in(&holder, Silence::Playback, true).expect("the speaker is silenced");
         assert!(!playing.playing);
         // Silencing the speaker left the microphone exactly as it was: they are two controls.
-        assert_eq!(playing.capture, "muted_by_person");
+        assert!(
+            holder
+                .as_ref()
+                .is_some_and(DesktopVoiceCall::is_muted_by_person)
+        );
     }
 }
