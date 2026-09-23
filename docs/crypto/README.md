@@ -328,8 +328,10 @@ A member's side of the record is `kr_client::sync::membership`. Before a member 
 record it checks the chain from the record it holds, the issuer against its hosts' reports, the
 signature, and its own wrap, opened against the issuer's stored-envelope key; for a new epoch the
 key must differ from every key it holds and every key it opened from an earlier record since it
-joined. The membership file it keeps holds records, which carry only public keys and wraps, and
-no key: what it compares keys by is each key's mark, the SHA-256 of the key under
+joined. No record may carry the key of a record the member sent since it joined that settled
+without applying, since a service could still have handed out that record's wraps. The membership
+file it keeps holds records, which carry only public keys and wraps, and no key: what it compares
+keys by, the withdrawn ones included, is each key's mark, the SHA-256 of the key under
 `kr-collection-key-mark/1`, and the key itself goes only to the device's secret store.
 
 ## Authority inside an envelope

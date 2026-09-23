@@ -318,7 +318,8 @@ paired and able to manage it, with the same stored-envelope key, and nothing it 
 host or a verified authority feed reports the issuer revoked (the issuer of the record that opened
 the epoch passes the same test); the signature verifies; and the key it opens is the one it
 already holds for that epoch, or, for a new epoch, one that differs from every key it holds and
-every key it opened from an earlier record since it joined.
+every key it opened from an earlier record since it joined. It never accepts a record carrying a
+key it withdrew: the key of a record it sent since it joined that never applied.
 
 Adding a device and joining a collection each widen who reads a person's settings, so each is a
 plan (`Plan`) the owner confirms: "share settings with *name*" on a member, with the recipient's
@@ -331,26 +332,34 @@ Removing a device gives the members that stay a freshly drawn key at the next ep
 device has no wrap of it. What it held already stays with it: a rotation takes nothing back, and
 no retroactive secrecy is claimed. A record that leaves this device out ends its membership, even
 when a later record lists it again: it forgets the collection's keys and reads the collection
-again only after the owner confirms a join on it.
+again only after the owner confirms a join on it. So does a service that answers the collection
+as absent, or with a chain this device cannot follow; that answer is recorded at once.
 
 Every record this device issues takes the next epoch and a freshly drawn key, an addition
 included. It wraps the key in use only for the devices its installed record lists, so a record
 that is sent and never applies, whose wraps a service could still hand out, carries no key anybody
 writes with. A new member reads the settings once a member seals them again under the new epoch.
 Records another member issues at an unchanged epoch, which only add members, are accepted as
-before.
+before. A service can still hand out the wraps of such a record, and another member could carry
+its key into a record of its own, so when a record this device sent settles without applying, the
+write that settles it withdraws its key: no record carrying that key is accepted, whoever issued
+it, and the device rotates away from one as from any record it refuses. The withdrawn keys last as
+long as the membership; a new join starts with none.
 
-The membership file keeps nine facts: the join record, the installed record, the head, the host
+The membership file keeps ten facts: the join record, the installed record, the head, the host
 answers, the pending removals, at most one pending addition, at most one candidate record with its
-request identity and dispatch mark, whether a join awaits the owner, and the outcomes not yet
-shown. `SyncMembership::step` runs one row of the reconciler at a time and makes at most one
+request identity and dispatch mark, the keys withdrawn since the join, whether a join awaits the
+owner, and the outcomes not yet shown. `SyncMembership::step` runs one row of the reconciler at a time and makes at most one
 durable write, so a restart resumes where the file says; the module documentation has the rows.
 Publication into the collection is open only while no removal is pending, no candidate stands, no
 join awaits the owner and the newest record this device has is the one it installed
 (`SyncMembership::publishes`). A candidate is sent once, after its dispatch mark is written; an
 answer that is lost is settled by the request's status and then its fence, and where the service
-no longer holds the receipt, by the record after the candidate's base. A change is reported done
-only at a head fetched after the change was recorded.
+no longer holds the receipt, by the record after the candidate's base. A dispatched candidate
+leaves the file only through that settlement. A device that is out still settles it first, by
+status and fence, sending nothing and moving no head, and only then forgets the collection's keys;
+a join or a new collection waits for both, so nothing it sent can still run in the membership that
+follows. A change is reported done only at a head fetched after the change was recorded.
 
 The file is replaced whole: written to a temporary name, flushed, renamed over the old one, and on
 Unix the directory entry is flushed too. On Windows nothing flushes the directory entry, so after a
@@ -370,11 +379,11 @@ Two limits are stated rather than closed:
   hand the key, or the settings themselves, to a removed device.
 
 The reconciler's exhaustive test runs a bounded model of its world over the reconciler itself: every
-reachable
-combination of the file's facts under the owner's changes, other members' records (a faulty one
-among them), host and feed revocations, lost requests and answers, expired receipts and crashes,
-with every state checked against the invariants and every state settling once events stop. Its
-eight configurations run with
+reachable combination of the file's facts under the owner's changes, other members' records (a
+faulty one among them, which may carry the key of any record this device sent), host and feed
+revocations, lost requests and answers, expired receipts, a service that answers as if the
+collection were gone, and crashes, with every state checked against the invariants and every state
+settling once events stop. Its nine configurations run with
 `cargo test --release -p kr-client --lib membership::exhaustive -- --ignored`; the two smallest,
 and one run for each rule the test can weaken, run with the rest of the suite.
 
