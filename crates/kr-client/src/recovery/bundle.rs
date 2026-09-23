@@ -26,12 +26,12 @@
 //! What a direct consumer still owes is an answer for a write it never heard back about. Every
 //! write carries a fresh identity and the instant the call was made, nothing is retried on its own,
 //! and a lost answer is reported as an unknown outcome ([`LostWrite`]). The store keeps a record of
-//! the last write it sent, and the record holds what settling that write takes and nothing more:
-//! the place it compared against, the identity and the instant it went out under, and the digest
-//! of the encrypted bundle it sent. It is on this device's disk before the write leaves and stays
-//! until the next write replaces it, so a process that ends with the write unanswered leaves it for
-//! the next store to take up; it never holds the bundle, its ciphertext or a key. Two things settle
-//! it:
+//! the last write it sent, and the record holds what settling and recognising that write take and
+//! nothing more: where the bundle is, the place the write compared against, the identity and the
+//! instant it went out under, the digest of the encrypted bundle it sent, and what is known of
+//! what became of it. It is on this device's disk before the write leaves and stays until the next
+//! write replaces it, so a process that ends with the write unanswered leaves it for the next store
+//! to take up; it never holds the bundle, its ciphertext or a key. Two things settle it:
 //!
 //! * **A read that recognises the write.** When the bytes at the locator are the very bytes this
 //!   device sent, whose digest says so, that write applied and cannot apply again, because a
@@ -551,7 +551,9 @@ impl BundleStore {
     /// Returns [`RecoveryError::BundleConflict`] when the service refused the comparison because
     /// another device wrote first, [`RecoveryError::BundleOutcomeUnknown`] when the answer never
     /// came back, [`RecoveryError::BundleWriteUnsettled`] when a previous write is still
-    /// outstanding, and [`RecoveryError::BundleNotAWrite`], [`RecoveryError::BundleWentBack`],
+    /// outstanding, [`RecoveryError::Storage`] or [`RecoveryError::UnreadableWriteRecord`] when the
+    /// record of the write cannot be written, in which case nothing is sent, and
+    /// [`RecoveryError::BundleNotAWrite`], [`RecoveryError::BundleWentBack`],
     /// [`RecoveryError::BundleDidNotMoveOn`] or [`RecoveryError::BundleHistoryForked`] for a
     /// position this device cannot read.
     pub async fn commit(

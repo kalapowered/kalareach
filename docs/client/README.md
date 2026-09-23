@@ -592,15 +592,15 @@ device sent and an owner is shown a retained artefact rather than told it does n
 
 **The bundle is key material, and it settles itself by reading.** Section 20 says what it holds:
 collection locators, trusted backup-writer signing public keys and generation checkpoints. None of
-that is session content, so it is not one of the content-bearing outboxes privacy mode fences, and
-a write of it is not cancelled or deleted when privacy mode is enabled: a deleted bundle is a
-restore that cannot verify an archive the owner still holds. The settings-sync outbox keeps a full
-account of every request it dispatches, content included, because its work is session content under
-a privacy generation; the bundle needs none of that. It writes directly and reads to find out what
+that is session content, so it is not one of the content-bearing outboxes privacy mode fences, and a
+write of it is not cancelled or deleted when privacy mode is enabled: a deleted bundle is a restore
+that cannot verify an archive the owner still holds. The settings-sync outbox keeps a full account
+of every request it dispatches, content included, because its work is session content under a
+privacy generation; the bundle needs none of that. It writes directly and reads to find out what
 happened. What the store keeps is one record of the last write it sent, and the record holds only
-what settling that write takes: the place it compared against, the identity and instant it went out
-under, and the digest of the encrypted bundle it sent. It never holds the bundle, its ciphertext or
-a key.
+what settling and recognising that write take: where the bundle is, the place the write compared
+against, the identity and instant it went out under, the digest of the encrypted bundle it sent, and
+what is known of what became of it. It never holds the bundle, its ciphertext or a key.
 
 Each write carries an identity of its own and the instant of the call, which is what the service
 signs with and measures freshness against. Nothing is ever resent on its own, so each attempt is
