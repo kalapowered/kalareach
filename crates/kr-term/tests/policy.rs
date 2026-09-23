@@ -40,6 +40,8 @@ fn leased_engine() -> Engine {
     engine
 }
 
+/// KR-REQ-08.38: the default destination of a side effect is the attachment holding the input
+/// lease, at its epoch, and nothing of it is forwarded to anyone else.
 #[test]
 fn a_bell_goes_to_the_lease_holder_and_nowhere_else() {
     let mut engine = leased_engine();
@@ -55,6 +57,8 @@ fn a_bell_goes_to_the_lease_holder_and_nowhere_else() {
     assert!(outcome.forward.is_empty(), "the bell byte stops here");
 }
 
+/// KR-REQ-08.38: with no lease there is no destination, and the side effect becomes a host event
+/// rather than a broadcast.
 #[test]
 fn a_side_effect_without_a_lease_becomes_a_host_event() {
     let mut engine = Engine::new(EngineConfig::default()).expect("engine");
@@ -72,6 +76,8 @@ fn a_side_effect_without_a_lease_becomes_a_host_event() {
     );
 }
 
+/// KR-REQ-08.06: a clipboard write is decoded and routed to one named attachment, never forwarded
+/// in the output stream.
 #[test]
 fn a_clipboard_write_is_decoded_and_routed_to_one_destination() {
     let mut engine = leased_engine();
@@ -165,6 +171,8 @@ fn a_policy_that_allows_reads_routes_them_to_the_lease_holder() {
     );
 }
 
+/// KR-REQ-08.06: the host policy decides whether a side effect is delivered at all, and a refusal
+/// is reported rather than delivered somewhere else.
 #[test]
 fn a_denying_policy_refuses_the_write_and_says_so() {
     let policy = Policy {
@@ -267,7 +275,8 @@ fn notifications_and_progress_are_recognised_by_subcommand() {
     }
 }
 
-/// The reducer cannot apply a sequence policy rejected, even when handed one directly.
+/// KR-REQ-08.08: the reducer cannot apply a sequence policy rejected, even when handed one
+/// directly.
 #[test]
 fn the_reducer_refuses_what_policy_refused() {
     let policy = Policy::DEFAULT;
@@ -285,6 +294,62 @@ fn the_reducer_refuses_what_policy_refused() {
         assert!(
             kr_term::adapter::adapt(event, context).actions.is_empty(),
             "the adapter produces no action for {event:?}"
+        );
+    }
+}
+
+/// KR-REQ-08.08: what direct mode forwards is cut from the parser's own spans.
+///
+/// The bytes the engine hands on are exactly the bytes of the events policy forwarded, in order.
+/// Each input here is one a second reading could frame differently: an escape that abandons a
+/// title rather than doubling inside it, a raw string terminator inside a title's payload, and a
+/// sequence split across two reads. The framing that decides what reaches a terminal counts
+/// offsets; it never decides for itself where a control family begins or ends.
+#[test]
+fn what_is_forwarded_is_cut_from_the_parsers_own_spans() {
+    let inputs: [&[&[u8]]; 3] = [
+        &[b"\x1b]2;x\x1b\x1b]52;c;c2VjcmV0\x07after"],
+        &[b"\x1b]0;a\x9cb\x07text"],
+        &[b"a\x1b[1;3", b"1mb\x1b[6n\x07\x1b[?1049h\x1b_Gf=1;A\x1b\\c"],
+    ];
+    for reads in inputs {
+        let whole: Vec<u8> = reads.concat();
+
+        // What the one parse and the policy decided, read straight from the events.
+        let policy = Policy::DEFAULT;
+        let mut lexer = Lexer::new();
+        let mut events = Vec::new();
+        for read in reads {
+            lexer.feed(read, &mut events);
+        }
+        lexer.close(&mut events);
+        let decided: Vec<u8> = events
+            .iter()
+            .filter(|event| policy.decide(event).disposition == DirectDisposition::Forward)
+            .flat_map(|event| event.raw().to_vec())
+            .collect();
+
+        // What the engine forwards, read back from the offsets it hands on.
+        let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+        let mut spans = Vec::new();
+        for read in reads {
+            spans.extend(engine.feed(read, 0).forward);
+        }
+        spans.extend(engine.close(0).forward);
+        let forwarded: Vec<u8> = spans
+            .iter()
+            .flat_map(|span| {
+                let start = usize::try_from(span.start()).expect("a small offset");
+                let end = usize::try_from(span.end()).expect("a small offset");
+                whole[start..end].to_vec()
+            })
+            .collect();
+
+        assert_eq!(
+            forwarded,
+            decided,
+            "{}: the forwarded bytes are the forwarded events' own bytes",
+            String::from_utf8_lossy(&whole).escape_debug()
         );
     }
 }
@@ -307,6 +372,54 @@ fn malformed_input_requires_projection() {
     );
     // The good text on either side is still forwardable.
     assert!(!outcome.forward.is_empty());
+}
+
+/// KR-REQ-08.47: a batch direct mode cannot carry moves the attachment to projection at the safe
+/// cursor before it, the malformed text is drawn as U+FFFD with a diagnostic out of band, and none
+/// of the rejected bytes is forwarded.
+#[test]
+fn a_batch_direct_mode_cannot_carry_is_projected_with_replacement_characters() {
+    let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+    // A surrogate, which is never valid UTF-8, between two runs of good text.
+    let input = b"ok\xed\xa0\x80more";
+    let outcome = engine.feed(input, 0);
+    let settled = engine.quiesce(0);
+
+    assert_eq!(
+        outcome.projection_required_at,
+        Some(2),
+        "projection starts at the safe cursor before the malformed bytes"
+    );
+    assert!(
+        outcome
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == DiagnosticKind::MalformedUtf8),
+        "the replacement is reported out of band"
+    );
+    for span in outcome.forward.iter().chain(settled.forward.iter()) {
+        assert!(
+            span.end() <= 2 || span.start() >= 5,
+            "a forwarded span reaches into the malformed bytes: {span:?}"
+        );
+    }
+
+    // The canonical grid, which is what a projected attachment is drawn from, holds U+FFFD where
+    // the malformed bytes were and the good text on either side of them.
+    let first: String = engine.grid().visible_rows()[0]
+        .runs
+        .iter()
+        .map(|run| run.text.as_str())
+        .collect();
+    let first = first.trim_end();
+    let between = first
+        .strip_prefix("ok")
+        .and_then(|rest| rest.strip_suffix("more"))
+        .unwrap_or_else(|| panic!("the good text is kept around the replacement: {first:?}"));
+    assert!(
+        !between.is_empty() && between.chars().all(|c| c == '\u{fffd}'),
+        "the malformed bytes are drawn as U+FFFD: {first:?}"
+    );
 }
 
 /// No malformed byte ever reaches a physical terminal as an unclassified introducer.
@@ -414,7 +527,8 @@ fn the_title_stack_is_virtualised_and_bounded() {
     assert!(engine.titles().depth() <= kr_term::title::MAX_DEPTH);
 }
 
-/// Diagnostics are rate limited, and the suppressed count travels with the next one through.
+/// KR-REQ-08.09: diagnostics are an out-of-band status stream, rate limited, with every occurrence
+/// still counted.
 #[test]
 fn diagnostics_are_rate_limited_but_counted() {
     let mut engine = Engine::new(EngineConfig::default()).expect("engine");
@@ -438,7 +552,8 @@ fn diagnostics_are_rate_limited_but_counted() {
     assert_eq!(total, 500, "every occurrence is still counted");
 }
 
-/// Nothing the engine produces is ever written into the application's output stream.
+/// KR-REQ-08.09: nothing the engine produces is ever written into the application's output
+/// stream or painted into the grid; diagnostics travel out of band.
 #[test]
 fn diagnostics_never_touch_the_output_stream() {
     let mut engine = Engine::new(EngineConfig::default()).expect("engine");

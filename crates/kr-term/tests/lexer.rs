@@ -6,7 +6,7 @@
 
 use kr_term::class::SequenceClass;
 use kr_term::event::{
-    DirectDisposition, DiscardCause, Event, EventKind, ReplacementCause, SequenceFamily,
+    CsiParam, DirectDisposition, DiscardCause, Event, EventKind, ReplacementCause, SequenceFamily,
 };
 use kr_term::lexer::{LexLimits, Lexer, undouble_escapes};
 
@@ -65,6 +65,68 @@ fn spans_cover(input: &[u8], events: &[Event]) {
         next = event.span.end();
     }
     assert_eq!(next, input.len() as u64, "spans do not cover the input");
+}
+
+/// KR-REQ-08.07: one lexical pass gives every event the original bytes at the span they occupy,
+/// its parsed parameters, its class and whether the parser stands on ground after it.
+///
+/// The policy layer and the grid reducer take these events as they are; nothing downstream reads
+/// the bytes a second time, so this pass is the only place a sequence is framed.
+#[test]
+fn one_pass_keeps_each_events_bytes_parameters_class_and_ground() {
+    let input: &[u8] = b"a\x1b[1;31mb\x1b[6n\x07\x1b]0;t\x1b\\\x1b[?2027h";
+    let events = lex(input);
+
+    // The bytes: the spans tile the input, and every event holds exactly the bytes at its span.
+    spans_cover(input, &events);
+    for event in &events {
+        let start = usize::try_from(event.span.start()).expect("a small offset");
+        let end = usize::try_from(event.span.end()).expect("a small offset");
+        assert_eq!(event.raw(), &input[start..end], "{event:?}");
+    }
+
+    // The class of every event, from the section 8 table: text and a rendition are display, a
+    // cursor report request is a query, the bell a side effect, the title a mode, and a set of
+    // mode 2027 an extension.
+    assert_eq!(classes(&events), "DDDQSMX");
+
+    // The parameters, parsed once and kept in source order with their punctuation.
+    let EventKind::Csi {
+        params, final_byte, ..
+    } = &events[1].kind
+    else {
+        panic!("the second event is the rendition: {:?}", events[1]);
+    };
+    assert_eq!(*final_byte, b'm');
+    assert_eq!(
+        params,
+        &vec![
+            CsiParam::Integer(1),
+            CsiParam::Punct(b';'),
+            CsiParam::Integer(31)
+        ]
+    );
+
+    // Ground: a complete event leaves the parser on ground.
+    assert!(events.iter().all(|event| event.ground_after));
+
+    // A read that ends inside the rendition leaves the parser off ground, and the rest of it
+    // arriving produces the same events with the same spans, not a second framing of them.
+    let mut lexer = Lexer::new();
+    let mut split = Vec::new();
+    lexer.feed(&input[..5], &mut split);
+    assert!(!lexer.at_ground(), "a read that stops inside a sequence");
+    lexer.feed(&input[5..], &mut split);
+    lexer.close(&mut split);
+    let framing = |events: &[Event]| -> Vec<(u64, u64, char)> {
+        events
+            .iter()
+            .filter(|event| !matches!(event.kind, EventKind::Text { .. }))
+            .map(|event| (event.span.start(), event.span.end(), event.class.letter()))
+            .collect()
+    };
+    assert_eq!(framing(&split), framing(&events));
+    assert_eq!(text(&split), text(&events));
 }
 
 #[test]
@@ -243,6 +305,8 @@ fn malformed_utf8_becomes_one_replacement_per_subpart() {
     }
 }
 
+/// KR-REQ-08.13: a control string past its bound is discarded whole at its own terminator, and
+/// nothing of it is forwarded.
 #[test]
 fn an_oversized_control_string_is_discarded_whole() {
     let mut input = b"\x1b]0;".to_vec();
@@ -260,7 +324,7 @@ fn an_oversized_control_string_is_discarded_whole() {
     assert_eq!(events[0].disposition, DirectDisposition::Withhold);
 }
 
-/// The suffix of an oversized payload never executes as a fresh control sequence.
+/// KR-REQ-08.13: the suffix of an oversized payload never executes as a fresh control sequence.
 #[test]
 fn an_oversized_payload_suffix_does_not_execute() {
     let mut input = b"\x1b]0;".to_vec();
@@ -279,6 +343,8 @@ fn an_oversized_payload_suffix_does_not_execute() {
     assert_eq!(text(&events), b"after");
 }
 
+/// KR-REQ-08.13: the clipboard write has its own 1 MiB bound, and past it the string is discarded
+/// like any other.
 #[test]
 fn osc52_has_its_own_larger_bound() {
     // 200 KiB is over the 64 KiB control-string bound but under the 1 MiB OSC 52 bound.
@@ -295,6 +361,8 @@ fn osc52_has_its_own_larger_bound() {
     assert_eq!(classes(&events), "X", "past its own bound it is discarded");
 }
 
+/// KR-REQ-08.13: an oversized string that has not ended is held in constant memory, resynchronises
+/// only at its own terminator, and never executes a sequence buried in its payload.
 #[test]
 fn an_unterminated_oversized_string_never_executes_its_payload() {
     let limits = LexLimits {

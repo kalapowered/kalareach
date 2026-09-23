@@ -193,7 +193,7 @@ fn enquiry_is_consumed_and_answered_with_silence() {
     assert_eq!(outcome.responses, 0, "kr-vt/1 has no answerback string");
 }
 
-/// A query flood is bounded three ways and says so out of band.
+/// KR-REQ-08.50: a query flood is bounded three ways, says so out of band, and forwards nothing.
 #[test]
 fn a_query_flood_degrades_instead_of_allocating() {
     let mut engine = engine();
@@ -227,7 +227,7 @@ fn a_query_flood_degrades_instead_of_allocating() {
     );
 }
 
-/// Human input is never starved: the lane hands over only what the caller asked for.
+/// KR-REQ-08.50: human input is never starved; the lane hands over only what the caller asked for.
 #[test]
 fn the_lane_respects_the_callers_byte_budget() {
     let mut engine = engine();
@@ -257,7 +257,8 @@ fn the_lane_respects_the_callers_byte_budget() {
     assert!(engine.lane().pending() > 0, "the rest is still waiting");
 }
 
-/// A reply never lands inside an unfinished paste or a half-delivered human input frame.
+/// KR-REQ-08.48: a reply never lands inside an unfinished paste or a half-delivered human input
+/// frame, unless the backend is qualified to take it inside a paste.
 #[test]
 fn a_reply_waits_for_the_session_loop() {
     let mut engine = engine();
@@ -284,7 +285,7 @@ fn a_reply_waits_for_the_session_loop() {
     assert_eq!(engine.lane_mut().drain(qualified, 4096, 0).len(), 1);
 }
 
-/// Replies are not history. Nothing pending survives a reconnection.
+/// KR-REQ-08.50: replies are not history, and nothing pending survives a reconnection.
 #[test]
 fn undelivered_replies_are_not_replayed_after_a_reset() {
     let mut engine = engine();
@@ -300,7 +301,8 @@ fn undelivered_replies_are_not_replayed_after_a_reset() {
     );
 }
 
-/// A reply that waited past its deadline is dropped rather than written.
+/// KR-REQ-08.49: a deferred reply shares the lane's bounded deadline, and one that waited past it
+/// is dropped rather than written.
 #[test]
 fn a_stale_reply_is_dropped_rather_than_written() {
     let mut engine = engine();
@@ -313,7 +315,8 @@ fn a_stale_reply_is_dropped_rather_than_written() {
     assert!(engine.lane().degradation().expired > 0);
 }
 
-/// The budget refills over time rather than granting one burst for the life of the session.
+/// KR-REQ-08.50: the burst budget refills over time rather than granting one burst for the life of
+/// the session.
 #[test]
 fn the_reply_budget_refills() {
     let mut engine = Engine::new(EngineConfig {
@@ -332,7 +335,49 @@ fn the_reply_budget_refills() {
     assert_eq!(outcome.responses, 1, "a quarter second buys one more");
 }
 
-/// Two answers about different subjects are never collapsed into each other.
+/// KR-REQ-08.50: the lane holds replies to the profile's bounds: a qualified response size, a
+/// 128 KiB queue and a burst of 256 replies a second. A reply past its size bound is refused and
+/// reported rather than queued, and a burst past the budget degrades rather than growing.
+#[test]
+fn the_lane_holds_its_replies_to_the_profiles_bounds() {
+    assert_eq!(LaneLimits::DEFAULT.max_queue_bytes, 128 * 1024);
+    assert_eq!(LaneLimits::DEFAULT.responses_per_second, 256);
+    assert!(LaneLimits::DEFAULT.max_response_bytes <= LaneLimits::DEFAULT.max_queue_bytes);
+
+    // A thousand cursor reports at one instant, which the lane never coalesces: the burst is
+    // answered and the rest is over budget, reported rather than queued.
+    let mut engine = engine();
+    let outcome = engine.feed(&b"\x1b[6n".repeat(1_000), 0);
+    assert_eq!(outcome.responses, 256, "the burst is 256 replies");
+    assert_eq!(outcome.degradation.over_budget, 1_000 - 256);
+    assert!(outcome.degradation.is_degraded());
+    assert!(engine.lane().queued_bytes() <= LaneLimits::DEFAULT.max_queue_bytes);
+    assert!(outcome.forward.is_empty(), "no query is forwarded instead");
+
+    // A reply larger than the qualified response size is never queued.
+    let mut bounded = Engine::new(EngineConfig {
+        lane: LaneLimits {
+            max_response_bytes: 4,
+            ..LaneLimits::DEFAULT
+        },
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    let outcome = bounded.feed(b"\x1b[c", 0);
+    assert_eq!(outcome.responses, 0);
+    assert_eq!(outcome.degradation.oversized, 1);
+    assert!(
+        outcome
+            .diagnostics
+            .iter()
+            .any(|d| d.kind == kr_term::diag::DiagnosticKind::ResponseLaneDegraded),
+        "the refusal is reported out of band"
+    );
+    assert_eq!(bounded.lane().pending(), 0);
+}
+
+/// KR-REQ-08.50: coalescing under a full queue never collapses two answers about different
+/// subjects into each other.
 #[test]
 fn coalescing_keeps_different_subjects_apart() {
     let mut engine = Engine::new(EngineConfig {
