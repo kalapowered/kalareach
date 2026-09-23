@@ -43,6 +43,8 @@ fn every_valid_fixture_validates() {
     }
 }
 
+/// KR-REQ-23.53: a package whose action declares an effect outside the closed vocabulary, or
+/// whose control names an action its manifest does not register, is refused with that finding.
 #[test]
 fn every_invalid_fixture_produces_exactly_its_expected_findings() {
     let cases = directories(&fixtures_root().join("invalid"));

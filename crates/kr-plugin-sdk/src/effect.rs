@@ -738,6 +738,8 @@ mod tests {
         );
     }
 
+    /// KR-REQ-23.53: an effect outside the closed vocabulary has no meaning; its wire name
+    /// resolves to nothing.
     #[test]
     fn an_unknown_effect_class_has_no_meaning() {
         assert_eq!(EffectClass::from_wire("shell.exec"), None);

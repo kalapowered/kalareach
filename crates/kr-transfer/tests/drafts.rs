@@ -52,6 +52,8 @@ fn draft(harness: &Harness) -> kr_protocol::transfer::DraftRecord {
 
 /// KR-REQ-23.41: a draft carries its owner, its revision and its environment, and every update
 /// names the revision it expects.
+/// KR-REQ-06.08: a draft update is bound to the exact draft revision: one naming another revision
+/// is refused, the current one advances it, and the revision it moved past is refused afterwards.
 #[test]
 fn a_draft_carries_its_owner_revision_and_environment() {
     let harness = Harness::create();
@@ -91,6 +93,21 @@ fn a_draft_carries_its_owner_revision_and_environment() {
         .draft;
     assert_eq!(updated.revision, DraftRevision::new(2));
     assert_eq!(updated.text, "changed");
+
+    // The revision the update was made at is now stale in its turn.
+    let superseded = harness
+        .service
+        .draft_update(
+            &harness.actor,
+            &DraftUpdateParams {
+                draft_id: created.draft_id,
+                expected_revision: created.revision,
+                text: "changed again".to_owned(),
+            },
+            None,
+        )
+        .expect_err("refuses the revision it has moved past");
+    assert_eq!(superseded.code(), ErrorCode::DraftConflict);
 
     // Another principal's draft and an identifier that names nothing are refused the same way, so
     // the refusal is never a signal that something with that identifier exists.

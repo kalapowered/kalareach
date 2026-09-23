@@ -847,6 +847,8 @@ fn the_next_deadline_is_the_earliest_timer_the_host_has_to_wake_for() {
 
 // ----- Application notices -----------------------------------------------------------------
 
+/// KR-REQ-06.05: text an application prints is never an approval request: a notice that reads
+/// like one stays an untrusted notice and raises no pending approval.
 #[test]
 fn an_application_notice_is_untrusted_and_is_never_a_pending_approval() {
     let mut attention = engine();

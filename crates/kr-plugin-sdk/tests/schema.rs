@@ -112,6 +112,8 @@ fn the_contract_table_carries_the_limits_and_the_vocabularies() {
     assert_eq!(ceiling.len(), 3);
 }
 
+/// KR-REQ-23.53: every effect class in the generated plugin contract names the rights it needs,
+/// and a mutating one needs at least one.
 #[test]
 fn every_effect_class_in_the_contract_names_its_rights() {
     let (_, text) = generated_files()
