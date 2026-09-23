@@ -14,8 +14,10 @@
 //! another window while a second window watches: the session, its shell and its agent go on
 //! running, and the watching window stays attached. The first terminal attaches again and is drawn
 //! the screen as it is rather than the history that made it, and the session ends when its shell
-//! exits. The other two tests are the other ways a session ends: end of input, a crash, and
-//! `kr close` with its grace period and drain. Nothing that ends is started again.
+//! exits. The other tests are the other ways a session ends: end of input, a crash, and `kr close`
+//! with its grace period and drain. Every attachment is sent how its session closed and ends with
+//! the status that implies, one attachment or two, and an attachment whose connection is lost
+//! without a closure still ends as a lost connection. Nothing that ends is started again.
 //!
 //! The daemon runs in this test's process, as it does in the host suites, and starts each worker as
 //! a detached process of its own, which is how a host without a service manager starts one. The
@@ -141,6 +143,32 @@ const RECORD_ALLOWANCE: Duration = Duration::from_secs(1);
 /// What a terminal that implements both keyboard protocols answers `kr`'s capability queries with,
 /// ending with the device attributes that close the exchange.
 const PROBE_ANSWER: &[u8] = b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c";
+
+/// The status an attachment ends with when its session closed cleanly: its shell exited with
+/// status 0, or somebody closed it.
+const CLEAN: i32 = 0;
+
+/// The status an attachment ends with when its session closed any other way: the general failure.
+const NOT_CLEAN: i32 = 1;
+
+/// The status an attachment ends with when its connection ended without a closure.
+const CONNECTION_LOST: i32 = 3;
+
+/// What an attachment says when its session's shell exited with `status`.
+fn exited_with(status: u64) -> Vec<u8> {
+    format!("the session closed: its shell exited with status {status}").into_bytes()
+}
+
+/// What an attachment says when a signal ended its session's shell, named as the record names it.
+fn ended_by(signal: &str) -> Vec<u8> {
+    format!("the session closed: a signal ended its shell ({signal})").into_bytes()
+}
+
+/// What an attachment says when its session was closed on request.
+const CLOSED_ON_REQUEST: &[u8] = b"the session closed: it was closed on request";
+
+/// What an attachment says when its connection ended without a closure.
+const CONNECTION_ENDED: &[u8] = b"the connection to the session ended";
 
 fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
@@ -1143,6 +1171,27 @@ impl Window {
         })
     }
 
+    /// Waits for the attachment in this window to end after `mark`, and requires the status it
+    /// ended with and the line it said.
+    ///
+    /// `marker` is what the window's shell prints before the status of the `kr` it ran.
+    fn attachment_ended(&self, mark: usize, marker: &str, status: i32, said: &[u8], what: &str) {
+        let ended = self.exit_status_after(mark, marker, what);
+        let shown = self.screen.since(mark);
+        assert_eq!(
+            ended,
+            status,
+            "{what}: the attachment ended with status {ended}, not {status}: {}",
+            String::from_utf8_lossy(&shown).escape_debug()
+        );
+        assert!(
+            contains(&shown, said),
+            "{what}: the attachment said {:?}: {}",
+            String::from_utf8_lossy(said),
+            String::from_utf8_lossy(&shown).escape_debug()
+        );
+    }
+
     /// Answers the next capability exchange `kr` starts on this terminal after `mark`.
     fn answer_capability_queries(&self, mark: usize) -> std::thread::JoinHandle<()> {
         let screen = self.screen.clone();
@@ -1220,6 +1269,27 @@ fn answered(queries: std::thread::JoinHandle<()>) {
             .unwrap_or("the thread answering the terminal's queries failed");
         panic!("{detail}");
     }
+}
+
+/// Opens a window that watches a session and never types, and waits until it has been drawn the
+/// session's screen, which it can only be once it is subscribed.
+///
+/// Its shell prints `watch-finished-` and the status `kr attach` ended with.
+fn watcher(host: &Host, display: &str) -> Window {
+    let window = Window::open(
+        host,
+        &format!(
+            "{kr} attach --no-probe {display}; printf '\\nwatch-%s-%s\\n' finished \"$?\"; \
+             IFS= read -r _",
+            kr = quoted(&kr()),
+        ),
+    );
+    window.wait_for(
+        0,
+        PROMPT.as_bytes(),
+        "the watching window was drawn the session's screen",
+    );
+    window
 }
 
 /// Polls until `found` has an answer, and fails with how long it waited when it never does.
@@ -1315,6 +1385,35 @@ fn worker_exit_status(worker: &ProcessStartIdentity) -> i32 {
             status.terminating_signal()
         )
     })
+}
+
+/// Collects the status of a worker this test killed, and requires that the kill is what ended it.
+fn worker_killed(worker: &ProcessStartIdentity) {
+    let pid = rustix::process::Pid::from_raw(
+        i32::try_from(worker.pid.get()).expect("a process identifier"),
+    )
+    .expect("a process identifier");
+    let status = until("the killed worker to be collected", || {
+        rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG)
+            .expect("the worker is this process's child")
+            .map(|(_, status)| status)
+    });
+    assert_eq!(
+        status.terminating_signal(),
+        Some(libc::SIGKILL),
+        "the worker was ended by the kill: {status:?}"
+    );
+}
+
+/// Kills a process this test knows by the identity the kernel gave it.
+fn kill(identity: &ProcessStartIdentity, what: &str) {
+    assert!(running(identity), "{what} is running before it is killed");
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(identity.pid.get()).expect("an identifier"))
+            .expect("an identifier"),
+        rustix::process::Signal::KILL,
+    )
+    .unwrap_or_else(|error| panic!("kills {what}: {error}"));
 }
 
 /// Whether `haystack` shows `prefix` followed by exactly `number`.
@@ -1710,15 +1809,21 @@ fn a_session_made_by_kr_new_carries_a_question_outlives_its_terminal_and_ends_wi
         0,
         "the worker ended with its session, and ended cleanly"
     );
-    // Both windows still attached are let go, and each gets its terminal back.
-    first.wait_for(
+    // KR-REQ-07.52: both windows still attached are told how the session closed, and each ends with
+    // the status that implies and says so. A shell that exited with status 7 failed, so each ends
+    // with the general failure rather than as a lost connection. Each gets its terminal back.
+    first.attachment_ended(
         ending,
-        b"attach-finished-",
+        "attach-finished-",
+        NOT_CLEAN,
+        &exited_with(7),
         "the reattached window's attachment ended with the session",
     );
-    second.wait_for(
+    second.attachment_ended(
         watched,
-        b"watch-finished-",
+        "watch-finished-",
+        NOT_CLEAN,
+        &exited_with(7),
         "the watching window's attachment ended with the session",
     );
     ended(&reattach, "the reattached window's kr attach");
@@ -1783,10 +1888,12 @@ fn end_of_input_and_a_crash_each_close_their_session_and_neither_is_restarted() 
     assert_eq!(closed["closure"]["exit_code"], 0);
     ended(&root, "the shell that read the end of its input");
     assert_eq!(worker_exit_status(&worker), 0);
-    first.wait_for(
+    first.attachment_ended(
         typing,
-        b"new-finished-",
-        "the attachment ended with the session",
+        "new-finished-",
+        CLEAN,
+        &exited_with(0),
+        "the attachment ended with the session its shell ended cleanly",
     );
     first.wait_until_put_back("the terminal came back when the session closed");
 
@@ -1812,20 +1919,148 @@ fn end_of_input_and_a_crash_each_close_their_session_and_neither_is_restarted() 
     .expect("kills the shell");
     let closed = host.wait_until_closed(&crashed.to_string());
     assert_eq!(closed["closure"]["reason"], "root_signal");
-    assert!(
-        closed["closure"]["signal"].is_string(),
-        "the closure names the signal that ended the shell: {closed}"
-    );
+    let signal = closed["closure"]["signal"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the closure names the signal that ended the shell: {closed}"));
     assert_eq!(worker_exit_status(&worker), 0);
-    second.wait_for(
+    second.attachment_ended(
         crashing,
-        b"new-finished-",
-        "the attachment ended with the session",
+        "new-finished-",
+        NOT_CLEAN,
+        &ended_by(signal),
+        "the attachment ended with the session its shell crashed out of",
     );
     second.wait_until_put_back("the terminal came back when the session closed");
 
     // Neither is started again.
     host.nothing_restarts(&[ended_by_input, crashed]);
+}
+
+/// KR-REQ-07.52: however the shell ends, by its own exit, the end of its input or a crash, every
+/// attachment is sent how the session closed and ends with the status that implies, whether the
+/// session has one attachment or two; and nothing is started again.
+#[test]
+fn each_way_a_shell_ends_reaches_one_attachment_or_two_with_the_status_it_implies() {
+    let host = Host::start();
+
+    // Its own exit, seen by the one terminal that made the session. The shell's status is in what
+    // the attachment says, and the attachment ends with the general failure: 3 is the status a lost
+    // connection ends with, and a shell's own status never stands in for one of the command's.
+    let (alone, exited) = host.create_in_window("IFS= read -r _");
+    let exiting = alone.mark();
+    alone.type_text(b"exit 3\r");
+    let closed = host.wait_until_closed(&exited.session_id.to_string());
+    assert_eq!(closed["closure"]["reason"], "root_exit");
+    assert_eq!(closed["closure"]["exit_code"], 3);
+    alone.attachment_ended(
+        exiting,
+        "new-finished-",
+        NOT_CLEAN,
+        &exited_with(3),
+        "the only attachment of a session whose shell exited with status 3",
+    );
+    alone.wait_until_put_back("the terminal came back when the session closed");
+    ended(&exited.root, "the shell that exited");
+    assert_eq!(worker_exit_status(&exited.worker), 0);
+
+    // The end of its input, seen by two: the terminal that made the session, where Ctrl-D is typed,
+    // and one that only watches. A shell that read the end of its input after a command that
+    // succeeded exits with status 0, which is a clean end for both.
+    let (typing, input) = host.create_in_window("IFS= read -r _");
+    let watching = watcher(&host, &input.display);
+    let (typed, watched) = (typing.mark(), watching.mark());
+    typing.type_text(b"\x04");
+    let closed = host.wait_until_closed(&input.session_id.to_string());
+    assert_eq!(closed["closure"]["reason"], "root_exit");
+    assert_eq!(closed["closure"]["exit_code"], 0);
+    for (window, mark, marker, what) in [
+        (
+            &typing,
+            typed,
+            "new-finished-",
+            "the terminal the end of input was typed into",
+        ),
+        (
+            &watching,
+            watched,
+            "watch-finished-",
+            "the terminal that watched",
+        ),
+    ] {
+        window.attachment_ended(mark, marker, CLEAN, &exited_with(0), what);
+        window.wait_until_put_back(what);
+    }
+    ended(&input.root, "the shell that read the end of its input");
+    assert_eq!(worker_exit_status(&input.worker), 0);
+
+    // A crash, seen by two: the shell is killed outright while both terminals are attached.
+    let (making, crash) = host.create_in_window("IFS= read -r _");
+    let onlooker = watcher(&host, &crash.display);
+    let (made, looked) = (making.mark(), onlooker.mark());
+    kill(&crash.root, "the shell");
+    let closed = host.wait_until_closed(&crash.session_id.to_string());
+    assert_eq!(closed["closure"]["reason"], "root_signal");
+    let signal = closed["closure"]["signal"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the closure names the signal that ended the shell: {closed}"));
+    for (window, mark, marker, what) in [
+        (
+            &making,
+            made,
+            "new-finished-",
+            "the terminal that made the crashed session",
+        ),
+        (
+            &onlooker,
+            looked,
+            "watch-finished-",
+            "the terminal that watched it",
+        ),
+    ] {
+        window.attachment_ended(mark, marker, NOT_CLEAN, &ended_by(signal), what);
+        window.wait_until_put_back(what);
+    }
+    assert_eq!(worker_exit_status(&crash.worker), 0);
+
+    host.nothing_restarts(&[exited.session_id, input.session_id, crash.session_id]);
+}
+
+/// A connection that ends without a closure is still a lost connection: when a worker is killed
+/// outright it tells nobody anything, and each attachment ends with the status that says its
+/// connection was lost. The host records the closure the worker could not, and nothing is started
+/// again.
+#[test]
+fn a_connection_lost_without_a_closure_still_ends_each_attachment_as_a_lost_connection() {
+    let host = Host::start();
+    let (making, created) = host.create_in_window("IFS= read -r _");
+    let onlooker = watcher(&host, &created.display);
+    let (made, looked) = (making.mark(), onlooker.mark());
+    kill(&created.worker, "the worker");
+    for (window, mark, marker, what) in [
+        (
+            &making,
+            made,
+            "new-finished-",
+            "the terminal that made the session",
+        ),
+        (
+            &onlooker,
+            looked,
+            "watch-finished-",
+            "the terminal that watched it",
+        ),
+    ] {
+        window.attachment_ended(mark, marker, CONNECTION_LOST, CONNECTION_ENDED, what);
+        window.wait_until_put_back(what);
+    }
+    worker_killed(&created.worker);
+    let closed = host.wait_until_closed(&created.session_id.to_string());
+    assert_eq!(
+        closed["closure"]["reason"], "worker_crash",
+        "the host recorded how the session ended, since its worker could not: {closed}"
+    );
+    ended(&created.root, "the shell of the worker that was killed");
+    host.nothing_restarts(&[created.session_id]);
 }
 
 /// One explicit close of a new session, watched from before the request.
@@ -1895,20 +2130,19 @@ fn close_explicitly(host: &Host) -> (SessionId, Result<(), String>) {
     assert_eq!(accepted["durability"], "durable");
 
     // KR-REQ-07.53: from then on input is refused. The shell is still running and reading, and this
-    // line would create a file if it reached it. The attachment that carries it is told the session
-    // has closed, and ends the way a detach does rather than the way a lost connection does.
+    // line would create a file if it reached it. The attachment that carries it is refused it, stays
+    // until the closure arrives, and ends with the status the closure implies, saying that what was
+    // typed went nowhere.
     let typed_while_attached = running(&kr_new);
     window.type_text(b"touch typed-while-closing\r");
     let status = host.kr_json(&["status", &display]);
     let status_read = Instant::now();
-    // Looked for from before the close: the attachment cannot end before it, and one that ended
-    // before the line was typed has already said so.
+    // Looked for from before the close: the attachment cannot end before it.
     let attachment_exit = window.exit_status_after(
         before_close,
         "new-finished-",
         "the attachment the line was typed into to end",
     );
-    let attachment_ended = Instant::now();
     let seen = watch.finish();
     let (shell_seen, job_seen) = (seen[0], seen[1]);
     assert_ne!(
@@ -1923,14 +2157,33 @@ fn close_explicitly(host: &Host) -> (SessionId, Result<(), String>) {
     } else {
         missed.push("the shell was not seen running once the status had been read".to_owned());
     }
-    if typed_while_attached && shell_seen.running >= attachment_ended {
-        assert_eq!(
-            attachment_exit, 0,
-            "the attachment was told the session refused its input while the shell still ran"
+    // A close somebody asked for is a clean end, so the attachment ends successfully, and says how
+    // the session closed.
+    let told = window.screen.since(before_close);
+    assert_eq!(
+        attachment_exit,
+        CLEAN,
+        "the attachment the line was typed into ended with the closure's own status: {}",
+        String::from_utf8_lossy(&told).escape_debug()
+    );
+    assert!(
+        contains(&told, CLOSED_ON_REQUEST),
+        "and said the session was closed on request: {}",
+        String::from_utf8_lossy(&told).escape_debug()
+    );
+    if typed_while_attached && shell_seen.running >= status_read {
+        assert!(
+            contains(
+                &told,
+                b"what was typed while it was closing was not delivered"
+            ),
+            "the attachment was refused the line while the shell still ran, and said so: {}",
+            String::from_utf8_lossy(&told).escape_debug()
         );
     } else {
         missed.push(
-            "the line was not typed, or the attachment not seen to end, while the shell ran"
+            "the line was not typed while the attachment was there, or the shell was not seen \
+             running after it"
                 .to_owned(),
         );
     }
@@ -2022,10 +2275,13 @@ fn close_explicitly(host: &Host) -> (SessionId, Result<(), String>) {
     }
 
     // What the job wrote while it was being stopped reached the window still attached, and so did
-    // the last number it had published, which it had written to the terminal first.
-    watching.wait_for(
+    // the last number it had published, which it had written to the terminal first. Then the
+    // closure did, and the window ended with its status.
+    watching.attachment_ended(
         0,
-        b"watch-finished-",
+        "watch-finished-",
+        CLEAN,
+        CLOSED_ON_REQUEST,
         "the watching window's attachment ended with the session",
     );
     let last_tick: u64 = std::fs::read_to_string(host.work.join("last-tick"))

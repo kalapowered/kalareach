@@ -209,6 +209,13 @@ async fn run(cli: Cli) -> Result<Completion> {
                 typed_while_asking,
             )
             .await;
+            // A presentation that failed never began an attachment. One that began is presented,
+            // however the attachment then ended, and how it ended is reported the way `kr attach`
+            // reports it.
+            let (presentation_error, outcome) = match presented {
+                Ok(outcome) => (None, outcome),
+                Err(error) => (Some(error), None),
+            };
             if cli.json {
                 let mut document = report::session(&created.session);
                 if let Some(object) = document.as_object_mut() {
@@ -218,15 +225,34 @@ async fn run(cli: Cli) -> Result<Completion> {
                     );
                     object.insert(
                         "presentation_error".to_owned(),
-                        match presented.as_ref() {
-                            Ok(()) => serde_json::Value::Null,
-                            Err(error) => serde_json::json!(error.to_string()),
-                        },
+                        presentation_error
+                            .as_ref()
+                            .map_or(serde_json::Value::Null, |error| {
+                                serde_json::json!(error.to_string())
+                            }),
                     );
                     object.insert(
                         "execution_context_chosen".to_owned(),
                         serde_json::json!(arguments.execution.chosen().is_some()),
                     );
+                    object.insert(
+                        "outcome".to_owned(),
+                        outcome.as_ref().map_or(serde_json::Value::Null, |outcome| {
+                            serde_json::json!(outcome.detail())
+                        }),
+                    );
+                    // An attachment that ended with the session's closure has its record, so the
+                    // document describes the session as this command leaves it.
+                    if let Some(record) = outcome
+                        .as_ref()
+                        .and_then(kr_cli::session::AttachOutcome::closure)
+                    {
+                        object.insert(
+                            "state".to_owned(),
+                            serde_json::json!(kr_protocol::session::SessionState::Closed.as_str()),
+                        );
+                        object.insert("closure".to_owned(), report::closure(record));
+                    }
                 }
                 print_json(&document);
             } else {
@@ -258,11 +284,20 @@ async fn run(cli: Cli) -> Result<Completion> {
                         created.session.shell_path
                     ),
                 }
-                if let Err(error) = presented.as_ref() {
+                if let Some(error) = presentation_error.as_ref() {
                     eprintln!("kr: the session was created; its terminal was not opened: {error}");
                 }
+                if let Some(outcome) = outcome.as_ref() {
+                    println!("{}", outcome.detail());
+                }
             }
-            Ok(presented.map_or_else(Completion::Reported, |()| Completion::Done))
+            Ok(match (presentation_error, outcome) {
+                (Some(error), _) => Completion::Reported(error),
+                (None, Some(outcome)) => outcome
+                    .into_error()
+                    .map_or(Completion::Done, Completion::Reported),
+                (None, None) => Completion::Done,
+            })
         }
         Command::Attach(arguments) => {
             let selector = SessionSelector::parse(&arguments.session)?;
@@ -286,6 +321,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                     "ok": !outcome.is_failure(),
                     "session_id": session_id.to_string(),
                     "outcome": outcome.detail(),
+                    "closure": outcome.closure().map(report::closure),
                 }));
             } else {
                 println!("{}", outcome.detail());
@@ -970,16 +1006,17 @@ fn describe_terminals(
 /// Presents a session that has just been created.
 ///
 /// A failure here never creates a second session: the session exists, and what could not be done
-/// is opening a window on it.
+/// is opening a window on it. An attachment that began returns how it ended, which is not a failure
+/// to present even when it is a failure of its own.
 async fn present(
     paths: &HostPaths,
     created: &SessionCreateResult,
     presentation: Presentation,
     owed: kr_cli::session::UndeliveredTyping,
     typed_before: Vec<u8>,
-) -> Result<()> {
+) -> Result<Option<kr_cli::session::AttachOutcome>> {
     match presentation {
-        Presentation::Invisible => Ok(()),
+        Presentation::Invisible => Ok(None),
         Presentation::Attach => {
             let selector = SessionSelector::Identifier(created.session.session_id);
             let (_, descriptor) = find(paths, &selector, Some(created.session.environment_id))?;
@@ -1000,7 +1037,7 @@ async fn present(
                 },
             )
             .await?;
-            outcome.into_error().map_or(Ok(()), Err)
+            Ok(Some(outcome))
         }
         Presentation::Terminal => {
             // Nothing here forwards input, so anything the person typed while the terminal was
@@ -1012,9 +1049,12 @@ async fn present(
             // The window is the host's to open: a session created on a paired device can ask for a
             // local tab too, and the daemon is the only party on this host that can open one. What
             // this command does with the answer is report it against the session that exists.
-            created.presentation_error.as_ref().map_or(Ok(()), |error| {
-                Err(CliError::TerminalUnavailable(error.message.clone()))
-            })
+            created
+                .presentation_error
+                .as_ref()
+                .map_or(Ok(None), |error| {
+                    Err(CliError::TerminalUnavailable(error.message.clone()))
+                })
         }
     }
 }

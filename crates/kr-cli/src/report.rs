@@ -13,7 +13,7 @@ use kr_protocol::desktop::{
     SleepInhibitionState,
 };
 use kr_protocol::hostinfo::HostInfoResult;
-use kr_protocol::session::{SessionState, SessionSummary};
+use kr_protocol::session::{ClosureRecord, SessionState, SessionSummary};
 use serde_json::{Value, json};
 
 use crate::error::CliError;
@@ -57,20 +57,26 @@ pub fn session(summary: &SessionSummary) -> Value {
             "login_generation": summary.desktop.login_generation.as_ref().map(|value| value.get()),
         },
         "created_at_ms": summary.created_at_ms.get(),
-        "closure": summary.closure.as_ref().map(|closure| json!({
-            "reason": closure.reason.as_str(),
-            "exit_code": closure.root_exit_code.as_ref().map(|code| code.get()),
-            "signal": closure.root_signal.as_ref().cloned(),
-            "ownership_coverage": match closure.ownership_coverage {
-                kr_protocol::session::OwnershipCoverage::Complete => "complete",
-                kr_protocol::session::OwnershipCoverage::Incomplete => "incomplete",
-            },
-            "durability": match closure.durability {
-                kr_protocol::session::Durability::Durable => "durable",
-                kr_protocol::session::Durability::Volatile => "volatile",
-            },
-            "closed_at_ms": closure.closed_at_ms.get(),
-        })),
+        "closure": summary.closure.as_ref().map(closure),
+    })
+}
+
+/// Renders a session's closure record.
+#[must_use]
+pub fn closure(record: &ClosureRecord) -> Value {
+    json!({
+        "reason": record.reason.as_str(),
+        "exit_code": record.root_exit_code.as_ref().map(|code| code.get()),
+        "signal": record.root_signal.as_ref().cloned(),
+        "ownership_coverage": match record.ownership_coverage {
+            kr_protocol::session::OwnershipCoverage::Complete => "complete",
+            kr_protocol::session::OwnershipCoverage::Incomplete => "incomplete",
+        },
+        "durability": match record.durability {
+            kr_protocol::session::Durability::Durable => "durable",
+            kr_protocol::session::Durability::Volatile => "volatile",
+        },
+        "closed_at_ms": record.closed_at_ms.get(),
     })
 }
 

@@ -40,6 +40,12 @@ pub enum CliError {
     /// The host refused the request.
     #[error("{0}")]
     Refused(kr_protocol::error::ProtocolError),
+    /// The attached session closed, and not cleanly: its shell failed or something ended it.
+    ///
+    /// The attachment itself did what it was for, so this is no refusal and no lost host. It is
+    /// the general failure, and the sentence carries what the closure record says.
+    #[error("{0}")]
+    SessionClosed(String),
     /// Local IPC failed.
     #[error("{0}")]
     Ipc(#[from] kr_ipc::IpcError),
@@ -62,7 +68,7 @@ impl CliError {
             Self::TerminalUnavailable(_) => 7,
             Self::Refused(_) => 8,
             Self::Ipc(_) => 3,
-            Self::Other(_) => 1,
+            Self::SessionClosed(_) | Self::Other(_) => 1,
         }
     }
 
@@ -101,6 +107,9 @@ impl CliError {
                 .as_str()
                 .to_owned(),
             Self::Refused(error) => error.code.as_str().to_owned(),
+            Self::SessionClosed(_) => kr_protocol::error::ErrorCode::SessionClosed
+                .as_str()
+                .to_owned(),
             Self::Other(_) => kr_protocol::error::ErrorCode::ResourceUnavailable
                 .as_str()
                 .to_owned(),

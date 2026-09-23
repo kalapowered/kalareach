@@ -15,7 +15,7 @@ use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{InputLeaseEpoch, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, U64};
-use kr_protocol::session::Dimensions;
+use kr_protocol::session::{ClosureReason, ClosureRecord, Dimensions, SESSION_CLOSED_EVENT};
 use kr_protocol::worker::WorkerDescriptor;
 
 use crate::attach::{Attachment, RestorationGuard};
@@ -27,8 +27,21 @@ use crate::terminal::ControllingTerminal;
 pub enum AttachOutcome {
     /// The terminal's own input ended, or the user detached.
     Detached,
-    /// The session closed while this terminal was attached.
-    SessionClosed,
+    /// The session closed while this terminal was attached, and its worker said how.
+    Closed {
+        /// The session's closure record, as its worker sent it.
+        record: Box<ClosureRecord>,
+        /// Whether something typed here was not delivered because the session was closing.
+        undelivered: bool,
+    },
+    /// The session closed while this terminal was attached, and how it closed did not reach it.
+    ///
+    /// The session said it was closing, by refusing this terminal's input, and then its connection
+    /// ended without the closure; or the closure arrived in a form this build cannot read.
+    SessionClosed {
+        /// Whether something typed here was not delivered because the session was closing.
+        undelivered: bool,
+    },
     /// The input lease moved to somebody else.
     LeaseLost,
     /// The connection to the worker ended.
@@ -37,13 +50,27 @@ pub enum AttachOutcome {
     DeliveryUncertain(String),
 }
 
+/// What the line about a closure adds when the session refused something typed here.
+const UNDELIVERED: &str = "; what was typed while it was closing was not delivered";
+
 impl AttachOutcome {
     /// Returns the sentence a person is shown.
     #[must_use]
     pub fn detail(&self) -> String {
         match self {
             Self::Detached => "detached".to_owned(),
-            Self::SessionClosed => "the session closed".to_owned(),
+            Self::Closed {
+                record,
+                undelivered,
+            } => format!(
+                "the session closed: {}{}",
+                how_it_closed(record),
+                if *undelivered { UNDELIVERED } else { "" }
+            ),
+            Self::SessionClosed { undelivered } => format!(
+                "the session closed{}",
+                if *undelivered { UNDELIVERED } else { "" }
+            ),
             Self::LeaseLost => "another attachment took the input lease".to_owned(),
             Self::Disconnected => "the connection to the session ended".to_owned(),
             Self::DeliveryUncertain(detail) => {
@@ -52,11 +79,23 @@ impl AttachOutcome {
         }
     }
 
-    /// Returns whether this outcome is a failure the exit code must carry.
+    /// Returns the closure record this attachment was sent, when it was sent one.
     #[must_use]
-    pub const fn is_failure(&self) -> bool {
+    pub fn closure(&self) -> Option<&ClosureRecord> {
         match self {
-            Self::Detached | Self::SessionClosed => false,
+            Self::Closed { record, .. } => Some(record.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// Returns whether this outcome is a failure the exit code must carry.
+    ///
+    /// A closure is one when it was not clean: see [`closed_cleanly`].
+    #[must_use]
+    pub fn is_failure(&self) -> bool {
+        match self {
+            Self::Detached | Self::SessionClosed { .. } => false,
+            Self::Closed { record, .. } => !closed_cleanly(record),
             Self::LeaseLost | Self::Disconnected | Self::DeliveryUncertain(_) => true,
         }
     }
@@ -65,7 +104,10 @@ impl AttachOutcome {
     #[must_use]
     pub fn into_error(self) -> Option<CliError> {
         match self {
-            Self::Detached | Self::SessionClosed => None,
+            Self::Detached | Self::SessionClosed { .. } => None,
+            Self::Closed { ref record, .. } => {
+                (!closed_cleanly(record)).then(|| CliError::SessionClosed(self.detail()))
+            }
             Self::LeaseLost => Some(CliError::Refused(kr_protocol::error::ProtocolError::new(
                 ErrorCode::LeaseLost,
                 self.detail(),
@@ -75,6 +117,47 @@ impl AttachOutcome {
                 kr_protocol::error::ProtocolError::new(ErrorCode::OutcomeUnknown, self.detail()),
             )),
         }
+    }
+}
+
+/// Whether a session closed the way the person meant it to.
+///
+/// Two closures are clean: a shell that exited with status 0, which is what `exit` and the end of
+/// its input are when the last command succeeded, and a close somebody asked for. An attachment
+/// ends successfully for those. Every other closure is a shell that failed or was ended by
+/// something outside it, and an attachment reports it as the failure it is.
+#[must_use]
+pub fn closed_cleanly(record: &ClosureRecord) -> bool {
+    match record.reason {
+        ClosureReason::CloseRequested => true,
+        ClosureReason::RootExit => record
+            .root_exit_code
+            .as_ref()
+            .is_some_and(|code| code.get() == 0),
+        ClosureReason::RootSignal
+        | ClosureReason::RootLaunchFailed
+        | ClosureReason::WorkerCrash
+        | ClosureReason::DesktopLost
+        | ClosureReason::HostShutdown => false,
+    }
+}
+
+/// Says how a session closed, in the words a person is shown.
+fn how_it_closed(record: &ClosureRecord) -> String {
+    match record.reason {
+        ClosureReason::RootExit => record.root_exit_code.as_ref().map_or_else(
+            || "its shell exited".to_owned(),
+            |code| format!("its shell exited with status {}", code.get()),
+        ),
+        ClosureReason::RootSignal => record.root_signal.as_ref().map_or_else(
+            || "a signal ended its shell".to_owned(),
+            |signal| format!("a signal ended its shell ({signal})"),
+        ),
+        ClosureReason::CloseRequested => "it was closed on request".to_owned(),
+        ClosureReason::RootLaunchFailed => "its shell never became ready".to_owned(),
+        ClosureReason::WorkerCrash => "its worker ended before it finished closing".to_owned(),
+        ClosureReason::DesktopLost => "the desktop login it ran in ended".to_owned(),
+        ClosureReason::HostShutdown => "its host shut down".to_owned(),
     }
 }
 
@@ -752,6 +835,16 @@ async fn drive(
     // screen the session had something new to say from one it asked for itself.
     let mut drawn_at: Option<u64> = None;
 
+    // Whether the session has said it is closing, by refusing something this terminal sent. From
+    // then on nothing more is sent: the session refuses input from the moment its closing began,
+    // and a size or a fresh screen is of no use to a session that is ending. The terminal stays,
+    // showing what the session drains, until the closure arrives as the last thing on its stream,
+    // so it ends with that closure's own status rather than a guess made halfway through it. The
+    // worker bounds how long that is, as it does for every attachment that is only watching.
+    let mut closing = false;
+    // Whether something typed here was not delivered because the session was closing.
+    let mut undelivered = false;
+
     // What the person typed while the host was asking the terminal what it was. It was buffered
     // rather than discarded, and it is the first thing the application receives, in the order it
     // was typed in.
@@ -795,6 +888,10 @@ async fn drive(
                 // person's, and it goes to the application now.
                 pointer_deadline = None;
                 let held = pointers.release();
+                if closing {
+                    undelivered |= !held.is_empty();
+                    continue;
+                }
                 if !held.is_empty() {
                     // Typing brings a following window back to the live screen, wherever in this
                     // loop the typing turns out to have been.
@@ -857,6 +954,20 @@ async fn drive(
             message = client.recv() => {
                 match message {
                     Ok(ControlFrame::Notification(notification)) => {
+                        // The session has closed, and this is how. It is the last thing the stream
+                        // carries, after every byte this terminal was owed, and it ends the
+                        // attachment with the status the closure implies.
+                        if notification.event_type.as_str() == SESSION_CLOSED_EVENT {
+                            return match notification.payload.to_typed::<ClosureRecord>() {
+                                Ok(record) => AttachOutcome::Closed {
+                                    record: Box::new(record),
+                                    undelivered,
+                                },
+                                // A closure this build cannot read is still the end of the
+                                // session, and it is not a lost connection.
+                                Err(_) => AttachOutcome::SessionClosed { undelivered },
+                            };
+                        }
                         if notification.event_type.as_str() == "session.output"
                             && let Ok(event) = notification
                                 .payload
@@ -891,6 +1002,9 @@ async fn drive(
                                 // at. What is held goes with it, because the next thing drawn has
                                 // to be a screen this terminal was actually sent.
                                 display.discard();
+                                if closing {
+                                    continue;
+                                }
                                 let request_id = kr_protocol::ids::RequestId::new(next_request);
                                 next_request += 1;
                                 if !resubscribe(client, descriptor, request_id, attachment_id).await
@@ -938,6 +1052,7 @@ async fn drive(
                             if follow_live
                                 && changed
                                 && parked.is_some()
+                                && !closing
                                 && let Ok(size) = terminal.size()
                                 && size.columns > 0
                                 && size.rows > 0
@@ -980,7 +1095,7 @@ async fn drive(
                                 }
                                 let _ = handle.flush();
                             }
-                            if drawn.resubscribe {
+                            if drawn.resubscribe && !closing {
                                 let request_id = kr_protocol::ids::RequestId::new(next_request);
                                 next_request += 1;
                                 if !resubscribe(client, descriptor, request_id, attachment_id).await
@@ -1001,6 +1116,9 @@ async fn drive(
                             // It is discarded before the fresh one is asked for, so nothing is
                             // drawn from it in between.
                             display.discard();
+                            if closing {
+                                continue;
+                            }
                             let request_id = kr_protocol::ids::RequestId::new(next_request);
                             next_request += 1;
                             if !resubscribe(client, descriptor, request_id, attachment_id).await {
@@ -1022,6 +1140,11 @@ async fn drive(
                         // Only this request's own record: an older answer must not forget what a
                         // newer request is still waiting to be told.
                         requested.remove(&answered);
+                        // A session that is closing has nothing more to say to this terminal in an
+                        // answer, and nothing an answer would have it send is of use any more.
+                        if closing {
+                            continue;
+                        }
                         match (what, response.outcome) {
                             // A size report is a report, not an insistence. Another attachment may
                             // own the size, and the answer then says so; the terminal is shown that
@@ -1151,16 +1274,21 @@ async fn drive(
                             (
                                 Outstanding::Input(sent),
                                 kr_protocol::envelope::Outcome::Error(error),
-                            ) => {
-                                return match error.code {
-                                    ErrorCode::LeaseLost => AttachOutcome::LeaseLost,
-                                    ErrorCode::SessionClosed => AttachOutcome::SessionClosed,
-                                    code => AttachOutcome::DeliveryUncertain(format!(
+                            ) => match error.code {
+                                ErrorCode::LeaseLost => return AttachOutcome::LeaseLost,
+                                // The session is closing, and refuses input from the moment it
+                                // began. This terminal stops sending and waits for the closure.
+                                ErrorCode::SessionClosed => {
+                                    closing = true;
+                                    undelivered = true;
+                                }
+                                code => {
+                                    return AttachOutcome::DeliveryUncertain(format!(
                                         "{code} at input {sent}: {}",
                                         error.message
-                                    )),
-                                };
-                            }
+                                    ));
+                                }
+                            },
                             (Outstanding::Input(_), kr_protocol::envelope::Outcome::Ok(_)) => {}
                             // A scroll-back report answers with the row the window actually
                             // landed on, which is not always the one it asked for: a row the
@@ -1207,23 +1335,32 @@ async fn drive(
                                     requested.insert(request_id, position);
                                 }
                             }
-                            // The screen follows as ordinary output. A refusal means the session no
-                            // longer has this attachment, which is the end of it.
+                            // The screen follows as ordinary output. A refusal because the session
+                            // is closing is answered by the closure, which is still to come; any
+                            // other means the session no longer has this attachment, which is the
+                            // end of it.
                             (Outstanding::Resubscribe, outcome) => {
                                 if let kr_protocol::envelope::Outcome::Error(error) = outcome {
-                                    return match error.code {
-                                        ErrorCode::SessionClosed => AttachOutcome::SessionClosed,
-                                        _ => AttachOutcome::Disconnected,
-                                    };
+                                    if error.code != ErrorCode::SessionClosed {
+                                        return AttachOutcome::Disconnected;
+                                    }
+                                    closing = true;
                                 }
                             }
                         }
                     }
                     Ok(_) => {}
+                    // A session that said it was closing and whose connection then ended without
+                    // the closure has closed: its worker has gone, and how is not known here. Any
+                    // other connection that ends is a connection lost.
+                    Err(_) if closing => return AttachOutcome::SessionClosed { undelivered },
                     Err(_) => return AttachOutcome::Disconnected,
                 }
             }
             () = wait_for_resize(&mut resized) => {
+                if closing {
+                    continue;
+                }
                 // The outer terminal changed size. The session is told, so the application is
                 // redrawn at the size the person is actually looking at. The request goes out on
                 // this loop's own connection and its answer comes back through the arm above:
@@ -1299,9 +1436,10 @@ async fn drive(
             bytes = input.recv() => {
                 let Some(bytes) = bytes else {
                     // The terminal's own input ended. Whatever the classifier was part way
-                    // through is the person's, and it goes before the attachment does.
+                    // through is the person's, and it goes before the attachment does, unless the
+                    // session is closing and would refuse it.
                     let held = pointers.release();
-                    if !held.is_empty() {
+                    if !held.is_empty() && !closing {
                         let Some(epoch) = epoch else {
                             return AttachOutcome::Detached;
                         };
@@ -1324,6 +1462,12 @@ async fn drive(
                     }
                     return AttachOutcome::Detached;
                 };
+                // The session is closing and refuses input. What is typed now goes nowhere, and
+                // the line this attachment ends with says so.
+                if closing {
+                    undelivered = true;
+                    continue;
+                }
                 // The scroll-back keys first, where they are this terminal's at all. They move
                 // the window it is looking through and never reach the session, so an attachment
                 // that may not type can still read what is above the live page.
@@ -1654,8 +1798,125 @@ async fn wait_for_resize(_resized: &mut Option<&mut WindowChanges>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{SCROLL_BACK_KEY, SCROLL_FORWARD_KEY, landed, scroll_keys, scroll_step, scrolled};
+    use super::{
+        AttachOutcome, SCROLL_BACK_KEY, SCROLL_FORWARD_KEY, landed, scroll_keys, scroll_step,
+        scrolled,
+    };
     use kr_protocol::attachment::ViewportPosition;
+    use kr_protocol::scalars::{Nullable, U64};
+    use kr_protocol::session::{ClosureReason, ClosureRecord};
+
+    fn closure(reason: ClosureReason, code: Option<u64>, signal: Option<&str>) -> ClosureRecord {
+        ClosureRecord {
+            session_id: kr_protocol::ids::SessionId::new(kr_protocol::scalars::Uuid::from_bytes(
+                [7; 16],
+            )),
+            session_epoch: kr_protocol::ids::SessionEpoch::V1,
+            reason,
+            root_exit_code: Nullable(code.map(U64::new)),
+            root_signal: Nullable(signal.map(ToOwned::to_owned)),
+            terminated: Vec::new(),
+            surviving: Vec::new(),
+            ownership_coverage: kr_protocol::session::OwnershipCoverage::Incomplete,
+            durability: kr_protocol::session::Durability::Durable,
+            closed_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+        }
+    }
+
+    /// The exit status an outcome ends the command with.
+    fn status(outcome: &AttachOutcome) -> u8 {
+        outcome
+            .clone()
+            .into_error()
+            .map_or(0, |error| error.exit_code())
+    }
+
+    /// KR-REQ-07.52: an attachment ends with the status its session's closure implies, and says
+    /// how the session closed in one line.
+    #[test]
+    fn a_closure_ends_the_attachment_with_the_status_it_implies() {
+        for (record, expected, said) in [
+            (
+                closure(ClosureReason::RootExit, Some(0), None),
+                0,
+                "the session closed: its shell exited with status 0",
+            ),
+            (
+                closure(ClosureReason::RootExit, Some(7), None),
+                1,
+                "the session closed: its shell exited with status 7",
+            ),
+            // The shell's own status is not passed through: 3 is what a lost connection ends
+            // with, and a script has to be able to tell the two apart.
+            (
+                closure(ClosureReason::RootExit, Some(3), None),
+                1,
+                "the session closed: its shell exited with status 3",
+            ),
+            (
+                closure(ClosureReason::RootSignal, None, Some("Killed: 9")),
+                1,
+                "the session closed: a signal ended its shell (Killed: 9)",
+            ),
+            // A close somebody asked for is how the person meant the session to end, whatever
+            // the stopped shell's own status was.
+            (
+                closure(ClosureReason::CloseRequested, None, Some("Terminated")),
+                0,
+                "the session closed: it was closed on request",
+            ),
+            (
+                closure(ClosureReason::DesktopLost, None, Some("Hangup")),
+                1,
+                "the session closed: the desktop login it ran in ended",
+            ),
+            (
+                closure(ClosureReason::RootLaunchFailed, None, None),
+                1,
+                "the session closed: its shell never became ready",
+            ),
+        ] {
+            let outcome = AttachOutcome::Closed {
+                record: Box::new(record.clone()),
+                undelivered: false,
+            };
+            assert_eq!(status(&outcome), expected, "{record:?}");
+            assert_eq!(outcome.is_failure(), expected != 0, "{record:?}");
+            assert_eq!(outcome.detail(), said);
+            assert_eq!(outcome.closure(), Some(&record));
+        }
+    }
+
+    /// An attachment that typed while its session was closing is told the typing went nowhere.
+    #[test]
+    fn what_was_typed_while_the_session_closed_is_said_to_be_undelivered() {
+        let outcome = AttachOutcome::Closed {
+            record: Box::new(closure(ClosureReason::CloseRequested, None, None)),
+            undelivered: true,
+        };
+        assert_eq!(status(&outcome), 0);
+        assert_eq!(
+            outcome.detail(),
+            "the session closed: it was closed on request; what was typed while it was closing \
+             was not delivered"
+        );
+        let without_the_record = AttachOutcome::SessionClosed { undelivered: true };
+        assert_eq!(status(&without_the_record), 0);
+        assert_eq!(
+            without_the_record.detail(),
+            "the session closed; what was typed while it was closing was not delivered"
+        );
+        assert_eq!(without_the_record.closure(), None);
+    }
+
+    /// A connection that ends without a closure still ends the command as a lost connection.
+    #[test]
+    fn a_connection_lost_without_a_closure_still_ends_with_status_3() {
+        let outcome = AttachOutcome::Disconnected;
+        assert_eq!(status(&outcome), 3);
+        assert_eq!(outcome.detail(), "the connection to the session ended");
+        assert_eq!(outcome.closure(), None);
+    }
 
     /// Section 8 line 459: a scroll-back key is this terminal's own, and never the session's.
     #[test]
