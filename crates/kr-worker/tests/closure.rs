@@ -496,66 +496,126 @@ fn quoted(path: &std::path::Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
 }
 
-/// How long after its grace and drain a closing worker is given to write its record, before this
-/// test takes it that the worker is waiting for something else.
+/// The line a drain test's shell prints, and the only output it gives.
 #[cfg(unix)]
-const RECORD_ALLOWANCE: Duration = Duration::from_secs(3);
+const LAST_LINE: &[u8] = b"kr-read-before-the-closure";
+
+/// How long a worker that does not wait for what it has read takes to write its record once its
+/// drain period has ended.
+///
+/// Nothing lies between the two in such a worker but the record itself, so this is a scheduling
+/// allowance. A drain test lets the worker go on after it, and a worker that waits correctly is
+/// still waiting then.
+#[cfg(unix)]
+const RECORD_ALLOWANCE: Duration = Duration::from_secs(2);
+
+/// A script that prints [`LAST_LINE`] once `gate` exists, and then waits on its terminal.
+///
+/// The gate is a file rather than a line typed at the terminal, because a typed line is echoed:
+/// the echo would be output too, and the first read after the gate would be the echo instead of
+/// the line.
+#[cfg(unix)]
+fn prints_once(gate: &std::path::Path) -> String {
+    format!(
+        "until [ -e {} ]; do sleep 0.05; done; printf '{}\\n'; read -r _",
+        quoted(gate),
+        String::from_utf8_lossy(LAST_LINE)
+    )
+}
+
+/// Opens the gate, and returns once the read loop has read what the shell printed and stands
+/// before counting it, with what lets it go on.
+#[cfg(unix)]
+async fn read_and_not_counted(host: &Host, gate: &std::path::Path) -> std::sync::mpsc::Sender<()> {
+    let (arrived, release) = host.runtime.pause_after_next_read();
+    std::fs::write(gate, b"").expect("opens the gate");
+    tokio::time::timeout(LIVENESS_DEADLINE, arrived)
+        .await
+        .unwrap_or_else(|_| panic!("waited {LIVENESS_DEADLINE:?} for the line to be read"))
+        .expect("the read loop says it has read the line");
+    release
+}
+
+/// Asks the session to close, and returns once its drain period has ended and a worker that did not
+/// wait for what it had read would have written its record.
+#[cfg(unix)]
+async fn close_past_the_drain(host: &Host) {
+    let drained = host.runtime.watch_drain_end();
+    let (_, gate) = host.runtime.close(ClosureReason::CloseRequested);
+    gate.release();
+    tokio::time::timeout(LIVENESS_DEADLINE, drained)
+        .await
+        .unwrap_or_else(|_| panic!("waited {LIVENESS_DEADLINE:?} for the drain to end"))
+        .expect("the closure says its drain has ended");
+    let _ = tokio::time::timeout(RECORD_ALLOWANCE, host.runtime.wait_closed()).await;
+}
+
+/// Checks that each client was sent [`LAST_LINE`] before the closure, and the session's own record.
+#[cfg(unix)]
+async fn each_was_sent_the_line_first(host: &Host, clients: [&mut LocalClient; 2]) {
+    let record = closed(host).await;
+    assert_eq!(record.reason, ClosureReason::CloseRequested);
+    for (index, client) in clients.into_iter().enumerate() {
+        let (output, sent) = until_the_closure(client).await;
+        assert!(
+            carries(&output, LAST_LINE),
+            "attachment {index} was sent the line the worker had read before the closure: {}",
+            String::from_utf8_lossy(&output).escape_debug()
+        );
+        assert_eq!(
+            sent, record,
+            "attachment {index} was sent the session's own record"
+        );
+    }
+}
 
 /// KR-REQ-07.52: output the worker read from the terminal before its drain ended reaches every
 /// attachment before the closure, however far behind with it the worker is.
 ///
 /// The session's own tasks are held still before the shell prints, so the line it prints is read
-/// and waits to be ingested, which is where a busy machine leaves a worker for seconds at a time.
-/// The close goes on around the hold: its sequence runs beside the endpoint rather than with the
-/// session's tasks. The tasks are let go when the record is written or, for a worker that is
-/// waiting for its own parsing instead, a while after it would have been. A worker that wrote the
-/// record at the end of the drain has put the closure in front of the line by then, and the line
-/// reaches nobody.
+/// and counted and then waits to be ingested, which is where a busy machine leaves a worker for
+/// seconds at a time. The close goes on around the hold, because its sequence runs beside the
+/// endpoint rather than with the session's tasks. The tasks are let go once the drain has ended
+/// and a worker that did not wait would have written its record: such a worker has put the
+/// closure in front of the line by then, and the line reaches nobody.
 ///
-/// Unix only: the shell marks that it has printed with a file, named by a POSIX path. The drain
-/// this checks is the same code on every platform.
+/// Unix only: the shell's gate is a file named by a POSIX path. The drain this checks is the same
+/// code on every platform.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn output_read_before_the_drain_ends_reaches_every_attachment_before_the_closure() {
     let tasks = SessionTasks::start();
     let marks = tempfile::tempdir().expect("a directory on the internal disk");
-    let printed = marks.path().join("printed");
-    let host = host_on(
-        &format!(
-            "read -r _; printf 'kr-read-before-the-closure\\n'; : > {}; read -r _",
-            quoted(&printed)
-        ),
-        tasks.handle(),
-    )
-    .await;
-    let (mut typing, mut keys) = attached_holding_the_keys(&host).await;
-    let mut watcher = watching(&host).await;
+    let gate = marks.path().join("gate");
+    let host = host_on(&prints_once(&gate), tasks.handle()).await;
+    let mut first = watching(&host).await;
+    let mut second = watching(&host).await;
     let held = tasks.hold().await;
-    keys.release(&host.runtime);
-    until("the shell to mark that it has printed its line", || {
-        printed.exists()
-    })
-    .await;
-    let (_, gate) = host.runtime.close(ClosureReason::CloseRequested);
-    gate.release();
-    let _ = tokio::time::timeout(
-        kr_worker::session::GRACE_PERIOD + kr_worker::session::DRAIN_PERIOD + RECORD_ALLOWANCE,
-        host.runtime.wait_closed(),
-    )
-    .await;
+    drop(read_and_not_counted(&host, &gate).await);
+    close_past_the_drain(&host).await;
     drop(held);
-    let record = closed(&host).await;
-    assert_eq!(record.reason, ClosureReason::CloseRequested);
-    for (client, what) in [(&mut typing, "the typing"), (&mut watcher, "the watching")] {
-        let (output, sent) = until_the_closure(client).await;
-        assert!(
-            carries(&output, b"kr-read-before-the-closure"),
-            "{what} attachment was sent the line the worker had read before the closure: {}",
-            String::from_utf8_lossy(&output).escape_debug()
-        );
-        assert_eq!(
-            sent, record,
-            "{what} attachment was sent the session's own record"
-        );
-    }
+    each_was_sent_the_line_first(&host, [&mut first, &mut second]).await;
+}
+
+/// KR-REQ-07.52: output from a read that had returned when the drain ended reaches every
+/// attachment before the closure, even while the read loop has still to count it.
+///
+/// The read loop is stopped after the read that returned the line and before it counted it, and
+/// the drain ends while it stands there. A worker that measured what it had read without waiting
+/// for that read would leave the line out of the measure, write its record, and hand the line to
+/// nobody once the read loop went on.
+///
+/// Unix only, for the same reason as the test above.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_that_returned_before_the_drain_ended_reaches_every_attachment_before_the_closure() {
+    let marks = tempfile::tempdir().expect("a directory on the internal disk");
+    let gate = marks.path().join("gate");
+    let host = host(&prints_once(&gate)).await;
+    let mut first = watching(&host).await;
+    let mut second = watching(&host).await;
+    let reading = read_and_not_counted(&host, &gate).await;
+    close_past_the_drain(&host).await;
+    drop(reading);
+    each_was_sent_the_line_first(&host, [&mut first, &mut second]).await;
 }

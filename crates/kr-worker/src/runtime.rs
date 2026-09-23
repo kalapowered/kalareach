@@ -412,24 +412,120 @@ fn wait_for_room(
 /// attachment.
 #[derive(Clone, Debug)]
 struct ReadProgress {
-    /// Bytes the read loop has taken from the terminal, counted as each read returns them.
-    read: Arc<std::sync::atomic::AtomicU64>,
+    /// Bytes the read loop has taken from the terminal. A read and its count are one step under
+    /// this lock; see [`ReadCounter::read`].
+    read: Arc<Mutex<u64>>,
     /// Bytes the session has ingested, counted once each batch has been handed to every attachment.
     /// The ingestion owns the sending side, so this ends when the ingestion does.
     ingested: tokio::sync::watch::Receiver<u64>,
+    /// The pauses this host's own tests arm inside a closure's drain.
+    #[cfg(feature = "testing")]
+    pauses: Arc<DrainPauses>,
 }
 
 impl ReadProgress {
+    /// Returns the read loop's side of this count.
+    fn counter(&self) -> ReadCounter {
+        ReadCounter {
+            read: Arc::clone(&self.read),
+            #[cfg(feature = "testing")]
+            pauses: Arc::clone(&self.pauses),
+        }
+    }
+
     /// Waits until every byte read so far has been ingested.
     ///
-    /// What was read after this was called is not waited for. Nothing here waits for a client:
+    /// What is read after the measure is taken is not waited for. Nothing here waits for a client:
     /// ingesting hands each attachment its output and never waits for one to take it. What this
     /// waits for is the worker's own parsing, of a queue whose depth bounds it. An ingestion that
     /// has ended will ingest nothing more, and the wait ends with it.
     async fn ingested_what_was_read(&self) {
-        let read = self.read.load(std::sync::atomic::Ordering::Acquire);
+        let read = *self
+            .read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut ingested = self.ingested.clone();
         let _ = ingested.wait_for(|ingested| *ingested >= read).await;
+    }
+}
+
+/// The read loop's side of [`ReadProgress`].
+struct ReadCounter {
+    read: Arc<Mutex<u64>>,
+    #[cfg(feature = "testing")]
+    pauses: Arc<DrainPauses>,
+}
+
+impl ReadCounter {
+    /// Reads what the terminal has and counts it, as one step.
+    ///
+    /// A closure measures what has been read under the same lock, so a read that returned output
+    /// is either in that measure or began after it was taken: nothing can have left the terminal
+    /// uncounted while a closure decided what it waits for. The read itself never waits, because
+    /// the terminal is opened to answer rather than wait, so a measure waits here for one read at
+    /// the most.
+    fn read(&self, reader: &mut dyn std::io::Read, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let mut read = self
+            .read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = reader.read(buffer);
+        if let Ok(taken) = result
+            && taken > 0
+        {
+            #[cfg(feature = "testing")]
+            self.pauses.after_read();
+            *read += taken as u64;
+        }
+        result
+    }
+}
+
+/// The pauses this host's own tests arm inside a closure's drain. Compiled away in every shipped
+/// build.
+///
+/// A test cannot otherwise stand in the two moments a closure's drain turns on: a read that has
+/// returned and is not yet counted, and the end of the drain period, just before what has been
+/// read is measured.
+#[cfg(feature = "testing")]
+#[derive(Debug, Default)]
+struct DrainPauses {
+    /// Where the read loop says it has arrived after a read, and what lets it go on.
+    after_read: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
+    /// Where a closure says its drain period has ended.
+    drain_ended: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+#[cfg(feature = "testing")]
+impl DrainPauses {
+    /// Waits at the pause after a read, where one is armed.
+    fn after_read(&self) {
+        let armed = self
+            .after_read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.recv();
+        }
+    }
+
+    /// Says that a closure's drain period has ended, where that is being watched for.
+    fn drain_ended(&self) {
+        let armed = self
+            .drain_ended
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(ended) = armed {
+            let _ = ended.send(());
+        }
     }
 }
 
@@ -500,12 +596,14 @@ impl SessionRuntime {
         // decoupled by their own queues, and a worker that cannot ingest stops reading rather than
         // growing without limit or discarding bytes.
         let (output_sender, mut output_receiver) = mpsc::channel::<ReadEvent>(READ_QUEUE_DEPTH);
-        let read = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (ingested_sender, ingested) = tokio::sync::watch::channel(0_u64);
         let progress = ReadProgress {
-            read: Arc::clone(&read),
+            read: Arc::new(Mutex::new(0)),
             ingested,
+            #[cfg(feature = "testing")]
+            pauses: Arc::default(),
         };
+        let counter = progress.counter();
         let wake = Arc::new(Notify::new());
         let closed = Arc::new(Notify::new());
         // Input this session accepted and output it produced are what ask the supervision to look
@@ -522,7 +620,9 @@ impl SessionRuntime {
             let mut buffer = vec![0_u8; 64 * 1024];
             let mut filled = 0_usize;
             loop {
-                match std::io::Read::read(&mut reader, &mut buffer[filled..]) {
+                // Counted as it leaves the terminal, before it is batched or queued: from there it
+                // is output this worker holds, and a closure waits for it.
+                match counter.read(&mut reader, &mut buffer[filled..]) {
                     Ok(0) => {
                         if filled > 0 {
                             let _ = output_sender
@@ -532,9 +632,6 @@ impl SessionRuntime {
                         break;
                     }
                     Ok(taken) => {
-                        // Counted as it leaves the terminal, before it is batched or queued: from
-                        // here it is output this worker holds, and a closure waits for it.
-                        read.fetch_add(taken as u64, std::sync::atomic::Ordering::Release);
                         // Taken together rather than one read at a time. What the terminal has is
                         // read until the buffer is full or it has no more, and that is one batch:
                         // an application printing steadily hands the engine and every subscriber a
@@ -1108,6 +1205,46 @@ impl SessionRuntime {
             .is_ok()
     }
 
+    /// Stops the read loop after its next read that returns output, before that output is
+    /// counted, for this host's own tests.
+    ///
+    /// Returns the end that says the read loop has arrived, and the end that lets it go; dropping
+    /// the second lets it go too. The pause fires once. The read loop holds the count while it
+    /// waits here, so a closure that measures what has been read waits for it.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn pause_after_next_read(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (arrived, watch) = tokio::sync::oneshot::channel();
+        let (release, go) = std::sync::mpsc::channel();
+        *self
+            .progress
+            .pauses
+            .after_read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Says when the next closure's drain period ends, before what has been read is measured, for
+    /// this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn watch_drain_end(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (ended, watch) = tokio::sync::oneshot::channel();
+        *self
+            .progress
+            .pauses
+            .drain_ended
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ended);
+        watch
+    }
+
     /// Returns the session's current lifecycle state.
     #[must_use]
     /// Applies one fence stimulus and everything that came of it, under one session lock.
@@ -1254,6 +1391,8 @@ impl CloseGate {
                 let _ = session.force_close();
             }
             tokio::time::sleep(DRAIN_PERIOD).await;
+            #[cfg(feature = "testing")]
+            runtime.progress.pauses.drain_ended();
             // The drain bounds how long the terminal is read, not how much of what was read
             // reaches the attachments. Each is sent its closure after all of its output, so what
             // the read loop has taken by now is ingested before the record is written, however far
