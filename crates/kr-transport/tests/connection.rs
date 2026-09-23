@@ -15,7 +15,9 @@ use kr_cbor::CanonicalValue;
 use kr_crypto::connect::PairedPeer;
 use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Request, Response};
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::extension::{self, ExtensionDefinition, ExtensionId, ExtensionOffers};
+use kr_protocol::extension::{
+    self, ExtensionDefinition, ExtensionId, ExtensionOffers, MemberBlock,
+};
 use kr_protocol::frame::{StreamHeader, StreamKind, StreamResource};
 use kr_protocol::hello::{
     ALPN, ClientOffer, ConnectProof, ConnectReply, HelloReply, HostSelection, PROTOCOL_VERSION,
@@ -1314,20 +1316,12 @@ async fn an_offer_with_a_field_its_schema_does_not_declare_is_refused_before_it_
     assert_eq!(error.to_protocol_error().code, ErrorCode::UnsupportedSchema);
 }
 
-/// A test extension that adds `{"level": <level_type>}` to a `host.info` result.
-fn thermal(level_type: &str) -> ExtensionDefinition {
+/// A test extension that adds a member of type `B` to a `host.info` result. Two member types give
+/// two schemas, and so two hashes, under one identifier.
+fn thermal<B: kr_protocol::wire::WireMessage>() -> ExtensionDefinition {
     ExtensionDefinition::new(
         ExtensionId::new("org.example.thermal").expect("an identifier"),
-        [(
-            "HostInfoResult".to_owned(),
-            serde_json::json!({
-                "type": "object",
-                "properties": {"level": {"type": level_type}},
-                "additionalProperties": false
-            }),
-        )]
-        .into_iter()
-        .collect(),
+        [MemberBlock::of::<B>("HostInfoResult")],
     )
     .expect("a definition")
 }
@@ -1337,16 +1331,16 @@ fn thermal(level_type: &str) -> ExtensionDefinition {
 /// not implement, or holds another schema for, is left out and the connection completes without it.
 #[tokio::test]
 async fn an_extension_is_negotiated_by_identifier_and_schema_hash() {
-    let offered = extension::offer(&[thermal("integer")]);
+    let offered = extension::offer(&[thermal::<ProtocolVersion>()]);
     for (host_extensions, selected) in [
-        (vec![thermal("integer")], offered.clone()),
+        (vec![thermal::<ProtocolVersion>()], offered.clone()),
         (Vec::new(), ExtensionOffers::new()),
-        (vec![thermal("string")], ExtensionOffers::new()),
+        (vec![thermal::<ReceiveLimits>()], ExtensionOffers::new()),
     ] {
         let (mut host, mut client) = paired_pair().await;
         Arc::get_mut(&mut client.identity)
             .expect("the identity is not shared yet")
-            .extensions = vec![thermal("integer")];
+            .extensions = vec![thermal::<ProtocolVersion>()];
         Arc::get_mut(&mut host.identity)
             .expect("the identity is not shared yet")
             .extensions = host_extensions;
@@ -1399,7 +1393,7 @@ fn spawn_selecting_unoffered(host: &Side) -> JoinHandle<()> {
             device_key_revision: record.device_key_revision,
             boot_epoch: epochs().boot_epoch,
             clock_epoch: epochs().clock_epoch,
-            extensions: extension::offer(&[thermal("integer")]),
+            extensions: extension::offer(&[thermal::<ProtocolVersion>()]),
         };
         writer
             .write_message(&HelloReply::Selected(Box::new(selection)))

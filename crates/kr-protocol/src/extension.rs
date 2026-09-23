@@ -32,9 +32,10 @@
 //!
 //! A message that carries a member of an extension its connection did not negotiate, or in an
 //! object that extension does not extend, is refused before typed decoding
-//! (`unnegotiated_extension`, `UNSUPPORTED_SCHEMA`). A member of a negotiated extension is checked
-//! against its schema, taken out, and returned beside the message by
-//! [`crate::wire::decode_extended`].
+//! (`unnegotiated_extension`, `UNSUPPORTED_SCHEMA`). A member of a negotiated extension is a
+//! protocol type of its own ([`MemberBlock`]): it is read into that type, structure first and then
+//! typed decoding, taken out of the message, and returned beside it by
+//! [`crate::wire::decode_extended`] once the message has been read too.
 //!
 //! This build implements no extension ([`implemented`]), so it offers and selects none, and every
 //! extension member it receives is refused.
@@ -42,13 +43,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock};
 
-use kr_cbor::{CanonicalMap, CanonicalValue, Extensions, Member, ObjectShape, Shape, Undeclared};
+use kr_cbor::{
+    AdmittedMember, CanonicalMap, CanonicalValue, CborError, Extensions, Member, ObjectShape,
+    Shape, Undeclared,
+};
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::scalars::Digest256;
-use crate::wire::READ_ONLY_METADATA;
+use crate::wire::{READ_ONLY_METADATA, WireMessage};
 
 /// The domain the schema hash is separated by.
 pub const SCHEMA_DOMAIN: &str = "kr-extension/1";
@@ -158,6 +162,12 @@ pub enum ExtensionError {
         /// What could not be represented.
         reason: String,
     },
+    /// The definition adds two members to one type.
+    #[error("an extension adds one member to each type it extends, and {target} is named twice")]
+    DuplicateTarget {
+        /// The type named twice.
+        target: String,
+    },
     /// The host selected an extension the client did not offer with that hash.
     #[error("the host selected the extension {extension}, which was not offered with that schema")]
     NotOffered {
@@ -166,44 +176,106 @@ pub enum ExtensionError {
     },
 }
 
+/// The member an extension adds to one read-only metadata type.
+///
+/// The member is a protocol type of its own: its published schema is what the extension's hash
+/// covers, and a member that arrives is read into that type, structure first and then typed
+/// decoding, before the message carrying it is. A member whose field is missing, of the wrong
+/// kind or out of range is refused like any message.
+#[derive(Clone)]
+pub struct MemberBlock {
+    target: String,
+    schema: Value,
+    shape: Arc<Shape>,
+    read: fn(&CanonicalValue) -> Result<(), CborError>,
+}
+
+impl MemberBlock {
+    /// The member `B` adds to the type whose schema name is `target`.
+    #[must_use]
+    pub fn of<B: WireMessage>(target: impl Into<String>) -> Self {
+        Self {
+            target: target.into(),
+            schema: crate::schema::schema_for::<B>(),
+            shape: crate::wire::shape_of::<B>(),
+            read: |value| crate::wire::from_value::<B>(value).map(drop),
+        }
+    }
+
+    /// Returns the schema name of the type the member extends.
+    #[must_use]
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    /// Returns the member's published schema, which the extension's hash covers.
+    #[must_use]
+    pub const fn schema(&self) -> &Value {
+        &self.schema
+    }
+}
+
+impl core::fmt::Debug for MemberBlock {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("MemberBlock")
+            .field("target", &self.target)
+            .field("schema", &self.schema)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for MemberBlock {
+    fn eq(&self, other: &Self) -> bool {
+        self.target == other.target && self.schema == other.schema
+    }
+}
+
+impl Eq for MemberBlock {}
+
 /// An extension this build implements.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExtensionDefinition {
     id: ExtensionId,
-    members: BTreeMap<String, Value>,
+    members: BTreeMap<String, MemberBlock>,
     schema_hash: Digest256,
-    shapes: BTreeMap<String, Arc<Shape>>,
 }
 
 impl ExtensionDefinition {
     /// Defines an extension by its identifier and the member it adds to each type it extends.
     ///
-    /// `members` maps a type's schema name, as `packages/protocol/schema` publishes it, to the JSON
-    /// Schema of the member the extension adds there.
-    ///
     /// # Errors
     ///
-    /// Returns [`ExtensionError::NotReadOnlyMetadata`] when a type is not read-only metadata, and
+    /// Returns [`ExtensionError::NotReadOnlyMetadata`] when a member's type is not read-only
+    /// metadata, [`ExtensionError::DuplicateTarget`] when two members extend one type, and
     /// [`ExtensionError::UnrepresentableSchema`] when a schema holds a value that cannot be hashed.
-    pub fn new(id: ExtensionId, members: BTreeMap<String, Value>) -> Result<Self, ExtensionError> {
-        if let Some(target) = members
-            .keys()
-            .find(|target| !READ_ONLY_METADATA_TYPES.contains(target.as_str()))
-        {
-            return Err(ExtensionError::NotReadOnlyMetadata {
-                target: target.clone(),
-            });
+    pub fn new(
+        id: ExtensionId,
+        members: impl IntoIterator<Item = MemberBlock>,
+    ) -> Result<Self, ExtensionError> {
+        let mut blocks = BTreeMap::new();
+        for member in members {
+            if !READ_ONLY_METADATA_TYPES.contains(member.target.as_str()) {
+                return Err(ExtensionError::NotReadOnlyMetadata {
+                    target: member.target,
+                });
+            }
+            if blocks.contains_key(&member.target) {
+                return Err(ExtensionError::DuplicateTarget {
+                    target: member.target,
+                });
+            }
+            blocks.insert(member.target.clone(), member);
         }
-        let schema_hash = schema_hash(&id, &members)?;
-        let shapes = members
+        let schemas = blocks
             .iter()
-            .map(|(target, schema)| (target.clone(), Arc::new(crate::wire::compile(schema))))
+            .map(|(target, block)| (target.clone(), block.schema.clone()))
             .collect();
+        let schema_hash = schema_hash(&id, &schemas)?;
         Ok(Self {
             id,
-            members,
+            members: blocks,
             schema_hash,
-            shapes,
         })
     }
 
@@ -219,10 +291,13 @@ impl ExtensionDefinition {
         self.schema_hash
     }
 
-    /// Returns the member schema for each type the extension extends.
+    /// Returns the member schema for each type the extension extends, as the hash covers them.
     #[must_use]
-    pub const fn members(&self) -> &BTreeMap<String, Value> {
-        &self.members
+    pub fn schemas(&self) -> BTreeMap<String, Value> {
+        self.members
+            .iter()
+            .map(|(target, block)| (target.clone(), block.schema.clone()))
+            .collect()
     }
 }
 
@@ -383,6 +458,33 @@ impl NegotiatedExtensions {
     }
 }
 
+impl NegotiatedExtensions {
+    /// Returns the member block a negotiated extension adds to `object` under `key`.
+    fn block(&self, object: Option<&str>, key: &str) -> Option<&MemberBlock> {
+        self.definitions
+            .iter()
+            .find(|definition| definition.id.as_str() == key)
+            .and_then(|definition| definition.members.get(object?))
+    }
+
+    /// Reads an admitted member into its own type, so that a member the check let through on its
+    /// structure alone is not returned until its fields have their kinds, values and ranges too.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed decoding failure, or [`CborError::UnnegotiatedExtension`] for a member no
+    /// negotiated extension adds there.
+    pub(crate) fn read(&self, member: &AdmittedMember) -> Result<(), CborError> {
+        let block = self
+            .block(member.object.as_deref(), &member.key)
+            .ok_or_else(|| CborError::UnnegotiatedExtension {
+                at: member.object.clone().unwrap_or_default(),
+                extension: member.key.clone(),
+            })?;
+        (block.read)(&member.value)
+    }
+}
+
 impl Extensions for NegotiatedExtensions {
     fn classify(&self, object: &ObjectShape, key: &str) -> Member {
         // A declared field never has a dot, so an undeclared key without one is an ordinary field
@@ -394,13 +496,9 @@ impl Extensions for NegotiatedExtensions {
         if object.undeclared != Undeclared::Ignore {
             return Member::Refused;
         }
-        let Some(name) = object.name.as_deref() else {
-            return Member::Refused;
-        };
-        self.definitions
-            .iter()
-            .find(|definition| definition.id.as_str() == key)
-            .and_then(|definition| definition.shapes.get(name))
-            .map_or(Member::Refused, |shape| Member::Admitted(Arc::clone(shape)))
+        self.block(object.name.as_deref(), key)
+            .map_or(Member::Refused, |block| {
+                Member::Admitted(Arc::clone(&block.shape))
+            })
     }
 }

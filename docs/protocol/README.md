@@ -302,10 +302,13 @@ SHA-256 of the KR-CBOR-1 encoding of `["kr-extension/1", identifier, {type name:
 which covers the identifier, every type it extends and the exact JSON Schema of each member.
 
 A member of an extension that the connection did not negotiate, or that does not extend the object
-carrying it, is refused before typed decoding. A member of a negotiated extension is checked against
-its schema, removed before typed decoding and returned beside the message by
-`kr_protocol::wire::decode_extended`. This build implements no extension, so it offers and selects
-none and every extension member it receives is refused. Local connections negotiate none.
+carrying it, is refused before typed decoding. A member of a negotiated extension is a protocol type
+of its own (`MemberBlock::of::<T>`), and the hash covers that type's published schema. It is read
+into that type, structure first and then typed decoding, before the message carrying it is read, so
+a member that is missing a field, carries one of the wrong kind or out of range is refused like any
+message; it is then removed and returned beside the message by `kr_protocol::wire::decode_extended`.
+This build implements no extension, so it offers and selects none and every extension member it
+receives is refused. Local connections negotiate none.
 
 ## Receipt states
 

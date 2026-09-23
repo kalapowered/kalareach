@@ -76,7 +76,7 @@ pub fn from_value<T: WireMessage>(value: &CanonicalValue) -> Result<T, CborError
 pub struct Extended<T> {
     /// The message, typed without its extension members.
     pub message: T,
-    /// Each extension member, checked against its extension's schema, with where it was.
+    /// Each extension member, read into its own type and found valid, with where it was.
     pub members: Vec<AdmittedMember>,
 }
 
@@ -104,6 +104,11 @@ pub fn from_value_extended<T: WireMessage>(
     extensions: &NegotiatedExtensions,
 ) -> Result<Extended<T>, CborError> {
     let checked = kr_cbor::check(value, &shape_of::<T>(), extensions)?;
+    // Each member is read into its own type before the message is, so no part of the message
+    // reaches a typed decoder until every part has passed its schema.
+    for member in &checked.members {
+        extensions.read(member)?;
+    }
     Ok(Extended {
         message: kr_cbor::from_canonical_value(&checked.value)?,
         members: checked.members,

@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 use kr_cbor::{CanonicalMap, CanonicalValue};
 use kr_protocol::envelope::ParamsValue;
 use kr_protocol::extension::{
-    self, ExtensionDefinition, ExtensionError, ExtensionId, ExtensionOffers, NegotiatedExtensions,
+    self, ExtensionDefinition, ExtensionError, ExtensionId, ExtensionOffers, MemberBlock,
+    NegotiatedExtensions,
 };
 use kr_protocol::hostinfo::{EnvironmentListResult, EnvironmentSummary, HostInfoResult};
 use kr_protocol::question::QuestionAnswerParams;
@@ -62,14 +63,18 @@ fn level(value: i128) -> CanonicalValue {
     )
 }
 
-/// The member schema the test extension adds to a `host.info` result.
-fn thermal_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {"level": {"type": "integer", "minimum": 0}},
-        "required": ["level"],
-        "additionalProperties": false
-    })
+/// The member the test extension adds: a level, never negative.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct Thermal {
+    level: u64,
+}
+
+/// The same member with another schema: a level in words.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ThermalInWords {
+    level: String,
 }
 
 fn thermal_id() -> ExtensionId {
@@ -77,13 +82,8 @@ fn thermal_id() -> ExtensionId {
 }
 
 fn thermal() -> ExtensionDefinition {
-    ExtensionDefinition::new(
-        thermal_id(),
-        [("HostInfoResult".to_owned(), thermal_schema())]
-            .into_iter()
-            .collect(),
-    )
-    .expect("a definition")
+    ExtensionDefinition::new(thermal_id(), [MemberBlock::of::<Thermal>("HostInfoResult")])
+        .expect("a definition")
 }
 
 /// KR-REQ-23.14: a mutation's parameter schema is closed for the negotiated version. A field the
@@ -254,17 +254,24 @@ fn an_extension_identifier_is_dotted_lower_case() {
 }
 
 /// KR-REQ-23.14: the schema hash covers the identifier, every type the extension extends and the
-/// exact member schema, and nothing else.
+/// exact published schema of each member, and nothing else.
 #[test]
 fn the_schema_hash_covers_the_identifier_the_types_and_the_exact_schema() {
     let base = thermal();
-    let members = base.members().clone();
+    let schemas = base.schemas();
+    let published = kr_protocol::schema::schema_for::<Thermal>();
+    assert_eq!(
+        schemas,
+        [("HostInfoResult".to_owned(), published.clone())]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()
+    );
 
     // The hash is SHA-256 of KR-CBOR-1 ["kr-extension/1", identifier, {type: schema}].
     let mut map = CanonicalMap::new();
     map.insert(
         "HostInfoResult".to_owned(),
-        kr_cbor::to_canonical_value(&thermal_schema()).expect("a schema"),
+        kr_cbor::to_canonical_value(&published).expect("a schema"),
     )
     .expect("one key");
     let input = kr_cbor::signing_input(
@@ -280,43 +287,43 @@ fn the_schema_hash_covers_the_identifier_the_types_and_the_exact_schema() {
         Digest256::from_bytes(kr_cbor::sha256(&input))
     );
 
-    let other_id = extension::schema_hash(
-        &ExtensionId::new("org.example.thermal2").expect("an identifier"),
-        &members,
+    let other_id = ExtensionDefinition::new(
+        ExtensionId::new("org.example.thermal2").expect("an identifier"),
+        [MemberBlock::of::<Thermal>("HostInfoResult")],
     )
-    .expect("a hash");
-    let mut other_schema = members.clone();
-    other_schema.insert(
-        "HostInfoResult".to_owned(),
-        json!({"type": "object", "properties": {"level": {"type": "integer"}}, "additionalProperties": false}),
-    );
-    let mut more_types = members.clone();
-    more_types.insert("EnvironmentSummary".to_owned(), thermal_schema());
-    for (what, hash) in [
+    .expect("a definition");
+    let other_schema = ExtensionDefinition::new(
+        thermal_id(),
+        [MemberBlock::of::<ThermalInWords>("HostInfoResult")],
+    )
+    .expect("a definition");
+    let more_types = ExtensionDefinition::new(
+        thermal_id(),
+        [
+            MemberBlock::of::<Thermal>("HostInfoResult"),
+            MemberBlock::of::<Thermal>("EnvironmentSummary"),
+        ],
+    )
+    .expect("a definition");
+    for (what, definition) in [
         ("identifier", other_id),
-        (
-            "schema",
-            extension::schema_hash(&thermal_id(), &other_schema).expect("a hash"),
-        ),
-        (
-            "types",
-            extension::schema_hash(&thermal_id(), &more_types).expect("a hash"),
-        ),
+        ("schema", other_schema),
+        ("types", more_types),
     ] {
         assert_ne!(
-            hash,
+            definition.schema_hash(),
             base.schema_hash(),
             "the hash does not cover the {what}"
         );
     }
     assert_eq!(
-        extension::schema_hash(&thermal_id(), &members).expect("a hash"),
+        extension::schema_hash(&thermal_id(), &schemas).expect("a hash"),
         base.schema_hash(),
         "the same schema hashes the same"
     );
 
     // A schema that KR-CBOR-1 cannot carry has no hash.
-    let mut fraction = members;
+    let mut fraction = schemas;
     fraction.insert("EnvironmentSummary".to_owned(), json!({"maximum": 0.5}));
     assert!(matches!(
         extension::schema_hash(&thermal_id(), &fraction),
@@ -325,7 +332,7 @@ fn the_schema_hash_covers_the_identifier_the_types_and_the_exact_schema() {
 }
 
 /// KR-REQ-23.14: an extension extends read-only metadata only, so a member taken out before typed
-/// decoding is never one a signature or a digest covers.
+/// decoding is never one a signature or a digest covers, and it adds one member to each type.
 #[test]
 fn an_extension_may_extend_read_only_metadata_only() {
     for target in [
@@ -335,17 +342,24 @@ fn an_extension_may_extend_read_only_metadata_only() {
         "NoSuchType",
     ] {
         assert_eq!(
-            ExtensionDefinition::new(
-                thermal_id(),
-                [(target.to_owned(), thermal_schema())]
-                    .into_iter()
-                    .collect()
-            ),
+            ExtensionDefinition::new(thermal_id(), [MemberBlock::of::<Thermal>(target)]),
             Err(ExtensionError::NotReadOnlyMetadata {
                 target: target.to_owned()
             })
         );
     }
+    assert_eq!(
+        ExtensionDefinition::new(
+            thermal_id(),
+            [
+                MemberBlock::of::<Thermal>("HostInfoResult"),
+                MemberBlock::of::<ThermalInWords>("HostInfoResult"),
+            ]
+        ),
+        Err(ExtensionError::DuplicateTarget {
+            target: "HostInfoResult".to_owned()
+        })
+    );
 }
 
 /// KR-REQ-23.14: the host selects exactly the offered extensions it holds with the identical hash.
@@ -367,12 +381,7 @@ fn an_extension_is_selected_only_by_identifier_and_identical_hash() {
     );
     let theirs = ExtensionDefinition::new(
         thermal_id(),
-        [(
-            "HostInfoResult".to_owned(),
-            json!({"type": "object", "properties": {"level": {"type": "string"}}, "additionalProperties": false}),
-        )]
-        .into_iter()
-        .collect(),
+        [MemberBlock::of::<ThermalInWords>("HostInfoResult")],
     )
     .expect("a definition");
     assert!(
@@ -479,4 +488,40 @@ fn a_message_may_use_only_an_extension_its_connection_negotiated() {
         wire::from_value_extended::<kr_protocol::identity::BootIdentity>(&boot, &negotiated)
             .expect_err("a closed object");
     assert_eq!(error.rule(), "unnegotiated_extension");
+}
+
+/// KR-REQ-23.14: a negotiated extension's member is read into its own type before the message is
+/// returned, so a member that is not an object, lacks a field, carries a field of the wrong kind or
+/// a value out of range is refused like any message, and a valid one is returned typed-checked.
+#[test]
+fn a_negotiated_member_is_read_into_its_own_type_before_it_is_returned() {
+    let ours = thermal();
+    let negotiated = NegotiatedExtensions::from_selection(
+        &extension::offer(std::slice::from_ref(&ours)),
+        std::slice::from_ref(&ours),
+    );
+    let info = host_info();
+    let empty = CanonicalValue::Map(CanonicalMap::new());
+    let in_words = CanonicalValue::Map(
+        CanonicalMap::from_entries([("level".to_owned(), CanonicalValue::text("hot"))])
+            .expect("one key"),
+    );
+    for (what, member) in [
+        ("null", CanonicalValue::Null),
+        ("no level", empty),
+        ("a level in words", in_words),
+        ("a negative level", level(-1)),
+    ] {
+        let message = with(&info, &[("org.example.thermal", member)]);
+        let error =
+            wire::from_value_extended::<HostInfoResult>(&message, &negotiated).expect_err(what);
+        assert_eq!(error.rule(), "deserialize_failed", "{what}: {error}");
+        assert_eq!(wire::refusal_code(&error).as_str(), "INVALID_ARGUMENT");
+    }
+
+    let message = with(&info, &[("org.example.thermal", level(0))]);
+    let read =
+        wire::from_value_extended::<HostInfoResult>(&message, &negotiated).expect("a valid member");
+    let member: Thermal = wire::from_value(&read.members[0].value).expect("its own type");
+    assert_eq!(member, Thermal { level: 0 });
 }
