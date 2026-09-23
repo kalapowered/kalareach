@@ -77,8 +77,34 @@ fn make_fifo(path: &Path) {
     assert!(status.success(), "mkfifo {}", path.display());
 }
 
+/// What a session's root shell runs: the words of one command, and what it adds to the
+/// environment.
+struct Root {
+    command: Vec<String>,
+    environment: Vec<(String, String)>,
+}
+
+/// Quotes one word for the POSIX shell that starts the root command.
+fn quoted(word: &str) -> String {
+    format!("'{}'", word.replace('\'', "'\\''"))
+}
+
 /// Starts a session whose root shell is `kr agent-tools --stdio`, and connects to it.
 async fn hosted() -> Hosted {
+    hosted_with(|binary| Root {
+        command: vec![
+            binary.display().to_string(),
+            "agent-tools".to_owned(),
+            "--stdio".to_owned(),
+        ],
+        environment: Vec::new(),
+    })
+    .await
+}
+
+/// Starts a session whose root shell runs the command `root` names for the copied `kr`, with its
+/// standard streams on a pair of named pipes, and connects to it.
+async fn hosted_with(root: impl FnOnce(&Path) -> Root) -> Hosted {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
@@ -112,6 +138,14 @@ async fn hosted() -> Hosted {
 
     let runtime_root = temp.paths().runtime_root().display().to_string();
     let state_root = temp.paths().state_root().display().to_string();
+    let root = root(&binary);
+    let command: Vec<String> = root.command.iter().map(|word| quoted(word)).collect();
+    let mut variables = vec![
+        ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+        ("KR_RUNTIME_DIR".to_owned(), runtime_root.clone()),
+        ("KR_STATE_DIR".to_owned(), state_root.clone()),
+    ];
+    variables.extend(root.environment);
     let config = SessionConfig {
         session_id,
         session_epoch: SessionEpoch::V1,
@@ -124,18 +158,14 @@ async fn hosted() -> Hosted {
             arguments: vec![
                 "-c".to_owned(),
                 format!(
-                    "exec {} agent-tools --stdio < {} > {}",
-                    binary.display(),
+                    "exec {} < {} > {}",
+                    command.join(" "),
                     to_server.display(),
                     from_server.display()
                 ),
             ],
             cwd: "/".to_owned(),
-            environment: vec![
-                ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
-                ("KR_RUNTIME_DIR".to_owned(), runtime_root.clone()),
-                ("KR_STATE_DIR".to_owned(), state_root.clone()),
-            ],
+            environment: variables,
         },
         shell_mode: ShellMode::NativeCompat,
         worker_profile: WorkerProfile::HeadlessUser,
@@ -289,6 +319,8 @@ impl Hosted {
 /// The four tools, their schemas and nothing else.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_server_offers_exactly_the_four_contact_tools() {
+    // KR-REQ-11.52: the helper in the session serves exactly `ask_user`, `wait_for_answer`,
+    // `cancel_question` and `send_notification`.
     let hosted = hosted().await;
     let listing = hosted
         .client
@@ -339,6 +371,9 @@ async fn the_server_offers_exactly_the_four_contact_tools() {
 /// wait returns that free text as free text.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_select_is_answered_with_free_text_and_the_agent_reads_it_as_free_text() {
+    // KR-REQ-01.18: an agent asks through the tools and reads the person's answer.
+    // KR-REQ-11.59: a select carries "Something else" after its choices, and the free-text answer
+    // reaches the agent as free text.
     let hosted = hosted().await;
     let (created, failed) = hosted
         .call(
@@ -412,6 +447,8 @@ async fn a_select_is_answered_with_free_text_and_the_agent_reads_it_as_free_text
 /// Text and yes-or-no, answered from the command line.
 #[tokio::test(flavor = "multi_thread")]
 async fn text_and_confirm_answers_reach_the_agent() {
+    // KR-REQ-01.18: text and yes-or-no answers reach the agent that asked.
+    // KR-REQ-11.59: a confirm carries "Something else", which the agent cannot remove.
     let hosted = hosted().await;
     let (created, _) = hosted
         .call(
@@ -487,6 +524,8 @@ async fn text_and_confirm_answers_reach_the_agent() {
 /// Two clients answering at once: one wins, and the other is told the question is resolved.
 #[tokio::test(flavor = "multi_thread")]
 async fn exactly_one_of_two_simultaneous_answers_wins() {
+    // KR-REQ-11.60: two clients answer at once through the worker; the first answer wins
+    // atomically and the other is told the question is resolved.
     let hosted = hosted().await;
     let (created, _) = hosted
         .call(
@@ -556,6 +595,9 @@ async fn exactly_one_of_two_simultaneous_answers_wins() {
 /// The same request identifier, twice, and then with different words.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_exact_retry_is_the_same_question_and_a_changed_one_is_a_conflict() {
+    // KR-REQ-11.55: an exact idempotent retry returns the same question and the same token to the
+    // verified source.
+    // KR-REQ-11.58: a changed payload under the same request identifier is `ID_CONFLICT`.
     let hosted = hosted().await;
     let payload = json!({
         "request_id": "ask-idempotent",
@@ -588,6 +630,10 @@ async fn an_exact_retry_is_the_same_question_and_a_changed_one_is_a_conflict() {
 /// Cancelling a question, and then cancelling it again.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancelled_question_stays_cancelled() {
+    // KR-REQ-11.56: the caller token a cancellation carries is in neither the journal nor its
+    // write-ahead log.
+    // KR-REQ-11.60: cancellation is a terminal state: cancelling again and answering afterwards
+    // both change nothing.
     let hosted = hosted().await;
     let (created, _) = hosted
         .call(
@@ -655,6 +701,8 @@ async fn a_cancelled_question_stays_cancelled() {
 /// KR-REQ-23.31: a private question method checks the caller token of the question it names.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_token_reaches_only_the_question_it_was_issued_for() {
+    // KR-REQ-11.58: a wait needs the question's own caller token.
+    // KR-REQ-11.63: another question's token retrieves nothing about this one.
     let hosted = hosted().await;
     let (first, _) = hosted
         .call(
@@ -685,6 +733,9 @@ async fn a_token_reaches_only_the_question_it_was_issued_for() {
 /// An alert, which asks for nothing and de-duplicates on its own identifier.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_notification_asks_for_nothing_and_repeats_nothing() {
+    // KR-REQ-01.18: an agent raises an alert through the tools.
+    // KR-REQ-11.65: an alert is raised with its severity, asks for nothing, creates no question,
+    // and a repeat under its de-duplication identifier raises nothing new.
     let hosted = hosted().await;
     let payload = json!({
         "dedup_id": "build-failed",
@@ -714,6 +765,10 @@ async fn a_notification_asks_for_nothing_and_repeats_nothing() {
 /// A wait that runs out returns the same pending question, and nothing is recreated.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_wait_that_times_out_returns_the_same_question() {
+    // KR-REQ-11.55: a creation that waits returns the pending question when nobody answers, and a
+    // wait timeout preserves it.
+    // KR-REQ-11.57: a wait that runs out returns the same question at the same revision and
+    // creates nothing.
     let hosted = hosted().await;
     let (created, _) = hosted
         .call(
@@ -757,6 +812,10 @@ async fn a_wait_that_times_out_returns_the_same_question() {
 /// claims about the session.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_helper_outside_a_session_is_told_how_to_get_into_one() {
+    // KR-REQ-11.53: outside a KR session every tool answers `NOT_IN_KR_SESSION` with the
+    // `kr new --attach` setup instruction and creates nothing.
+    // KR-REQ-11.52: a session named in the environment is a lookup hint, not a binding: a process
+    // the kernel does not place inside the session is refused.
     // A host tree with a live session in it, and a tool server that is not inside that session:
     // it is a child of this test rather than of the session's own shell.
     let hosted = hosted().await;
@@ -816,5 +875,505 @@ async fn a_helper_outside_a_session_is_told_how_to_get_into_one() {
             .as_array()
             .expect("questions")
             .is_empty()
+    );
+}
+
+/// Runs `kr` against a host tree, from a task that does not hold the hosted session.
+fn kr_against(
+    binary: &Path,
+    runtime_root: &Path,
+    state_root: &Path,
+    arguments: &[&str],
+) -> std::process::Output {
+    std::process::Command::new(binary)
+        .args(arguments)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("KR_RUNTIME_DIR", runtime_root)
+        .env("KR_STATE_DIR", state_root)
+        .current_dir("/")
+        .output()
+        .expect("runs the command")
+}
+
+/// Reads this session's question ledger through a connection of its own, as a restarted worker
+/// would.
+fn ledger(hosted: &Hosted) -> kr_worker::questions::store::Store {
+    kr_worker::questions::store::Store::open(
+        Some(&hosted.journal),
+        hosted.session_id,
+        SessionEpoch::V1,
+    )
+    .expect("a second connection to the journal")
+}
+
+/// KR-REQ-01.18, KR-REQ-11.66: the skill installs, and the tool server its installation registers
+/// in the agent's own configuration is the one the agent runs: started from that entry inside a
+/// session, it asks the person a question, returns the answer they gave and raises an alert. The
+/// host has no account, no managed service and no entitlement configured.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_installed_skill_asks_returns_the_answer_and_raises_an_alert() {
+    let home = tempfile::tempdir().expect("a home directory on the internal disk");
+    let state = tempfile::tempdir().expect("a state directory on the internal disk");
+    let home_path = home.path().to_path_buf();
+    let records = state.path().join("agent-tools");
+    let hosted = hosted_with(|binary| {
+        let installer = kr_controller::agent_tools::Installer::new(
+            home_path.clone(),
+            records.clone(),
+            binary.display().to_string(),
+        );
+        let installed = installer
+            .install(&kr_protocol::skill::AgentToolsParams {
+                agent: kr_protocol::skill::AgentTarget::ClaudeCode,
+                scope: kr_protocol::skill::InstallScope::User,
+                project_dir: kr_protocol::scalars::Nullable::null(),
+            })
+            .expect("the skill installs");
+        assert!(!installed.already_installed);
+        let skill = home_path.join(".claude/skills/kalareach-contact");
+        for file in ["SKILL.md", "TOOLS.md", "manifest.json"] {
+            assert!(skill.join(file).is_file(), "{file} is installed");
+        }
+        let configuration: Value = serde_json::from_str(
+            &std::fs::read_to_string(home_path.join(".claude.json"))
+                .expect("the agent's configuration"),
+        )
+        .expect("JSON");
+        let entry = &configuration["mcpServers"]["kalareach"];
+        let mut command = vec![entry["command"].as_str().expect("a command").to_owned()];
+        command.extend(
+            entry["args"]
+                .as_array()
+                .expect("its arguments")
+                .iter()
+                .map(|word| word.as_str().expect("a word").to_owned()),
+        );
+        assert_eq!(command[1..], ["agent-tools", "--stdio"]);
+        let environment = entry["env"]
+            .as_object()
+            .map(|variables| {
+                variables
+                    .iter()
+                    .map(|(name, value)| {
+                        (name.clone(), value.as_str().expect("a value").to_owned())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Root {
+            command,
+            environment,
+        }
+    })
+    .await;
+
+    let (created, failed) = hosted
+        .call(
+            "ask_user",
+            json!({
+                "request_id": "installed-ask",
+                "agent_name": "an installed agent",
+                "context": "the release branch is ready",
+                "question": "tag it now?",
+                "type": "confirm"
+            }),
+        )
+        .await;
+    assert!(!failed, "the installed server asked: {created}");
+    let question_id = created["question_id"]
+        .as_str()
+        .expect("an identifier")
+        .to_owned();
+    let token = created["caller_token"]
+        .as_str()
+        .expect("a token")
+        .to_owned();
+    let answered = hosted.kr(&["question", "answer", &question_id, "--yes"]);
+    assert!(
+        answered.status.success(),
+        "kr question answer: {}",
+        String::from_utf8_lossy(&answered.stderr)
+    );
+    let (waited, failed) = hosted
+        .call(
+            "wait_for_answer",
+            json!({"question_id": question_id, "caller_token": token, "wait_seconds": 20}),
+        )
+        .await;
+    assert!(!failed, "the wait answered: {waited}");
+    assert_eq!(waited["state"], "answered");
+    assert_eq!(
+        waited["answer"],
+        json!({"kind": "decision", "decided": true})
+    );
+
+    let (alerted, failed) = hosted
+        .call(
+            "send_notification",
+            json!({
+                "dedup_id": "release-tagged",
+                "agent_name": "an installed agent",
+                "text": "the release is tagged",
+                "severity": "info"
+            }),
+        )
+        .await;
+    assert!(!failed, "the installed server raised an alert: {alerted}");
+    assert_eq!(alerted["deduplicated"], json!(false));
+    let listed = hosted.kr(&["question", "list", "--include-resolved", "--json"]);
+    let listed: Value = serde_json::from_slice(&listed.stdout).expect("json");
+    assert_eq!(
+        listed["questions"].as_array().expect("questions").len(),
+        1,
+        "the alert asked nothing"
+    );
+}
+
+/// KR-REQ-11.52: the tool server is bound to the session by what the kernel reports about the
+/// process at the other end of the worker's socket, not by anything it sends: the question it
+/// created names that process with the start value the kernel records for it now, inside the
+/// session's own boundary, running the `kr` this test launched; the name the caller gave itself is
+/// kept apart as an unverified label.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_helper_is_bound_to_its_own_process_and_its_start_time() {
+    let hosted = hosted().await;
+    let (created, failed) = hosted
+        .call(
+            "ask_user",
+            json!({
+                "request_id": "bound",
+                "agent_name": "the host itself",
+                "context": "",
+                "question": "shall I?",
+                "type": "confirm"
+            }),
+        )
+        .await;
+    assert!(!failed, "{created}");
+    let question_id: kr_protocol::ids::QuestionId = created["question_id"]
+        .as_str()
+        .expect("an identifier")
+        .parse()
+        .expect("a question identifier");
+
+    let mut worker = hosted.worker().await;
+    let read: kr_protocol::question::QuestionReadResult = worker
+        .request(
+            kr_protocol::method::Method::QuestionRead,
+            &kr_protocol::question::QuestionReadParams {
+                session_id: hosted.session_id,
+                question_id: kr_protocol::scalars::Nullable::some(question_id),
+                include_resolved: false,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("the question reads")
+        .to_typed()
+        .expect("decodes");
+    let source = &read.questions[0].source;
+    let pid = u32::try_from(source.process.pid.get()).expect("a process identifier");
+    assert_eq!(
+        kr_ipc::identity::process_start_identity(pid).expect("the kernel names the process"),
+        source.process,
+        "the recorded identity is the live process, start value and all"
+    );
+    assert!(
+        source.session_member,
+        "the process is inside the session's boundary"
+    );
+    let executable = std::fs::canonicalize(
+        source
+            .executable
+            .as_ref()
+            .expect("the platform names the executable"),
+    )
+    .expect("the executable exists");
+    assert_eq!(
+        executable,
+        std::fs::canonicalize(&hosted.binary).expect("the launched binary"),
+        "the bound process runs the tool server this test launched"
+    );
+    assert_eq!(
+        source.agent_label.as_ref().map(String::as_str),
+        Some("the host itself"),
+        "the caller's own name is a label beside the identity, not the identity"
+    );
+}
+
+/// KR-REQ-11.55: `ask_user` returns, over the tool server's own standard streams, a durable
+/// question: its identifier, revision, state and expiry, with a 32-byte caller token; a creation
+/// that waits returns the question still pending when nobody answers; and the worker's journal,
+/// read through a connection of its own, holds that question with a keyed tag and a sealed copy of
+/// the token, never the token.
+#[tokio::test(flavor = "multi_thread")]
+async fn ask_user_returns_a_durable_question_and_its_token_over_the_helpers_own_streams() {
+    let hosted = hosted().await;
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_millis() as u64;
+    let (created, failed) = hosted
+        .call(
+            "ask_user",
+            json!({
+                "request_id": "durable",
+                "context": "",
+                "question": "shall I?",
+                "type": "confirm",
+                "wait_seconds": 1
+            }),
+        )
+        .await;
+    assert!(!failed, "{created}");
+    assert_eq!(
+        created["state"], "pending",
+        "the wait ran out and the question stands"
+    );
+    assert_eq!(created["revision"], json!(1));
+    let expires = created["expires_at_ms"].as_u64().expect("an expiry");
+    assert!(
+        expires > before && expires <= before + 24 * 60 * 60 * 1000 + 60_000,
+        "expires at {expires}, created after {before}"
+    );
+    let token = created["caller_token"].as_str().expect("a token");
+    assert_eq!(token.len(), 64, "32 bytes, in hexadecimal");
+    let token: Vec<u8> = (0..32)
+        .map(|index| u8::from_str_radix(&token[index * 2..index * 2 + 2], 16).expect("hexadecimal"))
+        .collect();
+    let question_id: kr_protocol::ids::QuestionId = created["question_id"]
+        .as_str()
+        .expect("an identifier")
+        .parse()
+        .expect("a question identifier");
+
+    let ledger = ledger(&hosted);
+    let stored = ledger.read(question_id).expect("the question is on disk");
+    assert_eq!(stored.state, kr_protocol::question::QuestionState::Pending);
+    assert_eq!(stored.revision.get(), 1);
+    let row = ledger.read_row(question_id).expect("its row");
+    assert_eq!(row.token_tag.len(), 32);
+    assert_ne!(row.token_tag, token);
+    assert!(
+        !row.token_sealed
+            .windows(token.len())
+            .any(|window| window == token.as_slice()),
+        "the sealed copy is not the token"
+    );
+}
+
+/// KR-REQ-11.57: one `wait_for_answer` call outlasts a single bounded broker wait: the tool server
+/// renews the broker wait itself, inside that one call, and returns the answer as soon as a person
+/// gives it; a wait that runs out returns the same question and neither recreates it nor records a
+/// second creation to notify anybody about; and the person's answer is written to the journal while
+/// the wait is in progress, so the wait holds a subscription rather than a transaction.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_wait_renews_its_broker_waits_and_returns_the_answer_when_it_comes() {
+    let hosted = hosted().await;
+    let (created, _) = hosted
+        .call(
+            "ask_user",
+            json!({
+                "request_id": "long-wait",
+                "context": "",
+                "question": "shall I?",
+                "type": "confirm"
+            }),
+        )
+        .await;
+    let question_id = created["question_id"]
+        .as_str()
+        .expect("an identifier")
+        .to_owned();
+    let token = created["caller_token"]
+        .as_str()
+        .expect("a token")
+        .to_owned();
+
+    let (timed_out, failed) = hosted
+        .call(
+            "wait_for_answer",
+            json!({"question_id": question_id, "caller_token": token, "wait_seconds": 1}),
+        )
+        .await;
+    assert!(!failed, "{timed_out}");
+    assert_eq!(timed_out["state"], "pending");
+    assert_eq!(timed_out["question_id"], created["question_id"]);
+    assert_eq!(timed_out["revision"], created["revision"]);
+
+    // A person answers a little after the first broker wait inside the next call has ended.
+    let renewal = std::time::Duration::from_millis(kr_protocol::question::WAIT_RENEWAL.get());
+    let binary = hosted.binary.clone();
+    let runtime_root = hosted.temp.paths().runtime_root().to_path_buf();
+    let state_root = hosted.temp.paths().state_root().to_path_buf();
+    let answering = question_id.clone();
+    let person = tokio::spawn(async move {
+        tokio::time::sleep(renewal + std::time::Duration::from_secs(2)).await;
+        tokio::task::spawn_blocking(move || {
+            kr_against(
+                &binary,
+                &runtime_root,
+                &state_root,
+                &["question", "answer", &answering, "--yes"],
+            )
+        })
+        .await
+        .expect("the answer ran")
+    });
+
+    let started = std::time::Instant::now();
+    let (waited, failed) = hosted
+        .call(
+            "wait_for_answer",
+            json!({"question_id": question_id, "caller_token": token, "wait_seconds": 40}),
+        )
+        .await;
+    let elapsed = started.elapsed();
+    let answered = person.await.expect("the person's task");
+    assert!(
+        answered.status.success(),
+        "the answer was written during the wait: {}",
+        String::from_utf8_lossy(&answered.stderr)
+    );
+    assert!(!failed, "{waited}");
+    assert_eq!(waited["state"], "answered");
+    assert_eq!(
+        waited["answer"],
+        json!({"kind": "decision", "decided": true})
+    );
+    assert!(
+        elapsed > renewal,
+        "the one call outlasted a single broker wait of {renewal:?}: {elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(40),
+        "the call returned when the answer came rather than at the end of its wait: {elapsed:?}"
+    );
+
+    let created_events = ledger(&hosted)
+        .events_since(0, 64)
+        .expect("the feed")
+        .into_iter()
+        .filter(|(_, event)| {
+            event.kind == kr_protocol::question::QuestionEventKind::Created
+                && event.question.question_id.to_string() == question_id
+        })
+        .count();
+    assert_eq!(
+        created_events, 1,
+        "nothing was created twice, and nobody was told twice"
+    );
+    let listed = hosted.kr(&["question", "list", "--include-resolved", "--json"]);
+    let listed: Value = serde_json::from_slice(&listed.stdout).expect("json");
+    assert_eq!(listed["questions"].as_array().expect("questions").len(), 1);
+}
+
+/// Reads this session's attention inbox, acknowledged items included.
+async fn inbox(
+    hosted: &Hosted,
+    worker: &mut kr_ipc::client::LocalClient,
+) -> Vec<kr_protocol::attention::AttentionItem> {
+    let result: kr_protocol::attention::AttentionReadResult = worker
+        .request(
+            kr_protocol::method::Method::AttentionRead,
+            &kr_protocol::attention::AttentionReadParams {
+                session_id: hosted.session_id,
+                include_acknowledged: true,
+                max_items: kr_protocol::scalars::U64::new(64),
+                after: kr_protocol::scalars::Nullable::null(),
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("the inbox reads")
+        .to_typed()
+        .expect("decodes");
+    result.items
+}
+
+/// KR-REQ-11.64: a person answering yes resolves the question and does nothing else: the session's
+/// attention inbox holds the question's own item and never an approval, before the answer and
+/// after it, and what the agent reads back is the decision alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_yes_resolves_the_question_and_raises_no_approval() {
+    use kr_protocol::attention::AttentionRule;
+
+    let hosted = hosted().await;
+    let (created, _) = hosted
+        .call(
+            "ask_user",
+            json!({
+                "request_id": "approve-this",
+                "context": "this deletes the release branch",
+                "question": "delete it?",
+                "type": "confirm"
+            }),
+        )
+        .await;
+    let question_id = created["question_id"]
+        .as_str()
+        .expect("an identifier")
+        .to_owned();
+    let token = created["caller_token"]
+        .as_str()
+        .expect("a token")
+        .to_owned();
+
+    // The question reaches the inbox as a pending input from a verified source. The worker's own
+    // maintenance feeds the inbox on its cadence; the test runs that same pass now rather than
+    // waiting for the next tick.
+    let mut worker = hosted.worker().await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let _ = hosted._service.attention_pass();
+        let items = inbox(&hosted, &mut worker).await;
+        assert!(
+            items
+                .iter()
+                .all(|item| item.rule != AttentionRule::PendingApproval),
+            "a question is not an approval: {items:?}"
+        );
+        if items
+            .iter()
+            .any(|item| item.rule == AttentionRule::PendingInput)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the question never reached the inbox: {items:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let answered = hosted.kr(&["question", "answer", &question_id, "--yes"]);
+    assert!(
+        answered.status.success(),
+        "kr question answer: {}",
+        String::from_utf8_lossy(&answered.stderr)
+    );
+    let (waited, failed) = hosted
+        .call(
+            "wait_for_answer",
+            json!({"question_id": question_id, "caller_token": token, "wait_seconds": 20}),
+        )
+        .await;
+    assert!(!failed, "{waited}");
+    assert_eq!(waited["state"], "answered");
+    assert_eq!(
+        waited["answer"],
+        json!({"kind": "decision", "decided": true}),
+        "the agent reads the decision and nothing else"
+    );
+
+    // Once the inbox has read the answer, it holds no approval: the yes raised none.
+    let _ = hosted._service.attention_pass();
+    let items = inbox(&hosted, &mut worker).await;
+    assert!(
+        items
+            .iter()
+            .all(|item| item.rule != AttentionRule::PendingApproval),
+        "an answer raised an approval: {items:?}"
     );
 }

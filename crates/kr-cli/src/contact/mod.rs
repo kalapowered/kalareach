@@ -663,6 +663,61 @@ mod tests {
         assert!(decode_token("abc").is_err());
     }
 
+    /// KR-REQ-11.54, KR-REQ-19.07: the four tools are the whole surface, and no parameter of any
+    /// of them selects a session, an environment, history or input: every call acts on the session
+    /// the worker bound this process to, so no call can enumerate another session, read it or send
+    /// it input.
+    #[test]
+    fn no_tool_takes_an_argument_that_reaches_another_session() {
+        let tools = Contact::tool_router().list_all();
+        let mut names: Vec<String> = tools.iter().map(|tool| tool.name.to_string()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "ask_user",
+                "cancel_question",
+                "send_notification",
+                "wait_for_answer"
+            ]
+        );
+        for tool in &tools {
+            let schema = serde_json::to_value(&*tool.input_schema).expect("a schema");
+            let mut parameters: Vec<&str> = schema["properties"]
+                .as_object()
+                .expect("the tool declares its parameters")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            parameters.sort_unstable();
+            let expected: &[&str] = match tool.name.as_ref() {
+                "ask_user" => &[
+                    "agent_name",
+                    "choices",
+                    "context",
+                    "expiry_seconds",
+                    "question",
+                    "request_id",
+                    "type",
+                    "wait_seconds",
+                ],
+                "wait_for_answer" => &["caller_token", "question_id", "wait_seconds"],
+                "cancel_question" => &["caller_token", "question_id"],
+                "send_notification" => &[
+                    "agent_name",
+                    "dedup_id",
+                    "safe_session_link",
+                    "severity",
+                    "text",
+                ],
+                other => panic!("an unexpected tool {other}"),
+            };
+            assert_eq!(parameters, expected, "{}", tool.name);
+        }
+    }
+
+    /// KR-REQ-11.53: outside a session the refusal is `NOT_IN_KR_SESSION` with the setup
+    /// instruction.
     #[test]
     fn a_refusal_carries_the_stable_code_and_the_setup_instruction() {
         let result = refusal(CliError::Refused(ProtocolError::new(
@@ -675,6 +730,8 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
     }
 
+    /// KR-REQ-11.57: with no qualified client deadline installed, a wait is kept short enough to
+    /// return inside any client's own default, however long the caller asked for.
     #[test]
     fn an_unqualified_wait_is_short_however_long_the_caller_asked_for() {
         // Nothing here knows what this client allows, so a request for longer is not honoured.
@@ -689,6 +746,8 @@ mod tests {
         );
     }
 
+    /// KR-REQ-11.55: the optional wait on `ask_user` is at most thirty seconds, and shorter when the
+    /// client's own deadline is.
     #[test]
     fn a_creation_wait_is_bounded_by_its_own_ceiling_and_by_the_client() {
         assert_eq!(
@@ -705,6 +764,8 @@ mod tests {
         );
     }
 
+    /// KR-REQ-11.57: a long poll honours the requested duration, defaults to five minutes, stops at
+    /// the ten-minute host ceiling, and is shortened to the installed client's qualified deadline.
     #[test]
     fn a_declared_deadline_bounds_both_the_default_and_an_explicit_wait() {
         let generous = Some(DurationMs::new(660_000));
@@ -736,6 +797,7 @@ mod tests {
         );
     }
 
+    /// KR-REQ-11.59: an `other` answer reaches the agent as free text, never as a choice or a yes.
     #[test]
     fn a_free_text_answer_is_reported_as_free_text() {
         let value = answer_value(&QuestionAnswer::Other {
