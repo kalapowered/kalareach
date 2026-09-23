@@ -13,8 +13,9 @@
 # What a person can see is read from the screen: every claim that something is on screen, in the
 # browser engines, the desktop window and the phones alike, is held to what the system's text
 # recognition reads in an image of it, taken as the page draws itself, every word whole and in
-# order. A page's structure only says where to look; what must be absent is counted in it with
-# hidden elements included. Without text recognition (macOS's Vision framework, compiled here with
+# order. A page's structure only says where to look. What must be absent is counted in the structure
+# with hidden elements included, and in a picture wherever its letters appear in a row, so a near
+# copy fails the claim. Without text recognition (macOS's Vision framework, compiled here with
 # swiftc) nothing a person sees can be checked, and the run says so.
 #
 # The page is the harness: the real screen against the scripted host. Its starting state comes from
@@ -271,14 +272,21 @@ image_shows() {
     done
 }
 
-# True when none of the phrases after the image path is read in it.
+# The letters and digits of a text alone, in lower case, with nothing between them.
+letters_of() {
+    printf '%s' "$1" | LC_ALL=C tr -cd '[:alnum:]' | LC_ALL=C tr '[:upper:]' '[:lower:]'
+}
+
+# True when none of the phrases after the image path is read in it. Absence errs the other way from
+# presence: a phrase counts as there wherever its letters appear in a row, even inside a longer
+# word, so a near copy of what must be absent fails the claim instead of passing it.
 image_lacks() {
     local image=$1 text phrase
     shift
     text="$("$ocr" "$image" 2>/dev/null)" || return 1
-    text="$(words_of "$text")"
+    text="$(letters_of "$text")"
     for phrase in "$@"; do
-        [[ "$text" == *"$(words_of "$phrase")"* ]] && return 1
+        [[ "$text" == *"$(letters_of "$phrase")"* ]] && return 1
     done
     return 0
 }
@@ -843,7 +851,7 @@ run_desktop() {
           if ((await page.getByText(word, { exact: false }).count()) !== 0) throw new Error(name + ' carried ' + word);
         }
         await settled();
-        await page.screenshot({ path: '$shots/' + name, fullPage: true });
+        await page.screenshot({ path: '$shots/' + name, fullPage: true, caret: 'initial' });
         console.log(['shot', row, name, how, words.join('|'), without.join('|')].join('\t'));
       };
       const start = async () => {

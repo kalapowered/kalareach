@@ -164,14 +164,14 @@ function readImage(image: string): string {
 
 /**
  * What a person can read in the one element `locator` names: the place is captured as the screen
- * draws it, animations included, and read by text recognition. Null while it is not one element on
- * screen.
+ * draws it, with nothing paused or hidden (animations and the text caret included), and read by
+ * text recognition. Null while it is not one element on screen.
  */
 async function readOnScreen(locator: Locator): Promise<string | null> {
   const image = `${imagesArgument}/kr-voice-reading.png`
   await settled(locator.page())
   try {
-    await locator.screenshot({ path: image, timeout: 1_000 })
+    await locator.screenshot({ path: image, caret: 'initial', timeout: 1_000 })
   } catch {
     return null
   }
