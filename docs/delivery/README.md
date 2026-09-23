@@ -90,9 +90,12 @@ authority over session content.
 
 **Recipients of an external message can read it.** Encrypted KalaReach routing does not change that,
 and every message says so in its own text. The content is intersected with the recipient's own
-authority: the host filter decides which interval of history the grant reaches, and the producer
-checks that each line's session is one the grant names. A line that fails either is left out, and
-the message says how many were left out and why.
+authority, which is the grant the destination's rule names, read from the host's grants at the
+moment of asking: a grant that is revoked, expired, not yet redeemed, issued for another
+environment, or one that does not let its holder view a session admits nothing. The host filter
+decides which interval of history the grant reaches, and the producer checks that each line's
+session is one the grant covers. A line that fails either is left out, and the message says how
+many were left out and why.
 
 Retry follows from the destination rather than from optimism. A destination that deduplicates by a
 delivery identifier the host chooses is presented again after an unknown outcome. One that does not

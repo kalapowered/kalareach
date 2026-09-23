@@ -5323,7 +5323,8 @@ mod tests {
             journal
                 .connection
                 .execute(
-                    "UPDATE delivery_notifications SET content = x'7b7d' WHERE notification_id = ?1",
+                    "UPDATE delivery_notifications SET content = x'7b7d'
+                      WHERE notification_id = ?1",
                     params![NotificationId::new(uuid(9)).to_string()],
                 )
                 .is_err(),

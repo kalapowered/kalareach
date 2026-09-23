@@ -27,10 +27,9 @@
 //! generation contract's `accepts_result` rule applied at the one place this crate publishes: a
 //! result from before the boundary belongs to work privacy mode cancelled.
 
-use std::collections::BTreeSet;
-
 use kr_attention::engine::Announcement;
 use kr_protocol::attention::{AttentionLevel, AttentionRule};
+use kr_protocol::grant::SessionSelector;
 use kr_protocol::ids::{EnvelopeId, EnvironmentId, NotificationId, SessionId};
 use kr_protocol::push::{PushAlert, PushDeliveryRequest, PushPlatformHints, PushUrgency};
 use kr_protocol::scalars::{Nullable, TimestampMs, Uuid};
@@ -215,16 +214,30 @@ pub const fn urgency_for(level: AttentionLevel) -> PushUrgency {
     }
 }
 
+/// What one rule's grant lets its recipient read.
+///
+/// Two answers, because the history filter decides *when* content may be seen and carries no
+/// resource selector, so which sessions' content may be read is a second answer rather than
+/// something the filter could have been asked for. The sessions are the grant's own selector
+/// rather than a list of the sessions that exist now: a grant that covers every session covers the
+/// one created a minute from now, and a list taken today would call that a change of authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecipientScope {
+    /// When content may be seen, and on which surfaces.
+    pub viewer: ViewerScope,
+    /// Which sessions' content may be read.
+    pub sessions: SessionSelector,
+}
+
 /// What a destination's rule grants the recipient.
 ///
-/// The host that owns the grant store answers it. The history filter decides *when* content may
-/// be seen and carries no resource selector, so the resources are a second answer rather than
-/// something the filter could have been asked for.
+/// The host that owns the grant store answers it.
 pub trait RecipientAuthority: std::fmt::Debug {
-    /// The viewer scope and the sessions one rule's grant names.
+    /// The scope one rule's grant gives its recipient.
     ///
-    /// `None` is a rule whose grant no longer exists or has been revoked, which admits nothing.
-    fn scope_for(&self, rule: &DeliveryRule) -> Option<(ViewerScope, BTreeSet<SessionId>)>;
+    /// `None` is a rule whose grant no longer exists, is not in force, or does not let its
+    /// recipient read session content, which admits nothing.
+    fn scope_for(&self, rule: &DeliveryRule) -> Option<RecipientScope>;
 }
 
 /// A digest of the authority one notification was admitted under.
@@ -239,12 +252,9 @@ pub trait RecipientAuthority: std::fmt::Debug {
 ///
 /// The scope is digested through its debug rendering, which is the only total view of it this
 /// crate has and is stable for a build: what matters is that two scopes that differ anywhere
-/// produce two digests.
+/// produce two digests. The session selector's rendering lists a named set in its canonical order.
 #[must_use]
-pub fn authority_digest(
-    rule: &DeliveryRule,
-    scope: Option<(&ViewerScope, &BTreeSet<SessionId>)>,
-) -> String {
+pub fn authority_digest(rule: &DeliveryRule, scope: Option<&RecipientScope>) -> String {
     use std::fmt::Write as _;
 
     let mut input = format!(
@@ -254,11 +264,8 @@ pub fn authority_digest(
             .map_or_else(|| "-".to_owned(), |grant| grant.to_string())
     );
     match scope {
-        Some((scope, sessions)) => {
-            let _ = write!(input, "scope={scope:?};sessions=");
-            for session in sessions {
-                let _ = write!(input, "{session},");
-            }
+        Some(RecipientScope { viewer, sessions }) => {
+            let _ = write!(input, "scope={viewer:?};sessions={sessions:?};");
         }
         None => input.push_str("scope=-;"),
     }
@@ -886,18 +893,18 @@ impl Producer {
         // Configuration is where it goes; the grant is what may go there. A rule whose grant has
         // been revoked admits nothing, and the destination's own configuration does not stand in
         // for it.
-        let (scope, sessions) = authority
+        let scope = authority
             .scope_for(rule)
             .ok_or_else(|| DeliveryError::NotAuthorised(destination.id.to_string()))?;
         let destination_digest = destination.binding_digest();
-        let authority_digest = authority_digest(rule, Some((&scope, &sessions)));
+        let authority_digest = authority_digest(rule, Some(&scope));
         let notification_id = preview::fresh_notification_id();
         let message = external::compose(
             external_destination.kind,
             notice.alert,
             lines.to_vec(),
-            &HistoryFilter::new(scope),
-            &sessions,
+            &HistoryFilter::new(scope.viewer),
+            &scope.sessions,
             external::delivery_id(external_destination, notification_id),
         )?;
         let content = serde_json::to_vec(&message_json(&message))
@@ -1047,6 +1054,8 @@ pub const MAX_NOTICE_LIFETIME_MS: u64 = MAX_EXPIRY_AHEAD_MS;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::destination::{
         DestinationKind, ExternalDestination, Idempotency, PreviewKeys, PushDestination,
@@ -1058,8 +1067,13 @@ mod tests {
     struct Everything(BTreeSet<SessionId>);
 
     impl RecipientAuthority for Everything {
-        fn scope_for(&self, _rule: &DeliveryRule) -> Option<(ViewerScope, BTreeSet<SessionId>)> {
-            Some((ViewerScope::owner(), self.0.clone()))
+        fn scope_for(&self, _rule: &DeliveryRule) -> Option<RecipientScope> {
+            Some(RecipientScope {
+                viewer: ViewerScope::owner(),
+                sessions: SessionSelector::These {
+                    session_ids: self.0.iter().copied().collect(),
+                },
+            })
         }
     }
 
@@ -1067,7 +1081,7 @@ mod tests {
     struct Revoked;
 
     impl RecipientAuthority for Revoked {
-        fn scope_for(&self, _rule: &DeliveryRule) -> Option<(ViewerScope, BTreeSet<SessionId>)> {
+        fn scope_for(&self, _rule: &DeliveryRule) -> Option<RecipientScope> {
             None
         }
     }

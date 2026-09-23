@@ -34,6 +34,7 @@
 
 use std::collections::BTreeSet;
 
+use kr_protocol::grant::SessionSelector;
 use kr_protocol::ids::{NotificationId, SessionId};
 use kr_protocol::push::PushAlert;
 use kr_protocol::scalars::TimestampMs;
@@ -172,8 +173,8 @@ pub trait ExternalSender: std::fmt::Debug {
 
 /// Composes one message from content the viewer is allowed to see.
 ///
-/// `granted_sessions` is what the grant names. The history filter decides *when*, so this decides
-/// *which resource*, which is the division the history filter states: its scope carries no
+/// `sessions` is the grant's own session selector. The history filter decides *when*, so this
+/// decides *which resource*, which is the division the history filter states: its scope carries no
 /// session selector and every caller checks its own resources.
 ///
 /// # Errors
@@ -185,7 +186,7 @@ pub fn compose(
     alert: PushAlert,
     lines: Vec<ContentLine>,
     filter: &HistoryFilter,
-    granted_sessions: &BTreeSet<SessionId>,
+    sessions: &SessionSelector,
     delivery_id: Option<String>,
 ) -> Result<ExternalMessage> {
     if !kind.recipients_read_the_content() {
@@ -209,7 +210,7 @@ pub fn compose(
     let mut candidates = Vec::new();
     for line in lines {
         match line.session_id {
-            Some(session) if !granted_sessions.contains(&session) => {
+            Some(session) if !sessions.admits(session) => {
                 count(Withheld::ResourceNotGranted, 1);
             }
             _ if line.produced_at_ms.is_none() => count(Withheld::NoProductionTime, 1),
@@ -492,8 +493,10 @@ mod tests {
         }
     }
 
-    fn granted(sessions: &[SessionId]) -> BTreeSet<SessionId> {
-        sessions.iter().copied().collect()
+    fn granted(sessions: &[SessionId]) -> SessionSelector {
+        SessionSelector::These {
+            session_ids: sessions.iter().copied().collect(),
+        }
     }
 
     fn webhook(idempotency: Idempotency) -> ExternalDestination {

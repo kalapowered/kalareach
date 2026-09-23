@@ -21,7 +21,9 @@ use kr_delivery::destination::{
 };
 use kr_delivery::external::{ExternalMessage, ExternalOutcome, ExternalSender};
 use kr_delivery::journal::{DeliveryState, EventSource};
-use kr_delivery::producer::{DEFAULT_NOTIFICATION_LIFETIME_MS, Notice, RecipientAuthority};
+use kr_delivery::producer::{
+    DEFAULT_NOTIFICATION_LIFETIME_MS, Notice, RecipientAuthority, RecipientScope,
+};
 use kr_delivery::push::{DeliveryStatus, PushSender, SendOutcome, SenderCredentials, StatusAnswer};
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::envelope::{ActionTarget, MutationRequest, ParamsValue};
@@ -362,8 +364,13 @@ impl SenderCredentials for FlakyRenewal {
 struct Granted(BTreeSet<SessionId>);
 
 impl RecipientAuthority for Granted {
-    fn scope_for(&self, _rule: &DeliveryRule) -> Option<(ViewerScope, BTreeSet<SessionId>)> {
-        Some((ViewerScope::owner(), self.0.clone()))
+    fn scope_for(&self, _rule: &DeliveryRule) -> Option<RecipientScope> {
+        Some(RecipientScope {
+            viewer: ViewerScope::owner(),
+            sessions: SessionSelector::These {
+                session_ids: self.0.iter().copied().collect(),
+            },
+        })
     }
 }
 
@@ -2220,9 +2227,15 @@ fn an_external_message_that_expires_during_the_authority_lookup_is_not_sent() {
     struct SlowAuthority(std::sync::atomic::AtomicBool);
 
     impl RecipientAuthority for SlowAuthority {
-        fn scope_for(&self, _rule: &DeliveryRule) -> Option<(ViewerScope, BTreeSet<SessionId>)> {
+        fn scope_for(&self, _rule: &DeliveryRule) -> Option<RecipientScope> {
             self.0.store(true, std::sync::atomic::Ordering::Relaxed);
-            Some((ViewerScope::owner(), BTreeSet::new()))
+            // The same authority the message was admitted under: only the time has moved.
+            Some(RecipientScope {
+                viewer: ViewerScope::owner(),
+                sessions: SessionSelector::These {
+                    session_ids: CanonicalSet::new(),
+                },
+            })
         }
     }
 
@@ -3070,8 +3083,9 @@ fn message_from_restores_withheld_metadata_and_rejects_invalid_timestamps() {
     let filter = kr_worker::history_filter::HistoryFilter::new(
         kr_worker::history_filter::ViewerScope::owner(),
     );
-    let mut granted_sessions = BTreeSet::new();
-    granted_sessions.insert(SessionId::new(uuid(1)));
+    let granted_sessions = SessionSelector::These {
+        session_ids: [SessionId::new(uuid(1))].into_iter().collect(),
+    };
 
     let line = kr_delivery::external::ContentLine {
         produced_at_ms: None, // Will cause NoProductionTime

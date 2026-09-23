@@ -44,6 +44,7 @@ use kr_protocol::scalars::{NotificationPreviewKey, TimestampMs};
 
 use crate::error::{ControllerError, Result};
 
+pub mod authority;
 pub mod client;
 pub mod credentials;
 pub mod status;
@@ -557,10 +558,10 @@ impl DeliveryModule {
         let now = if record.as_push().is_some() {
             kr_delivery::producer::authority_digest(rule, None)
         } else {
-            let Some((scope, sessions)) = authority.scope_for(rule) else {
+            let Some(scope) = authority.scope_for(rule) else {
                 return false;
             };
-            kr_delivery::producer::authority_digest(rule, Some((&scope, &sessions)))
+            kr_delivery::producer::authority_digest(rule, Some(&scope))
         };
         now == claimed.authority_digest
     }
