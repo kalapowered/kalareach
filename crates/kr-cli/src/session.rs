@@ -34,11 +34,14 @@ pub enum AttachOutcome {
         /// Whether something typed here was not delivered because the session was closing.
         undelivered: bool,
     },
-    /// The session closed while this terminal was attached, and how it closed did not reach it.
+    /// The session closed while this terminal was attached, and the closure it was sent could not
+    /// be read.
     ///
-    /// The session said it was closing, by refusing this terminal's input, and then its connection
-    /// ended without the closure; or the closure arrived in a form this build cannot read.
-    SessionClosed {
+    /// The session has ended, so this is no lost connection; how it ended is not known here, so it
+    /// is no success either.
+    ClosureUnreadable {
+        /// Why the closure could not be read.
+        detail: String,
         /// Whether something typed here was not delivered because the session was closing.
         undelivered: bool,
     },
@@ -67,8 +70,11 @@ impl AttachOutcome {
                 how_it_closed(record),
                 if *undelivered { UNDELIVERED } else { "" }
             ),
-            Self::SessionClosed { undelivered } => format!(
-                "the session closed{}",
+            Self::ClosureUnreadable {
+                detail,
+                undelivered,
+            } => format!(
+                "the session closed, and how it closed could not be read ({detail}){}",
                 if *undelivered { UNDELIVERED } else { "" }
             ),
             Self::LeaseLost => "another attachment took the input lease".to_owned(),
@@ -90,13 +96,17 @@ impl AttachOutcome {
 
     /// Returns whether this outcome is a failure the exit code must carry.
     ///
-    /// A closure is one when it was not clean: see [`closed_cleanly`].
+    /// A closure is one when it was not clean, see [`closed_cleanly`], or when it could not be
+    /// read.
     #[must_use]
     pub fn is_failure(&self) -> bool {
         match self {
-            Self::Detached | Self::SessionClosed { .. } => false,
+            Self::Detached => false,
             Self::Closed { record, .. } => !closed_cleanly(record),
-            Self::LeaseLost | Self::Disconnected | Self::DeliveryUncertain(_) => true,
+            Self::ClosureUnreadable { .. }
+            | Self::LeaseLost
+            | Self::Disconnected
+            | Self::DeliveryUncertain(_) => true,
         }
     }
 
@@ -104,10 +114,11 @@ impl AttachOutcome {
     #[must_use]
     pub fn into_error(self) -> Option<CliError> {
         match self {
-            Self::Detached | Self::SessionClosed { .. } => None,
+            Self::Detached => None,
             Self::Closed { ref record, .. } => {
                 (!closed_cleanly(record)).then(|| CliError::SessionClosed(self.detail()))
             }
+            Self::ClosureUnreadable { .. } => Some(CliError::SessionClosed(self.detail())),
             Self::LeaseLost => Some(CliError::Refused(kr_protocol::error::ProtocolError::new(
                 ErrorCode::LeaseLost,
                 self.detail(),
@@ -840,7 +851,8 @@ async fn drive(
     // and a size or a fresh screen is of no use to a session that is ending. The terminal stays,
     // showing what the session drains, until the closure arrives as the last thing on its stream,
     // so it ends with that closure's own status rather than a guess made halfway through it. The
-    // worker bounds how long that is, as it does for every attachment that is only watching.
+    // worker bounds how long that is, as it does for every attachment that is only watching; a
+    // connection that ends first ends this as a connection lost, like any other.
     let mut closing = false;
     // Whether something typed here was not delivered because the session was closing.
     let mut undelivered = false;
@@ -964,8 +976,12 @@ async fn drive(
                                     undelivered,
                                 },
                                 // A closure this build cannot read is still the end of the
-                                // session, and it is not a lost connection.
-                                Err(_) => AttachOutcome::SessionClosed { undelivered },
+                                // session, and it is not a lost connection. What it would have
+                                // said is not known, so it is not reported as a success.
+                                Err(error) => AttachOutcome::ClosureUnreadable {
+                                    detail: error.to_string(),
+                                    undelivered,
+                                },
                             };
                         }
                         if notification.event_type.as_str() == "session.output"
@@ -1350,10 +1366,10 @@ async fn drive(
                         }
                     }
                     Ok(_) => {}
-                    // A session that said it was closing and whose connection then ended without
-                    // the closure has closed: its worker has gone, and how is not known here. Any
-                    // other connection that ends is a connection lost.
-                    Err(_) if closing => return AttachOutcome::SessionClosed { undelivered },
+                    // A connection that ends without the closure is a connection lost, even after
+                    // the session said it was closing: a refusal says the session had begun to
+                    // close, not how it ended, and a worker that went before saying so may have
+                    // gone for any reason.
                     Err(_) => return AttachOutcome::Disconnected,
                 }
             }
@@ -1900,13 +1916,23 @@ mod tests {
             "the session closed: it was closed on request; what was typed while it was closing \
              was not delivered"
         );
-        let without_the_record = AttachOutcome::SessionClosed { undelivered: true };
-        assert_eq!(status(&without_the_record), 0);
+    }
+
+    /// A closure this build cannot read ends the attachment as a failure: the session ended, and
+    /// how it ended is not known.
+    #[test]
+    fn a_closure_that_cannot_be_read_is_not_reported_as_a_success() {
+        let outcome = AttachOutcome::ClosureUnreadable {
+            detail: "an unknown field".to_owned(),
+            undelivered: false,
+        };
+        assert_eq!(status(&outcome), 1);
+        assert!(outcome.is_failure());
         assert_eq!(
-            without_the_record.detail(),
-            "the session closed; what was typed while it was closing was not delivered"
+            outcome.detail(),
+            "the session closed, and how it closed could not be read (an unknown field)"
         );
-        assert_eq!(without_the_record.closure(), None);
+        assert_eq!(outcome.closure(), None);
     }
 
     /// A connection that ends without a closure still ends the command as a lost connection.
