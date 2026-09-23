@@ -58,6 +58,10 @@ public final class VoiceCall: NSObject {
     private let queue: DispatchQueue
     /// Every decision about the microphone, the speaker and the end of this call.
     private var control: VoiceCallControl!
+    /// Reads, while the audio device is on, how much audio the call's source has taken in, which is
+    /// what says the microphone is delivering. Touched only on ``queue``.
+    private var recorderTimer: DispatchSourceTimer?
+    private var recorderWatch = VoiceRecorderWatch()
 
     /// Whether the person has muted their own microphone.
     public var isMutedByPerson: Bool { control.isMutedByPerson }
@@ -68,7 +72,11 @@ public final class VoiceCall: NSObject {
     /// Builds a call for its offer and its answer, with the audio unit and the microphone off.
     ///
     /// No audio session is opened here: that waits for ``permit(voiceSessionId:closesAtEpochMs:)``,
-    /// so nothing but a call the host permitted can open the microphone.
+    /// so nothing but a call the host permitted can open the microphone. The call claims the
+    /// process's audio before anything it does can reach it, and a second call, while one holds it,
+    /// is refused without touching the first.
+    ///
+    /// - Throws: ``VoiceAudioError/callAlreadyRunning`` while another call holds the audio.
     public init(observer: VoiceCallObserver) throws {
         // Before the factory or any connection exists, so the audio unit cannot start by itself.
         AudioSession.shared.holdAudioUntilACallTurnsItOn()
@@ -111,9 +119,49 @@ public final class VoiceCall: NSObject {
         queue = DispatchQueue(label: "to.kala.reach.companion.voice-call")
         self.observer = observer
         super.init()
+        // Before the control exists: building it sets every switch off, and a call that does not
+        // hold the audio must not switch off the audio of the call that does.
+        guard AudioSession.shared.claim(self) else {
+            connection.close()
+            throw VoiceAudioError.callAlreadyRunning
+        }
         control = VoiceCallControl(platform: Platform(call: self), switches: Switches(call: self))
         connection.delegate = self
         connection.add(microphone, streamIds: ["kr-voice"])
+    }
+
+    /// Starts reading how much audio the source has taken in when the device comes on, and stops
+    /// when it goes off. The switch is set on every change; only a change of state restarts this.
+    private func watchRecorder(_ on: Bool) {
+        queue.async { [weak self] in
+            guard let self, on != (self.recorderTimer != nil) else { return }
+            self.recorderTimer?.cancel()
+            self.recorderTimer = nil
+            self.recorderWatch.reset()
+            guard on else { return }
+            let timer = DispatchSource.makeTimerSource(queue: self.queue)
+            timer.schedule(deadline: .now() + .milliseconds(250), repeating: .milliseconds(250))
+            timer.setEventHandler { [weak self] in self?.readCapturedAudio() }
+            timer.resume()
+            self.recorderTimer = timer
+        }
+    }
+
+    /// One reading of the local source's `totalSamplesDuration`, the seconds of audio it has taken
+    /// in, handed to the watch on this call's queue.
+    private func readCapturedAudio() {
+        connection.statistics { [weak self] report in
+            let source = report.statistics.values.first {
+                $0.type == "media-source" && ($0.values["kind"] as? String) == "audio"
+            }
+            let seconds = (source?.values["totalSamplesDuration"] as? NSNumber)?.doubleValue
+            self?.queue.async { [weak self] in
+                guard let self, self.recorderTimer != nil else { return }
+                if let running = self.recorderWatch.observe(capturedSeconds: seconds, atMs: VoiceCall.nowMs()) {
+                    self.control.recorder(running: running)
+                }
+            }
+        }
     }
 
     /// Opens the microphone for a call the host started.
@@ -192,7 +240,7 @@ public final class VoiceCall: NSObject {
 
         func activate() throws { try AudioSession.shared.activate(for: call) }
 
-        func deactivate() { try? AudioSession.shared.deactivate() }
+        func deactivate() { try? AudioSession.shared.deactivate(for: call) }
 
         func schedule(atMs: UInt64, _ task: @escaping () -> Void) -> () -> Void {
             let work = DispatchWorkItem(block: task)
@@ -201,9 +249,13 @@ public final class VoiceCall: NSObject {
             return { work.cancel() }
         }
 
-        func publish(_ state: VoiceCaptureState) { AudioSession.shared.publish(state) }
+        func publish(_ state: VoiceCaptureState) { AudioSession.shared.publish(state, for: call) }
 
-        func ended() { call.connection.close() }
+        func ended() {
+            call.watchRecorder(false)
+            call.connection.close()
+            AudioSession.shared.release(call)
+        }
     }
 
     /// The media, as the control sets it.
@@ -212,7 +264,10 @@ public final class VoiceCall: NSObject {
 
         init(call: VoiceCall) { self.call = call }
 
-        func setAudioDevice(_ on: Bool) { AudioSession.shared.setAudioEnabled(on) }
+        func setAudioDevice(_ on: Bool) {
+            AudioSession.shared.setAudioEnabled(on, for: call)
+            call.watchRecorder(on)
+        }
 
         func setMicrophone(_ on: Bool) { call.microphone.isEnabled = on }
 
@@ -239,8 +294,8 @@ extension VoiceCall: AudioSessionEvents {
         queue.async { [weak self] in self?.control.reset() }
     }
 
-    public func audioSessionRecorder(running: Bool) {
-        queue.async { [weak self] in self?.control.recorder(running: running) }
+    public func audioSessionRecorderStopped() {
+        queue.async { [weak self] in self?.control.recorder(running: false) }
     }
 }
 

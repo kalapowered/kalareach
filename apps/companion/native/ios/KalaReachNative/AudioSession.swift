@@ -31,8 +31,9 @@ public protocol AudioSessionEvents: AnyObject {
     func audioSessionRoute(changing: Bool, hasInput: Bool)
     /// The audio services were reset, and everything the session held is gone.
     func audioSessionReset()
-    /// WebRTC's audio unit started or stopped recording, or failed to start.
-    func audioSessionRecorder(running: Bool)
+    /// WebRTC's audio unit stopped, or failed to start. A start is not reported here: WebRTC says
+    /// only that playback or recording was asked to begin, which says nothing about the microphone.
+    func audioSessionRecorderStopped()
 }
 
 /// Configures and releases this application's audio session, and reports what the system does to it.
@@ -50,6 +51,9 @@ public final class AudioSession: NSObject, RTCAudioSessionDelegate {
     private let session = RTCAudioSession.sharedInstance()
     private var observers: [UUID: CaptureObserver] = [:]
     private var activatedForCall = false
+    /// The one call the process's audio belongs to. Every change below names its call and is
+    /// ignored for any other, so a call being built cannot touch the audio of a call that is running.
+    private let owner = VoiceAudioOwner()
     /// The call the session was activated for, which is told what the system does.
     private weak var call: AudioSessionEvents?
 
@@ -92,6 +96,13 @@ public final class AudioSession: NSObject, RTCAudioSessionDelegate {
         session.add(self)
     }
 
+    /// Makes `call` the one call the process's audio belongs to. False, and nothing changed, while
+    /// another call holds it.
+    public func claim(_ call: AudioSessionEvents) -> Bool { owner.claim(call) }
+
+    /// Gives the audio back, when `call` holds it.
+    public func release(_ call: AudioSessionEvents) { owner.release(call) }
+
     /// Holds WebRTC's audio unit off until a call turns it on. A call calls this before it builds
     /// its connection; the first use of ``shared`` has already done it, and this says so where the
     /// order matters.
@@ -120,6 +131,7 @@ public final class AudioSession: NSObject, RTCAudioSessionDelegate {
     /// started call and does not authorise unattended microphone activation, and §15 ¶22 says the
     /// microphone is never silently activated later without a fresh permitted active-call context.
     public func activate(for call: AudioSessionEvents) throws {
+        guard owner.holds(call) else { throw VoiceAudioError.callAlreadyRunning }
         guard AVAudioSession.sharedInstance().recordPermission == .granted else {
             capture = .unavailable
             throw VoiceAudioError.microphoneNotPermitted
@@ -137,17 +149,21 @@ public final class AudioSession: NSObject, RTCAudioSessionDelegate {
     }
 
     /// Lets WebRTC run its audio unit, recorder and player, or stops it. The call's one switch for
-    /// the audio device; nothing else turns it on.
-    public func setAudioEnabled(_ on: Bool) {
+    /// the audio device; nothing else turns it on, and a call that does not hold the audio changes
+    /// nothing.
+    public func setAudioEnabled(_ on: Bool, for call: AudioSessionEvents) {
+        guard owner.holds(call) else { return }
         session.lockForConfiguration()
         defer { session.unlockForConfiguration() }
         session.isAudioEnabled = on && activatedForCall
     }
 
-    /// Gives the session back, and tells whatever was interrupted that it may resume.
-    public func deactivate() throws {
+    /// Gives the session back, and tells whatever was interrupted that it may resume. Only the call
+    /// that holds the audio can.
+    public func deactivate(for call: AudioSessionEvents) throws {
+        guard owner.holds(call) else { return }
         activatedForCall = false
-        call = nil
+        self.call = nil
         session.lockForConfiguration()
         defer { session.unlockForConfiguration() }
         session.isAudioEnabled = false
@@ -158,8 +174,10 @@ public final class AudioSession: NSObject, RTCAudioSessionDelegate {
     /// Publishes what the microphone is doing, as the running call's gate decided it.
     ///
     /// The one way the state on the screen changes while a call runs, so it is always the gate's
-    /// answer and never a guess made here from one notification.
-    public func publish(_ state: VoiceCaptureState) {
+    /// answer and never a guess made here from one notification. Only the call that holds the audio
+    /// publishes.
+    public func publish(_ state: VoiceCaptureState, for call: AudioSessionEvents) {
+        guard owner.holds(call) else { return }
         capture = state
     }
 
@@ -224,18 +242,15 @@ public final class AudioSession: NSObject, RTCAudioSessionDelegate {
     }
 
     // What WebRTC's audio unit reports, on WebRTC's own threads. The call moves each report onto
-    // its own queue before acting on it.
-
-    public func audioSessionDidStartPlayOrRecord(_: RTCAudioSession) {
-        call?.audioSessionRecorder(running: true)
-    }
+    // its own queue before acting on it. Only a stop or a failure is taken from here: a start is read
+    // from the audio the call's source has taken in.
 
     public func audioSessionDidStopPlayOrRecord(_: RTCAudioSession) {
-        call?.audioSessionRecorder(running: false)
+        call?.audioSessionRecorderStopped()
     }
 
     public func audioSession(_: RTCAudioSession, audioUnitStartFailedWithError _: Error) {
-        call?.audioSessionRecorder(running: false)
+        call?.audioSessionRecorderStopped()
     }
 }
 

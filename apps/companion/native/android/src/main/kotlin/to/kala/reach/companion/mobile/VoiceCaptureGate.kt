@@ -160,12 +160,13 @@ class VoiceCaptureGate(private val keptIntervals: Int = 64) {
     fun displayed(nowMs: Long): VoiceCaptureState {
         settle(nowMs)
         val held = permit
+        // What the system did is said first: it is why the recorder stopped, when it did.
         return when {
             stopped || held == null || nowMs >= held.deadlineMs -> VoiceCaptureState.IDLE
-            !inputAvailable || !recorderRunning -> VoiceCaptureState.UNAVAILABLE
-            routeChanging -> VoiceCaptureState.ROUTE_CHANGING
             taken == Taken.FOCUS_LOST -> VoiceCaptureState.FOCUS_LOST
             taken == Taken.SUSPENDED -> VoiceCaptureState.SUSPENDED_BY_SYSTEM
+            routeChanging -> VoiceCaptureState.ROUTE_CHANGING
+            !inputAvailable || !recorderRunning -> VoiceCaptureState.UNAVAILABLE
             mutedByPerson -> VoiceCaptureState.MUTED_BY_PERSON
             else -> VoiceCaptureState.CAPTURING
         }

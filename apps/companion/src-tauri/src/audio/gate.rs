@@ -207,19 +207,17 @@ impl CaptureGate {
             .permit
             .as_ref()
             .is_some_and(|held| now_ms < held.deadline_ms);
+        // What the system did is said first: it is why the recorder stopped, when it did.
         if inner.stopped || !live {
-            "idle"
-        } else if !inner.input_available || !inner.recorder_running {
-            "unavailable"
-        } else if inner.route_changing {
-            "route_changing"
-        } else {
-            match inner.taken {
-                Taken::Interrupted => "interrupted",
-                Taken::Suspended => "suspended_by_system",
-                Taken::None if inner.muted_by_person => "muted_by_person",
-                Taken::None => "capturing",
-            }
+            return "idle";
+        }
+        match inner.taken {
+            Taken::Interrupted => "interrupted",
+            Taken::Suspended => "suspended_by_system",
+            Taken::None if inner.route_changing => "route_changing",
+            Taken::None if !inner.input_available || !inner.recorder_running => "unavailable",
+            Taken::None if inner.muted_by_person => "muted_by_person",
+            Taken::None => "capturing",
         }
     }
 

@@ -265,13 +265,15 @@ public final class VoiceCaptureGate: @unchecked Sendable {
         locked {
             settle(nowMs)
             guard !stopped, let held = permit, nowMs < held.deadlineMs else { return .idle }
-            if !inputAvailable || !recorderRunning { return .unavailable }
-            if routeChanging { return .routeChanging }
+            // What the system did is said first: it is why the recorder stopped, when it did.
             switch taken {
             case .interrupted: return .interrupted
             case .suspended: return .suspendedBySystem
-            case .none: return mutedByPerson ? .mutedByPerson : .capturing
+            case .none: break
             }
+            if routeChanging { return .routeChanging }
+            if !inputAvailable || !recorderRunning { return .unavailable }
+            return mutedByPerson ? .mutedByPerson : .capturing
         }
     }
 
@@ -561,5 +563,89 @@ public final class VoiceCallControl: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return body()
+    }
+}
+
+/// The one call this process's audio belongs to.
+///
+/// The audio session and the audio unit are the process's, not a call's, so a call that is being
+/// built must not touch them while another call holds them: a second call's constructor switching
+/// the audio off would silence the call that is running. A call claims the audio before anything it
+/// does can reach it, gives it back when it ends, and every change to the shared audio names the
+/// call making it and is ignored when that call is not the holder.
+public final class VoiceAudioOwner: @unchecked Sendable {
+    private let lock = NSLock()
+    private weak var holder: AnyObject?
+
+    public init() {}
+
+    /// Makes `call` the holder. False, and nothing changed, when another call still holds it.
+    public func claim(_ call: AnyObject) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if let current = holder, current !== call { return false }
+        holder = call
+        return true
+    }
+
+    /// Gives the audio back, when `call` is the holder.
+    public func release(_ call: AnyObject) {
+        lock.lock()
+        defer { lock.unlock() }
+        if holder === call { holder = nil }
+    }
+
+    /// Whether `call` holds the audio.
+    public func holds(_ call: AnyObject) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return holder === call
+    }
+}
+
+/// Whether the microphone is delivering audio, read from how much audio the call's source has taken
+/// in so far.
+///
+/// WebRTC's audio session says only that playback or recording was asked to start, which a call
+/// that plays and records nothing would also report. What the source has taken in is the
+/// recorder's own work: while that total grows the microphone is delivering audio, and once it has
+/// not grown for `quietMs` it is not. The first reading after the device comes on is where the count
+/// starts, not growth.
+public struct VoiceRecorderWatch: Sendable {
+    private let quietMs: UInt64
+    private var last: Double?
+    private var grewAtMs: UInt64?
+    private var running = false
+
+    public init(quietMs: UInt64 = 750) {
+        self.quietMs = quietMs
+    }
+
+    /// Takes one reading of the source's total captured seconds, nil when the report had none, at
+    /// `atMs` on the monotonic clock. Answers the recorder's new state when it changed, else nil.
+    public mutating func observe(capturedSeconds: Double?, atMs: UInt64) -> Bool? {
+        if let total = capturedSeconds {
+            defer { last = total }
+            if let previous = last, total > previous {
+                grewAtMs = atMs
+                if !running {
+                    running = true
+                    return true
+                }
+                return nil
+            }
+        }
+        if running, atMs >= (grewAtMs ?? atMs) + quietMs {
+            running = false
+            return false
+        }
+        return nil
+    }
+
+    /// Starts afresh, for a device that has just come on or gone off.
+    public mutating func reset() {
+        last = nil
+        grewAtMs = nil
+        running = false
     }
 }

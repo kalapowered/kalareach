@@ -407,10 +407,11 @@ final class VoiceCallControlTests: XCTestCase {
         XCTAssertTrue(platform.timers.isEmpty)
     }
 
-    /// KR-REQ-15.34 and KR-ACC-014: a timer that never runs does not keep the microphone carrying
-    /// speech. The next change of any kind after the deadline ends the call, and the record vouches
-    /// for nothing from the deadline on.
-    func testAStalledTimerDoesNotKeepTheMicrophoneOn() {
+    /// KR-REQ-15.34 and KR-ACC-014: when the timer is late, the first change of any kind after the
+    /// deadline ends the call, and the record vouches for nothing from the deadline on. Until the
+    /// call's queue runs the timer or delivers such a change, the switches stay as they were: iOS has
+    /// no per-frame check.
+    func testAChangeAfterTheDeadlineEndsTheCallWhenTheTimerIsLate() {
         let (control, platform, switches) = running(seconds: 30)
         platform.now = 1_000 + 30_000
         XCTAssertFalse(control.couldHaveHeard(atMs: 1_000 + 30_000))
@@ -467,6 +468,51 @@ final class VoiceCallControlTests: XCTestCase {
         XCTAssertEqual(muted.displayed(), .mutedByPerson)
     }
 
+    /// KR-REQ-15.34: the process's audio belongs to one call. A second call is refused before it can
+    /// build anything that sets a switch, and a switch set for a call that does not hold the audio
+    /// changes nothing, so the running call keeps its audio.
+    func testASecondCallIsRefusedWithoutTouchingTheAudioOfTheFirst() {
+        final class SharedDevice { var on = false }
+        final class OwnedSwitches: VoiceMediaSwitches {
+            let owner: VoiceAudioOwner
+            let device: SharedDevice
+            let call: AnyObject
+            init(owner: VoiceAudioOwner, device: SharedDevice, call: AnyObject) {
+                self.owner = owner
+                self.device = device
+                self.call = call
+            }
+            func setAudioDevice(_ on: Bool) { if owner.holds(call) { device.on = on } }
+            func setMicrophone(_: Bool) {}
+            func setPlayback(_: Bool) {}
+        }
+        let owner = VoiceAudioOwner()
+        let device = SharedDevice()
+        let first = NSObject()
+        XCTAssertTrue(owner.claim(first))
+        let platform = Platform()
+        let control = VoiceCallControl(
+            platform: platform,
+            switches: OwnedSwitches(owner: owner, device: device, call: first)
+        )
+        XCTAssertTrue(control.permit(voiceSessionId: "voice-session-1", closesAtEpochMs: platform.closesIn(60)))
+        XCTAssertTrue(device.on)
+
+        let second = NSObject()
+        XCTAssertFalse(owner.claim(second), "a second call is refused while the first holds the audio")
+        // What building a control for the second call would do: every switch off, which changes
+        // nothing it does not hold.
+        _ = VoiceCallControl(platform: Platform(), switches: OwnedSwitches(owner: owner, device: device, call: second))
+        XCTAssertTrue(device.on, "the running call keeps its audio")
+
+        control.stop()
+        XCTAssertFalse(device.on)
+        owner.release(second)
+        XCTAssertFalse(owner.claim(second), "only the holder gives the audio back")
+        owner.release(first)
+        XCTAssertTrue(owner.claim(second), "the audio is free once the first call has given it back")
+    }
+
     /// KR-REQ-15.35: the end of a call is final, and the second end does nothing.
     func testAnEndedCallStaysEnded() {
         let (control, platform, switches) = running()
@@ -478,5 +524,49 @@ final class VoiceCallControlTests: XCTestCase {
         control.recorder(running: true)
         XCTAssertFalse(control.permit(voiceSessionId: "voice-session-2", closesAtEpochMs: platform.closesIn(60)))
         XCTAssertFalse(switches.deviceOn || switches.microphoneOn || switches.playbackOn)
+    }
+}
+
+/// KR-REQ-15.36: on iOS the recorder counts as running while the call's source is taking in audio,
+/// and not because WebRTC said playback or recording was asked to begin.
+final class VoiceRecorderWatchTests: XCTestCase {
+    /// A call that plays and records nothing, or reports no source at all, never counts as recording.
+    func testPlaybackAloneIsNotARecorder() {
+        var watch = VoiceRecorderWatch()
+        let readings: [Double?] = [nil, 0, 0, nil, 0, 0]
+        for (index, reading) in readings.enumerated() {
+            XCTAssertNil(watch.observe(capturedSeconds: reading, atMs: UInt64(index) * 250))
+        }
+    }
+
+    /// An input that started and delivers nothing is not recording, whatever was reported about it.
+    func testAnInputThatNeverDeliversIsNotARecorder() {
+        var watch = VoiceRecorderWatch()
+        for index in 0 ..< 8 {
+            XCTAssertNil(watch.observe(capturedSeconds: 1.5, atMs: UInt64(index) * 250))
+        }
+    }
+
+    /// Audio arriving is the start, and the source taking in nothing for the quiet time is the stop.
+    func testAudioArrivingStartsItAndNothingArrivingStopsIt() {
+        var watch = VoiceRecorderWatch(quietMs: 750)
+        XCTAssertNil(watch.observe(capturedSeconds: 0, atMs: 0), "the first reading is where counting starts")
+        XCTAssertEqual(watch.observe(capturedSeconds: 0.25, atMs: 250), true)
+        XCTAssertNil(watch.observe(capturedSeconds: 0.5, atMs: 500))
+        XCTAssertNil(watch.observe(capturedSeconds: 0.5, atMs: 750))
+        XCTAssertNil(watch.observe(capturedSeconds: nil, atMs: 1_000))
+        XCTAssertEqual(watch.observe(capturedSeconds: 0.5, atMs: 1_250), false)
+        XCTAssertNil(watch.observe(capturedSeconds: 0.5, atMs: 1_500))
+        XCTAssertEqual(watch.observe(capturedSeconds: 0.75, atMs: 1_750), true)
+    }
+
+    /// After a reset, for a device that went off and came on again, counting starts afresh.
+    func testAResetStartsCountingAfresh() {
+        var watch = VoiceRecorderWatch()
+        XCTAssertNil(watch.observe(capturedSeconds: 0, atMs: 0))
+        XCTAssertEqual(watch.observe(capturedSeconds: 0.25, atMs: 250), true)
+        watch.reset()
+        XCTAssertNil(watch.observe(capturedSeconds: 10, atMs: 500), "the first reading after a reset is where counting starts")
+        XCTAssertEqual(watch.observe(capturedSeconds: 10.25, atMs: 750), true)
     }
 }
