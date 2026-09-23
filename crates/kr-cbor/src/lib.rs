@@ -90,6 +90,6 @@ pub use crate::serde_bridge::{
     to_canonical_vec, to_canonical_vec_within, to_ciborium,
 };
 pub use crate::shape::{
-    AdmittedMember, Checked, Extensions, Member, ObjectShape, Shape, Undeclared, check,
+    AdmittedMember, Checked, Extensions, Member, ObjectShape, Shape, TaggedShape, Undeclared, check,
 };
 pub use crate::value::{CanonicalMap, CanonicalValue, Integer, compare_keys};

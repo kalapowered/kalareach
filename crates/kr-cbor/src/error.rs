@@ -194,6 +194,19 @@ pub enum CborError {
         field: String,
     },
 
+    /// An object's tag names a variant its schema does not have.
+    ///
+    /// Found by [`crate::check`] before typed decoding runs, never by the typed decoder.
+    #[error("{at} names the variant {variant:?} in {tag:?}, which its schema does not have")]
+    UnknownVariant {
+        /// The object, by schema name where it has one, and where it is in the message.
+        at: String,
+        /// The field whose text selects the variant.
+        tag: String,
+        /// The text it carried.
+        variant: String,
+    },
+
     /// An object carries a member of an extension that is not admitted there.
     ///
     /// Found by [`crate::check`] before typed decoding runs, never by the typed decoder.
@@ -231,9 +244,9 @@ impl CborError {
     /// Returns the stable rule identifier for this failure.
     ///
     /// The cross-language fixtures under `fixtures/cbor/` name the expected rule with these
-    /// strings, so the Rust and TypeScript decoders must agree on the byte rules. `unknown_field`
-    /// and `unnegotiated_extension` come from [`crate::check`], which reads a message against its
-    /// schema rather than its bytes.
+    /// strings, so the Rust and TypeScript decoders must agree on the byte rules. `unknown_field`,
+    /// `unknown_variant` and `unnegotiated_extension` come from [`crate::check`], which reads a
+    /// message against its schema rather than its bytes.
     #[must_use]
     pub fn rule(&self) -> &'static str {
         match self {
@@ -261,6 +274,7 @@ impl CborError {
             Self::IntegerOutOfRange { .. } => "integer_out_of_range",
             Self::NonCanonical => "non_canonical",
             Self::UnknownField { .. } => "unknown_field",
+            Self::UnknownVariant { .. } => "unknown_variant",
             Self::UnnegotiatedExtension { .. } => "unnegotiated_extension",
             Self::Unrepresentable { .. } => "unrepresentable",
             Self::Serialize { .. } => "serialize_failed",

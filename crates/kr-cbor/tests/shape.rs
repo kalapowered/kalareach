@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use kr_cbor::{
-    CanonicalMap, CanonicalValue, CborError, Extensions, Member, ObjectShape, Shape, Undeclared,
-    check,
+    CanonicalMap, CanonicalValue, CborError, Extensions, Member, ObjectShape, Shape, TaggedShape,
+    Undeclared, check,
 };
 
 /// Every undeclared key is an ordinary field.
@@ -18,13 +18,19 @@ impl Extensions for NoMembers {
     }
 }
 
-/// Keys that start with `ext.` are extension members; `ext.admitted` is admitted in `Admits` only.
+/// Keys that start with `ext.` are extension members; `ext.admitted` is admitted in `Admits` only,
+/// with any value, and `ext.block` in `Admits` only, as a closed object declaring `level`.
 struct Dotted;
 
 impl Extensions for Dotted {
-    fn classify(&self, object: &ObjectShape, key: &str) -> Member {
-        match (key, object.name.as_deref()) {
-            ("ext.admitted", Some("Admits")) => Member::Admitted,
+    fn classify(&self, target: &ObjectShape, key: &str) -> Member {
+        match (key, target.name.as_deref()) {
+            ("ext.admitted", Some("Admits")) => Member::Admitted(Arc::new(Shape::Any)),
+            ("ext.block", Some("Admits")) => Member::Admitted(Arc::new(object(
+                "Block",
+                &[("level", Shape::Scalar)],
+                Undeclared::Refuse,
+            ))),
             (key, _) if key.starts_with("ext.") => Member::Refused,
             _ => Member::Field,
         }
@@ -265,4 +271,114 @@ fn an_opaque_value_is_not_read() {
         map(&[("anything", int(1)), ("ext.other", int(2))]),
     )]);
     check(&value, &shape, &Dotted).expect("opaque");
+}
+
+/// `{"kind": "text", "text": ...}` or `{"kind": "number", "number": ...}`, told apart by `kind`.
+fn tagged() -> Shape {
+    let variant = |kind: &str, field: &str| {
+        let Shape::Object(object) = object(
+            "Answer",
+            &[("kind", Shape::Scalar), (field, Shape::Scalar)],
+            Undeclared::Refuse,
+        ) else {
+            unreachable!("an object shape");
+        };
+        (kind.to_owned(), object)
+    };
+    Shape::Tagged(Arc::new(TaggedShape::new(
+        Some("Answer".to_owned()),
+        "kind".to_owned(),
+        [variant("text", "text"), variant("number", "number")]
+            .into_iter()
+            .collect(),
+    )))
+}
+
+#[test]
+fn a_tagged_variant_is_checked_against_the_variant_its_tag_names() {
+    let shape = tagged();
+    check(
+        &map(&[
+            ("kind", CanonicalValue::text("text")),
+            ("text", CanonicalValue::text("x")),
+        ]),
+        &shape,
+        &NoMembers,
+    )
+    .expect("the variant its tag names");
+
+    // The fields of one variant under the tag of another: the tag decides, as it does for the typed
+    // decoder, so the field is undeclared.
+    assert_eq!(
+        check(
+            &map(&[
+                ("kind", CanonicalValue::text("number")),
+                ("text", CanonicalValue::text("x"))
+            ]),
+            &shape,
+            &NoMembers
+        )
+        .expect_err("refused"),
+        CborError::UnknownField {
+            at: "Answer".to_owned(),
+            field: "text".to_owned()
+        }
+    );
+
+    let error = check(
+        &map(&[
+            ("kind", CanonicalValue::text("other")),
+            ("text", CanonicalValue::text("x")),
+        ]),
+        &shape,
+        &NoMembers,
+    )
+    .expect_err("refused");
+    assert_eq!(
+        error,
+        CborError::UnknownVariant {
+            at: "Answer".to_owned(),
+            tag: "kind".to_owned(),
+            variant: "other".to_owned()
+        }
+    );
+    assert_eq!(error.rule(), "unknown_variant");
+
+    // Without a tag no one variant applies: a key no variant declares is refused, and the rest is
+    // the typed layer's, which refuses the missing tag.
+    assert_eq!(
+        check(&map(&[("zz", int(1))]), &shape, &NoMembers).expect_err("refused"),
+        CborError::UnknownField {
+            at: "Answer".to_owned(),
+            field: "zz".to_owned()
+        }
+    );
+    check(
+        &map(&[("text", CanonicalValue::text("x"))]),
+        &shape,
+        &NoMembers,
+    )
+    .expect("declared by a variant");
+}
+
+#[test]
+fn an_admitted_member_is_checked_against_its_own_schema_before_it_is_taken_out() {
+    let admits = object("Admits", &[("known", Shape::Scalar)], Undeclared::Refuse);
+    let value = map(&[("known", int(1)), ("ext.block", map(&[("level", int(2))]))]);
+    let checked = check(&value, &admits, &Dotted).expect("admitted");
+    assert_eq!(checked.value.into_owned(), map(&[("known", int(1))]));
+    assert_eq!(checked.members[0].key, "ext.block");
+    assert_eq!(checked.members[0].value, map(&[("level", int(2))]));
+
+    let widened = map(&[
+        ("known", int(1)),
+        ("ext.block", map(&[("level", int(2)), ("zz", int(3))])),
+    ]);
+    assert_eq!(
+        check(&widened, &admits, &Dotted).expect_err("refused"),
+        CborError::UnknownField {
+            at: "Block at /ext.block".to_owned(),
+            field: "zz".to_owned()
+        }
+    );
 }

@@ -39,12 +39,89 @@ pub enum Shape {
     Map(Arc<Shape>),
     /// A map whose keys are the fields an object declares.
     Object(Arc<ObjectShape>),
+    /// An object that is one of several variants, told apart by the text of one field.
+    ///
+    /// The field's value selects the variant whose fields apply, exactly as the typed decoder
+    /// selects it, so a message that names one variant is never checked against another's fields.
+    Tagged(Arc<TaggedShape>),
     /// A value that has one of these shapes.
     ///
     /// They are tried in order and the first that accepts the value decides. A shape that expects
     /// a container is not tried against a scalar, or the other way round, which is what tells a
-    /// variant carried by name from a variant carried with content.
+    /// variant carried by name from a variant carried with content. Alternatives are only ever
+    /// objects that declare different keys, or shapes of different kinds, so no two of them accept
+    /// the same value; variants that share keys are a [`Shape::Tagged`].
     OneOf(Arc<[Shape]>),
+}
+
+/// Variants of one object, selected by the text of their tag field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaggedShape {
+    tag: String,
+    variants: BTreeMap<String, Arc<ObjectShape>>,
+    any_variant: ObjectShape,
+}
+
+impl TaggedShape {
+    /// Builds the variants of an object told apart by the field `tag`.
+    ///
+    /// Each variant's fields include the tag itself. `name` is the schema name of the whole union.
+    #[must_use]
+    pub fn new(
+        name: Option<String>,
+        tag: String,
+        variants: BTreeMap<String, Arc<ObjectShape>>,
+    ) -> Self {
+        let mut fields: BTreeMap<String, Vec<Shape>> = BTreeMap::new();
+        for variant in variants.values() {
+            for (field, shape) in &variant.fields {
+                let shapes = fields.entry(field.clone()).or_default();
+                if !shapes.contains(shape) {
+                    shapes.push(shape.clone());
+                }
+            }
+        }
+        let undeclared = if variants
+            .values()
+            .all(|variant| variant.undeclared == Undeclared::Ignore)
+        {
+            Undeclared::Ignore
+        } else {
+            Undeclared::Refuse
+        };
+        let any_variant = ObjectShape {
+            name,
+            fields: fields
+                .into_iter()
+                .map(|(field, mut shapes)| {
+                    let shape = if shapes.len() == 1 {
+                        shapes.remove(0)
+                    } else {
+                        Shape::OneOf(shapes.into())
+                    };
+                    (field, shape)
+                })
+                .collect(),
+            undeclared,
+        };
+        Self {
+            tag,
+            variants,
+            any_variant,
+        }
+    }
+
+    /// The field whose text selects the variant.
+    #[must_use]
+    pub fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    /// Every variant, by the text of its tag.
+    #[must_use]
+    pub const fn variants(&self) -> &BTreeMap<String, Arc<ObjectShape>> {
+        &self.variants
+    }
 }
 
 /// One object: the fields it declares and what happens to a key it does not.
@@ -79,13 +156,14 @@ pub trait Extensions {
 }
 
 /// What an undeclared key is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Member {
     /// An ordinary field. The object's [`Undeclared`] rule decides.
     Field,
-    /// A member of an extension admitted in this object. It is removed before typed decoding and
-    /// returned in [`Checked::members`].
-    Admitted,
+    /// A member of an extension admitted in this object, whose value has the given shape. The
+    /// value is checked against it, then removed before typed decoding and returned in
+    /// [`Checked::members`].
+    Admitted(Arc<Shape>),
     /// A member of an extension that is not admitted in this object. The message is refused.
     Refused,
 }
@@ -118,8 +196,9 @@ pub struct AdmittedMember {
 /// # Errors
 ///
 /// Returns [`CborError::UnknownField`] for an undeclared ordinary key in an object that refuses
-/// one, and [`CborError::UnnegotiatedExtension`] for an extension member the policy refuses. The
-/// error names the object and where it is in the message.
+/// one, [`CborError::UnknownVariant`] for a tag naming no variant, and
+/// [`CborError::UnnegotiatedExtension`] for an extension member the policy refuses. The error
+/// names the object and where it is in the message.
 pub fn check<'a>(
     value: &'a CanonicalValue,
     shape: &Shape,
@@ -167,6 +246,7 @@ impl<'v> Walk<'_, 'v> {
             (Shape::Array(item), CanonicalValue::Array(items)) => self.array(items, item),
             (Shape::Map(member), CanonicalValue::Map(map)) => self.map(map, member),
             (Shape::Object(object), CanonicalValue::Map(map)) => self.object(map, object),
+            (Shape::Tagged(tagged), CanonicalValue::Map(map)) => self.tagged(map, tagged),
             (Shape::OneOf(shapes), _) => self.one_of(value, shapes),
             // Opaque, scalar, or a value whose kind is not the one the shape describes: there is
             // nothing here the check can read, and the typed layer refuses a wrong kind.
@@ -215,12 +295,16 @@ impl<'v> Walk<'_, 'v> {
                 outcome?.map(Some)
             } else {
                 match self.extensions.classify(object, key) {
-                    Member::Admitted => {
+                    Member::Admitted(member) => {
+                        self.path.push(Step::Key(key));
+                        let outcome = self.value(entry, &member);
+                        self.path.pop();
+                        let value = outcome?.unwrap_or_else(|| entry.clone());
                         self.members.push(AdmittedMember {
                             object: object.name.clone(),
                             path: self.pointer(),
                             key: key.clone(),
-                            value: entry.clone(),
+                            value,
                         });
                         Some(None)
                     }
@@ -244,6 +328,22 @@ impl<'v> Walk<'_, 'v> {
             keep(&mut rewritten, map, index, key, entry, change);
         }
         Ok(rewritten.map(sorted_map))
+    }
+
+    fn tagged(&mut self, map: &'v CanonicalMap, tagged: &TaggedShape) -> Rewrite {
+        match map.get(&tagged.tag) {
+            Some(CanonicalValue::Text(variant)) => match tagged.variants.get(variant) {
+                Some(object) => self.object(map, object),
+                None => Err(self.failure(CborError::UnknownVariant {
+                    at: self.describe(&tagged.any_variant),
+                    tag: tagged.tag.clone(),
+                    variant: variant.clone(),
+                })),
+            },
+            // No variant is named, so no one variant's fields apply: a key that no variant declares
+            // is refused here, and the typed layer refuses the missing or malformed tag.
+            _ => self.object(map, &tagged.any_variant),
+        }
     }
 
     fn one_of(&mut self, value: &'v CanonicalValue, shapes: &[Shape]) -> Rewrite {
@@ -308,7 +408,9 @@ fn kind_fits(value: &CanonicalValue, shape: &Shape) -> bool {
         Shape::Any | Shape::OneOf(_) => true,
         Shape::Scalar => !container,
         Shape::Array(_) => matches!(value, CanonicalValue::Array(_)),
-        Shape::Map(_) | Shape::Object(_) => matches!(value, CanonicalValue::Map(_)),
+        Shape::Map(_) | Shape::Object(_) | Shape::Tagged(_) => {
+            matches!(value, CanonicalValue::Map(_))
+        }
     }
 }
 
