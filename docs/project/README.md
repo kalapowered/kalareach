@@ -72,14 +72,18 @@ Where a repository was created is recorded, and it is not permission to read it:
 through a destination location is read through a location only once the owner binds it to a source
 location. A workspace made through a location reads its repository through that binding, is always
 an independent clone (a linked worktree writes its path into the repository it shares, which no
-location reaches), and is removed through the location it was made in.
+location reaches), and is removed through the location it was made in. A workspace made through no
+location is reached through none: a caller bounded by a grant is refused its removal, whatever it
+may read.
 
 **Every location a request names is asked again before each step.** It is admitted when the request
 is resolved, again inside the transaction that begins the effect, and again immediately before every
 read through it: every Git invocation and every copy a materialisation makes. A preview is a read. A
 withdrawal refuses the next of these, so an operation whose location was withdrawn part way fails at
 its next read, and a staging directory it had made in that location is kept and named with the
-reason rather than removed through a location that no longer admits it.
+reason rather than removed through a location that no longer admits it. A publication that failed
+part way is reconciled through its destination only while the location still admits it; otherwise
+it is settled from the journal, as a replacement daemon settles one.
 
 **A repository reached through a location is found by this host, not by Git.** Git opens a
 repository's metadata for itself, so a check made after it is too late. Before any invocation, this
@@ -94,12 +98,15 @@ link and enters no other mount:
 | the object directory | the common directory | `objects` |
 | each line of `objects/info/alternates` | the object directory that holds the file | a name beneath it, followed the same way; at most 16 object directories and a chain at most 4 deep, with no loop |
 
-A worktree backlink, a submodule, an `http-alternates` file, a link at `info/exclude`,
-`info/attributes` or `info/sparse-checkout`, and a configuration that sets `core.worktree` each
-refuse the repository to the location before it is read. The owner reaches such a repository by
-naming its path, exactly as before. Git itself is still given paths: each invocation requires its
-directory to be the object this host found, and the paths a repository reports are opened again and
-compared with the objects the descent found.
+A worktree backlink, a submodule, an `http-alternates` file, an `objects/info` that is not a
+directory, an `info/exclude`, `info/attributes` or `info/sparse-checkout` that is a link or on
+another mount, and a configuration that sets `core.worktree` each refuse the repository to the
+location before it is read. The owner reaches such a repository by naming its path, exactly as
+before. Git itself is still given paths. Each invocation requires its directory to be the object
+this host found through a handle, every invocation in a staging directory included, so a tree
+swapped for a link between two invocations stops the next one. The paths a repository reports are
+compared with the paths the operating system gives for the handles this host holds, and nothing is
+opened by a path Git reported.
 
 ## Creating a repository
 
