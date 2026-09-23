@@ -906,6 +906,40 @@ async fn the_descriptor_is_published_whole_and_owner_only_and_names_the_worker()
     daemon.stop().await;
 }
 
+/// KR-REQ-07.03: the size of the terminal a session is created from travels in the create request
+/// and is the pseudo-terminal's size before the root shell starts, so it is the size the shell
+/// sees without anything resizing it afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_creating_terminals_size_is_the_shells_from_the_start() {
+    let host = Host::create();
+    let daemon = host.start().await;
+    let mut client = host.client().await;
+    let size = kr_protocol::session::Dimensions::new(100, 30);
+    let mut params = create_params(host.environment_id, host.temp.root());
+    params.presentation = Presentation::Attach;
+    params.dimensions = Nullable::some(size);
+    let created: SessionCreateResult = client
+        .mutate(
+            Method::SessionCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &params,
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the create succeeds")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(created.session.dimensions, size);
+    // A terminal of that size attaches without claiming it, so nothing can resize the session
+    // before the shell is asked what size it is running at.
+    let mut terminal = LocalTerminal::attach(&host, created.session.session_id, size, true).await;
+    terminal.type_line("stty size").await;
+    terminal.shown("30 100", 1).await;
+    close(&mut client, &host, created.session.session_id).await;
+    daemon.stop().await;
+}
+
 /// KR-REQ-05.02: a worker is reached on a private endpoint that carries the operating system's
 /// access control: a socket only its owner may open, in a directory only its owner may enter.
 #[cfg(unix)]

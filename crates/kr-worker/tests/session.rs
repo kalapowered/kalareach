@@ -2017,3 +2017,31 @@ async fn the_palette_a_create_request_names_reaches_the_launched_session() {
         let _ = closure_record(&runtime, "the session closes").await;
     }
 }
+
+/// KR-REQ-07.15: silence is not a reason to close a session. A live session with no attachment, no
+/// output and nothing asked of it is still live, and has no closure record, after the slowest sweep
+/// the host makes of it: nothing closes a session for being idle unless an explicit policy says
+/// so, and this host has no such policy.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_session_is_never_closed_for_its_silence() {
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(&host, "exec cat");
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let runtime = std::sync::Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
+    tokio::time::sleep(kr_worker::lifecycle::IDLE_SWEEP_INTERVAL + Duration::from_secs(5)).await;
+    assert_eq!(runtime.state(), SessionState::Live);
+    assert!(
+        runtime.session().closure().is_none(),
+        "nothing closed the session while it was idle"
+    );
+    let (_, gate) = runtime.close(ClosureReason::CloseRequested);
+    gate.release();
+    closure_record(&runtime, "the closure finishes").await;
+}
