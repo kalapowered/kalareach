@@ -2197,3 +2197,179 @@ async fn the_same_method_answers_both_ingresses_alike_once_the_grant_admits_the_
     close_session(&mut local, &host, session_id).await;
     daemon.stop().await;
 }
+
+/// Returns a loopback address where a managed service in an outage would be: every connection is
+/// accepted and nothing is ever answered. The count is how many connections the host opened to it,
+/// and the thread holding them ends with the test.
+fn a_service_that_never_answers() -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+    let address = listener.local_addr().expect("its address");
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&accepted);
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for connection in listener.incoming() {
+            match connection {
+                Ok(connection) => {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    held.push(connection);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (address, accepted)
+}
+
+/// KR-REQ-26.46: a control-plane outage does not stop local terminal use. The host is configured
+/// with a relay and a discovery service that accept connections and never answer, and on that host
+/// a session is still created on the local socket, a terminal on this machine still attaches to it,
+/// and what it types still runs and comes back.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_control_plane_outage_leaves_local_terminal_use_working() {
+    let Some(host) = Host::create() else {
+        return;
+    };
+    let (outage, reached) = a_service_that_never_answers();
+    let config = EndpointConfig {
+        bind_addr: Some("127.0.0.1:0".parse().expect("a loopback address")),
+        relay_urls: vec![format!("https://{outage}").parse().expect("a relay URL")],
+        discovery: kr_transport::config::DiscoveryConfig {
+            pkarr_publisher_url: Some(format!("http://{outage}/pkarr").parse().expect("a URL")),
+            pkarr_resolver_url: Some(format!("http://{outage}/pkarr").parse().expect("a URL")),
+            ..kr_transport::config::DiscoveryConfig::default()
+        },
+        ..EndpointConfig::default()
+    };
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let daemon = host.start(config, &owner).await;
+    let mut local = host.client().await;
+    let created = create(&mut local, &host).await;
+    let session_id = created.session.session_id;
+    let worker_endpoint = kr_ipc::paths::Endpoint::from_path(
+        created
+            .endpoint
+            .as_ref()
+            .cloned()
+            .expect("a live session names its worker"),
+    )
+    .expect("a worker endpoint");
+
+    // A terminal on this machine attaches on the worker's own endpoint, takes the keys and types.
+    let mut terminal = LocalClient::connect(&worker_endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("the local terminal reaches the worker");
+    let target = ActionTarget {
+        environment_id: host.environment_id,
+        session_id: Nullable::some(session_id),
+        session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+        application_instance_id: Nullable::null(),
+        agent_binding_revision: Nullable::null(),
+    };
+    let attached: SessionAttachResult = terminal
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &SessionAttachParams {
+                session_id,
+                mode: AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(created.session.dimensions),
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                requested: [
+                    AttachmentCapability::ObserveTerminal,
+                    AttachmentCapability::Input,
+                ]
+                .into_iter()
+                .collect(),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the local terminal attaches")
+        .to_typed()
+        .expect("decodes");
+    let attachment_id = attached.attachment.attachment_id;
+    let lease: kr_protocol::input::InputAcquireResult = terminal
+        .mutate(
+            Method::InputAcquire,
+            ActionId::new(kr_ipc::new_uuid()),
+            target,
+            &kr_protocol::input::InputAcquireParams {
+                session_id,
+                attachment_id,
+                expected_epoch: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the local terminal takes the keys")
+        .to_typed()
+        .expect("decodes");
+    let _: EventsSubscribeResult = terminal
+        .request(
+            Method::EventsSubscribe,
+            &kr_protocol::recovery::EventsSubscribeParams {
+                session_id,
+                attachment_id,
+                streams: [EventStream::Output].into_iter().collect(),
+                from_cursor: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the local terminal subscribes")
+        .to_typed()
+        .expect("decodes");
+    let _: kr_protocol::input::InputWriteResult = terminal
+        .request(
+            Method::InputWrite,
+            &kr_protocol::input::InputWriteParams {
+                session_id,
+                attachment_id,
+                epoch: lease.lease.epoch,
+                sequence: kr_protocol::ids::InputSequence::new(0),
+                bytes: kr_protocol::scalars::Bytes::new(
+                    b"printf 'kr-%s\\n' local-use-in-an-outage\n".to_vec(),
+                ),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the worker takes the line")
+        .to_typed()
+        .expect("decodes");
+    let mut seen = String::new();
+    let started = tokio::time::Instant::now();
+    while !seen.contains("kr-local-use-in-an-outage") {
+        let remaining = (started + Duration::from_secs(120))
+            .saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, terminal.recv()).await {
+            Ok(Ok(kr_protocol::envelope::ControlFrame::Notification(notification)))
+                if notification.event_type.as_str() == "session.output" =>
+            {
+                if let Ok(event) = notification.payload.to_typed::<OutputEvent>() {
+                    seen.push_str(&String::from_utf8_lossy(event.bytes.as_slice()));
+                }
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => panic!("the local terminal's connection ended ({error}): {seen:?}"),
+            Err(_) => panic!(
+                "waited {:?} for the typed line's output during the outage: {seen:?}",
+                started.elapsed()
+            ),
+        }
+    }
+
+    // The outage was real: the host did try its control plane, which answered nothing.
+    assert!(
+        reached.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "the host never tried the relay or the discovery service it was configured with"
+    );
+
+    drop(terminal);
+    close_session(&mut local, &host, session_id).await;
+    daemon.stop().await;
+}
