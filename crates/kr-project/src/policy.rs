@@ -25,8 +25,8 @@
 //!
 //! A location is the owner's. The rows have a grant column, and a location naming a grant admits
 //! nothing on this host: no paired device reaches a repository operation here, and an owner's
-//! confirmation of a device's location would have to be bound to that device's keys, which this
-//! host does not keep. So such a location is not authorised in the first place.
+//! confirmation of a device's location would have to be bound to that device's four public keys,
+//! of which this host keeps only two. So such a location is not authorised in the first place.
 //!
 //! ## The confirmation, in two submissions of one action
 //!
@@ -1194,14 +1194,14 @@ impl ProjectService {
             return Ok(request);
         }
         if let Some(grant) = params.grant_id.0 {
-            // The confirmation of a device's location has to name the keys of the device that
-            // holds the grant, and this host does not keep them; a location that named a grant
-            // would admit nothing here anyway.
+            // The confirmation of a device's location has to name the four public keys of the
+            // device that holds the grant, and this host keeps only two of them; a location that
+            // named a grant would admit nothing here anyway.
             return Err(ProjectError::PermissionDenied {
                 detail: format!(
                     "a location is authorised for the owner alone on this host: confirming one for \
-                     grant {grant} would have to name the keys of the device that holds it, which \
-                     this host does not keep"
+                     grant {grant} would have to name the four public keys of the device that holds \
+                     it, and this host keeps only two of them"
                 )
                 .into(),
             });
