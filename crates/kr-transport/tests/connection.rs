@@ -1277,6 +1277,42 @@ async fn a_control_frame_carries_every_shape_the_stream_uses() {
     assert_eq!(decoded, frame);
 }
 
+/// KR-REQ-09.02: a `hello` offer that carries a field its schema does not declare is refused by the
+/// host's frame reader before the typed decoder runs, and the refusal answers
+/// `UNSUPPORTED_SCHEMA`.
+#[tokio::test]
+async fn an_offer_with_a_field_its_schema_does_not_declare_is_refused_before_it_is_decoded() {
+    let (host, client) = paired_pair().await;
+    let accepting = spawn_accept(&host, one_device(&client), ManualClock::new());
+
+    let connection = client
+        .endpoint
+        .connect(direct_addr(&host), ALPN)
+        .await
+        .expect("a connection");
+    let (send, _recv) = connection.open_bi().await.expect("a stream");
+    let mut writer = FrameWriter::new(send, StreamKind::Control);
+    let CanonicalValue::Map(fields) =
+        kr_cbor::to_canonical_value(&offer(&client)).expect("an offer")
+    else {
+        unreachable!("an offer is a map");
+    };
+    let mut entries = fields.into_entries();
+    entries.push(("zz_unknown".to_owned(), CanonicalValue::Bool(true)));
+    let extended = kr_cbor::encode(&CanonicalValue::Map(
+        kr_cbor::CanonicalMap::from_entries(entries).expect("distinct keys"),
+    ));
+    writer.write_payload(&extended).await.expect("sent");
+
+    let (_connection, admitted) = accepting.await.expect("the host task");
+    let error = admitted.expect_err("the host refused the offer");
+    let TransportError::Frame(kr_protocol::frame::FrameError::Cbor(cbor)) = &error else {
+        panic!("an undeclared field is a frame refusal, not {error}");
+    };
+    assert_eq!(cbor.rule(), "unknown_field", "{error}");
+    assert_eq!(error.to_protocol_error().code, ErrorCode::UnsupportedSchema);
+}
+
 fn one_device(client: &Side) -> Arc<dyn PairedDirectory> {
     Arc::new(OneDevice {
         endpoint_id: client.record.endpoint_id,

@@ -543,6 +543,68 @@ mod tests {
         server.abort();
     }
 
+    /// KR-REQ-09.02: a local frame with a field its schema does not declare, or with a duplicate
+    /// key, is refused by the reader before the typed decoder runs, and answers with the code the
+    /// refusal names.
+    #[tokio::test]
+    async fn a_frame_its_schema_does_not_admit_is_refused_before_it_is_decoded() {
+        use kr_cbor::{CanonicalMap, CanonicalValue, CborError};
+        use kr_protocol::error::ErrorCode;
+
+        // The request inside the frame, with one field `Request` does not declare.
+        let mut frame = kr_cbor::to_canonical_value(&request(9)).expect("a value");
+        let CanonicalValue::Map(outer) = &mut frame else {
+            unreachable!("a variant with content is a map");
+        };
+        let mut entries = outer.clone().into_entries();
+        let CanonicalValue::Map(inner) = &entries[0].1 else {
+            unreachable!("a request is a map");
+        };
+        let mut fields = inner.clone().into_entries();
+        fields.push(("zz_unknown".to_owned(), CanonicalValue::Bool(true)));
+        entries[0].1 = CanonicalValue::Map(CanonicalMap::from_entries(fields).expect("distinct"));
+        *outer = CanonicalMap::from_entries(entries).expect("distinct");
+        let unknown = kr_cbor::encode(&frame);
+
+        // `{"request": ...}` with `request` twice, which only the byte rules can see.
+        let request_bytes = kr_cbor::to_canonical_vec(&request(9)).expect("bytes");
+        let body = &request_bytes[1..];
+        let duplicate = [&[0xa2][..], body, body].concat();
+
+        let codec = FrameCodec::new(StreamKind::Control);
+        for (payload, rule, code) in [
+            (unknown, "unknown_field", ErrorCode::UnsupportedSchema),
+            (duplicate, "duplicate_key", ErrorCode::InvalidArgument),
+        ] {
+            let (endpoint, listener, _host) = pair();
+            let server = tokio::spawn(async move {
+                let (connection, _) = listener.accept().await.expect("accepts");
+                let (mut reader, _writer) = split(connection, StreamKind::Control);
+                reader
+                    .read_message::<ControlFrame>()
+                    .await
+                    .expect_err("refuses")
+            });
+            let client = Connection::connect(&endpoint).await.expect("connects");
+            let (_reader, mut writer) = split(client, StreamKind::Control);
+            writer
+                .write_frame(&codec.encode(&payload).expect("a frame"))
+                .await
+                .expect("writes");
+            let error = server.await.expect("server task");
+            let IpcError::Frame(kr_protocol::frame::FrameError::Cbor(cbor)) = &error else {
+                panic!("{rule}: refused as {error}");
+            };
+            assert_eq!(cbor.rule(), rule, "{error}");
+            if rule == "unknown_field" {
+                assert!(
+                    matches!(cbor, CborError::UnknownField { field, .. } if field == "zz_unknown")
+                );
+            }
+            assert_eq!(error.code(), code, "{rule}");
+        }
+    }
+
     /// KR-REQ-23.10: a local frame's declared length is checked before its buffer exists.
     #[tokio::test]
     async fn an_over_long_declared_length_is_refused_before_the_buffer_exists() {
