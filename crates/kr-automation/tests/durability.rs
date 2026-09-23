@@ -221,6 +221,7 @@ fn read_answers_about_the_revision_it_was_asked_about() {
                 workflow_id: Nullable::some(workflow_id),
                 ..WorkflowReadParams::default()
             },
+            None,
             1_000,
         )
         .expect("the read answers");
@@ -233,6 +234,7 @@ fn read_answers_about_the_revision_it_was_asked_about() {
                 revision: Nullable::some(U64::new(2)),
                 ..WorkflowReadParams::default()
             },
+            None,
             1_000,
         )
         .expect("the read answers");

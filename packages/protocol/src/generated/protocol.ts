@@ -1380,6 +1380,10 @@ export type VoiceAction =
   | 'apply_diff'
   | 'deliver_externally'
 /**
+ * What a workflow alert is about.
+ */
+export type WorkflowAlertKind = 'causal_limit' | 'workflow_paused' | 'workflow_resumed'
+/**
  * Status of a workflow run.
  */
 export type WorkflowRunStatus =
@@ -1869,6 +1873,8 @@ export interface KalaReachProtocol {
   worker_rendezvous?: WorkerRendezvous
   worker_verify_challenge?: WorkerVerifyChallenge
   worker_verify_proof?: WorkerVerifyProof
+  workflow_alert?: WorkflowAlert
+  workflow_alert_kind?: WorkflowAlertKind
   workflow_deadlines?: WorkflowDeadlines
   workflow_definition?: WorkflowDefinition
   workflow_definition_summary?: WorkflowDefinitionSummary
@@ -21884,6 +21890,43 @@ export interface ProtocolVersion8 {
   minor: number
 }
 /**
+ * One attention record the automation journal holds and no attention state has acknowledged.
+ *
+ * It is the record an exhausted chain or a breached workflow limit owes, and the one that ends a
+ * pause. It stays in the journal, and in `workflow.read`, until the environment's attention state
+ * has taken it.
+ */
+export interface WorkflowAlert {
+  /**
+   * The chain, for an alert about a causal budget.
+   */
+  causal_root_id: CausalRootId | null
+  /**
+   * What it is about.
+   */
+  kind: 'causal_limit' | 'workflow_paused' | 'workflow_resumed'
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  raised_at_ms: string
+  /**
+   * Which limit was reached, or what ended the condition.
+   */
+  reason: string
+  /**
+   * The revision, for an alert about a workflow revision.
+   */
+  revision: U64 | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  sequence: string
+  /**
+   * The workflow, for an alert about a workflow revision.
+   */
+  workflow_id: WorkflowId | null
+}
+/**
  * Operational deadlines configured for a workflow.
  */
 export interface WorkflowDeadlines {
@@ -21936,7 +21979,7 @@ export interface WorkflowDefinition {
   revision: string
   trigger: WorkflowTrigger
   /**
-   * Unique workflow identifier.
+   * One automation definition.
    */
   workflow_id: string
 }
@@ -22042,11 +22085,15 @@ export interface WorkflowDefinitionSummary {
    */
   name: string
   /**
+   * Whether paused, by `workflow.pause` or because one of its own limits was breached.
+   */
+  paused: boolean
+  /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   revision: string
   /**
-   * Workflow identifier.
+   * One automation definition.
    */
   workflow_id: string
 }
@@ -22059,7 +22106,7 @@ export interface WorkflowEnableParams {
    */
   revision: string
   /**
-   * Workflow identifier.
+   * One automation definition.
    */
   workflow_id: string
 }
@@ -22076,7 +22123,7 @@ export interface WorkflowEnableResult {
    */
   revision: string
   /**
-   * Workflow identifier.
+   * One automation definition.
    */
   workflow_id: string
 }
@@ -22094,7 +22141,7 @@ export interface WorkflowInstallParams {
    */
   revision: string
   /**
-   * Workflow identifier to install or update.
+   * One automation definition.
    */
   workflow_id: string
 }
@@ -22138,7 +22185,7 @@ export interface WorkflowDefinition1 {
   revision: string
   trigger: WorkflowTrigger
   /**
-   * Unique workflow identifier.
+   * One automation definition.
    */
   workflow_id: string
 }
@@ -22155,7 +22202,7 @@ export interface WorkflowInstallResult {
    */
   revision: string
   /**
-   * Installed workflow identifier.
+   * One automation definition.
    */
   workflow_id: string
 }
@@ -22172,7 +22219,7 @@ export interface WorkflowPauseParams {
    */
   revision: string
   /**
-   * Workflow identifier.
+   * One automation definition.
    */
   workflow_id: string
 }
@@ -22189,7 +22236,7 @@ export interface WorkflowPauseResult {
    */
   revision: string
   /**
-   * Workflow identifier.
+   * One automation definition.
    */
   workflow_id: string
 }
@@ -22218,6 +22265,11 @@ export interface WorkflowReadParams {
  * Result of `workflow.read`.
  */
 export interface WorkflowReadResult {
+  /**
+   * The alerts about the workflows and chains this read covers that no attention state has
+   * taken yet, oldest first.
+   */
+  alerts: WorkflowAlert[]
   /**
    * Matching workflow definitions.
    */

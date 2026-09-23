@@ -1423,14 +1423,14 @@ methods! {
     doc: "Pause a definition. Exceeding a concurrency or budget limit pauses it automatically.";
 
     WorkflowRun = "workflow.run", Automation,
-    effect: Write, ingress: [LocalIpc, PairedDevice, Workflow], rights: [req(AutomationManage)],
+    effect: Write, ingress: [LocalIpc, PairedDevice], rights: [req(AutomationManage)],
     selectors: [Workflow],
     history: NotApplicable, capability: cap("workflow", WorkflowDefinitionVersion),
     freshness: ActionWindow, confirmation: None, idempotency: ACTION,
     doc: "Start a run, recording the trigger event, definition version and causal parent.";
 
     WorkflowRead = "workflow.read", Automation,
-    effect: Read, ingress: [LocalIpc, PairedDevice, Workflow], rights: [req(AutomationManage)],
+    effect: Read, ingress: [LocalIpc, PairedDevice], rights: [req(AutomationManage)],
     selectors: [Workflow],
     history: GrantLowerBound, capability: NO_CAPABILITY, freshness: CurrentAuthority,
     confirmation: None, idempotency: READ,

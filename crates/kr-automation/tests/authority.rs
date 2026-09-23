@@ -559,3 +559,96 @@ async fn a_grant_that_does_not_cover_this_environment_installs_nothing_here() {
         .expect_err("the grant does not reach this environment");
     assert!(refusal.to_string().contains("environment"), "{refusal}");
 }
+
+/// A submission that carries its caller's grant reaches only the workflows that act under that
+/// grant, and a read for that caller shows only those.
+#[tokio::test]
+async fn a_caller_grant_reaches_only_the_workflows_under_it() {
+    use kr_automation::{ActionKey, Submitted};
+    use kr_protocol::method::Method;
+
+    let held = test_grant_id(13);
+    let other = test_grant_id(14);
+    let service = service(
+        Arc::new(MockActionRunner::new()),
+        common::every_right(&[held, other]),
+    );
+    let mine = create_workflow_definition(
+        test_wf_id(13),
+        1,
+        "mine",
+        held,
+        vec![node("only", "run_tests")],
+        vec![],
+    );
+    let theirs = create_workflow_definition(
+        test_wf_id(14),
+        1,
+        "theirs",
+        other,
+        vec![node("only", "run_tests")],
+        vec![],
+    );
+    service
+        .submit_install(&install_params(&theirs), 1_000)
+        .expect("the owner installs under any grant");
+
+    fn as_caller(key: &ActionKey, held: GrantId) -> Submitted<'_> {
+        Submitted {
+            key,
+            admission: &common::admitted,
+            caller_grant: Some(held),
+        }
+    }
+    let key = common::fresh_action(Method::WorkflowInstall);
+    service
+        .install(&install_params(&mine), &as_caller(&key, held), 1_000)
+        .expect("a caller installs under the grant it holds");
+    let key = common::fresh_action(Method::WorkflowInstall);
+    let refusal = service
+        .install(
+            &install_params(&create_workflow_definition(
+                test_wf_id(15),
+                1,
+                "borrowed",
+                other,
+                vec![node("only", "run_tests")],
+                vec![],
+            )),
+            &as_caller(&key, held),
+            1_000,
+        )
+        .expect_err("not under a grant it does not hold");
+    assert!(refusal.to_string().contains("grant"), "{refusal}");
+
+    let key = common::fresh_action(Method::WorkflowEnable);
+    let refusal = service
+        .enable(
+            &WorkflowEnableParams {
+                workflow_id: theirs.workflow_id,
+                revision: theirs.revision,
+            },
+            &as_caller(&key, held),
+            1_000,
+        )
+        .expect_err("another grant's workflow is not the caller's");
+    assert!(refusal.to_string().contains("grant"), "{refusal}");
+
+    let seen = service
+        .read(
+            &kr_protocol::automation::WorkflowReadParams::default(),
+            Some(held),
+            1_000,
+        )
+        .expect("a read");
+    assert_eq!(seen.definitions.len(), 1);
+    assert_eq!(seen.definitions[0].workflow_id, mine.workflow_id);
+    let everything = service
+        .read(
+            &kr_protocol::automation::WorkflowReadParams::default(),
+            None,
+            1_000,
+        )
+        .expect("a read");
+    assert_eq!(everything.definitions.len(), 2, "the owner sees both");
+}

@@ -4701,8 +4701,7 @@
       "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
-        "paired_device",
-        "workflow"
+        "paired_device"
       ],
       "method": "workflow.run",
       "name": "workflow.run",
@@ -4732,8 +4731,7 @@
       "idempotency": "idempotent_read",
       "ingress": [
         "local_ipc",
-        "paired_device",
-        "workflow"
+        "paired_device"
       ],
       "method": "workflow.read",
       "name": "workflow.read",

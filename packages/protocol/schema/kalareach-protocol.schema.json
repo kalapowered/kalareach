@@ -29042,6 +29042,91 @@
       ],
       "type": "object"
     },
+    "WorkflowAlert": {
+      "additionalProperties": false,
+      "description": "One attention record the automation journal holds and no attention state has acknowledged.\n\nIt is the record an exhausted chain or a breached workflow limit owes, and the one that ends a\npause. It stays in the journal, and in `workflow.read`, until the environment's attention state\nhas taken it.",
+      "properties": {
+        "causal_root_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CausalRootId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The chain, for an alert about a causal budget."
+        },
+        "kind": {
+          "$ref": "#/$defs/WorkflowAlertKind",
+          "description": "What it is about."
+        },
+        "raised_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the record was committed."
+        },
+        "reason": {
+          "description": "Which limit was reached, or what ended the condition.",
+          "type": "string"
+        },
+        "revision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The revision, for an alert about a workflow revision."
+        },
+        "sequence": {
+          "$ref": "#/$defs/U64",
+          "description": "The record's position in the automation journal's event stream."
+        },
+        "workflow_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkflowId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The workflow, for an alert about a workflow revision."
+        }
+      },
+      "required": [
+        "sequence",
+        "kind",
+        "workflow_id",
+        "revision",
+        "causal_root_id",
+        "reason",
+        "raised_at_ms"
+      ],
+      "type": "object"
+    },
+    "WorkflowAlertKind": {
+      "description": "What a workflow alert is about.",
+      "oneOf": [
+        {
+          "const": "causal_limit",
+          "description": "A causal chain ran out of budget and was paused.",
+          "type": "string"
+        },
+        {
+          "const": "workflow_paused",
+          "description": "A workflow revision was paused by one of its own limits.",
+          "type": "string"
+        },
+        {
+          "const": "workflow_resumed",
+          "description": "The pause a limit caused was cleared by enabling the revision.",
+          "type": "string"
+        }
+      ]
+    },
     "WorkflowDeadlines": {
       "additionalProperties": false,
       "description": "Operational deadlines configured for a workflow.",
@@ -29174,6 +29259,10 @@
           "description": "Human-readable name.",
           "type": "string"
         },
+        "paused": {
+          "description": "Whether paused, by `workflow.pause` or because one of its own limits was breached.",
+          "type": "boolean"
+        },
         "revision": {
           "$ref": "#/$defs/U64",
           "description": "Revision of the definition."
@@ -29190,6 +29279,7 @@
         "description",
         "grant_reference",
         "enabled",
+        "paused",
         "installed_at_ms"
       ],
       "type": "object"
@@ -29472,6 +29562,13 @@
       "additionalProperties": false,
       "description": "Result of `workflow.read`.",
       "properties": {
+        "alerts": {
+          "description": "The alerts about the workflows and chains this read covers that no attention state has\ntaken yet, oldest first.",
+          "items": {
+            "$ref": "#/$defs/WorkflowAlert"
+          },
+          "type": "array"
+        },
         "definitions": {
           "description": "Matching workflow definitions.",
           "items": {
@@ -29509,7 +29606,8 @@
         "definitions",
         "runs",
         "node_receipts",
-        "remaining_causal_budget"
+        "remaining_causal_budget",
+        "alerts"
       ],
       "type": "object"
     },
@@ -31634,6 +31732,12 @@
     },
     "worker_verify_proof": {
       "$ref": "#/$defs/WorkerVerifyProof"
+    },
+    "workflow_alert": {
+      "$ref": "#/$defs/WorkflowAlert"
+    },
+    "workflow_alert_kind": {
+      "$ref": "#/$defs/WorkflowAlertKind"
     },
     "workflow_deadlines": {
       "$ref": "#/$defs/WorkflowDeadlines"

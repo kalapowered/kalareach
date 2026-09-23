@@ -43,12 +43,12 @@ use crate::attention::{
 };
 use crate::authority::MethodEntry;
 use crate::automation::{
-    CausalBudgetSummary, EdgeCondition, NodeReceiptSummary, NodeStatus, WorkflowDeadlines,
-    WorkflowDefinition, WorkflowDefinitionSummary, WorkflowEdge, WorkflowEnableParams,
-    WorkflowEnableResult, WorkflowInstallParams, WorkflowInstallResult, WorkflowNode,
-    WorkflowPauseParams, WorkflowPauseResult, WorkflowReadParams, WorkflowReadResult,
-    WorkflowResourceScope, WorkflowRunParams, WorkflowRunResult, WorkflowRunStatus,
-    WorkflowRunSummary, WorkflowTrigger,
+    CausalBudgetSummary, EdgeCondition, NodeReceiptSummary, NodeStatus, WorkflowAlert,
+    WorkflowAlertKind, WorkflowDeadlines, WorkflowDefinition, WorkflowDefinitionSummary,
+    WorkflowEdge, WorkflowEnableParams, WorkflowEnableResult, WorkflowInstallParams,
+    WorkflowInstallResult, WorkflowNode, WorkflowPauseParams, WorkflowPauseResult,
+    WorkflowReadParams, WorkflowReadResult, WorkflowResourceScope, WorkflowRunParams,
+    WorkflowRunResult, WorkflowRunStatus, WorkflowRunSummary, WorkflowTrigger,
 };
 use crate::broker::{
     ActionToken, ActionTokenClaim, CapabilityMap, DecoderLedgerEntry, DecodingTrust,
@@ -619,6 +619,8 @@ pub fn protocol_schema() -> Value {
         "edge_condition" => EdgeCondition,
         "node_receipt_summary" => NodeReceiptSummary,
         "node_status" => NodeStatus,
+        "workflow_alert" => WorkflowAlert,
+        "workflow_alert_kind" => WorkflowAlertKind,
         "workflow_deadlines" => WorkflowDeadlines,
         "workflow_definition" => WorkflowDefinition,
         "workflow_definition_summary" => WorkflowDefinitionSummary,

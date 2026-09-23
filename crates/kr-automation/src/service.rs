@@ -37,13 +37,14 @@ use kr_attention::event::{EventCursor, EventKind, SourceEvent};
 use kr_attention::{Attention, HostReading, Outcome};
 use kr_protocol::attention::AttentionSource;
 use kr_protocol::automation::{
-    NodeStatus, WorkflowDefinition, WorkflowEnableParams, WorkflowEnableResult,
-    WorkflowInstallParams, WorkflowInstallResult, WorkflowPauseParams, WorkflowPauseResult,
-    WorkflowReadParams, WorkflowReadResult, WorkflowRunParams, WorkflowRunResult,
+    NodeStatus, WorkflowAlert, WorkflowAlertKind, WorkflowDefinition, WorkflowEnableParams,
+    WorkflowEnableResult, WorkflowInstallParams, WorkflowInstallResult, WorkflowPauseParams,
+    WorkflowPauseResult, WorkflowReadParams, WorkflowReadResult, WorkflowRunParams,
+    WorkflowRunResult,
 };
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{
-    CausalRootId, EnvironmentId, PluginId, WorkflowId, WorkflowRunId, WorkspaceId,
+    CausalRootId, EnvironmentId, GrantId, PluginId, WorkflowId, WorkflowRunId, WorkspaceId,
 };
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
@@ -283,6 +284,7 @@ impl AutomationService {
         now_ms: u64,
     ) -> Result<WorkflowInstallResult> {
         let acted = self.store.act(submitted, now_ms, |journal| {
+            within_caller_grant(submitted, params.definition.grant_reference)?;
             let result = self.install_in(journal, params, now_ms)?;
             Ok((ActionRecord::done(&result)?, result))
         })?;
@@ -361,7 +363,8 @@ impl AutomationService {
         now_ms: u64,
     ) -> Result<WorkflowEnableResult> {
         let acted = self.store.act(submitted, now_ms, |journal| {
-            installed(journal, params.workflow_id, params.revision)?;
+            let installed = installed(journal, params.workflow_id, params.revision)?;
+            within_caller_grant(submitted, installed.definition.grant_reference)?;
             journal.set_enabled(params.workflow_id, params.revision.get(), true)?;
             journal.resume_workflow(params.workflow_id, params.revision.get(), now_ms)?;
             let result = WorkflowEnableResult {
@@ -387,7 +390,8 @@ impl AutomationService {
         now_ms: u64,
     ) -> Result<WorkflowPauseResult> {
         let acted = self.store.act(submitted, now_ms, |journal| {
-            installed(journal, params.workflow_id, params.revision)?;
+            let installed = installed(journal, params.workflow_id, params.revision)?;
+            within_caller_grant(submitted, installed.definition.grant_reference)?;
             journal.set_paused(params.workflow_id, params.revision.get(), true)?;
             let result = WorkflowPauseResult {
                 workflow_id: params.workflow_id,
@@ -421,7 +425,7 @@ impl AutomationService {
         now_ms: u64,
     ) -> Result<WorkflowRunResult> {
         let acted = self.store.act(submitted, now_ms, |journal| {
-            let started = self.admit_run(journal, params, now_ms)?;
+            let started = self.admit_run(journal, params, submitted, now_ms)?;
             Ok((
                 ActionRecord::Started {
                     run_id: started.run_id,
@@ -462,9 +466,11 @@ impl AutomationService {
         &self,
         journal: &Journal<'_>,
         params: &WorkflowRunParams,
+        submitted: &Submitted<'_>,
         now_ms: u64,
     ) -> Result<StartedRun> {
         let installed = installed(journal, params.workflow_id, params.revision)?;
+        within_caller_grant(submitted, installed.definition.grant_reference)?;
         if !installed.enabled {
             return Err(AutomationError::WorkflowDisabled(params.workflow_id));
         }
@@ -773,12 +779,23 @@ impl AutomationService {
         }))
     }
 
-    /// Reads definitions, runs, node receipts, and remaining causal budget (`workflow.read`).
+    /// Reads definitions, runs, node receipts, remaining causal budget and pending alerts
+    /// (`workflow.read`).
+    ///
+    /// `caller_grant` is the grant a paired device holds, when a paired device is asking: it is
+    /// shown only the workflows that act under that grant, their runs and receipts, the budgets
+    /// of the chains those runs belong to, and the alerts about any of them. The host's owner at
+    /// this machine passes `None` and is shown everything the request covers.
     ///
     /// # Errors
     ///
     /// Returns a storage error when the journal cannot be read.
-    pub fn read(&self, params: &WorkflowReadParams, now_ms: u64) -> Result<WorkflowReadResult> {
+    pub fn read(
+        &self,
+        params: &WorkflowReadParams,
+        caller_grant: Option<GrantId>,
+        now_ms: u64,
+    ) -> Result<WorkflowReadResult> {
         let wf_filter = params.workflow_id.0;
         let mut definitions = self.store.list_definitions(wf_filter)?;
         let mut runs = self.store.list_runs(wf_filter)?;
@@ -789,21 +806,23 @@ impl AutomationService {
             definitions.retain(|definition| definition.revision == revision);
             runs.retain(|run| run.revision == revision);
         }
+        // A device sees the revisions that act under its own grant and the runs of those
+        // revisions. A workflow identifier alone is not the unit: two revisions of one workflow
+        // may name different grants.
+        if let Some(held) = caller_grant {
+            definitions.retain(|definition| definition.grant_reference == held);
+            let visible: std::collections::HashSet<(WorkflowId, u64)> = definitions
+                .iter()
+                .map(|definition| (definition.workflow_id, definition.revision.get()))
+                .collect();
+            runs.retain(|run| visible.contains(&(run.workflow_id, run.revision.get())));
+        }
 
         let mut node_receipts = Vec::new();
-        if let Some(run_id) = params.run_id.0 {
-            // A run belongs to one workflow, and a reader that named another is not shown it.
-            let record = self.store.get_run_record(run_id)?;
-            let belongs = record.as_ref().is_some_and(|record| {
-                wf_filter.is_none_or(|id| record.workflow_id == id)
-                    && params
-                        .revision
-                        .0
-                        .is_none_or(|rev| record.revision == rev.get())
-            });
-            if belongs {
-                node_receipts = self.store.list_node_receipts(run_id)?;
-            }
+        if let Some(run_id) = params.run_id.0
+            && runs.iter().any(|run| run.run_id == run_id)
+        {
+            node_receipts = self.store.list_node_receipts(run_id)?;
         }
 
         // A budget is answered only for a root the rest of this request actually covers, so a
@@ -823,11 +842,41 @@ impl AutomationService {
             _ => Nullable::null(),
         };
 
+        // The alerts about what this read covers: a revision it shows, and a chain one of its runs
+        // belongs to. A reader asking about everything, as the owner, sees every alert.
+        let whole = wf_filter.is_none() && params.revision.0.is_none() && caller_grant.is_none();
+        let revisions: std::collections::HashSet<(WorkflowId, u64)> = definitions
+            .iter()
+            .map(|definition| (definition.workflow_id, definition.revision.get()))
+            .collect();
+        let roots: std::collections::HashSet<CausalRootId> =
+            runs.iter().map(|run| run.causal_root_id).collect();
+        let mut alerts = self
+            .store
+            .pending_attention()?
+            .into_iter()
+            .filter(|record| {
+                whole
+                    || match record.subject {
+                        AttentionSubject::Workflow {
+                            workflow_id,
+                            revision,
+                        } => revisions.contains(&(workflow_id, revision)),
+                        AttentionSubject::CausalRoot(root) => roots.contains(&root),
+                    }
+            })
+            .map(|record| alert(&record))
+            .collect::<Vec<_>>();
+        if alerts.len() > MAX_ALERTS_READ {
+            alerts.drain(..alerts.len() - MAX_ALERTS_READ);
+        }
+
         Ok(WorkflowReadResult {
             definitions,
             runs,
             node_receipts,
             remaining_causal_budget,
+            alerts,
         })
     }
 
@@ -1000,5 +1049,53 @@ fn recorded<T: serde::de::DeserializeOwned>(record: ActionRecord) -> Result<T> {
         ActionRecord::Started { run_id } => Err(AutomationError::InvalidArgument(format!(
             "this action started run {run_id}, which is not what the method it names does"
         ))),
+    }
+}
+
+/// The most alerts one read returns: the newest ones, oldest first.
+const MAX_ALERTS_READ: usize = 256;
+
+/// Refuses a submission that would reach a workflow outside the grant its caller holds.
+fn within_caller_grant(submitted: &Submitted<'_>, workflow_grant: GrantId) -> Result<()> {
+    match submitted.caller_grant {
+        Some(held) if held != workflow_grant => Err(AutomationError::PermissionDenied(format!(
+            "this workflow acts under grant {workflow_grant}, and a paired device reaches only \
+             the workflows that act under the grant it holds"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// An attention record as `workflow.read` shows it.
+fn alert(record: &crate::store::AttentionOutboxRecord) -> WorkflowAlert {
+    let (kind, workflow_id, revision, causal_root_id) = match record.subject {
+        AttentionSubject::CausalRoot(root) => (
+            WorkflowAlertKind::CausalLimit,
+            Nullable::null(),
+            Nullable::null(),
+            Nullable::some(root),
+        ),
+        AttentionSubject::Workflow {
+            workflow_id,
+            revision,
+        } => (
+            if record.ends_condition {
+                WorkflowAlertKind::WorkflowResumed
+            } else {
+                WorkflowAlertKind::WorkflowPaused
+            },
+            Nullable::some(workflow_id),
+            Nullable::some(U64::new(revision)),
+            Nullable::null(),
+        ),
+    };
+    WorkflowAlert {
+        sequence: U64::new(record.sequence),
+        kind,
+        workflow_id,
+        revision,
+        causal_root_id,
+        reason: record.reason.clone(),
+        raised_at_ms: TimestampMs::new(record.created_at_ms),
     }
 }

@@ -1157,3 +1157,307 @@ fn a_clock_wound_back_does_not_revive_a_grant_a_dispatch_refused() {
     )
     .expect_err("a clock wound back does not revive it");
 }
+
+mod net_support;
+
+/// Runs one automation mutation as a paired device and returns what the daemon answered.
+async fn device_mutation<P: serde::Serialize + ?Sized>(
+    session: &kr_client::session::Session,
+    environment_id: EnvironmentId,
+    method: Method,
+    params: &P,
+) -> std::result::Result<ParamsValue, ProtocolError> {
+    match session
+        .mutate(
+            method,
+            ActionTarget::environment(environment_id),
+            None,
+            &ParamsValue::empty(),
+            params,
+            kr_protocol::scalars::DurationMs::new(60_000),
+        )
+        .await
+    {
+        Ok(settled) => Ok(settled
+            .result()
+            .cloned()
+            .expect("an automation mutation answers with its result")),
+        Err(kr_client::error::ClientError::Host(refusal)) => Err(refusal),
+        Err(other) => panic!("the call did not reach the daemon: {other}"),
+    }
+}
+
+/// KR-REQ-23.52 and KR-REQ-19.04 at the paired-device ingress.
+///
+/// The registry is walked for the automation group, and every ingress it lists for a method is
+/// one this daemon serves: each method is called here from a paired device over the network, and
+/// the owner's own socket serves all five in the tests above. A device reaches only the workflows
+/// that act under the grant it holds, so a workflow cannot give it rights its grant does not carry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_automation_group_is_served_at_every_ingress_the_registry_lists() {
+    use kr_protocol::actor::ActorIngress;
+    use kr_protocol::method::{MethodGroup, REGISTRY};
+
+    let listed: Vec<_> = REGISTRY
+        .iter()
+        .filter(|entry| entry.method.group() == MethodGroup::Automation)
+        .collect();
+    assert_eq!(listed.len(), 5, "the group's five methods");
+    for entry in &listed {
+        for ingress in entry.ingress {
+            assert!(
+                matches!(ingress, ActorIngress::LocalIpc | ActorIngress::PairedDevice),
+                "{} lists an ingress this daemon does not serve: {ingress:?}",
+                entry.name
+            );
+        }
+        assert!(
+            entry.ingress.contains(&ActorIngress::PairedDevice),
+            "{} is served to a paired device and says so",
+            entry.name
+        );
+    }
+
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner).await;
+    let device = net_support::Device::create().await;
+    let record = net_support::pair_with(
+        &host,
+        &device,
+        &owner,
+        net_support::proposal(&[ActionRight::AutomationManage, ActionRight::TerminalInput]),
+    )
+    .await;
+    let session = net_support::connect(&host, &device, &record).await;
+    let own_grant = record.grant.grant_id;
+
+    // A workflow under the device's own grant: every method answers the device.
+    let document = definition(
+        workflow_id(20),
+        own_grant,
+        "a device's own",
+        WorkflowNode {
+            node_id: "tests".to_owned(),
+            action_kind: "run_tests".to_owned(),
+            action_params: r#"{"suite": "unit"}"#.to_owned(),
+            declared_environment: Nullable::null(),
+        },
+    );
+    let mut served = std::collections::BTreeSet::new();
+    let installed: WorkflowInstallResult = typed(
+        &device_mutation(
+            &session,
+            host.environment_id,
+            Method::WorkflowInstall,
+            &WorkflowInstallParams {
+                workflow_id: document.workflow_id,
+                revision: document.revision,
+                definition: document.clone(),
+                grant_reference: document.grant_reference,
+            },
+        )
+        .await
+        .expect("a device installs under its own grant"),
+    );
+    assert_eq!(installed.revision.get(), 1);
+    served.insert(Method::WorkflowInstall);
+    device_mutation(
+        &session,
+        host.environment_id,
+        Method::WorkflowEnable,
+        &WorkflowEnableParams {
+            workflow_id: document.workflow_id,
+            revision: document.revision,
+        },
+    )
+    .await
+    .expect("a device enables its own workflow");
+    served.insert(Method::WorkflowEnable);
+    let run: WorkflowRunResult = typed(
+        &device_mutation(
+            &session,
+            host.environment_id,
+            Method::WorkflowRun,
+            &WorkflowRunParams {
+                workflow_id: document.workflow_id,
+                revision: document.revision,
+                event_id: "evt-device".to_owned(),
+                event_type: "manual".to_owned(),
+                event_payload: Nullable::null(),
+            },
+        )
+        .await
+        .expect("a device runs its own workflow"),
+    );
+    // Nothing on this host carries out a test run, so the node fails; the run itself was served.
+    assert_eq!(run.status, WorkflowRunStatus::Failed, "{run:?}");
+    served.insert(Method::WorkflowRun);
+    device_mutation(
+        &session,
+        host.environment_id,
+        Method::WorkflowPause,
+        &WorkflowPauseParams {
+            workflow_id: document.workflow_id,
+            revision: document.revision,
+            reason: Nullable::null(),
+        },
+    )
+    .await
+    .expect("a device pauses its own workflow");
+    served.insert(Method::WorkflowPause);
+    let read: WorkflowReadResult = session
+        .read(Method::WorkflowRead, &WorkflowReadParams::default())
+        .await
+        .expect("a device reads its workflows");
+    assert_eq!(read.definitions.len(), 1);
+    assert!(read.definitions[0].paused, "the read shows the pause");
+    served.insert(Method::WorkflowRead);
+    assert_eq!(
+        served,
+        listed.iter().map(|entry| entry.method).collect(),
+        "every method the registry lists for a paired device was served to one"
+    );
+
+    // A workflow under the owner's grant is not the device's: it cannot install one under that
+    // grant, and it neither sees nor runs the owner's.
+    let host_device = kr_protocol::ids::DeviceId::new(host.environment_id.get());
+    let owners = grant_id(21);
+    host.controller()
+        .sharing()
+        .grants()
+        .issue(&GrantRecord {
+            grant: Grant {
+                grant_id: owners,
+                parent_grant_id: Nullable::null(),
+                issuer_device_id: host_device,
+                recipient_device_id: host_device,
+                authority_revision: host.controller().policy().authority_revision(),
+                environment_selector: EnvironmentSelector::Any,
+                session_selector: SessionSelector::Any,
+                actions: [ActionRight::TerminalInput].into_iter().collect(),
+                history: HistoryScope {
+                    lower_bound_ms: Nullable::null(),
+                    include_live_screen: false,
+                    named_questions: CanonicalSet::new(),
+                    named_approvals: CanonicalSet::new(),
+                },
+                expiry: GrantExpiry::Never,
+                organisation: Nullable::null(),
+            },
+            session_id: None,
+            issued_at_ms: 1_000,
+            activated_at_ms: Some(1_000),
+            revoked_at_ms: None,
+            revoked_by_parent: None,
+        })
+        .expect("the owner's grant is written");
+    let borrowed = definition(
+        workflow_id(21),
+        owners,
+        "borrowing the owner's grant",
+        WorkflowNode {
+            node_id: "tests".to_owned(),
+            action_kind: "run_tests".to_owned(),
+            action_params: r#"{"suite": "unit"}"#.to_owned(),
+            declared_environment: Nullable::null(),
+        },
+    );
+    let refused = device_mutation(
+        &session,
+        host.environment_id,
+        Method::WorkflowInstall,
+        &WorkflowInstallParams {
+            workflow_id: borrowed.workflow_id,
+            revision: borrowed.revision,
+            definition: borrowed.clone(),
+            grant_reference: borrowed.grant_reference,
+        },
+    )
+    .await
+    .expect_err("a device cannot install under a grant it does not hold");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+
+    let mut control = host.client().await;
+    typed::<WorkflowInstallResult>(
+        &control
+            .mutate(
+                Method::WorkflowInstall,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &WorkflowInstallParams {
+                    workflow_id: borrowed.workflow_id,
+                    revision: borrowed.revision,
+                    definition: borrowed.clone(),
+                    grant_reference: borrowed.grant_reference,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the owner installs under the owner's grant"),
+    );
+    let read: WorkflowReadResult = session
+        .read(Method::WorkflowRead, &WorkflowReadParams::default())
+        .await
+        .expect("a device reads its workflows");
+    assert_eq!(
+        read.definitions.len(),
+        1,
+        "the owner's workflow is not the device's to see"
+    );
+    let refused = device_mutation(
+        &session,
+        host.environment_id,
+        Method::WorkflowEnable,
+        &WorkflowEnableParams {
+            workflow_id: borrowed.workflow_id,
+            revision: borrowed.revision,
+        },
+    )
+    .await
+    .expect_err("a device cannot enable the owner's workflow");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+
+    // A revoked device's grant runs nothing, whoever asks: the pairing record is where its
+    // revocation is written, and the workflow's grant is read from there before anything runs.
+    host.controller()
+        .devices()
+        .revoke(record.device_id, kr_ipc::now_ms())
+        .expect("the device is revoked");
+    let enable_again = WorkflowEnableParams {
+        workflow_id: document.workflow_id,
+        revision: document.revision,
+    };
+    typed::<WorkflowEnableResult>(
+        &control
+            .mutate(
+                Method::WorkflowEnable,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &enable_again,
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the owner enables the device's workflow again"),
+    );
+    let refused = failure(
+        control
+            .mutate(
+                Method::WorkflowRun,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &WorkflowRunParams {
+                    workflow_id: document.workflow_id,
+                    revision: document.revision,
+                    event_id: "evt-after-revocation".to_owned(),
+                    event_type: "manual".to_owned(),
+                    event_payload: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(refused.message.contains("revoked"), "{refused:?}");
+
+    host.stop().await;
+}

@@ -140,6 +140,7 @@ async fn a_repeat_during_its_run_is_told_where_the_run_stands_and_starts_nothing
                     &Submitted {
                         key: &key,
                         admission: &common::admitted,
+                        caller_grant: None,
                     },
                     1_000,
                 )
@@ -154,6 +155,7 @@ async fn a_repeat_during_its_run_is_told_where_the_run_stands_and_starts_nothing
             &Submitted {
                 key: &key,
                 admission: &common::admitted,
+                caller_grant: None,
             },
             1_000,
         )
@@ -216,6 +218,7 @@ fn a_lapsed_admission_performs_nothing_and_leaves_no_record() {
             &Submitted {
                 key: &key,
                 admission: &lapsed,
+                caller_grant: None,
             },
             1_000,
         )
@@ -239,6 +242,7 @@ fn a_lapsed_admission_performs_nothing_and_leaves_no_record() {
             &Submitted {
                 key: &key,
                 admission: &common::admitted,
+                caller_grant: None,
             },
             1_000,
         )
@@ -272,6 +276,7 @@ fn a_repeated_refusal_is_answered_as_it_was_decided() {
     let submitted = Submitted {
         key: &key,
         admission: &common::admitted,
+        caller_grant: None,
     };
 
     let first = service
@@ -308,6 +313,7 @@ fn a_repeated_refusal_is_answered_as_it_was_decided() {
                     ..key.clone()
                 },
                 admission: &common::admitted,
+                caller_grant: None,
             },
             1_002,
         )
@@ -417,6 +423,7 @@ fn a_lapsed_admission_leaves_no_record_of_an_early_refusal() {
             &Submitted {
                 key: &key,
                 admission: &lapsed,
+                caller_grant: None,
             },
             1_000,
         )
@@ -436,6 +443,7 @@ fn a_lapsed_admission_leaves_no_record_of_an_early_refusal() {
             &Submitted {
                 key: &key,
                 admission: &common::admitted,
+                caller_grant: None,
             },
             1_001,
         )

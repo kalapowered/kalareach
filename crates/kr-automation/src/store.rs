@@ -432,6 +432,13 @@ pub struct Submitted<'a> {
     pub key: &'a ActionKey,
     /// Whether the admission the action was accepted under still stands.
     pub admission: &'a (dyn Fn() -> Result<()> + Send + Sync),
+    /// The grant the caller holds, when it reached this host as a paired device.
+    ///
+    /// Such a submission reaches only workflows that act under that grant: a device may not
+    /// install, enable, pause or run a workflow under authority it does not hold, which would give
+    /// it rights through a workflow that its own grant does not carry. `None` is the host's owner at
+    /// this machine, who may act on every workflow.
+    pub caller_grant: Option<GrantId>,
 }
 
 impl std::fmt::Debug for Submitted<'_> {
@@ -1879,7 +1886,7 @@ impl WorkflowStore {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT workflow_id, revision, name, description, grant_reference, enabled,
-                    installed_at_ms
+                    installed_at_ms, paused
              FROM workflow_definitions
              WHERE ?1 IS NULL OR workflow_id = ?1
              ORDER BY workflow_id, revision ASC",
@@ -1899,6 +1906,7 @@ impl WorkflowStore {
         let grant_str: String = row.get(4)?;
         let enabled: i64 = row.get(5)?;
         let installed: i64 = row.get(6)?;
+        let paused: i64 = row.get(7)?;
 
         Ok(WorkflowDefinitionSummary {
             workflow_id: WorkflowId::new(parse_stored_uuid(&wf_str)?),
@@ -1907,6 +1915,7 @@ impl WorkflowStore {
             description: Nullable::from(desc),
             grant_reference: GrantId::new(parse_stored_uuid(&grant_str)?),
             enabled: enabled != 0,
+            paused: paused != 0,
             installed_at_ms: TimestampMs::new(installed as u64),
         })
     }
@@ -2727,6 +2736,7 @@ mod tests {
                 &Submitted {
                     key: &installing,
                     admission: &refuse,
+                    caller_grant: None,
                 },
                 1_000,
                 |journal| {
@@ -2745,6 +2755,7 @@ mod tests {
                 &Submitted {
                     key: &installing,
                     admission: &admit,
+                    caller_grant: None,
                 },
                 1_000,
                 |journal| {
@@ -2762,6 +2773,7 @@ mod tests {
                 &Submitted {
                     key: &installing,
                     admission: &admit,
+                    caller_grant: None,
                 },
                 1_001,
                 |_| -> Result<(ActionRecord, ())> {
@@ -2782,6 +2794,7 @@ mod tests {
                 &Submitted {
                     key: &reused,
                     admission: &admit,
+                    caller_grant: None,
                 },
                 1_002,
                 |_| -> Result<(ActionRecord, ())> {
@@ -2817,6 +2830,7 @@ mod tests {
                 &Submitted {
                     key: &breaching,
                     admission: &admit,
+                    caller_grant: None,
                 },
                 1_000,
                 |journal| -> Result<(ActionRecord, ())> {

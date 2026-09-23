@@ -648,6 +648,15 @@ impl RemoteConnection {
             | Method::HistoryPage
             | Method::ActionRead
             | Method::InputWrite => self.proxied_read(request, entry, validated).await,
+            // The automation group's read. A device is shown the workflows that act under the
+            // grant it holds, their runs and receipts, and the budgets and alerts of the chains
+            // those runs belong to; a workflow under another grant is not this device's to see.
+            Method::WorkflowRead => {
+                self.controller
+                    .automation()
+                    .read_frame(request, Some(self.device.grant.grant_id))
+                    .await
+            }
             // The voice coordinator's own read. It runs on this host rather than on a worker: the
             // selection is built from what this daemon holds about the session, filtered under
             // this device's own grant, and what comes back goes to this device and nowhere else.
@@ -733,6 +742,15 @@ impl RemoteConnection {
             held = self
                 .controller
                 .project
+                .retained(&actor_id, mutation, entry.method)
+                .await;
+        }
+        // An automation action's record is the workflow journal's, written in the transaction
+        // that performed it, so a device that lost its reply is answered from it.
+        if held.is_none() && crate::automation::AutomationModule::serves(entry.method) {
+            held = self
+                .controller
+                .automation()
                 .retained(&actor_id, mutation, entry.method)
                 .await;
         }
@@ -1080,6 +1098,46 @@ impl RemoteConnection {
                         outcome: Outcome::Ok(value),
                     }),
                     Err(error) => failure(mutation.request_id, error.to_protocol_error()),
+                }
+            }
+            // The automation group. Like a project mutation it is the daemon's own effect: a
+            // workflow belongs to this environment rather than to a session, so it goes to the
+            // automation service rather than to a worker proxy. The admission travels with it into
+            // the workflow journal's own transaction, and the device reaches only the workflows
+            // that act under the grant it holds, so a workflow cannot give it rights its grant
+            // does not carry.
+            _ if crate::automation::AutomationModule::serves(entry.method) => {
+                if let Err(refusal) = self.claim_route(mutation, None) {
+                    return failure(mutation.request_id, refusal.into_error());
+                }
+                let controller = Arc::clone(&self.controller);
+                let mutation = mutation.clone();
+                let request_id = mutation.request_id;
+                let method = entry.method;
+                let carried = crate::authority::AdmittedMutation {
+                    connection_id: self.connection_id(),
+                    admitted_revision: validated,
+                    deadline: Some(accepted.deadline),
+                };
+                let caller_grant = Some(self.device.grant.grant_id);
+                // On a task that outlives this connection: a run dispatches its nodes, and
+                // dropping that future part way through would be a cancellation.
+                let effect = tokio::spawn(async move {
+                    controller
+                        .automation_mutation(&actor_id, &mutation, method, carried, caller_grant)
+                        .await
+                });
+                match tokio::time::timeout(EFFECT_WAIT, effect).await {
+                    Ok(Ok(outcome)) => ControlFrame::Response(Response {
+                        request_id,
+                        outcome: match outcome {
+                            Ok(value) => Outcome::Ok(value),
+                            Err(error) => Outcome::Error(error),
+                        },
+                    }),
+                    // The run is still going, or its task ended without an answer. The record of
+                    // the action is in the journal either way, and a repeat is answered from it.
+                    Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
                 }
             }
             // Everything else belongs to the worker that owns the session.
@@ -1812,6 +1870,12 @@ impl RemoteConnection {
         }
         if crate::changeset::ChangeSetModule::serves(entry.method) {
             crate::changeset::ChangeSetModule::check_subject(entry.method, mutation)
+                .map_err(|error| error.to_protocol_error())?;
+        }
+        // A workflow belongs to this environment rather than to a session or an application, and
+        // its own subject check is the one the local ingress makes.
+        if crate::automation::AutomationModule::serves(entry.method) {
+            crate::automation::AutomationModule::check_subject(entry.method, mutation)
                 .map_err(|error| error.to_protocol_error())?;
         }
         // A voice mutation's subject is this host. A voice session is not a shell session, so the

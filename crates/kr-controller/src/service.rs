@@ -626,23 +626,25 @@ impl Controller {
         // force.
         feed.note_revision(authority_revision);
         sharing.grants().store_feed(&feed.snapshot())?;
-        // The automation service reads the grant each definition names from the grant store this
-        // daemon already holds, under this daemon's own policy, and carries out its change-set
-        // nodes through the change-set service, so it takes all three rather than opening anything
-        // of its own beside its journal.
+        let devices = Arc::new(net::devices::DeviceDirectory::open(
+            setup.paths.registry_database(),
+        )?);
+        // The automation service reads the grant each definition names from the stores this
+        // daemon already holds (the grant store, and a paired device's own record), under this
+        // daemon's own policy, and carries out its change-set nodes through the change-set
+        // service, so it takes all of them rather than opening anything of its own beside its
+        // journal.
         let automation = Arc::new(
             crate::automation::AutomationModule::open(
                 &setup.paths,
                 setup.environment_id,
                 Arc::clone(&sharing),
+                Arc::clone(&devices),
                 Arc::clone(&policy),
                 Arc::clone(changesets.service()),
             )
             .await?,
         );
-        let devices = Arc::new(net::devices::DeviceDirectory::open(
-            setup.paths.registry_database(),
-        )?);
         let (initial_desktop, initial_evidence) = resolved_desktop(in_force.worker_profile, &boot);
         let opened_store = setup
             .secret_store
@@ -3633,6 +3635,7 @@ impl Controller {
         mutation: &MutationRequest,
         method: Method,
         carried: crate::authority::AdmittedMutation,
+        caller_grant: Option<kr_protocol::ids::GrantId>,
     ) -> std::result::Result<ParamsValue, ProtocolError> {
         // A mutation carrying no freshness at all is a retry of an action this host may already
         // hold, and the journal's record is where such a retry is answered from. What it may not
@@ -3657,7 +3660,7 @@ impl Controller {
                 .map_err(|error| error.to_protocol_error())
         });
         self.automation
-            .write(actor_id, mutation, method, admission)
+            .write(actor_id, mutation, method, admission, caller_grant)
             .await
     }
 
@@ -3695,7 +3698,7 @@ impl Controller {
             return self.changesets.read_frame(request).await;
         }
         if crate::automation::AutomationModule::serves(method) {
-            return self.automation.read_frame(request).await;
+            return self.automation.read_frame(request, None).await;
         }
         // The diagnostics are two answers, not one. The owner at their own machine is shown the
         // paths this host resolved and the names they chose, because that is a person asking their
@@ -3877,7 +3880,7 @@ impl Controller {
             };
             let answered = crate::automation::frame(
                 mutation.request_id,
-                self.automation_mutation(actor_id, mutation, method, carried)
+                self.automation_mutation(actor_id, mutation, method, carried, None)
                     .await,
             );
             // A run dispatches its nodes and waits for each of them, so the effect and its reply

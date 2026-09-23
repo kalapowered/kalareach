@@ -69,40 +69,77 @@ pub type Answer<T> = std::result::Result<T, ProtocolError>;
 #[derive(Debug)]
 pub struct HostGrants {
     sharing: Arc<SharingService>,
+    devices: Arc<crate::service::net::devices::DeviceDirectory>,
     policy: Arc<std::sync::Mutex<HostPolicy>>,
     environment_id: EnvironmentId,
 }
 
 impl HostGrants {
-    /// Reads grants from the daemon's own store, under the daemon's own policy.
+    /// Reads grants from the daemon's own stores, under the daemon's own policy.
+    ///
+    /// A grant lives in one of two places: the grant store, for a grant the host issued or shared,
+    /// and a paired device's own record, for the grant its pairing committed.
     #[must_use]
     pub const fn new(
         sharing: Arc<SharingService>,
+        devices: Arc<crate::service::net::devices::DeviceDirectory>,
         policy: Arc<std::sync::Mutex<HostPolicy>>,
         environment_id: EnvironmentId,
     ) -> Self {
         Self {
             sharing,
+            devices,
             policy,
             environment_id,
         }
     }
-}
 
-impl AuthoritySource for HostGrants {
-    fn grant(&self, grant_id: GrantId, now_ms: u64) -> kr_automation::Result<Grant> {
-        let record = self
+    /// Finds the record a grant stands on, in whichever store holds it.
+    fn record(&self, grant_id: GrantId) -> kr_automation::Result<crate::grants::GrantRecord> {
+        let unavailable = |error: ControllerError| {
+            kr_automation::AutomationError::AuthorityUnavailable(error.to_string())
+        };
+        if let Some(record) = self
             .sharing
             .grants()
             .record(grant_id)
-            .map_err(|error| {
-                kr_automation::AutomationError::AuthorityUnavailable(error.to_string())
-            })?
+            .map_err(unavailable)?
+        {
+            return Ok(record);
+        }
+        // A paired device's grant is the one its pairing committed, and the device's record is
+        // where its revocation and its expiry are written. A recorded expiry is a decision the host
+        // already took, and it stands whatever the clock says now.
+        let paired = self
+            .devices
+            .devices()
+            .map_err(unavailable)?
+            .into_iter()
+            .find(|device| device.grant.grant_id == grant_id)
             .ok_or_else(|| {
                 kr_automation::AutomationError::PermissionDenied(format!(
                     "grant {grant_id} is not one this host issued"
                 ))
             })?;
+        if paired.expired_at_ms.is_some() {
+            return Err(kr_automation::AutomationError::PermissionDenied(format!(
+                "grant {grant_id}: this grant has expired"
+            )));
+        }
+        Ok(crate::grants::GrantRecord {
+            grant: paired.grant,
+            session_id: None,
+            issued_at_ms: paired.paired_at_ms.get(),
+            activated_at_ms: Some(paired.paired_at_ms.get()),
+            revoked_at_ms: paired.revoked_at_ms.map(|at| at.get()),
+            revoked_by_parent: None,
+        })
+    }
+}
+
+impl AuthoritySource for HostGrants {
+    fn grant(&self, grant_id: GrantId, now_ms: u64) -> kr_automation::Result<Grant> {
+        let record = self.record(grant_id)?;
         // A grant this host holds for itself is the owner's own authority at this machine; any
         // other recipient is a device that reached the host over the network, and the bounded
         // offline validity is about exactly that access.
@@ -452,6 +489,7 @@ impl AutomationModule {
         paths: &kr_ipc::paths::EnvironmentPaths,
         environment_id: EnvironmentId,
         sharing: Arc<SharingService>,
+        devices: Arc<crate::service::net::devices::DeviceDirectory>,
         policy: Arc<std::sync::Mutex<HostPolicy>>,
         changesets: Arc<ChangeSetService>,
     ) -> Result<Self> {
@@ -459,7 +497,7 @@ impl AutomationModule {
         // a runtime directory is cleared by one.
         let state_dir = paths.state_dir().to_path_buf();
         let grants: Arc<dyn AuthoritySource> =
-            Arc::new(HostGrants::new(sharing, policy, environment_id));
+            Arc::new(HostGrants::new(sharing, devices, policy, environment_id));
         let host = Host {
             environment_id,
             runner: Arc::new(HostActions::new(
@@ -578,9 +616,16 @@ impl AutomationModule {
     }
 
     /// Serves one automation read and returns the frame it answers with.
+    ///
+    /// `caller_grant` is the grant a paired device holds, when one is asking: it is shown only
+    /// the workflows that act under that grant. The owner at this machine passes `None`.
     #[must_use]
-    pub async fn read_frame(&self, request: &Request) -> ControlFrame {
-        frame(request.request_id, self.read(request).await)
+    pub async fn read_frame(
+        &self,
+        request: &Request,
+        caller_grant: Option<GrantId>,
+    ) -> ControlFrame {
+        frame(request.request_id, self.read(request, caller_grant).await)
     }
 
     /// Answers an action this service has already performed for this caller, if it has.
@@ -613,7 +658,11 @@ impl AutomationModule {
     /// # Errors
     ///
     /// Returns the refusal the service decided, under the service's own code.
-    pub async fn read(&self, request: &Request) -> Answer<ParamsValue> {
+    pub async fn read(
+        &self,
+        request: &Request,
+        caller_grant: Option<GrantId>,
+    ) -> Answer<ParamsValue> {
         let Some(method) = request.method.method() else {
             return Err(ProtocolError::new(
                 ErrorCode::PermissionDenied,
@@ -634,7 +683,7 @@ impl AutomationModule {
         let now_ms = kr_ipc::now_ms().get();
         blocking(move || {
             let asked: WorkflowReadParams = typed(&params)?;
-            encode(&service.read(&asked, now_ms)?)
+            encode(&service.read(&asked, caller_grant, now_ms)?)
         })
         .await
     }
@@ -647,6 +696,9 @@ impl AutomationModule {
     /// that lapsed while it waited for a blocking thread or for the journal's own lock; and it is
     /// asked only when there is no record to answer from, so a retry still gets its own result.
     ///
+    /// `caller_grant` is the grant a paired device holds, when one is submitting: the action
+    /// reaches only a workflow that acts under that grant. The owner at this machine passes `None`.
+    ///
     /// # Errors
     ///
     /// Returns the refusal the service decided, under the service's own code.
@@ -656,6 +708,7 @@ impl AutomationModule {
         mutation: &MutationRequest,
         method: Method,
         admission: Admission,
+        caller_grant: Option<GrantId>,
     ) -> Answer<ParamsValue> {
         let key = action_key(actor_id, mutation, method)?;
         let service = Arc::clone(&self.service);
@@ -675,6 +728,7 @@ impl AutomationModule {
                 let submitted = Submitted {
                     key: &key,
                     admission: &still_admitted,
+                    caller_grant,
                 };
                 encode(&service.run(&asked, &submitted, now_ms).await?)
             }
@@ -684,6 +738,7 @@ impl AutomationModule {
                     let submitted = Submitted {
                         key: &key,
                         admission: &still_admitted,
+                        caller_grant,
                     };
                     encode(&service.install(&asked, &submitted, now_ms)?)
                 })
@@ -695,6 +750,7 @@ impl AutomationModule {
                     let submitted = Submitted {
                         key: &key,
                         admission: &still_admitted,
+                        caller_grant,
                     };
                     encode(&service.enable(&asked, &submitted, now_ms)?)
                 })
@@ -706,6 +762,7 @@ impl AutomationModule {
                     let submitted = Submitted {
                         key: &key,
                         admission: &still_admitted,
+                        caller_grant,
                     };
                     encode(&service.pause(&asked, &submitted, now_ms)?)
                 })

@@ -113,6 +113,15 @@ wire_enum! {
 }
 
 wire_enum! {
+    /// What a workflow alert is about.
+    WorkflowAlertKind {
+        CausalLimit => "causal_limit", "A causal chain ran out of budget and was paused.";
+        WorkflowPaused => "workflow_paused", "A workflow revision was paused by one of its own limits.";
+        WorkflowResumed => "workflow_resumed", "The pause a limit caused was cleared by enabling the revision.";
+    }
+}
+
+wire_enum! {
     /// Execution status of a single workflow action node.
     NodeStatus {
         Pending => "pending", "Waiting for dependencies to complete.";
@@ -283,6 +292,8 @@ pub struct WorkflowDefinitionSummary {
     pub grant_reference: GrantId,
     /// Whether enabled.
     pub enabled: bool,
+    /// Whether paused, by `workflow.pause` or because one of its own limits was breached.
+    pub paused: bool,
     /// When installed.
     pub installed_at_ms: TimestampMs,
 }
@@ -314,6 +325,30 @@ pub struct WorkflowRunSummary {
     pub started_at_ms: TimestampMs,
     /// When execution finished, if terminated.
     pub ended_at_ms: Nullable<TimestampMs>,
+}
+
+/// One attention record the automation journal holds and no attention state has acknowledged.
+///
+/// It is the record an exhausted chain or a breached workflow limit owes, and the one that ends a
+/// pause. It stays in the journal, and in `workflow.read`, until the environment's attention state
+/// has taken it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowAlert {
+    /// The record's position in the automation journal's event stream.
+    pub sequence: U64,
+    /// What it is about.
+    pub kind: WorkflowAlertKind,
+    /// The workflow, for an alert about a workflow revision.
+    pub workflow_id: Nullable<WorkflowId>,
+    /// The revision, for an alert about a workflow revision.
+    pub revision: Nullable<U64>,
+    /// The chain, for an alert about a causal budget.
+    pub causal_root_id: Nullable<CausalRootId>,
+    /// Which limit was reached, or what ended the condition.
+    pub reason: String,
+    /// When the record was committed.
+    pub raised_at_ms: TimestampMs,
 }
 
 /// Summary receipt of an executed action node.
@@ -490,6 +525,9 @@ pub struct WorkflowReadResult {
     pub node_receipts: Vec<NodeReceiptSummary>,
     /// Remaining causal budget for requested causal root, if queried.
     pub remaining_causal_budget: Nullable<CausalBudgetSummary>,
+    /// The alerts about the workflows and chains this read covers that no attention state has
+    /// taken yet, oldest first.
+    pub alerts: Vec<WorkflowAlert>,
 }
 
 #[cfg(test)]

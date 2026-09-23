@@ -12,13 +12,22 @@ and per-grant admission limits.
 | `workflow.enable` | Activates an installed workflow definition revision | `automation.manage` |
 | `workflow.pause` | Pauses an enabled workflow definition revision | `automation.manage` |
 | `workflow.run` | Explicitly triggers an execution run of an enabled workflow | `automation.manage` |
-| `workflow.read` | Reads workflow definitions, revision states, runs, and budgets | `automation.manage` |
+| `workflow.read` | Reads definitions and whether each revision is paused, runs, node receipts, a chain's remaining budget, and the alerts no attention state has taken | `automation.manage` |
 
-The control daemon serves all five. They arrive through its ordinary path: a read is checked
-against current authority, and a mutation carries an action window, is checked against the method
-registry and its rights, and runs on a task a dropped connection cannot cancel part way through.
-A workflow belongs to the environment rather than to a session, so a request that targets a
-session or a foreground application is refused before anything is written.
+The control daemon serves all five, to the owner on the local socket and to a paired device over
+the network, and those are the only ingresses the method registry lists for them. They arrive
+through the daemon's ordinary path on either door: a read is checked against current authority,
+and a mutation carries an action window, is checked against the method registry and its rights,
+and runs on a task a dropped connection cannot cancel part way through. A workflow belongs to the
+environment rather than to a session, so a request that targets a session or a foreground
+application is refused before anything is written.
+
+A paired device acts under the grant it holds and no other. It may install a workflow only under
+that grant, and it may enable, pause, run and read only the workflows that act under it; the
+owner's workflows and another device's are neither its to change nor its to see. A workflow
+therefore never gives a device a right its own grant does not carry. A paired device's grant is
+read from its pairing record, so revoking the device stops every workflow under that grant, and a
+grant whose expiry the host has recorded does not come back.
 
 Every method has an exhaustive authority entry in `kr_protocol::method::REGISTRY` naming its
 effect class, the ingress an actor may reach it through, the rights it requires, its resource
@@ -241,8 +250,9 @@ The contract with every consumer:
   removed.
 
 The attention records wait in the stream under that rule. The environment's attention state is the
-consumer they are for; until it registers, nothing removes them, and `workflow.read` shows the
-causal budget's pause.
+consumer they are for; until it registers, nothing removes them. `workflow.read` shows each
+revision's pause and lists the alerts no attention state has taken, for the workflows and chains the
+read covers, newest 256 at most.
 
 ## Source workflow and evidence binding
 

@@ -354,3 +354,88 @@ async fn a_redelivered_trigger_neither_spends_an_allowance_nor_pauses_the_workfl
         1
     );
 }
+
+/// `workflow.read` shows a revision's pause and the alert it owes until an attention state takes
+/// the alert, and the alert that ends it when the revision is enabled again.
+#[tokio::test]
+async fn a_read_shows_the_pause_and_its_alert() {
+    use kr_protocol::automation::{WorkflowAlertKind, WorkflowReadParams};
+    use kr_protocol::scalars::Nullable;
+
+    let grant = test_grant_id(40);
+    let service = kr_automation::AutomationService::in_memory(common::host(
+        std::sync::Arc::new(kr_automation::MockActionRunner::new()),
+        common::every_right(&[grant]),
+        std::sync::Arc::new(kr_automation::ManualClock::new(1_000)),
+    ))
+    .expect("a service");
+    let definition = kr_automation::create_workflow_definition(
+        test_wf_id(40),
+        1,
+        "paused by a limit",
+        grant,
+        vec![kr_protocol::automation::WorkflowNode {
+            node_id: "only".to_owned(),
+            action_kind: "run_tests".to_owned(),
+            action_params: r#"{"suite": "unit"}"#.to_owned(),
+            declared_environment: Nullable::null(),
+        }],
+        vec![],
+    );
+    service
+        .submit_install(
+            &kr_protocol::automation::WorkflowInstallParams {
+                workflow_id: definition.workflow_id,
+                revision: definition.revision,
+                definition: definition.clone(),
+                grant_reference: grant,
+            },
+            1_000,
+        )
+        .expect("installs");
+    service
+        .store()
+        .pause_workflow_on_breach(definition.workflow_id, 1, "four runs at once", 1_100)
+        .expect("paused");
+
+    let read = |service: &kr_automation::AutomationService| {
+        service
+            .read(
+                &WorkflowReadParams {
+                    workflow_id: Nullable::some(definition.workflow_id),
+                    ..WorkflowReadParams::default()
+                },
+                None,
+                1_200,
+            )
+            .expect("a read")
+    };
+    let paused = read(&service);
+    assert!(paused.definitions[0].paused);
+    assert_eq!(paused.alerts.len(), 1);
+    assert_eq!(paused.alerts[0].kind, WorkflowAlertKind::WorkflowPaused);
+    assert_eq!(paused.alerts[0].reason, "four runs at once");
+
+    service
+        .submit_enable(
+            &kr_protocol::automation::WorkflowEnableParams {
+                workflow_id: definition.workflow_id,
+                revision: definition.revision,
+            },
+            1_300,
+        )
+        .expect("enables");
+    let resumed = read(&service);
+    assert!(!resumed.definitions[0].paused);
+    assert_eq!(
+        resumed
+            .alerts
+            .iter()
+            .map(|alert| alert.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            WorkflowAlertKind::WorkflowPaused,
+            WorkflowAlertKind::WorkflowResumed
+        ]
+    );
+}
