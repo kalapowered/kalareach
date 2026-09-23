@@ -361,6 +361,9 @@ pub struct AttentionModule {
     /// beside the store so a restart keeps what it knew about the wall clock.
     time: kr_worker::action::time::TimeContract,
     time_file: std::path::PathBuf,
+    /// Held from reading what the time contract must keep to recording it as kept, so one save
+    /// never replaces a newer one with an older state.
+    time_saving: std::sync::Mutex<()>,
     origins: std::sync::Mutex<Origins>,
     /// Wakes the maintenance loop when a timer may have moved.
     wake: Arc<tokio::sync::Notify>,
@@ -385,6 +388,19 @@ impl AttentionModule {
         paths: &kr_ipc::paths::EnvironmentPaths,
         boot_identity: kr_protocol::identity::BootIdentity,
     ) -> Result<Self> {
+        Self::open_over(
+            paths,
+            boot_identity,
+            kr_worker::action::time::TimeSources::system(),
+        )
+    }
+
+    /// Opens the store as [`Self::open`] does, reading time from the clocks given.
+    fn open_over(
+        paths: &kr_ipc::paths::EnvironmentPaths,
+        boot_identity: kr_protocol::identity::BootIdentity,
+        sources: kr_worker::action::time::TimeSources,
+    ) -> Result<Self> {
         let time_file = paths.state_dir().join("attention-time.cbor");
         let recorded = std::fs::read(&time_file).ok().and_then(|bytes| {
             kr_cbor::from_canonical_slice::<kr_protocol::action::HostTimeState>(
@@ -393,12 +409,8 @@ impl AttentionModule {
             )
             .ok()
         });
-        let time = kr_worker::action::time::TimeContract::restore(
-            boot_identity,
-            "",
-            kr_worker::action::time::TimeSources::system(),
-            recorded,
-        );
+        let time =
+            kr_worker::action::time::TimeContract::restore(boot_identity, "", sources, recorded);
         let identity = kr_ipc::identity::current_process_start_identity().map_err(|error| {
             ControllerError::RegistryUnavailable {
                 detail: format!("this daemon's process cannot be identified: {error}"),
@@ -424,6 +436,7 @@ impl AttentionModule {
             store: std::sync::Mutex::new(store),
             time,
             time_file,
+            time_saving: std::sync::Mutex::new(()),
             origins: std::sync::Mutex::new(Origins::default()),
             wake: Arc::new(tokio::sync::Notify::new()),
         };
@@ -510,7 +523,14 @@ impl AttentionModule {
     }
 
     /// Writes down what the time contract has to keep across a restart, when it has something new.
+    ///
+    /// One save at a time, from reading the state to recording it as kept: two saves that crossed
+    /// could write an older state over a newer one and still record the newer as kept.
     fn keep_time(&self) {
+        let _saving = self
+            .time_saving
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !self.time.unsaved() {
             return;
         }
@@ -1390,6 +1410,13 @@ impl AttentionModule {
     pub fn watch(self: &Arc<Self>, reach: Arc<dyn Reach>, worker: KnownWorker) {
         let session_id = worker.descriptor.session_id;
         {
+            // With the store held, as a closure holds it: a page being taken from the link this
+            // replaces is taken, certificate and all, before the link and its certificate go, and
+            // one read after this finds its link gone.
+            let _store = self
+                .store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut guard = self.origins();
             let origins = &mut *guard;
             origins.closing.remove(&session_id);
@@ -1746,16 +1773,22 @@ impl AttentionModule {
                 Err(Unfinished::Store(error)) => Err(error),
             }
         };
-        {
+        let changed = {
             let mut origins = self.origins();
             if finished.is_ok() {
                 origins.unfinished.remove(&session_id);
                 origins.closing.remove(&session_id);
+                true
             } else {
-                origins.unfinished.insert(session_id);
+                // A session newly left unfinished wakes the loop that retries it. One that failed
+                // again is already on the loop's schedule, and waking the loop for it would retry
+                // it at once, again and again, rather than after the pause a retry waits.
+                origins.unfinished.insert(session_id)
             }
+        };
+        if changed {
+            self.wake.notify_one();
         }
-        self.wake.notify_one();
     }
 
     /// Tries again to finish every closed session the store could not finish before.
@@ -1898,8 +1931,10 @@ impl AttentionModule {
                 };
                 held.finish_again(reach.as_ref()).await;
                 let reading = held.reading();
-                let certified = held.certificates();
                 if let Ok(mut store) = held.store() {
+                    // Read with the store held: a closure and a replacement take the store before
+                    // they take a certificate away, so this tick never decides on one they took.
+                    let certified = held.certificates();
                     let _ = store.tick(reading, &|origin| certified_at(&certified, origin));
                     // Expired records are let go of only on a wall clock this host can prove, so a
                     // rollback cannot make a live record look expired.
@@ -1912,12 +1947,12 @@ impl AttentionModule {
                         );
                     }
                 }
-                let mut wait =
-                    held.next_decidable_deadline(reading, &certified)
-                        .map_or(MAINTENANCE, |due| {
-                            Duration::from_millis(due.saturating_sub(reading.continuous_ms))
-                                .clamp(Duration::from_millis(50), MAINTENANCE)
-                        });
+                let mut wait = held
+                    .next_decidable_deadline(reading)
+                    .map_or(MAINTENANCE, |due| {
+                        Duration::from_millis(due.saturating_sub(reading.continuous_ms))
+                            .clamp(Duration::from_millis(50), MAINTENANCE)
+                    });
                 if !held.origins().unfinished.is_empty() {
                     wait = wait.min(CLOSURE_RETRY);
                 }
@@ -1937,12 +1972,9 @@ impl AttentionModule {
     /// A timer that has fallen due and whose origin has no certificate that reaches it waits for
     /// one, and a new certificate wakes the loop; counting it here would have the loop tick for
     /// nothing again and again.
-    fn next_decidable_deadline(
-        &self,
-        reading: HostReading,
-        certified: &BTreeMap<SessionId, u64>,
-    ) -> Option<u64> {
+    fn next_decidable_deadline(&self, reading: HostReading) -> Option<u64> {
         let store = self.store().ok()?;
+        let certified = &self.certificates();
         let engine = store.engine().ok()?;
         let mut origins: BTreeSet<Origin> = engine
             .all_consumed()
@@ -3537,28 +3569,237 @@ mod tests {
         );
     }
 
-    /// What the store's time contract has to keep across a restart is written beside the store
-    /// when it is learned, and a store opened again reads it back.
-    #[tokio::test]
-    async fn what_the_time_contract_must_keep_is_written_beside_the_store() {
+    /// A reach that connects to nothing, reads no journal, and counts how often it is asked about
+    /// a closure.
+    #[derive(Default)]
+    struct Counting {
+        asked: AtomicU64,
+    }
+
+    impl Reach for Counting {
+        fn connect<'a>(
+            &'a self,
+            _worker: &'a KnownWorker,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<LocalClient>> + Send + 'a>>
+        {
+            Box::pin(async { Err(ControllerError::supervision("this test connects nothing")) })
+        }
+
+        fn unaccounted<'a>(
+            &'a self,
+            _session_id: SessionId,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { false })
+        }
+
+        fn closed_journal(&self, _session_id: SessionId) -> Option<kr_worker::journal::Journal> {
+            None
+        }
+
+        fn output_floor(&self, _session_id: SessionId) -> Option<u64> {
+            None
+        }
+    }
+
+    /// A worker for `session_id` as the directory knows it, published at `published_at_ms`.
+    fn known(
+        temp: &kr_ipc::testing::TempHost,
+        session_id: SessionId,
+        published_at_ms: u64,
+    ) -> KnownWorker {
+        let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+        let process =
+            kr_ipc::identity::current_process_start_identity().expect("a process identity");
+        let identity = kr_ipc::verify::WorkerIdentity::generate(
+            session_id,
+            kr_protocol::ids::SessionEpoch::V1,
+            boot.clone(),
+            process.clone(),
+            kr_protocol::hello::PROTOCOL_VERSION,
+        )
+        .expect("a session key");
+        let endpoint = temp
+            .environment()
+            .worker_endpoint(DisplayNumber::new(5))
+            .expect("an endpoint");
+        KnownWorker {
+            descriptor: kr_protocol::worker::WorkerDescriptor {
+                session_id,
+                session_epoch: kr_protocol::ids::SessionEpoch::V1,
+                environment_id: temp.environment_id(),
+                display_number: DisplayNumber::new(5),
+                boot_identity: boot,
+                process_start_identity: process,
+                protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+                endpoint: endpoint.as_text(),
+                worker_public_key: *identity.public_key(),
+                worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+                published_at_ms: TimestampMs::new(published_at_ms),
+            },
+            endpoint,
+        }
+    }
+
+    /// A closed session the store cannot finish is tried again on the retry's own schedule: a
+    /// retry that fails again does not wake the loop that made it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_closure_the_store_cannot_finish_is_retried_on_its_own_schedule() {
         let temp = kr_ipc::testing::TempHost::create();
-        let first = module(&temp);
+        let module = module(&temp);
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        // From here on the store answers nothing, as a store that cannot be written does.
+        let poisoning = Arc::clone(&module);
+        let _ = std::thread::spawn(move || {
+            let _held = poisoning.store.lock();
+            panic!("the store stops answering");
+        })
+        .join();
+        let reach = Arc::new(Counting::default());
+        module.session_closed(reach.as_ref(), session_id).await;
+        assert!(module.origins().unfinished.contains(&session_id));
+        let first = reach.asked.load(Ordering::SeqCst);
+        module.maintain(Arc::clone(&reach) as Arc<dyn Reach>);
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let retried = reach.asked.load(Ordering::SeqCst) - first;
+        assert!(retried >= 1, "the loop tries the closure again");
+        assert!(
+            retried <= 2,
+            "retried {retried} times in a second and a half rather than after its pause"
+        );
+    }
+
+    /// A replacement of a session's worker waits for a page being taken from the link it replaces,
+    /// and no certificate of the old worker's outlives it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replacement_waits_for_a_page_being_taken_and_leaves_no_certificate() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = module(&temp);
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let (link, _reader, _writer) = linked(&temp, 1, &module, session_id).await;
+        {
+            let mut origins = module.origins();
+            origins.watched.insert(session_id);
+            origins.workers.insert(
+                session_id,
+                Watched {
+                    worker: known(&temp, session_id, 1),
+                    revision: 0,
+                    replaced: Arc::new(tokio::sync::Notify::new()),
+                },
+            );
+        }
+        // A page being taken holds the store from its look at the link to its certificate.
+        let taking = module.store.lock().expect("the store");
+        let replacing = {
+            let module = Arc::clone(&module);
+            let worker = known(&temp, session_id, 2);
+            std::thread::spawn(move || {
+                module.watch(Arc::new(Stub { unaccounted: false }), worker);
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        module
+            .origins()
+            .certified
+            .insert(session_id, kr_ipc::clock::boot_elapsed_ms());
+        drop(taking);
+        replacing.join().expect("the replacement finishes");
+        let origins = module.origins();
+        assert!(
+            !origins.certified.contains_key(&session_id),
+            "no certificate of the old worker's outlives the replacement"
+        );
+        assert!(
+            !origins
+                .links
+                .get(&session_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &link))
+        );
+    }
+
+    /// A rollback of the wall clock the store's time contract saw is written beside the store,
+    /// one save at a time however many readings save at once, and a store opened again reads it
+    /// back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn what_the_time_contract_must_keep_is_written_beside_the_store() {
+        use kr_worker::action::adapter::{
+            RecordedTimeAdapter, UnixTimex, classify_unix, unix_model,
+        };
+        use kr_worker::action::time::{ManualActiveClock, ManualWallClock, TimeSources};
+
+        const WALL: u64 = 1_700_000_000_000;
+        let temp = kr_ipc::testing::TempHost::create();
+        let continuous = kr_ipc::clock::ManualSharedClock::new();
+        continuous.advance(Duration::from_secs(3_600));
+        let active = ManualActiveClock::new();
+        active.advance(Duration::from_secs(3_600));
+        let wall = ManualWallClock::new(WALL);
+        let adapter = RecordedTimeAdapter::new(classify_unix(
+            "macos",
+            "ntp_adjtime(2)",
+            UnixTimex {
+                time_state: unix_model::TIME_OK,
+                status: unix_model::STA_PLL,
+                maxerror_us: 62_192,
+                esterror_us: 500_000,
+            },
+            TimestampMs::new(WALL),
+        ));
+        let sources = || TimeSources {
+            continuous: Arc::new(continuous.clone()),
+            active: Arc::new(active.clone()),
+            wall: Arc::new(wall.clone()),
+            adapter: Arc::new(adapter.clone()),
+        };
+        let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+        let first = Arc::new(
+            AttentionModule::open_over(&temp.environment(), boot.clone(), sources())
+                .expect("the store opens"),
+        );
         let _ = first.reading();
+        assert_eq!(
+            first.time.trust(),
+            kr_protocol::action::WallClockTrust::Trusted
+        );
+
+        // The wall clock is set back a minute, and several readings observe it and save at once.
+        wall.set(WALL - 60_000);
+        let readers: Vec<_> = (0..8)
+            .map(|_| {
+                let first = Arc::clone(&first);
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        let _ = first.reading();
+                    }
+                })
+            })
+            .collect();
+        for reader in readers {
+            reader.join().expect("the readings finish");
+        }
+        assert_eq!(
+            first.time.trust(),
+            kr_protocol::action::WallClockTrust::Unresolved
+        );
         assert!(
             !first.time.unsaved(),
             "nothing it must keep is left unwritten"
         );
-        if let Ok(bytes) = std::fs::read(&first.time_file) {
-            kr_cbor::from_canonical_slice::<kr_protocol::action::HostTimeState>(
-                &bytes,
-                &kr_cbor::Limits::DEFAULT,
-            )
-            .expect("what was written reads back");
-        }
-        let trust = first.time.trust();
+        let bytes = std::fs::read(&first.time_file).expect("the record is written");
+        kr_cbor::from_canonical_slice::<kr_protocol::action::HostTimeState>(
+            &bytes,
+            &kr_cbor::Limits::DEFAULT,
+        )
+        .expect("what was written reads back");
         drop(first);
-        let again = module(&temp);
-        assert_eq!(again.time.trust(), trust);
+        let again = AttentionModule::open_over(&temp.environment(), boot, sources())
+            .expect("the store opens again");
+        assert_eq!(
+            again.time.trust(),
+            kr_protocol::action::WallClockTrust::Unresolved,
+            "a restart keeps the rollback"
+        );
     }
 
     /// A request's bound covers the wait for the connection's writer as well as the answer, so a
