@@ -315,11 +315,23 @@ impl Store {
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(source) => return Err(CatalogueError::storage(&from, &source)),
         };
-        write_atomically(
-            &self.root.join("staging"),
-            &self.datastore().join(TIME_CHECKPOINT),
-            &bytes,
-        )
+        // The client writes this document in place, so a write it did not finish leaves it empty
+        // or cut short, and a document that does not read back is one the client ignores. Only a
+        // time that reads back, and is no earlier than the time already kept, replaces it.
+        let Ok(seen) = serde_json::from_slice::<jiff::Timestamp>(&bytes) else {
+            return Ok(());
+        };
+        let to = self.datastore().join(TIME_CHECKPOINT);
+        match std::fs::read(&to) {
+            Ok(held) => {
+                if serde_json::from_slice::<jiff::Timestamp>(&held).is_ok_and(|kept| kept >= seen) {
+                    return Ok(());
+                }
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(CatalogueError::storage(&to, &source)),
+        }
+        write_atomically(&self.root.join("staging"), &to, &bytes)
     }
 
     /// Makes a verified working copy the accepted trust checkpoint, one document at a time.
@@ -1693,6 +1705,38 @@ mod tests {
             "{outcome:?}"
         );
         assert_eq!(std::fs::read(&manifest).expect("readable"), manifest_bytes);
+    }
+
+    #[test]
+    fn only_a_time_that_reads_back_and_is_later_replaces_the_kept_one() {
+        let (_directory, store) = store();
+        let kept = store.datastore().join(TIME_CHECKPOINT);
+        let earlier = jiff::Timestamp::from_second(1_760_000_000).expect("a time");
+        let later = jiff::Timestamp::from_second(1_760_000_600).expect("a time");
+        let json = |time: jiff::Timestamp| serde_json::to_vec(&time).expect("serialisable");
+        std::fs::write(&kept, json(later)).expect("writable");
+
+        for (seen, replaces) in [
+            (Vec::new(), false),
+            (json(later)[..5].to_vec(), false),
+            (json(earlier), false),
+            (json(later), false),
+            (
+                json(jiff::Timestamp::from_second(1_760_001_200).expect("a time")),
+                true,
+            ),
+        ] {
+            let before = std::fs::read(&kept).expect("readable");
+            let working = store.working_datastore(false).expect("a copy");
+            std::fs::write(working.path().join(TIME_CHECKPOINT), &seen).expect("writable");
+            owned(|permit| store.publish_time_checkpoint(permit, &working)).expect("kept");
+            let after = std::fs::read(&kept).expect("readable");
+            if replaces {
+                assert_eq!(after, seen);
+            } else {
+                assert_eq!(after, before, "{:?}", String::from_utf8_lossy(&seen));
+            }
+        }
     }
 
     #[test]

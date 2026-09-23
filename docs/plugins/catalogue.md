@@ -71,8 +71,10 @@ accepted checkpoint, document by document with each document renamed into place 
 the metadata has verified and under the same admission as any other change. A verification that
 fails, is interrupted or is refused leaves the checkpoint exactly as it was, and no interruption
 leaves a half-written document the client would skip. Once the metadata has verified, the
-checkpoint is kept whatever happens to the rest of the sync; so is the latest time the client saw
-while it fetched a full mirror, which is what lets it refuse a clock set back behind that time.
+checkpoint is kept whatever happens to the rest of the sync. The latest time the client saw while it
+fetched a full mirror is kept too, in a commit of its own once the mirror has finished or stopped on
+an error, which is what lets it refuse a clock set back behind that time; a sync cancelled during
+the mirror, or refused at that commit, keeps the time the checkpoint already had.
 
 Where a new root changes the keys that sign timestamps or snapshots, those roles may start again
 from lower versions, and the client drops their old versions when it sees the change. A sync that
