@@ -617,13 +617,7 @@ impl kr_controller::supervision::TerminalPresenter for RefusingTerminal {
 /// an argument of its own, never text assembled into a command line.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_terminal_that_cannot_be_opened_leaves_one_live_session_and_a_presentation_error() {
-    let Some(worker_build) = worker_beside_this_test() else {
-        eprintln!(
-            "skipped: this suite starts a worker process and none is built beside the test \
-             binary; build it with `cargo build -p kr-worker`"
-        );
-        return;
-    };
+    let worker_build = worker_beside_this_test();
     let temp = kr_ipc::testing::TempHost::create();
     // On the internal disk, and never the copy in the workspace: a worker a service manager starts
     // is its own privacy identity, and one that opened a path on the external volume would stop
@@ -757,8 +751,14 @@ async fn a_terminal_that_cannot_be_opened_leaves_one_live_session_and_a_presenta
     rendezvous_serving.abort();
 }
 
-/// Returns the worker binary beside this test's own, when the build has produced one.
-fn worker_beside_this_test() -> Option<std::path::PathBuf> {
+/// Returns the worker binary beside this test's own.
+///
+/// # Panics
+///
+/// Panics, naming where the worker should be and how to build it, when the build has not produced
+/// one. A test that returned early instead would report a pass for a session it never started. A
+/// test run of the whole workspace builds the worker, because the worker's own tests launch it.
+fn worker_beside_this_test() -> std::path::PathBuf {
     let mut directory = std::env::current_exe().expect("the test binary");
     directory.pop();
     if directory.file_name().is_some_and(|name| name == "deps") {
@@ -769,7 +769,13 @@ fn worker_beside_this_test() -> Option<std::path::PathBuf> {
     } else {
         "kr-worker"
     });
-    worker.is_file().then_some(worker)
+    assert!(
+        worker.is_file(),
+        "this test starts a worker process and there is none at {}; build it with \
+         `cargo build -p kr-worker`, or run the whole workspace's tests, which build it",
+        worker.display()
+    );
+    worker
 }
 
 // --------------------------------------------------------------------------------------------
