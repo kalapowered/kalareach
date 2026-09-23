@@ -547,6 +547,8 @@ fn a_confirmation_keeps_its_own_deadline_and_its_own_boot() {
 }
 
 /// A challenge answered for another host does not confirm a transfer on this one.
+/// KR-REQ-02.09: changing who holds a session's host authority needs an owner confirmation bound
+/// to this host.
 #[test]
 fn a_confirmation_issued_for_another_host_does_not_authorise_a_transfer_here() {
     let clock = Clock;
@@ -1474,6 +1476,8 @@ fn a_view_only_invitation_obtains_no_input_through_a_plugin_an_attachment_action
 // KR-REQ-23.49: the sharing method group
 // ---------------------------------------------------------------------------------------------
 
+/// KR-REQ-02.09: a persistent grant that enlarges what a device already holds needs the owner's
+/// confirmation; a bounded invitation does not.
 #[test]
 fn sharing_checks_parent_rights_expiry_and_owner_confirmation() {
     let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");

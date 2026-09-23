@@ -1479,6 +1479,8 @@ fn only_the_issuing_owner_confirms_or_cancels() {
 
 /// KR-REQ-10.05: issuing and confirming each need their own fresh confirmation, bound to the
 /// action, digest and destination and signed by the enrolled owner.
+/// KR-REQ-02.09: issuing a pairing invitation and confirming a new device, both of which enlarge
+/// what can reach this host, each need a fresh owner confirmation for exactly that action.
 #[test]
 fn issuing_and_confirming_both_need_a_fresh_single_use_confirmation() {
     let harness = Harness::new();

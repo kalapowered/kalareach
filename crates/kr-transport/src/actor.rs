@@ -222,6 +222,9 @@ mod tests {
     /// KR-REQ-23.17: the envelope binds the original ingress, the device, the grant and the
     /// revision it was checked at, the admitting controller generation and the connection, each
     /// exactly as the host established it. A request can change only the grant it claims.
+    /// KR-REQ-02.06: a paired device's action carries the envelope the host built for it: the
+    /// device, the grant the action is checked against and that grant's revision, beside the
+    /// ingress, the generation and the connection.
     #[test]
     fn the_envelope_records_the_facts_the_host_established() {
         let actor = device_actor();
@@ -283,6 +286,8 @@ mod tests {
 
     /// KR-REQ-23.17, KR-REQ-23.20: a local caller's envelope records local IPC and no device; it
     /// never passes as a paired network device.
+    /// KR-REQ-02.06: a local caller's envelope names no device and no grant: it is authenticated
+    /// by its operating-system identity instead.
     #[test]
     fn a_local_caller_is_not_a_paired_device() {
         let actor = ConnectionActor::local_peer(

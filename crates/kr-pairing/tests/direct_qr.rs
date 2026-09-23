@@ -657,6 +657,8 @@ fn a_reused_expired_or_cancelled_invitation_gives_a_specific_rejection() {
 
 /// KR-REQ-10.37, KR-REQ-10.38: `pair.confirm` takes only the issuing owner, the exact transcript
 /// and the exact client keys, and a short-code confirmation does not approve a direct redemption.
+/// KR-REQ-02.09: a device paired by direct QR is admitted only on the issuing owner's confirmation
+/// of that exact exchange and those keys.
 #[test]
 fn only_the_issuing_owner_confirms_the_exact_transcript_and_keys() {
     let harness = Harness::new();
