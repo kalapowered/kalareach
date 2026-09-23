@@ -30,6 +30,40 @@ fn keyboard(engine: &mut Engine) -> kr_term::snapshot::KeyboardSnapshot {
     engine.snapshot(viewport, 0).0.keyboard
 }
 
+/// Everything a restoration or a projection reads from the canonical grid: the text of every
+/// visible row, the cursor, the pen, the title and the modes that decide where the next character
+/// goes.
+#[derive(Debug, PartialEq, Eq)]
+struct Screen {
+    rows: Vec<String>,
+    cursor: (u32, u32),
+    pen: String,
+    title: String,
+    alternate_auto_wrap_insert_origin: [bool; 4],
+    margins: (u32, u32),
+}
+
+fn screen(engine: &Engine) -> Screen {
+    let grid = engine.grid();
+    Screen {
+        rows: grid
+            .visible_rows()
+            .iter()
+            .map(|row| row.runs.iter().map(|run| run.text.as_str()).collect())
+            .collect(),
+        cursor: grid.cursor(),
+        pen: grid.sgr_parameters(),
+        title: grid.title().to_owned(),
+        alternate_auto_wrap_insert_origin: [
+            grid.alternate_active(),
+            grid.auto_wrap(),
+            grid.insert_mode(),
+            grid.origin_mode(),
+        ],
+        margins: grid.margins_vertical(),
+    }
+}
+
 fn attachment() -> AttachmentId {
     AttachmentId::new(Uuid::from_bytes([7; 16]))
 }
@@ -275,8 +309,9 @@ fn notifications_and_progress_are_recognised_by_subcommand() {
     }
 }
 
-/// KR-REQ-08.08: the reducer cannot apply a sequence policy rejected, even when handed one
-/// directly.
+/// KR-REQ-08.08: the reducer cannot apply a sequence policy rejected: the adapter produces no
+/// action for one even when handed it directly, and the production engine leaves the canonical
+/// grid exactly as it was, including for a sequence a terminal would use to paint the screen.
 #[test]
 fn the_reducer_refuses_what_policy_refused() {
     let policy = Policy::DEFAULT;
@@ -296,6 +331,46 @@ fn the_reducer_refuses_what_policy_refused() {
             "the adapter produces no action for {event:?}"
         );
     }
+
+    // Through the engine the session runs, whose reducer is the one that writes the grid. A query,
+    // a bell, a mode the profile refuses, a graphics string, a switch to 132 columns that would
+    // clear the screen and a request to fill the whole screen with a character are all refused, and
+    // the screen they reach is the screen they leave.
+    let refused: &[u8] = b"\x1b[c\x07\x1b[?2027h\x1b_Gf=24;AAAA\x1b\\\x1b[?3h\x1b[88;1;1;24;80$x";
+    let mut classes = Lexer::new();
+    let mut events = Vec::new();
+    classes.feed(refused, &mut events);
+    classes.close(&mut events);
+    assert!(
+        events
+            .iter()
+            .all(|event| !policy.decide(event).apply_to_grid),
+        "every one of them is a sequence policy refuses: {events:?}"
+    );
+    let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+    engine.feed(b"\x1b[1;31mvisible text\x1b[0m\r\nsecond line", 0);
+    engine.quiesce(0);
+    let before = screen(&engine);
+    engine.feed(refused, 0);
+    engine.quiesce(0);
+    assert_eq!(
+        screen(&engine),
+        before,
+        "the refused sequences changed the grid"
+    );
+
+    // The comparison sees a screen being painted: the alignment pattern, which the profile
+    // applies, fills every cell with a letter.
+    engine.feed(b"\x1b#8", 0);
+    engine.quiesce(0);
+    let painted = screen(&engine);
+    assert_ne!(painted, before, "an applied sequence changes the grid");
+    let full = "E".repeat(engine.grid().size().cols as usize);
+    assert!(
+        painted.rows.iter().all(|row| row == &full),
+        "{:?}",
+        painted.rows
+    );
 }
 
 /// KR-REQ-08.08: what direct mode forwards is cut from the parser's own spans.
@@ -552,14 +627,23 @@ fn diagnostics_are_rate_limited_but_counted() {
     assert_eq!(total, 500, "every occurrence is still counted");
 }
 
-/// KR-REQ-08.09: nothing the engine produces is ever written into the application's output
-/// stream or painted into the grid; diagnostics travel out of band.
+/// KR-REQ-08.09: diagnostics travel out of band. Sequences that produce them are reported, the
+/// output stream advances by the application's own bytes only, and nothing is painted into the
+/// canonical grid: the screen a terminal is drawn from is exactly what the application wrote.
 #[test]
 fn diagnostics_never_touch_the_output_stream() {
     let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+    engine.feed(b"what the application wrote", 0);
+    engine.quiesce(0);
+    let screen_before = screen(&engine);
     let before = engine.output_cursor();
     let input = b"\x1b[?77h\x1b_Gf=1;A\x1b\\";
-    engine.feed(input, 0);
+    let outcome = engine.feed(input, 0);
+    engine.quiesce(0);
+    assert!(
+        !outcome.diagnostics.is_empty(),
+        "the sequences were reported out of band"
+    );
     let consumed = engine.output_cursor() - before;
     assert_eq!(
         consumed,
@@ -567,6 +651,11 @@ fn diagnostics_never_touch_the_output_stream() {
         "the cursor advances by the input only"
     );
     assert_eq!(engine.grid().writer_log().bytes, 0);
+    assert_eq!(
+        screen(&engine),
+        screen_before,
+        "no diagnostic was painted into the grid"
+    );
 }
 
 // ------------------------------------------- behaviour the review found wrong

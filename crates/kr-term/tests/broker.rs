@@ -285,7 +285,8 @@ fn a_reply_waits_for_the_session_loop() {
     assert_eq!(engine.lane_mut().drain(qualified, 4096, 0).len(), 1);
 }
 
-/// KR-REQ-08.50: replies are not history, and nothing pending survives a reconnection.
+/// KR-REQ-08.50: nothing the lane has dropped can be written afterwards: a reset leaves no reply
+/// pending and none to drain.
 #[test]
 fn undelivered_replies_are_not_replayed_after_a_reset() {
     let mut engine = engine();
@@ -376,39 +377,54 @@ fn the_lane_holds_its_replies_to_the_profiles_bounds() {
     assert_eq!(bounded.lane().pending(), 0);
 }
 
-/// KR-REQ-08.50: coalescing under a full queue never collapses two answers about different
-/// subjects into each other.
+/// KR-REQ-08.50: under a full queue the lane coalesces only answers about the same subject. A
+/// report about a mode that is already waiting replaces the earlier report about that mode, and the
+/// newer answer is the one kept; a report about a different mode never stands in for another one,
+/// and is refused and counted instead.
 #[test]
 fn coalescing_keeps_different_subjects_apart() {
-    let mut engine = Engine::new(EngineConfig {
+    // A queue that holds two mode reports and not three.
+    let config = EngineConfig {
         lane: LaneLimits {
             max_queue_bytes: 24,
             ..LaneLimits::DEFAULT
         },
         ..EngineConfig::DEFAULT
-    })
-    .expect("engine");
-    // Mode reports about three different modes, in a queue that holds about two of them.
-    engine.feed(b"\x1b[?7$p\x1b[?25$p\x1b[?2004$p", 0);
-    let replies: Vec<Vec<u8>> = engine
-        .lane_mut()
-        .drain(LaneGate::default(), 1 << 20, 0)
-        .into_iter()
-        .map(|reply| reply.bytes().to_vec())
-        .collect();
-    let subjects: Vec<&[u8]> = replies.iter().map(Vec::as_slice).collect();
-    assert!(
-        subjects.iter().all(|reply| !reply.starts_with(b"\x1b[?7;")) || subjects.len() > 1,
-        "a report about one mode must not stand in for a report about another"
-    );
-    let mut seen: Vec<Vec<u8>> = subjects.iter().map(|r| (*r).to_vec()).collect();
-    seen.sort();
-    seen.dedup();
+    };
+    let drained = |engine: &mut Engine| -> Vec<Vec<u8>> {
+        engine
+            .lane_mut()
+            .drain(LaneGate::default(), 1 << 20, 0)
+            .into_iter()
+            .map(|reply| reply.bytes().to_vec())
+            .collect()
+    };
+
+    // Reports about auto-wrap and the cursor's visibility fill the queue. A report about bracketed
+    // paste does not fit, and nothing about bracketed paste is waiting to give way to it.
+    let mut different = Engine::new(config).expect("engine");
+    different.feed(b"\x1b[?7$p\x1b[?25$p\x1b[?2004$p", 0);
+    let shed = different.lane().degradation();
     assert_eq!(
-        seen.len(),
-        subjects.len(),
-        "no two replies are the same answer"
+        drained(&mut different),
+        [b"\x1b[?7;1$y".to_vec(), b"\x1b[?25;1$y".to_vec()],
+        "the two reports that fitted are kept, each about its own mode"
     );
+    assert_eq!(shed.coalesced, 0, "no report stood in for another mode's");
+    assert_eq!(shed.dropped, 1, "the report that did not fit is counted");
+
+    // The same two reports, then auto-wrap is turned off and asked about again. The newer report
+    // about auto-wrap replaces the older one, which is the only one that could give way to it.
+    let mut same = Engine::new(config).expect("engine");
+    same.feed(b"\x1b[?7$p\x1b[?25$p\x1b[?7l\x1b[?7$p", 0);
+    let shed = same.lane().degradation();
+    assert_eq!(
+        drained(&mut same),
+        [b"\x1b[?25;1$y".to_vec(), b"\x1b[?7;2$y".to_vec()],
+        "the newer answer about auto-wrap is kept, and the report about the cursor is untouched"
+    );
+    assert_eq!(shed.coalesced, 1, "the older report was coalesced");
+    assert_eq!(shed.dropped, 0);
 }
 
 /// A colour request that mixes mutations with questions does both.
