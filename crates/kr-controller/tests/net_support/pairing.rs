@@ -247,6 +247,7 @@ pub async fn invite_direct(
         client,
         ConfirmationSubject::IssueInvitation {
             mode: InviteModeKind::Direct,
+            rendezvous_origin: Nullable::null(),
             grant_kind,
             proposed_grant: proposal.clone(),
         },

@@ -50,6 +50,7 @@ fn issue_subject(
 ) -> ConfirmationSubject {
     ConfirmationSubject::IssueInvitation {
         mode: InviteModeKind::Direct,
+        rendezvous_origin: Nullable::null(),
         grant_kind,
         proposed_grant: proposed_grant.clone(),
     }
@@ -578,6 +579,7 @@ async fn an_owner_device_approves_what_the_local_owner_asked() {
         listed.display,
         ConfirmationDisplay::IssueInvitation {
             mode: InviteModeKind::Direct,
+            rendezvous_origin: Nullable::null(),
             grant_kind: InviteGrantKind::SessionInvitation,
             proposed_grant: grant.clone(),
         }

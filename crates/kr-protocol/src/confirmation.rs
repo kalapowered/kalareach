@@ -29,7 +29,7 @@ use crate::ids::{ConfirmationId, InvitationId};
 use crate::invitation::{InviteGrantKind, InviteModeKind, PairCandidateView};
 use crate::pairing::{
     ConfirmationChannel, DevicePublicKeys, OwnerConfirmationProof, OwnerConfirmationRequest,
-    ProposedGrant, SensitiveAction,
+    ProposedGrant, RendezvousOrigin, SensitiveAction,
 };
 use crate::rights::ActionRight;
 use crate::scalars::{AuthorisationKey, CanonicalSet, Digest256, Nullable, TimestampMs};
@@ -40,11 +40,14 @@ use crate::scalars::{AuthorisationKey, CanonicalSet, Digest256, Nullable, Timest
 pub enum ConfirmationSubject {
     /// Issuing a persistent pairing invitation proposing exactly this grant.
     ///
-    /// The host binds the digest of the proposed grant and its rights; the mode says how the
-    /// invitation will be offered, and neither mode carries authority.
+    /// The host binds [`crate::invitation::issuance_digest`] over all four members, so the
+    /// approval issues exactly this mode at exactly this origin, and the grant's rights.
     IssueInvitation {
         /// How the invitation will be offered.
         mode: InviteModeKind,
+        /// The rendezvous origin a code invitation reserves at. Null takes this host's default for
+        /// a code invitation, and is the only value a direct invitation takes.
+        rendezvous_origin: Nullable<RendezvousOrigin>,
         /// Which rules the proposal is checked against.
         grant_kind: InviteGrantKind,
         /// The exact rights the invitation will propose.
@@ -130,6 +133,8 @@ pub enum ConfirmationDisplay {
     IssueInvitation {
         /// How it will be offered.
         mode: InviteModeKind,
+        /// The origin a code invitation reserves at, the default included.
+        rendezvous_origin: Nullable<RendezvousOrigin>,
         /// Which rules the proposal was checked against.
         grant_kind: InviteGrantKind,
         /// The complete proposed grant.

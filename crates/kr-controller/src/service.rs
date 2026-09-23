@@ -3719,6 +3719,16 @@ impl Controller {
         if retained.is_none() && crate::attention::AttentionModule::serves(method) {
             retained = self.attention.retained(actor_id, &mutation, method);
         }
+        if retained.is_none() && net::methods::serves(method) {
+            retained = self
+                .pairing_retained(
+                    net::owner::Caller::local(actor_id.clone()),
+                    method,
+                    &mutation,
+                )
+                .await
+                .map(|outcome| respond(mutation.request_id, outcome));
+        }
         if let Some(retained) = retained {
             if let Err(error) = self.authorised(connection_id) {
                 return error_reply(
@@ -4009,7 +4019,14 @@ impl Controller {
             // Pairing and owner confirmation are the network module's, and a local caller reaches
             // them as the host's own account: the issuing owner of what it invites.
             let caller = net::owner::Caller::local(actor_id.clone());
-            let outcome = self.pairing_write(caller, method, mutation).await;
+            let admission = self.pairing_admission(
+                connection_id,
+                admitted,
+                accepted.map(|accepted| accepted.deadline),
+            );
+            let outcome = self
+                .pairing_write(caller, method, mutation, admission)
+                .await;
             return respond(mutation.request_id, outcome);
         }
         if crate::transfer::TransferModule::serves(method) {

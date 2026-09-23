@@ -33,14 +33,17 @@ use kr_pairing::platform::{
     TransitionOutcome,
 };
 use kr_protocol::actor::ActorIngress;
+use kr_protocol::error::ErrorCode;
 use kr_protocol::grant::Grant;
+use kr_protocol::grant::GrantExpiry;
 use kr_protocol::ids::{
     ActionId, ActorId, AttemptId, ConfirmationId, DeviceId, InvitationId, PairingEventSequence,
 };
 use kr_protocol::invitation::{InviteGrantKind, InviteModeKind, PairingSecurityEvent};
 use kr_protocol::pairing::{
-    ClientBundle, DevicePublicKeys, Locator, OwnerConfirmationProof, PairingConsumedReason,
-    ProposedGrant, RendezvousOrigin,
+    ClientBundle, ConfirmationChannel, DevicePublicKeys, KeyPurpose, Locator,
+    OwnerConfirmationProof, OwnerConfirmationRequest, PairingConsumedReason, ProposedGrant,
+    RendezvousOrigin,
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
@@ -90,7 +93,7 @@ pub fn prepare(directory: &DeviceDirectory) -> Result<()> {
                      issuing_actor TEXT NOT NULL,
                      issuing_ingress TEXT NOT NULL,
                      issuing_action_id BLOB,
-                     parameters_digest BLOB,
+                     mutation_digest BLOB,
                      issued_at_ms INTEGER NOT NULL,
                      confirmation_id BLOB NOT NULL
                  );
@@ -113,6 +116,13 @@ pub fn prepare(directory: &DeviceDirectory) -> Result<()> {
                      device_id BLOB,
                      invitation_id BLOB,
                      established_at_ms INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS owner_confirmation_requests (
+                     actor TEXT NOT NULL,
+                     action_id BLOB NOT NULL,
+                     mutation_digest BLOB NOT NULL,
+                     request BLOB NOT NULL,
+                     PRIMARY KEY (actor, action_id)
                  );
                  CREATE TABLE IF NOT EXISTS owner_confirmations (
                      confirmation_id BLOB PRIMARY KEY NOT NULL,
@@ -157,6 +167,20 @@ fn holds_owner_device(connection: &Connection) -> Result<bool> {
     }))
 }
 
+/// Returns true when `grant` makes its device an owner device at `now_ms`: it holds host
+/// management and has not run out.
+///
+/// A revoked or expired device record is refused by its own markers; this is the grant's half,
+/// for a grant whose expiry has passed before anything wrote a marker.
+#[must_use]
+pub fn holds_live_owner_grant(grant: &Grant, now_ms: u64) -> bool {
+    grant.permits(ActionRight::HostManage)
+        && match grant.expiry {
+            GrantExpiry::Never => true,
+            GrantExpiry::At { expires_at_ms } => now_ms < expires_at_ms.get(),
+        }
+}
+
 /// How this host has an owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostOwner {
@@ -180,6 +204,10 @@ pub struct Acceptance {
     pub consumed_at_ms: Option<TimestampMs>,
     /// The channel it arrived through, by its protocol name.
     pub channel: String,
+    /// The key identifier of the signer that answered it.
+    pub signer_key_id: kr_protocol::scalars::KeyId,
+    /// The challenge it answered.
+    pub request: OwnerConfirmationRequest,
 }
 
 /// What an invitation was issued as, which the store writes beside kr-pairing's record.
@@ -197,7 +225,7 @@ pub struct IssueTerms {
     pub issuing_actor: ActorId,
     /// How that owner reached the host.
     pub issuing_ingress: ActorIngress,
-    /// The action that issued it and the digest of its parameters, so a retry is recognised
+    /// The action that issued it and the digest of that whole mutation, so a retry is recognised
     /// after a restart without anything secret having been written.
     pub action: Option<(ActionId, Digest256)>,
     /// When it was issued, in UTC milliseconds.
@@ -422,6 +450,76 @@ impl InvitationRows {
         rows.iter().map(|bytes| decode(bytes)).collect()
     }
 
+    /// Returns the challenge one caller's action already asked for, and the digest of that
+    /// mutation.
+    ///
+    /// `owner.confirmation.request` is answered once per action: a retry of the same mutation gets
+    /// the challenge it was given, whether or not it is still outstanding, and the same action with
+    /// another payload is refused. This is the record that makes that hold across a restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns a registry error when the row cannot be read or decoded.
+    pub fn requested(
+        &self,
+        actor: &ActorId,
+        action_id: ActionId,
+    ) -> Result<Option<(Digest256, OwnerConfirmationRequest)>> {
+        self.directory
+            .with(|connection| {
+                connection
+                    .query_row(
+                        "SELECT mutation_digest, request FROM owner_confirmation_requests
+                         WHERE actor = ?1 AND action_id = ?2",
+                        params![actor.as_str(), action_id.get().as_bytes().as_slice()],
+                        |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                    )
+                    .optional()
+            })?
+            .map(|(digest, request)| {
+                Ok((
+                    Digest256::from_bytes(
+                        <[u8; 32]>::try_from(digest.as_slice()).map_err(|_| {
+                            ControllerError::registry("a mutation digest is 32 bytes")
+                        })?,
+                    ),
+                    decode::<OwnerConfirmationRequest>(&request)?,
+                ))
+            })
+            .transpose()
+    }
+
+    /// Records the challenge one caller's action asked for.
+    ///
+    /// # Errors
+    ///
+    /// Returns a registry error when the row cannot be written, including when the action already
+    /// has one.
+    pub fn record_requested(
+        &self,
+        actor: &ActorId,
+        action_id: ActionId,
+        digest: Digest256,
+        request: &OwnerConfirmationRequest,
+    ) -> Result<()> {
+        let request = encode(request)?;
+        self.directory.with(|connection| {
+            connection
+                .execute(
+                    "INSERT INTO owner_confirmation_requests
+                         (actor, action_id, mutation_digest, request)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        actor.as_str(),
+                        action_id.get().as_bytes().as_slice(),
+                        digest.as_bytes().as_slice(),
+                        request,
+                    ],
+                )
+                .map(|_| ())
+        })
+    }
+
     /// Records that an owner confirmation was answered, before anything spends it.
     ///
     /// Section 10 makes user-presence verification part of the host's acceptance record, so the
@@ -487,24 +585,41 @@ impl InvitationRows {
     ///
     /// Returns a registry error when the row cannot be read.
     pub fn acceptance(&self, confirmation_id: ConfirmationId) -> Result<Option<Acceptance>> {
-        self.directory.with(|connection| {
+        let row = self.directory.with(|connection| {
             connection
                 .query_row(
-                    "SELECT answered_at_ms, consumed_at_ms, channel FROM owner_confirmations
-                     WHERE confirmation_id = ?1",
+                    "SELECT answered_at_ms, consumed_at_ms, channel, signer_key_id, request
+                     FROM owner_confirmations WHERE confirmation_id = ?1",
                     params![confirmation_id.get().as_bytes().as_slice()],
                     |row| {
-                        Ok(Acceptance {
-                            answered_at_ms: TimestampMs::new(from_sql(row.get::<_, i64>(0)?)),
-                            consumed_at_ms: row
-                                .get::<_, Option<i64>>(1)?
+                        Ok((
+                            TimestampMs::new(from_sql(row.get::<_, i64>(0)?)),
+                            row.get::<_, Option<i64>>(1)?
                                 .map(|at| TimestampMs::new(from_sql(at))),
-                            channel: row.get::<_, String>(2)?,
-                        })
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Vec<u8>>(3)?,
+                            row.get::<_, Vec<u8>>(4)?,
+                        ))
                     },
                 )
                 .optional()
-        })
+        })?;
+        row.map(
+            |(answered_at_ms, consumed_at_ms, channel, signer, request)| {
+                Ok(Acceptance {
+                    answered_at_ms,
+                    consumed_at_ms,
+                    channel,
+                    signer_key_id: kr_protocol::scalars::KeyId::from_bytes(
+                        <[u8; 32]>::try_from(signer.as_slice()).map_err(|_| {
+                            ControllerError::registry("a key identifier is 32 bytes")
+                        })?,
+                    ),
+                    request: decode(&request)?,
+                })
+            },
+        )
+        .transpose()
     }
 }
 
@@ -732,6 +847,7 @@ fn consume(
     effect: &str,
     now: TimestampMs,
 ) -> Result<()> {
+    signer_still_authorised(transaction, proof, now)?;
     let request = encode(&proof.request)?;
     let action = text_of(&proof.request.action)?;
     let changed = transaction
@@ -762,6 +878,75 @@ fn consume(
         });
     }
     Ok(())
+}
+
+/// Checks, inside the consuming transaction, that the confirmation's signer still has the authority
+/// it answered with.
+///
+/// An answer is accepted when it arrives and spent later, and authority can change in between: the
+/// owner device that answered can be revoked, or its grant can run out, and the first owner can be
+/// established by another pairing. Revocation and the owner record are written to this same
+/// database, so reading them here, in the transaction that records the effect, is the boundary the
+/// two share: an effect commits only under the authority standing at that moment.
+fn signer_still_authorised(
+    transaction: &Connection,
+    proof: &OwnerConfirmationProof,
+    now: TimestampMs,
+) -> Result<()> {
+    let lapsed = |detail: &str| ControllerError::Refused {
+        code: ErrorCode::OwnerConfirmationRequired,
+        detail: detail.to_owned(),
+    };
+    match proof.channel {
+        ConfirmationChannel::LocalBootstrapTerminal => {
+            let owned = transaction
+                .query_row("SELECT COUNT(*) FROM host_owner WHERE id = 0", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(ControllerError::registry)?
+                > 0;
+            if owned {
+                return Err(lapsed(
+                    "this host has an owner, so the terminal bootstrap no longer confirms anything",
+                ));
+            }
+            Ok(())
+        }
+        ConfirmationChannel::OwnerDevicePresence | ConfirmationChannel::PairedOwnerDevice => {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT authorisation_key, grant FROM network_devices
+                     WHERE revoked_at_ms IS NULL AND expired_at_ms IS NULL",
+                )
+                .map_err(ControllerError::registry)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(ControllerError::registry)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(ControllerError::registry)?;
+            let standing = rows.iter().any(|(key, grant)| {
+                <[u8; 32]>::try_from(key.as_slice()).is_ok_and(|key| {
+                    kr_crypto::keys::key_id(KeyPurpose::Authorisation, &key) == proof.signer_key_id
+                }) && decode::<Grant>(grant)
+                    .is_ok_and(|grant| holds_live_owner_grant(&grant, now.get()))
+            });
+            if !standing {
+                return Err(lapsed(
+                    "the device that answered this confirmation is no longer an owner device of \
+                     this host",
+                ));
+            }
+            Ok(())
+        }
+        ConfirmationChannel::EnrolledPresenceSigner
+        | ConfirmationChannel::Session
+        | ConfirmationChannel::Plugin
+        | ConfirmationChannel::ContactTool => Err(lapsed(
+            "that channel carries no owner confirmation on this host",
+        )),
+    }
 }
 
 /// Returns the device record one completed pairing writes.
@@ -814,7 +999,7 @@ struct RawRow {
     issuing_actor: String,
     issuing_ingress: String,
     issuing_action_id: Option<Vec<u8>>,
-    parameters_digest: Option<Vec<u8>>,
+    mutation_digest: Option<Vec<u8>>,
     issued_at_ms: i64,
     confirmation_id: Vec<u8>,
 }
@@ -828,7 +1013,7 @@ fn read_row(
             "SELECT invitation_id, mode, locator, rendezvous_origin, state, locked_attempt,
                     consumed_reason, failed_confirmations, deadline_monotonic_ms, boot_identity,
                     grant_kind, proposed_grant, issuing_actor, issuing_ingress, issuing_action_id,
-                    parameters_digest, issued_at_ms, confirmation_id
+                    mutation_digest, issued_at_ms, confirmation_id
              FROM pairing_invitations WHERE invitation_id = ?1",
             params![invitation_id.get().as_bytes().as_slice()],
             |row| {
@@ -848,7 +1033,7 @@ fn read_row(
                     issuing_actor: row.get(12)?,
                     issuing_ingress: row.get(13)?,
                     issuing_action_id: row.get(14)?,
-                    parameters_digest: row.get(15)?,
+                    mutation_digest: row.get(15)?,
                     issued_at_ms: row.get(16)?,
                     confirmation_id: row.get(17)?,
                 })
@@ -906,7 +1091,7 @@ fn decode_row(raw: RawRow) -> Result<InvitationRow> {
     let record = decode_record(&raw)?;
     let action = match (
         raw.issuing_action_id.as_deref(),
-        raw.parameters_digest.as_deref(),
+        raw.mutation_digest.as_deref(),
     ) {
         (Some(action), Some(digest)) => Some((
             ActionId::new(uuid(Some(action))?),
@@ -955,7 +1140,7 @@ fn insert_invitation(
                  invitation_id, mode, locator, rendezvous_origin, state, locked_attempt,
                  consumed_reason, failed_confirmations, deadline_monotonic_ms, boot_identity,
                  grant_kind, proposed_grant, issuing_actor, issuing_ingress, issuing_action_id,
-                 parameters_digest, issued_at_ms, confirmation_id
+                 mutation_digest, issued_at_ms, confirmation_id
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
                        ?18)",
             params![
@@ -1102,7 +1287,14 @@ fn from_sql(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
 }
 
+/// Returns kr-pairing's view of a failed write.
+///
+/// A confirmation whose authority lapsed before its effect committed is refused as what it is,
+/// so the caller is told to confirm again rather than that storage failed.
 fn store_failure(error: ControllerError) -> kr_pairing::PairingError {
+    if error.code() == ErrorCode::OwnerConfirmationRequired {
+        return kr_pairing::PairingError::OwnerConfirmationRequired;
+    }
     kr_pairing::PairingError::Store {
         reason: error.to_string(),
     }
@@ -1117,7 +1309,6 @@ pub fn from_store_failure(error: &kr_pairing::PairingError) -> ControllerError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kr_protocol::pairing::ConfirmationChannel;
 
     #[test]
     fn a_consumed_reason_is_stored_under_its_protocol_name() {
@@ -1138,6 +1329,31 @@ mod tests {
         assert_eq!(
             text_of(&ConfirmationChannel::LocalBootstrapTerminal).expect("a name"),
             ConfirmationChannel::LocalBootstrapTerminal.as_str()
+        );
+    }
+
+    /// KR-REQ-10.05: an owner device is a device whose grant holds host management and has not
+    /// run out. A grant past its expiry makes no owner, whether or not anything has yet written the
+    /// expiry into the device's record.
+    #[test]
+    fn a_grant_that_ran_out_makes_no_owner_device() {
+        let mut grant = kr_pairing::grants::personal_owner_grant().into_grant(
+            kr_protocol::ids::GrantId::new(Uuid::from_bytes([1; 16])),
+            DeviceId::new(Uuid::from_bytes([2; 16])),
+            DeviceId::new(Uuid::from_bytes([3; 16])),
+            kr_protocol::ids::AuthorityRevision::new(1),
+        );
+        assert!(holds_live_owner_grant(&grant, 1_000));
+        grant.expiry = GrantExpiry::At {
+            expires_at_ms: TimestampMs::new(1_000),
+        };
+        assert!(holds_live_owner_grant(&grant, 999));
+        assert!(!holds_live_owner_grant(&grant, 1_000));
+        grant.expiry = GrantExpiry::Never;
+        grant.actions = [ActionRight::SessionView].into_iter().collect();
+        assert!(
+            !holds_live_owner_grant(&grant, 1_000),
+            "no host management, no owner"
         );
     }
 }

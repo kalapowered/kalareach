@@ -7154,10 +7154,22 @@
                 "proposed_grant": {
                   "$ref": "#/$defs/ProposedGrant",
                   "description": "The complete proposed grant."
+                },
+                "rendezvous_origin": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/RendezvousOrigin"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "The origin a code invitation reserves at, the default included."
                 }
               },
               "required": [
                 "mode",
+                "rendezvous_origin",
                 "grant_kind",
                 "proposed_grant"
               ],
@@ -7252,7 +7264,7 @@
       "oneOf": [
         {
           "additionalProperties": false,
-          "description": "Issuing a persistent pairing invitation proposing exactly this grant.\n\nThe host binds the digest of the proposed grant and its rights; the mode says how the\ninvitation will be offered, and neither mode carries authority.",
+          "description": "Issuing a persistent pairing invitation proposing exactly this grant.\n\nThe host binds [`crate::invitation::issuance_digest`] over all four members, so the\napproval issues exactly this mode at exactly this origin, and the grant's rights.",
           "properties": {
             "issue_invitation": {
               "properties": {
@@ -7267,10 +7279,22 @@
                 "proposed_grant": {
                   "$ref": "#/$defs/ProposedGrant",
                   "description": "The exact rights the invitation will propose."
+                },
+                "rendezvous_origin": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/RendezvousOrigin"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "The rendezvous origin a code invitation reserves at. Null takes this host's default for\na code invitation, and is the only value a direct invitation takes."
                 }
               },
               "required": [
                 "mode",
+                "rendezvous_origin",
                 "grant_kind",
                 "proposed_grant"
               ],

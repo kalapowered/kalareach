@@ -67,6 +67,17 @@ fn proposal() -> ProposedGrant {
     }
 }
 
+/// The digest an owner confirms to issue this suite's code invitation.
+fn issue_digest() -> Digest256 {
+    kr_protocol::invitation::issuance_digest(
+        kr_protocol::invitation::InviteModeKind::Code,
+        Some(&origin()),
+        kr_protocol::invitation::InviteGrantKind::SessionInvitation,
+        &proposal(),
+    )
+    .expect("a digest")
+}
+
 fn client_bundle(keys: &DeviceKeys) -> ClientBundle {
     ClientBundle {
         endpoint_id: *keys.transport.public(),
@@ -174,11 +185,7 @@ impl Harness {
     }
 
     fn issue_approval(&self) -> Approval {
-        self.approval(
-            SensitiveAction::IssueInvitation,
-            kr_pairing::confirm::action_digest(&proposal()).expect("a digest"),
-            None,
-        )
+        self.approval(SensitiveAction::IssueInvitation, issue_digest(), None)
     }
 
     /// The challenge that approves whatever candidate the host currently holds.
@@ -1486,11 +1493,7 @@ fn issuing_and_confirming_both_need_a_fresh_single_use_confirmation() {
     let harness = Harness::new();
 
     // A confirmation for another action does not issue an invitation.
-    let wrong_action = harness.approval(
-        SensitiveAction::EnlargeGrant,
-        kr_pairing::confirm::action_digest(&proposal()).expect("a digest"),
-        None,
-    );
+    let wrong_action = harness.approval(SensitiveAction::EnlargeGrant, issue_digest(), None);
     assert!(matches!(
         HostInvitation::issue(
             &harness.store,
@@ -1506,7 +1509,7 @@ fn issuing_and_confirming_both_need_a_fresh_single_use_confirmation() {
     // Nor does one naming a destination device: an invitation is issued before anybody answers it.
     let premature = harness.approval(
         SensitiveAction::IssueInvitation,
-        kr_pairing::confirm::action_digest(&proposal()).expect("a digest"),
+        issue_digest(),
         Some(harness.client_keys.public_keys()),
     );
     assert!(matches!(

@@ -823,6 +823,25 @@ impl RemoteConnection {
                 .attention()
                 .retained(&actor_id, mutation, entry.method);
         }
+        // An owner device's own confirmation answers are retained by the pairing service, and a
+        // repeat of one over a new connection is answered from there.
+        if held.is_none() && super::methods::serves(entry.method) {
+            held = self
+                .controller
+                .pairing_retained(
+                    super::owner::Caller::device(self.device.clone()),
+                    entry.method,
+                    mutation,
+                )
+                .await
+                .map(|outcome| match outcome {
+                    Ok(value) => ControlFrame::Response(Response {
+                        request_id: mutation.request_id,
+                        outcome: Outcome::Ok(value),
+                    }),
+                    Err(error) => failure(mutation.request_id, error.to_protocol_error()),
+                });
+        }
         if let Some(retained) = held {
             if let Err(error) = self.admitted_to_answer(validated) {
                 return failure(mutation.request_id, error);
@@ -1332,9 +1351,14 @@ impl RemoteConnection {
                     );
                 }
                 let caller = super::owner::Caller::device(self.device.clone());
+                let admission = self.controller.pairing_admission(
+                    self.connection_id(),
+                    Some(validated),
+                    Some(accepted.deadline),
+                );
                 match self
                     .controller
-                    .pairing_write(caller, entry.method, mutation)
+                    .pairing_write(caller, entry.method, mutation, admission)
                     .await
                 {
                     Ok(value) => ControlFrame::Response(Response {

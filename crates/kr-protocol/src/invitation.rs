@@ -73,6 +73,54 @@ pub enum InviteGrantKind {
     SessionInvitation,
 }
 
+/// The rendezvous origin a host reserves a code at when its owner names none.
+///
+/// Section 10 has the origin always shown on the issuing screen, the default included, with a way
+/// to change it before an attempt starts. This is that default: the service KalaReach runs.
+pub const DEFAULT_RENDEZVOUS_ORIGIN: &str = "https://reach.kala.to";
+
+/// Returns the default rendezvous origin.
+///
+/// # Panics
+///
+/// Never: the constant is a valid origin, and a test holds it to that.
+#[must_use]
+pub fn default_rendezvous_origin() -> RendezvousOrigin {
+    RendezvousOrigin::new(DEFAULT_RENDEZVOUS_ORIGIN).expect("the default origin is an origin")
+}
+
+/// The domain an owner's confirmation to issue an invitation is computed under.
+pub const ISSUE_INVITATION_DOMAIN: &str = "kr-pair/issue-invitation/1";
+
+/// Returns the digest an owner confirms when it approves issuing one invitation.
+///
+/// It covers everything the owner is shown about the invitation: how it will be offered, the
+/// origin a code invitation reserves its locator at, the rules its grant is checked against, and
+/// the exact proposed grant. A confirmation for a code invitation therefore cannot issue a direct
+/// one, and one for one origin cannot reserve at another.
+///
+/// # Errors
+///
+/// Returns a CBOR error when the grant is outside KR-CBOR-1.
+pub fn issuance_digest(
+    mode: InviteModeKind,
+    rendezvous_origin: Option<&RendezvousOrigin>,
+    grant_kind: InviteGrantKind,
+    proposed_grant: &ProposedGrant,
+) -> Result<Digest256, kr_cbor::CborError> {
+    let origin: Nullable<RendezvousOrigin> =
+        rendezvous_origin.map_or_else(Nullable::null, |origin| Nullable::some(origin.clone()));
+    Ok(Digest256::from_bytes(kr_cbor::sha256(
+        &kr_cbor::to_canonical_vec(&(
+            ISSUE_INVITATION_DOMAIN,
+            mode,
+            origin,
+            grant_kind,
+            proposed_grant,
+        ))?,
+    )))
+}
+
 /// The parameters of `pair.invite`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -409,6 +457,81 @@ mod tests {
         assert!(QrText::new("has space").is_err());
         assert!(QrText::new("padded==").is_err());
         assert!(QrText::new("a".repeat(MAX_QR_PAYLOAD_LEN.div_ceil(3) * 4 + 1)).is_err());
+    }
+
+    /// KR-REQ-10.05: the confirmation to issue an invitation names how it is offered, where a code
+    /// is reserved, the kind of its grant and the grant itself; changing any one of them is
+    /// another digest, so one approval issues exactly one kind of invitation.
+    #[test]
+    fn the_issuing_digest_names_the_mode_the_origin_the_kind_and_the_grant() {
+        let grant = crate::pairing::ProposedGrant {
+            parent_grant_id: Nullable::null(),
+            environment_selector: crate::grant::EnvironmentSelector::Any,
+            session_selector: crate::grant::SessionSelector::Any,
+            actions: [crate::rights::ActionRight::SessionView]
+                .into_iter()
+                .collect(),
+            history: crate::grant::HistoryScope {
+                lower_bound_ms: Nullable::null(),
+                include_live_screen: false,
+                named_questions: crate::scalars::CanonicalSet::new(),
+                named_approvals: crate::scalars::CanonicalSet::new(),
+            },
+            expiry: crate::grant::GrantExpiry::Never,
+            organisation: Nullable::null(),
+        };
+        let origin = default_rendezvous_origin();
+        let other_origin = RendezvousOrigin::new("https://pair.example.org").expect("an origin");
+        let code = issuance_digest(
+            InviteModeKind::Code,
+            Some(&origin),
+            InviteGrantKind::PersonalOwner,
+            &grant,
+        )
+        .expect("a digest");
+        let mut wider = grant.clone();
+        wider
+            .actions
+            .insert(crate::rights::ActionRight::TerminalInput);
+        for other in [
+            issuance_digest(
+                InviteModeKind::Direct,
+                None,
+                InviteGrantKind::PersonalOwner,
+                &grant,
+            ),
+            issuance_digest(
+                InviteModeKind::Code,
+                Some(&other_origin),
+                InviteGrantKind::PersonalOwner,
+                &grant,
+            ),
+            issuance_digest(
+                InviteModeKind::Code,
+                Some(&origin),
+                InviteGrantKind::SessionInvitation,
+                &grant,
+            ),
+            issuance_digest(
+                InviteModeKind::Code,
+                Some(&origin),
+                InviteGrantKind::PersonalOwner,
+                &wider,
+            ),
+        ] {
+            assert_ne!(other.expect("a digest"), code);
+        }
+        assert_eq!(
+            issuance_digest(
+                InviteModeKind::Code,
+                Some(&origin),
+                InviteGrantKind::PersonalOwner,
+                &grant,
+            )
+            .expect("a digest"),
+            code,
+            "the same terms are the same digest"
+        );
     }
 
     #[test]

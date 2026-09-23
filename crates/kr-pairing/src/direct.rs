@@ -34,7 +34,7 @@ use crate::bundles;
 use crate::confirm::ConfirmationLedger;
 use crate::error::{PairingError, Result};
 use crate::grants::{self, GrantIdentities, GrantKind};
-use crate::host::{HostIdentity, OwnerApproval, OwnerContext};
+use crate::host::{HostIdentity, IssueTerms, OwnerApproval, OwnerContext};
 use crate::platform::{
     InvitationRecord, InvitationState, InvitationStore, LivePeer, PairingClock, PairingCommitment,
     TransitionOutcome, require_completed_handshake,
@@ -138,7 +138,17 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
         approval: &OwnerApproval<'_>,
         ledger: &mut ConfirmationLedger,
     ) -> Result<Self> {
-        approval.accept_issue(ledger, &clock, &host, &proposed_grant)?;
+        approval.accept_issue(
+            ledger,
+            &clock,
+            &host,
+            &IssueTerms {
+                mode: kr_protocol::invitation::InviteModeKind::Direct,
+                origin: None,
+                grant_kind,
+                proposed_grant: &proposed_grant,
+            },
+        )?;
         grants::validate_proposal(&proposed_grant, grant_kind, clock.wall_clock_ms())?;
         bundles::require_consistent_keys(
             &host.keys,

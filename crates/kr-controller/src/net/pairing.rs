@@ -31,16 +31,18 @@ use kr_protocol::confirmation::{
     OwnerConfirmationCompleteResult, OwnerConfirmationPendingResult,
     OwnerConfirmationRequestParams, OwnerConfirmationRequestResult,
 };
+use kr_protocol::envelope::{MutationRequest, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ActionId, ActorId, AuthorityRevision, DeviceId, GrantId, InvitationId};
 use kr_protocol::invitation::{
     InviteEntry, InviteGrantKind, InviteMode, InviteModeKind, PairCancelParams, PairCandidateView,
     PairConfirmParams, PairConfirmResult, PairInviteParams, PairInviteResult, PairOwnerView,
-    PairingApproval, QrText,
+    PairingApproval, QrText, default_rendezvous_origin, issuance_digest,
 };
+use kr_protocol::method::Method;
 use kr_protocol::pairing::{
     DevicePublicKeys, MAX_CONFIRMATION_FAILURES, NetworkConfig, PairStatus, PairingConsumedReason,
-    ProposedGrant, QrPayload, SensitiveAction,
+    ProposedGrant, QrPayload, RendezvousOrigin, SensitiveAction,
 };
 use kr_protocol::preauth::{
     PairRedeemParams, PairRedeemResult, PairStatusParams, PairStatusResult,
@@ -231,14 +233,22 @@ impl PairingHost {
         &self,
         caller: &Caller,
         params: &OwnerConfirmationRequestParams,
-        action: ActionId,
+        action: (ActionId, Digest256),
+        admission: &dyn Fn() -> Result<()>,
     ) -> Result<OwnerConfirmationRequestResult> {
+        // A retry is answered before anything about the subject is resolved again: the invitation
+        // it named may be gone, and the answer it was owed is the challenge it was given.
+        if let Some(retained) = self.owner.retained_request(caller, action) {
+            return retained;
+        }
         let resolved = match &params.subject {
             ConfirmationSubject::IssueInvitation {
                 mode,
+                rendezvous_origin,
                 grant_kind,
                 proposed_grant,
             } => {
+                let origin = resolved_origin(*mode, rendezvous_origin.0.as_ref())?;
                 validate_proposal(
                     proposed_grant,
                     kind_of(*grant_kind),
@@ -247,11 +257,13 @@ impl PairingHost {
                 .map_err(refusal)?;
                 Resolved {
                     action: SensitiveAction::IssueInvitation,
-                    digest: kr_pairing::confirm::action_digest(proposed_grant).map_err(refusal)?,
+                    digest: issuance_digest(*mode, origin.as_ref(), *grant_kind, proposed_grant)
+                        .map_err(ControllerError::registry)?,
                     destination: None,
                     rights: proposed_grant.actions.clone(),
                     display: ConfirmationDisplay::IssueInvitation {
                         mode: *mode,
+                        rendezvous_origin: origin.map_or_else(Nullable::null, Nullable::some),
                         grant_kind: *grant_kind,
                         proposed_grant: proposed_grant.clone(),
                     },
@@ -311,7 +323,7 @@ impl PairingHost {
                 }
             }
         };
-        self.owner.request(caller, resolved, Some(action))
+        self.owner.request(caller, resolved, action, admission)
     }
 
     /// `owner.confirmation.pending`: the challenges an owner can still answer.
@@ -332,8 +344,12 @@ impl PairingHost {
         &self,
         caller: &Caller,
         params: &OwnerConfirmationCompleteParams,
+        admission: &dyn Fn() -> Result<()>,
     ) -> Result<OwnerConfirmationCompleteResult> {
-        self.owner.complete(caller, params)
+        if let Some(retained) = self.owner.retained_answer(params) {
+            return retained;
+        }
+        self.owner.complete(caller, params, admission)
     }
 
     /// `pair.invite`: issues one invitation under a fresh owner confirmation naming its grant.
@@ -350,31 +366,19 @@ impl PairingHost {
         &self,
         caller: &Caller,
         params: &PairInviteParams,
-        action: ActionId,
+        action: (ActionId, Digest256),
         network_config: NetworkConfig,
+        admission: &dyn Fn() -> Result<()>,
     ) -> Result<PairInviteResult> {
         if caller.device.is_some() {
             return Err(ControllerError::PermissionDenied {
                 detail: "an invitation is issued over local IPC only".to_owned(),
             });
         }
-        let digest = parameters_digest(params)?;
+        let (action, digest) = action;
         let mut open = self.open();
-        if let Some(offered) = open.as_ref()
-            && offered.issued_by == caller.actor_id
-            && offered.action.0 == action
-        {
-            return if offered.action.1 == digest {
-                Ok(offered.answer.clone())
-            } else {
-                Err(id_conflict())
-            };
-        }
-        if let Some(row) = self.rows.row_for_action(&caller.actor_id, action)? {
-            if row.terms.action.map(|(_, recorded)| recorded) != Some(digest) {
-                return Err(id_conflict());
-            }
-            return Err(no_longer_open(&row));
+        if let Some(retained) = self.retained_invite(&open, caller, action, digest) {
+            return retained;
         }
         if let Some(offered) = open.as_ref()
             && matches!(
@@ -390,8 +394,19 @@ impl PairingHost {
             });
         }
         let kind = kind_of(params.grant_kind);
-        let expectation_digest =
-            kr_pairing::confirm::action_digest(&params.proposed_grant).map_err(refusal)?;
+        let origin = match &params.mode {
+            InviteMode::Code { rendezvous_origin } => {
+                resolved_origin(InviteModeKind::Code, rendezvous_origin.0.as_ref())?
+            }
+            InviteMode::Direct => None,
+        };
+        let expectation_digest = issuance_digest(
+            params.mode.kind(),
+            origin.as_ref(),
+            params.grant_kind,
+            &params.proposed_grant,
+        )
+        .map_err(ControllerError::registry)?;
         let rights = params.proposed_grant.actions.clone();
         let expectation = self.owner.expectation(
             SensitiveAction::IssueInvitation,
@@ -401,7 +416,7 @@ impl PairingHost {
         );
         let terms = IssueTerms {
             mode: params.mode.kind(),
-            rendezvous_origin: None,
+            rendezvous_origin: origin.clone(),
             grant_kind: params.grant_kind,
             proposed_grant: params.proposed_grant.clone(),
             issuing_actor: caller.actor_id.clone(),
@@ -410,6 +425,10 @@ impl PairingHost {
             issued_at_ms: kr_ipc::now_ms(),
         };
         let owner = caller.owner_context();
+        // The last check before anything is spent or written: the caller's registration and the
+        // deadline its mutation was admitted under, which the wait for this thread and for the
+        // invitation's lock may have used up.
+        admission()?;
         let (mode, answer) = match &params.mode {
             InviteMode::Direct => {
                 let mut identity = self.identity.clone();
@@ -472,6 +491,7 @@ impl PairingHost {
         caller: &Caller,
         params: &PairConfirmParams,
         authority_revision: AuthorityRevision,
+        admission: &dyn Fn() -> Result<()>,
     ) -> Result<PairConfirmResult> {
         let mut open = self.open();
         let Some(offered) = open
@@ -504,6 +524,7 @@ impl PairingHost {
         );
         let identities = fresh_identities(self.identity.device_id, authority_revision)?;
         let owner = caller.owner_context();
+        admission()?;
         let (spendable, mut challenges) = self.owner.spend(&expectation)?;
         let committed = match (&mut offered.mode, params.approval) {
             (
@@ -550,13 +571,25 @@ impl PairingHost {
     /// # Errors
     ///
     /// Returns the refusal: another caller than the issuing owner, or a store failure.
-    pub fn cancel(&self, caller: &Caller, params: &PairCancelParams) -> Result<PairStatusResult> {
+    pub fn cancel(
+        &self,
+        caller: &Caller,
+        params: &PairCancelParams,
+        admission: &dyn Fn() -> Result<()>,
+    ) -> Result<PairStatusResult> {
         let mut open = self.open();
         if let Some(offered) = open
             .as_mut()
             .filter(|offered| offered.invitation_id() == params.invitation_id)
+            .filter(|offered| {
+                matches!(
+                    offered.state(),
+                    InvitationState::Open | InvitationState::Locked { .. }
+                )
+            })
         {
             let owner = caller.owner_context();
+            admission()?;
             match &mut offered.mode {
                 OpenMode::Direct(invitation) => {
                     if params.deny {
@@ -567,7 +600,9 @@ impl PairingHost {
                 }
             }
             .map_err(refusal)?;
-            *open = None;
+            // The ended invitation stays: its candidate authenticated itself, and asking what
+            // happened is how it learns it was denied or withdrawn. The next invitation replaces
+            // it.
         }
         drop(open);
         self.recorded_status(caller, params.invitation_id)
@@ -745,6 +780,126 @@ impl PairingHost {
         Ok(row)
     }
 
+    /// Returns what a repeated mutation is owed, when its action already has an outcome.
+    ///
+    /// This is asked before a first admission's freshness is: a caller that reconnects and repeats
+    /// an action it already submitted gets that action's own result, not a refusal about a window
+    /// that has since been replaced. Nothing here writes.
+    #[must_use]
+    pub fn retained(
+        &self,
+        caller: &Caller,
+        method: Method,
+        mutation: &MutationRequest,
+        digest: Digest256,
+    ) -> Option<Result<ParamsValue>> {
+        match method {
+            Method::PairInvite => {
+                let open = self.open();
+                self.retained_invite(&open, caller, mutation.action_id, digest)
+                    .map(|retained| retained.and_then(|answer| encode(&answer)))
+            }
+            Method::OwnerConfirmationRequest => self
+                .owner
+                .retained_request(caller, (mutation.action_id, digest))
+                .map(|retained| retained.and_then(|answer| encode(&answer))),
+            Method::OwnerConfirmationComplete => {
+                let params: OwnerConfirmationCompleteParams = mutation.params.to_typed().ok()?;
+                self.owner
+                    .retained_answer(&params)
+                    .map(|retained| retained.and_then(|answer| encode(&answer)))
+            }
+            Method::PairConfirm => {
+                let params: PairConfirmParams = mutation.params.to_typed().ok()?;
+                kr_pairing::platform::InvitationStore::commitment(&self.rows, params.invitation_id)
+                    .ok()??;
+                Some(
+                    self.committed_answer(caller, params.invitation_id)
+                        .and_then(|answer| encode(&answer)),
+                )
+            }
+            Method::PairCancel => {
+                let params: PairCancelParams = mutation.params.to_typed().ok()?;
+                let row = self.rows.row(params.invitation_id).ok()??;
+                let wanted = if params.deny {
+                    PairingConsumedReason::Denied
+                } else {
+                    PairingConsumedReason::Cancelled
+                };
+                (row.record.state == InvitationState::Consumed { reason: wanted }).then(|| {
+                    self.recorded_status(caller, params.invitation_id)
+                        .and_then(|answer| encode(&answer))
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The answer a repeated `pair.invite` is owed: the open invitation's, or what became of it.
+    fn retained_invite(
+        &self,
+        open: &Option<Open>,
+        caller: &Caller,
+        action: ActionId,
+        digest: Digest256,
+    ) -> Option<Result<PairInviteResult>> {
+        if let Some(offered) = open.as_ref()
+            && offered.issued_by == caller.actor_id
+            && offered.action.0 == action
+        {
+            if offered.action.1 != digest {
+                return Some(Err(id_conflict()));
+            }
+            // An invitation that ended stays in memory for its candidate's sake; its issuer is
+            // told what became of it from the durable row, like after a restart.
+            if matches!(
+                offered.state(),
+                InvitationState::Open | InvitationState::Locked { .. }
+            ) {
+                return Some(Ok(offered.answer.clone()));
+            }
+        }
+        match self.rows.row_for_action(&caller.actor_id, action) {
+            Ok(Some(row)) => Some(Err(
+                if row.terms.action.map(|(_, recorded)| recorded) == Some(digest) {
+                    no_longer_open(&row)
+                } else {
+                    id_conflict()
+                },
+            )),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        }
+    }
+
+    /// `pair.status` from a paired device: the device's own committed pairing, and nothing else.
+    ///
+    /// A device paired through an invitation may reconnect as the device it became and ask about
+    /// that invitation; the answer is about itself. It is the issuing owner of nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PERMISSION_DENIED` for any other invitation.
+    pub fn device_status(
+        &self,
+        caller: &Caller,
+        params: &PairStatusParams,
+    ) -> Result<PairStatusResult> {
+        let Some(device) = caller.device.as_ref() else {
+            return Err(refusal(kr_pairing::PairingError::NotIssuingOwner));
+        };
+        if device.committed_invitation_id != Some(params.invitation_id) {
+            return Err(refusal(kr_pairing::PairingError::NotIssuingOwner));
+        }
+        Ok(PairStatusResult {
+            status: PairStatus::Committed {
+                device_id: device.device_id,
+                grant_id: device.grant.grant_id,
+            },
+            owner: Nullable::null(),
+        })
+    }
+
     fn open(&self) -> MutexGuard<'_, Option<Open>> {
         self.open.lock().unwrap_or_else(|held| held.into_inner())
     }
@@ -875,11 +1030,28 @@ fn clock_digest() -> Result<Digest256> {
     kr_pairing::confirm::action_digest(&CLOCK_PURPOSE).map_err(refusal)
 }
 
-/// Returns the digest of one `pair.invite`'s parameters, which a retry of its action must repeat.
-fn parameters_digest(params: &PairInviteParams) -> Result<Digest256> {
-    Ok(Digest256::from_bytes(kr_cbor::sha256(
-        &kr_cbor::to_canonical_vec(params).map_err(ControllerError::registry)?,
-    )))
+/// Returns the origin a code invitation reserves at: the one named, or this host's default.
+///
+/// A direct invitation names none, and one that did would be naming a service it never contacts.
+fn resolved_origin(
+    mode: InviteModeKind,
+    named: Option<&RendezvousOrigin>,
+) -> Result<Option<RendezvousOrigin>> {
+    match (mode, named) {
+        (InviteModeKind::Code, Some(origin)) => Ok(Some(origin.clone())),
+        (InviteModeKind::Code, None) => Ok(Some(default_rendezvous_origin())),
+        (InviteModeKind::Direct, None) => Ok(None),
+        (InviteModeKind::Direct, Some(_)) => Err(ControllerError::Refused {
+            code: ErrorCode::InvalidArgument,
+            detail: "a direct invitation contacts no rendezvous service, so it names no origin"
+                .to_owned(),
+        }),
+    }
+}
+
+fn encode<T: serde::Serialize>(value: &T) -> Result<ParamsValue> {
+    ParamsValue::from_typed(value)
+        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
 }
 
 fn qr_text(payload: &QrPayload) -> Result<QrText> {
@@ -920,9 +1092,20 @@ fn no_longer_open(row: &InvitationRow) -> ControllerError {
 }
 
 /// Returns what a candidate is told, under the pairing error's own stable code.
+///
+/// An authentication failure says that and nothing more. Section 10 keeps it ambiguous, and a
+/// message naming which value did not match would tell a candidate what the code cannot: whether
+/// it had the secret, the transcript or the endpoint wrong.
 fn protocol_refusal(error: kr_pairing::PairingError) -> ProtocolError {
-    ProtocolError::new(error.code(), error.to_string())
+    let code = error.code();
+    if code == ErrorCode::PairingAuthFailed {
+        return ProtocolError::new(code, AUTHENTICATION_FAILED);
+    }
+    ProtocolError::new(code, error.to_string())
 }
+
+/// The one thing a candidate is told when its pairing could not be authenticated.
+pub const AUTHENTICATION_FAILED: &str = "the pairing could not be authenticated";
 
 fn malformed(error: impl std::fmt::Display) -> ProtocolError {
     ProtocolError::new(ErrorCode::InvalidArgument, error.to_string())

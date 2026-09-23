@@ -105,7 +105,42 @@ impl Host {
 
     /// Starts a daemon on a fresh environment, on the network, with no owner yet.
     pub async fn start_unowned() -> Self {
-        let temp = kr_ipc::testing::TempHost::create();
+        Self::start_on(kr_ipc::testing::TempHost::create()).await
+    }
+
+    /// Stops this daemon and starts another on the same environment tree, the way a restart of
+    /// the host does: every durable record stays, and nothing held in memory does.
+    pub async fn restart(self) -> Self {
+        let Self {
+            temp,
+            controller,
+            network,
+            clients,
+            owner,
+            ..
+        } = self;
+        clients.abort();
+        let _ = clients.await;
+        network.shutdown().await;
+        // Each connection's task holds the daemon, and the daemon holds its environment's lock
+        // until the last of them ends. A suite closes its clients before it restarts.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&controller) > 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stopped daemon is still held in {} places",
+                Arc::strong_count(&controller) - 1
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        drop(controller);
+        let mut host = Self::start_on(temp).await;
+        host.owner = owner;
+        host
+    }
+
+    /// Starts a daemon on the network over an environment tree that may already hold records.
+    async fn start_on(temp: kr_ipc::testing::TempHost) -> Self {
         let environment = temp.environment();
         let environment_id = temp.environment_id();
         let secrets = environment.secrets_dir();

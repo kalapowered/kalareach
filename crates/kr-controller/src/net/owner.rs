@@ -43,10 +43,10 @@ use kr_protocol::pairing::{
     OwnerConfirmationRequest, SensitiveAction,
 };
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, Digest256, EndpointKey};
+use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, Digest256, EndpointKey, KeyId};
 
 use super::devices::{DeviceDirectory, DeviceRecord};
-use super::invitations::InvitationRows;
+use super::invitations::{InvitationRows, holds_live_owner_grant};
 use super::pairing::HostPairingClock;
 use crate::error::{ControllerError, Result};
 
@@ -91,16 +91,16 @@ impl Caller {
         }
     }
 
-    /// Returns true when this caller holds owner authority on this host.
+    /// Returns true when this caller holds owner authority on this host at `now_ms`.
     ///
-    /// A local caller is the host's own account. A paired device is an owner device when its live
-    /// grant holds `host.manage`.
+    /// A local caller is the host's own account. A paired device is an owner device while its
+    /// record stands and its grant holds `host.manage` and has not run out.
     #[must_use]
-    pub fn is_owner(&self) -> bool {
+    pub fn is_owner(&self, now_ms: u64) -> bool {
         match (&self.device, self.ingress) {
             (None, ActorIngress::LocalIpc) => true,
             (Some(device), ActorIngress::PairedDevice) => {
-                device.is_paired() && device.grant.permits(ActionRight::HostManage)
+                device.is_paired() && holds_live_owner_grant(&device.grant, now_ms)
             }
             _ => false,
         }
@@ -132,8 +132,6 @@ struct Entry {
     request: OwnerConfirmationRequest,
     display: ConfirmationDisplay,
     first_owner: bool,
-    requested_by: ActorId,
-    requested_under: Option<ActionId>,
     answer: Option<Answer>,
 }
 
@@ -260,37 +258,35 @@ impl OwnerAuthority {
 
     /// Issues the challenge for one resolved action.
     ///
-    /// A retry of the same caller's action gets the challenge that action already issued, while it
-    /// is still outstanding, rather than a second one.
+    /// `action` is the caller's action and the digest of its whole mutation. The challenge an
+    /// action asked for is recorded before it is issued, so a retry of that mutation gets the same
+    /// challenge, outstanding or not and across a restart, and the same action with another
+    /// payload is `ID_CONFLICT`. `admission` is asked immediately before anything is written.
     ///
     /// # Errors
     ///
-    /// Returns `PERMISSION_DENIED` for a caller without owner authority, and an error when the
-    /// random generator or the owner record is unavailable.
+    /// Returns `PERMISSION_DENIED` for a caller without owner authority, `ID_CONFLICT` for a
+    /// reused action, the admission's refusal, and an error when the random generator or the
+    /// records are unavailable.
     pub fn request(
         &self,
         caller: &Caller,
         resolved: Resolved,
-        action: Option<ActionId>,
+        action: (ActionId, Digest256),
+        admission: &dyn Fn() -> Result<()>,
     ) -> Result<OwnerConfirmationRequestResult> {
-        if !caller.is_owner() {
+        if !caller.is_owner(kr_ipc::now_ms().get()) {
             return Err(ControllerError::PermissionDenied {
                 detail: "only this host's owner asks for an owner confirmation".to_owned(),
             });
         }
+        if let Some(retained) = self.retained_request(caller, action) {
+            return retained;
+        }
         let initial_bootstrap = self.enrolment()? == HostEnrolment::InitialBootstrap;
         let mut state = self.state();
         self.sweep(&mut state);
-        if let Some(action) = action
-            && let Some(entry) = state.entries.values().find(|entry| {
-                entry.requested_by == caller.actor_id && entry.requested_under == Some(action)
-            })
-        {
-            return Ok(OwnerConfirmationRequestResult {
-                request: entry.request.clone(),
-                initial_bootstrap,
-            });
-        }
+        admission()?;
         let request = request_confirmation(
             &self.clock,
             resolved.action,
@@ -301,6 +297,8 @@ impl OwnerAuthority {
             self.host_endpoint_id,
         )
         .map_err(refusal)?;
+        self.rows
+            .record_requested(&caller.actor_id, action.0, action.1, &request)?;
         state.ledger.issue(&request, &self.clock);
         state.issued += 1;
         let order = state.issued;
@@ -311,8 +309,6 @@ impl OwnerAuthority {
                 request: request.clone(),
                 display: resolved.display,
                 first_owner: resolved.first_owner,
-                requested_by: caller.actor_id.clone(),
-                requested_under: action,
                 answer: None,
             },
         );
@@ -322,13 +318,71 @@ impl OwnerAuthority {
         })
     }
 
+    /// Returns the answer an action that already asked for a challenge is owed, when it did.
+    ///
+    /// # Errors
+    ///
+    /// The inner result is `ID_CONFLICT` when the same action asked with another payload, and a
+    /// registry error when the record cannot be read.
+    pub fn retained_request(
+        &self,
+        caller: &Caller,
+        action: (ActionId, Digest256),
+    ) -> Option<Result<OwnerConfirmationRequestResult>> {
+        let recorded = match self.rows.requested(&caller.actor_id, action.0) {
+            Ok(recorded) => recorded?,
+            Err(error) => return Some(Err(error)),
+        };
+        let (digest, request) = recorded;
+        if digest != action.1 {
+            return Some(Err(ControllerError::Refused {
+                code: ErrorCode::IdConflict,
+                detail: "this action already asked for a confirmation of something else".to_owned(),
+            }));
+        }
+        Some(
+            self.enrolment()
+                .map(|enrolment| OwnerConfirmationRequestResult {
+                    request,
+                    initial_bootstrap: enrolment == HostEnrolment::InitialBootstrap,
+                }),
+        )
+    }
+
+    /// Returns the answer a repeated completion is owed, when the same proof already answered.
+    ///
+    /// The acceptance record is what says so, so this holds after the challenge was spent and
+    /// across a restart.
+    #[must_use]
+    pub fn retained_answer(
+        &self,
+        params: &OwnerConfirmationCompleteParams,
+    ) -> Option<Result<OwnerConfirmationCompleteResult>> {
+        let proof = &params.proof;
+        match self.rows.acceptance(proof.request.confirmation_id) {
+            Ok(Some(acceptance))
+                if acceptance.channel == proof.channel.as_str()
+                    && acceptance.signer_key_id == proof.signer_key_id
+                    && acceptance.request == proof.request =>
+            {
+                Some(Ok(OwnerConfirmationCompleteResult {
+                    confirmation_id: proof.request.confirmation_id,
+                    channel: proof.channel,
+                    answered_at_ms: acceptance.answered_at_ms,
+                }))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        }
+    }
+
     /// Lists the challenges an owner can still answer, oldest first.
     ///
     /// # Errors
     ///
     /// Returns `PERMISSION_DENIED` for a caller without owner authority.
     pub fn pending(&self, caller: &Caller) -> Result<OwnerConfirmationPendingResult> {
-        if !caller.is_owner() {
+        if !caller.is_owner(kr_ipc::now_ms().get()) {
             return Err(ControllerError::PermissionDenied {
                 detail: "only this host's owner reads its outstanding confirmations".to_owned(),
             });
@@ -360,6 +414,7 @@ impl OwnerAuthority {
         &self,
         caller: &Caller,
         params: &OwnerConfirmationCompleteParams,
+        admission: &dyn Fn() -> Result<()>,
     ) -> Result<OwnerConfirmationCompleteResult> {
         let proof = &params.proof;
         // Section 10: noninteractive confirmation from a session, plugin or contact-tool channel is
@@ -396,6 +451,7 @@ impl OwnerAuthority {
                 "that challenge has already been answered with another proof",
             ));
         }
+        admission()?;
         let now = kr_ipc::now_ms();
         self.rows.record_answered(proof, &caller.actor_id, now)?;
         if let Some(entry) = state.entries.get_mut(&key) {
@@ -431,13 +487,42 @@ impl OwnerAuthority {
             .values()
             .filter(|entry| entry.answer.is_some() && expectation.require(&entry.request).is_ok())
             .collect();
+        if candidates.is_empty() {
+            return Err(confirmation_required(
+                "this action needs a fresh owner confirmation naming it",
+            ));
+        }
         candidates.sort_by_key(|entry| entry.order);
-        let entry = candidates.first().ok_or_else(|| {
-            confirmation_required("this action needs a fresh owner confirmation naming it")
-        })?;
-        let answer = entry.answer.clone().expect("filtered on an answer");
+        // Each answer was verified when it arrived; the authority behind it is checked again now,
+        // because a device can be revoked, or its grant run out, between the two. An answer whose
+        // authority has gone is passed over, never spent, and the oldest answer that still stands
+        // is the one taken. The store checks once more inside the transaction that records the
+        // effect.
+        let owner_keys: Vec<KeyId> = self
+            .owner_devices()?
+            .iter()
+            .map(|device| key_id(&device.authorisation))
+            .collect();
+        let (request, answer) = candidates
+            .iter()
+            .find_map(|entry| {
+                let answer = entry.answer.as_ref()?;
+                let standing = match answer.proof.channel {
+                    ConfirmationChannel::LocalBootstrapTerminal => {
+                        enrolment == HostEnrolment::InitialBootstrap
+                    }
+                    _ => owner_keys.contains(&answer.proof.signer_key_id),
+                };
+                standing.then(|| (entry.request.clone(), answer.clone()))
+            })
+            .ok_or_else(|| {
+                confirmation_required(
+                    "the owner confirmation that answered this was given under authority this \
+                     host no longer holds; confirm again",
+                )
+            })?;
         let spendable = Spendable {
-            request: entry.request.clone(),
+            request,
             proof: answer.proof,
             signer: answer.signer,
             enrolment,
@@ -552,13 +637,14 @@ impl OwnerAuthority {
         }
     }
 
-    /// Returns the live paired devices whose grant holds host management.
+    /// Returns the live paired devices whose grant holds host management and has not run out.
     fn owner_devices(&self) -> Result<Vec<DeviceRecord>> {
+        let now = kr_ipc::now_ms().get();
         Ok(self
             .devices()
             .devices()?
             .into_iter()
-            .filter(|device| device.is_paired() && device.grant.permits(ActionRight::HostManage))
+            .filter(|device| device.is_paired() && holds_live_owner_grant(&device.grant, now))
             .collect())
     }
 
@@ -599,7 +685,7 @@ impl Challenges {
 }
 
 /// Returns the key identifier of an authorisation key, as a proof names its signer.
-fn key_id(key: &AuthorisationKey) -> kr_protocol::scalars::KeyId {
+fn key_id(key: &AuthorisationKey) -> KeyId {
     kr_crypto::keys::key_id(KeyPurpose::Authorisation, key.as_bytes())
 }
 

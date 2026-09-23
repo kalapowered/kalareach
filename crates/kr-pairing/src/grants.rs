@@ -44,6 +44,26 @@ pub enum GrantKind {
     SessionInvitation,
 }
 
+impl GrantKind {
+    /// Returns the kind as the wire names it.
+    #[must_use]
+    pub const fn protocol(self) -> kr_protocol::invitation::InviteGrantKind {
+        match self {
+            Self::PersonalOwner => kr_protocol::invitation::InviteGrantKind::PersonalOwner,
+            Self::SessionInvitation => kr_protocol::invitation::InviteGrantKind::SessionInvitation,
+        }
+    }
+
+    /// Returns the kind a wire name names.
+    #[must_use]
+    pub const fn from_protocol(kind: kr_protocol::invitation::InviteGrantKind) -> Self {
+        match kind {
+            kr_protocol::invitation::InviteGrantKind::PersonalOwner => Self::PersonalOwner,
+            kr_protocol::invitation::InviteGrantKind::SessionInvitation => Self::SessionInvitation,
+        }
+    }
+}
+
 /// Builds the grant a session invitation proposes by default: `session.view` for one hour.
 ///
 /// `duration_ms` shortens or extends it, up to [`MAX_SESSION_INVITATION_MS`].

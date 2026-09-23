@@ -28,6 +28,7 @@ use kr_pairing::platform::{
     TestClientBudgetStore, TestClock, TestLivePeer, TestRendezvousHost,
 };
 use kr_protocol::actor::ActorIngress;
+use kr_protocol::error::ErrorCode;
 use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope, SessionSelector};
 use kr_protocol::ids::{
     ActionId, ActorId, AuthorityRevision, DeviceId, DeviceKeyRevision, GrantId, InvitationId,
@@ -103,7 +104,17 @@ fn open_unowned(path: &Path) -> (Arc<DeviceDirectory>, InvitationRows) {
 
 /// A device record holding a personal owner grant, as an owner device's row reads.
 fn owner_device() -> kr_controller::service::net::devices::DeviceRecord {
-    let keys = DeviceKeys::generate().expect("keys");
+    owner_device_with(
+        &DeviceKeys::generate().expect("keys"),
+        DeviceId::new(Uuid::from_bytes([0x0c; 16])),
+    )
+}
+
+/// The row of an owner device holding `keys`, under the identity `device_id`.
+fn owner_device_with(
+    keys: &DeviceKeys,
+    device_id: DeviceId,
+) -> kr_controller::service::net::devices::DeviceRecord {
     let owner_keys = DeviceKeys::generate().expect("keys");
     let clock = TestClock::new();
     let grant = kr_pairing::grants::personal_owner_grant();
@@ -118,17 +129,17 @@ fn owner_device() -> kr_controller::service::net::devices::DeviceRecord {
     )
     .expect("a challenge");
     device_record(&PairingCommitment {
-        invitation_id: InvitationId::new(Uuid::from_bytes([0x0a; 16])),
-        attempt_id: kr_protocol::ids::AttemptId::new(Uuid::from_bytes([0x0b; 16])),
-        device_id: DeviceId::new(Uuid::from_bytes([0x0c; 16])),
+        invitation_id: InvitationId::new(kr_ipc::new_uuid()),
+        attempt_id: kr_protocol::ids::AttemptId::new(kr_ipc::new_uuid()),
+        device_id,
         grant: grant.clone().into_grant(
-            GrantId::new(Uuid::from_bytes([0x0d; 16])),
+            GrantId::new(kr_ipc::new_uuid()),
             DeviceId::new(Uuid::from_bytes([1; 16])),
-            DeviceId::new(Uuid::from_bytes([0x0c; 16])),
+            device_id,
             AuthorityRevision::new(1),
         ),
         client_keys: keys.public_keys(),
-        client_bundle: Some(client_bundle(&keys)),
+        client_bundle: Some(client_bundle(keys)),
         proposed_grant: grant,
         verification_value: "00000000".to_owned(),
         owner_confirmation: sign_confirmation(
@@ -159,12 +170,50 @@ struct Harness {
     owner: OwnerContext,
     grant: ProposedGrant,
     grant_kind: GrantKind,
+    /// The channel the owner answers on, and the enrolment it is accepted under.
+    channel: ConfirmationChannel,
+    enrolment: HostEnrolment,
+    /// The owner's device on record, when the owner answers on one.
+    owner_device_id: Option<DeviceId>,
 }
 
 type Host<'a> = HostInvitation<InvitationRows, &'a TestClock>;
 
 impl Harness {
+    /// A harness whose owner answers on an owner device this host has on record.
+    ///
+    /// The store checks the signer of every confirmation it records as spent against the live
+    /// owner devices, so the owner's device row is written here.
     fn new(rows: InvitationRows) -> Self {
+        let mut harness = Self::answering(
+            rows,
+            ConfirmationChannel::OwnerDevicePresence,
+            HostEnrolment::Enrolled,
+        );
+        let device_id = DeviceId::new(kr_ipc::new_uuid());
+        harness
+            .rows
+            .directory()
+            .commit(&owner_device_with(&harness.owner_keys, device_id))
+            .expect("the owner's device");
+        harness.owner_device_id = Some(device_id);
+        harness
+    }
+
+    /// A harness for a host with no owner, whose owner answers at this host's own terminal.
+    fn bootstrap(rows: InvitationRows) -> Self {
+        Self::answering(
+            rows,
+            ConfirmationChannel::LocalBootstrapTerminal,
+            HostEnrolment::InitialBootstrap,
+        )
+    }
+
+    fn answering(
+        rows: InvitationRows,
+        channel: ConfirmationChannel,
+        enrolment: HostEnrolment,
+    ) -> Self {
         Self {
             rows,
             clock: TestClock::new(),
@@ -179,6 +228,9 @@ impl Harness {
             },
             grant: viewer_grant(),
             grant_kind: GrantKind::SessionInvitation,
+            channel,
+            enrolment,
+            owner_device_id: None,
         }
     }
 
@@ -216,12 +268,8 @@ impl Harness {
             .lock()
             .expect("the ledger")
             .issue(&request, &self.clock);
-        let proof = sign_confirmation(
-            &self.owner_keys.authorisation,
-            &request,
-            ConfirmationChannel::OwnerDevicePresence,
-        )
-        .expect("a proof");
+        let proof = sign_confirmation(&self.owner_keys.authorisation, &request, self.channel)
+            .expect("a proof");
         Approval { request, proof }
     }
 
@@ -229,7 +277,7 @@ impl Harness {
         OwnerApproval {
             owner: &self.owner,
             signer,
-            enrolment: HostEnrolment::Enrolled,
+            enrolment: self.enrolment,
             request: &approval.request,
             proof: &approval.proof,
         }
@@ -259,7 +307,13 @@ impl Harness {
     fn issue_under(&self, action: Option<(ActionId, Digest256)>) -> Host<'_> {
         let approval = self.approval(
             SensitiveAction::IssueInvitation,
-            kr_pairing::confirm::action_digest(&self.grant).expect("a digest"),
+            kr_protocol::invitation::issuance_digest(
+                InviteModeKind::Code,
+                Some(&origin()),
+                self.grant_kind.protocol(),
+                &self.grant,
+            )
+            .expect("a digest"),
             None,
         );
         HostInvitation::issue(
@@ -901,7 +955,7 @@ fn a_host_with_no_owner_commits_only_its_first_owner() {
     let (_, rows) = open_unowned(&path);
     assert_eq!(rows.host_owner().expect("readable"), None);
 
-    let viewer_host = Harness::new(rows.clone());
+    let viewer_host = Harness::bootstrap(rows.clone());
     let mut invitation = viewer_host.issue();
     bind(&viewer_host, &mut invitation);
     let refused = approve(&viewer_host, &mut invitation);
@@ -912,7 +966,7 @@ fn a_host_with_no_owner_commits_only_its_first_owner() {
     assert!(rows.events_after(None, 10).expect("readable").is_empty());
     assert_eq!(rows.host_owner().expect("readable"), None);
 
-    let mut owner_host = Harness::new(rows.clone());
+    let mut owner_host = Harness::bootstrap(rows.clone());
     owner_host.grant = kr_pairing::grants::personal_owner_grant();
     owner_host.grant_kind = GrantKind::PersonalOwner;
     let mut invitation = owner_host.issue();
@@ -929,5 +983,61 @@ fn a_host_with_no_owner_commits_only_its_first_owner() {
             device_id: commitment.device_id,
             invitation_id: commitment.invitation_id,
         })
+    );
+
+    // The bootstrap is over: an answer given at the terminal spends nothing on a host with an
+    // owner.
+    let late = owner_host.approval(
+        SensitiveAction::ChangeHostAuthority,
+        Digest256::from_bytes([2; 32]),
+        None,
+    );
+    let refused = rows
+        .record_consumed(&late.proof, "the clock", TimestampMs::new(20))
+        .expect_err("the bootstrap is over");
+    assert_eq!(refused.code(), ErrorCode::OwnerConfirmationRequired);
+}
+
+/// KR-REQ-10.05, KR-REQ-10.06: the authority behind an owner's answer is read again inside the
+/// transaction that commits the effect. An owner device revoked after it answered commits nothing:
+/// no device, no commitment, no event and no consumption, and the invitation stays where it was.
+#[test]
+fn an_answer_whose_owner_device_was_revoked_commits_nothing() {
+    let temp = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.sqlite3");
+    let (directory, rows) = open(&path);
+    let harness = Harness::new(rows.clone());
+    let mut host = harness.issue();
+    bind(&harness, &mut host);
+    let invitation_id = host.invitation_id();
+    let before = rows
+        .load(invitation_id)
+        .expect("readable")
+        .expect("a record");
+    directory
+        .revoke(
+            harness.owner_device_id.expect("the owner's device"),
+            TimestampMs::new(harness.clock_wall()),
+        )
+        .expect("revoked");
+
+    let refused = approve(&harness, &mut host);
+    assert!(
+        matches!(refused, Err(PairingError::OwnerConfirmationRequired)),
+        "{refused:?}"
+    );
+    assert_eq!(
+        rows.load(invitation_id)
+            .expect("readable")
+            .expect("a record"),
+        before
+    );
+    assert!(rows.commitment(invitation_id).expect("readable").is_none());
+    assert!(rows.events_after(None, 10).expect("readable").is_empty());
+    assert!(
+        directory
+            .record_for_device(harness.identities().recipient_device_id)
+            .expect("readable")
+            .is_none()
     );
 }

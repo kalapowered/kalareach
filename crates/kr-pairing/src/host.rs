@@ -153,8 +153,26 @@ pub struct OwnerApproval<'a> {
     pub proof: &'a OwnerConfirmationProof,
 }
 
+/// What an owner approves when it approves issuing one invitation.
+#[derive(Clone, Copy, Debug)]
+pub struct IssueTerms<'a> {
+    /// How the invitation is offered.
+    pub mode: kr_protocol::invitation::InviteModeKind,
+    /// The origin a code invitation reserves its locator at. None for a direct invitation.
+    pub origin: Option<&'a RendezvousOrigin>,
+    /// The rules the proposed grant is checked against.
+    pub grant_kind: GrantKind,
+    /// The exact proposed grant.
+    pub proposed_grant: &'a ProposedGrant,
+}
+
 impl OwnerApproval<'_> {
-    /// Accepts a confirmation to issue an invitation proposing exactly these rights.
+    /// Accepts a confirmation to issue exactly this invitation: its mode, its origin, the kind of
+    /// its grant and the grant's rights.
+    ///
+    /// The digest is [`kr_protocol::invitation::issuance_digest`] over all four, so an approval
+    /// given for a code invitation cannot issue a direct one, one given for one origin cannot
+    /// reserve at another, and one given for other rights issues nothing.
     ///
     /// # Errors
     ///
@@ -165,14 +183,20 @@ impl OwnerApproval<'_> {
         ledger: &mut ConfirmationLedger,
         clock: &dyn PairingClock,
         host: &HostIdentity,
-        proposed_grant: &ProposedGrant,
+        terms: &IssueTerms<'_>,
     ) -> Result<()> {
+        let proposed_grant = terms.proposed_grant;
         self.accept(
             ledger,
             clock,
             &ConfirmationExpectation {
                 action: SensitiveAction::IssueInvitation,
-                action_digest: confirm::action_digest(proposed_grant)?,
+                action_digest: kr_protocol::invitation::issuance_digest(
+                    terms.mode,
+                    terms.origin,
+                    terms.grant_kind.protocol(),
+                    proposed_grant,
+                )?,
                 host_device_id: host.device_id,
                 host_endpoint_id: host.endpoint_id,
                 // There is no destination device yet: the invitation is issued before anybody
@@ -391,7 +415,17 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
         approval: &OwnerApproval<'_>,
         ledger: &mut ConfirmationLedger,
     ) -> Result<Self> {
-        approval.accept_issue(ledger, &clock, &proposal.host, &proposal.proposed_grant)?;
+        approval.accept_issue(
+            ledger,
+            &clock,
+            &proposal.host,
+            &IssueTerms {
+                mode: kr_protocol::invitation::InviteModeKind::Code,
+                origin: Some(&proposal.origin),
+                grant_kind: proposal.grant_kind,
+                proposed_grant: &proposal.proposed_grant,
+            },
+        )?;
         grants::validate_proposal(
             &proposal.proposed_grant,
             proposal.grant_kind,

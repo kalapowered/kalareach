@@ -13882,6 +13882,10 @@ export interface PendingConfirmation {
            */
           mode: 'code' | 'direct'
           proposed_grant: ProposedGrant
+          /**
+           * The origin a code invitation reserves at, the default included.
+           */
+          rendezvous_origin: RendezvousOrigin | null
         }
       }
     | {
@@ -14221,6 +14225,11 @@ export interface OwnerConfirmationRequestParams {
            */
           mode: 'code' | 'direct'
           proposed_grant: ProposedGrant2
+          /**
+           * The rendezvous origin a code invitation reserves at. Null takes this host's default for
+           * a code invitation, and is the only value a direct invitation takes.
+           */
+          rendezvous_origin: RendezvousOrigin | null
         }
       }
     | {
@@ -14635,7 +14644,7 @@ export interface PairInviteResult {
            */
           qr_text: string
           /**
-           * The origin the locator was reserved at. Always shown, the default included.
+           * A canonical HTTPS origin: https:// followed by a lower-case host or a bracketed IPv6 literal and an optional non-default port, with no path, query, fragment or user information.
            */
           rendezvous_origin: string
         }

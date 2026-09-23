@@ -146,7 +146,13 @@ impl Harness {
     fn issue(&self) -> Invitation<'_> {
         let approval = self.approval(
             SensitiveAction::IssueInvitation,
-            kr_pairing::confirm::action_digest(&proposal()).expect("a digest"),
+            kr_protocol::invitation::issuance_digest(
+                kr_protocol::invitation::InviteModeKind::Direct,
+                None,
+                kr_protocol::invitation::InviteGrantKind::SessionInvitation,
+                &proposal(),
+            )
+            .expect("a digest"),
             None,
         );
         DirectInvitation::issue(
