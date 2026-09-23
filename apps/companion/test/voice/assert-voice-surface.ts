@@ -111,14 +111,15 @@ const PATIENCE_MS = 5_000
 class ReaderFailure extends Error {}
 
 /**
- * The words of a text, in order: each run of letters and digits, in lower case. Spacing, line breaks
- * and punctuation only separate words, so a sentence the layout wrapped, an apostrophe drawn curly
- * or a comma the recogniser missed reads the same. Every word is compared whole and in its place:
- * "Unmute" is not "Mute", a sentence without its "not" is another sentence, and "0.01" (the words 0
- * and 01) is not "00.1" (00 and 1).
+ * The words of a text, in order and in lower case: each amount (digits with the separators inside
+ * them and a currency sign in front, so "$0.01" and "8,000" are one word each) and each other run of
+ * letters and digits. Spacing, line breaks and the rest of punctuation only separate words, so a
+ * sentence the layout wrapped or an apostrophe drawn curly reads the same. Every word is compared
+ * whole and in its place: "Unmute" is not "Mute", a sentence without its "not" is another sentence,
+ * and "$0.01" is neither "$00.1" nor "0.01".
  */
 function wordsOf(text: string): string[] {
-  return text.normalize('NFKC').toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []
+  return text.normalize('NFKC').toLowerCase().match(/[$€£]?\p{N}+(?:[.,]\p{N}+)*|[\p{L}\p{N}]+/gu) ?? []
 }
 
 /** Whether all of `run`, a sequence of words, occurs together and in order in `read`. */

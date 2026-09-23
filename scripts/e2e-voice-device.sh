@@ -251,13 +251,18 @@ SWIFT
     ocr="$artefacts/read-text"
 }
 
-# The words of a text, in lower case, one space between them and one at each end. Spacing, line
-# breaks and punctuation only separate words, so a phrase the screen wrapped or a comma the
-# recogniser missed reads the same, while every word is compared whole: "Unmute" is not "Mute", and
-# "0.01" (the words 0 and 01) is not "00.1".
+# The words of a text, in lower case, one space between them and one at each end: each amount
+# (digits with the separators inside them and a currency sign in front, so "$0.01" and "8,000" are
+# one word each) and each other run of letters and digits. Spacing, line breaks and the rest of
+# punctuation only separate words, so a phrase the screen wrapped reads the same, while every word
+# is compared whole: "Unmute" is not "Mute", and "$0.01" is not "$00.1". The same rule as the
+# surface assertions use.
 words_of() {
-    printf ' %s ' "$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]' |
-        LC_ALL=C sed -E 's/[^[:alnum:]]+/ /g; s/^ +//; s/ +$//' | tr '\n' ' ' | sed -E 's/ +/ /g; s/ $//')"
+    python3 -c '
+import re, sys, unicodedata
+text = unicodedata.normalize("NFKC", sys.argv[1]).lower()
+print(" " + " ".join(re.findall(r"[$€£]?\d+(?:[.,]\d+)*|[^\W_]+", text)) + " ")
+' "$1"
 }
 
 # True when each of the phrases after the image path is read in it, every word whole and in order.
