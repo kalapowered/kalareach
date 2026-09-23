@@ -202,14 +202,17 @@ pub async fn open_worker(descriptor: &WorkerDescriptor, build_id: BuildId) -> Re
 ///
 /// # Errors
 ///
-/// Returns [`CliError::HostUnavailable`] when no daemon is listening.
+/// Returns [`CliError::HostUnavailable`] when no daemon is listening. Its message names what the
+/// person has to do about it, because a failure that only says what is missing leaves the setup
+/// to be guessed.
 pub async fn open_controller(paths: &EnvironmentPaths, build_id: BuildId) -> Result<LocalClient> {
     let endpoint = paths.controller_endpoint()?;
     LocalClient::connect(&endpoint, LocalClientKind::Cli, build_id)
         .await
         .map_err(|error| {
             CliError::HostUnavailable(format!(
-                "no KalaReach host is running for this environment: {error}"
+                "no KalaReach host is running for this environment: {error}; start the control \
+                 daemon, kr-controller, for it"
             ))
         })
 }

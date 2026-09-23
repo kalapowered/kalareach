@@ -188,3 +188,69 @@ fn a_document_this_build_does_not_know_is_left_exactly_as_it_was() {
         "byte for byte as the owner left it"
     );
 }
+
+/// Every path under `root`, so a test can say that nothing was added or removed there.
+fn every_path_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut waiting = vec![root.to_path_buf()];
+    while let Some(directory) = waiting.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                waiting.push(path.clone());
+            }
+            found.push(path);
+        }
+    }
+    found.sort();
+    found
+}
+
+/// KR-REQ-07.13: with no control daemon set up, `kr new` fails with `HOST_NOT_CONFIGURED` and the
+/// action that sets one up, and on the way it installs no service, enables no lingering and starts
+/// nothing: the person's home and this host's trees are exactly as they were.
+#[test]
+fn creating_with_no_host_says_what_to_set_up_and_installs_nothing() {
+    let installation = Installation::create();
+    let home = installation.tree.root().join("home");
+    std::fs::create_dir_all(&home).expect("a home of this test's own");
+    let before = every_path_under(installation.tree.root());
+
+    let output = Command::new(kr())
+        .args(["--json", "new", "--invisible"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env(
+            kr_ipc::paths::RUNTIME_DIR_VARIABLE,
+            installation.tree.paths().runtime_root(),
+        )
+        .env(
+            kr_ipc::paths::STATE_DIR_VARIABLE,
+            installation.tree.paths().state_root(),
+        )
+        .current_dir(support::command_binaries())
+        .output()
+        .expect("the command runs");
+
+    assert_ne!(output.status.code(), Some(0), "nothing was created");
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("a JSON failure report");
+    assert_eq!(report["ok"], serde_json::json!(false));
+    assert_eq!(report["code"], serde_json::json!("HOST_NOT_CONFIGURED"));
+    let message = report["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("start the control daemon"),
+        "the failure names the setup it needs: {message}"
+    );
+    assert_eq!(
+        every_path_under(installation.tree.root()),
+        before,
+        "no service definition, no lingering setting and no runtime file was written anywhere \
+         this command could reach"
+    );
+}
