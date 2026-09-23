@@ -2240,6 +2240,29 @@ fn exit_status(output: &TerminalOutput, marker: &str) -> i32 {
     }
 }
 
+/// Ends what a test leaves running, however the test ends: the session it hosts, stopped by force,
+/// and the shell on its terminal.
+///
+/// A test that fails part way can leave a session nobody has told to stop and a shell on a terminal
+/// nobody reads, and unwinding past them must not leave them running beside the tests that follow.
+/// A session that closed normally is untouched by the forced stop.
+struct Leftovers<'a> {
+    hosted: &'a Hosted,
+    shell: Box<dyn portable_pty::Child + Send + Sync>,
+}
+
+impl Drop for Leftovers<'_> {
+    fn drop(&mut self) {
+        // A session whose lock an earlier panic poisoned cannot be reached at all, and a panic
+        // inside a drop that is already unwinding would take the whole test binary down.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = self.hosted.runtime.session().force_close();
+        }));
+        let _ = self.shell.kill();
+        let _ = self.shell.wait();
+    }
+}
+
 /// Frames a payload the way the connection carries it.
 fn framed(payload: &[u8]) -> Vec<u8> {
     let length = u32::try_from(payload.len()).expect("a frame this connection carried");
@@ -2305,7 +2328,7 @@ async fn a_connection_lost_after_a_refusal_ends_the_attachment_as_a_lost_connect
         })
         .expect("opens a terminal");
     let display = hosted.display.get().to_string();
-    let mut shell = pty
+    let shell = pty
         .slave
         .spawn_command(shell_running(
             &hosted,
@@ -2315,6 +2338,10 @@ async fn a_connection_lost_after_a_refusal_ends_the_attachment_as_a_lost_connect
             ),
         ))
         .expect("starts the shell");
+    let _leftovers = Leftovers {
+        hosted: &hosted,
+        shell,
+    };
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     let queries =
         answer_keyboard_queries_then_type(&output, pty.master.take_writer().expect("a writer"));
@@ -2372,6 +2399,4 @@ async fn a_connection_lost_after_a_refusal_ends_the_attachment_as_a_lost_connect
     tokio::time::timeout(LIVENESS_DEADLINE, hosted.runtime.wait_closed())
         .await
         .unwrap_or_else(|_| panic!("the session closed within {LIVENESS_DEADLINE:?}"));
-    let _ = shell.kill();
-    let _ = shell.wait();
 }
