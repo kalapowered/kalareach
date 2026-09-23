@@ -326,7 +326,9 @@ pub fn check_successor(previous: &CollectionKeyRecord, next: &CollectionKeyRecor
             what: "the collection a key record belongs to, which is the previous record's",
         });
     }
-    if after.revision.get() != before.revision.get().saturating_add(1) {
+    // Checked rather than saturating: the last revision a counter can hold has no successor, and
+    // two records at that one value would be two answers to one place in the order.
+    if before.revision.get().checked_add(1) != Some(after.revision.get()) {
         return Err(CryptoError::BindingMismatch {
             what: "the revision of a key record, which is the one after the previous record's",
         });
@@ -338,7 +340,7 @@ pub fn check_successor(previous: &CollectionKeyRecord, next: &CollectionKeyRecor
     }
     let epoch = after.key_epoch.get();
     let before_epoch = before.key_epoch.get();
-    if epoch != before_epoch && epoch != before_epoch.saturating_add(1) {
+    if epoch != before_epoch && before_epoch.checked_add(1) != Some(epoch) {
         return Err(CryptoError::BindingMismatch {
             what: "the epoch of a key record, which stays or moves on by one",
         });
@@ -489,17 +491,27 @@ impl CollectionMembers {
     ///
     /// # Errors
     ///
-    /// Returns an encoding error when the previous record cannot be digested.
+    /// Returns [`CryptoError::BindingMismatch`] when `previous` is at the last revision a record can
+    /// have, and an encoding error when it cannot be digested.
     pub fn successor_draft(
         &self,
         previous: &CollectionKeyRecord,
         issued_at_ms: TimestampMs,
     ) -> Result<CollectionRecordDraft> {
+        let revision =
+            previous
+                .payload
+                .revision
+                .get()
+                .checked_add(1)
+                .ok_or(CryptoError::BindingMismatch {
+                    what: "the revision after the last one a key record can have",
+                })?;
         Ok(CollectionRecordDraft {
             collection_id: previous.payload.collection_id,
             home: previous.payload.home,
             key_epoch: self.key_epoch(),
-            revision: SyncKeyRecordRevision::new(previous.payload.revision.get().saturating_add(1)),
+            revision: SyncKeyRecordRevision::new(revision),
             previous: Some(previous.digest()?),
             issued_at_ms,
             members: self.members.clone(),

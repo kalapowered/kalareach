@@ -528,3 +528,40 @@ fn removing_members_rotates_and_claims_no_retroactive_secrecy() {
             .constant_time_eq(&old_key)
     );
 }
+
+#[test]
+fn the_last_revision_a_record_can_have_has_no_successor() {
+    let (home, member) = (Device::new(), Device::new());
+    let key = fresh_key();
+    let draft = |revision: u64, previous: Digest256| CollectionRecordDraft {
+        collection_id: collection(),
+        home: installation_id(home.authorisation.public()),
+        key_epoch: SyncKeyEpoch::new(0),
+        revision: SyncKeyRecordRevision::new(revision),
+        previous: Some(previous),
+        issued_at_ms: TimestampMs::new(1),
+        members: vec![home.recipient(), member.recipient()],
+    };
+    let last = issue_collection_key_record(
+        &home.authorisation,
+        &home.envelope,
+        &draft(u64::MAX, Digest256::from_bytes([1; 32])),
+        &key,
+    )
+    .expect("a record");
+
+    // Nothing can be drafted after it...
+    assert!(matches!(
+        CollectionMembers::of_record(&last).successor_draft(&last, TimestampMs::new(2)),
+        Err(CryptoError::BindingMismatch { .. })
+    ));
+    // ...and a record claiming that same last revision is not its successor.
+    let again = issue_collection_key_record(
+        &home.authorisation,
+        &home.envelope,
+        &draft(u64::MAX, last.digest().expect("a digest")),
+        &key,
+    )
+    .expect("a record");
+    assert!(binding(check_successor(&last, &again)));
+}
