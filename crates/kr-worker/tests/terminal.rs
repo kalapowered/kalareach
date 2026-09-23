@@ -724,6 +724,47 @@ async fn a_reply_waits_for_an_open_paste_and_takes_no_lease() {
     let _ = std::fs::remove_dir_all(&gates);
 }
 
+/// KR-REQ-08.49: when the person with a paste open goes away, the paste is closed before the host's
+/// held answer is written, so the answer never lands inside a paste nobody is left to finish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn losing_the_paste_holder_closes_the_paste_before_a_held_reply() {
+    let gates = std::env::temp_dir().join(format!("kalareach-gates-{}", kr_ipc::new_uuid()));
+    std::fs::create_dir_all(&gates).expect("a directory for this test's gates");
+    let (ask, read) = (gates.join("ask"), gates.join("read"));
+    let host = host(&format!(
+        "stty raw -echo || exit 1; printf '\\033[?2004hkr-ready.'; \
+         while [ ! -e '{}' ]; do sleep 0.1; done; printf '\\033[c'; \
+         while [ ! -e '{}' ]; do sleep 0.1; done; exec cat -v",
+        ask.display(),
+        read.display()
+    ))
+    .await;
+    let (_client, _, mut keys) =
+        attached_holding_the_keys(&host, Dimensions::new(CANONICAL.0, CANONICAL.1)).await;
+    produced(&host.runtime, b"kr-ready.").await;
+
+    // A paste is open when the application asks, so the answer waits.
+    keys.type_bytes(&host.runtime, b"\x1b[200~kr-pasted-");
+    std::fs::write(&ask, b"").expect("opens the gate");
+    produced(&host.runtime, b"\x1b[c").await;
+    // The person holding the paste goes away without finishing it.
+    {
+        let mut session = host.runtime.session();
+        session.detach(keys.attachment()).expect("detaches");
+        host.runtime.flush_locked(&mut session);
+    }
+    std::fs::write(&read, b"").expect("opens the gate");
+
+    produced(&host.runtime, b"^[[?62;22c").await;
+    let seen = retained(&host.runtime);
+    assert!(
+        carries(&seen, b"^[[200~kr-pasted-^[[201~^[[?62;22c"),
+        "the host closed the paste before it delivered the answer: {}",
+        String::from_utf8_lossy(&seen).escape_debug()
+    );
+    let _ = std::fs::remove_dir_all(&gates);
+}
+
 /// KR-REQ-08.50: an application flooding the host with questions is answered within the lane's
 /// budget with its degradation reported out of band; none of the questions reaches the attached
 /// terminal, and the person's typing still reaches the application.
