@@ -95,6 +95,7 @@ pub mod review;
 pub mod rule;
 pub mod scope;
 pub mod store;
+pub mod subject;
 pub mod time;
 pub mod visit;
 
@@ -105,4 +106,5 @@ pub use crate::host::{ActionKey, Answer, Attention, ChangedPage, InboxPage, Muta
 pub use crate::rule::{RULES, Rule};
 pub use crate::scope::{DeviceScope, Viewer};
 pub use crate::store::{ActionRecord, Claimant, Liveness};
+pub use crate::subject::Subject;
 pub use crate::time::HostReading;

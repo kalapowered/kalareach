@@ -1305,6 +1305,68 @@ fn an_adapter_failing_for_two_sessions_is_two_failures() {
     assert_eq!(left[0].session_id.0, Some(session(1)));
 }
 
+/// The environment's own report about an adapter and a session's report about another never share
+/// an item, even when the environment's adapter identifier starts with that session's identifier
+/// and the separator, which an identifier may hold.
+#[test]
+fn an_environment_report_and_a_session_report_about_adapters_stay_apart() {
+    let mut attention = engine();
+    let lookalike = PluginId::new(format!("{}|git", session(1))).expect("an identifier");
+    let git = PluginId::new("git").expect("an identifier");
+    feed(
+        &mut attention,
+        &[
+            SourceEvent::new(
+                EventCursor::new(AttentionSource::Receipts, 1),
+                TimestampMs::new(NOON),
+                EventKind::AdapterFailed {
+                    plugin_id: lookalike.clone(),
+                    session_id: None,
+                    detail: "the helper exited".to_owned(),
+                },
+            ),
+            in_session(
+                session(1),
+                AttentionSource::HostEvents,
+                1,
+                0,
+                EventKind::AdapterFailed {
+                    plugin_id: git,
+                    session_id: Some(session(1)),
+                    detail: "the index is locked".to_owned(),
+                },
+            ),
+        ],
+        0,
+    );
+    let failures = |attention: &Attention| -> Vec<AttentionItem> {
+        owner_inbox(attention)
+            .into_iter()
+            .filter(|item| item.rule == AttentionRule::AdapterFailed)
+            .collect()
+    };
+    assert_eq!(failures(&attention).len(), 2);
+
+    feed(
+        &mut attention,
+        &[SourceEvent::new(
+            EventCursor::new(AttentionSource::Receipts, 2),
+            TimestampMs::new(NOON + 1_000),
+            EventKind::AdapterRecovered {
+                plugin_id: lookalike,
+            },
+        )],
+        1_000,
+    );
+    let left = failures(&attention);
+    assert_eq!(
+        left.len(),
+        1,
+        "the environment's recovery ends its own report only"
+    );
+    assert_eq!(left[0].session_id.0, Some(session(1)));
+}
+
 /// A notice with neither an identifier nor a fingerprint is its own record, and a record is named
 /// by its origin as well as its place: two sessions' records about one session never fold.
 #[test]

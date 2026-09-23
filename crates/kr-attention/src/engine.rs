@@ -67,6 +67,7 @@ use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 use crate::event::{EventCursor, EventKind, Origin, SourceEvent, numbers_every_record};
 use crate::rule::rule;
 use crate::scope::Viewer;
+use crate::subject::Subject;
 use crate::time::{Anchor, Elapsed, HostReading, MS_IN_MINUTE};
 
 /// Largest number of gaps the engine keeps. The oldest is dropped past it.
@@ -418,7 +419,7 @@ pub fn clip_summary(text: &str) -> String {
 /// Everything one raised condition names.
 struct Raise {
     id: AttentionRule,
-    subject: String,
+    subject: Subject,
     source: AttentionSource,
     origin: Origin,
     session_id: Option<SessionId>,
@@ -440,39 +441,19 @@ fn text_of(event: &SourceEvent, host_words: impl FnOnce() -> String) -> Text {
 }
 
 /// The subject an automation item is keyed on, and the one line the host says about it.
-fn automation_subject(subject: &AttentionAutomationSubject) -> (String, String) {
+fn automation_subject(subject: &AttentionAutomationSubject) -> (Subject, String) {
     match subject {
         AttentionAutomationSubject::Workflow {
             workflow_id,
             revision,
         } => (
-            format!("workflow|{workflow_id}|{}", revision.get()),
+            Subject::workflow(*workflow_id, revision.get()),
             format!("workflow {workflow_id} revision {}", revision.get()),
         ),
         AttentionAutomationSubject::CausalChain { causal_root_id } => (
-            format!("chain|{causal_root_id}"),
+            Subject::chain(*causal_root_id),
             format!("causal chain {causal_root_id}"),
         ),
-    }
-}
-
-/// The subject a pending approval is keyed on.
-///
-/// An upstream request identifier is the connector's own and is not unique across sessions, so the
-/// session is part of it.
-fn approval_subject(session_id: SessionId, request_id: &impl core::fmt::Display) -> String {
-    format!("{session_id}|{request_id}")
-}
-
-/// The subject an adapter failure is keyed on: the adapter, within the origin that reported it.
-///
-/// One adapter can fail for two sessions at once, and each session's failure is its own: a device
-/// that sees one session is shown that session's, and its recovery ends that one. The
-/// environment's own reports keep the adapter alone as their subject.
-fn adapter_subject(origin: Origin, plugin_id: &impl core::fmt::Display) -> String {
-    match origin {
-        Origin::Environment => plugin_id.to_string(),
-        Origin::Session(session_id) => format!("{session_id}|{plugin_id}"),
     }
 }
 
@@ -529,8 +510,8 @@ impl Engine {
     /// It is derived under the store's own secret, so a caller cannot work one out and a host that
     /// holds an item can always name it again.
     #[must_use]
-    pub fn key_for(&self, rule: AttentionRule, subject: &str) -> AttentionKey {
-        self.keys.attention_key(rule, subject)
+    pub fn key_for(&self, rule: AttentionRule, subject: &Subject) -> AttentionKey {
+        self.keys.attention_key(rule, subject.as_str())
     }
 
     /// Returns the secret this store derives its keys under, for the store to write down.
@@ -1125,7 +1106,7 @@ impl Engine {
         let source = event.cursor.source;
         let origin = event.cursor.origin;
         let raise = |id: AttentionRule,
-                     subject: String,
+                     subject: Subject,
                      session_id: Option<SessionId>,
                      text: Text,
                      routing: AttentionRouting| Raise {
@@ -1153,7 +1134,7 @@ impl Engine {
             } => self.raise(
                 raise(
                     AttentionRule::PendingApproval,
-                    approval_subject(*session_id, request_id),
+                    Subject::approval(*session_id, request_id),
                     Some(*session_id),
                     text_of(event, || summary.clone()),
                     AttentionRouting::OwnerPolicy,
@@ -1166,7 +1147,7 @@ impl Engine {
                 session_id,
             } => self.resolve(
                 AttentionRule::PendingApproval,
-                &approval_subject(*session_id, request_id),
+                &Subject::approval(*session_id, request_id),
             ),
             EventKind::QuestionPending {
                 question_id,
@@ -1201,7 +1182,7 @@ impl Engine {
                 self.raise(
                     raise(
                         AttentionRule::PendingInput,
-                        question_id.to_string(),
+                        Subject::question(*question_id),
                         Some(*session_id),
                         text_of(event, || summary.clone()),
                         AttentionRouting::OwnerPolicy,
@@ -1212,11 +1193,14 @@ impl Engine {
             }
             EventKind::QuestionResolved { question_id, .. } => {
                 self.pending_inputs.remove(question_id);
-                let mut outcomes =
-                    self.resolve(AttentionRule::PendingInput, &question_id.to_string());
-                outcomes.extend(
-                    self.resolve(AttentionRule::InputIdleReminder, &question_id.to_string()),
+                let mut outcomes = self.resolve(
+                    AttentionRule::PendingInput,
+                    &Subject::question(*question_id),
                 );
+                outcomes.extend(self.resolve(
+                    AttentionRule::InputIdleReminder,
+                    &Subject::question(*question_id),
+                ));
                 outcomes
             }
             EventKind::CommandCompleted {
@@ -1230,7 +1214,7 @@ impl Engine {
                 self.raise(
                     raise(
                         AttentionRule::CommandFailed,
-                        format!("{session_id}|{command}"),
+                        Subject::command(*session_id, command),
                         Some(*session_id),
                         text_of(event, || format!("{command} exited {exit_code}")),
                         AttentionRouting::OwnerPolicy,
@@ -1247,7 +1231,7 @@ impl Engine {
             } => self.raise(
                 raise(
                     AttentionRule::ReviewReady,
-                    format!("{session_id}|{turn_id}"),
+                    Subject::turn(*session_id, turn_id),
                     Some(*session_id),
                     text_of(event, || summary.clone()),
                     AttentionRouting::OwnerPolicy,
@@ -1266,7 +1250,7 @@ impl Engine {
             } => self.raise(
                 raise(
                     AttentionRule::AdapterFailed,
-                    adapter_subject(origin, plugin_id),
+                    Subject::adapter(origin, plugin_id),
                     *session_id,
                     text_of(event, || format!("{plugin_id}: {detail}")),
                     AttentionRouting::OwnerPolicy,
@@ -1276,12 +1260,12 @@ impl Engine {
             ),
             EventKind::AdapterRecovered { plugin_id } => self.resolve(
                 AttentionRule::AdapterFailed,
-                &adapter_subject(origin, plugin_id),
+                &Subject::adapter(origin, plugin_id),
             ),
             EventKind::HostContactLost { detail } => self.raise(
                 raise(
                     AttentionRule::HostContactLost,
-                    "host".to_owned(),
+                    Subject::host(),
                     None,
                     text_of(event, || detail.clone()),
                     AttentionRouting::OwnerPolicy,
@@ -1289,21 +1273,20 @@ impl Engine {
                 reading,
                 mode,
             ),
-            EventKind::HostContactRestored => self.resolve(AttentionRule::HostContactLost, "host"),
+            EventKind::HostContactRestored => {
+                self.resolve(AttentionRule::HostContactLost, &Subject::host())
+            }
             EventKind::ApplicationNotice { session_id, notice } => {
                 // An identifier is the application's own grouping, and the notice is keyed on it.
                 // Without one, two notices that say the same thing are one condition, and what
                 // they say is known by the fingerprint the record's owner made, which travels
                 // whether or not the text does. A notice with neither is its own record.
                 let subject = match (&notice.id, &notice.fingerprint) {
-                    (Some(id), _) => format!("{session_id}|id|{id}"),
+                    (Some(id), _) => Subject::notice_id(*session_id, id),
                     (None, Some(fingerprint)) => {
-                        format!("{session_id}|fingerprint|{}", fingerprint.to_hex())
+                        Subject::notice_fingerprint(*session_id, fingerprint)
                     }
-                    (None, None) => format!(
-                        "{session_id}|record|{}|{}|{}",
-                        event.cursor.origin, event.cursor.source, event.cursor.sequence
-                    ),
+                    (None, None) => Subject::notice_record(*session_id, &event.cursor),
                 };
                 let routing = if notice.lease_held {
                     AttentionRouting::LeaseHolder
@@ -1398,7 +1381,7 @@ impl Engine {
     }
 
     fn raise(&mut self, raise: Raise, reading: HostReading, mode: Mode) -> Vec<Outcome> {
-        let key = self.keys.attention_key(raise.id, &raise.subject);
+        let key = self.keys.attention_key(raise.id, raise.subject.as_str());
         let policy = rule(raise.id);
         let mut outcomes = Vec::new();
         if self.items.contains_key(&key) {
@@ -1618,8 +1601,8 @@ impl Engine {
     /// A held announcement about a condition that has ended is not a notification anybody wants:
     /// quiet hours defer an announcement about something outstanding, and nothing here is
     /// outstanding any more.
-    fn resolve(&mut self, id: AttentionRule, subject: &str) -> Vec<Outcome> {
-        let key = self.keys.attention_key(id, subject);
+    fn resolve(&mut self, id: AttentionRule, subject: &Subject) -> Vec<Outcome> {
+        let key = self.keys.attention_key(id, subject.as_str());
         if self.items.remove(&key).is_none() {
             return Vec::new();
         }
@@ -1719,7 +1702,7 @@ impl Engine {
             outcomes.extend(self.raise(
                 Raise {
                     id: AttentionRule::InputIdleReminder,
-                    subject: question_id.to_string(),
+                    subject: Subject::question(question_id),
                     source: record.source,
                     origin: record.origin,
                     session_id: Some(session_id),

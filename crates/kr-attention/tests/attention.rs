@@ -7,7 +7,7 @@ use kr_attention::engine::Outcome;
 use kr_attention::event::{ApplicationNotice, EventCursor, EventKind, Fingerprint, SourceEvent};
 use kr_attention::key::DERIVED_MARKER;
 use kr_attention::rule::{ADAPTER_ESCALATION_MS, REMINDER_INTERVAL_MS, RULES, rule};
-use kr_attention::{Attention, Claimant, Content, HostReading, Liveness, Origin, Viewer};
+use kr_attention::{Attention, Claimant, Content, HostReading, Liveness, Origin, Subject, Viewer};
 use kr_protocol::attention::{
     AttentionAcknowledgeResult, AttentionAutomationSubject, AttentionGap, AttentionItem,
     AttentionItemRevision, AttentionKey, AttentionLevel, AttentionReadParams, AttentionReadResult,
@@ -202,7 +202,7 @@ fn adapter_failed(sequence: u64, at_ms: u64) -> SourceEvent {
 }
 
 /// The key one rule and one subject land on, derived the way the engine derives it.
-fn key(attention: &Attention, id: AttentionRule, subject: &str) -> AttentionKey {
+fn key(attention: &Attention, id: AttentionRule, subject: &Subject) -> AttentionKey {
     attention
         .key_for(id, subject)
         .expect("the store is this owner's")
@@ -237,7 +237,7 @@ fn notice_key(attention: &Attention, body: &str) -> AttentionKey {
     key(
         attention,
         AttentionRule::ApplicationNotice,
-        &format!("{}|fingerprint|{}", session(1), fingerprint(body).to_hex()),
+        &Subject::notice_fingerprint(session(1), &fingerprint(body)),
     )
 }
 
@@ -250,8 +250,8 @@ fn fingerprint(body: &str) -> Fingerprint {
 }
 
 /// The subject a pending approval of session one is keyed on.
-fn approval_subject(request: &str) -> String {
-    format!("{}|{request}", session(1))
+fn approval_subject(request: &str) -> Subject {
+    Subject::approval(session(1), &request)
 }
 
 /// Session one, as the origin of the records these tests feed.
@@ -989,7 +989,7 @@ fn one_actor_s_acknowledgement_does_not_silence_the_host_s_reminder() {
             &[key(
                 &attention,
                 AttentionRule::AdapterFailed,
-                &format!("{}|git", session(1)),
+                &Subject::adapter(one(), &"git"),
             )],
             reading(1),
         )
@@ -2909,7 +2909,7 @@ fn a_key_carries_none_of_the_text_the_condition_came_from() {
         key(
             &attention,
             AttentionRule::CommandFailed,
-            &format!("{}|{secret}", session(1))
+            &Subject::command(session(1), secret)
         )
     );
 }

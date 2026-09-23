@@ -312,7 +312,7 @@ impl Attention {
     pub fn key_for(
         &self,
         rule: kr_protocol::attention::AttentionRule,
-        subject: &str,
+        subject: &kr_attention::Subject,
     ) -> Result<kr_protocol::attention::AttentionKey> {
         self.locked()?.key_for(rule, subject).map_err(translate)
     }

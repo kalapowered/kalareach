@@ -62,6 +62,7 @@ use crate::event::{EventCursor, EventKind, Origin, SourceEvent};
 use crate::review::Reviews;
 use crate::scope::Viewer;
 use crate::store::{ActionRecord, Claimant, Owner, Store, StoredState};
+use crate::subject::Subject;
 use crate::time::HostReading;
 use crate::visit::{Visit, Visits};
 
@@ -446,7 +447,7 @@ impl Attention {
     /// # Errors
     ///
     /// As [`Attention::engine`].
-    pub fn key_for(&self, rule: AttentionRule, subject: &str) -> Result<AttentionKey> {
+    pub fn key_for(&self, rule: AttentionRule, subject: &Subject) -> Result<AttentionKey> {
         self.live()?;
         Ok(self.state.engine.key_for(rule, subject))
     }
@@ -1164,7 +1165,7 @@ fn review_in(
     {
         let key = state.engine.key_for(
             AttentionRule::ReviewReady,
-            &format!("{session_id}|{turn_id}"),
+            &Subject::turn(*session_id, turn_id),
         );
         state.engine.acknowledge_current(actor, &key, reading);
     }

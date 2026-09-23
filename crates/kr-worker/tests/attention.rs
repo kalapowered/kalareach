@@ -802,7 +802,7 @@ async fn a_question_in_the_ledger_becomes_pending_input_when_the_host_reads_its_
             .attention()
             .key_for(
                 AttentionRule::PendingInput,
-                &created.question.question_id.to_string()
+                &kr_attention::Subject::question(created.question.question_id)
             )
             .expect("the engine names its own items"),
         "and it is keyed on the question it is about, by derivation rather than by name"
@@ -1261,7 +1261,7 @@ async fn a_question_answered_inside_a_backlog_owes_no_reminder_when_the_host_cat
             .attention()
             .key_for(
                 AttentionRule::PendingInput,
-                &open.question.question_id.to_string()
+                &kr_attention::Subject::question(open.question.question_id)
             )
             .expect("the engine names its own items")
     );
