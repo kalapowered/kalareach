@@ -8,7 +8,7 @@
 //!
 //! | What an item is about | The owner at this machine | A paired device |
 //! | --- | --- | --- |
-//! | a session | sees it | when its grant admits the session and carries `session.view` |
+//! | a session, or raised from a session's records | sees it | when its grant admits the session and carries `session.view` |
 //! | a workflow or a causal chain | sees it | when its grant carries `automation.manage` and the workflow or chain acts under that same grant |
 //! | the environment itself | sees it | when its grant carries `host.manage` |
 //!
@@ -72,8 +72,14 @@ impl Viewer<'_> {
         match self {
             Self::Owner => true,
             Self::Device(scope) => {
-                if let Some(session_id) = item.session_id {
-                    return self.sees_session(session_id);
+                // An item raised from a session's records has its text read from that session, so
+                // a caller sees it only when it may see that session as well as any the item names.
+                let sessions = [item.origin.session(), item.session_id];
+                if sessions.iter().any(Option::is_some) {
+                    return sessions
+                        .into_iter()
+                        .flatten()
+                        .all(|session_id| self.sees_session(session_id));
                 }
                 if item.automation.is_some() {
                     // An automation item whose grant the journal could not name is the owner's

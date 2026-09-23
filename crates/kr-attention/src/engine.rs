@@ -210,6 +210,15 @@ pub enum Content {
 }
 
 impl Item {
+    /// Returns the session this item is about: the one it names, or else the one whose records
+    /// raised it.
+    ///
+    /// A page's session filter and a session's ending both go by it.
+    #[must_use]
+    pub fn session(&self) -> Option<SessionId> {
+        self.session_id.or_else(|| self.origin.session())
+    }
+
     /// Returns this item as the wire type, for one actor.
     ///
     /// The host's own words travel with it. A session's text does not: the wire item's summary is
@@ -222,7 +231,7 @@ impl Item {
             rule: self.rule,
             source: self.source,
             level: self.level,
-            session_id: Nullable(self.session_id),
+            session_id: Nullable(self.session()),
             summary: Nullable(match &self.text {
                 Text::Host(text) => Some(text.clone()),
                 Text::Record(_) => None,
@@ -613,7 +622,7 @@ impl Engine {
             .items
             .values()
             .filter(|item| viewer.sees(item))
-            .filter(|item| session.is_none_or(|session_id| item.session_id == Some(session_id)))
+            .filter(|item| session.is_none_or(|session_id| item.session() == Some(session_id)))
             .filter_map(|item| {
                 let acknowledged = self.is_acknowledged(actor, item);
                 (include_acknowledged || !acknowledged)
@@ -780,7 +789,7 @@ impl Engine {
             .items
             .values()
             .filter(|item| {
-                item.session_id == Some(session_id)
+                item.session() == Some(session_id)
                     && matches!(
                         item.rule,
                         AttentionRule::PendingApproval
@@ -883,7 +892,7 @@ impl Engine {
                     rule: item.rule,
                     level: item.level,
                     routing: item.routing,
-                    session_id: item.session_id,
+                    session_id: item.session(),
                     text: item.text.clone(),
                 })
             })

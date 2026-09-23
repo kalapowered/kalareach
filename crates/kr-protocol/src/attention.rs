@@ -743,7 +743,7 @@ pub struct AttentionQuietHoursResult {
 pub struct ReviewReadParams {
     /// One session to narrow the page to, or null for every session this caller may see.
     pub session_id: Nullable<SessionId>,
-    /// One subject, or null for a page of every subject this session knows about.
+    /// One subject, or null for a page of every subject the host holds within that scope.
     pub subject: Nullable<ReviewSubject>,
     /// The largest page the caller will accept, bounded by [`MAX_REVIEW_SUBJECTS`].
     ///
@@ -751,8 +751,9 @@ pub struct ReviewReadParams {
     pub max_reviews: U64,
     /// The subject to continue after, or null to start at the oldest.
     ///
-    /// A subject this session no longer holds is refused rather than restarting the page, because
-    /// a page that silently began again would read as the end of the list.
+    /// A subject the host no longer holds, or one outside the caller's scope, is refused rather
+    /// than restarting the page, because a page that silently began again would read as the end
+    /// of the list.
     pub after: Nullable<ReviewSubject>,
 }
 

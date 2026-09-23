@@ -24364,7 +24364,7 @@
               "type": "null"
             }
           ],
-          "description": "The subject to continue after, or null to start at the oldest.\n\nA subject this session no longer holds is refused rather than restarting the page, because\na page that silently began again would read as the end of the list."
+          "description": "The subject to continue after, or null to start at the oldest.\n\nA subject the host no longer holds, or one outside the caller's scope, is refused rather\nthan restarting the page, because a page that silently began again would read as the end\nof the list."
         },
         "max_reviews": {
           "$ref": "#/$defs/U64",
@@ -24390,7 +24390,7 @@
               "type": "null"
             }
           ],
-          "description": "One subject, or null for a page of every subject this session knows about."
+          "description": "One subject, or null for a page of every subject the host holds within that scope."
         }
       },
       "required": [

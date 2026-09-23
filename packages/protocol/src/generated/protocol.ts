@@ -18685,8 +18685,9 @@ export interface ReviewReadParams {
   /**
    * The subject to continue after, or null to start at the oldest.
    *
-   * A subject this session no longer holds is refused rather than restarting the page, because
-   * a page that silently began again would read as the end of the list.
+   * A subject the host no longer holds, or one outside the caller's scope, is refused rather
+   * than restarting the page, because a page that silently began again would read as the end
+   * of the list.
    */
   after: ReviewSubject | null
   /**
@@ -18698,7 +18699,7 @@ export interface ReviewReadParams {
    */
   session_id: SessionId | null
   /**
-   * One subject, or null for a page of every subject this session knows about.
+   * One subject, or null for a page of every subject the host holds within that scope.
    */
   subject: ReviewSubject | null
 }

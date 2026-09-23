@@ -16,7 +16,7 @@ use kr_protocol::attention::{
 };
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{
-    ActorId, AgentTurnId, ApprovalRequestId, GrantId, QuestionId, SessionId, WorkflowId,
+    ActorId, AgentTurnId, ApprovalRequestId, GrantId, PluginId, QuestionId, SessionId, WorkflowId,
 };
 use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 
@@ -377,6 +377,19 @@ fn a_device_sees_what_its_grant_admits_and_nothing_else() {
             pending(session(2), 1, 0, question(2)),
             // Session two loses a range, which is something about session two.
             pending(session(2), 4, 0, question(3)),
+            // A record of session two's that names session one is still session two's record, and
+            // its text is read from session two.
+            in_session(
+                session(2),
+                AttentionSource::HostEvents,
+                1,
+                0,
+                EventKind::AdapterFailed {
+                    plugin_id: PluginId::new("git").expect("an identifier"),
+                    session_id: Some(session(1)),
+                    detail: "the index is locked".to_owned(),
+                },
+            ),
             paused(3, workflow(1, 1), Some(grant(1))),
             paused(8, workflow(2, 1), Some(grant(2))),
             paused(9, workflow(3, 1), None),
@@ -392,7 +405,7 @@ fn a_device_sees_what_its_grant_admits_and_nothing_else() {
     );
     assert_eq!(
         owner_inbox(&attention).len(),
-        7,
+        8,
         "the owner sees everything"
     );
 
@@ -468,6 +481,25 @@ fn a_device_sees_what_its_grant_admits_and_nothing_else() {
         .expect("the store is this owner's");
     assert_eq!(host_only.len(), 1, "only the environment's own item");
     assert_eq!(host_only[0].rule, AttentionRule::HostContactLost);
+
+    // A device that may see both sessions sees what session two raised about session one.
+    let admits_both = |candidate: SessionId| candidate == session(1) || candidate == session(2);
+    let both = Viewer::Device(DeviceScope {
+        grant_id: grant(1),
+        session_view: true,
+        automation_manage: false,
+        host_manage: false,
+        admits_session: &admits_both,
+    });
+    let across = attention
+        .inbox(&actor("device:phone"), &both, true)
+        .expect("the store is this owner's");
+    assert!(
+        across
+            .iter()
+            .any(|item| item.rule == AttentionRule::AdapterFailed
+                && item.session_id.0 == Some(session(1)))
+    );
 
     // The workflow journal's own words are the host's, and a caller that is served no session text
     // is still served them.
