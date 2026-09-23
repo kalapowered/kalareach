@@ -404,6 +404,35 @@ fn wait_for_room(
     }
 }
 
+/// How much output the read loop has taken from the terminal, and how much of it has been ingested.
+///
+/// The two differ by what is waiting in the read queue and by the batch the read loop is still
+/// filling, which together are at most [`READ_QUEUE_DEPTH`] batches and one more. On a busy machine
+/// that is seconds of parsing: bytes that have left the terminal and have not yet reached any
+/// attachment.
+#[derive(Clone, Debug)]
+struct ReadProgress {
+    /// Bytes the read loop has taken from the terminal, counted as each read returns them.
+    read: Arc<std::sync::atomic::AtomicU64>,
+    /// Bytes the session has ingested, counted once each batch has been handed to every attachment.
+    /// The ingestion owns the sending side, so this ends when the ingestion does.
+    ingested: tokio::sync::watch::Receiver<u64>,
+}
+
+impl ReadProgress {
+    /// Waits until every byte read so far has been ingested.
+    ///
+    /// What was read after this was called is not waited for. Nothing here waits for a client:
+    /// ingesting hands each attachment its output and never waits for one to take it. What this
+    /// waits for is the worker's own parsing, of a queue whose depth bounds it. An ingestion that
+    /// has ended will ingest nothing more, and the wait ends with it.
+    async fn ingested_what_was_read(&self) {
+        let read = self.read.load(std::sync::atomic::Ordering::Acquire);
+        let mut ingested = self.ingested.clone();
+        let _ = ingested.wait_for(|ingested| *ingested >= read).await;
+    }
+}
+
 /// A running session and the tasks around it.
 #[derive(Debug)]
 pub struct SessionRuntime {
@@ -418,6 +447,8 @@ pub struct SessionRuntime {
     fence: Arc<std::sync::atomic::AtomicU64>,
     /// What tells the supervision that a process this session owns can have appeared.
     activity: Arc<crate::lifecycle::Activity>,
+    /// How far ingestion is behind the terminal, which the closure waits out.
+    progress: ReadProgress,
 }
 
 impl SessionRuntime {
@@ -469,6 +500,12 @@ impl SessionRuntime {
         // decoupled by their own queues, and a worker that cannot ingest stops reading rather than
         // growing without limit or discarding bytes.
         let (output_sender, mut output_receiver) = mpsc::channel::<ReadEvent>(READ_QUEUE_DEPTH);
+        let read = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (ingested_sender, ingested) = tokio::sync::watch::channel(0_u64);
+        let progress = ReadProgress {
+            read: Arc::clone(&read),
+            ingested,
+        };
         let wake = Arc::new(Notify::new());
         let closed = Arc::new(Notify::new());
         // Input this session accepted and output it produced are what ask the supervision to look
@@ -494,12 +531,15 @@ impl SessionRuntime {
                         let _ = output_sender.blocking_send(ReadEvent::Ended);
                         break;
                     }
-                    Ok(read) => {
+                    Ok(taken) => {
+                        // Counted as it leaves the terminal, before it is batched or queued: from
+                        // here it is output this worker holds, and a closure waits for it.
+                        read.fetch_add(taken as u64, std::sync::atomic::Ordering::Release);
                         // Taken together rather than one read at a time. What the terminal has is
                         // read until the buffer is full or it has no more, and that is one batch:
                         // an application printing steadily hands the engine and every subscriber a
                         // few large deliveries rather than thousands of small ones.
-                        filled += read;
+                        filled += taken;
                         if filled < buffer.len() {
                             continue;
                         }
@@ -732,6 +772,7 @@ impl SessionRuntime {
             closed: Arc::clone(&closed),
             fence: Arc::clone(&fence),
             activity: Arc::clone(&activity),
+            progress: progress.clone(),
         };
 
         let ingest_session = Arc::clone(&session);
@@ -760,6 +801,9 @@ impl SessionRuntime {
                                 let _ = ingest_input.send(batch);
                             }
                         }
+                        // Every attachment has been handed this batch, so a closure recorded from
+                        // here on follows it.
+                        ingested_sender.send_modify(|ingested| *ingested += bytes.len() as u64);
                     }
                     ReadEvent::Ended => {
                         // The terminal is finished. Whether the root shell has ended is a separate
@@ -790,6 +834,7 @@ impl SessionRuntime {
         let monitor_fence = Arc::clone(&fence);
         let monitor_activity = Arc::clone(&activity);
         let monitor_clock = Arc::clone(&shared_clock);
+        let monitor_progress = progress;
         tokio::spawn(async move {
             // The monitor holds a runtime of its own so a closure it begins publishes its fence and
             // its paste terminator the same way a requested one does. Building it only once the
@@ -804,6 +849,7 @@ impl SessionRuntime {
                 closed: Arc::clone(&monitor_closed),
                 fence: Arc::clone(&monitor_fence),
                 activity: Arc::clone(&monitor_activity),
+                progress: monitor_progress,
             });
             // Built here rather than by the caller: waiting for a child to end is the runtime's
             // own facility, and this is the task that does the waiting.
@@ -1208,6 +1254,12 @@ impl CloseGate {
                 let _ = session.force_close();
             }
             tokio::time::sleep(DRAIN_PERIOD).await;
+            // The drain bounds how long the terminal is read, not how much of what was read
+            // reaches the attachments. Each is sent its closure after all of its output, so what
+            // the read loop has taken by now is ingested before the record is written, however far
+            // behind a busy machine has left the parsing. What the terminal gives after this point
+            // is past the drain.
+            runtime.progress.ingested_what_was_read().await;
             {
                 let mut session = runtime.session();
                 session.finish_close();

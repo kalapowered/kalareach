@@ -57,7 +57,10 @@ const STALE_TOKEN: &str = "the capability this caller presented is not one this 
 /// How long an owned process group has to stop before it is forced.
 pub const GRACE_PERIOD: Duration = Duration::from_secs(5);
 
-/// How long output drains after the processes have stopped.
+/// How long the terminal is read after the processes have stopped.
+///
+/// It bounds the reading, not the delivery: what was read by the end of it reaches every
+/// attachment before the closure, however long ingesting it takes.
 pub const DRAIN_PERIOD: Duration = Duration::from_secs(2);
 
 /// Everything a worker needs to bring one session up.

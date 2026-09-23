@@ -64,6 +64,14 @@ fn build() -> BuildId {
 
 /// Hosts a session whose shell runs `script`, and serves it on the worker's endpoint.
 async fn host(script: &str) -> Host {
+    host_on(script, &tokio::runtime::Handle::current()).await
+}
+
+/// Hosts a session whose shell runs `script`, with the session's own tasks on `tasks`.
+///
+/// Those are the tasks that ingest what the terminal gives, watch the root shell and time the paste
+/// recogniser. The endpoint, its connections and a closure's sequence run where the caller does.
+async fn host_on(script: &str, tasks: &tokio::runtime::Handle) -> Host {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
@@ -104,13 +112,16 @@ async fn host(script: &str) -> Host {
     };
     let mut session = Session::open(config).expect("opens the session");
     session.launch().expect("launches the shell");
-    let runtime = Arc::new(
-        SessionRuntime::start(
-            session,
-            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+    let runtime = {
+        let _tasks = tasks.enter();
+        Arc::new(
+            SessionRuntime::start(
+                session,
+                std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+            )
+            .expect("starts the runtime"),
         )
-        .expect("starts the runtime"),
-    );
+    };
     let endpoint = environment
         .worker_endpoint(DisplayNumber::new(1))
         .expect("an endpoint");
@@ -394,4 +405,157 @@ async fn an_attachment_that_subscribes_after_the_closure_is_sent_it_all_the_same
         host.runtime.closure_delivered(CLOSURE_NOTICE_TIMEOUT).await,
         "and the worker is owed nothing once it has been"
     );
+}
+
+/// A runtime for a session's own tasks that a test can hold still.
+///
+/// A worker on a busy machine can be seconds behind its terminal: the read loop, on a thread of its
+/// own, has taken output that the task which ingests it has not reached yet, and a closure's drain
+/// can end while the worker is in that state. Load makes the state last as long as the machine
+/// decides. A hold makes it last as long as the test decides, and the read loop goes on reading
+/// through it exactly as it does under load.
+#[cfg(unix)]
+struct SessionTasks {
+    handle: tokio::runtime::Handle,
+    holds: Option<tokio::sync::mpsc::UnboundedSender<Hold>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// One hold: it is said to have begun on the first, and it lasts until the second's sender goes.
+#[cfg(unix)]
+struct Hold {
+    begun: tokio::sync::oneshot::Sender<()>,
+    until: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(unix)]
+impl SessionTasks {
+    /// Starts the runtime on a thread of its own, which is the only thread it has.
+    fn start() -> Self {
+        let (handles, handle) = std::sync::mpsc::channel();
+        let (holds, mut requested) = tokio::sync::mpsc::unbounded_channel::<Hold>();
+        let thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime for the session's tasks");
+            let _ = handles.send(runtime.handle().clone());
+            runtime.block_on(async move {
+                while let Some(hold) = requested.recv().await {
+                    let _ = hold.begun.send(());
+                    // The runtime's only thread waits here, so nothing on the runtime runs until
+                    // the hold is over.
+                    let _ = hold.until.recv();
+                }
+            });
+            runtime.shutdown_background();
+        });
+        let handle = handle
+            .recv()
+            .expect("the session's tasks have a runtime to run on");
+        Self {
+            handle,
+            holds: Some(holds),
+            thread: Some(thread),
+        }
+    }
+
+    /// The runtime the session's tasks are started on.
+    const fn handle(&self) -> &tokio::runtime::Handle {
+        &self.handle
+    }
+
+    /// Holds every task on the runtime still, from when this returns until what it returns goes.
+    async fn hold(&self) -> std::sync::mpsc::Sender<()> {
+        let (begun, has_begun) = tokio::sync::oneshot::channel();
+        let (release, until) = std::sync::mpsc::channel();
+        self.holds
+            .as_ref()
+            .expect("the session's tasks are running")
+            .send(Hold { begun, until })
+            .expect("the session's tasks are running");
+        has_begun.await.expect("the hold begins");
+        release
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SessionTasks {
+    /// Ends the runtime and the session's tasks with it, once any hold is over.
+    fn drop(&mut self) {
+        drop(self.holds.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Quotes a path for the shell a test session runs.
+#[cfg(unix)]
+fn quoted(path: &std::path::Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+}
+
+/// How long after its grace and drain a closing worker is given to write its record, before this
+/// test takes it that the worker is waiting for something else.
+#[cfg(unix)]
+const RECORD_ALLOWANCE: Duration = Duration::from_secs(3);
+
+/// KR-REQ-07.52: output the worker read from the terminal before its drain ended reaches every
+/// attachment before the closure, however far behind with it the worker is.
+///
+/// The session's own tasks are held still before the shell prints, so the line it prints is read
+/// and waits to be ingested, which is where a busy machine leaves a worker for seconds at a time.
+/// The close goes on around the hold: its sequence runs beside the endpoint rather than with the
+/// session's tasks. The tasks are let go when the record is written or, for a worker that is
+/// waiting for its own parsing instead, a while after it would have been. A worker that wrote the
+/// record at the end of the drain has put the closure in front of the line by then, and the line
+/// reaches nobody.
+///
+/// Unix only: the shell marks that it has printed with a file, named by a POSIX path. The drain
+/// this checks is the same code on every platform.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn output_read_before_the_drain_ends_reaches_every_attachment_before_the_closure() {
+    let tasks = SessionTasks::start();
+    let marks = tempfile::tempdir().expect("a directory on the internal disk");
+    let printed = marks.path().join("printed");
+    let host = host_on(
+        &format!(
+            "read -r _; printf 'kr-read-before-the-closure\\n'; : > {}; read -r _",
+            quoted(&printed)
+        ),
+        tasks.handle(),
+    )
+    .await;
+    let (mut typing, mut keys) = attached_holding_the_keys(&host).await;
+    let mut watcher = watching(&host).await;
+    let held = tasks.hold().await;
+    keys.release(&host.runtime);
+    until("the shell to mark that it has printed its line", || {
+        printed.exists()
+    })
+    .await;
+    let (_, gate) = host.runtime.close(ClosureReason::CloseRequested);
+    gate.release();
+    let _ = tokio::time::timeout(
+        kr_worker::session::GRACE_PERIOD + kr_worker::session::DRAIN_PERIOD + RECORD_ALLOWANCE,
+        host.runtime.wait_closed(),
+    )
+    .await;
+    drop(held);
+    let record = closed(&host).await;
+    assert_eq!(record.reason, ClosureReason::CloseRequested);
+    for (client, what) in [(&mut typing, "the typing"), (&mut watcher, "the watching")] {
+        let (output, sent) = until_the_closure(client).await;
+        assert!(
+            carries(&output, b"kr-read-before-the-closure"),
+            "{what} attachment was sent the line the worker had read before the closure: {}",
+            String::from_utf8_lossy(&output).escape_debug()
+        );
+        assert_eq!(
+            sent, record,
+            "{what} attachment was sent the session's own record"
+        );
+    }
 }
