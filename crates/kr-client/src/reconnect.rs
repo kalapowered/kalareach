@@ -148,6 +148,9 @@ mod tests {
         assert_eq!(loop_.ceiling(), BACKOFF_MAX);
     }
 
+    /// KR-REQ-23.22: old raw input is never replayed: input a connection left unacknowledged is
+    /// reported as uncertain, and nothing a client carries across a disconnect can address the old
+    /// connection's input lane.
     #[test]
     fn unacknowledged_input_is_reported_and_never_resent() {
         let mut lane = InputLane::new(

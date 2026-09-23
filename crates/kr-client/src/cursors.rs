@@ -678,6 +678,50 @@ mod tests {
         );
     }
 
+    /// KR-REQ-06.05: a stream position belongs to the stream it was taken on. Two streams held
+    /// side by side keep their own sequences and content cursors: a gap on one leaves the other's
+    /// position alone, and a restoration of each resumes from that stream's own cursor.
+    #[test]
+    fn a_position_belongs_to_the_stream_it_was_taken_on() {
+        let mut cursors = StreamCursors::new();
+        let output = stream("session:1.output");
+        let other = stream("session:2.output");
+        for sequence in 1..=3 {
+            assert_eq!(
+                cursors.accept(&event(&output, sequence)),
+                Delivery::Received
+            );
+        }
+        cursors.applied(&output, EventSequence::new(3));
+        cursors.applied_content(&output, U64::new(900));
+
+        // The first event on the other stream is not judged against this one's sequence.
+        assert_eq!(cursors.accept(&event(&other, 1)), Delivery::Received);
+        assert_eq!(cursors.position(&other), None);
+        assert_eq!(cursors.applied_cursor(&other), None);
+        cursors.applied(&other, EventSequence::new(1));
+        cursors.applied_content(&other, U64::new(40));
+
+        // A gap on the other stream costs that stream its position and nothing else.
+        assert!(matches!(
+            cursors.accept(&event(&other, 5)),
+            Delivery::Gap { .. }
+        ));
+        assert!(cursors.needs_snapshot(&other));
+        assert_eq!(cursors.applied_cursor(&other), None);
+        assert!(!cursors.needs_snapshot(&output));
+        assert_eq!(cursors.position(&output), Some(EventSequence::new(3)));
+        assert_eq!(cursors.applied_cursor(&output), Some(U64::new(900)));
+        assert_eq!(
+            Restoration::start(output.clone(), &cursors).step(),
+            RestorationStep::SubscribeFrom(U64::new(900))
+        );
+        assert_eq!(
+            Restoration::start(other, &cursors).step(),
+            RestorationStep::SubscribeFromStart
+        );
+    }
+
     #[test]
     fn a_stream_held_at_the_beginning_is_not_a_stream_held_nowhere() {
         let mut cursors = StreamCursors::new();
