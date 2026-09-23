@@ -388,15 +388,12 @@ impl OpenedRepository {
         let git_dir_path = PathBuf::from(lines.next().unwrap_or_default());
         let top_level = PathBuf::from(lines.next().unwrap_or_default());
         let moved = match &self.through {
-            // A repository found through a location was never named by the paths Git spells, which
-            // may reach it through a link above the location: what Git reports has to open to
-            // the objects the descent found.
+            // A repository found through a location is named to Git by a path whose spelling
+            // need not be Git's own, which resolves every link. What Git reports is compared with
+            // the path the operating system gives for the handles this host holds, so nothing is
+            // opened by the path Git reported.
             Some(_) => {
-                let environment_id = self.work_tree.environment_id();
-                AuthorisedDirectory::open_root(environment_id, &top_level)?.identity()
-                    != self.identity.work_tree
-                    || AuthorisedDirectory::open_root(environment_id, &git_dir_path)?.identity()
-                        != self.identity.git_dir
+                path_of(&self.work_tree)? != top_level || path_of(&self.git_dir)? != git_dir_path
             }
             None => git_dir_path != self.git_dir_path || top_level != self.top_level,
         };
@@ -420,9 +417,11 @@ impl OpenedRepository {
             // Found again the way it was found the first time: through the location, by the
             // same descent, rather than by the paths Git reported.
             Some((location, relative)) => {
-                let again = crate::discovery::discover(
-                    location.subdirectory(relative)?,
+                let again = crate::discovery::discover_through(
+                    location,
+                    relative,
                     &self.top_level.display().to_string(),
+                    self.admission.as_ref(),
                 )?;
                 RepositoryIdentity {
                     git_dir: again.common_dir.identity(),
@@ -604,6 +603,53 @@ impl OpenedRepository {
         let output = profile.run(&request)?;
         output.require_success()?;
         Ok(())
+    }
+}
+
+/// Returns the path the operating system gives for an open directory now, taken from its handle.
+///
+/// It is the directory's path as the kernel knows it, with every link above it resolved, which is
+/// how Git spells the paths it reports.
+#[cfg(target_vendor = "apple")]
+fn path_of(directory: &AuthorisedDirectory) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStringExt as _;
+    let path = rustix::fs::getpath(directory.handle()).map_err(|error| unlocated(&error.into()))?;
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(
+        path.into_bytes(),
+    )))
+}
+
+/// Returns the path the operating system gives for an open directory now, taken from its handle.
+///
+/// It is the directory's path as the kernel knows it, with every link above it resolved, which is
+/// how Git spells the paths it reports.
+#[cfg(target_os = "linux")]
+fn path_of(directory: &AuthorisedDirectory) -> Result<PathBuf> {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+    let descriptor = directory.handle().as_fd().as_raw_fd();
+    std::fs::read_link(format!("/proc/self/fd/{descriptor}")).map_err(|error| unlocated(&error))
+}
+
+/// No platform this crate runs Git on is without one of the two above; elsewhere a repository
+/// reached through a location is not confirmed at all.
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+fn path_of(_directory: &AuthorisedDirectory) -> Result<PathBuf> {
+    Err(ProjectError::IdentityChanged {
+        detail: "this platform does not say where an open directory is, so a repository reached \
+                 through a location is not confirmed here"
+            .to_owned()
+            .into(),
+    })
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+fn unlocated(error: &std::io::Error) -> ProjectError {
+    ProjectError::IdentityChanged {
+        detail: format!(
+            "this host could not ask where a repository's directory is now ({error}), so what Git \
+             reported is not taken as that directory"
+        )
+        .into(),
     }
 }
 

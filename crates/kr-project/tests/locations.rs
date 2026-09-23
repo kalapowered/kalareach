@@ -26,8 +26,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kr_project::ProjectService;
-use kr_project::discovery::{Discovered, MAX_ALTERNATE_DEPTH, discover};
-use kr_project::git::Interposition;
+use kr_project::discovery::{Discovered, MAX_ALTERNATE_DEPTH, discover, discover_through};
+use kr_project::git::{Interposition, ReadAdmission};
 use kr_project::policy::{Admitting, LocationUse};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ActionId, EnvironmentId, GrantId, ProjectLocationId, ProjectRepositoryId};
@@ -2485,10 +2485,434 @@ fn discovery_reads_nothing_the_location_does_not_authorise() {
     assert!(refusal_of(discovered_at(root.path(), "reaching")).contains("submodule"));
     std::fs::remove_file(tree.join(".gitmodules")).expect("unlinked");
 
+    // `objects/info` itself a link: whatever it names would hide its alternates from the check.
+    let info = objects.join("info");
+    std::fs::rename(&info, objects.join("info-set-aside")).expect("the directory is moved aside");
+    std::fs::create_dir(elsewhere.path().join("info")).expect("an info directory elsewhere");
+    std::fs::write(
+        elsewhere.path().join("info/alternates"),
+        format!("{}\n", elsewhere.path().display()),
+    )
+    .expect("alternates the check would never see");
+    std::os::unix::fs::symlink(elsewhere.path().join("info"), &info)
+        .expect("a link at objects/info");
+    assert!(refusal_of(discovered_at(root.path(), "reaching")).contains("objects/info"));
+    std::fs::remove_file(&info).expect("unlinked");
+    std::fs::rename(objects.join("info-set-aside"), &info).expect("put back");
+
+    // An `alternates` that is not a file is refused too, rather than skipped.
+    std::fs::create_dir(objects.join("info/alternates")).expect("a directory at the name");
+    assert!(refusal_of(discovered_at(root.path(), "reaching")).contains("not a file"));
+    std::fs::remove_dir(objects.join("info/alternates")).expect("removed");
+
     std::fs::create_dir(root.path().join("linked-git")).expect("a tree");
     std::os::unix::fs::symlink(tree.join(".git"), root.path().join("linked-git/.git"))
         .expect("a .git that is a link");
     assert!(refusal_of(discovered_at(root.path(), "linked-git")).contains("link"));
 
     discovered_at(root.path(), "reaching").expect("and with all of that gone, it is found");
+}
+
+#[test]
+fn discovery_asks_its_admission_before_its_first_read() {
+    // Discovery is one read through the location, and its first step is the descent to the
+    // working tree: a refusal from the admission comes before it, so a name that is not there is
+    // never even looked for.
+    let root = tempfile::tempdir().expect("a directory");
+    let refusing = ReadAdmission::new(|| {
+        Err(kr_project::ProjectError::PermissionDenied {
+            detail: "the location was withdrawn a moment ago".to_owned().into(),
+        })
+    });
+    let refusal = discover_through(
+        &held_root(root.path()),
+        &relative("absent"),
+        "absent",
+        Some(&refusing),
+    )
+    .expect_err("nothing is read after a refusal");
+    assert!(
+        refusal.to_string().contains("withdrawn a moment ago"),
+        "{refusal}"
+    );
+}
+
+/// Moves a directory aside and puts a link to `target` at its name.
+fn swap_for_link(directory: &Path, target: &Path) {
+    std::fs::rename(directory, directory.with_file_name("set-aside"))
+        .expect("the directory is moved aside");
+    std::os::unix::fs::symlink(target, directory).expect("a link in its place");
+}
+
+#[test]
+fn a_tree_swapped_for_a_link_mid_operation_is_not_written_through() {
+    // Every Git invocation in a directory this host created requires the object there to be the
+    // one it found through its own handle. A link put in place of the staged tree between two
+    // invocations sends the next one nowhere: the clone and the workspace both fail, and the
+    // repository the link names is not checked out.
+    let mut fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let projects = fixture.work().join("projects");
+    let workspaces = fixture.work().join("workspaces");
+    let into = owner_location(
+        &fixture,
+        &owner,
+        &projects,
+        LocationPurpose::Destination,
+        210,
+    );
+    let made_in = owner_location(
+        &fixture,
+        &owner,
+        &workspaces,
+        LocationPurpose::Destination,
+        211,
+    );
+    let sources = fixture.work().join("sources");
+    let source = owner_location(&fixture, &owner, &sources, LocationPurpose::Source, 212);
+    let upstream = ordinary_repository(fixture.work(), "upstream");
+    git_raw(
+        fixture.work(),
+        [
+            "clone",
+            "--quiet",
+            "--no-checkout",
+            upstream.to_str().expect("a path in text"),
+            "outside",
+        ],
+    );
+    let outside = fixture.work().join("outside");
+    let untouched = names_in(&outside);
+
+    // The clone's tree is swapped while its branch is asked for, before its checkout.
+    let target = outside.clone();
+    let once = AtomicBool::new(false);
+    fixture.interpose(Interposition::new(Arc::new(
+        move |described: &str, directory: &Path, _: &Path| {
+            if described.starts_with("git symbolic-ref") && !once.swap(true, Ordering::SeqCst) {
+                swap_for_link(directory, &target);
+            }
+        },
+    )));
+    clone_into(
+        fixture.service(),
+        through(environment, into, "cloned"),
+        local_remote(&upstream),
+        213,
+    )
+    .expect_err("the checkout's directory is not the tree this host staged");
+    assert_eq!(
+        names_in(&outside),
+        untouched,
+        "nothing was checked out there"
+    );
+    assert!(
+        names_in(&projects).is_empty(),
+        "and the staging directory went, the link with it and not through it: {:?}",
+        names_in(&projects)
+    );
+
+    // The workspace's tree is swapped as soon as its clone has finished, before its checkout.
+    let project = adopt(&fixture, &sources, "repo", 214);
+    attach(fixture.service(), &owner, project, source, 215).expect("the repository is bound");
+    let target = outside.clone();
+    let once = AtomicBool::new(false);
+    fixture.interpose(
+        Interposition::new(Arc::new(|_: &str, _: &Path, _: &Path| {})).and_after(Arc::new(
+            move |described: &str, directory: &Path, _: &Path| {
+                if described.starts_with("git clone") && !once.swap(true, Ordering::SeqCst) {
+                    swap_for_link(&directory.join("tree"), &target);
+                }
+            },
+        )),
+    );
+    workspace_through(
+        fixture.service(),
+        project,
+        through(environment, made_in, "ws"),
+        false,
+        216,
+    )
+    .expect_err("the workspace's checkout is refused for the same reason");
+    assert_eq!(
+        names_in(&outside),
+        untouched,
+        "nothing was checked out there"
+    );
+    assert!(
+        names_in(&workspaces).is_empty(),
+        "{:?}",
+        names_in(&workspaces)
+    );
+}
+
+// ----- another mount grafted beneath a location --------------------------------------------------
+
+/// The exit code the half inside a mount namespace uses to say the namespace would not mount.
+#[cfg(target_os = "linux")]
+const NOT_EXERCISED: i32 = 77;
+
+/// Set in the environment of the copy of a test that runs inside a mount namespace.
+#[cfg(target_os = "linux")]
+const IN_NAMESPACE: &str = "KR_PROJECT_LOCATION_GRAFTS";
+
+/// Another mount put at a directory for as long as the value lives: a disk image this account
+/// attaches on macOS, a bind mount inside this account's own mount namespace on Linux.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct Graft(std::path::PathBuf);
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl Drop for Graft {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        let _ = std::process::Command::new("/usr/bin/hdiutil")
+            .args(["detach", "-force", "-quiet"])
+            .arg(&self.0)
+            .status();
+        #[cfg(target_os = "linux")]
+        let _ = std::process::Command::new("umount")
+            .arg("-l")
+            .arg(&self.0)
+            .status();
+    }
+}
+
+/// Puts another mount at `at`, or returns `None` where this host will not.
+#[cfg(target_os = "macos")]
+fn graft(at: &Path, scratch: &Path) -> Option<Graft> {
+    std::fs::create_dir_all(at).expect("the mount point");
+    let image = scratch.join(format!("graft-{}.dmg", at.file_name()?.to_string_lossy()));
+    let made = std::process::Command::new("/usr/bin/hdiutil")
+        .args([
+            "create", "-size", "8m", "-fs", "HFS+", "-volname", "graft", "-quiet",
+        ])
+        .arg(&image)
+        .status();
+    if !made.is_ok_and(|status| status.success()) {
+        return None;
+    }
+    let attached = std::process::Command::new("/usr/bin/hdiutil")
+        .args([
+            "attach",
+            "-nobrowse",
+            "-noverify",
+            "-noautoopen",
+            "-quiet",
+            "-mountpoint",
+        ])
+        .arg(at)
+        .arg(&image)
+        .status();
+    attached
+        .is_ok_and(|status| status.success())
+        .then(|| Graft(at.to_path_buf()))
+}
+
+/// Puts another mount at `at`, or returns `None` where this host will not.
+#[cfg(target_os = "linux")]
+fn graft(at: &Path, scratch: &Path) -> Option<Graft> {
+    if at.is_file() {
+        let source = scratch.join(format!("graft-{}", at.file_name()?.to_string_lossy()));
+        std::fs::write(&source, b"*\n").expect("a file on the other side");
+        return bind(&source, at);
+    }
+    std::fs::create_dir_all(at).expect("the mount point");
+    let source = scratch.join(format!("graft-{}", at.file_name()?.to_string_lossy()));
+    std::fs::create_dir_all(&source).expect("the tree to mount");
+    bind(&source, at)
+}
+
+#[cfg(target_os = "linux")]
+fn bind(source: &Path, at: &Path) -> Option<Graft> {
+    std::process::Command::new("mount")
+        .arg("--bind")
+        .arg(source)
+        .arg(at)
+        .status()
+        .is_ok_and(|status| status.success())
+        .then(|| Graft(at.to_path_buf()))
+}
+
+/// Says a case was not exercised: printed on macOS, and on Linux the namespace's exit code.
+fn not_exercised() {
+    #[cfg(target_os = "linux")]
+    std::process::exit(NOT_EXERCISED);
+    #[cfg(not(target_os = "linux"))]
+    println!("not exercised: this host would not put another mount inside the location");
+}
+
+/// Runs `body` where this host can graft a mount beneath a location, and otherwise says the case
+/// was not exercised rather than reporting a result it did not produce.
+fn with_grafts(test: &str, body: fn()) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = test;
+        body();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os(IN_NAMESPACE).is_some() {
+            body();
+            return;
+        }
+        let probe = std::process::Command::new("unshare")
+            .args(["-r", "-m", "--", "true"])
+            .status();
+        if !probe.is_ok_and(|status| status.success()) {
+            println!("not exercised: this host does not give this account a mount namespace");
+            return;
+        }
+        let status = std::process::Command::new("unshare")
+            .args(["-r", "-m", "--"])
+            .arg(std::env::current_exe().expect("the test binary"))
+            .args(["--exact", "--nocapture", "--test-threads=1", test])
+            .env(IN_NAMESPACE, "1")
+            .status()
+            .expect("the test binary runs inside a mount namespace");
+        if status.code() == Some(NOT_EXERCISED) {
+            println!("not exercised: this namespace would not place a bind mount");
+            return;
+        }
+        assert!(
+            status.success(),
+            "the case inside the namespace failed: {status}"
+        );
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (test, body);
+        not_exercised();
+    }
+}
+
+#[test]
+fn bind_mount_and_cross_device_grafts_are_refused() {
+    with_grafts("bind_mount_and_cross_device_grafts_are_refused", || {
+        // A repository on another mount beneath a source location, a repository beneath it whose
+        // object directory is another mount, and (where a file can be mounted over a file) a
+        // pattern file that is another mount are each refused to the location before Git runs.
+        let fixture = Fixture::create();
+        let owner = TestOwner::default();
+        let environment = fixture.environment_id();
+        let sources = fixture.work().join("sources");
+        let projects = fixture.work().join("projects");
+        let scratch = fixture.work().join("scratch");
+        std::fs::create_dir(&scratch).expect("a scratch directory");
+        let source = owner_location(&fixture, &owner, &sources, LocationPurpose::Source, 220);
+        let into = owner_location(
+            &fixture,
+            &owner,
+            &projects,
+            LocationPurpose::Destination,
+            221,
+        );
+
+        let Some(_grafted) = graft(&sources.join("grafted"), &scratch) else {
+            return not_exercised();
+        };
+        ordinary_repository(&sources.join("grafted"), "repo");
+        let refusal = clone_into(
+            fixture.service(),
+            through(environment, into, "one"),
+            beneath(source, "grafted/repo"),
+            222,
+        )
+        .expect_err("a repository on another mount is not reached through the location");
+        assert!(refusal.to_string().contains("mount"), "{refusal}");
+
+        let metadata = ordinary_repository(&sources, "metadata");
+        let Some(_objects) = graft(&metadata.join(".git/objects"), &scratch) else {
+            return not_exercised();
+        };
+        let refusal = clone_into(
+            fixture.service(),
+            through(environment, into, "two"),
+            beneath(source, "metadata"),
+            223,
+        )
+        .expect_err("an object directory on another mount is not read through the location");
+        assert!(refusal.to_string().contains("mount"), "{refusal}");
+
+        #[cfg(target_os = "linux")]
+        {
+            let patterned = ordinary_repository(&sources, "patterned");
+            std::fs::write(patterned.join(".git/info/exclude"), b"").expect("a pattern file");
+            let Some(_exclude) = graft(&patterned.join(".git/info/exclude"), &scratch) else {
+                return not_exercised();
+            };
+            let refusal = clone_into(
+                fixture.service(),
+                through(environment, into, "three"),
+                beneath(source, "patterned"),
+                224,
+            )
+            .expect_err("a pattern file on another mount refuses the repository");
+            assert!(refusal.to_string().contains("info/exclude"), "{refusal}");
+        }
+        assert!(
+            names_in(&projects).is_empty(),
+            "nothing was created: {:?}",
+            names_in(&projects)
+        );
+    });
+}
+
+#[test]
+fn recursive_removal_refuses_a_grafted_mount() {
+    with_grafts("recursive_removal_refuses_a_grafted_mount", || {
+        // A workspace made through a location is removed through that location's handle, and
+        // the removal stops before another mount put inside its tree: nothing there is reached,
+        // and the refusal says where it stopped.
+        let fixture = Fixture::create();
+        let owner = TestOwner::default();
+        let environment = fixture.environment_id();
+        let sources = fixture.work().join("sources");
+        let workspaces = fixture.work().join("workspaces");
+        let scratch = fixture.work().join("scratch");
+        std::fs::create_dir(&scratch).expect("a scratch directory");
+        let source = owner_location(&fixture, &owner, &sources, LocationPurpose::Source, 230);
+        let made_in = owner_location(
+            &fixture,
+            &owner,
+            &workspaces,
+            LocationPurpose::Destination,
+            231,
+        );
+        let project = adopt(&fixture, &sources, "repo", 232);
+        attach(fixture.service(), &owner, project, source, 233).expect("the repository is bound");
+        let made = workspace_through(
+            fixture.service(),
+            project,
+            through(environment, made_in, "ws"),
+            false,
+            234,
+        )
+        .expect("the workspace is made")
+        .workspace
+        .0
+        .expect("a workspace");
+        let tree = workspaces.join("ws");
+        let Some(_graft) = graft(&tree.join("grafted"), &scratch) else {
+            return not_exercised();
+        };
+        std::fs::write(tree.join("grafted/kept"), b"elsewhere\n").expect("a file over there");
+        let refusal = fixture
+            .service()
+            .workspace_remove(
+                &WorkspaceRemoveParams {
+                    workspace_id: made.workspace_id,
+                    retention: RetentionPolicy::RemoveRetained,
+                },
+                Some(&action("workspace.remove", 235)),
+            )
+            .expect_err("the removal stops before the other mount");
+        assert!(refusal.to_string().contains("grafted"), "{refusal}");
+        assert!(refusal.to_string().contains("mount"), "{refusal}");
+        assert_eq!(
+            std::fs::read(tree.join("grafted/kept")).expect("the file on the other mount"),
+            b"elsewhere\n",
+            "nothing on the other mount was reached"
+        );
+    });
 }

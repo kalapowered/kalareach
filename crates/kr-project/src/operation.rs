@@ -760,13 +760,13 @@ pub fn stage_init(
         arguments.push(OsStr::new(branch));
     }
     arguments.push(OsStr::new(STAGED_TREE));
-    let mut request = GitRequest::write(staging.path(), &arguments)
+    // The directory is named by path for Git, and it has to be the object this host created.
+    let request = GitRequest::write(staging.path(), &arguments)
+        .expecting(staging.identity())
         .with_ceiling(staging.path())
         .with_deadline(Duration::from_millis(OPERATION_DEADLINE.get()))
         .with_cancellation(Arc::clone(cancel))
         .admitted(admission.cloned());
-    // The directory is named by path for Git, and it has to be the object this host created.
-    request.expected = Some(staging.identity());
     profile.run_checked(&request)?;
     Ok(())
 }
@@ -807,14 +807,14 @@ pub fn stage_clone(
     // A clone from a path on this machine reads the repository it copies, which is not one of the
     // directories this operation owns. It matters where a platform's mechanism confines reading.
     let source = PathBuf::from(&remote.specification.url);
+    // The directory is named by path for Git, and it has to be the object this host created.
     let mut request = GitRequest::write(staging.path(), &arguments)
+        .expecting(staging.identity())
         .with_ceiling(staging.path())
         .with_deadline(Duration::from_millis(OPERATION_DEADLINE.get()))
         .with_transport(remote.access())
         .with_cancellation(Arc::clone(cancel))
         .admitted(admission.cloned());
-    // The directory is named by path for Git, and it has to be the object this host created.
-    request.expected = Some(staging.identity());
     if matches!(remote.specification.transport, RemoteTransport::LocalPath) {
         request = request.reading(&[source.as_path()]);
     }
@@ -828,10 +828,13 @@ pub fn stage_clone(
         OsStr::new("--"),
         OsStr::new(&key),
     ];
+    // From here on every invocation runs in the tree the clone made, which has to be that object:
+    // its identity is read through the staging directory's handle, never through the path.
     let tree = staging.tree_path();
     let stored = profile
         .run_checked(
             &GitRequest::read(&tree, &arguments)
+                .expecting(staging.staged_identity()?)
                 .with_ceiling(staging.path())
                 .admitted(admission.cloned()),
         )?
@@ -872,6 +875,10 @@ fn check_out(
     admission: Option<&ReadAdmission>,
 ) -> Result<()> {
     let tree = staging.tree_path();
+    // The staged tree as the object this host found through the staging directory's handle. Each
+    // invocation below requires its directory to be that object, so a tree swapped for a link or
+    // another directory between two of them sends the next one nowhere.
+    let staged = staging.staged_identity()?;
     let arguments: [&OsStr; 3] = [
         OsStr::new("rev-parse"),
         OsStr::new("--verify"),
@@ -879,6 +886,7 @@ fn check_out(
     ];
     let head = profile.run(
         &GitRequest::read(&tree, &arguments)
+            .expecting(staged)
             .with_ceiling(staging.path())
             .admitted(admission.cloned()),
     )?;
@@ -895,6 +903,7 @@ fn check_out(
     ];
     let named = profile.run(
         &GitRequest::read(&tree, &arguments)
+            .expecting(staged)
             .with_ceiling(staging.path())
             .admitted(admission.cloned()),
     )?;
@@ -910,6 +919,7 @@ fn check_out(
         arguments.push(OsStr::new(&revision));
     }
     let request = GitRequest::write(&tree, &arguments)
+        .expecting(staged)
         .with_ceiling(staging.path())
         .with_deadline(Duration::from_millis(OPERATION_DEADLINE.get()))
         .with_cancellation(Arc::clone(cancel))

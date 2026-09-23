@@ -671,6 +671,12 @@ impl ProjectService {
         let Some(destination) = destination else {
             return self.settle_unreachable(row);
         };
+        // The running operation holds its destination, and asks its location first: one that no
+        // longer admits this operation reaches nothing, so the operation is settled the way a
+        // recovery settles one, with no filesystem effect.
+        if self.admit_destination(destination).is_err() {
+            return self.settle_unreachable(row);
+        }
         // A name that is recorded and a sibling that could be opened are two different things. A
         // directory this host could not look at is one it has not accounted for, and saying it was
         // cleaned up would be saying something it did not establish.
@@ -892,8 +898,7 @@ impl ProjectService {
         staging: Option<StagingSibling>,
     ) -> Result<()> {
         let path = destination.path();
-        let admission =
-            self.destination_admission(destination, Admitting::Caller(row.authority.grant_id));
+        let admission = self.destination_admission(destination);
         let opened = self.open_at(destination, admission.as_ref())?;
         if opened.identity().work_tree != identity {
             return Err(ProjectError::OutcomeUnknown {
@@ -1048,8 +1053,12 @@ impl ProjectService {
         admission: Option<ReadAdmission>,
     ) -> Result<OpenedRepository> {
         let shown = location.handle().host_path(relative).display().to_string();
-        let work_tree = location.handle().subdirectory(relative)?;
-        let found = crate::discovery::discover(work_tree, &shown)?;
+        let found = crate::discovery::discover_through(
+            location.handle(),
+            relative,
+            &shown,
+            admission.as_ref(),
+        )?;
         OpenedRepository::discovered(
             &self.profile,
             found,
@@ -1072,20 +1081,23 @@ impl ProjectService {
     }
 
     /// Returns the admission the reads of a running operation ask, from the destination it holds.
-    fn destination_admission(
-        &self,
-        destination: &Destination,
-        admitting: Admitting,
-    ) -> Option<ReadAdmission> {
+    fn destination_admission(&self, destination: &Destination) -> Option<ReadAdmission> {
         let held = destination.location()?;
         self.locations().read_admission(vec![(
             Arc::clone(held),
             LocationUse {
                 purpose: LocationPurpose::Destination,
                 environment_id: self.environment_id,
-                admitting,
+                admitting: destination.admitting(),
             },
         )])
+    }
+
+    /// Asks a destination's location, when it has one, whether this operation may still read
+    /// through it: immediately before a read, so no read starts after a withdrawal commits.
+    fn admit_destination(&self, destination: &Destination) -> Result<()> {
+        self.destination_admission(destination)
+            .map_or(Ok(()), |admission| admission.admit())
     }
 
     /// Makes one operation's staging sibling and records it: the name before the directory exists,
@@ -1173,9 +1185,7 @@ impl ProjectService {
         destination: &Destination,
         expected: ObjectIdentity,
     ) -> Cleanup {
-        if let Some(admission) = self.destination_admission(destination, destination.admitting())
-            && let Err(refusal) = admission.admit()
-        {
+        if let Err(refusal) = self.admit_destination(destination) {
             return Cleanup::Kept(format!(
                 "{refusal}; nothing is removed through it, and the owner reconciles this path"
             ));
@@ -1515,6 +1525,7 @@ impl ProjectService {
             _ => None,
         };
         let admission = self.locations().read_admission(reach);
+        self.admit_destination(&destination)?;
         let state = destination.probe()?;
         check_destination(&plan, state, &destination)?;
         let project_repository_id = ProjectRepositoryId::new(new_uuid());
@@ -1970,6 +1981,7 @@ impl ProjectService {
         let (display_path, isolation) = match destination.as_ref() {
             None => (project.display_path.clone(), None),
             Some(destination) => {
+                self.admit_destination(destination)?;
                 if !matches!(destination.probe()?, DestinationState::Absent) {
                     return Err(ProjectError::Destination {
                         detail: format!(
@@ -2172,6 +2184,9 @@ impl ProjectService {
                             ];
                             self.profile.run_checked(
                                 &GitRequest::write(staging.path(), &arguments)
+                                    // Named by path for Git, and required to be the directory
+                                    // this host created.
+                                    .expecting(staging.identity())
                                     .with_ceiling(staging.path())
                                     // The repository this clone copies, which is not one of the
                                     // directories the operation owns.
@@ -2192,6 +2207,9 @@ impl ProjectService {
                             ];
                             self.profile.run_checked(
                                 &GitRequest::write(&tree, &arguments)
+                                    // The tree the clone made, found through the staging
+                                    // directory's handle rather than by its path.
+                                    .expecting(staging.staged_identity()?)
                                     .with_ceiling(staging.path())
                                     .with_deadline(Duration::from_millis(OPERATION_DEADLINE.get()))
                                     .with_cancellation(Arc::clone(&cancel))
@@ -2354,6 +2372,21 @@ impl ProjectService {
         // this caller, and through nothing else; a location that is dormant or withdrawn refuses
         // the removal here, before anything is reserved.
         let recorded = self.locked()?.workspace(params.workspace_id)?;
+        // A workspace made through no location is reached through none, whatever authority a
+        // caller holds over the repository it is a copy of: only the owner reaches it, by the path
+        // it was made at.
+        if let Some(grant) = performed.grant()
+            && recorded.as_ref().is_some_and(|row| row.located.is_none())
+        {
+            return Err(ProjectError::PermissionDenied {
+                detail: format!(
+                    "workspace {} was made through no location, so a caller bounded by grant \
+                     {grant} reaches it through none",
+                    params.workspace_id
+                )
+                .into(),
+            });
+        }
         let reach = self.tree_reach(
             recorded.as_ref().and_then(|row| row.located.as_ref()),
             Admitting::Caller(performed.grant()),

@@ -2892,3 +2892,77 @@ fn a_grant_withdrawn_before_a_removal_reserves_leaves_the_workspace_and_its_tree
         .expect("a removal under a grant that stands is performed");
     assert!(removed.working_files_removed);
 }
+
+#[test]
+fn source_permission_does_not_delete_an_outside_workspace() {
+    // A workspace made through no location is reached through none, whatever authority a caller
+    // holds over the repository it is a copy of: a caller bounded by a grant is refused its
+    // removal before anything is reserved or touched, and the owner, who made it by naming a
+    // path, still removes it.
+    let fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, "sourced");
+    let made = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "made by path".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::IndependentClone)),
+                policy: include_everything(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "outside",
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 40)),
+        )
+        .expect("the owner makes a workspace by naming a path")
+        .workspace
+        .0
+        .expect("a workspace");
+    let grant = kr_protocol::ids::GrantId::new(Uuid::from_bytes([0x5a; 16]));
+    let bounded = action("workspace.remove", 41);
+    let refusal = fixture
+        .service()
+        .workspace_remove(
+            &WorkspaceRemoveParams {
+                workspace_id: made.workspace_id,
+                retention: RetentionPolicy::RemoveRetained,
+            },
+            Performed::from(Some(&bounded)).bounded_by(grant),
+        )
+        .expect_err("a bounded caller reaches no workspace made through no location");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied, "{refusal}");
+    assert!(
+        fixture.work().join("outside/.git").exists(),
+        "nothing was removed"
+    );
+    let read = fixture
+        .service()
+        .workspace_read(&WorkspaceReadParams {
+            workspace_id: made.workspace_id,
+        })
+        .expect("the workspace reads");
+    assert_eq!(
+        read.workspace.state,
+        WorkspaceState::Ready,
+        "nothing was reserved"
+    );
+    let removed = fixture
+        .service()
+        .workspace_remove(
+            &WorkspaceRemoveParams {
+                workspace_id: made.workspace_id,
+                retention: RetentionPolicy::RemoveRetained,
+            },
+            Some(&action("workspace.remove", 42)),
+        )
+        .expect("the owner removes it");
+    assert!(removed.working_files_removed);
+}

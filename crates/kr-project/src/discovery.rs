@@ -42,6 +42,7 @@ use kr_transfer::authority::ObjectKind;
 use kr_transfer::{AuthorisedDirectory, Escape, ObjectIdentity, ObjectPolicy, RelativeName};
 
 use crate::error::{ProjectError, Result};
+use crate::git::ReadAdmission;
 
 /// How many object directories one repository may reach through alternates, its own included.
 pub const MAX_OBJECT_DIRECTORIES: usize = 16;
@@ -143,6 +144,27 @@ pub fn discover(work_tree: AuthorisedDirectory, shown: &str) -> Result<Discovere
     })
 }
 
+/// Finds the repository whose working tree is `relative` beneath `location`.
+///
+/// Discovery is one read through the location, and its first step is the descent to the working
+/// tree, so `admission` is asked before that step: a withdrawal that committed a moment earlier
+/// refuses it rather than a later read.
+///
+/// # Errors
+///
+/// Returns the admission's refusal, or whatever [`discover`] returns.
+pub fn discover_through(
+    location: &AuthorisedDirectory,
+    relative: &RelativeName,
+    shown: &str,
+    admission: Option<&ReadAdmission>,
+) -> Result<Discovered> {
+    if let Some(admission) = admission {
+        admission.admit()?;
+    }
+    discover(location.subdirectory(relative)?, shown)
+}
+
 /// Takes in one object directory and every alternate it reaches, each from the directory that
 /// names it.
 fn follow_objects(
@@ -167,42 +189,48 @@ fn follow_objects(
         ));
     }
     let mut alternates = Vec::new();
-    if matches!(
-        kind_of(&objects, "info", shown)?,
-        Some(ObjectKind::Directory)
-    ) {
-        let info = objects.subdirectory(&name("info")?)?;
-        for entry in entries_of(&info, shown)? {
-            match kind_of(&info, &entry, shown)? {
-                None => {}
-                Some(ObjectKind::Link) => {
-                    return Err(refused(
-                        shown,
-                        &format!("objects/info/{entry}"),
-                        "is a link",
-                    ));
-                }
-                Some(_) if entry == "http-alternates" => {
-                    return Err(refused(
-                        shown,
-                        "objects/info/http-alternates",
-                        "names objects over a network",
-                    ));
-                }
-                Some(ObjectKind::File) if entry == "alternates" => {
-                    let text = read_small(&info, "alternates", shown)?;
-                    for line in text.lines() {
-                        let line = line.trim_end_matches('\r');
-                        // Git skips an empty line and one that starts with `#`.
-                        if line.is_empty() || line.starts_with('#') {
-                            continue;
-                        }
-                        alternates.push(beneath(shown, "objects/info/alternates", line)?);
+    match kind_of(&objects, "info", shown)? {
+        None => {}
+        Some(ObjectKind::Directory) => {
+            let info = objects.subdirectory(&name("info")?)?;
+            for entry in entries_of(&info, shown)? {
+                match kind_of(&info, &entry, shown)? {
+                    None => {}
+                    Some(ObjectKind::Link) => {
+                        return Err(refused(
+                            shown,
+                            &format!("objects/info/{entry}"),
+                            "is a link",
+                        ));
                     }
+                    Some(_) if entry == "http-alternates" => {
+                        return Err(refused(
+                            shown,
+                            "objects/info/http-alternates",
+                            "names objects over a network",
+                        ));
+                    }
+                    Some(ObjectKind::File) if entry == "alternates" => {
+                        let text = read_small(&info, "alternates", shown)?;
+                        for line in text.lines() {
+                            let line = line.trim_end_matches('\r');
+                            // Git skips an empty line and one that starts with `#`.
+                            if line.is_empty() || line.starts_with('#') {
+                                continue;
+                            }
+                            alternates.push(beneath(shown, "objects/info/alternates", line)?);
+                        }
+                    }
+                    Some(_) if entry == "alternates" => {
+                        return Err(refused(shown, "objects/info/alternates", "is not a file"));
+                    }
+                    Some(_) => {}
                 }
-                Some(_) => {}
             }
         }
+        // Git reads what it finds under `info` whatever `info` is, so a link or anything else
+        // there would hide the alternates it names from this check.
+        Some(_) => return Err(refused(shown, "objects/info", "is not a directory")),
     }
     let base = objects.try_clone()?;
     found.push(objects);
@@ -221,13 +249,19 @@ fn follow_objects(
 }
 
 /// Requires one pattern file, when it is there, to be a file beneath its own base.
+///
+/// The file is opened rather than looked at: the open is what checks that the object itself is
+/// on the location's mount, and a file mounted over the name would pass a look.
 fn require_pattern_file(base: &AuthorisedDirectory, relative: &str, shown: &str) -> Result<()> {
-    match base.probe(&name(relative)?) {
-        Ok(ObjectKind::File) => Ok(()),
-        Ok(_) => Err(refused(shown, relative, "is not a file")),
-        Err(Escape::NotFound { .. }) => Ok(()),
+    match base.open_read(&name(relative)?, ObjectPolicy::ReadableFile) {
+        Ok(_) | Err(Escape::NotFound { .. }) => Ok(()),
         Err(Escape::Link { .. }) => Err(refused(shown, relative, "reaches through a link")),
-        Err(other) => Err(other.into()),
+        Err(Escape::CrossedMount { .. }) => Err(refused(shown, relative, "is on another mount")),
+        Err(other) => Err(refused(
+            shown,
+            relative,
+            &format!("is not a file this host can read beneath its base ({other})"),
+        )),
     }
 }
 
