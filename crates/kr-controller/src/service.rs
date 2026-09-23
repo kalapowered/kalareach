@@ -8452,6 +8452,185 @@ mod a_create_that_launches_nothing {
             .expect("claims")
     }
 
+    /// KR-REQ-07.09: a daemon starting after a crash settles every launch its predecessor left
+    /// unresolved before anything could replace it, and launches nothing while it does. A launch
+    /// whose process is confirmed gone never started a shell and is resolved as failed; a launch
+    /// whose process may still be running keeps its place rather than being started again; and a
+    /// worker that took its claim and is gone is recorded as a session that ended abnormally,
+    /// never as one that did not run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_daemon_settles_every_unresolved_launch_and_launches_nothing() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment_id = temp.environment_id();
+        let actor_id = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+        let intent = kr_cbor::to_canonical_vec(&create_params(environment_id)).expect("encodes");
+        // An identifier this host watched end, which no process can be mistaken for, and this
+        // process, which is certainly running.
+        let gone = kr_ipc::identity::ended_process_identity(4_000_000);
+        let running =
+            kr_ipc::identity::current_process_start_identity().expect("this process's identity");
+        let (ended_launch, running_launch, claimed_and_gone) = {
+            let mut registry = crate::registry::Registry::open(
+                temp.environment().registry_database(),
+                environment_id,
+            )
+            .expect("the registry a crashed daemon left");
+            let mut launched = |launcher: &kr_protocol::identity::ProcessStartIdentity| {
+                let reservation = registry
+                    .reserve(
+                        &actor_id,
+                        kr_ipc::new_uuid(),
+                        kr_protocol::scalars::Digest256::from_bytes([0x5d; 32]),
+                        &intent,
+                        kr_ipc::now_ms(),
+                    )
+                    .expect("reserves")
+                    .reservation;
+                registry
+                    .record_launch(reservation.reservation_id, launcher)
+                    .expect("records the launcher");
+                registry
+                    .set_phase(reservation.reservation_id, LaunchPhase::Spawned)
+                    .expect("spawned");
+                reservation
+            };
+            let ended_launch = launched(&gone);
+            let running_launch = launched(&running);
+            let claimed_and_gone = launched(&gone);
+            registry
+                .claim_rendezvous(
+                    claimed_and_gone.reservation_id,
+                    *kr_crypto::keys::AuthorisationKeyPair::generate()
+                        .expect("a key")
+                        .public(),
+                )
+                .expect("the worker claimed its reservation");
+            (ended_launch, running_launch, claimed_and_gone)
+        };
+
+        let (controller, asked) = daemon_running(&temp, temp.root().join("kr-worker"), None).await;
+        let registry = controller.registry.lock().await;
+        let phase = |reservation: &crate::registry::Reservation| {
+            registry
+                .reservation(reservation.reservation_id)
+                .expect("reads")
+                .expect("still recorded")
+                .phase
+        };
+        assert_eq!(
+            phase(&ended_launch),
+            LaunchPhase::Failed,
+            "a launch whose process is gone, and which never reached its claim, started nothing"
+        );
+        assert_eq!(
+            phase(&running_launch),
+            LaunchPhase::Spawned,
+            "a launch that may still be running is kept rather than started again"
+        );
+        let closure = registry
+            .closure(claimed_and_gone.session_id)
+            .expect("reads")
+            .expect("the claimed launch that is gone is recorded as a session that ended");
+        assert_eq!(
+            closure.reason,
+            kr_protocol::session::ClosureReason::WorkerCrash
+        );
+        assert_eq!(
+            registry.occupancy().expect("counts"),
+            1,
+            "only the launch that may still be running keeps its place"
+        );
+        drop(registry);
+        assert!(
+            asked.lock().expect("the launches").is_empty(),
+            "settling what was left launched nothing"
+        );
+    }
+
+    /// KR-REQ-24.04: a daemon rebuilds its directory from workers that answer its challenge, not
+    /// from what its records say. A recorded worker whose endpoint answers nobody and whose process
+    /// is gone is a stale hint: it is not published again, and the session is recorded as ended
+    /// rather than listed as running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_recorded_worker_that_answers_nobody_is_not_published_again() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment_id = temp.environment_id();
+        let actor_id = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+        let intent = kr_cbor::to_canonical_vec(&create_params(environment_id)).expect("encodes");
+        let gone = kr_ipc::identity::ended_process_identity(4_000_001);
+        let session_id = {
+            let mut registry = crate::registry::Registry::open(
+                temp.environment().registry_database(),
+                environment_id,
+            )
+            .expect("the registry a crashed daemon left");
+            let reservation = registry
+                .reserve(
+                    &actor_id,
+                    kr_ipc::new_uuid(),
+                    kr_protocol::scalars::Digest256::from_bytes([0x6e; 32]),
+                    &intent,
+                    kr_ipc::now_ms(),
+                )
+                .expect("reserves")
+                .reservation;
+            registry
+                .record_launch(reservation.reservation_id, &gone)
+                .expect("records the launcher");
+            registry
+                .set_phase(reservation.reservation_id, LaunchPhase::Spawned)
+                .expect("spawned");
+            let key = *kr_crypto::keys::AuthorisationKeyPair::generate()
+                .expect("a key")
+                .public();
+            registry
+                .claim_rendezvous(reservation.reservation_id, key)
+                .expect("claims");
+            // Everything a record can say about a worker, and nothing that proves it is there.
+            registry
+                .record_worker(
+                    reservation.reservation_id,
+                    &crate::registry::WorkerRecord {
+                        session_id: reservation.session_id,
+                        display_number: reservation.display_number,
+                        public_key: key,
+                        process_identity: gone.clone(),
+                        endpoint: temp
+                            .environment()
+                            .worker_endpoint(reservation.display_number)
+                            .expect("an endpoint")
+                            .as_text(),
+                        profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+                        state: kr_protocol::session::SessionState::Live,
+                        acknowledged_revision: kr_protocol::ids::AuthorityRevision::new(0),
+                    },
+                )
+                .expect("records the worker");
+            reservation.session_id
+        };
+
+        let (controller, asked) = daemon_running(&temp, temp.root().join("kr-worker"), None).await;
+        assert!(
+            controller.directory.lock().await.get(session_id).is_none(),
+            "a record nobody answers for is not a worker this daemon publishes"
+        );
+        let closure = controller
+            .registry
+            .lock()
+            .await
+            .closure(session_id)
+            .expect("reads")
+            .expect("the session whose worker is gone is recorded as ended");
+        assert_eq!(
+            closure.reason,
+            kr_protocol::session::ClosureReason::WorkerCrash
+        );
+        assert!(
+            asked.lock().expect("the launches").is_empty(),
+            "and nothing was launched in its place"
+        );
+    }
+
     /// A create token that already has a reservation is answered from it, not refused again.
     ///
     /// Section 9: a retry resolves to what its first attempt produced. What this pins is that the

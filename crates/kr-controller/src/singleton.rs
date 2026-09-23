@@ -182,6 +182,8 @@ impl Drop for SingletonLock {
 mod tests {
     use super::*;
 
+    /// KR-REQ-24.04: each daemon that takes the environment's singleton lock advances the
+    /// persistent generation before it does anything else.
     #[test]
     fn the_generation_advances_each_time_the_lock_is_taken() {
         let host = kr_ipc::testing::TempHost::create();
@@ -240,6 +242,8 @@ mod tests {
         taken.expect("the environment is free once its holder has let go");
     }
 
+    /// KR-REQ-24.04: one daemon holds an environment at a time; a second one started beside it is
+    /// refused rather than allowed to serve the same workers.
     #[cfg(unix)]
     #[test]
     fn a_second_daemon_is_refused_while_the_first_holds_the_environment() {

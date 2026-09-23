@@ -31,9 +31,12 @@ fn registry() -> (kr_ipc::testing::TempHost, Registry) {
     (host, registry)
 }
 
+/// KR-REQ-07.07, KR-REQ-24.05: the create is reserved durably, with the actor, the token and the
+/// payload digest, before anything is spawned, and a retry of the same intent resolves to the same
+/// reservation, also after the registry is opened again, so no retry allocates a second session.
 #[test]
 fn a_repeated_create_token_resolves_to_the_same_reservation() {
-    let (_host, mut registry) = registry();
+    let (host, mut registry) = registry();
     let token = kr_ipc::new_uuid();
     let first = registry
         .reserve(
@@ -61,6 +64,27 @@ fn a_repeated_create_token_resolves_to_the_same_reservation() {
         1,
         "one session, not two"
     );
+
+    // The reservation is on disk before anything is launched, so a daemon that opens the registry
+    // afterwards, as one restarting does, resolves the same retry to the same reservation.
+    drop(registry);
+    let mut reopened = Registry::open(
+        host.environment().registry_database(),
+        host.environment_id(),
+    )
+    .expect("reopens the registry");
+    let after = reopened
+        .reserve(
+            &actor("local:501"),
+            token,
+            digest(1),
+            &intent(),
+            TimestampMs::new(3),
+        )
+        .expect("resolves to the same intent");
+    assert!(after.deduplicated);
+    assert_eq!(after.reservation, first.reservation);
+    assert_eq!(reopened.occupancy().expect("counts"), 1);
 }
 
 #[test]
@@ -140,9 +164,21 @@ fn every_new_execution_is_given_a_new_session_identifier() {
     }
 }
 
+/// KR-REQ-07.14: an environment admits 128 live or creating sessions unless its owner sets another
+/// limit, refuses past the limit with `SESSION_LIMIT` before anything is reserved or spawned, and
+/// never evicts a session to make room.
 #[test]
 fn the_limit_refuses_before_anything_is_spawned_and_never_evicts() {
     let (_host, mut registry) = registry();
+    assert_eq!(
+        kr_protocol::limits::DEFAULT_MAX_SESSIONS_PER_ENVIRONMENT,
+        128
+    );
+    assert_eq!(
+        registry.session_limit().expect("reads the limit"),
+        128,
+        "a new environment starts at the default"
+    );
     registry.set_session_limit(3).expect("sets the limit");
     let mut reserved = Vec::new();
     for _ in 0..3 {
@@ -166,6 +202,11 @@ fn the_limit_refuses_before_anything_is_spawned_and_never_evicts() {
             TimestampMs::new(2),
         )
         .expect_err("refuses");
+    assert_eq!(
+        error.code(),
+        kr_protocol::error::ErrorCode::SessionLimit,
+        "the refusal a caller is given is SESSION_LIMIT"
+    );
     match error {
         ControllerError::SessionLimit { live, limit, .. } => {
             assert_eq!(live, 3);
@@ -192,9 +233,12 @@ fn the_limit_refuses_before_anything_is_spawned_and_never_evicts() {
         .expect("the freed capacity is usable");
 }
 
+/// KR-REQ-07.48: display numbers are allocated in increasing order within an environment and never
+/// reused, also after the registry is opened again, while each session's true identity is its
+/// protocol UUID.
 #[test]
 fn display_numbers_increase_and_are_never_reused() {
-    let (_host, mut registry) = registry();
+    let (host, mut registry) = registry();
     let mut reservations = Vec::new();
     for _ in 0..4 {
         let admission = registry
@@ -233,8 +277,45 @@ fn display_numbers_increase_and_are_never_reused() {
         1,
         "the closed session keeps its row, and its number"
     );
+
+    // Each session is its UUID: five reservations, five identities, and the closed one keeps both
+    // its number and its identity.
+    let mut identities: Vec<_> = reservations
+        .iter()
+        .chain(std::iter::once(&next.reservation))
+        .map(|reservation| reservation.session_id)
+        .collect();
+    identities.sort();
+    identities.dedup();
+    assert_eq!(identities.len(), 5, "no two sessions share an identity");
+    let closed = registry
+        .reservation_for_session(reservations[3].session_id)
+        .expect("reads")
+        .expect("the closed session is still recorded");
+    assert_eq!(closed.display_number.get(), 4);
+
+    // A daemon that opens the registry again goes on from where the numbers stood.
+    drop(registry);
+    let mut reopened = Registry::open(
+        host.environment().registry_database(),
+        host.environment_id(),
+    )
+    .expect("reopens the registry");
+    let later = reopened
+        .reserve(
+            &actor("local:501"),
+            kr_ipc::new_uuid(),
+            digest(3),
+            &intent(),
+            TimestampMs::new(3),
+        )
+        .expect("reserves");
+    assert_eq!(later.reservation.display_number.get(), 6);
 }
 
+/// KR-REQ-02.05, KR-REQ-24.04: the environment registry belongs to the controller and holds its
+/// persistent generation, which every new daemon advances before it reaches a worker, so the
+/// generation it presents is always ahead of the one it replaced.
 #[test]
 fn the_generation_advances_and_is_remembered_across_opens() {
     let host = kr_ipc::testing::TempHost::create();
@@ -254,6 +335,9 @@ fn the_generation_advances_and_is_remembered_across_opens() {
     );
 }
 
+/// KR-REQ-07.08: the private startup exchange binds one launched worker to its reservation: the
+/// first claim records the worker's key before the worker is told anything, and a second claimant
+/// for the same reservation is refused and fences it.
 #[test]
 fn one_launched_process_gets_one_rendezvous_admission() {
     let (_host, mut registry) = registry();
@@ -300,6 +384,8 @@ fn one_launched_process_gets_one_rendezvous_admission() {
     );
 }
 
+/// KR-REQ-07.09: a launch that was fenced cannot be brought back by a late report from the worker
+/// it launched.
 #[test]
 fn a_ready_report_cannot_revive_a_fenced_reservation() {
     let (_host, mut registry) = registry();
@@ -338,6 +424,8 @@ fn a_ready_report_cannot_revive_a_fenced_reservation() {
     );
 }
 
+/// KR-REQ-07.09: an unresolved launch that was fenced keeps its place in the environment until
+/// something confirms it never started, so nothing replaces it while it may still be running.
 #[test]
 fn a_fenced_reservation_keeps_its_slot_and_a_failed_one_does_not() {
     let (_host, mut registry) = registry();

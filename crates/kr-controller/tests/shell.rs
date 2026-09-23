@@ -610,6 +610,9 @@ impl kr_controller::supervision::TerminalPresenter for RefusingTerminal {
 
 /// KR-REQ-07.43, KR-REQ-07.31, KR-REQ-01.21: a terminal that cannot be opened is reported against
 /// the session that was created, and nothing creates a second one.
+/// KR-REQ-07.11: the failed presentation is attempted once and never retries the execution.
+/// KR-REQ-07.50: the terminal is asked to run an argument vector in which the session's identity is
+/// an argument of its own, never text assembled into a command line.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_terminal_that_cannot_be_opened_leaves_one_live_session_and_a_presentation_error() {
     let Some(worker_build) = worker_beside_this_test() else {
