@@ -770,12 +770,18 @@ impl WorkerService {
                     break;
                 }
                 // A newly accepted attention connection states the privacy fence before anything
-                // else it carries. One whose statement cannot be written whole is ended, and the
-                // next connection states the fence instead.
-                if let Some(statement) = state.pending_statement.take()
-                    && !self.send_statement(connection_id, statement).await
-                {
-                    break;
+                // else it carries. One whose statement cannot be written whole, or cannot name the
+                // journal's generation, is ended, and the next connection states the fence instead.
+                if let Some(statement) = state.pending_statement.take() {
+                    let deadline = tokio::time::Instant::now()
+                        + crate::attention_fence::ATTENTION_BARRIER_WAIT;
+                    let stated = match self.state_fence(connection_id, statement, deadline) {
+                        Some(stating) => stating.await.unwrap_or(false),
+                        None => false,
+                    };
+                    if !stated {
+                        break;
+                    }
                 }
             }
             if state.subscribed.is_none() {
@@ -1558,9 +1564,10 @@ impl WorkerService {
             turn: Some(turn),
         };
         let sequence = raised.frame.sequence.get();
-        if let Some(connection_id) = raised.connection_id {
-            self.send_statement_before(connection_id, raised.frame, deadline)
-                .await;
+        if let Some(connection_id) = raised.connection_id
+            && let Some(stating) = self.state_fence(connection_id, raised.frame, deadline)
+        {
+            let _ = stating.await;
         }
         let acknowledged = self
             .attention_fence
@@ -1570,50 +1577,50 @@ impl WorkerService {
         transition
     }
 
-    /// Sends a statement of the privacy fence on an attention connection, within the bound a
-    /// statement has.
-    async fn send_statement(
-        &self,
-        connection_id: ConnectionId,
-        frame: kr_protocol::attention::AttentionBarrier,
-    ) -> bool {
-        let deadline = tokio::time::Instant::now() + crate::attention_fence::ATTENTION_BARRIER_WAIT;
-        self.send_statement_before(connection_id, frame, deadline)
-            .await
-    }
-
-    /// Sends a statement of the privacy fence on an attention connection before `deadline`.
+    /// Sends a statement of the privacy fence on an attention connection before `deadline`, on a
+    /// task of its own, and returns that task; nothing when there is no runtime to run it on, and
+    /// the connection is ended then instead.
     ///
+    /// The task is the statement's owner, so a caller that stops waiting for it does not stop it.
     /// A statement that cannot be written whole ends the connection, a frame none of which went
-    /// being taken back first: the daemon then opens the next connection, and the first frame on
-    /// it states the fence as it is by then. Returns whether the statement was written whole.
-    async fn send_statement_before(
-        &self,
+    /// being taken back first, and so does one that cannot name the journal's generation: the
+    /// daemon then opens the next connection, and the first frame on it states the fence as it is
+    /// by then. The task answers whether the statement was written whole and named the generation.
+    fn state_fence(
+        self: &Arc<Self>,
         connection_id: ConnectionId,
         frame: kr_protocol::attention::AttentionBarrier,
         deadline: tokio::time::Instant,
-    ) -> bool {
-        let registration = self
-            .admitted
-            .lock()
-            .expect("the connection registry is not poisoned")
-            .get(&connection_id)
-            .cloned();
-        let Some(registration) = registration else {
-            return false;
-        };
-        let written = write_within(
-            &registration.writable,
-            &registration.writer,
-            &ControlFrame::AttentionBarrier(frame),
-            &registration.withdrawn,
-            deadline,
-        )
-        .await;
-        if !written {
+    ) -> Option<tokio::task::JoinHandle<bool>> {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             self.withdraw(connection_id);
-        }
-        written
+            return None;
+        };
+        let service = Arc::clone(self);
+        Some(runtime.spawn(async move {
+            let named = frame.generation.is_present();
+            let registration = service
+                .admitted
+                .lock()
+                .expect("the connection registry is not poisoned")
+                .get(&connection_id)
+                .cloned();
+            let Some(registration) = registration else {
+                return false;
+            };
+            let written = write_within(
+                &registration.writable,
+                &registration.writer,
+                &ControlFrame::AttentionBarrier(frame),
+                &registration.withdrawn,
+                deadline,
+            )
+            .await;
+            if !written || !named {
+                service.withdraw(connection_id);
+            }
+            written && named
+        }))
     }
 
     /// Reads one page, holding the request while there is nothing to answer with.
@@ -5375,46 +5382,34 @@ impl std::fmt::Debug for PrivacyTransition {
 
 impl PrivacyTransition {
     /// Settles the transition after the commit attempt, succeeded or failed.
+    ///
+    /// The statement is sent on a task of its own, so a caller that stops waiting for this does
+    /// not stop the statement.
     pub async fn settle(mut self) {
-        let Some(turn) = self.turn.take() else {
-            return;
-        };
+        if let Some(stating) = self.settle_now() {
+            let _ = stating.await;
+        }
+    }
+
+    /// Settles the transition in the fence and starts the statement that says so.
+    fn settle_now(&mut self) -> Option<tokio::task::JoinHandle<bool>> {
+        let turn = self.turn.take()?;
         let settled = self
             .service
             .attention_fence
             .settle(|| self.service.journal_generation());
         drop(turn);
-        if let Some(connection_id) = settled.connection_id {
-            self.service
-                .send_statement(connection_id, settled.frame)
-                .await;
-        }
+        let deadline = tokio::time::Instant::now() + crate::attention_fence::ATTENTION_BARRIER_WAIT;
+        self.service
+            .state_fence(settled.connection_id?, settled.frame, deadline)
     }
 }
 
 impl Drop for PrivacyTransition {
     fn drop(&mut self) {
-        let Some(turn) = self.turn.take() else {
-            return;
-        };
-        let settled = self
-            .service
-            .attention_fence
-            .settle(|| self.service.journal_generation());
-        drop(turn);
-        let Some(connection_id) = settled.connection_id else {
-            return;
-        };
-        let service = Arc::clone(&self.service);
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                service.send_statement(connection_id, settled.frame).await;
-            });
-        } else {
-            // With nothing to send it from, the connection is ended, and the next one states the
-            // settled fence first.
-            service.withdraw(connection_id);
-        }
+        // The statement's task outlives this; with no runtime to run it on, the connection is
+        // ended instead, and the next one states the settled fence first.
+        let _ = self.settle_now();
     }
 }
 

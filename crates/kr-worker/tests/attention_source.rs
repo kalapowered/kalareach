@@ -52,6 +52,11 @@ fn build() -> BuildId {
 }
 
 async fn host() -> Host {
+    host_with(true).await
+}
+
+/// A session and its worker, with a journal or, when `journal` is false, with none.
+async fn host_with(journal: bool) -> Host {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
@@ -93,7 +98,7 @@ async fn host() -> Host {
         worker_profile: WorkerProfile::HeadlessUser,
         desktop: DesktopBinding::none(),
         dimensions: Dimensions::new(80, 24),
-        journal_path: Some(journal_path.clone()),
+        journal_path: journal.then(|| journal_path.clone()),
         spool_directory: Some(environment.session_spool(session_id)),
         worker_endpoint: None,
         send_queue_bytes: 1024 * 1024,
@@ -120,7 +125,7 @@ async fn host() -> Host {
                 boot_identity: boot.clone(),
                 controller_public_key: *controller.public_key(),
                 controller_generation: ControllerGeneration::new(1),
-                journal_path: Some(journal_path.clone()),
+                journal_path: journal.then(|| journal_path.clone()),
                 build_id: build(),
             },
         )
@@ -1518,4 +1523,73 @@ async fn a_statement_that_cannot_be_written_ends_the_connection() {
     transition.settle().await;
     let settled = newer.statement(Duration::from_secs(5)).await;
     assert!(!settled.raised);
+}
+
+/// KR-REQ-24.11: a worker that cannot read its journal's privacy generation cannot say where the
+/// session stands, so its statement keeps the daemon's barrier raised, and the connection is ended
+/// so the next one states the fence again.
+#[tokio::test]
+async fn a_worker_that_cannot_read_its_generation_keeps_the_barrier() {
+    let host = host_with(false).await;
+    let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
+    let first = &link.statements[0];
+    assert!(first.raised, "the barrier stays raised");
+    assert_eq!(first.generation, Nullable::null());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while link.client.recv().await.is_ok() {}
+    })
+    .await
+    .expect("the connection ends");
+}
+
+/// KR-REQ-24.11: a settlement whose caller stops waiting for it while the connection's writer is
+/// busy is still stated: the statement is its own task's, not the caller's.
+#[tokio::test]
+async fn a_settlement_whose_caller_stops_waiting_is_still_stated() {
+    let host = host().await;
+    for index in 0..256 {
+        notify(&host, &format!("{index} {}", "x".repeat(600)));
+    }
+    let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
+    let raising = raise(&host);
+    let raised = link.statement(Duration::from_secs(5)).await;
+    link.acknowledge(&raised).await;
+    let transition = raising.await.expect("the raise finishes");
+
+    // Pages nobody reads yet hold the connection's writer, so the settlement has to wait for it.
+    for round in 0..3_u64 {
+        link.writer()
+            .write_message(&ControlFrame::AttentionSources(AttentionSourcesRequest {
+                request_id: RequestId::new(60 + round),
+                max_records: U64::new(256),
+                ..sources(0, 0, 0)
+            }))
+            .await
+            .expect("writes the request");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let settling = tokio::spawn(transition.settle());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !settling.is_finished(),
+        "the settlement waits for the writer"
+    );
+    settling.abort();
+
+    // Reading the pages frees the writer; the settlement goes after them.
+    let settled = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match link.client.recv().await.expect("the worker answers") {
+                ControlFrame::AttentionBarrier(statement) => return statement,
+                ControlFrame::AttentionSourcePage(_)
+                | ControlFrame::Notification(_)
+                | ControlFrame::Event(_) => {}
+                other => panic!("the worker answered {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the settlement is stated");
+    assert!(!settled.raised);
+    assert_eq!(settled.generation, Nullable::some(U64::ZERO));
 }

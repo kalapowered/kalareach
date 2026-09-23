@@ -264,6 +264,10 @@ struct SessionFence {
     /// Whether the latest statement applied from the session's worker says a transition is in
     /// progress.
     barrier: bool,
+    /// Whether the session was closed over a worker the host could not confirm had ended. Such a
+    /// worker may still be running and changing its privacy state where this daemon cannot see
+    /// it, so nothing it answered is released after the closure is recorded.
+    unaccounted: bool,
 }
 
 /// What must still hold for a response's session text to be released.
@@ -292,12 +296,14 @@ impl Ticket {
     }
 
     /// Answers whether every text the ticket names may be released at `now`: its session's
-    /// barrier is lowered, the generation its answer was decided under is the one recorded, and
-    /// its lease has more than the margin left.
+    /// barrier is lowered, the session was not closed over a worker the host could not account
+    /// for, the generation its answer was decided under is the one recorded, and its lease has more
+    /// than the margin left.
     fn holds(&self, fences: &BTreeMap<SessionId, SessionFence>, now: u64) -> bool {
         self.entries.iter().all(|entry| {
             let fence = fences.get(&entry.session_id).copied().unwrap_or_default();
             !fence.barrier
+                && !fence.unaccounted
                 && entry.generation.is_some()
                 && fence.recorded == entry.generation
                 && now.saturating_add(RELEASE_MARGIN_MS) < entry.release_until
@@ -1052,7 +1058,9 @@ impl AttentionModule {
         }
         let fence = fences.entry(link.session_id).or_default();
         fence.recorded = fence.recorded.max(statement.generation.0.map(U64::get));
-        fence.barrier = statement.raised;
+        // A statement that cannot name the session's generation cannot lower a barrier: lowering
+        // one at a generation nobody named would release text decided under the one before.
+        fence.barrier = statement.raised || statement.generation.0.is_none();
         true
     }
 
@@ -1695,6 +1703,16 @@ impl AttentionModule {
             }
         }
         let unaccounted = reach.unaccounted(session_id).await;
+        if unaccounted {
+            // Under the release lock, so a response already put together for the session, and a
+            // write already part way through, releases nothing more of its text from here on.
+            self.release
+                .write()
+                .await
+                .entry(session_id)
+                .or_default()
+                .unaccounted = true;
+        }
         self.finish(reach, session_id, unaccounted);
     }
 
@@ -3027,6 +3045,159 @@ mod tests {
         assert_eq!(fence.recorded, Some(1));
     }
 
+    /// KR-REQ-24.11: a statement that cannot name the session's generation lowers no barrier and
+    /// moves no recorded generation, whatever it says about a transition.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_statement_that_names_no_generation_lowers_no_barrier() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = module(&temp);
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let (_link, mut reader, mut writer) = linked(&temp, 1, &module, session_id).await;
+        for (sequence, raised, generation) in [(1, true, Some(0)), (2, false, None)] {
+            writer
+                .write_message(&statement(sequence, raised, generation))
+                .await
+                .expect("states");
+            let _ = reader
+                .read_message::<ControlFrame>()
+                .await
+                .expect("acknowledged");
+        }
+        let fence = fence_of(&module, session_id).await;
+        assert!(fence.barrier, "the barrier stands");
+        assert_eq!(fence.recorded, Some(0));
+    }
+
+    /// KR-REQ-24.11: a session closed over a worker the host could not account for releases
+    /// nothing more of what its worker answered: not an answer already put together for a reader,
+    /// not the rest of one part way to its reader, and not a delivery's text. A closure the host
+    /// could account for leaves the answers its worker gave releasable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unaccounted_closure_stops_what_its_worker_answered() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = module(&temp);
+        let closing = SessionId::new(kr_ipc::new_uuid());
+        let (link, mut reader, mut writer) = linked(&temp, 1, &module, closing).await;
+        module
+            .take_page(closing, &link, 0, 0, &question_page(closing))
+            .expect("the page is taken");
+        let assembling = {
+            let module = Arc::clone(&module);
+            tokio::spawn(async move {
+                module
+                    .read_released(
+                        &Stub { unaccounted: true },
+                        &Caller::Owner,
+                        &owner(),
+                        &inbox_request(),
+                    )
+                    .await
+            })
+        };
+        let ControlFrame::AttentionText(request) =
+            reader.read_message::<ControlFrame>().await.expect("asked")
+        else {
+            panic!("a text request");
+        };
+        writer
+            .write_message(&ControlFrame::AttentionTextAnswer(Box::new(
+                AttentionTextAnswer {
+                    request_id: request.request_id,
+                    privacy_generation: Nullable::some(U64::ZERO),
+                    release_until_boot_ms: lease_from_now(),
+                    texts: request
+                        .records
+                        .iter()
+                        .map(|record| AttentionRecordText {
+                            source: record.source,
+                            sequence: record.sequence,
+                            text: Nullable::some("which branch?".to_owned()),
+                        })
+                        .collect(),
+                },
+            )))
+            .await
+            .expect("answers");
+        let assembled = assembling.await.expect("the read finishes");
+        assert!(!assembled.ticket.is_empty(), "the answer carries live text");
+
+        // A delivery's ticket and an answer part way to its reader, from the same session.
+        let delivery = ticket(&[closing], 0, lease_from_now().get());
+        assert_eq!(module.release_delivery(&delivery, || 1).await, Some(1));
+        let (mut partway, mut partway_reader) = owner_connection(&temp, 2).await;
+        let writing = {
+            let module = Arc::clone(&module);
+            let ticket = ticket(&[closing], 0, lease_from_now().get());
+            tokio::spawn(async move {
+                let written = module
+                    .write_released(
+                        &mut partway,
+                        StreamKind::Control,
+                        Released {
+                            frame: answer_of(900 * 1024),
+                            withheld: Some(withheld()),
+                            ticket,
+                        },
+                    )
+                    .await;
+                drop(partway);
+                written
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!writing.is_finished());
+
+        module
+            .session_closed(&Stub { unaccounted: true }, closing)
+            .await;
+        let draining =
+            tokio::spawn(async move { partway_reader.read_message::<ControlFrame>().await });
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), writing)
+                .await
+                .expect("the write stops")
+                .expect("the write finishes")
+                .is_err(),
+            "the rest of the answer does not go"
+        );
+        let _ = draining.await;
+        assert_eq!(module.release_delivery(&delivery, || 1).await, None);
+        let (mut whole, mut whole_reader) = owner_connection(&temp, 3).await;
+        module
+            .write_released(&mut whole, StreamKind::Control, assembled)
+            .await
+            .expect("the withheld answer is written");
+        let read = whole_reader
+            .read_message::<ControlFrame>()
+            .await
+            .expect("the reader gets an answer");
+        let ControlFrame::Response(response) = read else {
+            panic!("a response");
+        };
+        let Outcome::Ok(value) = response.outcome else {
+            panic!("the read was refused");
+        };
+        let inbox: AttentionReadResult = value.to_typed().expect("decodes");
+        assert!(inbox.items.iter().all(|item| !item.summary.is_present()));
+
+        // A closure the host could account for keeps what the worker answered releasable.
+        let handed_over = SessionId::new(kr_ipc::new_uuid());
+        set_fence(
+            &module,
+            handed_over,
+            SessionFence {
+                recorded: Some(0),
+                ..SessionFence::default()
+            },
+        )
+        .await;
+        let kept = ticket(&[handed_over], 0, lease_from_now().get());
+        module
+            .session_closed(&Stub { unaccounted: false }, handed_over)
+            .await;
+        assert_eq!(module.release_delivery(&kept, || 1).await, Some(1));
+    }
+
     /// KR-REQ-24.11: an owner's answer partly written when the barrier rises is not finished: the
     /// next transport write is refused, and the caller ends the connection, so the reader never
     /// holds the whole answer.
@@ -3040,7 +3211,7 @@ mod tests {
             session_id,
             SessionFence {
                 recorded: Some(0),
-                barrier: false,
+                ..SessionFence::default()
             },
         )
         .await;
@@ -3102,7 +3273,7 @@ mod tests {
                 session_id,
                 SessionFence {
                     recorded: Some(0),
-                    barrier: false,
+                    ..SessionFence::default()
                 },
             )
             .await;
@@ -3140,7 +3311,7 @@ mod tests {
             session_id,
             SessionFence {
                 recorded: Some(0),
-                barrier: false,
+                ..SessionFence::default()
             },
         )
         .await;
@@ -3242,7 +3413,7 @@ mod tests {
             session_id,
             SessionFence {
                 recorded: Some(0),
-                barrier: false,
+                ..SessionFence::default()
             },
         )
         .await;
@@ -3263,7 +3434,7 @@ mod tests {
             session_id,
             SessionFence {
                 recorded: Some(1),
-                barrier: false,
+                ..SessionFence::default()
             },
         )
         .await;

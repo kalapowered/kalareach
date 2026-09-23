@@ -135,17 +135,22 @@ impl AttentionFence {
     /// Takes the next statement's place and builds it from the state as it is now.
     ///
     /// `generation` reads the journal's privacy generation; it is called with the state held, so
-    /// the generation and whether a transition is raised are read as one.
+    /// the generation and whether a transition is raised are read as one. A statement that cannot
+    /// name the generation says a transition is in progress whatever the state says: lowering the
+    /// daemon's barrier without naming the generation committed would leave it releasing text
+    /// decided under the one before, so a statement that cannot say where the session stands keeps
+    /// the barrier where it is.
     fn statement(
         state: &mut FenceState,
         generation: impl FnOnce() -> Option<u64>,
     ) -> AttentionBarrier {
         state.sequence = state.sequence.saturating_add(1);
+        let generation = generation();
         AttentionBarrier {
             request_id: RequestId::new(state.sequence),
             sequence: U64::new(state.sequence),
-            raised: state.raised,
-            generation: Nullable(generation().map(U64::new)),
+            raised: state.raised || generation.is_none(),
+            generation: Nullable(generation.map(U64::new)),
         }
     }
 
@@ -480,6 +485,20 @@ mod tests {
         assert!(raised.frame.raised && second.raised);
         assert!(!settled.frame.raised);
         assert_eq!(settled.frame.generation, Nullable::some(U64::new(1)));
+    }
+
+    /// A statement that cannot name the journal's generation says a transition is in progress,
+    /// even once the transition has been settled.
+    #[test]
+    fn a_statement_that_cannot_name_the_generation_keeps_the_barrier() {
+        let (fence, _clock) = fence();
+        let first = fence.began(connection(), 1, || None);
+        assert!(first.raised);
+        assert_eq!(first.generation, Nullable::null());
+        let _ = fence.raise(|| Some(0));
+        let settled = fence.settle(|| None);
+        assert!(settled.frame.raised, "an unknown generation lowers nothing");
+        assert!(!fence.is_raised(), "though the transition itself is over");
     }
 
     /// No answer carries text while a transition is raised or when one began or ended while its
