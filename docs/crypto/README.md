@@ -97,6 +97,7 @@ can. The domains this crate and `kr-protocol` define:
 | `kr-pair/owner-confirm/1` | An owner-confirmation challenge |
 | `kr-revocation/1`, `kr-authority/1` | A revocation request and a host authority revision record |
 | `kr-archive-manifest/1` | A signed archive manifest |
+| `kr-collection-keys/1` | A synchronised collection's key record: its members, its epoch and each member's key wrap |
 | `kr-recovery-bundle/1` | The retrieval context a recovery bundle's key is derived from |
 | `KRRECOV1` | The `crypto_kdf` context of the recovery seed |
 
@@ -177,8 +178,9 @@ size*, which is the quantity section 20 bounds, and names the limit it hit;
 
 ### Revocation, rotation and the checkpoint
 
-Revoking a recipient removes it from every future wrap, and for a mutable shared collection it
-rotates the keys as well. The rotation is a rule rather than a report: revoking advances
+Revoking recipients removes them from every future wrap, and for a mutable shared collection it
+rotates the keys as well. `ArchiveRecipients::revoke` takes every recipient that leaves in one step
+and advances the rotation once for all of them. The rotation is a rule rather than a report: revoking advances
 `ArchiveRecipients::rotation`, every staged object carries the rotation it was made under, and
 `seal_archive` refuses one from before the current rotation. Resuming it makes it again under a new
 key. `StagedObject`'s fields are private for that reason - the only ways to obtain one are
@@ -286,6 +288,35 @@ asked for. The revision travels with it so a reader can see whether the two devi
 content.
 Binding the requested collection into the additional data would be sound as well; it is left out
 because the check inside the plaintext is the one a reader has to make either way.
+
+### Collection keys
+
+A synchronised collection is sealed under one key per epoch, and the devices that hold it are the
+members a signed key record names (`kr_protocol::collection_keys`). The record carries, for every
+member, the epoch's key wrapped to that member's stored-envelope key: `crypto_box_easy` from the
+issuer's stored-envelope key under a fresh random nonce, over `CBOR([context, key])`, where the
+context names the format `kr-collection-key-wrap/1`, the collection, the epoch and both key
+identifiers. A wrap therefore opens for one collection, one epoch and one recipient, and
+`open_collection_key` checks both parties against the expected context before it opens anything,
+because a box sealed from A to B also opens from B to A. It opens against a sender key the caller
+chose from its own paired records; nothing reads a sender key out of a record.
+
+`issue_collection_key_record` wraps the key for every member, the issuer included, and signs the
+record under `kr-collection-keys/1`, so every wrap in a record has one sender and every record names
+its issuer among its members. `check_genesis` is the first record's rule: revision one, the first
+epoch, nothing before it, and its issuer alone, whose installation is the collection's home.
+`check_successor` is the rule between two records: the same collection and home, the next revision,
+the previous record's digest, an issuer that was already a member with the same keys, and an epoch
+that stays or moves on by one, where an unchanged epoch only adds members. A removal therefore
+cannot be recorded without a new epoch; whether the new epoch's key is fresh is the issuer's to
+ensure, since nothing that reads a record can see it.
+
+`CollectionMembers` is the member set: an `ArchiveRecipients` of a mutable shared collection, whose
+rotation is the epoch, with each member's authorisation key beside it. Adding a member keeps the
+epoch; removing members advances it once and returns the same `Revocation` a backup recipient's
+removal does, which claims no retroactive secrecy. `Revocation::describe_settings_sync` is the
+sentence a person reads: the devices that stay get a new key, and the one that left keeps what it
+already had.
 
 ## Authority inside an envelope
 
@@ -447,7 +478,7 @@ answered by ending idle connections rather than by forgetting a challenge.
 
 `fixtures/crypto/` holds the documents below. The first three are regenerated with
 `cargo run -p kr-crypto --bin kr-crypto-vectors` and checked in continuous integration with
-`--check`, as is `relay.json`. `recovery-kit.json` is checked by `crates/kr-client/tests/
+`--check`, as are `relay.json` and `collection-keys.json`. `recovery-kit.json` is checked by `crates/kr-client/tests/
 recovery.rs::the_printed_kit_is_the_document_the_fixture_publishes` instead, because the rendering
 it pins belongs to `kr-client` rather than to the vector generator:
 
@@ -456,6 +487,7 @@ it pins belongs to `kr-client` rather than to the vector generator:
 | `signatures.json` | Ed25519 signatures over the domain-separated transcripts `fixtures/cbor/digests.json` and `fixtures/protocol/transcripts.json` publish, both `kr-connect/1` proofs over the published connection transcript, the RFC 8032 section 7.1 test vector, and three negative cases a verifier must reject |
 | `envelopes.json` | A sealed mailbox envelope with its authenticated plaintext and canonical bytes; a signed revocation request forwarded in an envelope, with the exact bytes its signature covers; a sealed manifest key wrap with its plaintext; the section 20 size buckets |
 | `kdf.json` | The RFC 5869 HKDF-SHA256 vector, an HMAC-SHA256 vector, the `KRRECOV1` subkeys with the recovery recipient's public key, and the context-bound bundle key |
+| `collection-keys.json` | A synchronised collection's first two key records, one member creating it and then adding a second at the same epoch, with the bytes each signature covers, each record's digest, and the second member's key wrap with its plaintext |
 | `recovery-kit.json` | The printable and QR recovery kit for the same test seed: its profile version, checksum, grouped base32 seed, locator, origins and the exact document bytes |
 
 Only domain-separated transcripts are signed. `fixtures/cbor/digests.json` also publishes a complete
