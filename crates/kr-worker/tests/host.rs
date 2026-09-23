@@ -79,6 +79,17 @@ impl WorkerSupervisor for WorkerWithPackageRoot {
     }
 }
 
+/// One request the daemon made of its supervisor.
+#[derive(Clone, Debug)]
+struct Launch {
+    /// What was asked for: `worker <program>` or `service <label>`.
+    what: String,
+    /// For a worker, what the environment's registry held for its session at that moment, read
+    /// from the database on disk through a connection of its own: the reservation's phase and its
+    /// create token, or why nothing could be read.
+    reserved: Option<String>,
+}
+
 /// Starts what `DetachedSupervisor` starts, and keeps a list of every request.
 ///
 /// A worker and a separately supervised service, such as the plugin runtime, are both started
@@ -86,26 +97,55 @@ impl WorkerSupervisor for WorkerWithPackageRoot {
 /// for this environment.
 #[derive(Debug)]
 struct RecordingSupervisor {
-    launched: Arc<std::sync::Mutex<Vec<String>>>,
+    launched: Arc<std::sync::Mutex<Vec<Launch>>>,
+    registry: PathBuf,
 }
 
 impl RecordingSupervisor {
-    fn note(&self, launch: String) {
+    fn note(&self, launch: Launch) {
         self.launched
             .lock()
             .expect("the launch list is not poisoned")
             .push(launch);
     }
+
+    /// The durable reservation for `session_id`, as another reader of the database sees it.
+    fn reserved(&self, session_id: SessionId) -> String {
+        rusqlite::Connection::open_with_flags(
+            &self.registry,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .and_then(|connection| {
+            connection.query_row(
+                "SELECT phase, lower(hex(create_token)) FROM reservations WHERE session_id = ?1",
+                [session_id.get().as_bytes().as_slice()],
+                |row| {
+                    Ok(format!(
+                        "{} {}",
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?
+                    ))
+                },
+            )
+        })
+        .unwrap_or_else(|error| format!("nothing readable: {error}"))
+    }
 }
 
 impl WorkerSupervisor for RecordingSupervisor {
     fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
-        self.note(format!("worker {}", launch.program.display()));
+        self.note(Launch {
+            what: format!("worker {}", launch.program.display()),
+            reserved: Some(self.reserved(launch.session_id)),
+        });
         DetachedSupervisor::new().start(launch)
     }
 
     fn start_service(&self, launch: &ServiceLaunch) -> LaunchOutcome {
-        self.note(format!("service {}", launch.label));
+        self.note(Launch {
+            what: format!("service {}", launch.label),
+            reserved: None,
+        });
         DetachedSupervisor::new().start_service(launch)
     }
 
@@ -123,7 +163,7 @@ struct Host {
     /// Where the worker this daemon starts looks for its own, when a test gives it one.
     worker_packages: Option<PathBuf>,
     /// Everything the daemon asked its supervisor to start, when a test keeps the list.
-    launched: Option<Arc<std::sync::Mutex<Vec<String>>>>,
+    launched: Option<Arc<std::sync::Mutex<Vec<Launch>>>>,
 }
 
 impl Host {
@@ -165,14 +205,22 @@ impl Host {
         self
     }
 
-    /// What the daemon has asked its supervisor to start so far.
-    fn launches(&self) -> Vec<String> {
+    /// Every request the daemon has made of its supervisor so far.
+    fn requests(&self) -> Vec<Launch> {
         self.launched
             .as_ref()
             .expect("this host keeps a list of launches")
             .lock()
             .expect("the launch list is not poisoned")
             .clone()
+    }
+
+    /// What the daemon has asked its supervisor to start so far.
+    fn launches(&self) -> Vec<String> {
+        self.requests()
+            .into_iter()
+            .map(|launch| launch.what)
+            .collect()
     }
 
     fn with_shell_package(mut self) -> Self {
@@ -265,7 +313,10 @@ impl Host {
                 boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
                 supervisor: match (self.worker_packages.clone(), self.launched.clone()) {
                     (Some(packages), _) => Box::new(WorkerWithPackageRoot { packages }),
-                    (None, Some(launched)) => Box::new(RecordingSupervisor { launched }),
+                    (None, Some(launched)) => Box::new(RecordingSupervisor {
+                        launched,
+                        registry: environment.registry_database(),
+                    }),
                     (None, None) => Box::new(DetachedSupervisor::new()),
                 },
                 worker_program: self.worker.clone(),
@@ -748,7 +799,8 @@ impl LocalTerminal {
 /// terminal attached on this machine keeps receiving it; a new terminal attaches through the
 /// worker's own descriptor and endpoint while no daemon is running, and types into the shell;
 /// and once a replacement daemon has taken over, the session is live with both terminals still
-/// attached, and a terminal attaching then is drawn the screen as it now is.
+/// attached, and a terminal attaching then is drawn the screen as it now is: the text, the title
+/// and the mode the application set before the daemon went are all still in it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_restart_during_output_keeps_the_local_terminals_and_the_screen() {
     let host = Host::create();
@@ -761,12 +813,20 @@ async fn a_daemon_restart_during_output_keeps_the_local_terminals_and_the_screen
 
     // A terminal attached on this machine starts a ticker in the shell: output that keeps coming
     // whatever the daemon is doing, until a file appears in the session's own directory. What the
-    // shell echoes of the command is `kr-%s`, so only the ticker itself produces `kr-tick`.
+    // shell echoes of the command is `kr-%s`, so only the ticker itself produces `kr-tick`. Each
+    // tick returns to the start of its line rather than starting a new one, so the ticks do not
+    // scroll the screen and what was written before the daemon went stays on it.
     let mut watching = LocalTerminal::attach(&host, session_id, dimensions, true).await;
     watching
-        .type_line("(while [ ! -e kr-stop ]; do printf 'kr-%s\\n' tick; sleep 0.2; done) &")
+        .type_line("(while [ ! -e kr-stop ]; do printf 'kr-%s\\r' tick; sleep 0.2; done) &")
         .await;
     watching.shown("kr-tick", 1).await;
+    // State of the terminal's own, set before the daemon goes: a line of text, a title and a mode.
+    // Each is spelled so that only the output produces it, never the shell's echo of the command.
+    watching
+        .type_line("printf '\\033]2;kr-%s\\007\\033[?2004hkr-%s-%s\\n' title before restart")
+        .await;
+    watching.shown("kr-before-restart", 1).await;
 
     // The daemon goes while the ticker is writing, and the output keeps arriving.
     let generation = first.generation;
@@ -815,6 +875,17 @@ async fn a_daemon_restart_during_output_keeps_the_local_terminals_and_the_screen
     watching.shown("kr-settled", 1).await;
     let mut late = LocalTerminal::attach(&host, session_id, dimensions, false).await;
     late.shown("kr-settled", 1).await;
+    for (what, drawn) in [
+        ("the line written before the restart", "kr-before-restart"),
+        ("the title set before it", "\u{1b}]2;kr-title"),
+        ("and the mode set before it", "\u{1b}[?2004h"),
+    ] {
+        assert!(
+            late.seen.contains(drawn),
+            "the screen a terminal is drawn after the restart holds {what}: {:?}",
+            late.seen
+        );
+    }
 
     close(&mut client, &host, session_id).await;
     second.stop().await;
@@ -964,8 +1035,8 @@ async fn the_descriptor_is_published_whole_and_owner_only_and_names_the_worker()
 /// KR-REQ-07.02: a create presented for attaching makes the session at the creating terminal's
 /// size, and that terminal then attaches to it.
 /// KR-REQ-07.03: the size of the terminal a session is created from travels in the create request
-/// and is the pseudo-terminal's size before the root shell starts, so it is the size the shell
-/// sees without anything resizing it afterwards.
+/// and is the pseudo-terminal's size before the root shell starts: the shell's own first command,
+/// run as it starts and before anything attaches or types, reads that size.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_creating_terminals_size_is_the_shells_from_the_start() {
     let host = Host::create();
@@ -975,6 +1046,18 @@ async fn the_creating_terminals_size_is_the_shells_from_the_start() {
     let mut params = create_params(host.environment_id, host.temp.root());
     params.presentation = Presentation::Attach;
     params.dimensions = Nullable::some(size);
+    // An interactive POSIX shell runs the file `ENV` names as it starts, before its first prompt,
+    // so the size this file records is the one the shell was started at.
+    let startup = host.temp.root().join("kr-measure-at-start.sh");
+    let measured = host.temp.root().join("kr-size-at-start");
+    std::fs::write(&startup, format!("stty size > '{}'\n", measured.display()))
+        .expect("writes the shell's startup file");
+    params
+        .environment_snapshot
+        .push(kr_protocol::session::EnvironmentVariable {
+            name: "ENV".to_owned(),
+            value: startup.display().to_string(),
+        });
     let created: SessionCreateResult = client
         .mutate(
             Method::SessionCreate,
@@ -988,8 +1071,26 @@ async fn the_creating_terminals_size_is_the_shells_from_the_start() {
         .to_typed()
         .expect("decodes");
     assert_eq!(created.session.dimensions, size);
-    // A terminal of that size attaches without claiming it, so nothing can resize the session
-    // before the shell is asked what size it is running at.
+    let started = std::time::Instant::now();
+    let at_start = loop {
+        if let Ok(text) = std::fs::read_to_string(&measured)
+            && text.ends_with('\n')
+        {
+            break text;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "waited {:?} for the shell to measure its terminal as it started",
+            started.elapsed()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        at_start.trim(),
+        "30 100",
+        "the shell started at the creating terminal's size"
+    );
+    // A terminal of that size attaches without claiming it, and the shell still says the same.
     let mut terminal = LocalTerminal::attach(&host, created.session.session_id, size, true).await;
     terminal.type_line("stty size").await;
     terminal.shown("30 100", 1).await;
@@ -1189,10 +1290,11 @@ fn worker_dirs(host: &Host) -> Vec<String> {
 }
 
 /// KR-REQ-07.14: a create past the environment's limit is refused with `SESSION_LIMIT` before
-/// anything is spawned, and the session already running is not evicted to make room.
+/// anything is spawned: the daemon's only request of its supervisor is the first session's worker.
+/// The session already running is not evicted to make room.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_environment_limit_refuses_before_anything_is_spawned() {
-    let host = Host::create();
+    let host = Host::create().recording_launches();
     {
         // The limit is part of the environment's record, so it is set before the daemon starts.
         let mut registry = Registry::open(host.paths().registry_database(), host.environment_id)
@@ -1242,14 +1344,21 @@ async fn the_environment_limit_refuses_before_anything_is_spawned() {
         SessionState::Live,
         "and the session that was running still is"
     );
+    assert_eq!(
+        host.launches(),
+        [format!("worker {}", host.worker.display())],
+        "the refused create launched nothing"
+    );
     close(&mut client, &host, created.session.session_id).await;
 }
 
-/// KR-REQ-07.07: a create retried with its token resolves to the session its first attempt made,
-/// and the environment holds one session and one worker for it, not two.
+/// KR-REQ-07.07, KR-REQ-24.05: by the time the daemon asks its supervisor for the worker, the create
+/// is already durable: another reader of the registry's database finds its reservation, under its
+/// create token, in the spawned phase. A create retried with that token resolves to the session its
+/// first attempt made, and the environment holds one session, one launch and one worker for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_repeated_create_token_returns_the_same_session() {
-    let host = Host::create();
+    let host = Host::create().recording_launches();
     let _controller = host.start().await;
     let mut client = host.client().await;
     let token = ActionId::new(kr_ipc::new_uuid());
@@ -1308,14 +1417,28 @@ async fn a_repeated_create_token_returns_the_same_session() {
         listed.sessions
     );
     assert_eq!(worker_dirs(&host).len(), 1, "and one worker was prepared");
+    let requests = host.requests();
+    assert_eq!(requests.len(), 1, "and launched: {requests:?}");
+    let token_hex: String = token
+        .get()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(
+        requests[0].reserved.as_deref(),
+        Some(format!("spawned {token_hex}").as_str()),
+        "the reservation was on disk, under this create's token, when the worker was asked for"
+    );
     close(&mut client, &host, first.session.session_id).await;
 }
 
-/// KR-REQ-05.05: a closed session's descriptor is retired, a reader asking about the session is
-/// answered with the closure record its worker wrote, and asking starts nothing.
+/// KR-REQ-05.05: a closed session's descriptor is retired, the daemon answers a reader asking about
+/// the session with the closure record its worker wrote, and asking launches nothing: the only
+/// process the daemon ever asked its supervisor for is the session's original worker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_closed_session_answers_with_the_record_its_worker_wrote() {
-    let host = Host::create();
+    let host = Host::create().recording_launches();
     let _controller = host.start().await;
     let mut client = host.client().await;
     let created = create(&mut client, &host).await;
@@ -1412,6 +1535,11 @@ async fn a_closed_session_answers_with_the_record_its_worker_wrote() {
         running.sessions.is_empty(),
         "reading a closed session started nothing: {:?}",
         running.sessions
+    );
+    assert_eq!(
+        host.launches(),
+        [format!("worker {}", host.worker.display())],
+        "and no process was launched for it after the first"
     );
 }
 
