@@ -506,6 +506,13 @@ public final class VoiceCallControl: @unchecked Sendable {
         }
     }
 
+    /// A reading of the recorder showed nothing new, or came from before the device last changed.
+    /// It changes nothing, but it reaches the call like everything else does, so it ends a call
+    /// whose deadline has passed.
+    public func recorderUnchanged() {
+        entered {}
+    }
+
     /// The person's own mute. Nothing the system does changes it.
     public func setMutedByPerson(_ muted: Bool) {
         change { now in gate.setMutedByPerson(muted, nowMs: now) }
@@ -770,9 +777,14 @@ public final class VoiceRecorderReader {
     public func request() -> UInt64? { on ? generation : nil }
 
     /// A reading asked for in `generation`: the source's total captured seconds, nil when the
-    /// report had none, at `atMs` on the monotonic clock.
+    /// report had none, at `atMs` on the monotonic clock. Every reading reaches the call, one that
+    /// shows nothing new or comes too late included, so the first reading after the deadline ends
+    /// the call however late its timer is.
     public func reading(capturedSeconds: Double?, generation: UInt64, atMs: UInt64) {
-        guard on, generation == self.generation else { return }
+        guard on, generation == self.generation else {
+            control.recorderUnchanged()
+            return
+        }
         switch watch.observe(capturedSeconds: capturedSeconds, atMs: atMs) {
         case let .started(at)?:
             control.recorder(running: true)
@@ -782,7 +794,7 @@ public final class VoiceRecorderReader {
         case .stopped?:
             control.recorder(running: false)
         case nil:
-            break
+            control.recorderUnchanged()
         }
     }
 

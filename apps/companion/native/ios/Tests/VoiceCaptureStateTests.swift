@@ -436,6 +436,7 @@ final class VoiceCallControlTests: XCTestCase {
             ("the recorder starting", { control, _ in control.recorder(running: true) }),
             ("the recorder stopping", { control, _ in control.recorder(running: false) }),
             ("audio seen arriving", { control, platform in control.recorderHeard(atMs: platform.now) }),
+            ("a reading that showed nothing new", { control, _ in control.recorderUnchanged() }),
             ("the person's mute", { control, _ in control.setMutedByPerson(true) }),
             ("the playback mute", { control, _ in control.setPlaybackMuted(true) }),
             ("an interruption", { control, _ in control.interruption(began: true, mayResume: false) }),
@@ -784,6 +785,29 @@ final class VoiceRecorderReaderTests: XCTestCase {
         XCTAssertTrue(control.couldHaveHeard(atMs: 1_400))
         XCTAssertFalse(control.couldHaveHeard(atMs: 1_600), "the report after the deadline is not taken")
         XCTAssertFalse(control.couldHaveHeard(atMs: 2_100), "nothing after the deadline")
+    }
+
+    /// A reading after the deadline that shows nothing new, with the timer late and the quiet time
+    /// not yet over, still reaches the call and ends it.
+    func testAReadingThatShowsNothingNewAfterTheDeadlineEndsTheCall() {
+        let (_, reader, platform, switches) = permitted(seconds: 1)
+        read(reader, platform, [(1_000, 0), (1_250, 0.25), (1_500, 0.5)])
+        XCTAssertTrue(switches.microphoneOn)
+        read(reader, platform, [(2_050, 0.5)])
+        XCTAssertFalse(switches.microphoneOn)
+    }
+
+    /// So does a reading from before the device last changed, which is otherwise dropped.
+    func testAStaleReadingAfterTheDeadlineEndsTheCall() {
+        let (_, reader, platform, switches) = permitted(seconds: 1)
+        read(reader, platform, [(1_000, 0), (1_250, 0.25), (1_500, 0.5)])
+        let stale = reader.request()!
+        reader.device(on: false)
+        reader.device(on: true)
+        XCTAssertTrue(switches.microphoneOn)
+        platform.now = 2_050
+        reader.reading(capturedSeconds: 0.75, generation: stale, atMs: 2_050)
+        XCTAssertFalse(switches.microphoneOn)
     }
 
     /// A reading while the device is off, or one from before it came on, is not taken.
