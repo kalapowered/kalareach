@@ -849,3 +849,354 @@ async fn a_device_cannot_take_or_probe_another_grant_s_workflow() {
         .expect_err("the journal cannot hold this revision number");
     assert!(refusal.to_string().contains("revision"), "{refusal}");
 }
+
+/// A node with the parameters its action kind requires.
+fn typed_node(node_id: &str, action_kind: &str) -> WorkflowNode {
+    WorkflowNode {
+        node_id: node_id.to_owned(),
+        action_kind: action_kind.to_owned(),
+        action_params: match action_kind {
+            "request_review" => r#"{"reviewer_id": "reviewer"}"#.to_owned(),
+            "create_session" => r#"{"title": "follow-up"}"#.to_owned(),
+            _ => r#"{"suite": "unit"}"#.to_owned(),
+        },
+        declared_environment: Nullable::null(),
+    }
+}
+
+/// Installs and enables a one-node workflow, as the owner or as a paired device.
+fn installed(
+    service: &AutomationService,
+    id: u8,
+    grant: GrantId,
+    trigger: &str,
+    action_kind: &str,
+    device: Option<GrantId>,
+) -> WorkflowDefinition {
+    use kr_protocol::method::Method;
+
+    let mut definition = create_workflow_definition(
+        test_wf_id(id),
+        1,
+        "chain member",
+        grant,
+        vec![typed_node("only", action_kind)],
+        vec![],
+    );
+    definition.trigger.event_type = trigger.to_owned();
+    let enable = WorkflowEnableParams {
+        workflow_id: definition.workflow_id,
+        revision: definition.revision,
+    };
+    match device {
+        None => {
+            service
+                .submit_install(&install_params(&definition), 1_000)
+                .expect("installs");
+            service.submit_enable(&enable, 1_000).expect("enables");
+        }
+        Some(held) => {
+            let device = as_device(held);
+            let key = common::fresh_action(Method::WorkflowInstall);
+            service
+                .install(&install_params(&definition), &device(&key), 1_000)
+                .expect("a device installs under its own grant");
+            let key = common::fresh_action(Method::WorkflowEnable);
+            service
+                .enable(&enable, &device(&key), 1_000)
+                .expect("a device enables its own workflow");
+        }
+    }
+    definition
+}
+
+/// A crossing the owner installs, a workflow under a device's grant triggered by the owner's
+/// events, brings a run under the device's grant into the owner's chain. That is the owner's
+/// decision, and what the device installed does not follow it there: a device's subscription is
+/// triggered only by a run whose whole chain, from its root, acts under the device's grant. In
+/// a chain of its own, the same subscription is triggered.
+#[tokio::test]
+async fn a_device_subscription_does_not_follow_an_owner_crossing_into_another_grant_s_chain() {
+    use kr_protocol::method::Method;
+
+    let owners = test_grant_id(25);
+    let devices = test_grant_id(26);
+    let service = service(
+        Arc::new(MockActionRunner::new()),
+        common::every_right(&[owners, devices]),
+    );
+    let producer = installed(&service, 40, owners, "manual", "run_tests", None);
+    let crossing = installed(
+        &service,
+        41,
+        devices,
+        "tests.passed",
+        "request_review",
+        None,
+    );
+    let subscriber = installed(
+        &service,
+        42,
+        devices,
+        "review.completed",
+        "create_session",
+        Some(devices),
+    );
+
+    let owners_run = service
+        .submit_run(&run_params(&producer, "evt-owner"), 1_000)
+        .await
+        .expect("the owner's run completes");
+    let mut decisions = service.dispatch_triggers(2_000).await.expect("a pass");
+    decisions.extend(service.dispatch_triggers(3_000).await.expect("a pass"));
+    assert!(
+        decisions.iter().any(
+            |decision| decision.workflow_id == crossing.workflow_id && decision.outcome.is_ok()
+        ),
+        "the owner's crossing joins the owner's chain: {decisions:?}"
+    );
+    assert!(
+        decisions
+            .iter()
+            .all(|decision| decision.workflow_id != subscriber.workflow_id),
+        "the device's subscription does not follow the crossing: {decisions:?}"
+    );
+    let budget = service
+        .store()
+        .get_budget(owners_run.causal_root_id)
+        .unwrap()
+        .expect("the owner's chain has a budget");
+    assert_eq!(
+        budget.total_runs, 2,
+        "the owner's run and the crossing only"
+    );
+
+    // A chain the device's own run started is the device's, and the subscription follows it.
+    let device_root = installed(
+        &service,
+        43,
+        devices,
+        "manual",
+        "request_review",
+        Some(devices),
+    );
+    let device = as_device(devices);
+    let key = common::fresh_action(Method::WorkflowRun);
+    service
+        .run(
+            &run_params(&device_root, "evt-device"),
+            &device(&key),
+            4_000,
+        )
+        .await
+        .expect("the device's run completes");
+    let decisions = service.dispatch_triggers(5_000).await.expect("a pass");
+    assert!(
+        decisions
+            .iter()
+            .any(|decision| decision.workflow_id == subscriber.workflow_id
+                && decision.outcome.is_ok()),
+        "{decisions:?}"
+    );
+}
+
+/// A device reads a run of its own that a crossing brought into another grant's chain as its
+/// own, and nothing of that chain: not the run it descends from, not the node that triggered it,
+/// not the chain's remaining budget, not the chain's alerts. The owner reads all of it.
+#[tokio::test]
+async fn a_device_reads_nothing_of_another_grant_s_chain_through_an_owner_crossing() {
+    use kr_protocol::automation::WorkflowReadParams;
+
+    let owners = test_grant_id(27);
+    let devices = test_grant_id(28);
+    let service = service(
+        Arc::new(MockActionRunner::new()),
+        common::every_right(&[owners, devices]),
+    );
+    let producer = installed(&service, 44, owners, "manual", "run_tests", None);
+    let crossing = installed(
+        &service,
+        45,
+        devices,
+        "tests.passed",
+        "request_review",
+        None,
+    );
+    let owners_run = service
+        .submit_run(&run_params(&producer, "evt-owner"), 1_000)
+        .await
+        .expect("the owner's run completes");
+    service.dispatch_triggers(2_000).await.expect("a pass");
+    let root = owners_run.causal_root_id;
+    // The owner's chain runs out of time, and owes its alert.
+    assert!(
+        service
+            .store()
+            .reserve_budget_action(root, 0, 1_000 + 3_600_001)
+            .is_err(),
+        "the chain is out of lifetime"
+    );
+
+    let about = |run_id| WorkflowReadParams {
+        workflow_id: Nullable::some(crossing.workflow_id),
+        run_id: Nullable::some(run_id),
+        causal_root_id: Nullable::some(root),
+        ..WorkflowReadParams::default()
+    };
+    let owners_view = service
+        .read(&WorkflowReadParams::default(), None, 3_000)
+        .expect("reads");
+    let crossing_run = owners_view
+        .runs
+        .iter()
+        .find(|run| run.workflow_id == crossing.workflow_id)
+        .expect("the crossing ran")
+        .clone();
+    assert_eq!(crossing_run.parent_run_id.0, Some(owners_run.run_id));
+    assert_eq!(crossing_run.causal_root_id, root);
+    let owners_view = service
+        .read(&about(crossing_run.run_id), None, 3_000)
+        .expect("reads");
+    assert!(owners_view.remaining_causal_budget.0.is_some());
+    assert!(
+        !owners_view.alerts.is_empty(),
+        "the owner sees the chain's alert"
+    );
+    assert!(
+        owners_view
+            .node_receipts
+            .iter()
+            .all(|receipt| receipt.causal_parent.0.is_some())
+    );
+
+    let devices_view = service
+        .read(&about(crossing_run.run_id), Some(devices), 3_000)
+        .expect("reads");
+    let seen = devices_view
+        .runs
+        .iter()
+        .find(|run| run.run_id == crossing_run.run_id)
+        .expect("the device sees the run under its grant");
+    assert_eq!(seen.parent_run_id.0, None);
+    assert_eq!(seen.parent_node_id.0, None);
+    assert_eq!(seen.trigger_event_id, kr_automation::DERIVED_TRIGGER_PREFIX);
+    assert!(!devices_view.node_receipts.is_empty());
+    assert!(
+        devices_view
+            .node_receipts
+            .iter()
+            .all(|receipt| receipt.causal_parent.0.is_none())
+    );
+    assert!(devices_view.remaining_causal_budget.0.is_none());
+    assert!(devices_view.alerts.is_empty(), "{:?}", devices_view.alerts);
+    assert!(
+        devices_view
+            .runs
+            .iter()
+            .all(|run| run.run_id != owners_run.run_id)
+    );
+}
+
+/// A revision number the journal cannot hold names no revision, whoever asks and whatever is
+/// stored at the largest number it can hold. Such a request is answered exactly as one for a
+/// revision that is not installed, before anything is said about the one that is.
+#[tokio::test]
+async fn a_revision_past_what_the_journal_holds_is_answered_as_not_installed() {
+    use kr_protocol::automation::WorkflowPauseParams;
+    use kr_protocol::error::ProtocolError;
+    use kr_protocol::method::Method;
+    use kr_protocol::scalars::U64;
+
+    let owners = test_grant_id(29);
+    let devices = test_grant_id(30);
+    let service = service(
+        Arc::new(MockActionRunner::new()),
+        common::every_right(&[owners, devices]),
+    );
+    let mut largest = create_workflow_definition(
+        test_wf_id(46),
+        1,
+        "the largest revision",
+        owners,
+        vec![typed_node("only", "run_tests")],
+        vec![],
+    );
+    largest.revision = U64::new(u64::try_from(i64::MAX).expect("fits"));
+    service
+        .submit_install(&install_params(&largest), 1_000)
+        .expect("the largest revision the journal holds installs");
+    let device = as_device(devices);
+    let past = U64::new(u64::MAX);
+
+    let key = common::fresh_action(Method::WorkflowEnable);
+    let absent = ProtocolError::from(
+        service
+            .enable(
+                &WorkflowEnableParams {
+                    workflow_id: largest.workflow_id,
+                    revision: U64::new(9),
+                },
+                &device(&key),
+                1_000,
+            )
+            .expect_err("not installed"),
+    );
+    let key = common::fresh_action(Method::WorkflowEnable);
+    let enable = ProtocolError::from(
+        service
+            .enable(
+                &WorkflowEnableParams {
+                    workflow_id: largest.workflow_id,
+                    revision: past,
+                },
+                &device(&key),
+                1_000,
+            )
+            .expect_err("no such revision"),
+    );
+    let key = common::fresh_action(Method::WorkflowPause);
+    let pause = ProtocolError::from(
+        service
+            .pause(
+                &WorkflowPauseParams {
+                    workflow_id: largest.workflow_id,
+                    revision: past,
+                    reason: Nullable::null(),
+                },
+                &device(&key),
+                1_000,
+            )
+            .expect_err("no such revision"),
+    );
+    let mut run = run_params(&largest, "evt-past");
+    run.revision = past;
+    let key = common::fresh_action(Method::WorkflowRun);
+    let ran = ProtocolError::from(
+        service
+            .run(&run, &device(&key), 1_000)
+            .await
+            .expect_err("no such revision"),
+    );
+    for refusal in [&enable, &pause, &ran] {
+        assert_eq!(refusal.code, absent.code, "{refusal:?}");
+        assert_eq!(refusal.message, absent.message, "{refusal:?}");
+        assert!(
+            !refusal.message.contains(&i64::MAX.to_string()),
+            "{refusal:?}"
+        );
+    }
+
+    // The owner is told the same: the number names nothing, not a revision that differs.
+    let owners_enable = ProtocolError::from(
+        service
+            .submit_enable(
+                &WorkflowEnableParams {
+                    workflow_id: largest.workflow_id,
+                    revision: past,
+                },
+                1_000,
+            )
+            .expect_err("no such revision"),
+    );
+    assert_eq!(owners_enable.code, absent.code, "{owners_enable:?}");
+}

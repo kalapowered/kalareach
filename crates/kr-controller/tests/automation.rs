@@ -1158,6 +1158,105 @@ fn a_clock_wound_back_does_not_revive_a_grant_a_dispatch_refused() {
     .expect_err("a clock wound back does not revive it");
 }
 
+/// A decision stands on the clock floor in memory, so a floor that could not be written down stops
+/// every dispatch until it is: on the next decision too, however many come in between and whatever
+/// the clock reads meanwhile. A decision taken on it instead would be one a restart could revive,
+/// because the floor on disk would still be the old one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clock_floor_that_could_not_be_written_down_stays_owed_until_it_is() {
+    use kr_automation::{AuthoritySource, AutomationError};
+    use kr_controller::automation::HostGrants;
+
+    let host = host().await;
+    let now = kr_ipc::now_ms().get();
+    let expires = now + 3_600_000;
+    let device_id = kr_protocol::ids::DeviceId::new(host.environment_id.get());
+    let grant = Grant {
+        grant_id: grant_id(15),
+        parent_grant_id: Nullable::null(),
+        issuer_device_id: device_id,
+        recipient_device_id: device_id,
+        authority_revision: host.controller.policy().authority_revision(),
+        environment_selector: EnvironmentSelector::Any,
+        session_selector: SessionSelector::Any,
+        actions: [ActionRight::AutomationManage].into_iter().collect(),
+        history: HistoryScope {
+            lower_bound_ms: Nullable::null(),
+            include_live_screen: false,
+            named_questions: CanonicalSet::new(),
+            named_approvals: CanonicalSet::new(),
+        },
+        expiry: GrantExpiry::At {
+            expires_at_ms: kr_protocol::scalars::TimestampMs::new(expires),
+        },
+        organisation: Nullable::null(),
+    };
+    host.controller
+        .sharing()
+        .grants()
+        .issue(&GrantRecord {
+            grant: grant.clone(),
+            session_id: None,
+            issued_at_ms: now,
+            activated_at_ms: Some(now),
+            revoked_at_ms: None,
+            revoked_by_parent: None,
+        })
+        .expect("the grant is written");
+    let grants = HostGrants::new(
+        Arc::clone(host.controller.sharing()),
+        Arc::clone(host.controller.devices()),
+        Arc::new(std::sync::Mutex::new(host.controller.policy())),
+        host.environment_id,
+    );
+    grants
+        .grant(grant.grant_id, now)
+        .expect("the grant stands before it expires");
+
+    // From here every write of the host's policy fails, as it would on a full disk.
+    let registry = rusqlite::Connection::open(host._temp.environment().registry_database())
+        .expect("opens the registry");
+    registry
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    registry
+        .execute_batch(
+            "CREATE TRIGGER refuse_policy BEFORE INSERT ON host_authority
+             WHEN NEW.key = 'policy'
+             BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("the fault is in place");
+    for reading in [expires + 1, expires + 1, expires - 1, now] {
+        let error = grants
+            .grant(grant.grant_id, reading)
+            .expect_err("nothing is decided on a floor that is not written down");
+        assert!(
+            matches!(error, AutomationError::AuthorityUnavailable(_)),
+            "at {reading}: {error}"
+        );
+    }
+
+    // Once the floor can be written down, the refusal stands, and it stands on disk.
+    registry
+        .execute_batch("DROP TRIGGER refuse_policy;")
+        .expect("the fault is cleared");
+    let error = grants
+        .grant(grant.grant_id, expires - 1)
+        .expect_err("the grant expired at the floor this host decided from");
+    assert!(
+        matches!(error, AutomationError::PermissionDenied(_)),
+        "{error}"
+    );
+    let stored = host
+        .controller
+        .sharing()
+        .grants()
+        .stored_policy()
+        .expect("reads the policy")
+        .expect("the host has a policy");
+    assert!(stored.utc_floor_ms.get() > expires, "{stored:?}");
+}
+
 mod net_support;
 
 /// Runs one automation mutation as a paired device and returns what the daemon answered.

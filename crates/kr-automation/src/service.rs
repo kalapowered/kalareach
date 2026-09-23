@@ -675,17 +675,15 @@ impl AutomationService {
         let Some(parent) = journal.run_record(*run_id)? else {
             return Ok((Vec::new(), Vec::new()));
         };
-        // The grant the producing run acts under. A revision a paired device installed is
-        // triggered only by runs under that device's own grant, so a device cannot subscribe to
-        // another grant's events, spend that chain's budget or learn about its runs.
-        let producer_grant = journal
-            .definition(parent.workflow_id, parent.revision)?
-            .map(|producer| producer.definition.grant_reference);
         let mut decisions = Vec::new();
         let mut started = Vec::new();
         for installed in journal.definitions_triggered_by(produced)? {
+            // A revision a paired device installed joins a chain only when every run in that
+            // chain, from its root to the producing run, acts under the device's own grant. So a
+            // device cannot subscribe to another grant's events, spend another grant's chain or
+            // read its runs back as parents, however the chain reached a run under its grant.
             if let Some(held) = installed.installed_under
-                && producer_grant != Some(held)
+                && !chain_acts_under(journal, &parent, held)?
             {
                 continue;
             }
@@ -809,10 +807,15 @@ impl AutomationService {
     /// Reads definitions, runs, node receipts, remaining causal budget and pending alerts
     /// (`workflow.read`).
     ///
-    /// `caller_grant` is the grant a paired device holds, when a paired device is asking: it is
-    /// shown only the workflows that act under that grant, their runs and receipts, the budgets
-    /// of the chains those runs belong to, and the alerts about any of them. The host's owner at
-    /// this machine passes `None` and is shown everything the request covers.
+    /// `caller_grant` is the grant a paired device holds, when a paired device is asking. It is
+    /// shown the workflows that act under that grant, their runs and those runs' receipts, and the
+    /// alerts about those workflows. It is shown a chain's remaining budget and the chain's alerts
+    /// only for a chain that is its grant's: one whose root run acts under that grant. A run of
+    /// its own that descends from a run under another grant, which only a crossing the host's
+    /// owner installed can start, is shown without anything of that other run: no parent run or
+    /// node, no causal parent in its receipts, and a trigger identifier that is the derived-trigger
+    /// prefix alone. The host's owner at this machine passes `None` and is shown everything the
+    /// request covers.
     ///
     /// # Errors
     ///
@@ -844,12 +847,42 @@ impl AutomationService {
                 .collect();
             runs.retain(|run| visible.contains(&(run.workflow_id, run.revision.get())));
         }
+        // A run a device may see can descend from a run under another grant, through a crossing
+        // the owner installed. That other run is not the device's to read, nor is anything that
+        // names it.
+        let mut foreign_parent = std::collections::HashSet::new();
+        if let Some(held) = caller_grant {
+            for run in &mut runs {
+                let Some(parent) = run.parent_run_id.0 else {
+                    continue;
+                };
+                if self.store.run_grant(parent)? != Some(held) {
+                    run.parent_run_id = Nullable::null();
+                    run.parent_node_id = Nullable::null();
+                    DERIVED_TRIGGER_PREFIX.clone_into(&mut run.trigger_event_id);
+                    foreign_parent.insert(run.run_id);
+                }
+            }
+        }
+        // Nor is a chain another grant's run started: its allowance and its alerts are that
+        // grant's, even when a crossing brought a device's run into it.
+        let own_chain = |root: CausalRootId| -> Result<bool> {
+            Ok(match caller_grant {
+                Some(held) => self.store.chain_grant(root)? == Some(held),
+                None => true,
+            })
+        };
 
         let mut node_receipts = Vec::new();
         if let Some(run_id) = params.run_id.0
             && runs.iter().any(|run| run.run_id == run_id)
         {
             node_receipts = self.store.list_node_receipts(run_id)?;
+            if foreign_parent.contains(&run_id) {
+                for receipt in &mut node_receipts {
+                    receipt.causal_parent = Nullable::null();
+                }
+            }
         }
 
         // A budget is answered only for a root the rest of this request actually covers, so a
@@ -859,7 +892,7 @@ impl AutomationService {
                 if runs.iter().any(|run| {
                     run.causal_root_id == root_id
                         && params.run_id.0.is_none_or(|named| run.run_id == named)
-                }) =>
+                }) && own_chain(root_id)? =>
             {
                 self.store
                     .get_budget(root_id)?
@@ -899,8 +932,16 @@ impl AutomationService {
                 .map(|definition| (definition.workflow_id, definition.revision.get()))
                 .collect()
         };
-        let roots: std::collections::HashSet<CausalRootId> =
-            selected.iter().map(|run| run.causal_root_id).collect();
+        let mut roots = std::collections::HashSet::new();
+        for root in selected
+            .iter()
+            .map(|run| run.causal_root_id)
+            .collect::<std::collections::HashSet<_>>()
+        {
+            if own_chain(root)? {
+                roots.insert(root);
+            }
+        }
         let mut alerts = self
             .store
             .pending_attention()?
@@ -1034,25 +1075,6 @@ impl AutomationService {
     }
 }
 
-/// Loads the exact revision a request names, with the journal's state for it.
-fn installed(
-    journal: &Journal<'_>,
-    workflow_id: WorkflowId,
-    revision: U64,
-) -> Result<InstalledDefinition> {
-    let installed = journal
-        .definition(workflow_id, revision.get())?
-        .ok_or(AutomationError::WorkflowNotFound(workflow_id))?;
-    if installed.definition.revision != revision {
-        return Err(AutomationError::RevisionMismatch {
-            workflow_id,
-            expected: revision.get(),
-            found: installed.definition.revision.get(),
-        });
-    }
-    Ok(installed)
-}
-
 /// Derives a descendant's causal context from the journal's record of the run that produced its
 /// trigger.
 ///
@@ -1107,22 +1129,57 @@ const MAX_ALERTS_READ: usize = 256;
 
 /// Loads the exact revision a submission names, when its caller may reach it.
 ///
-/// A paired device reaches only the revisions that act under the grant it holds. Any other is
-/// answered exactly as a revision that is not installed is, so a device learns neither that it
-/// exists nor which grant it acts under.
+/// A paired device reaches only the revisions that act under the grant it holds. Whether it may
+/// is decided before anything else is said about the revision, and any revision it cannot reach is
+/// answered exactly as a revision that is not installed, so a device learns neither that it exists
+/// nor which grant it acts under nor anything else the journal holds about it.
 fn visible(
     journal: &Journal<'_>,
     workflow_id: WorkflowId,
     revision: U64,
     submitted: &Submitted<'_>,
 ) -> Result<InstalledDefinition> {
-    let installed = installed(journal, workflow_id, revision)?;
-    match submitted.caller_grant {
-        Some(held) if installed.definition.grant_reference != held => {
-            Err(AutomationError::WorkflowNotFound(workflow_id))
-        }
-        _ => Ok(installed),
+    let Some(installed) = journal.definition(workflow_id, revision.get())? else {
+        return Err(AutomationError::WorkflowNotFound(workflow_id));
+    };
+    if let Some(held) = submitted.caller_grant
+        && installed.definition.grant_reference != held
+    {
+        return Err(AutomationError::WorkflowNotFound(workflow_id));
     }
+    if installed.definition.revision != revision {
+        return Err(AutomationError::RevisionMismatch {
+            workflow_id,
+            expected: revision.get(),
+            found: installed.definition.revision.get(),
+        });
+    }
+    Ok(installed)
+}
+
+/// Reports whether every run in a chain, from `run` back to its root, acts under `grant`.
+///
+/// Each step is the journal's own record of a run's parent, and a run at depth `n` has `n - 1`
+/// ancestors, so the walk takes at most `run.depth` steps. A walk that has not reached the root by
+/// then, or that meets a run it cannot find, answers no.
+fn chain_acts_under(journal: &Journal<'_>, run: &StoredRunRecord, grant: GrantId) -> Result<bool> {
+    let mut link = run.clone();
+    for _ in 0..run.depth.max(1) {
+        let acts_under = journal
+            .definition(link.workflow_id, link.revision)?
+            .is_some_and(|installed| installed.definition.grant_reference == grant);
+        if !acts_under {
+            return Ok(false);
+        }
+        let Some(parent) = link.parent_run_id else {
+            return Ok(true);
+        };
+        let Some(parent) = journal.run_record(parent)? else {
+            return Ok(false);
+        };
+        link = parent;
+    }
+    Ok(false)
 }
 
 /// An attention record as `workflow.read` shows it.

@@ -315,11 +315,14 @@ pub struct WorkflowRunSummary {
     /// Current status.
     pub status: WorkflowRunStatus,
     /// The run whose node triggered this one, as this host recorded it, when this run descends
-    /// from another. Absent for a run an external trigger started.
+    /// from another. Absent for a run an external trigger started, and, to a paired device, for a
+    /// run that another grant's run triggered.
     pub parent_run_id: Nullable<WorkflowRunId>,
-    /// The node of that run whose outcome triggered this one.
+    /// The node of that run whose outcome triggered this one, absent whenever the parent run is.
     pub parent_node_id: Nullable<String>,
-    /// Trigger event identifier.
+    /// Trigger event identifier. A trigger a node produced is `node:` followed by that node's
+    /// action identifier; a paired device is shown `node:` alone for one another grant's run
+    /// produced.
     pub trigger_event_id: String,
     /// When execution began.
     pub started_at_ms: TimestampMs,
@@ -361,7 +364,8 @@ pub struct NodeReceiptSummary {
     pub node_id: String,
     /// Action identifier assigned to this execution.
     pub action_id: ActionId,
-    /// Causal parent description.
+    /// The node of the parent run whose outcome triggered this run, when the run descends from
+    /// another and the reader may see that run.
     pub causal_parent: Nullable<String>,
     /// Node execution status.
     pub status: NodeStatus,

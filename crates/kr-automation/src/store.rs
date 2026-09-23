@@ -90,6 +90,14 @@ fn stored(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
+/// A definition revision as the journal keys it, or `None` for a number no revision can have.
+///
+/// A revision is stored exactly or not at all. Saturating it, as a count may be, would make every
+/// number past the largest one the store holds name the revision stored there.
+fn revision_key(revision: u64) -> Option<i64> {
+    i64::try_from(revision).ok()
+}
+
 /// Durable record of a workflow run, and the host's only source of causal ancestry.
 #[derive(Debug, Clone)]
 pub struct StoredRunRecord {
@@ -613,12 +621,15 @@ impl<'c> Journal<'c> {
         workflow_id: WorkflowId,
         revision: u64,
     ) -> Result<Option<InstalledDefinition>> {
+        let Some(key) = revision_key(revision) else {
+            return Ok(None);
+        };
         let found = self
             .conn
             .query_row(
                 "SELECT definition_json, enabled, paused, installed_under FROM workflow_definitions
                  WHERE workflow_id = ?1 AND revision = ?2",
-                params![workflow_id.to_string(), stored(revision)],
+                params![workflow_id.to_string(), key],
                 Self::parse_installed,
             )
             .optional()?;
@@ -658,14 +669,12 @@ impl<'c> Journal<'c> {
         installed_under: Option<GrantId>,
         installed_at_ms: u64,
     ) -> Result<()> {
-        // A revision is stored as a signed integer, and one the store could not hold exactly
-        // would collide with every larger number.
-        if i64::try_from(definition.revision.get()).is_err() {
+        let Some(key) = revision_key(definition.revision.get()) else {
             return Err(AutomationError::InvalidArgument(format!(
                 "a revision is at most {}",
                 i64::MAX
             )));
-        }
+        };
         self.admit()?;
         let def_json = serde_json::to_string(definition)?;
         self.conn
@@ -676,7 +685,7 @@ impl<'c> Journal<'c> {
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, ?7, ?8)",
                 params![
                     definition.workflow_id.to_string(),
-                    stored(definition.revision.get()),
+                    key,
                     definition.name,
                     definition.description.as_ref(),
                     def_json,
@@ -705,15 +714,12 @@ impl<'c> Journal<'c> {
     ///
     /// Returns [`AutomationError::WorkflowNotFound`] when the revision is not installed.
     pub fn set_enabled(&self, workflow_id: WorkflowId, revision: u64, enabled: bool) -> Result<()> {
+        let key = revision_key(revision).ok_or(AutomationError::WorkflowNotFound(workflow_id))?;
         self.admit()?;
         let updated = self.conn.execute(
             "UPDATE workflow_definitions SET enabled = ?1
              WHERE workflow_id = ?2 AND revision = ?3",
-            params![
-                i64::from(enabled),
-                workflow_id.to_string(),
-                stored(revision)
-            ],
+            params![i64::from(enabled), workflow_id.to_string(), key],
         )?;
         if updated == 0 {
             return Err(AutomationError::WorkflowNotFound(workflow_id));
@@ -727,11 +733,12 @@ impl<'c> Journal<'c> {
     ///
     /// Returns [`AutomationError::WorkflowNotFound`] when the revision is not installed.
     pub fn set_paused(&self, workflow_id: WorkflowId, revision: u64, paused: bool) -> Result<()> {
+        let key = revision_key(revision).ok_or(AutomationError::WorkflowNotFound(workflow_id))?;
         self.admit()?;
         let updated = self.conn.execute(
             "UPDATE workflow_definitions SET paused = ?1
              WHERE workflow_id = ?2 AND revision = ?3",
-            params![i64::from(paused), workflow_id.to_string(), stored(revision)],
+            params![i64::from(paused), workflow_id.to_string(), key],
         )?;
         if updated == 0 {
             return Err(AutomationError::WorkflowNotFound(workflow_id));
@@ -754,11 +761,14 @@ impl<'c> Journal<'c> {
         revision: u64,
         now_ms: u64,
     ) -> Result<()> {
+        let Some(key) = revision_key(revision) else {
+            return Ok(());
+        };
         self.admit()?;
         let resumed = self.conn.execute(
             "UPDATE workflow_definitions SET paused = 0
              WHERE workflow_id = ?1 AND revision = ?2 AND paused = 1",
-            params![workflow_id.to_string(), stored(revision)],
+            params![workflow_id.to_string(), key],
         )?;
         if resumed > 0 {
             self.record_event(
@@ -788,11 +798,14 @@ impl<'c> Journal<'c> {
         reason: &str,
         now_ms: u64,
     ) -> Result<()> {
+        let Some(key) = revision_key(revision) else {
+            return Ok(());
+        };
         self.admit()?;
         let paused = self.conn.execute(
             "UPDATE workflow_definitions SET paused = 1
              WHERE workflow_id = ?1 AND revision = ?2 AND paused = 0",
-            params![workflow_id.to_string(), stored(revision)],
+            params![workflow_id.to_string(), key],
         )?;
         if paused > 0 {
             self.record_event(
@@ -813,11 +826,14 @@ impl<'c> Journal<'c> {
     ///
     /// Returns a storage error when the row cannot be read.
     pub fn is_paused(&self, workflow_id: WorkflowId, revision: u64) -> Result<bool> {
+        let Some(key) = revision_key(revision) else {
+            return Ok(false);
+        };
         let paused: Option<i64> = self
             .conn
             .query_row(
                 "SELECT paused FROM workflow_definitions WHERE workflow_id = ?1 AND revision = ?2",
-                params![workflow_id.to_string(), stored(revision)],
+                params![workflow_id.to_string(), key],
                 |row| row.get(0),
             )
             .optional()?;
@@ -857,12 +873,15 @@ impl<'c> Journal<'c> {
         revision: u64,
         event_id: &str,
     ) -> Result<bool> {
+        let Some(key) = revision_key(revision) else {
+            return Ok(false);
+        };
         let found: Option<i64> = self
             .conn
             .query_row(
                 "SELECT 1 FROM trigger_dedup
                  WHERE workflow_id = ?1 AND revision = ?2 AND event_id = ?3",
-                params![workflow_id.to_string(), stored(revision), event_id],
+                params![workflow_id.to_string(), key, event_id],
                 |row| row.get(0),
             )
             .optional()?;
@@ -930,6 +949,44 @@ impl<'c> Journal<'c> {
         ))?;
         let rows = stmt.query_map(params![root_id.to_string()], Self::parse_run_record)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Reads the grant a run acts under: the one its recorded revision names.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the rows cannot be read.
+    pub fn run_grant(&self, run_id: WorkflowRunId) -> Result<Option<GrantId>> {
+        let Some(run) = self.run_record(run_id)? else {
+            return Ok(None);
+        };
+        Ok(self
+            .definition(run.workflow_id, run.revision)?
+            .map(|installed| installed.definition.grant_reference))
+    }
+
+    /// Reads the grant a causal chain belongs to: the one its root run acts under.
+    ///
+    /// A chain starts from exactly one run with no parent, the run of the external trigger the
+    /// host minted the root for, and every other run in it descends from that one.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the rows cannot be read.
+    pub fn chain_grant(&self, root_id: CausalRootId) -> Result<Option<GrantId>> {
+        let root_run = self
+            .conn
+            .query_row(
+                "SELECT run_id FROM workflow_runs
+                 WHERE causal_root_id = ?1 AND parent_run_id IS NULL",
+                params![root_id.to_string()],
+                |row| parse_stored_uuid(&row.get::<_, String>(0)?).map(WorkflowRunId::new),
+            )
+            .optional()?;
+        match root_run {
+            Some(run_id) => self.run_grant(run_id),
+            None => Ok(None),
+        }
     }
 
     fn parse_run_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRunRecord> {
@@ -1006,7 +1063,8 @@ impl<'c> Journal<'c> {
         now_ms: u64,
     ) -> Result<CausalBudget> {
         let wf_id_str = definition.workflow_id.to_string();
-        let rev = stored(definition.revision.get());
+        let rev = revision_key(definition.revision.get())
+            .ok_or(AutomationError::WorkflowNotFound(definition.workflow_id))?;
 
         if self.trigger_is_recorded(definition.workflow_id, definition.revision.get(), event_id)? {
             return Err(AutomationError::DuplicateTrigger {
@@ -2335,6 +2393,24 @@ impl WorkflowStore {
     /// Returns a storage error when the rows cannot be read.
     pub fn list_runs_by_root(&self, root_id: CausalRootId) -> Result<Vec<StoredRunRecord>> {
         self.read(|journal| journal.runs_by_root(root_id))
+    }
+
+    /// Reads the grant a run acts under.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the rows cannot be read.
+    pub fn run_grant(&self, run_id: WorkflowRunId) -> Result<Option<GrantId>> {
+        self.read(|journal| journal.run_grant(run_id))
+    }
+
+    /// Reads the grant a causal chain belongs to.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the rows cannot be read.
+    pub fn chain_grant(&self, root_id: CausalRootId) -> Result<Option<GrantId>> {
+        self.read(|journal| journal.chain_grant(root_id))
     }
 
     /// Commits a trigger, run, and budget reservation together in one local transaction.

@@ -72,6 +72,10 @@ pub struct HostGrants {
     devices: Arc<crate::service::net::devices::DeviceDirectory>,
     policy: Arc<std::sync::Mutex<HostPolicy>>,
     environment_id: EnvironmentId,
+    /// The clock floor as this module last wrote it down, and `None` before its first write.
+    ///
+    /// Read and changed only while the policy's lock is held.
+    written_floor: std::sync::Mutex<Option<u64>>,
 }
 
 impl HostGrants {
@@ -91,6 +95,7 @@ impl HostGrants {
             devices,
             policy,
             environment_id,
+            written_floor: std::sync::Mutex::new(None),
         }
     }
 
@@ -153,7 +158,6 @@ impl AuthoritySource for HostGrants {
                 .policy
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let floor = policy.utc_floor_ms();
             let decided = crate::grants::standing_at_dispatch(
                 &record,
                 &mut policy,
@@ -161,22 +165,30 @@ impl AuthoritySource for HostGrants {
                 ingress,
                 now_ms,
             );
-            // The floor the decision raised is written down while the lock is held, as the daemon
-            // writes every other raise of it, so it survives a restart. A floor that could not be
-            // written down is a decision this host could not stand on after one: a clock wound
-            // back before the next start would find the old floor and revive what was refused. So
-            // nothing is dispatched on it, and the raised floor stays in memory, which is the
-            // stricter answer while this daemon runs.
-            if policy.utc_floor_ms() != floor {
+            // A decision stands on the floor in memory, so that floor is written down before the
+            // decision is used, while the lock is held, as the daemon writes every other raise of
+            // it. A decision on a floor that is not on disk is one this host could not stand on
+            // after a restart: a clock wound back before the next start would find the old floor
+            // and revive what was refused. The write stays owed until it succeeds, whoever raised
+            // the floor and however many decisions come in between, and until then nothing is
+            // dispatched. The raised floor stays in memory meanwhile, which is the stricter answer
+            // while this daemon runs.
+            let floor = policy.utc_floor_ms();
+            let mut written = self
+                .written_floor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *written != Some(floor) {
                 self.sharing
                     .grants()
                     .store_policy(&policy.snapshot())
                     .map_err(|error| {
                         kr_automation::AutomationError::AuthorityUnavailable(format!(
-                            "the clock floor this decision raised could not be written down: \
+                            "the clock floor this decision stands on could not be written down: \
                              {error}"
                         ))
                     })?;
+                *written = Some(floor);
             }
             decided
         }
