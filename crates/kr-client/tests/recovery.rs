@@ -123,6 +123,8 @@ struct ScriptedService {
     keeps_refused_copies_as: Mutex<Option<SyncConflictId>>,
     /// Whether a fence that finds no receipt can still say nothing ever ran under the identity.
     fence_cannot_say_nothing_ran: Mutex<bool>,
+    /// A path the next exchange puts a directory at while it has the call, on the device's disk.
+    obstruct_during_the_next_exchange: Mutex<Option<std::path::PathBuf>>,
 }
 
 impl ScriptedService {
@@ -180,6 +182,18 @@ impl ScriptedService {
     /// Makes the next applied exchange answer with a position of the suite's choosing.
     fn next_exchange_answers(&self, position: SyncPosition) {
         *self.exchange_answers.lock().expect("the script") = Some(position);
+    }
+
+    /// Makes the device's disk refuse a file at `path` while the next exchange is at the service.
+    ///
+    /// It is the disk failing between the send and the answer: the device wrote its record before
+    /// the call, and the record it would write when the answer arrives meets a directory where its
+    /// temporary file goes.
+    fn obstruct_during_the_next_exchange(&self, path: std::path::PathBuf) {
+        *self
+            .obstruct_during_the_next_exchange
+            .lock()
+            .expect("the script") = Some(path);
     }
 
     /// Makes this service keep a copy of every write it refuses, under one name.
@@ -303,6 +317,14 @@ impl SyncBackupService for ScriptedService {
                 .lock()
                 .expect("the attempts")
                 .push(attempt.clone());
+            if let Some(path) = self
+                .obstruct_during_the_next_exchange
+                .lock()
+                .expect("the script")
+                .take()
+            {
+                std::fs::create_dir(&path).expect("the obstruction");
+            }
             let interruption = std::mem::take(&mut *self.interruption.lock().expect("the script"));
             if interruption == Interruption::LoseTheRequest {
                 return Err(lost("the request never reached the service"));
@@ -449,8 +471,9 @@ impl Device {
     fn stored(&self) -> Vec<(String, Vec<u8>)> {
         let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(self.disk.path())
             .expect("the disk")
-            .map(|entry| {
-                let path = entry.expect("an entry").path();
+            .map(|entry| entry.expect("an entry").path())
+            .filter(|path| path.is_file())
+            .map(|path| {
                 (
                     path.file_name()
                         .expect("a name")
@@ -462,6 +485,20 @@ impl Device {
             .collect();
         files.sort();
         files
+    }
+
+    /// Returns where this device's store writes a record before it renames it into place.
+    fn partial(&self) -> std::path::PathBuf {
+        let (lock, _) = self
+            .stored()
+            .into_iter()
+            .find(|(name, _)| name.ends_with(".bundle-lock"))
+            .expect("the lock");
+        self.disk.path().join(
+            lock.strip_suffix(".bundle-lock")
+                .map(|name| format!("{name}.bundle-write-partial"))
+                .expect("the name"),
+        )
     }
 
     /// Returns the bytes of the one write record on this device's disk.
@@ -2258,16 +2295,7 @@ async fn a_partial_record_left_by_an_earlier_failure_does_not_refuse_the_next_wr
     // A half-written record sits beside the lock while the store is open, as a failed write whose
     // clean-up also failed would leave it. It was never a record, and nothing describes a write
     // that went out.
-    let (lock, _) = store
-        .stored()
-        .into_iter()
-        .find(|(name, _)| name.ends_with(".bundle-lock"))
-        .expect("the lock");
-    let partial = store.disk.path().join(
-        lock.strip_suffix(".bundle-lock")
-            .map(|name| format!("{name}.bundle-write-partial"))
-            .expect("the name"),
-    );
+    let partial = store.partial();
     std::fs::write(&partial, b"half a record").expect("the partial file");
 
     let mut bundle = BundleStore::empty(TimestampMs::new(1));
@@ -2282,6 +2310,102 @@ async fn a_partial_record_left_by_an_earlier_failure_does_not_refuse_the_next_wr
         .expect("the write goes out and lands");
     assert!(!partial.exists());
     assert_eq!(store.stored().len(), 2, "the record and the lock");
+}
+
+#[tokio::test]
+async fn a_record_the_disk_could_not_bring_up_to_date_is_asked_about_again_after_a_restart() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let second = AuthorisationKeyPair::generate().expect("another writer key");
+    let third = AuthorisationKeyPair::generate().expect("a third writer key");
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+
+    // The disk fails between the send and the answer, so the record written before the call says
+    // nothing is known and the one that would say the write was answered is never written. The
+    // answer stands all the same: the write applied, and the caller is told so.
+    let obstruction = store.partial();
+    service.obstruct_during_the_next_exchange(obstruction.clone());
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the write is answered and lands");
+    assert_eq!(store.lost_write(), None);
+    let on_the_disk =
+        kr_cbor::decode(&store.record(), &kr_cbor::Limits::DEFAULT).expect("a record");
+    assert_eq!(
+        on_the_disk.as_map().and_then(|map| map.get("known")),
+        Some(&kr_cbor::CanonicalValue::text("unsettled"))
+    );
+
+    // The disk recovers and the process ends. The store opened afterwards has only the record that
+    // says less than was known, so it treats the write as outstanding, and the read that finds its
+    // bytes where that write landed settles it again.
+    std::fs::remove_dir(&obstruction).expect("the disk recovers");
+    let mut store = store.restart(Arc::clone(&service) as Arc<_>);
+    assert!(matches!(
+        store.lost_write(),
+        Some(LostWrite::Unsettled { .. })
+    ));
+    let mut carried = store.fetch(&seed).await.expect("the bundle");
+    assert_eq!(store.lost_write(), Some(LostWrite::Applied));
+
+    // The same holds for a settlement. The next write's answer is lost, and the read that settles
+    // it cannot write that down either.
+    service.interrupt_the_next_exchange(Interruption::LoseTheAnswerAfterTheWrite);
+    assert!(matches!(
+        store
+            .enable_writer(
+                &seed,
+                &mut carried,
+                trusted(&second),
+                TimestampMs::new(2_000)
+            )
+            .await,
+        Err(RecoveryError::BundleOutcomeUnknown { .. })
+    ));
+    std::fs::create_dir(&obstruction).expect("the disk fails again");
+    let mut carried = store.fetch(&seed).await.expect("the bundle");
+    assert_eq!(store.lost_write(), Some(LostWrite::Applied));
+    std::fs::remove_dir(&obstruction).expect("the disk recovers");
+    let mut store = store.restart(Arc::clone(&service) as Arc<_>);
+    assert!(matches!(
+        store.lost_write(),
+        Some(LostWrite::Unsettled { .. })
+    ));
+    assert!(matches!(
+        store
+            .enable_writer(
+                &seed,
+                &mut carried,
+                trusted(&third),
+                TimestampMs::new(2_500)
+            )
+            .await,
+        Err(RecoveryError::BundleWriteUnsettled { .. })
+    ));
+    let mut carried = store.fetch(&seed).await.expect("the bundle");
+    assert_eq!(store.lost_write(), Some(LostWrite::Applied));
+    store
+        .enable_writer(
+            &seed,
+            &mut carried,
+            trusted(&third),
+            TimestampMs::new(3_000),
+        )
+        .await
+        .expect("the next write lands on what is there");
+    assert_eq!(carried.revision.get(), 3);
+    assert!(
+        service.fences().is_empty(),
+        "every question was answered by reading"
+    );
 }
 
 #[tokio::test]
