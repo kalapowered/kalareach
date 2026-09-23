@@ -122,7 +122,7 @@ impl Questions {
         let mut events = expiry_events(store.expire_due(now, self.agents.as_deref())?, now);
         let header =
             store.source_header(source, params.agent_name.as_ref().cloned(), binding, now)?;
-        let created = store.create(source, &header, params, &choices, expiry, now)?;
+        let created = store.create(source, &header, binding, params, &choices, expiry, now)?;
         if !created.deduplicated {
             events.push(QuestionEvent {
                 kind: QuestionEventKind::Created,

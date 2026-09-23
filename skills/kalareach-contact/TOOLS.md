@@ -108,7 +108,7 @@ It asks for nothing and there is nothing to wait on.
 | `NOT_IN_KR_SESSION` | This process is not inside a KalaReach session, and nothing was created | Start the agent inside one: `kr new --attach`. The message carries the instruction |
 | `ID_CONFLICT` | That `request_id` or `dedup_id` already carries a different payload | Use a fresh identifier, or send the original payload |
 | `QUESTION_RESOLVED` | Somebody answered or cancelled it first | Read the answer with `wait_for_answer` |
-| `QUESTION_EXPIRED` | Its deadline passed, the process that asked has gone, or the host saw your conversation move on: another thread was selected or the agent's owner changed | Ask again with a fresh `request_id` if it still matters |
+| `QUESTION_EXPIRED` | Its deadline passed, the process that asked has gone, or the agent it was asked for has ended | Ask again with a fresh `request_id` if it still matters |
 | `PERMISSION_DENIED` | The token does not belong to this question, or to you | Use the token `ask_user` returned for that question |
 | `INVALID_ARGUMENT` | The form breaks a rule: too few or too many choices, an answer over 16 KiB, a duplicate choice identifier | Fix the payload |
 
@@ -119,7 +119,7 @@ It asks for nothing and there is nothing to wait on.
 | Wait on creation | up to 30 seconds |
 | Long poll | 300 seconds when you name none, 600 at most, and never past the client deadline the installation declared; 45 at most when it declared none |
 | Internal renewal | 20 seconds per broker wait, renewed until your deadline |
-| Question lifetime | 24 hours, or the life of this process, whichever ends first; where the host tracks your conversation, also no longer than the conversation it was asked in |
+| Question lifetime | 24 hours, or the life of this process, whichever ends first; where the host launched your agent, also no longer than that agent |
 | Answer size | 16 KiB |
 | Choices | 2 to 12, plus "Something else" |
 

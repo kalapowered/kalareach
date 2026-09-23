@@ -86,7 +86,7 @@ an identity and a caller chooses its own.
 | `pending` | Waiting for a person. Dismissing the form leaves it here |
 | `answered` | A person answered it. Terminal |
 | `cancelled` | The source or a person withdrew it. Terminal |
-| `expired` | Its deadline passed, the application that asked has gone, or the agent binding it was asked under changed or ended. Terminal |
+| `expired` | Its deadline passed, the application that asked has gone, the agent it was asked for ended, or a bridge that attests each request's thread saw that thread left. Terminal |
 
 Cancellation and expiry are different states, and dismissing a form is neither.
 
@@ -131,23 +131,26 @@ on. A call the client drops without cancelling it loses the wait, never the ques
 
 ## Agent bindings
 
-A question records the agent binding it was asked under only when a qualified bridge supplies one.
-The worker's broker is that bridge for the agents it launched: it knows each agent's process by its
-start identity, and it advances the agent's binding revision when the upstream owner or the selected
-thread changes. A helper at or below such an agent asks under the agent's application instance and
-its current revision, and both are in the question's identity header.
+A question is bound to an agent only as far as a qualified bridge can vouch for. The worker's broker
+is the bridge for the agents it launched: it knows each agent's process by its start identity, so a
+helper at or below such an agent is found by the kernel's parent chain, and its questions name the
+agent's application instance in their identity header. When that instance ends, every unanswered
+question asked for it is invalidated: it moves to `expired`, which the answering surfaces read, the
+attention feed carries and the agent's own wait returns, and a person's answer to it is refused with
+`QUESTION_EXPIRED`. A question that was already answered keeps its answer. The worker applies this
+before every read and every answer, and on its own maintenance tick, so it does not wait for somebody
+to look.
 
-When the broker detects a switch, every unanswered question asked under the binding it left is
-invalidated: it moves to `expired`, which the answering surfaces read, the attention feed carries and
-the agent's own wait returns, and a person's answer to it is refused with `QUESTION_EXPIRED`. An
-agent instance that ends takes its binding with it the same way. A question that was already
-answered keeps its answer. The worker applies this before every read and every answer, and on its
-own maintenance tick, so it does not wait for somebody to look.
+The parent chain proves which agent a helper serves, not which of its threads a request came from:
+one helper can serve several threads, and a request made in one can arrive after another is
+selected. Section 11 records a thread binding only with verified per-request source context, so the
+broker records none. These questions are application-scoped, their header carries no binding
+revision, and a thread switch the broker reports claims nothing for them.
 
-A helper no bridge describes asks application-scoped questions: its header carries no binding
-revision, and no thread-switch detection is claimed for it. Its questions end with its own process,
-at the latest after a day. A shared or multiplexed helper that cannot say which conversation each
-request comes from is in the same position.
+A bridge that does attest the thread of each request records the binding revision the request was
+made under, and when it reports a switch, every unanswered question asked under the binding it left
+is invalidated the same way. A helper no bridge describes asks application-scoped questions that end
+with its own process, at the latest after a day.
 
 ## Cancellation
 

@@ -1,10 +1,11 @@
 //! A question asked under an agent's binding ends when that binding does.
 //!
-//! The bridge is the worker's own broker. It launched the agent, knows its process by its start
-//! identity and advances the agent's binding revision when the upstream owner or the selected
-//! thread changes. The source here is this test process, launched as far as the broker is
-//! concerned, and the ledger is the worker's question ledger with that broker attached, which is
-//! how the worker service opens it.
+//! Two bridges. The worker's own broker launched the agent and knows its process by its start
+//! identity, so it says which agent a helper belongs to and whether that agent's instance is still
+//! live; the source here is this test process, launched as far as the broker is concerned, and the
+//! ledger is opened with that broker attached, as the worker service opens it. The other bridge is
+//! a double that attests the thread each request was made in, which is what section 11 asks of a
+//! bridge before a question records a thread binding.
 //!
 //! | Row | What proves it |
 //! | --- | --- |
@@ -151,15 +152,158 @@ fn state_of(questions: &[Question], question_id: QuestionId) -> QuestionState {
         .state
 }
 
-/// KR-REQ-11.62: a question from an agent the broker bridges records the binding it was asked
-/// under; when the bridge detects that the upstream owner or the selected thread changed, the
-/// unanswered questions asked under the binding it left are invalidated. Every client reads the
-/// invalidation, the feed carries it, a person's answer to it is refused and the agent reads it
-/// too; an answered question keeps its answer, a question no bridge describes is application-scoped
-/// and untouched, and the next question is asked under the new binding.
+/// A bridge that attests the thread each request was made in, as a connector with verified
+/// per-request context does: every request from `agent` is made under the binding `revision` names.
+#[derive(Debug)]
+struct Attesting {
+    agent: ProcessStartIdentity,
+    instance: ApplicationInstanceId,
+    revision: std::sync::Mutex<u64>,
+}
+
+impl Attesting {
+    fn switch(&self) {
+        *self.revision.lock().expect("the lock") += 1;
+    }
+}
+
+impl kr_worker::questions::AgentBindings for Attesting {
+    fn binding_of(
+        &self,
+        process: &ProcessStartIdentity,
+    ) -> Option<kr_worker::questions::AgentBinding> {
+        process
+            .matches(&self.agent)
+            .then(|| kr_worker::questions::AgentBinding {
+                application_instance_id: self.instance,
+                revision: Some(AgentBindingRevision::new(
+                    *self.revision.lock().expect("the lock"),
+                )),
+            })
+    }
+
+    fn current(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+    ) -> Option<AgentBindingRevision> {
+        (application_instance_id == self.instance)
+            .then(|| AgentBindingRevision::new(*self.revision.lock().expect("the lock")))
+    }
+}
+
+/// KR-REQ-11.62: a helper under an agent the worker's broker launched asks for that agent: its
+/// questions name the agent's application instance, and they end when the instance does, however
+/// long their day had left, for every client, with a person's answer refused and the agent's own
+/// read showing it. The broker proves which agent a helper belongs to and not which thread a
+/// request came from, so no binding revision is recorded and a thread switch it reports claims
+/// nothing: the question stays open until the instance ends. A question no bridge describes is
+/// application-scoped and ends only with its own source.
 #[test]
-fn a_detected_switch_invalidates_the_unanswered_questions_asked_under_the_binding_it_left() {
+fn a_launched_agents_questions_are_application_scoped_and_end_with_its_instance() {
     let (broker, instance, questions) = bridged();
+    let agent = source(this_process(), 1);
+    let elsewhere = source(parent_process(), 2);
+
+    let (asked, _) = questions
+        .create(&agent, &ask("asked"), now(1_000))
+        .expect("asked");
+    let (unbridged, _) = questions
+        .create(&elsewhere, &ask("unbridged"), now(1_000))
+        .expect("asked");
+    assert_eq!(
+        asked.question.source.application_instance_id, instance,
+        "a helper under a launched agent asks for that agent's instance"
+    );
+    assert!(
+        asked
+            .question
+            .source
+            .agent_binding_revision
+            .as_ref()
+            .is_none(),
+        "membership of an application is not a thread binding"
+    );
+    assert!(
+        unbridged
+            .question
+            .source
+            .agent_binding_revision
+            .as_ref()
+            .is_none()
+    );
+    assert_ne!(unbridged.question.source.application_instance_id, instance);
+
+    // A thread switch the broker reports claims nothing for an application-scoped question.
+    broker
+        .advance_binding(instance, None, TimestampMs::new(1_500))
+        .expect("the binding advances");
+    assert!(questions.sweep(now(1_600)).expect("sweeps").is_empty());
+    assert_eq!(
+        state_of(
+            &every_question(&questions, 1_700),
+            asked.question.question_id
+        ),
+        QuestionState::Pending
+    );
+
+    // The agent's instance ends.
+    let ended = broker.end(instance, InstanceEnding::NativeExit);
+    assert!(ended.instance_ended);
+
+    let read = every_question(&questions, 2_000);
+    assert_eq!(
+        state_of(&read, asked.question.question_id),
+        QuestionState::Expired
+    );
+    assert_eq!(
+        state_of(&read, unbridged.question.question_id),
+        QuestionState::Pending
+    );
+    let expired: Vec<QuestionId> = questions
+        .events_since(0, 64)
+        .expect("the feed")
+        .into_iter()
+        .filter(|(_, event)| event.kind == QuestionEventKind::Expired)
+        .map(|(_, event)| event.question.question_id)
+        .collect();
+    assert_eq!(expired, vec![asked.question.question_id]);
+    let refused = questions
+        .answer(&person(), None, &answer(&asked.question), now(2_100))
+        .expect_err("an answer to it is refused");
+    assert_eq!(refused.code(), ErrorCode::QuestionExpired);
+    let (own, _) = questions
+        .read_own(
+            &agent,
+            &QuestionReadOwnParams {
+                session_id: session(),
+                question_id: asked.question.question_id,
+                caller_token: CallerToken::new(asked.caller_token.as_slice().to_vec()),
+                wait_ms: Nullable::null(),
+            },
+            now(2_200),
+        )
+        .expect("the agent reads its question");
+    assert_eq!(own.question.state, QuestionState::Expired);
+}
+
+/// KR-REQ-11.62: with a bridge that attests the thread each request was made in, a question records
+/// the binding revision it was asked under, and a detected switch invalidates the unanswered
+/// questions asked under the binding it left. Every client reads the invalidation, the feed carries
+/// it once, a person's answer is refused and the worker's check before a dispatch marker refuses it
+/// too; an answer given before the switch stays the answer, a question no bridge describes is
+/// untouched, and the next question is asked under the new binding and stays open while it holds.
+#[test]
+fn a_switch_an_attesting_bridge_detects_invalidates_the_questions_asked_under_the_binding_it_left()
+{
+    let instance = ApplicationInstanceId::new(Uuid::from_bytes([11; 16]));
+    let bridge = Arc::new(Attesting {
+        agent: this_process(),
+        instance,
+        revision: std::sync::Mutex::new(1),
+    });
+    let questions = Questions::open(None, session(), SessionEpoch::V1)
+        .expect("a ledger")
+        .with_agents(Arc::clone(&bridge) as Arc<dyn kr_worker::questions::AgentBindings>);
     let agent = source(this_process(), 1);
     let elsewhere = source(parent_process(), 2);
 
@@ -173,14 +317,11 @@ fn a_detected_switch_invalidates_the_unanswered_questions_asked_under_the_bindin
         .create(&elsewhere, &ask("unbridged"), now(1_000))
         .expect("asked");
     for created in [&waiting, &settled] {
-        assert_eq!(
-            created.question.source.application_instance_id, instance,
-            "a bridged question names the agent's own instance"
-        );
+        assert_eq!(created.question.source.application_instance_id, instance);
         assert_eq!(
             created.question.source.agent_binding_revision.as_ref(),
             Some(&AgentBindingRevision::new(1)),
-            "and the binding it is asked under"
+            "the question records the binding it was asked under"
         );
     }
     assert!(
@@ -192,18 +333,13 @@ fn a_detected_switch_invalidates_the_unanswered_questions_asked_under_the_bindin
             .is_none(),
         "a source no bridge describes is application-scoped and claims no switch detection"
     );
-    assert_ne!(unbridged.question.source.application_instance_id, instance);
     questions
         .answer(&person(), None, &answer(&settled.question), now(1_500))
         .expect("answered before the switch");
 
     // The agent moves to another thread.
-    let revision = broker
-        .advance_binding(instance, None, TimestampMs::new(2_000))
-        .expect("the binding advances");
-    assert_eq!(revision, AgentBindingRevision::new(2));
+    bridge.switch();
 
-    // Every client reads the same thing, and the feed says so once.
     let read = every_question(&questions, 2_100);
     assert_eq!(
         state_of(&read, waiting.question.question_id),
@@ -236,7 +372,6 @@ fn a_detected_switch_invalidates_the_unanswered_questions_asked_under_the_bindin
         .collect();
     assert_eq!(expired, vec![waiting.question.question_id]);
 
-    // A person answering what they were shown is refused, and nothing changes.
     let refused = questions
         .answer(&person(), None, &answer(&waiting.question), now(2_200))
         .expect_err("an answer to an invalidated question is refused");
@@ -249,27 +384,9 @@ fn a_detected_switch_invalidates_the_unanswered_questions_asked_under_the_bindin
                 Some(&QuestionAnswer::Decision { decided: true }),
                 now(2_200),
             )
-            .is_err(),
-        "the worker's check before a dispatch marker refuses it too"
+            .is_err()
     );
 
-    // The agent that asked reads the same state when it polls.
-    let (own, _) = questions
-        .read_own(
-            &agent,
-            &QuestionReadOwnParams {
-                session_id: session(),
-                question_id: waiting.question.question_id,
-                caller_token: CallerToken::new(waiting.caller_token.as_slice().to_vec()),
-                wait_ms: Nullable::null(),
-            },
-            now(2_300),
-        )
-        .expect("the agent reads its question");
-    assert_eq!(own.question.state, QuestionState::Expired);
-
-    // The next question is asked under the binding the agent is on now, and stays open while it
-    // does not move.
     let (next, _) = questions
         .create(&agent, &ask("after the switch"), now(3_000))
         .expect("asked");
@@ -283,38 +400,6 @@ fn a_detected_switch_invalidates_the_unanswered_questions_asked_under_the_bindin
             &every_question(&questions, 3_200),
             next.question.question_id
         ),
-        QuestionState::Pending
-    );
-}
-
-/// KR-REQ-11.62: an agent instance that ends takes its binding with it, so the unanswered questions
-/// asked under that binding end too, however long their day had left.
-#[test]
-fn a_question_ends_with_the_agent_instance_it_was_asked_under() {
-    let (broker, instance, questions) = bridged();
-    let agent = source(this_process(), 1);
-    let elsewhere = source(parent_process(), 2);
-    let (asked, _) = questions
-        .create(&agent, &ask("asked"), now(1_000))
-        .expect("asked");
-    let (unbridged, _) = questions
-        .create(&elsewhere, &ask("unbridged"), now(1_000))
-        .expect("asked");
-
-    let ended = broker.end(instance, InstanceEnding::NativeExit);
-    assert!(ended.instance_ended);
-
-    let swept = questions.sweep(now(2_000)).expect("sweeps");
-    assert_eq!(swept.len(), 1);
-    assert_eq!(swept[0].kind, QuestionEventKind::Expired);
-    assert_eq!(swept[0].question.question_id, asked.question.question_id);
-    let read = every_question(&questions, 2_100);
-    assert_eq!(
-        state_of(&read, asked.question.question_id),
-        QuestionState::Expired
-    );
-    assert_eq!(
-        state_of(&read, unbridged.question.question_id),
         QuestionState::Pending
     );
 }

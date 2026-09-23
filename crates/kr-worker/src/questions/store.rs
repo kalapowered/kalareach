@@ -19,11 +19,11 @@
 //!
 //! Expiry is applied before every read and every resolution, so an expired question is never
 //! answered and never reported as pending. A question expires at its deadline on either clock, when
-//! the application that asked has gone, or when the agent binding it was asked under has changed or
-//! ended: section 11 gives it the shorter of a day and the originating binding's own life, and a
-//! detected thread or binding switch invalidates the unanswered questions asked under the binding
-//! it left. Only a qualified bridge supplies a binding, so only a question that recorded one can
-//! be invalidated that way; an application-scoped question claims no such detection.
+//! the application that asked has gone, or when the agent binding it was asked under has ended:
+//! section 11 gives it the shorter of a day and the originating binding's own life. A question
+//! asked for a bridged agent ends with that agent's instance, and one whose bridge attested the
+//! thread of its request also ends when the bridge detects a switch away from that thread. A
+//! question no bridge vouched for is application-scoped and claims no such detection.
 
 use kr_crypto::secret::SymmetricKey;
 use kr_protocol::identity::ProcessStartIdentity;
@@ -180,6 +180,11 @@ impl Store {
                      record         BLOB    NOT NULL,
                      created_at_ms  INTEGER NOT NULL,
                      PRIMARY KEY (source_key, dedup_id)
+                 );
+                 CREATE TABLE IF NOT EXISTS question_bindings (
+                     question_id             BLOB PRIMARY KEY,
+                     application_instance_id BLOB    NOT NULL,
+                     revision                INTEGER
                  );",
             )
             .map_err(QuestionError::unavailable)?;
@@ -274,7 +279,7 @@ impl Store {
             // A thread or binding revision is recorded only when a qualified bridge supplies one,
             // and never invented: section 11 makes a null here mean "application-scoped, with no
             // thread-switch detection claimed".
-            agent_binding_revision: Nullable(binding.map(|binding| binding.revision)),
+            agent_binding_revision: Nullable(binding.and_then(|binding| binding.revision)),
         })
     }
 
@@ -284,10 +289,12 @@ impl Store {
     ///
     /// Returns [`QuestionError::IdConflict`] when the request identifier was used with a different
     /// payload, and [`QuestionError::Unavailable`] when the write fails.
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         &mut self,
         source: &VerifiedSource,
         header: &QuestionSource,
+        binding: Option<AgentBinding>,
         params: &QuestionCreateParams,
         choices: &[QuestionChoice],
         expiry_ms: u64,
@@ -372,6 +379,21 @@ impl Store {
                 ],
             )
             .map_err(QuestionError::unavailable)?;
+        // The agent binding goes in the same transaction as the question, so a question that was
+        // asked under a bridged agent is never on record without the instance it ends with.
+        if let Some(binding) = binding {
+            transaction
+                .execute(
+                    "INSERT INTO question_bindings (question_id, application_instance_id, revision)
+                     VALUES (?1, ?2, ?3)",
+                    params![
+                        question_id.get().as_bytes().as_slice(),
+                        binding.application_instance_id.get().as_bytes().as_slice(),
+                        binding.revision.map(|revision| count(revision.get())),
+                    ],
+                )
+                .map_err(QuestionError::unavailable)?;
+        }
         write_event(
             &transaction,
             &QuestionEvent {
@@ -521,10 +543,11 @@ impl Store {
     /// Moves every question whose time is up, whose source has gone, or whose agent binding has
     /// moved on, to `expired`.
     ///
-    /// `agents` is the qualified bridge the binding revisions came from. A question that recorded a
-    /// revision is invalidated when the bridge reports a different revision for its application
-    /// instance, because the upstream owner or the selected thread changed, or no revision at all,
-    /// because the instance ended.
+    /// `agents` is the qualified bridge the bindings came from. A question asked under a bridged
+    /// agent is invalidated when that agent's instance has ended, and one that also recorded a
+    /// binding revision is invalidated when the bridge reports a different revision, because the
+    /// upstream owner or the selected thread changed. A question no bridge described is judged by
+    /// its deadline and its source's life alone.
     ///
     /// # Errors
     ///
@@ -537,8 +560,12 @@ impl Store {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT question_id, expires_at_ms, expires_at_boot_ms, source_process, source
-                 FROM questions WHERE state = 'pending'",
+                "SELECT questions.question_id, expires_at_ms, expires_at_boot_ms, source_process,
+                        question_bindings.application_instance_id, question_bindings.revision
+                 FROM questions
+                 LEFT JOIN question_bindings
+                        ON question_bindings.question_id = questions.question_id
+                 WHERE state = 'pending'",
             )
             .map_err(QuestionError::unavailable)?;
         let candidates = statement
@@ -548,7 +575,8 @@ impl Store {
                     u64::try_from(row.get::<_, i64>(1)?).unwrap_or(u64::MAX),
                     u64::try_from(row.get::<_, i64>(2)?).unwrap_or(u64::MAX),
                     row.get::<_, Vec<u8>>(3)?,
-                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
                 ))
             })
             .map_err(QuestionError::unavailable)?
@@ -556,7 +584,8 @@ impl Store {
             .map_err(QuestionError::unavailable)?;
         drop(statement);
         let mut expired = Vec::new();
-        for (identifier, utc_deadline, boot_deadline, encoded_process, encoded_source) in candidates
+        for (identifier, utc_deadline, boot_deadline, encoded_process, instance, revision) in
+            candidates
         {
             let question_id = QuestionId::new(uuid_from(&identifier)?);
             let due = now.utc_ms.get() >= utc_deadline || now.boot_ms >= boot_deadline;
@@ -570,16 +599,20 @@ impl Store {
                 ),
                 Err(_) => false,
             };
-            // A detected switch invalidates the unanswered questions asked under the binding it
-            // left, and an instance that ended takes its binding with it. A question no bridge
-            // described recorded no revision and is judged by its source's life alone.
-            let binding_moved = agents.is_some_and(|agents| {
-                decode::<QuestionSource>(&encoded_source).is_ok_and(|header| {
-                    header.agent_binding_revision.as_ref().is_some_and(|asked| {
-                        agents.current(header.application_instance_id) != Some(*asked)
-                    })
-                })
-            });
+            // An agent instance that ended takes its binding with it, and a detected switch
+            // invalidates the unanswered questions asked under the binding it left. Only a question
+            // asked under a bridged agent has an instance here, and only one whose bridge attested
+            // its request's thread has a revision.
+            let binding_moved = match (agents, instance) {
+                (Some(agents), Some(instance)) => {
+                    let current = agents.current(ApplicationInstanceId::new(uuid_from(&instance)?));
+                    match revision {
+                        Some(asked) => current.map(|current| count(current.get())) != Some(asked),
+                        None => current.is_none(),
+                    }
+                }
+                _ => false,
+            };
             if !due && !source_gone && !binding_moved {
                 continue;
             }
@@ -1133,7 +1166,7 @@ mod tests {
             .expect("a header");
         let choices = build_choices(params.kind, &params.choices).expect("choices");
         store
-            .create(&source, &header, params, &choices, 60_000, now(at))
+            .create(&source, &header, None, params, &choices, 60_000, now(at))
             .expect("creates")
     }
 
@@ -1163,7 +1196,15 @@ mod tests {
             .expect("a header");
         let choices = build_choices(params.kind, &params.choices).expect("choices");
         let error = store
-            .create(&source, &header, &params, &choices, 60_000, now(2_000))
+            .create(
+                &source,
+                &header,
+                None,
+                &params,
+                &choices,
+                60_000,
+                now(2_000),
+            )
             .expect_err("conflict");
         assert_eq!(error.code(), kr_protocol::error::ErrorCode::IdConflict);
     }
@@ -1249,7 +1290,15 @@ mod tests {
             .expect("a header");
         let choices = build_choices(params.kind, &params.choices).expect("choices");
         store
-            .create(&source, &header, &params, &choices, 60_000, now(1_000))
+            .create(
+                &source,
+                &header,
+                None,
+                &params,
+                &choices,
+                60_000,
+                now(1_000),
+            )
             .expect("creates");
         // The deadline is an hour away and the process never existed, so what expires the question
         // is the end of the binding rather than the clock.

@@ -35,12 +35,17 @@
 //!
 //! A session is one binding; the agent a question comes from is another. Section 11 records an
 //! agent thread or binding revision only when a qualified bridge supplies one, and invalidates the
-//! unanswered questions asked under a binding when a switch is detected. [`AgentBindings`] is how
-//! this ledger learns both: which bridged application instance a calling process belongs to and at
-//! which revision, and where that instance's binding stands now. The worker's broker answers it
-//! for the agents it launched, whose upstream owner and selected thread it tracks. A source that
-//! no bridge describes gets no revision, its question is application-scoped, and no thread-switch
-//! detection is claimed for it.
+//! unanswered questions asked under a binding when a switch is detected. A shared or multiplexed
+//! helper must supply verified per-request source context; without it, its questions are
+//! application-scoped and no thread-switch detection is claimed for them.
+//!
+//! [`AgentBindings`] is how this ledger learns what a bridge can say: which application instance a
+//! calling process belongs to, whether that instance is still live, and, only when the bridge can
+//! attest the request's own thread, the binding revision the request was made under. The worker's
+//! broker is the bridge for the agents it launched. It proves membership by the kernel's parent
+//! chain, which says nothing about which of an agent's threads a request came from, so it attests
+//! no revision: a helper under a launched agent asks application-scoped questions, and they end
+//! with the agent's instance. A source that no bridge describes is application-scoped as well.
 
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{AgentBindingRevision, ApplicationInstanceId, ConnectionId};
@@ -98,27 +103,31 @@ impl VerifiedSource {
     }
 }
 
-/// The bridged application instance a source belongs to, and the binding a question from it is
-/// asked under.
+/// The bridged application instance a source belongs to, and the thread binding a request was made
+/// under when the bridge can say.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AgentBinding {
-    /// The application instance, as the worker's broker names it.
+    /// The application instance, as the bridge names it.
     pub application_instance_id: ApplicationInstanceId,
-    /// The revision its binding is at: it advances when the upstream owner or the selected thread
-    /// changes.
-    pub revision: AgentBindingRevision,
+    /// The binding revision the request was made under, when the bridge attests the request's own
+    /// thread.
+    ///
+    /// Membership of an application is not that: a helper shared by several threads, or one that
+    /// outlives a switch, carries requests from more than one of them. Without verified
+    /// per-request context this is None, the question is application-scoped and no thread-switch
+    /// detection is claimed for it; it still ends with its application instance.
+    pub revision: Option<AgentBindingRevision>,
 }
 
 /// What a qualified bridge says about the agents in this session.
 ///
-/// Implemented by the worker's broker. A ledger with none of these records no binding revision and
-/// invalidates nothing on a switch, which is the application-scoped case section 11 allows for a
-/// helper no bridge describes.
+/// Implemented by the worker's broker. A ledger with none of these binds no question to an agent,
+/// which is the application-scoped case section 11 allows for a helper no bridge describes.
 pub trait AgentBindings: Send + Sync + std::fmt::Debug {
-    /// Returns the bridged instance a calling process belongs to, and its revision now.
+    /// Returns the bridged instance a calling process belongs to, with the revision its request was
+    /// made under when the bridge can attest that.
     ///
-    /// A process belongs to an instance when it is that instance's process or descends from it, by a
-    /// parent chain the kernel confirms link by link. None when no bridged instance holds it.
+    /// None when no bridged instance holds the process.
     fn binding_of(&self, process: &ProcessStartIdentity) -> Option<AgentBinding>;
 
     /// Returns the revision one instance's binding is at now, or None when the instance has ended.
