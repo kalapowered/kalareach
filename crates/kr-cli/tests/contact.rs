@@ -1360,15 +1360,16 @@ async fn ask_user_returns_a_durable_question_and_its_token_over_the_helpers_own_
     );
 }
 
-/// KR-REQ-11.57: one `wait_for_answer` call outlasts its bounded broker waits: the installed
-/// client's qualified deadline allows a long poll, the tool server renews the broker wait itself
-/// inside that one call, and the call returns the answer as soon as a person gives it; during a
-/// broker wait that is observed to be under way, no connection holds a transaction on the session's
-/// journal, which a truncating checkpoint from another connection proves by completing; and a wait
-/// that runs out returns the same question and neither recreates it nor records a second creation
-/// to notify anybody about.
+/// KR-REQ-11.57: one `wait_for_answer` call, under an installed client's qualified deadline that
+/// allows a long poll, stays open for longer than one renewal interval of the host's wait and
+/// returns the answer as soon as a person gives it; while it is open, a truncating checkpoint from
+/// another connection completes, so no connection holds a transaction on the session's journal at
+/// that moment; and a wait that runs out returns the same question and neither recreates it nor
+/// records a second creation to notify anybody about. Whether the tool server renews bounded
+/// broker waits inside the call, and whether each wait holds only a subscription, cannot be seen
+/// from outside the worker, and this test claims neither.
 #[tokio::test(flavor = "multi_thread")]
-async fn one_wait_renews_its_broker_waits_and_returns_the_answer_when_it_comes() {
+async fn one_long_wait_stays_open_and_returns_the_answer_when_it_comes() {
     // The installation declared a qualified client deadline of four minutes, so a long poll is not
     // cut to the short wait an unqualified client gets.
     let hosted = hosted_with(|binary| Root {
@@ -1413,10 +1414,9 @@ async fn one_wait_renews_its_broker_waits_and_returns_the_answer_when_it_comes()
     assert_eq!(timed_out["question_id"], created["question_id"]);
     assert_eq!(timed_out["revision"], created["revision"]);
 
-    // Two more questions from the same helper, due to expire ten and thirty seconds from now. Every
-    // broker wait begins by expiring whatever is due, and nothing else expires questions while the
-    // one call below waits, so each of these is recorded as expired by the first broker wait that
-    // begins after its deadline. That is what makes the call's broker waits observable.
+    // Two more questions from the same helper, due to expire ten and thirty seconds from now. The
+    // host's wait expires whatever falls due while the call below is open, so the markers' expiries
+    // are moments the test can wait for without a timer of its own.
     let (first_marker, _) = hosted
         .call("ask_user", ask("expires-first", Some(10)))
         .await;
@@ -1432,11 +1432,10 @@ async fn one_wait_renews_its_broker_waits_and_returns_the_answer_when_it_comes()
         .expect("an identifier")
         .to_owned();
 
-    // An observer watches the journal through a connection of its own. When the first marker
-    // expires, a broker wait has just begun, and a truncating checkpoint is run inside it: that
-    // cannot complete while any connection holds a read or a write transaction. When the second
-    // marker expires, another broker wait has begun inside the same call. Only then does a person
-    // answer, and only while the call is still waiting.
+    // An observer watches the journal through a connection of its own. Once the first marker has
+    // expired, a truncating checkpoint runs: it cannot complete while any connection holds a read
+    // or a write transaction. Once the second marker has expired, a person answers, and only while
+    // the call is still waiting.
     let waiting = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let still_waiting = Arc::clone(&waiting);
     let journal = hosted.journal.clone();
@@ -1466,7 +1465,7 @@ async fn one_wait_renews_its_broker_waits_and_returns_the_answer_when_it_comes()
                 }
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "no broker wait began after the marker's deadline"
+                    "the marker did not expire while the call was waiting"
                 );
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -1526,7 +1525,7 @@ async fn one_wait_renews_its_broker_waits_and_returns_the_answer_when_it_comes()
     let (first_wait, checkpointed_at, checkpointed_while_waiting, second_wait, in_flight, answered) =
         observer.await.expect("the observer ran");
     eprintln!(
-        "broker waits observed at {first_wait} and {second_wait}; checkpoint at {checkpointed_at:?}; \
+        "markers expired at {first_wait} and {second_wait}; checkpoint at {checkpointed_at:?}; \
          the call returned after {elapsed:?}"
     );
 
@@ -1539,17 +1538,18 @@ async fn one_wait_renews_its_broker_waits_and_returns_the_answer_when_it_comes()
         in_flight,
         "the one call was still waiting when the person answered"
     );
+    let renewal = Duration::from_millis(kr_protocol::question::WAIT_RENEWAL.get());
     assert!(
-        second_wait >= first_wait + 10_000,
-        "the one call began a broker wait after each marker's deadline, {first_wait} and \
-         {second_wait}: it renewed its broker wait"
+        elapsed > renewal,
+        "the one call stayed open longer than one renewal interval of {renewal:?}: {elapsed:?}"
     );
-    let checkpointed_at = checkpointed_at
-        .unwrap_or_else(|| panic!("a truncating checkpoint never completed during the wait"));
     assert!(
-        checkpointed_while_waiting && checkpointed_at < second_wait,
-        "the checkpoint completed inside the broker wait that began at {first_wait}, at \
-         {checkpointed_at}, before the next began at {second_wait}"
+        checkpointed_at.is_some(),
+        "a truncating checkpoint never completed while the call was waiting"
+    );
+    assert!(
+        checkpointed_while_waiting,
+        "the checkpoint completed while the call was waiting, at {checkpointed_at:?}"
     );
     assert!(!failed, "{waited}");
     assert_eq!(waited["state"], "answered");
