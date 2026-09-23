@@ -1552,9 +1552,10 @@ mod tests {
     /// KR-REQ-03.08: an environment identity binds one installation and one operating-system
     /// user. Each installation's state root holds its own random identity, written once and read
     /// back unchanged, so two installations on one machine are two environments rather than one
-    /// machine's fingerprint; the identity lives in a file only this user can read, inside a
-    /// directory only this user can enter; and an installation's default state root is inside
-    /// this user's own home.
+    /// machine's fingerprint; the identity lives in a file this user owns inside a directory this
+    /// user owns, and nobody else is granted either (on Unix the modes are `0600` and `0700`, and
+    /// on Windows each access-control list names this user and the machine's own accounts only);
+    /// and an installation's default state root is inside this user's own profile.
     #[test]
     fn an_environment_identity_is_one_installations_and_one_users() {
         let root = temporary_root("bound");
@@ -1589,6 +1590,30 @@ mod tests {
                     .expect("a default state root")
                     .starts_with(home_directory().expect("a home directory")),
                 "an installation's own state is kept in its user's home"
+            );
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsHandle as _;
+
+            // The same question asked of the access-control lists, read back from handles: each
+            // is owned by this user and grants nobody but this user and the machine's own
+            // accounts, and the state root's list is protected from the directory above it.
+            check_access_list(
+                opened(first.state_root()).as_handle(),
+                "the state root",
+                true,
+            )
+            .expect("the state root is this user's alone");
+            let file = std::fs::File::open(first.environment_id_file()).expect("the identity file");
+            check_access_list(file.as_handle(), "the identity file", false)
+                .expect("the identity file is this user's alone");
+            let profile = std::env::var_os("LOCALAPPDATA").expect("this user's local profile");
+            assert!(
+                default_state_root()
+                    .expect("a default state root")
+                    .starts_with(profile),
+                "an installation's own state is kept in its user's profile"
             );
         }
         std::fs::remove_dir_all(&root).ok();
