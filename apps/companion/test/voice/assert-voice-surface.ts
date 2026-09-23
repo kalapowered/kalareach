@@ -20,7 +20,7 @@
  * KR-REQ-15.22: speech interruption stops playback only; cancellation is a separate host request.
  */
 
-import { chromium, webkit, type Browser, type BrowserType, type Page } from '@playwright/test'
+import { chromium, webkit, type Browser, type BrowserType, type Locator, type Page } from '@playwright/test'
 
 /** The runtime this file is executed by, declared rather than pulled in as a type package. */
 declare const process: { readonly argv: readonly string[]; exitCode?: number }
@@ -156,12 +156,20 @@ function noHeading(page: Page, name: string): Step {
   }
 }
 
-/** The section labelled `region` carries every one of the words. */
+/** The text a person can see in `locator`: it must be visible, and hidden descendants do not count. */
+async function visibleText(locator: Locator, what: string): Promise<string> {
+  await locator.waitFor({ state: 'visible', timeout: 5_000 }).catch(() => {
+    throw new Error(`${what} is not visible`)
+  })
+  return locator.innerText()
+}
+
+/** The section labelled `region` is visible and its visible text carries every one of the words. */
 function sectionShows(page: Page, region: string, words: readonly string[]): Step {
   return {
     says: `the "${region}" section shows ${quoted(words)}`,
     run: async () => {
-      const text = (await page.getByRole('region', { name: region, exact: true }).textContent()) ?? ''
+      const text = await visibleText(page.getByRole('region', { name: region, exact: true }), `"${region}"`)
       for (const word of words) expect(text.includes(word), `"${region}" does not show "${word}": ${text}`)
     }
   }
@@ -171,19 +179,20 @@ function modelReads(page: Page, model: string): Step {
   return {
     says: `the voice model reads "${model}"`,
     run: async () => {
-      const text = await page.textContent('.kr-voice__provider dd')
-      expect(text?.trim() === model, `the voice model reads "${text ?? ''}"`)
+      const text = await visibleText(page.locator('.kr-voice__provider dd').first(), 'the voice model')
+      expect(text.trim() === model, `the voice model reads "${text}"`)
     }
   }
 }
 
 /**
  * The button is described, through every id its `aria-describedby` names, by text carrying every one
- * of the words. An id that names nothing fails the step.
+ * of the words. An id that names nothing fails the step. This is what assistive technology reads,
+ * whether or not it is on screen, and the words say so.
  */
 function describedBy(page: Page, name: string, words: readonly string[]): Step {
   return {
-    says: `the "${name}" button is described by text showing ${quoted(words)}`,
+    says: `the "${name}" button's aria-describedby text reads ${quoted(words)}`,
     run: async () => {
       const ids = ((await page.getByRole('button', { name, exact: true }).getAttribute('aria-describedby')) ?? '')
         .split(/\s+/)
@@ -204,16 +213,14 @@ function captureReads(page: Page, words: string): Step {
   return {
     says: `the capture line reads "${words}"`,
     run: async () => {
-      try {
-        await page.waitForFunction(
-          (text) => document.querySelector('.kr-voice__capture')?.textContent?.includes(text) === true,
-          words,
-          { timeout: 5_000 }
-        )
-      } catch {
-        const actual = await page.textContent('.kr-voice__capture')
-        throw new Error(`expected the capture line to read "${words}", got "${actual ?? ''}"`)
+      const line = page.locator('.kr-voice__capture').first()
+      let actual = ''
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        actual = await visibleText(line, 'the capture line')
+        if (actual.includes(words)) return
+        await page.waitForTimeout(100)
       }
+      throw new Error(`expected the capture line to read "${words}", got "${actual}"`)
     }
   }
 }
@@ -234,12 +241,13 @@ function markedPressed(page: Page, name: string): Step {
   }
 }
 
+/** Each button passes every check a press makes (visible, enabled, steady, not covered), unpressed. */
 function canPress(page: Page, names: readonly string[]): Step {
   return {
     says: `${quoted(names)} can be pressed`,
     run: async () => {
       for (const name of names) {
-        expect(await page.getByRole('button', { name, exact: true }).isEnabled(), `"${name}" cannot be pressed`)
+        await page.getByRole('button', { name, exact: true }).click({ trial: true, timeout: 5_000 })
       }
     }
   }
@@ -256,10 +264,14 @@ function cannotPress(page: Page, name: string): Step {
 
 function callOnScreen(page: Page, running: boolean): Step {
   return {
-    says: running ? 'the running call is still on screen' : 'no running call is on screen',
+    says: running ? 'the running call is still on screen' : 'no running call is on the page',
     run: async () => {
-      const count = await page.locator('.kr-voice--live').count()
-      expect(count === (running ? 1 : 0), `found ${count} running call screens`)
+      const calls = page.locator('.kr-voice--live')
+      if (running) {
+        expect((await calls.count()) === 1 && (await calls.isVisible()), 'the running call is not on screen')
+      } else {
+        expect((await calls.count()) === 0, 'a running call is still on the page')
+      }
     }
   }
 }
