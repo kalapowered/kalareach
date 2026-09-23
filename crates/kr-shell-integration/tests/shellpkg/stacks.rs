@@ -2190,7 +2190,8 @@ pub struct CaseOutcome {
     pub id: String,
     pub shell: ShellKind,
     pub stack: String,
-    /// `qualified`, or why the case did not run.
+    /// `qualified`, naming the states it narrowed its claim about where it narrowed any; or why
+    /// the case did not run, or what failed.
     pub verdict: String,
     /// The package identity this case qualified, where it ran.
     pub package_identity: Option<String>,
@@ -2233,7 +2234,7 @@ fn one_line(text: &str) -> String {
         .join(" ")
 }
 
-/// Writes what each case concluded where the run asked for its evidence.
+/// Writes what each case concluded to the run's evidence, and prints it.
 pub fn record_outcomes(name: &str, outcomes: &[CaseOutcome]) {
     let mut report = String::new();
     for outcome in outcomes {

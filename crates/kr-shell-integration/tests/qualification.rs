@@ -486,20 +486,21 @@ fn every_case_holds_against_the_package_it_names() {
         }
 
         ran += 1;
-        let mut outcome = CaseOutcome::skipped(case, "qualified");
+        let mut outcome = CaseOutcome::skipped(case, "not run");
         outcome.package_identity = Some(package.identity.clone());
         outcome.stack_versions = versions;
         outcome.checks = case.checks.clone();
-        if let Err(reason) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_case(case, &package);
-        })) {
-            let message = reason
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| reason.downcast_ref::<&str>().map(|text| (*text).to_owned()))
-                .unwrap_or_else(|| "the case panicked".to_owned());
-            outcome.verdict = format!("failed: {message}");
-            failures.push(format!("{}: {message}", case.id));
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_case(case, &package))) {
+            Ok(narrowed) => outcome.verdict = qualified(&narrowed),
+            Err(reason) => {
+                let message = reason
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| reason.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+                    .unwrap_or_else(|| "the case panicked".to_owned());
+                outcome.verdict = format!("failed: {message}");
+                failures.push(format!("{}: {message}", case.id));
+            }
         }
         outcomes.push(outcome);
     }
@@ -555,17 +556,39 @@ fn installed_stacks() -> Option<StackIndex> {
     }
 }
 
-/// Drives one case through the checks it claims, a fresh shell for each group of them.
+/// What a case that held says it qualified.
+///
+/// A drive that could not read the state it names proves the key it offered and what the shell did
+/// with it, and nothing about the state. The case's own line says which states those were, so the
+/// word the summary prints is never more than the drives observed.
+fn qualified(narrowed: &[DetachExclusion]) -> String {
+    if narrowed.is_empty() {
+        "qualified".to_owned()
+    } else {
+        format!(
+            "qualified, narrowed to what the reader reported: {}",
+            narrowed
+                .iter()
+                .map(|exclusion| exclusion.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+/// Drives one case through the checks it claims, a fresh shell for each group of them, and
+/// returns the excluded states it could not read and so narrowed its claim about.
 ///
 /// A group is a set of checks that can share one reader without one of them deciding what the
 /// next one sees. Driving an excluded state leaves the editor somewhere — inside a listing, a
 /// search, a pending sequence — and a check that started from there would be measuring the drive
 /// before it rather than the package. A shell costs a second to start; a check that measured the
 /// wrong thing costs a qualification that says nothing.
-fn run_case(case: &QualificationCase, package: &Package) {
+fn run_case(case: &QualificationCase, package: &Package) -> Vec<DetachExclusion> {
     let index = StackIndex::read().expect("the index was read before this case was chosen");
     let setup = CaseSetup::prepare(case, package, &index);
     let claimed = |name: &str| case.checks.iter().any(|check| check == name);
+    let mut narrowed = Vec::new();
 
     the_startup_and_the_customisation(case, package, &setup);
 
@@ -580,7 +603,7 @@ fn run_case(case: &QualificationCase, package: &Package) {
     }
 
     if claimed("gesture_is_native_outside_the_condition") {
-        outside_the_condition_the_editor_keeps_the_key(
+        narrowed = outside_the_condition_the_editor_keeps_the_key(
             case,
             package,
             &setup,
@@ -611,6 +634,7 @@ fn run_case(case: &QualificationCase, package: &Package) {
     if claimed("instant_prompt") {
         a_second_start_draws_from_the_cache_the_first_wrote(case, package, &setup);
     }
+    narrowed
 }
 
 /// A shell of this case's own, at its first prompt and reading.
@@ -1012,7 +1036,8 @@ fn the_gesture_detaches_at_an_eligible_prompt(
     enter
 }
 
-/// Every state section 7 excludes, driven where this reader has it and recorded where it does not.
+/// Every state section 7 excludes, driven where this reader has it and recorded where it does not,
+/// returning the states whose drives narrowed their claim.
 ///
 /// Every drive gets a shell of its own. A drive that ran where another had already been would be
 /// measuring what that one left behind: a keymap one drive changed is the keymap the next starts
@@ -1024,7 +1049,7 @@ fn outside_the_condition_the_editor_keeps_the_key(
     package: &Package,
     setup: &CaseSetup,
     exhaustive: bool,
-) {
+) -> Vec<DetachExclusion> {
     let mut seen: Vec<DriveObservation> = Vec::new();
     let mut skipped = Vec::new();
     for drive in shellpkg::exclusion_drives(case.shell) {
@@ -1085,25 +1110,9 @@ fn outside_the_condition_the_editor_keeps_the_key(
             );
         }
     }
-    // The narrowing is said on the run's own output as well as in the evidence file below. That
-    // file is written only where a run names a directory for it, and a case that printed
-    // "qualified" with a narrowed claim and nothing anywhere saying so would be claiming more than
-    // it proved.
-    println!(
-        "{}: narrowed to what the reader reported: {}",
-        case.id,
-        if narrowed.is_empty() {
-            "nothing, every drive read the state it names".to_owned()
-        } else {
-            narrowed
-                .iter()
-                .map(|drive| drive.exclusion.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        }
-    );
     // Every line of this record is something a drive read off the reader or watched the shell do.
-    // Nothing is added beside them.
+    // Nothing is added beside them. The states whose drives narrowed go back to the case as well,
+    // whose own line in the summary names them.
     shellpkg::record(
         &format!("exclusions-{}.txt", case.id),
         &format!(
@@ -1127,6 +1136,7 @@ fn outside_the_condition_the_editor_keeps_the_key(
             accounted.join("; ")
         ),
     );
+    narrowed.iter().map(|drive| drive.exclusion).collect()
 }
 
 /// One excluded state, in a shell of its own, from the state the reader reports to the answer the

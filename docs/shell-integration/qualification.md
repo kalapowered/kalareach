@@ -17,12 +17,16 @@ That builds or verifies the packages from their pinned upstream releases, fetche
 customisations by digest, starts a real control daemon and a real managed session, and then drives
 every case. Its evidence goes to `${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}`, including
 `qualification-cases.tsv`, which is one line per case: what it qualified, which package identity,
-and which version of each customisation.
+and which version of each customisation. A case with a drive that could not read the state it
+names says so on that line, as `qualified, narrowed to what the reader reported:` followed by the
+states.
 
 The corpus on its own is `cargo test -p kr-shell-integration --test qualification`. With no package
 built and no customisation fetched it says so and stops; with `KR_REQUIRE_SHELL_PACKAGES` or
 `KR_REQUIRE_SHELL_STACKS` set, either absence is a failure instead, which is what continuous
-integration does.
+integration does. It writes the same evidence to `KR_TEST_ARTIFACTS_DIR`, or, where that is unset,
+to `kr-test-artifacts` in the scratch directory Cargo gives the build's tests (`target/tmp` by
+default). Evidence it cannot write fails the run.
 
 ## The corpus
 
@@ -109,8 +113,9 @@ each run writes:
   operator waiting for its target, so Zsh drives it. Where the drive reaches the keymap and the
   reader says no such thing — Bash's reader reports no pending operator, and Fish's reports nothing
   at all while it waits for the target — the run records the keymap it did observe and narrows the
-  claim to that, under "narrowed to what the reader reported" in the case's own evidence file. What
-  the qualification says about such a state is what the reader said, and no more.
+  claim to that, under "narrowed to what the reader reported" in the case's own evidence file and
+  on the case's line in the summary. What the qualification says about such a state is what the
+  reader said, and no more.
 
 Every line of a case's exclusion record comes from a report a reader wrote or from something the
 run watched the shell do. A drive that offers the gesture in a state it could not confirm says so

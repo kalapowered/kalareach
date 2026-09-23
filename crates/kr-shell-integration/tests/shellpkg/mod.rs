@@ -1757,17 +1757,36 @@ pub fn next_revision(revision: EditorBufferRevision) -> EditorBufferRevision {
 }
 
 /// Where a test writes evidence a reader can be checked against later.
+///
+/// Every run has one, because evidence is part of what a run concludes: a case whose record went
+/// nowhere would still say what it proved while nothing kept what it narrowed. A run that names
+/// none writes under the scratch directory Cargo gives this build's tests, which belongs to
+/// whoever built them.
 #[must_use]
-pub fn artifact_directory() -> Option<PathBuf> {
-    std::env::var_os("KR_TEST_ARTIFACTS_DIR").map(PathBuf::from)
+pub fn artifact_directory() -> PathBuf {
+    std::env::var_os("KR_TEST_ARTIFACTS_DIR").map_or_else(
+        || Path::new(env!("CARGO_TARGET_TMPDIR")).join("kr-test-artifacts"),
+        PathBuf::from,
+    )
 }
 
-/// Writes one line of evidence, when the run asked for it.
+/// Writes one record of evidence.
+///
+/// # Panics
+///
+/// Panics when the record cannot be written: a run whose evidence was lost has not shown what it
+/// says it has.
 pub fn record(name: &str, body: &str) {
-    if let Some(directory) = artifact_directory() {
-        let _ = std::fs::create_dir_all(&directory);
-        let _ = std::fs::write(directory.join(name), body);
-    }
+    let directory = artifact_directory();
+    std::fs::create_dir_all(&directory).unwrap_or_else(|error| {
+        panic!(
+            "the evidence directory {} could not be made: {error}",
+            directory.display()
+        )
+    });
+    let path = directory.join(name);
+    std::fs::write(&path, body)
+        .unwrap_or_else(|error| panic!("{} could not be written: {error}", path.display()));
 }
 
 /// True when `path` is on the internal disk rather than the workspace volume.
