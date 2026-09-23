@@ -335,43 +335,87 @@ fn limits_are_checked_before_anything_a_message_declares_is_reserved() {
     );
 }
 
-/// KR-REQ-23.05, KR-REQ-09.02: duplicate keys, unsorted keys and invalid UTF-8 are refused by the
-/// strict decoder before serde runs. Serde on its own accepts all three orderings and keeps the
-/// last of two duplicates, so the error each one gets names the wire rule rather than a schema
-/// mismatch.
+thread_local! {
+    /// How many times serde was asked to build a [`Recorded`] on this thread.
+    static ENTERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A map that records every time deserialisation is entered for it.
+#[derive(Debug, PartialEq)]
+struct Recorded(std::collections::BTreeMap<String, u64>);
+
+impl<'de> Deserialize<'de> for Recorded {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        ENTERED.with(|entered| entered.set(entered.get() + 1));
+        std::collections::BTreeMap::deserialize(deserializer).map(Self)
+    }
+}
+
+impl Serialize for Recorded {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+/// Decodes `bytes` as a [`Recorded`] and says how often deserialisation was entered.
+fn decode_recorded(bytes: &[u8]) -> (kr_cbor::Result<Recorded>, usize) {
+    ENTERED.with(|entered| entered.set(0));
+    let decoded = from_canonical_slice::<Recorded>(bytes, &Limits::DEFAULT);
+    (decoded, ENTERED.with(std::cell::Cell::get))
+}
+
+/// KR-REQ-23.05, KR-REQ-09.02: duplicate keys, unsorted keys, invalid UTF-8 and trailing bytes are
+/// refused by the strict decoder before serde deserialisation is entered at all, while a canonical
+/// message enters it once. Serde on its own accepts both orderings and keeps the last of two
+/// duplicates, so the refusal is the strict layer's.
 #[test]
 fn duplicates_disorder_and_invalid_text_never_reach_deserialisation() {
     use std::collections::BTreeMap;
+
+    // {"a": 1, "b": 2}: canonical, and deserialised once.
+    let canonical = hex::decode("a2616101616202").expect("hex");
+    let (decoded, entered) = decode_recorded(&canonical);
+    assert_eq!(
+        decoded.expect("a canonical map").0,
+        BTreeMap::from([("a".to_owned(), 1), ("b".to_owned(), 2)])
+    );
+    assert_eq!(entered, 1, "a canonical message reaches deserialisation");
 
     // {"a": 1, "a": 2}: serde alone would keep the second value.
     let duplicated = hex::decode("a2616101616102").expect("hex");
     let lenient: BTreeMap<String, u64> =
         ciborium::from_reader(duplicated.as_slice()).expect("serde alone accepts it");
     assert_eq!(lenient.get("a"), Some(&2));
-    assert!(matches!(
-        from_canonical_slice::<BTreeMap<String, u64>>(&duplicated, &Limits::DEFAULT),
-        Err(CborError::DuplicateKey { .. })
-    ));
+    let (decoded, entered) = decode_recorded(&duplicated);
+    assert!(matches!(decoded, Err(CborError::DuplicateKey { .. })));
+    assert_eq!(entered, 0, "a duplicate key never reaches deserialisation");
 
     // {"b": 1, "a": 2}: serde alone does not look at the order.
     let unsorted = hex::decode("a2616201616102").expect("hex");
     let lenient: BTreeMap<String, u64> =
         ciborium::from_reader(unsorted.as_slice()).expect("serde alone accepts it");
     assert_eq!(lenient.len(), 2);
-    assert!(matches!(
-        from_canonical_slice::<BTreeMap<String, u64>>(&unsorted, &Limits::DEFAULT),
-        Err(CborError::UnsortedMapKeys { .. })
-    ));
+    let (decoded, entered) = decode_recorded(&unsorted);
+    assert!(matches!(decoded, Err(CborError::UnsortedMapKeys { .. })));
+    assert_eq!(entered, 0, "an unsorted map never reaches deserialisation");
 
-    // A text string holding a lone continuation byte, as a value and as a map key.
+    // A key holding a lone continuation byte.
+    let invalid_key = hex::decode("a1618001").expect("hex");
+    let (decoded, entered) = decode_recorded(&invalid_key);
+    assert!(matches!(decoded, Err(CborError::InvalidUtf8 { .. })));
+    assert_eq!(entered, 0, "invalid UTF-8 never reaches deserialisation");
+
+    // A canonical map followed by one more byte.
+    let mut trailing = canonical.clone();
+    trailing.push(0x00);
+    let (decoded, entered) = decode_recorded(&trailing);
+    assert!(matches!(decoded, Err(CborError::TrailingBytes { .. })));
+    assert_eq!(entered, 0, "trailing bytes never reach deserialisation");
+
+    // Invalid UTF-8 as a value is refused the same way.
     let invalid_value = hex::decode("6180").expect("hex");
     assert!(matches!(
         from_canonical_slice::<String>(&invalid_value, &Limits::DEFAULT),
-        Err(CborError::InvalidUtf8 { .. })
-    ));
-    let invalid_key = hex::decode("a1618001").expect("hex");
-    assert!(matches!(
-        from_canonical_slice::<BTreeMap<String, u64>>(&invalid_key, &Limits::DEFAULT),
         Err(CborError::InvalidUtf8 { .. })
     ));
 }
