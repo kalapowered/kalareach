@@ -160,6 +160,32 @@ impl Authority {
         }
     }
 
+    /// Replaces the sessions the device's standing voice grant covers.
+    fn set_standing_sessions(&self, device_id: DeviceId, selector: SessionSelector) {
+        let mut store = self.store.lock().expect("the store");
+        let revoked = store.revoked.clone();
+        let standing = store
+            .grants
+            .iter_mut()
+            .rev()
+            .find(|grant| {
+                grant.recipient_device_id == device_id
+                    && grant.parent_grant_id.0.is_none()
+                    && grant.permits(ActionRight::VoiceUse)
+                    && !revoked.contains(&grant.grant_id)
+            })
+            .expect("a standing voice grant to change");
+        standing.session_selector = selector;
+    }
+
+    /// Replaces the sessions the device's ordinary grant covers.
+    fn set_device_sessions(&self, selector: SessionSelector) {
+        let mut held = self.device_grant.lock().expect("the device grant");
+        if let Some(grant) = held.as_mut() {
+            grant.session_selector = selector;
+        }
+    }
+
     /// How many grants have been written, standing and session-bound alike.
     fn issued(&self) -> usize {
         self.store.lock().expect("the store").grants.len()
@@ -2737,6 +2763,131 @@ async fn a_session_outside_the_voice_grant_is_neither_described_nor_started() {
     assert!(
         fixture.broker.offers().is_empty(),
         "the provider was never asked"
+    );
+}
+
+/// KR-REQ-15.19: a call that names no session reaches the voice grant's own sessions and no others.
+/// A voice grant over no session gives it nothing to reach, whatever the device's own grant covers,
+/// so the call is neither described nor started and the provider is never asked.
+#[tokio::test]
+async fn a_voice_grant_over_no_session_gives_a_call_nothing_to_reach() {
+    let empty: CanonicalSet<SessionId> = CanonicalSet::from_iter([]);
+    for selector in [
+        SessionSelector::None,
+        SessionSelector::These {
+            session_ids: CanonicalSet::from_iter([]),
+        },
+    ] {
+        let fixture = fixture();
+        fixture
+            .coordinator
+            .grant(
+                &grant_params(None),
+                AuthorityRevision::new(1),
+                10_000,
+                &kr_voice::Unbounded,
+            )
+            .await
+            .expect("a standing voice grant");
+        // The device's own grant still covers sessions A and B.
+        fixture
+            .authority
+            .set_standing_sessions(device(PHONE), selector.clone());
+
+        let error = fixture
+            .coordinator
+            .prepare(
+                device(PHONE),
+                &VoicePrepareParams {
+                    session_ids: empty.clone(),
+                    selected: CanonicalSet::from_iter([]),
+                },
+                10_000,
+            )
+            .await
+            .expect_err("a voice grant over no session describes no call");
+        assert_eq!(
+            error.reason(),
+            Some(VoiceRefusal::OutsideVoiceGrant),
+            "{selector:?}"
+        );
+
+        let error = fixture
+            .coordinator
+            .start(
+                device(PHONE),
+                &VoiceStartParams {
+                    session_ids: empty.clone(),
+                    ..start_params()
+                },
+                AuthorityRevision::new(1),
+                10_000,
+                &kr_voice::Unbounded,
+            )
+            .await
+            .expect_err("a voice grant over no session starts no call");
+        assert_eq!(
+            error.reason(),
+            Some(VoiceRefusal::OutsideVoiceGrant),
+            "{selector:?}"
+        );
+        assert!(
+            fixture.broker.offers().is_empty(),
+            "the provider was never asked ({selector:?})"
+        );
+    }
+}
+
+/// KR-REQ-15.19: a call that names no session is described with exactly the sessions it would
+/// reach: the voice grant's own, or the device's named sessions under a voice grant over every
+/// session; never every session.
+#[tokio::test]
+async fn a_call_that_names_no_session_reaches_the_voice_grants_own() {
+    async fn prepare(
+        coordinator: &Coordinator,
+    ) -> kr_voice::Result<kr_protocol::voice::VoicePrepareResult> {
+        let params = VoicePrepareParams {
+            session_ids: CanonicalSet::from_iter([]),
+            selected: CanonicalSet::from_iter([]),
+        };
+        coordinator.prepare(device(PHONE), &params, 10_000).await
+    }
+
+    let fixture = fixture();
+    fixture
+        .coordinator
+        .grant(
+            &grant_params(None),
+            AuthorityRevision::new(1),
+            10_000,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("a standing voice grant");
+    let only_a: CanonicalSet<SessionId> = [session(SESSION_A)].into_iter().collect();
+    let shown = prepare(&fixture.coordinator)
+        .await
+        .expect("the voice grant's own session");
+    assert_eq!(shown.session_ids, only_a, "the voice grant covers A alone");
+
+    fixture
+        .authority
+        .set_standing_sessions(device(PHONE), SessionSelector::Any);
+    let shown = prepare(&fixture.coordinator)
+        .await
+        .expect("the device's named sessions");
+    let both: CanonicalSet<SessionId> = [session(SESSION_A), session(SESSION_B)]
+        .into_iter()
+        .collect();
+    assert_eq!(shown.session_ids, both);
+
+    fixture.authority.set_device_sessions(SessionSelector::Any);
+    let error = prepare(&fixture.coordinator)
+        .await
+        .expect_err("every session is not a list a call can be bound to");
+    assert_eq!(
+        error.reason(),
+        Some(VoiceRefusal::SessionOutsideVoiceSession)
     );
 }
 

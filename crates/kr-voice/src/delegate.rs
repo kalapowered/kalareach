@@ -547,18 +547,12 @@ impl Coordinator {
                 )
             })?;
 
-        // Named sessions are held to both grants here, before anything is described or asked of a
-        // provider. The device's grant alone would let a call be described, and even created, for
-        // a session the voice grant does not cover, which the store then refuses to bind.
-        if let Some(outside) = requested
-            .iter()
-            .find(|session_id| !standing.session_selector.admits(**session_id))
-        {
-            return Err(VoiceError::refused(
-                VoiceRefusal::OutsideVoiceGrant,
-                format!("this device's voice grant does not cover session {outside}"),
-            ));
-        }
+        // The sessions this call would reach, resolved once and here, before anything is described
+        // or asked of a provider. Every one of them is held to both grants. Resolving an empty
+        // request later, inside the grant planner, would take the device's ordinary grant for it,
+        // and a call could then be described, and even created, for sessions the voice grant does
+        // not cover.
+        let session_ids = resolve_sessions(requested, &standing, &device_grant)?;
 
         let (expiry, authority_revision) = match purpose {
             // The call's grant expires on this host's own clock. A host that took its expiry from
@@ -577,46 +571,13 @@ impl Coordinator {
                 parent_grant_id: Some(standing.grant_id),
                 issuer_device_id: self.host_device_id,
                 environment_id: self.environment_id,
-                // An empty request takes the standing voice grant's own sessions, not the wider
-                // set the device's ordinary grant covers: the child narrows both, and the standing
-                // grant is the narrower of the two by construction.
-                session_ids: if requested.is_empty() {
-                    match &standing.session_selector {
-                        kr_protocol::grant::SessionSelector::These { session_ids } => {
-                            session_ids.clone()
-                        }
-                        _ => CanonicalSet::from_iter([]),
-                    }
-                } else {
-                    requested.clone()
-                },
+                // Never empty: the planner reads an empty set as "whatever the device's grant
+                // covers", which is exactly what a call must not be given.
+                session_ids: session_ids.clone(),
                 expiry,
                 authority_revision,
             },
         )?;
-
-        let session_ids = match &planned.plan.session_selector {
-            kr_protocol::grant::SessionSelector::These { session_ids } => session_ids.clone(),
-            // A voice session names what it reaches. A grant over every session cannot be turned
-            // into that list here, and answering with an empty one would be a call that reaches
-            // nothing, so the caller is asked to name them.
-            kr_protocol::grant::SessionSelector::Any => {
-                return Err(VoiceError::refused(
-                    VoiceRefusal::SessionOutsideVoiceSession,
-                    "name the sessions this voice session may reach; a voice grant over every \
-                     session is not one a call can be bound to",
-                ));
-            }
-            kr_protocol::grant::SessionSelector::None => CanonicalSet::from_iter([]),
-        };
-        if session_ids.is_empty() {
-            // Checked before the provider is asked, so a call is never created for a voice session
-            // that could reach nothing.
-            return Err(VoiceError::refused(
-                VoiceRefusal::OutsideDeviceGrant,
-                "this device's grant covers no session, so a voice session would reach none",
-            ));
-        }
         Ok(PlannedCall {
             device_grant,
             standing,
@@ -1641,6 +1602,66 @@ impl Coordinator {
     pub const fn delegation_note() -> &'static str {
         VOICE_DELEGATION_NOTE
     }
+}
+
+/// The sessions a call would reach: those it names, or the voice grant's own when it names none.
+///
+/// Refuses a voice grant over every session when no session is named, because a voice session
+/// names what it reaches and "every session" is not a list; refuses a result that reaches no
+/// session at all; and refuses any session either grant does not cover. The answer is never empty.
+fn resolve_sessions(
+    requested: &CanonicalSet<SessionId>,
+    standing: &Grant,
+    device_grant: &Grant,
+) -> Result<CanonicalSet<SessionId>> {
+    use kr_protocol::grant::SessionSelector;
+
+    let resolved = if requested.is_empty() {
+        match (&standing.session_selector, &device_grant.session_selector) {
+            (SessionSelector::These { session_ids }, _) => session_ids.clone(),
+            // A voice grant over every session narrows to the device's own named sessions.
+            (SessionSelector::Any, SessionSelector::These { session_ids }) => session_ids.clone(),
+            (SessionSelector::Any, SessionSelector::Any) => {
+                return Err(VoiceError::refused(
+                    VoiceRefusal::SessionOutsideVoiceSession,
+                    "name the sessions this voice session may reach; a voice grant over every \
+                     session is not one a call can be bound to",
+                ));
+            }
+            (SessionSelector::Any, SessionSelector::None) | (SessionSelector::None, _) => {
+                CanonicalSet::from_iter([])
+            }
+        }
+    } else {
+        requested.clone()
+    };
+    if resolved.is_empty() {
+        // Checked before the provider is asked, so a call is never created for a voice session
+        // that could reach nothing.
+        return Err(VoiceError::refused(
+            VoiceRefusal::OutsideVoiceGrant,
+            "this device's voice grant covers no session, so a voice session would reach none",
+        ));
+    }
+    if let Some(outside) = resolved
+        .iter()
+        .find(|session_id| !standing.session_selector.admits(**session_id))
+    {
+        return Err(VoiceError::refused(
+            VoiceRefusal::OutsideVoiceGrant,
+            format!("this device's voice grant does not cover session {outside}"),
+        ));
+    }
+    if let Some(outside) = resolved
+        .iter()
+        .find(|session_id| !device_grant.session_selector.admits(**session_id))
+    {
+        return Err(VoiceError::refused(
+            VoiceRefusal::OutsideDeviceGrant,
+            format!("this device's grant does not cover session {outside}"),
+        ));
+    }
+    Ok(resolved)
 }
 
 /// The service's rate in the protocol's shape, when every figure in it can be shown.
