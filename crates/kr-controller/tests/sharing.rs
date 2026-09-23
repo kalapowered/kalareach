@@ -1476,8 +1476,9 @@ fn a_view_only_invitation_obtains_no_input_through_a_plugin_an_attachment_action
 // KR-REQ-23.49: the sharing method group
 // ---------------------------------------------------------------------------------------------
 
-/// KR-REQ-02.09: a persistent grant that enlarges what a device already holds needs the owner's
-/// confirmation; a bounded invitation does not.
+/// KR-REQ-02.09: which grants count as rights-enlarging: a persistent grant that the device's
+/// existing grants do not cover is one, and needs the owner's confirmation; a bounded invitation,
+/// however wide, and a re-issue of what the device already holds are not.
 #[test]
 fn sharing_checks_parent_rights_expiry_and_owner_confirmation() {
     let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");

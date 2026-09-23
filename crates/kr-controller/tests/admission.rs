@@ -32,8 +32,8 @@ fn registry() -> (kr_ipc::testing::TempHost, Registry) {
 }
 
 /// KR-REQ-07.07, KR-REQ-24.05: the create is reserved durably, with the actor, the token and the
-/// payload digest, before anything is spawned, and a retry of the same intent resolves to the same
-/// reservation, also after the registry is opened again, so no retry allocates a second session.
+/// payload digest, and a retry of the same intent resolves to the same reservation, also after the
+/// registry is opened again, so no retry allocates a second session.
 #[test]
 fn a_repeated_create_token_resolves_to_the_same_reservation() {
     let (host, mut registry) = registry();
@@ -165,8 +165,8 @@ fn every_new_execution_is_given_a_new_session_identifier() {
 }
 
 /// KR-REQ-07.14: an environment admits 128 live or creating sessions unless its owner sets another
-/// limit, refuses past the limit with `SESSION_LIMIT` before anything is reserved or spawned, and
-/// never evicts a session to make room.
+/// limit, refuses past the limit with `SESSION_LIMIT` before anything is reserved, and never evicts
+/// a session to make room.
 #[test]
 fn the_limit_refuses_before_anything_is_spawned_and_never_evicts() {
     let (_host, mut registry) = registry();
