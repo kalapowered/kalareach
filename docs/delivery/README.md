@@ -89,8 +89,10 @@ Every few minutes, on a loop of its own, the daemon renews delivery credentials 
 window, so a credential is current before a notification needs it, and asks about outcomes nobody
 knows. Those questions are rationed: a bounded batch at a time, within a time limit, and a question
 that finds nothing waits longer before it is asked again, so an old backlog cannot keep a newer
-notification from being asked about. An old notification is asked about less often, never dropped:
-the gateway keeps an answer for a time that runs from its own decision, which the host cannot see.
+notification from being asked about. Each record waits from the moment its question fell due, first
+question or repeat, so a stream of new ones cannot keep an older one waiting either. An old
+notification is asked about less often, never dropped: the gateway keeps an answer for a time that
+runs from its own decision, which the host cannot see.
 
 The gateway allows each host 1,200 status questions an hour, and each installation the same, and it
 counts them whichever loop asks: the pass asking about a notification the gateway is still retrying,
