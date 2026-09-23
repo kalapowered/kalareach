@@ -145,6 +145,24 @@ impl ExternalSender for WebhookSender {
     }
 }
 
+/// Why this host holds no way to deliver to a destination of `kind`, or `None` when it does.
+///
+/// A paired device and a webhook need nothing beyond their own configuration. Each of the other
+/// four needs a credential from this host's secret store, and a destination's endpoint is never a
+/// credential. Configuration refuses those kinds with this reason, and a pass settles anything of
+/// those kinds with it rather than calling an adapter.
+#[must_use]
+pub const fn credential_needed(kind: DestinationKind) -> Option<&'static str> {
+    match kind {
+        DestinationKind::Push | DestinationKind::Webhook => None,
+        DestinationKind::Slack | DestinationKind::Discord => {
+            Some("its webhook address is itself a bearer secret")
+        }
+        DestinationKind::Telegram => Some("it sends through a bot token"),
+        DestinationKind::Email => Some("it sends through a mail account"),
+    }
+}
+
 /// The origin a webhook's address belongs to, or why this host will not deliver there.
 ///
 /// HTTPS, or plain HTTP on loopback alone, and no credentials in the address: the managed

@@ -3968,3 +3968,62 @@ fn a_credential_renewed_after_a_refusal_is_presented_without_a_second_renewal() 
         })
         .expect("a read");
 }
+
+/// KR-REQ-25.23: a message for a kind this host holds no credential for is settled without an
+/// adapter ever being called, and the record says why, even when the destination reached the
+/// journal without passing through configuration.
+#[test]
+fn a_message_for_a_kind_this_host_cannot_send_is_settled_without_an_attempt() {
+    let environment = environment();
+    let mut slack = webhook(Idempotency::Unsupported);
+    slack.destination = Destination::External(ExternalDestination {
+        kind: DestinationKind::Slack,
+        ..external_of(&slack).clone()
+    });
+    environment
+        .module
+        .with(|producer| {
+            producer
+                .journal_mut()
+                .configure_destination(&slack)
+                .expect("written straight into the journal");
+            Ok(())
+        })
+        .expect("a destination");
+    take_and_produce(
+        &environment,
+        &notice(1, "a command failed"),
+        std::slice::from_ref(&slack),
+        1,
+    );
+    let external = ExternalDouble::answering(Vec::new());
+    environment
+        .module
+        .run_due(
+            &GatewayDouble::queued(),
+            &SilentStatus,
+            &held(NOW + 30 * 24 * 60 * 60 * 1000),
+            &external,
+            &Granted(BTreeSet::new()),
+            &at(NOW),
+        )
+        .expect("a pass");
+    assert!(external.sent().is_empty(), "no adapter was called");
+    environment
+        .module
+        .with(|producer| {
+            let record = producer.journal().deliveries().expect("a read").remove(0);
+            assert_eq!(record.state, DeliveryState::Revoked);
+            assert!(!record.dispatched);
+            assert!(
+                record
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("no credential")),
+                "{:?}",
+                record.detail
+            );
+            Ok(())
+        })
+        .expect("a read");
+}

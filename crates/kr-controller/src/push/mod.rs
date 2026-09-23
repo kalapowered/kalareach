@@ -33,8 +33,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use kr_delivery::destination::{
-    DeliveryRule, Destination, DestinationId, DestinationKind, DestinationRecord, PreviewKeys,
-    PushDestination,
+    DeliveryRule, Destination, DestinationId, DestinationRecord, PreviewKeys, PushDestination,
 };
 use kr_delivery::external::ExternalSender;
 use kr_delivery::journal::{
@@ -272,15 +271,7 @@ impl DeliveryModule {
     /// cannot be written.
     pub fn configure(&self, record: &DestinationRecord) -> Result<()> {
         if let Destination::External(external) = &record.destination {
-            let needs = match external.kind {
-                DestinationKind::Webhook | DestinationKind::Push => None,
-                DestinationKind::Slack | DestinationKind::Discord => {
-                    Some("its webhook address is itself a bearer secret")
-                }
-                DestinationKind::Telegram => Some("it sends through a bot token"),
-                DestinationKind::Email => Some("it sends through a mail account"),
-            };
-            if let Some(needs) = needs {
+            if let Some(needs) = external::credential_needed(external.kind) {
                 return Err(ControllerError::InvalidArgument(format!(
                     "a {} destination needs a credential from this host's secret store, because \
                      {needs}, and a destination's endpoint is never a credential: this host \
@@ -824,6 +815,20 @@ impl DeliveryModule {
         clock: &dyn Clock,
     ) -> Result<()> {
         let destination = record.as_external().expect("an external destination");
+        if let Some(needs) = external::credential_needed(destination.kind) {
+            // Configuration refuses these kinds, so nothing is admitted for one. A record that
+            // reached here anyway is settled without calling an adapter: nothing could send it,
+            // and an attempt that never left is not an outcome anybody has to wonder about.
+            return self.settle(
+                delivery,
+                DeliveryState::Revoked,
+                &format!(
+                    "this host holds no credential for a {} destination: {needs}",
+                    destination.kind
+                ),
+                now_ms,
+            );
+        }
         let message = client::message_from(&delivery.content)?;
         let attempt = delivery.attempt;
         let outcome = external.send(destination, &message);
