@@ -20,13 +20,14 @@ use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope, Session
 use kr_protocol::ids::{ActorId, AuthorityRevision, DeviceId, DeviceKeyRevision, GrantId};
 use kr_protocol::pairing::{
     ConfirmationChannel, DeviceName, DevicePlatform, DevicePublicKeys, DirectQrPayload,
-    INVITATION_LIFETIME_MS, NetworkConfig, OwnerConfirmationProof, OwnerConfirmationRequest,
-    PairStatus, PairingConsumedReason, ProposedGrant, QrPayload, SensitiveAction,
-    direct_verification_value,
+    INVITATION_LIFETIME_MS, NetworkConfig, NetworkHint, OwnerConfirmationProof,
+    OwnerConfirmationRequest, PairStatus, PairingConsumedReason, ProposedGrant, QrPayload,
+    SensitiveAction, direct_verification_value,
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{
-    AuthorisationKey, CanonicalSet, Digest256, EndpointKey, Nullable, TimestampMs, Uuid,
+    AuthorisationKey, CanonicalSet, Digest256, EndpointKey, Nullable, Signature64, TimestampMs,
+    Uuid,
 };
 
 type Invitation<'a> = DirectInvitation<&'a TestInvitationStore, &'a TestClock>;
@@ -112,7 +113,7 @@ impl Harness {
             endpoint_id: *self.host_keys.transport.public(),
             keys: self.host_keys.public_keys(),
             device_key_revision: DeviceKeyRevision::new(1),
-            network_config: NetworkConfig::empty(),
+            network_config: network_config(),
         }
     }
 
@@ -217,6 +218,21 @@ impl Harness {
     }
 }
 
+/// A host's selected discovery and relay configuration, with every member populated.
+fn network_config() -> NetworkConfig {
+    let hint = |text: &str| NetworkHint::new(text).expect("a hint");
+    NetworkConfig {
+        relay_urls: vec![
+            hint("https://relay-1.reach.kala.to"),
+            hint("https://relay-2.reach.kala.to"),
+        ],
+        pkarr_publisher_url: Nullable::some(hint("https://pkarr.reach.kala.to")),
+        pkarr_resolver_url: Nullable::some(hint("https://resolver.reach.kala.to")),
+        dns_origin: Nullable::some(hint("dns.reach.kala.to")),
+        direct_addresses: vec![hint("192.0.2.10:4433"), hint("[2001:db8::10]:4433")],
+    }
+}
+
 /// What the candidate declares about itself in every redemption below.
 fn candidate_identity(harness: &Harness) -> kr_pairing::direct::CandidateIdentity {
     kr_pairing::direct::CandidateIdentity {
@@ -264,7 +280,7 @@ fn a_complete_direct_pairing_commits_the_device_and_the_proposed_grant() {
 
     // The QR carries the selected network configuration, a random 256-bit secret of its own and a
     // five-minute expiry, and until a candidate proves the secret the invitation grants nothing.
-    assert_eq!(payload.network_config, harness.identity().network_config);
+    assert_eq!(payload.network_config, network_config());
     assert_eq!(payload.secret.expose().len(), 32);
     let another = harness.issue();
     assert_ne!(
@@ -310,6 +326,22 @@ fn a_complete_direct_pairing_commits_the_device_and_the_proposed_grant() {
     assert_eq!(committed.proposed_grant, proposal());
     assert_eq!(committed.client_keys, harness.client_keys.public_keys());
     assert_eq!(committed.verification_value, client_value);
+    // The grant issued in the commit carries the proposal's rights, scope and expiry, from this
+    // host to the device just recorded.
+    let proposed = proposal();
+    assert_eq!(committed.grant.actions, proposed.actions);
+    assert_eq!(
+        committed.grant.environment_selector,
+        proposed.environment_selector
+    );
+    assert_eq!(committed.grant.session_selector, proposed.session_selector);
+    assert_eq!(committed.grant.history, proposed.history);
+    assert_eq!(committed.grant.expiry, proposed.expiry);
+    assert_eq!(
+        committed.grant.issuer_device_id,
+        harness.identity().device_id
+    );
+    assert_eq!(committed.grant.recipient_device_id, committed.device_id);
     assert_eq!(
         committed
             .client_bundle
@@ -386,7 +418,7 @@ fn the_submitted_endpoint_must_be_the_live_peer() {
 }
 
 /// KR-REQ-10.36, KR-REQ-10.35: redemption needs both the secret's HMAC over `D` and the Ed25519
-/// signature over `D`.
+/// signature over `D`; each one refuses a redemption the other would pass.
 #[test]
 fn a_wrong_secret_or_a_tampered_signature_does_not_redeem() {
     let harness = Harness::new();
@@ -424,8 +456,8 @@ fn a_wrong_secret_or_a_tampered_signature_does_not_redeem() {
         Err(PairingError::ContextMismatch { .. })
     ));
 
-    // Substituting only the authorisation key keeps the bundle self-consistent, and then the
-    // signature is what refuses it.
+    // A signature that does not verify refuses the redemption on its own: `D` and the secret's tag
+    // are the ones the candidate built, and only the signature's bytes are wrong.
     let payload = harness.scan(&invitation);
     let challenge = invitation
         .issue_challenge(&harness.client_peer())
@@ -438,11 +470,38 @@ fn a_wrong_secret_or_a_tampered_signature_does_not_redeem() {
         &host_peer,
     )
     .expect("a proof");
-    proof.client_keys.authorisation = *impostor.authorisation.public();
+    let mut signature = *proof.signature.as_bytes();
+    signature[0] ^= 0x01;
+    proof.signature = Signature64::from_bytes(signature);
     assert!(matches!(
         invitation.redeem(&proof, harness.client_keys.transport.public(), &peer),
         Err(PairingError::AuthenticationFailed)
     ));
+    assert_eq!(invitation.record().state, InvitationState::Open);
+
+    // Substituting the authorisation key and recomputing the secret's tag over the `D` that key
+    // gives leaves the signature, made by the original key over the original `D`, as the only
+    // thing that can refuse it.
+    let payload = harness.scan(&invitation);
+    let challenge = invitation
+        .issue_challenge(&harness.client_peer())
+        .expect("a challenge");
+    let (mut proof, mut transcript) = redeem_proof(
+        &payload,
+        &challenge,
+        &harness.client_keys.authorisation,
+        &candidate_identity(&harness),
+        &host_peer,
+    )
+    .expect("a proof");
+    proof.client_keys.authorisation = *impostor.authorisation.public();
+    transcript.client_keys.authorisation = *impostor.authorisation.public();
+    proof.secret_proof = kr_pairing::direct::secret_proof(&payload.secret, &transcript);
+    assert!(matches!(
+        invitation.redeem(&proof, harness.client_keys.transport.public(), &peer),
+        Err(PairingError::AuthenticationFailed)
+    ));
+    assert_eq!(invitation.record().state, InvitationState::Open);
 }
 
 /// KR-REQ-10.35, KR-REQ-10.36: the proof goes only to the endpoint the QR pinned, never in 0-RTT.
@@ -926,7 +985,7 @@ fn a_lost_response_does_not_strand_the_candidate() {
         Err(PairingError::CandidateLocked)
     ));
 
-    // And a cancelled invitation hands nothing back, retry or not.
+    // And a cancelled invitation hands nothing back, retry or not, and has committed nothing.
     invitation
         .cancel(&harness.issuing_owner)
         .expect("cancelled");
@@ -936,6 +995,89 @@ fn a_lost_response_does_not_strand_the_candidate() {
             reason: PairingConsumedReason::Cancelled
         })
     ));
+    assert_eq!(
+        kr_pairing::platform::InvitationStore::commitment(
+            &&harness.store,
+            invitation.invitation_id()
+        )
+        .expect("a read"),
+        None,
+        "a cancelled invitation commits nothing"
+    );
+}
+
+/// KR-REQ-10.37: a redemption over altered rights, or a retry from the same authenticated endpoint
+/// that alters the keys it declares, changes nothing. The first does not redeem, because `D` covers
+/// the host's own proposal; the second is refused while the first candidate holds the invitation;
+/// and what is committed is the first candidate's keys and the invitation's own rights.
+#[test]
+fn an_altered_redemption_changes_neither_the_keys_nor_the_rights() {
+    let harness = Harness::new();
+    let mut invitation = harness.issue();
+
+    let mut wider = harness.scan(&invitation);
+    wider.proposed_grant.actions = [ActionRight::SessionView, ActionRight::TerminalInput]
+        .into_iter()
+        .collect();
+    assert!(matches!(
+        run_redemption(&harness, &mut invitation, &wider),
+        Err(PairingError::AuthenticationFailed)
+    ));
+    assert_eq!(invitation.record().state, InvitationState::Open);
+
+    let payload = harness.scan(&invitation);
+    let challenge = invitation
+        .issue_challenge(&harness.client_peer())
+        .expect("a challenge");
+    let (proof, _) = redeem_proof(
+        &payload,
+        &challenge,
+        &harness.client_keys.authorisation,
+        &candidate_identity(&harness),
+        &harness.host_peer(),
+    )
+    .expect("a proof");
+    let peer = harness.client_peer();
+    let first = invitation
+        .redeem(&proof, harness.client_keys.transport.public(), &peer)
+        .expect("a redemption");
+
+    let other = DeviceKeys::generate().expect("keys");
+    let mut altered = candidate_identity(&harness);
+    altered.keys.stored_envelope = *other.stored_envelope.public();
+    altered.keys.notification_preview = *other.notification_preview.public();
+    let (altered_proof, _) = redeem_proof(
+        &payload,
+        &challenge,
+        &harness.client_keys.authorisation,
+        &altered,
+        &harness.host_peer(),
+    )
+    .expect("a proof");
+    assert!(matches!(
+        invitation.redeem(
+            &altered_proof,
+            harness.client_keys.transport.public(),
+            &peer
+        ),
+        Err(PairingError::CandidateLocked)
+    ));
+    assert_eq!(
+        invitation
+            .redeem(&proof, harness.client_keys.transport.public(), &peer)
+            .expect("the first redemption, retried"),
+        first
+    );
+
+    let committed = harness
+        .confirm(
+            &mut invitation,
+            first.transcript_digest,
+            client_keys_digest(&harness.client_keys.public_keys()).expect("a digest"),
+        )
+        .expect("a commitment");
+    assert_eq!(committed.client_keys, harness.client_keys.public_keys());
+    assert_eq!(committed.grant.actions, proposal().actions);
 }
 
 /// KR-REQ-10.37: the committed result is reported to the candidate's authenticated endpoint alone.
