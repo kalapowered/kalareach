@@ -10,8 +10,9 @@ use std::sync::{Arc, Mutex};
 use kr_client::error::ClientError;
 use kr_client::recovery::{
     Admission, BundleStore, FreshRestore, LostWrite, MAX_RECOVERY_KIT_BYTES, Material,
-    OfflineExport, RECOVERY_KIT_FORMAT, RecoveryError, RestoreLimits, RetrievalPolicy, SeedSource,
-    ServiceAccess, bundle_collection, may_back_up, may_restore, parse_kit, qr_payload, render_kit,
+    MigrationRecord, OfflineExport, RECOVERY_KIT_FORMAT, RecoveryError, RestoreLimits,
+    RetrievalPolicy, SeedSource, ServiceAccess, bundle_collection, may_back_up, may_restore,
+    parse_kit, qr_payload, render_kit,
 };
 use kr_client::services::{
     ServiceFuture, SyncBackupService, SyncExchanged, SyncPosition, SyncRequestFence,
@@ -2289,6 +2290,558 @@ async fn a_destination_that_holds_a_bundle_is_refused_before_a_source_that_has_m
         Err(RecoveryError::BundleConflict { .. })
     ));
     assert!(empty_service.attempts().is_empty());
+}
+
+#[tokio::test]
+async fn a_migration_whose_answer_was_lost_after_its_write_landed_is_completed_from_that_write() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let second = AuthorisationKeyPair::generate().expect("another writer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+    let kit = kit_of(&seed, &[ORIGIN]);
+
+    // The destination takes the write and the answer never comes back.
+    let destination_service = ScriptedService::shared();
+    let mut destination = BundleStore::new(Arc::clone(&destination_service) as Arc<_>, moved());
+    destination_service.interrupt_the_next_exchange(Interruption::LoseTheAnswerAfterTheWrite);
+    let moving = bundle.clone();
+    assert!(matches!(
+        store
+            .migrate(
+                &seed,
+                &mut bundle,
+                &kit,
+                &mut destination,
+                TimestampMs::new(2_000),
+            )
+            .await,
+        Err(RecoveryError::BundleOutcomeUnknown { .. })
+    ));
+    assert_eq!(bundle, moving, "the caller still holds what it was moving");
+    let landed_at = destination_service
+        .position_of(MOVED_LOCATOR)
+        .expect("the write landed");
+    let sent = destination_service.attempts().pop().expect("the write");
+
+    // Migrating again cannot finish it: the destination's write is still outstanding.
+    assert!(matches!(
+        store
+            .migrate(
+                &seed,
+                &mut bundle,
+                &kit,
+                &mut destination,
+                TimestampMs::new(2_500),
+            )
+            .await,
+        Err(RecoveryError::BundleWriteUnsettled { .. })
+    ));
+
+    // Completing it is one step. It ends the write by the identity it went out under, recognises
+    // the bundle it left by that identity's receipt and the digest of what it carried, and hands
+    // back what the migration owed: the record and the updated kit.
+    let migrated = store
+        .complete_migration(
+            &seed,
+            &mut bundle,
+            &kit,
+            &mut destination,
+            TimestampMs::new(3_000),
+        )
+        .await
+        .expect("the migration completes from the write that landed");
+    assert_eq!(migrated.record.from, context(ORIGIN));
+    assert_eq!(migrated.record.to, moved());
+    assert_eq!(migrated.record.bundle_position, landed_at);
+    assert_eq!(migrated.record.bundle_revision, moving.revision.get() + 1);
+    assert_eq!(migrated.record.verified_at_ms, TimestampMs::new(3_000));
+    assert_eq!(migrated.updated_kit.service_origins, vec![OTHER_ORIGIN]);
+    assert_eq!(migrated.updated_kit.bundle_locator, MOVED_LOCATOR);
+    assert_eq!(migrated.updated_kit.seed.expose(), kit.seed.expose());
+    assert_eq!(
+        bundle.revision.get(),
+        migrated.record.bundle_revision,
+        "the caller now holds the bundle at the destination, as a migration leaves it"
+    );
+    assert_eq!(destination.position(), Some(landed_at));
+    assert_eq!(destination.lost_write(), Some(LostWrite::Applied));
+
+    // It wrote nothing: the one write at the destination is the migration's own, and the old
+    // location has had no write since the bundle was first committed there.
+    assert_eq!(destination_service.attempts().len(), 1);
+    assert_eq!(service.attempts().len(), 1);
+    let fences = destination_service.fences();
+    assert_eq!(fences.len(), 1);
+    assert_eq!(fences[0].request_id, sent.request_id);
+
+    // A restore with the updated kit opens the bundle at its new home.
+    let mut restore = FreshRestore::new(migrated.updated_kit.clone(), RetrievalPolicy::SelfHosted);
+    restore
+        .obtained_access(ServiceAccess {
+            policy: RetrievalPolicy::SelfHosted,
+            service_origin: OTHER_ORIGIN.to_owned(),
+        })
+        .expect("access to the new origin");
+    let material = restore
+        .open_bundle(Arc::clone(&destination_service) as Arc<_>, OTHER_ORIGIN)
+        .await
+        .expect("the bundle authenticates at its new home");
+    assert_eq!(material.bundle_revision, migrated.record.bundle_revision);
+    assert!(
+        material
+            .trusted_writers
+            .iter()
+            .any(|held| held.writer_key_id == writer.key_id())
+    );
+
+    // And the destination store is the one that writes there from now on.
+    destination
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&second),
+            TimestampMs::new(4_000),
+        )
+        .await
+        .expect("the next write at the destination lands");
+    assert_eq!(destination.lost_write(), None);
+}
+
+#[tokio::test]
+async fn completing_a_migration_is_idempotent() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+    let kit = kit_of(&seed, &[ORIGIN]);
+    let destination_service = ScriptedService::shared();
+    let mut destination = BundleStore::new(Arc::clone(&destination_service) as Arc<_>, moved());
+    destination_service.interrupt_the_next_exchange(Interruption::LoseTheAnswerAfterTheWrite);
+    assert!(matches!(
+        store
+            .migrate(
+                &seed,
+                &mut bundle,
+                &kit,
+                &mut destination,
+                TimestampMs::new(2_000),
+            )
+            .await,
+        Err(RecoveryError::BundleOutcomeUnknown { .. })
+    ));
+
+    // The caller ends the lost write first, which says the bundle is there, and the destination
+    // store then holds it. A migration does not write over a bundle, so migrating again is
+    // refused and hands back neither a record nor a kit.
+    assert_eq!(
+        destination
+            .end_lost_write(&seed)
+            .await
+            .expect("the fence is made"),
+        Some(LostWrite::Applied)
+    );
+    assert!(matches!(
+        store
+            .migrate(
+                &seed,
+                &mut bundle,
+                &kit,
+                &mut destination,
+                TimestampMs::new(2_500),
+            )
+            .await,
+        Err(RecoveryError::DestinationHoldsABundle)
+    ));
+
+    // Completion finishes it, and asking again is answered the same way.
+    let first = store
+        .complete_migration(
+            &seed,
+            &mut bundle,
+            &kit,
+            &mut destination,
+            TimestampMs::new(3_000),
+        )
+        .await
+        .expect("the migration completes");
+    let again = store
+        .complete_migration(
+            &seed,
+            &mut bundle,
+            &kit,
+            &mut destination,
+            TimestampMs::new(3_000),
+        )
+        .await
+        .expect("asked again, it completes again");
+    assert_eq!(again.record, first.record);
+    assert_eq!(again.updated_kit, first.updated_kit);
+
+    // Later, it says when it read the bundle back, and nothing else about the move changes.
+    let later = store
+        .complete_migration(
+            &seed,
+            &mut bundle,
+            &kit,
+            &mut destination,
+            TimestampMs::new(5_000),
+        )
+        .await
+        .expect("asked later, it completes again");
+    assert_eq!(later.record.verified_at_ms, TimestampMs::new(5_000));
+    assert_eq!(
+        MigrationRecord {
+            verified_at_ms: first.record.verified_at_ms,
+            ..later.record.clone()
+        },
+        first.record
+    );
+    assert_eq!(later.updated_kit, first.updated_kit);
+
+    // None of them wrote anything, at either location.
+    assert_eq!(destination_service.attempts().len(), 1);
+    assert_eq!(service.attempts().len(), 1);
+    assert_eq!(
+        destination_service.position_of(MOVED_LOCATOR),
+        Some(first.record.bundle_position)
+    );
+    assert_eq!(bundle.revision.get(), first.record.bundle_revision);
+}
+
+#[tokio::test]
+async fn completing_a_migration_refuses_another_writers_bundle_at_the_place_its_write_would_have_taken()
+ {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+    let kit = kit_of(&seed, &[ORIGIN]);
+
+    // This migration's write is held somewhere on its way, so it has not reached the destination.
+    let destination_service = ScriptedService::shared();
+    let mut destination = BundleStore::new(Arc::clone(&destination_service) as Arc<_>, moved());
+    destination_service.interrupt_the_next_exchange(Interruption::LoseTheRequest);
+    assert!(matches!(
+        store
+            .migrate(
+                &seed,
+                &mut bundle,
+                &kit,
+                &mut destination,
+                TimestampMs::new(2_000),
+            )
+            .await,
+        Err(RecoveryError::BundleOutcomeUnknown { .. })
+    ));
+    let held = destination_service
+        .attempts()
+        .pop()
+        .expect("the held write");
+
+    // Another device migrates the same bundle to the same destination first. What it leaves is
+    // this bundle moved on by one revision, at the first place, which is exactly where this
+    // migration's write would have landed: its place in the order and the shape of its content
+    // both match. Only the writer and the instant it was written at are different.
+    let mut other_device = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut theirs = other_device.fetch(&seed).await.expect("they read it");
+    other_device
+        .migrate(
+            &seed,
+            &mut theirs,
+            &kit,
+            &mut BundleStore::new(Arc::clone(&destination_service) as Arc<_>, moved()),
+            TimestampMs::new(2_100),
+        )
+        .await
+        .expect("their migration lands");
+    assert_eq!(held.expected, None);
+    assert_eq!(destination_service.position_of(MOVED_LOCATOR), Some(at(1)));
+    assert_eq!(theirs.revision.get(), bundle.revision.get() + 1);
+
+    // The service says this migration's write never ran, so the bundle there is not its own,
+    // however well its place and its shape fit.
+    assert!(matches!(
+        store
+            .complete_migration(
+                &seed,
+                &mut bundle,
+                &kit,
+                &mut destination,
+                TimestampMs::new(3_000),
+            )
+            .await,
+        Err(RecoveryError::DestinationHoldsABundle)
+    ));
+    assert_eq!(
+        bundle.revision.get(),
+        1,
+        "the caller still holds what it was moving"
+    );
+    assert_eq!(
+        destination.lost_write(),
+        Some(LostWrite::Ended { retained: None })
+    );
+
+    // The completion ended the held write, so it cannot land on top of theirs afterwards, and
+    // what is at the destination is still what the other device left there.
+    assert!(
+        destination_service
+            .deliver_the_delayed_attempt(&held)
+            .is_err()
+    );
+    let mut reader = BundleStore::new(Arc::clone(&destination_service) as Arc<_>, moved());
+    assert_eq!(reader.fetch(&seed).await.expect("their bundle"), theirs);
+
+    // Asking again is refused again, and a migration into that store is refused as well.
+    assert!(matches!(
+        store
+            .complete_migration(
+                &seed,
+                &mut bundle,
+                &kit,
+                &mut destination,
+                TimestampMs::new(3_500),
+            )
+            .await,
+        Err(RecoveryError::DestinationHoldsABundle)
+    ));
+    assert!(matches!(
+        store
+            .migrate(
+                &seed,
+                &mut bundle,
+                &kit,
+                &mut destination,
+                TimestampMs::new(4_000),
+            )
+            .await,
+        Err(RecoveryError::DestinationHoldsABundle)
+    ));
+
+    // The content alone does not decide it either. The service now serves the very bytes this
+    // migration's write carried, as a write of their own, while it says that write never ran.
+    // The digest matches and the identity does not, and it takes both.
+    destination_service.republish(MOVED_LOCATOR, held.ciphertext.clone());
+    assert!(matches!(
+        store
+            .complete_migration(
+                &seed,
+                &mut bundle,
+                &kit,
+                &mut destination,
+                TimestampMs::new(4_500),
+            )
+            .await,
+        Err(RecoveryError::DestinationHoldsABundle)
+    ));
+    assert_eq!(bundle.revision.get(), 1);
+}
+
+#[tokio::test]
+async fn completing_a_migration_is_refused_when_the_old_location_has_moved_on_since_its_write() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let second = AuthorisationKeyPair::generate().expect("another writer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+    let kit = kit_of(&seed, &[ORIGIN]);
+    let destination_service = ScriptedService::shared();
+    let mut destination = BundleStore::new(Arc::clone(&destination_service) as Arc<_>, moved());
+    destination_service.interrupt_the_next_exchange(Interruption::LoseTheAnswerAfterTheWrite);
+    assert!(matches!(
+        store
+            .migrate(
+                &seed,
+                &mut bundle,
+                &kit,
+                &mut destination,
+                TimestampMs::new(2_000),
+            )
+            .await,
+        Err(RecoveryError::BundleOutcomeUnknown { .. })
+    ));
+
+    // After the write landed at the destination, another device enrols a writer at the old
+    // location. The bundle that was moved no longer carries every writer the owner has.
+    let mut other_device = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut theirs = other_device.fetch(&seed).await.expect("they read it");
+    other_device
+        .enable_writer(
+            &seed,
+            &mut theirs,
+            trusted(&second),
+            TimestampMs::new(2_500),
+        )
+        .await
+        .expect("their commit lands");
+
+    // The destination's bundle is this migration's own, and completing it would still hand back a
+    // kit pointing at a bundle without that writer. So it is a conflict, as it would have been
+    // before the write.
+    assert!(matches!(
+        store
+            .complete_migration(
+                &seed,
+                &mut bundle,
+                &kit,
+                &mut destination,
+                TimestampMs::new(3_000),
+            )
+            .await,
+        Err(RecoveryError::BundleConflict { .. })
+    ));
+    assert_eq!(
+        bundle.revision.get(),
+        1,
+        "the caller still holds what it was moving"
+    );
+    assert_eq!(
+        destination_service.attempts().len(),
+        1,
+        "nothing more was written"
+    );
+
+    // And a bundle the destination store wrote for itself is not a migration of this one, even
+    // though it is that store's own write.
+    let mut unrelated = BundleStore::empty(TimestampMs::new(1));
+    let mut own_service_store =
+        BundleStore::new(Arc::clone(&ScriptedService::shared()) as Arc<_>, moved());
+    own_service_store
+        .enable_writer(
+            &seed,
+            &mut unrelated,
+            trusted(&second),
+            TimestampMs::new(3_500),
+        )
+        .await
+        .expect("an unrelated first bundle there");
+    assert!(matches!(
+        store
+            .complete_migration(
+                &seed,
+                &mut bundle,
+                &kit,
+                &mut own_service_store,
+                TimestampMs::new(4_000),
+            )
+            .await,
+        Err(RecoveryError::DestinationHoldsABundle)
+    ));
+}
+
+#[tokio::test]
+async fn completing_a_migration_whose_write_never_landed_leaves_the_move_to_be_made_again() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let mut store = BundleStore::new(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    store
+        .enable_writer(
+            &seed,
+            &mut bundle,
+            trusted(&writer),
+            TimestampMs::new(1_000),
+        )
+        .await
+        .expect("the bundle commits");
+    let kit = kit_of(&seed, &[ORIGIN]);
+    let destination_service = ScriptedService::shared();
+    let mut destination = BundleStore::new(Arc::clone(&destination_service) as Arc<_>, moved());
+    destination_service.interrupt_the_next_exchange(Interruption::LoseTheRequest);
+    assert!(matches!(
+        store
+            .migrate(
+                &seed,
+                &mut bundle,
+                &kit,
+                &mut destination,
+                TimestampMs::new(2_000),
+            )
+            .await,
+        Err(RecoveryError::BundleOutcomeUnknown { .. })
+    ));
+    let held = destination_service
+        .attempts()
+        .pop()
+        .expect("the held write");
+
+    // Nothing is at the destination and the write never ran, so there is no move to complete.
+    assert!(matches!(
+        store
+            .complete_migration(
+                &seed,
+                &mut bundle,
+                &kit,
+                &mut destination,
+                TimestampMs::new(3_000),
+            )
+            .await,
+        Err(RecoveryError::MigrationDidNotLand)
+    ));
+    assert!(
+        destination_service
+            .deliver_the_delayed_attempt(&held)
+            .is_err(),
+        "the held write was ended and cannot land later"
+    );
+
+    // Which makes the move safe to make again.
+    let migrated = store
+        .migrate(
+            &seed,
+            &mut bundle,
+            &kit,
+            &mut destination,
+            TimestampMs::new(4_000),
+        )
+        .await
+        .expect("the migration lands");
+    assert_eq!(
+        destination_service.position_of(MOVED_LOCATOR),
+        Some(migrated.record.bundle_position)
+    );
 }
 
 #[tokio::test]

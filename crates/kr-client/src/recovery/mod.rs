@@ -134,10 +134,23 @@ pub enum RecoveryError {
     /// A migration writes where there is none. Comparing against a bundle already there would put
     /// the moved one over the top of it, and a bundle is the only thing a restore takes a writer
     /// key from, so the one replaced would take its archives with it.
+    ///
+    /// Completing a migration meets the same refusal when the bundle at the destination is not
+    /// the one that migration's write left there, whatever place in the order it holds.
     #[error(
         "that destination already holds a recovery bundle, and a migration does not write over one"
     )]
     DestinationHoldsABundle,
+    /// The migration being completed left nothing at the destination.
+    ///
+    /// The destination store sent no write for it, or the service refused that write or
+    /// establishes that it never ran, and nothing could be read there. Nothing will land under
+    /// that write's identity later, because the service has fenced it, so there is no move to
+    /// complete and making it again is safe.
+    #[error(
+        "that migration's write never landed at the destination, so there is nothing to complete"
+    )]
+    MigrationDidNotLand,
     /// The bundle at the locator was written by somebody else since this device last read it.
     #[error("the recovery bundle has moved on since this device last read it; read it again")]
     BundleConflict {

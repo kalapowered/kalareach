@@ -781,9 +781,11 @@ impl BundleStore {
     /// A destination that **answers nothing** leaves a write that may still land, and clearing the
     /// object would not help, because the delayed request would write it again. That is why the
     /// destination is a store the caller holds rather than one this call makes and drops: the
-    /// store that made the write keeps the record of it, refuses to write again while it stands,
-    /// and [`Self::end_lost_write`] on that store is what ends it. A migration abandoned part-way,
-    /// by a failure or by a dropped future, leaves that record where a retry will find it.
+    /// store that made the write keeps the record of it and refuses to write again while it
+    /// stands. [`Self::complete_migration`] is the step that follows: it ends that write and, where
+    /// it landed, completes the migration from it. [`Self::end_lost_write`] on the destination
+    /// store ends the write and completes nothing. A migration abandoned part-way, by a failure or
+    /// by a dropped future, leaves that record where either will find it.
     ///
     /// **The destination store has to hold nothing, and it stays the caller's.** A migration writes
     /// a bundle where there is none, so a store that has already read one at the destination is
@@ -798,9 +800,9 @@ impl BundleStore {
     /// Returns [`RecoveryError::UnknownServiceOrigin`] when the kit does not name this store's
     /// origin, [`RecoveryError::KitLocatorMismatch`] when it names another bundle,
     /// [`RecoveryError::MigrationWouldLoseAnOrigin`] for a kit that names several origins,
+    /// [`RecoveryError::KitIsForAnotherSeed`] when the kit and the seed disagree,
     /// [`RecoveryError::DestinationHoldsABundle`] when the destination store has read a bundle
-    /// there, [`RecoveryError::KitIsForAnotherSeed`] when the kit and the seed disagree,
-    /// [`RecoveryError::BundleConflict`] when the old location has moved on,
+    /// there, [`RecoveryError::BundleConflict`] when the old location has moved on,
     /// [`RecoveryError::BundleNotAuthentic`] when the bundle does not read back at the new
     /// location, and whatever [`Self::commit`] returns for the write itself.
     pub async fn migrate(
@@ -811,27 +813,7 @@ impl BundleStore {
         moved: &mut Self,
         now_ms: TimestampMs,
     ) -> Result<Migrated> {
-        let destination = moved.context.clone();
-        // A kit's origins share one locator, so the updated kit can name only the destination: an
-        // origin left in it would point at a bundle this migration did not move. That makes a kit
-        // naming several origins impossible to migrate one service at a time without losing the
-        // others, so it is refused rather than silently reduced. Per-origin locators are what a
-        // multiple-service migration needs, and this build does not have them.
-        if kit.service_origins.len() > 1 {
-            return Err(RecoveryError::MigrationWouldLoseAnOrigin {
-                origins: kit.service_origins.len(),
-            });
-        }
-        if !kit
-            .service_origins
-            .iter()
-            .any(|origin| origin == &self.context.service_origin)
-        {
-            return Err(RecoveryError::UnknownServiceOrigin);
-        }
-        if kit.bundle_locator != self.context.bundle_locator {
-            return Err(RecoveryError::KitLocatorMismatch);
-        }
+        let updated_kit = self.kit_for_the_move(seed, kit, &moved.context)?;
         // A migration writes a bundle where there is none. A destination store that has already
         // read one would compare against it and put this bundle over the top, and the read-back
         // check would pass, because what came back is what went in. The bundle it replaced would
@@ -843,28 +825,6 @@ impl BundleStore {
         if moved.baseline.is_some() {
             return Err(RecoveryError::DestinationHoldsABundle);
         }
-        // The kit has to be this seed's. `from_kit` reads it under its declared profile and checks
-        // its own checksum, which is what a mistyped or foreign-profile kit fails; the checksums
-        // then have to agree, because the updated kit this call returns is built from the *seed*,
-        // and a caller that handed in a kit for another seed would be handed back a kit that opens
-        // nothing it owns while its existing archives still wrap their keys for the old recovery
-        // recipient.
-        let kit_seed = RecoverySeed::from_kit(kit)?;
-        if !kit_seed
-            .bundle_key_for(&self.context)?
-            .constant_time_eq(&seed.bundle_key_for(&self.context)?)
-        {
-            return Err(RecoveryError::KitIsForAnotherSeed);
-        }
-
-        // The kit the migration will hand back has to be one its owner can actually keep. A
-        // destination whose locator cannot be printed, or whose kit is larger than a scannable
-        // code, would otherwise be found out after the bundle had been written there, which is
-        // the one failure this call cannot undo.
-        let origins = vec![destination.service_origin.clone()];
-        let updated_kit =
-            kr_crypto::kdf::RecoverySeed::to_kit(seed, origins, destination.bundle_locator.clone());
-        drop(crate::recovery::kit::render(&updated_kit)?);
 
         // The bundle being moved has to be the one at the old location *now*, not the one this
         // device read at some point. Migrating a snapshot from before somebody else's write would
@@ -879,18 +839,10 @@ impl BundleStore {
         // backwards is a conflict, not a migration that quietly drops the writers in between. The
         // read does not make what it returns this store's, so a refused replay does not become the
         // baseline that would let the next attempt through.
-        let known = self
-            .baseline
-            .as_ref()
-            .map(|baseline| baseline.bundle.revision.get());
-        let (_, current) = self.read(seed).await?;
-        if &current != bundle || known.is_some_and(|known| known > current.revision.get()) {
-            return Err(RecoveryError::BundleConflict {
-                expected: self.position(),
-                retained: None,
-            });
+        let current = self.read_the_source(seed).await?;
+        if &current != bundle {
+            return Err(self.source_moved_on());
         }
-        let origin = self.context.clone();
         // The candidate is prepared beside the caller's bundle. A destination that takes the write
         // and then fails to serve it back must not leave the caller holding a revision it has
         // nowhere to commit: what it holds is still the bundle at the old location.
@@ -911,16 +863,248 @@ impl BundleStore {
         // so a write through one could go out while a write through the other was still able to
         // land. What this store names is still the old location, which is where the superseded
         // copy stays.
-        Ok(Migrated {
+        Ok(self.migrated(moved, bundle, position, updated_kit, now_ms))
+    }
+
+    /// Completes a migration whose write at the destination went out and whose answer did not
+    /// come back.
+    ///
+    /// [`Self::migrate`] reports that migration as [`RecoveryError::BundleOutcomeUnknown`], and
+    /// its write may still have landed. Calling it again cannot finish the move: while the write
+    /// is outstanding the destination store will not write, and once that store has read the
+    /// bundle there it refuses, because a migration writes where there is none. This is the step
+    /// that finishes it, and it writes nothing at either location.
+    ///
+    /// **The bundle at the destination has to be this migration's own, and its place in the
+    /// order never says so on its own.** Another writer's bundle can be at the very place this
+    /// write would have taken. So two things are asked, and both have to agree. The service is
+    /// asked about the identity the destination's write went out under: the identity is fenced,
+    /// which ends the write where it was still open and repeats what the service recorded where it
+    /// was not. A write the service refused, or one it establishes never ran, left nothing, and
+    /// whatever is at the destination belongs to somebody else. The bundle there is then read back
+    /// and authenticated, and it has to carry the digest of the bundle that write carried, at the
+    /// place the service's receipt names wherever the service still holds one.
+    ///
+    /// **Then everything [`Self::migrate`] checks is checked.** The kit is this bundle's and this
+    /// seed's, the bundle at the destination is the caller's bundle moved on by the one revision a
+    /// write adds, and the old location still holds the bundle that was moved: a write made there
+    /// since would leave the updated kit pointing at a bundle without it. The caller may hold the
+    /// bundle that was moved or, where an earlier completion already returned, the one it became.
+    ///
+    /// It can be asked again, and it answers the same way: the fence repeats its answer, the read
+    /// finds the same bundle, and nothing is written. The destination store's record of the write
+    /// stays until that store writes again, so a completion is possible for as long as the
+    /// destination holds what the migration left.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusals of the kit [`Self::migrate`] lists,
+    /// [`RecoveryError::DestinationHoldsABundle`] when the bundle at the destination is not the one
+    /// this migration's write left there, [`RecoveryError::MigrationDidNotLand`] when that write
+    /// left nothing and nothing can be read there, [`RecoveryError::BundleConflict`] when the old
+    /// location has moved on, a service error when the fence or a read fails, and the refusals
+    /// [`Self::commit`] lists for a position this device cannot read.
+    pub async fn complete_migration(
+        &mut self,
+        seed: &RecoverySeed,
+        bundle: &mut RecoveryBundle,
+        kit: &RecoveryKit,
+        moved: &mut Self,
+        now_ms: TimestampMs,
+    ) -> Result<Migrated> {
+        let updated_kit = self.kit_for_the_move(seed, kit, &moved.context)?;
+        // The destination comes first, as it does for a migration: a destination whose bundle is
+        // not this migration's is refused whatever the old location holds.
+        let landed = moved.recognise_its_own_write(seed).await?;
+        // The destination's bundle has to be a move of the one the caller is completing. A write
+        // the destination store made for any other reason is its own, and still not this
+        // migration's.
+        if &landed.bundle != bundle && !is_a_move_of(&landed.bundle, bundle) {
+            return Err(RecoveryError::DestinationHoldsABundle);
+        }
+        let current = self.read_the_source(seed).await?;
+        if !is_a_move_of(&landed.bundle, &current) {
+            return Err(self.source_moved_on());
+        }
+        *bundle = landed.bundle;
+        Ok(self.migrated(moved, bundle, landed.position, updated_kit, now_ms))
+    }
+
+    /// Establishes that the bundle at this store's location is the one its last write left there,
+    /// and makes it this store's baseline.
+    ///
+    /// Both the writer's identity and the content decide it. The identity is fenced, and the
+    /// service's answer about it has to leave the write able to have landed: an applied receipt,
+    /// or a fence that cannot say the write never ran. Then the bundle read back has to carry the
+    /// write's digest, at the place the receipt names where there is one. A place in the order
+    /// alone says nothing about which write is there.
+    async fn recognise_its_own_write(&mut self, seed: &RecoverySeed) -> Result<Baseline> {
+        let Some(record) = self.last_write.as_ref().map(|write| write.record.clone()) else {
+            // This store has sent nothing, so nothing at its location can be its own.
+            return Err(self.left_nothing(seed).await);
+        };
+        let receipt = match self.fence(&record).await? {
+            SyncRequestFence::Applied { position } => {
+                diagnose_applied(record.expected, position)?;
+                Some(position)
+            }
+            // The service can no longer say whether the write ran, and nothing will run under it
+            // from now on. Its content is what is left to recognise it by.
+            SyncRequestFence::Fenced { never_ran: false } => None,
+            SyncRequestFence::Refused { retained } => {
+                self.settle(LostWrite::Ended { retained });
+                return Err(self.left_nothing(seed).await);
+            }
+            SyncRequestFence::Fenced { never_ran: true } => {
+                self.settle(LostWrite::Ended { retained: None });
+                return Err(self.left_nothing(seed).await);
+            }
+        };
+        let (position, bundle) = self.read(seed).await?;
+        let digest = digest_of(&bundle)?;
+        if let Some(receipt) = receipt {
+            // The receipt names the place this write took. A read behind it is a service that has
+            // gone back, and that one place holding other content is two histories rather than a
+            // bundle to decline politely. Neither becomes this store's baseline.
+            diagnose(Some(receipt), position)?;
+            if position == receipt && digest != record.digest {
+                return Err(RecoveryError::BundleHistoryForked {
+                    expected: receipt,
+                    found: position,
+                });
+            }
+        }
+        let own = digest == record.digest && receipt.is_none_or(|receipt| receipt == position);
+        // What was read is what the location holds, whoever wrote it, so it is the baseline either
+        // way: a store that has read a bundle there will not be migrated into afterwards.
+        self.settle(if own || receipt.is_some() {
+            LostWrite::Applied
+        } else {
+            LostWrite::Ended { retained: None }
+        });
+        let read = Baseline { position, bundle };
+        self.baseline = Some(read.clone());
+        if !own {
+            // Another bundle is there: somebody else's, or one that has moved the location on
+            // since this write landed. Either way it is not what this write left.
+            return Err(RecoveryError::DestinationHoldsABundle);
+        }
+        Ok(read)
+    }
+
+    /// Says what a location holds when nothing this store sent landed there.
+    ///
+    /// The answer about the migration is already final, and the read only decides which refusal
+    /// says it better. A bundle read there is somebody else's, and it becomes this store's
+    /// baseline, so a migration into this store is refused as well. Where nothing can be read, the
+    /// move can be made again: nothing this store sent will land later, and a write that meets a
+    /// bundle the read missed compares against absence, which the service refuses.
+    async fn left_nothing(&mut self, seed: &RecoverySeed) -> RecoveryError {
+        match self.adopt(seed).await {
+            Ok(_) => RecoveryError::DestinationHoldsABundle,
+            Err(_) => RecoveryError::MigrationDidNotLand,
+        }
+    }
+
+    /// Checks the kit a migration is given and builds the one it will hand back.
+    ///
+    /// Everything here is decided before anything is read or written, which is what lets a
+    /// refusal leave both locations exactly as they were.
+    fn kit_for_the_move(
+        &self,
+        seed: &RecoverySeed,
+        kit: &RecoveryKit,
+        destination: &RecoveryContext,
+    ) -> Result<RecoveryKit> {
+        // A kit's origins share one locator, so the updated kit can name only the destination: an
+        // origin left in it would point at a bundle this migration did not move. That makes a kit
+        // naming several origins impossible to migrate one service at a time without losing the
+        // others, so it is refused rather than silently reduced. Per-origin locators are what a
+        // multiple-service migration needs, and this build does not have them.
+        if kit.service_origins.len() > 1 {
+            return Err(RecoveryError::MigrationWouldLoseAnOrigin {
+                origins: kit.service_origins.len(),
+            });
+        }
+        if !kit
+            .service_origins
+            .iter()
+            .any(|origin| origin == &self.context.service_origin)
+        {
+            return Err(RecoveryError::UnknownServiceOrigin);
+        }
+        if kit.bundle_locator != self.context.bundle_locator {
+            return Err(RecoveryError::KitLocatorMismatch);
+        }
+        // The kit has to be this seed's. `from_kit` reads it under its declared profile and checks
+        // its own checksum, which is what a mistyped or foreign-profile kit fails; the checksums
+        // then have to agree, because the updated kit this call returns is built from the *seed*,
+        // and a caller that handed in a kit for another seed would be handed back a kit that opens
+        // nothing it owns while its existing archives still wrap their keys for the old recovery
+        // recipient.
+        let kit_seed = RecoverySeed::from_kit(kit)?;
+        if !kit_seed
+            .bundle_key_for(&self.context)?
+            .constant_time_eq(&seed.bundle_key_for(&self.context)?)
+        {
+            return Err(RecoveryError::KitIsForAnotherSeed);
+        }
+        // The kit the migration will hand back has to be one its owner can actually keep. A
+        // destination whose locator cannot be printed, or whose kit is larger than a scannable
+        // code, would otherwise be found out after the bundle had been written there, which is
+        // the one failure a migration cannot undo.
+        let updated_kit = kr_crypto::kdf::RecoverySeed::to_kit(
+            seed,
+            vec![destination.service_origin.clone()],
+            destination.bundle_locator.clone(),
+        );
+        drop(crate::recovery::kit::render(&updated_kit)?);
+        Ok(updated_kit)
+    }
+
+    /// Reads the bundle at the old location again, as a migration's source.
+    ///
+    /// The revision this store knew is held against what comes back, because authentication says
+    /// who wrote a bundle and never how long ago: a revision behind it is a replay.
+    async fn read_the_source(&self, seed: &RecoverySeed) -> Result<RecoveryBundle> {
+        let known = self
+            .baseline
+            .as_ref()
+            .map(|baseline| baseline.bundle.revision.get());
+        let (_, current) = self.read(seed).await?;
+        if known.is_some_and(|known| known > current.revision.get()) {
+            return Err(self.source_moved_on());
+        }
+        Ok(current)
+    }
+
+    /// The refusal for an old location that no longer holds the bundle being moved.
+    const fn source_moved_on(&self) -> RecoveryError {
+        RecoveryError::BundleConflict {
+            expected: self.position(),
+            retained: None,
+        }
+    }
+
+    /// Builds the record of a verified move and the kit that goes with it.
+    fn migrated(
+        &self,
+        moved: &Self,
+        bundle: &RecoveryBundle,
+        position: SyncPosition,
+        updated_kit: RecoveryKit,
+        now_ms: TimestampMs,
+    ) -> Migrated {
+        Migrated {
             record: MigrationRecord {
-                from: origin,
-                to: destination,
+                from: self.context.clone(),
+                to: moved.context.clone(),
                 bundle_revision: bundle.revision.get(),
                 bundle_position: position,
                 verified_at_ms: now_ms,
             },
             updated_kit,
-        })
+        }
     }
 }
 
@@ -1078,6 +1262,19 @@ fn digest_of(bundle: &RecoveryBundle) -> Result<Digest256> {
     Ok(Digest256::from_bytes(kr_cbor::sha256(
         &kr_cbor::to_canonical_vec(bundle)?,
     )))
+}
+
+/// Returns true when `moved` is `source` as a migration writes it: the same bundle, one revision on.
+///
+/// A migration writes the caller's bundle at the destination and the write adds one revision and
+/// stamps the instant it was made, so those two are what may differ and nothing else may.
+fn is_a_move_of(moved: &RecoveryBundle, source: &RecoveryBundle) -> bool {
+    moved.revision.get() == source.revision.get().saturating_add(1)
+        && RecoveryBundle {
+            revision: source.revision,
+            written_at_ms: source.written_at_ms,
+            ..moved.clone()
+        } == *source
 }
 
 /// Checks that a bundle read at one place is the write a receipt names at that same place.
