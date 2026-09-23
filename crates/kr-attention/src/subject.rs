@@ -14,7 +14,7 @@
 //! Read from the left, a subject gives back its form and then each part exactly, with the free text
 //! as whatever is left, so two subjects are equal only when their form and every part are. The
 //! types hold the rule: a part that is not last must be [`Fixed`], which only the fixed-form types
-//! are, and the free part ends the subject.
+//! are, and the free part ends the subject, which takes no part after it.
 
 use core::fmt::Write as _;
 
@@ -119,11 +119,13 @@ impl Fixed for Fingerprint {
     }
 }
 
-/// The subject one condition is keyed on.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Subject(String);
+/// A subject being built: its form, then its fixed parts.
+///
+/// It ends either with the one free part, [`Builder::last`], or with none, [`Builder::done`]; both
+/// give a [`Subject`], which takes no more parts, so no subject can hold two free parts.
+struct Builder(String);
 
-impl Subject {
+impl Builder {
     fn of(form: Form) -> Self {
         Self(form.word().to_owned())
     }
@@ -139,12 +141,22 @@ impl Subject {
         self
     }
 
-    fn last(mut self, part: &impl core::fmt::Display) -> Self {
+    fn last(mut self, part: &impl core::fmt::Display) -> Subject {
         self.0.push(SEPARATOR);
         let _ = write!(self.0, "{part}");
-        self
+        Subject(self.0)
     }
 
+    fn done(self) -> Subject {
+        Subject(self.0)
+    }
+}
+
+/// The subject one condition is keyed on.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Subject(String);
+
+impl Subject {
     /// Returns the subject as the text a key is derived from.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -155,25 +167,27 @@ impl Subject {
     /// the connector's own and not unique across sessions.
     #[must_use]
     pub fn approval(session_id: SessionId, request_id: &impl core::fmt::Display) -> Self {
-        Self::of(Form::Approval).then(&session_id).last(request_id)
+        Builder::of(Form::Approval)
+            .then(&session_id)
+            .last(request_id)
     }
 
     /// A pending question and its idle reminder.
     #[must_use]
     pub fn question(question_id: QuestionId) -> Self {
-        Self::of(Form::Question).then(&question_id)
+        Builder::of(Form::Question).then(&question_id).done()
     }
 
     /// A failed command in one session.
     #[must_use]
     pub fn command(session_id: SessionId, command: &str) -> Self {
-        Self::of(Form::Command).then(&session_id).last(&command)
+        Builder::of(Form::Command).then(&session_id).last(&command)
     }
 
     /// A completed turn waiting for review in one session.
     #[must_use]
     pub fn turn(session_id: SessionId, turn_id: &impl core::fmt::Display) -> Self {
-        Self::of(Form::Turn).then(&session_id).last(turn_id)
+        Builder::of(Form::Turn).then(&session_id).last(turn_id)
     }
 
     /// An adapter's failure, within the origin that reported it.
@@ -182,49 +196,54 @@ impl Subject {
     /// device that sees one session is shown that session's, and its recovery ends that one.
     #[must_use]
     pub fn adapter(origin: Origin, plugin_id: &impl core::fmt::Display) -> Self {
-        Self::of(Form::Adapter).then(&origin).last(plugin_id)
+        Builder::of(Form::Adapter).then(&origin).last(plugin_id)
     }
 
     /// Lost contact with the host, of which there is one.
     #[must_use]
     pub fn host() -> Self {
-        Self::of(Form::Host)
+        Builder::of(Form::Host).done()
     }
 
     /// An application's notice that carries its own identifier.
     #[must_use]
     pub fn notice_id(session_id: SessionId, id: &str) -> Self {
-        Self::of(Form::NoticeId).then(&session_id).last(&id)
+        Builder::of(Form::NoticeId).then(&session_id).last(&id)
     }
 
     /// An application's notice known by what it says, through its record owner's fingerprint.
     #[must_use]
     pub fn notice_fingerprint(session_id: SessionId, fingerprint: &Fingerprint) -> Self {
-        Self::of(Form::NoticeFingerprint)
+        Builder::of(Form::NoticeFingerprint)
             .then(&session_id)
             .then(fingerprint)
+            .done()
     }
 
     /// An application's notice with neither an identifier nor a fingerprint: its own record.
     #[must_use]
     pub fn notice_record(session_id: SessionId, record: &EventCursor) -> Self {
-        Self::of(Form::NoticeRecord)
+        Builder::of(Form::NoticeRecord)
             .then(&session_id)
             .then(&record.origin)
             .then(&record.source)
             .then(&record.sequence)
+            .done()
     }
 
     /// A workflow revision paused by its own limits.
     #[must_use]
     pub fn workflow(workflow_id: WorkflowId, revision: u64) -> Self {
-        Self::of(Form::Workflow).then(&workflow_id).then(&revision)
+        Builder::of(Form::Workflow)
+            .then(&workflow_id)
+            .then(&revision)
+            .done()
     }
 
     /// A causal chain paused because it ran out of budget.
     #[must_use]
     pub fn chain(causal_root_id: CausalRootId) -> Self {
-        Self::of(Form::Chain).then(&causal_root_id)
+        Builder::of(Form::Chain).then(&causal_root_id).done()
     }
 }
 
