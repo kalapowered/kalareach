@@ -1,7 +1,8 @@
 # Voice on the client
 
-The companion application owns microphone capture, audio playback, the WebRTC media path, the
-provider's read-only data channel, and the device-owner unlocked-screen confirmation ceremony.
+The companion application holds the parts of a voice call that belong on the device: capture,
+playback and the WebRTC connection in native code on each platform, the capture gate that decides
+when the microphone may carry speech, the voice screen, and the device-owner confirmation ceremony.
 It runs on macOS, iOS and Android.
 
 ## What a person is told before a call exists
@@ -35,12 +36,22 @@ The native client implements media directly:
   isolation. Audio samples are framed as 20ms Opus frames (48 kHz mono) and buffered in a ring buffer
   with 120ms target depth. Opening a desktop call refuses, and says so, rather than answering with
   an offer no transport on this platform could carry.
-- **iOS**: `apps/companion/native/ios/` uses `AVAudioSession` configured with `.playAndRecord`,
-  `.spokenAudio`, `[.allowBluetooth, .defaultToSpeaker, .mixWithOthers]`, and native WebRTC via the
-  pinned `stasel/WebRTC` framework.
-- **Android**: `apps/companion/native/android/` uses Android's `AudioRecord` / `AudioTrack` and native
-  WebRTC via `io.github.webrtc-sdk:android:150.7871.01`, managed under an active microphone foreground
-  service.
+- **iOS**: `apps/companion/native/ios/KalaReachNative/VoiceCall.swift` holds a native WebRTC
+  connection from the pinned `stasel/WebRTC` framework. Its audio session is WebRTC's
+  `RTCAudioSession`, configured for play and record in the voice chat mode, with Bluetooth headsets
+  allowed and the speaker by default. WebRTC's audio unit is held off (`useManualAudio`) from the
+  moment the session object exists, before any connection, so negotiating starts no recording.
+- **Android**: `apps/companion/native/android/android/src/main/java/.../voice/VoiceCall.kt` holds a
+  native WebRTC connection from `io.github.webrtc-sdk:android:150.7871.01`, over WebRTC's Java audio
+  device, which records through `AudioRecord` and plays through `AudioTrack`. Recording and playout
+  are switched off the moment the connection exists, and every recorded frame passes the capture
+  gate before the encoder sees it: a frame the gate refuses is replaced with silence.
+
+On iOS and Android the connection reads the provider's data channel and never writes to it. The
+voice screen starts a call through the application's own command, which asks this build's call for
+an offer before anything else; it has no connection to offer on any platform, so a start from the
+screen is refused before the host is asked for anything, and the phone connections above are not
+started from the screen.
 
 ## Screen lock and background audio
 
@@ -54,29 +65,40 @@ Android's microphone foreground service:
   persistent user-visible notification while a call is active. When the screen locks, the foreground
   service preserves the microphone and speaker channels. Every action on the notification names the
   call it was shown for, so one that arrives late reaches that call or nothing.
-- **Unattended activation forbidden**: building a call makes its offer with the microphone track
-  off, and opens no audio session and no foreground service. The microphone opens only when the
-  host's answer to a start permits the call. That answer names the voice session and the moment the
-  service closes it; each client's capture gate holds the deadline on the device's monotonic clock
-  and ends capture there without waiting for any event. A stopped call never reopens, and a second
-  permit for the same call is refused.
+- **Unattended activation forbidden**: building a call makes its offer with the recorder and the
+  microphone track off, and opens no audio session and no foreground service. Nothing records until
+  the host's answer to a start permits the call. That answer names the voice session and the moment
+  the service closes it. On the phones one control, `VoiceCallControl`, then decides every step,
+  and it is the only code that turns a recorder or a microphone on: it takes audio focus and the
+  foreground service on Android, or the audio session on iOS, and a refusal of any of them ends the
+  call; on Android nothing records until the service holds the foreground; and on every platform
+  the microphone carries speech only once the recorder reports itself running. The deadline is kept
+  on the device's monotonic clock, read again after the platform's own steps so their time counts
+  against it. The call ends at the deadline on its own thread rather than the main one, and any
+  change after the deadline ends it at once; on Android and the desktop every frame after the
+  deadline is refused as well. A stopped call never reopens, and a second permit for the same call
+  is refused.
 
 ## Capture states and unheard speech
 
-If capture is muted, interrupted, suspended, or unavailable, the interface displays the state plainly
-and enforces the requirement that **unheard speech never authorises an action** (KR-REQ-15.36, KR-ACC-014):
+If capture is muted, interrupted, suspended, or unavailable, the interface displays the state
+plainly, with the statement that **unheard speech never authorises an action** (KR-REQ-15.36):
 
 - `capturing`: Microphone is on and carrying the person's voice.
 - `muted_by_person`: The person pressed mute.
 - `interrupted`: Another call or high-priority audio took the microphone.
 - `route_changing`: Switching between speaker, receiver, or Bluetooth.
 - `suspended_by_system`: The OS suspended capture.
-- `unavailable`: No microphone hardware or permission is available.
+- `unavailable`: No microphone hardware or permission is available, or the recorder has not
+  started or has failed.
 - `idle`: No call has been permitted, the call has ended, or its deadline has passed.
 
 What the screen shows and whether the microphone carries speech come from the same gate, so the two
-cannot disagree. The gate keeps the recent intervals in which capture was on, and an instant older
-than the oldest one it kept is treated as unheard.
+cannot disagree. The gate keeps the recent intervals in which capture was on, and answers for the
+past only: an instant later than the moment it is asked at, or older than the oldest interval it
+kept, is treated as unheard. That record is what a claim that something was said would be checked
+against (KR-ACC-014). The screen does not check a delegation against it: delegations reach the
+screen from the host, not from the provider's channel.
 
 Whenever capture is in any state other than `capturing`, the UI displays:
 > "Nothing spoken while the microphone was not carrying your voice can authorise an action."
@@ -119,7 +141,12 @@ Actions requiring unlocked-screen confirmation (session closure, grant changes, 
 diff application, and external delivery) require a client-signed confirmation over the action hash:
 - **macOS**: `LAContext` with biometric / passcode evaluation, followed by Ed25519 signing.
 - **iOS**: `LocalAuthentication` (`evaluatePolicy(.deviceOwnerAuthentication)`), followed by CryptoKit Ed25519 signing.
-- **Android**: `BiometricPrompt` with device-credential fallback, followed by Ed25519 signing.
+- **Android**: `BiometricPrompt`, followed by Ed25519 signing. From Android 11 it accepts a strong
+  biometric or the device credential; before it, a strong biometric only, on a device with a secure
+  lock screen, because the older way to allow the credential also admits weak biometrics.
 - A platform without owner presence refuses with `UNAVAILABLE` rather than falsely answering "verified".
 - The signature binds the exact action hash and request ID with the paired device's identity key,
   never a session key. Provider text or model claims cannot produce a valid confirmation.
+
+The voice screen has no way to reach these ceremonies. A challenge the host sends it is shown with
+the host's words and the fact that the screen cannot sign it, and the host does not act on it.
