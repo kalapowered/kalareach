@@ -1404,3 +1404,934 @@ async fn an_admission_withdrawn_during_a_creation_is_refused_inside_the_services
         "no repository was adopted: {listed:?}"
     );
 }
+
+// ----- the owner's authorised locations ----------------------------------------------------------
+
+/// A daemon on the loopback network with an enrolled owner, whose project service is lent that
+/// owner for its location decisions.
+struct Owned {
+    host: Host,
+    network: kr_controller::service::net::Network,
+}
+
+impl Owned {
+    async fn stop(self) -> (kr_ipc::testing::TempHost, Arc<tempfile::TempDir>) {
+        self.network.shutdown().await;
+        self.host.stop().await
+    }
+}
+
+/// The owner every location test confirms as.
+fn owner_keys() -> kr_crypto::keys::DeviceKeys {
+    kr_crypto::keys::DeviceKeys::generate().expect("owner keys")
+}
+
+async fn owned(owner: &kr_crypto::keys::DeviceKeys) -> Owned {
+    owned_on(
+        kr_ipc::testing::TempHost::create(),
+        Arc::new(tempfile::TempDir::new().expect("a working directory on the internal disk")),
+        owner,
+    )
+    .await
+}
+
+async fn owned_on(
+    temp: kr_ipc::testing::TempHost,
+    work: Arc<tempfile::TempDir>,
+    owner: &kr_crypto::keys::DeviceKeys,
+) -> Owned {
+    use kr_controller::service::net::{self, NetworkSetup, config::NetworkSettings};
+
+    let host = host_on(temp, work).await;
+    let signer = *owner.authorisation.public();
+    let network = net::register(
+        &host.controller,
+        NetworkSetup {
+            settings: NetworkSettings {
+                endpoint: kr_transport::config::EndpointConfig {
+                    bind_addr: Some("127.0.0.1:0".parse().expect("a loopback address")),
+                    ..kr_transport::config::EndpointConfig::default()
+                },
+                ..NetworkSettings::default()
+            },
+            secrets: Arc::new(kr_crypto::store::MemoryStore::new()),
+            owner_signer: Some(signer),
+            enrolment: kr_pairing::confirm::HostEnrolment::Enrolled,
+        },
+    )
+    .await
+    .expect("the daemon joins the loopback network");
+    host.controller
+        .enrol_project_owner(
+            &network,
+            signer,
+            kr_pairing::confirm::HostEnrolment::Enrolled,
+        )
+        .expect("the owner is lent to the project service");
+    Owned { host, network }
+}
+
+/// The owner's proof for one challenge, from the owner's own presence signer.
+fn signed(
+    owner: &kr_crypto::keys::DeviceKeys,
+    request: &kr_protocol::pairing::OwnerConfirmationRequest,
+) -> kr_protocol::pairing::OwnerConfirmationProof {
+    kr_pairing::confirm::sign_confirmation(
+        &owner.authorisation,
+        request,
+        kr_protocol::pairing::ConfirmationChannel::EnrolledPresenceSigner,
+    )
+    .expect("the owner signs")
+}
+
+fn location_params(
+    environment_id: EnvironmentId,
+    path: &Path,
+    purpose: kr_protocol::project::LocationPurpose,
+) -> kr_protocol::project::ProjectLocationAuthoriseParams {
+    kr_protocol::project::ProjectLocationAuthoriseParams {
+        location_id: Nullable::null(),
+        environment_id,
+        grant_id: Nullable::null(),
+        purpose,
+        label: "the owner's own".to_owned(),
+        path: path.display().to_string(),
+        owner_confirmation: Nullable::null(),
+    }
+}
+
+fn proven(
+    params: &kr_protocol::project::ProjectLocationAuthoriseParams,
+    proof: kr_protocol::pairing::OwnerConfirmationProof,
+) -> kr_protocol::project::ProjectLocationAuthoriseParams {
+    kr_protocol::project::ProjectLocationAuthoriseParams {
+        owner_confirmation: Nullable(Some(proof)),
+        ..params.clone()
+    }
+}
+
+async fn submit<P: serde::Serialize + ?Sized>(
+    control: &mut LocalClient,
+    environment_id: EnvironmentId,
+    method: Method,
+    action: ActionId,
+    params: &P,
+) -> std::result::Result<ParamsValue, ProtocolError> {
+    control
+        .mutate(
+            method,
+            action,
+            ActionTarget::environment(environment_id),
+            params,
+        )
+        .await
+        .expect("the call reaches the daemon")
+}
+
+/// Builds a mutation once, so that it can be sent again exactly as it was first sent.
+///
+/// An exact duplicate is the original request, the action window included: the same identifier
+/// under another connection's window is another payload, and is refused as a reused identifier.
+async fn composed<P: serde::Serialize + ?Sized>(
+    control: &mut LocalClient,
+    environment_id: EnvironmentId,
+    method: Method,
+    action: ActionId,
+    params: &P,
+) -> kr_protocol::envelope::MutationRequest {
+    control
+        .compose(
+            method,
+            action,
+            ActionTarget::environment(environment_id),
+            params,
+        )
+        .await
+        .expect("the mutation is composed")
+}
+
+/// Submits an authorisation's first submission, expecting the challenge.
+async fn challenged(
+    control: &mut LocalClient,
+    environment_id: EnvironmentId,
+    action: ActionId,
+    params: &kr_protocol::project::ProjectLocationAuthoriseParams,
+) -> kr_protocol::pairing::OwnerConfirmationRequest {
+    let answered: kr_protocol::project::ProjectLocationAuthoriseResult = typed(
+        &submit(
+            control,
+            environment_id,
+            Method::ProjectLocationAuthorise,
+            action,
+            params,
+        )
+        .await
+        .expect("the first submission is answered"),
+    );
+    match answered.outcome {
+        kr_protocol::project::LocationAuthorisation::ConfirmationRequired { request } => request,
+        kr_protocol::project::LocationAuthorisation::Authorised { .. } => {
+            panic!("an authorisation with no proof authorises nothing")
+        }
+    }
+}
+
+fn authorised_location(value: &ParamsValue) -> kr_protocol::project::AuthorisedLocation {
+    let answered: kr_protocol::project::ProjectLocationAuthoriseResult = typed(value);
+    match answered.outcome {
+        kr_protocol::project::LocationAuthorisation::Authorised { location } => location,
+        kr_protocol::project::LocationAuthorisation::ConfirmationRequired { .. } => {
+            panic!("a submission carrying its proof is not answered with another challenge")
+        }
+    }
+}
+
+async fn locations(
+    control: &mut LocalClient,
+    environment_id: EnvironmentId,
+) -> Vec<kr_protocol::project::AuthorisedLocation> {
+    let listed: kr_protocol::project::ProjectLocationListResult = typed(
+        &control
+            .request(
+                Method::ProjectLocationList,
+                &kr_protocol::project::ProjectLocationListParams {
+                    environment_id,
+                    grant_id: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("project.location.list succeeds"),
+    );
+    listed.locations
+}
+
+/// KR-REQ-23.42, 23.43 and the specification's sensitive owner confirmation: a location is
+/// authorised under the owner's fresh confirmation of exactly it, and under nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn authorise_requires_exact_fresh_owner_confirmation() {
+    use kr_protocol::project::LocationPurpose;
+
+    let owner = owner_keys();
+    let stranger = owner_keys();
+    let owned = owned(&owner).await;
+    let host = &owned.host;
+    let mut control = client(host).await;
+    let root = host.work().join("projects");
+    std::fs::create_dir(&root).expect("a directory to authorise");
+    let params = location_params(host.environment_id, &root, LocationPurpose::Destination);
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let request = challenged(&mut control, host.environment_id, action, &params).await;
+    assert_eq!(
+        request.action,
+        kr_protocol::pairing::SensitiveAction::EnlargeGrant
+    );
+    assert_eq!(
+        request.host_device_id,
+        kr_protocol::ids::DeviceId::new(host.environment_id.get())
+    );
+    assert!(
+        locations(&mut control, host.environment_id)
+            .await
+            .is_empty(),
+        "nothing is authorised before the owner confirms"
+    );
+
+    // A signature that is not the enrolled owner's.
+    let refusal = failure(
+        submit(
+            &mut control,
+            host.environment_id,
+            Method::ProjectLocationAuthorise,
+            action,
+            &proven(&params, signed(&stranger, &request)),
+        )
+        .await,
+    );
+    assert_eq!(refusal.code, ErrorCode::OwnerConfirmationRequired);
+    // The owner's signature over a challenge altered after it was issued: more rights than the
+    // owner was shown.
+    let mut widened = request.clone();
+    widened.destination_rights = [
+        kr_protocol::rights::ActionRight::ProjectCreate,
+        kr_protocol::rights::ActionRight::WorkspaceManage,
+        kr_protocol::rights::ActionRight::HostManage,
+    ]
+    .into_iter()
+    .collect();
+    let refusal = failure(
+        submit(
+            &mut control,
+            host.environment_id,
+            Method::ProjectLocationAuthorise,
+            action,
+            &proven(&params, signed(&owner, &widened)),
+        )
+        .await,
+    );
+    assert_eq!(refusal.code, ErrorCode::OwnerConfirmationRequired);
+    // The owner's own proof, for this action's request but another path.
+    let elsewhere = host.work().join("elsewhere");
+    std::fs::create_dir(&elsewhere).expect("another directory");
+    let other_params = location_params(
+        host.environment_id,
+        &elsewhere,
+        LocationPurpose::Destination,
+    );
+    let refusal = failure(
+        submit(
+            &mut control,
+            host.environment_id,
+            Method::ProjectLocationAuthorise,
+            action,
+            &proven(&other_params, signed(&owner, &request)),
+        )
+        .await,
+    );
+    assert_eq!(refusal.code, ErrorCode::OwnerConfirmationRequired);
+    assert!(
+        locations(&mut control, host.environment_id)
+            .await
+            .is_empty(),
+        "no refusal authorised anything"
+    );
+
+    // The owner's proof of exactly this.
+    let location = authorised_location(
+        &submit(
+            &mut control,
+            host.environment_id,
+            Method::ProjectLocationAuthorise,
+            action,
+            &proven(&params, signed(&owner, &request)),
+        )
+        .await
+        .expect("the owner's confirmation authorises it"),
+    );
+    assert_eq!(location.path, root.display().to_string());
+    assert_eq!(location.state, kr_protocol::project::LocationState::Active);
+    // Spent: the same proof under another action is a confirmation of nothing there.
+    let replayed = failure(
+        submit(
+            &mut control,
+            host.environment_id,
+            Method::ProjectLocationAuthorise,
+            ActionId::new(kr_ipc::new_uuid()),
+            &proven(&params, signed(&owner, &request)),
+        )
+        .await,
+    );
+    assert_eq!(replayed.code, ErrorCode::OwnerConfirmationRequired);
+    assert_eq!(
+        locations(&mut control, host.environment_id).await,
+        vec![location]
+    );
+    drop(control);
+    let _ = owned.stop().await;
+}
+
+/// A daemon with no enrolled owner confirms nothing, so it authorises nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_with_no_enrolled_owner_authorises_no_location() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let refusal = failure(
+        submit(
+            &mut control,
+            host.environment_id,
+            Method::ProjectLocationAuthorise,
+            ActionId::new(kr_ipc::new_uuid()),
+            &location_params(
+                host.environment_id,
+                host.work(),
+                kr_protocol::project::LocationPurpose::Source,
+            ),
+        )
+        .await,
+    );
+    assert_eq!(refusal.code, ErrorCode::HostNotConfigured);
+    drop(control);
+    let _ = host.stop().await;
+}
+
+/// Section 9's receipt: a confirmed authorisation's exact retry is answered from its record, over
+/// the connection it was sent on and over another, and the same identifier with another payload is
+/// a different request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exact_confirmation_retry_returns_its_receipt() {
+    use kr_protocol::project::LocationPurpose;
+
+    let owner = owner_keys();
+    let owned = owned(&owner).await;
+    let host = &owned.host;
+    let mut control = client(host).await;
+    let params = location_params(host.environment_id, host.work(), LocationPurpose::Source);
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let request = challenged(&mut control, host.environment_id, action, &params).await;
+    let confirmed = composed(
+        &mut control,
+        host.environment_id,
+        Method::ProjectLocationAuthorise,
+        action,
+        &proven(&params, signed(&owner, &request)),
+    )
+    .await;
+    let first = authorised_location(
+        &control
+            .repeat(&confirmed)
+            .await
+            .expect("the call reaches the daemon")
+            .expect("it is authorised"),
+    );
+    let same = authorised_location(
+        &control
+            .repeat(&confirmed)
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the retry is answered from the record"),
+    );
+    let mut again = client(host).await;
+    let elsewhere = authorised_location(
+        &again
+            .repeat(&confirmed)
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the retry over another connection is answered from the record"),
+    );
+    assert_eq!(first, same, "one action, one receipt");
+    assert_eq!(first, elsewhere, "whichever connection asks");
+    assert_eq!(locations(&mut control, host.environment_id).await.len(), 1);
+    // The unconfirmed payload under the same identifier, and the confirmed one under another
+    // connection's window, are both other requests.
+    for different in [
+        submit(
+            &mut control,
+            host.environment_id,
+            Method::ProjectLocationAuthorise,
+            action,
+            &params,
+        )
+        .await,
+        submit(
+            &mut again,
+            host.environment_id,
+            Method::ProjectLocationAuthorise,
+            action,
+            &proven(&params, signed(&owner, &request)),
+        )
+        .await,
+    ] {
+        assert_eq!(failure(different).code, ErrorCode::IdConflict);
+    }
+    drop((control, again));
+    let _ = owned.stop().await;
+}
+
+/// Two copies of one confirmed submission arrive together. One performs it; the other waits for
+/// that transition and is given its answer, rather than meeting a challenge the first one spent.
+///
+/// The daemon answers one connection's requests in order and admits a first submission only under
+/// the window of the connection it arrived on, so two exact copies of one submission meet nowhere
+/// but in the service. They are driven there directly, under this daemon's own enrolled owner and
+/// its real ceremony: a challenge this host issued, the owner's signature over it, and a ledger
+/// that spends it once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_confirmation_submissions_overlap_before_the_claim() {
+    use kr_project::policy::OwnerAuthority as _;
+    use kr_protocol::project::{
+        LocationAuthorisation, LocationPurpose, ProjectLocationAuthoriseResult,
+    };
+
+    let owner = owner_keys();
+    let owned = owned(&owner).await;
+    let host = &owned.host;
+    let authority = Arc::new(kr_controller::project::HostOwner::new(
+        kr_protocol::ids::DeviceId::new(host.environment_id.get()),
+        owned.network.endpoint_id(),
+        *owner.authorisation.public(),
+        kr_pairing::confirm::HostEnrolment::Enrolled,
+        Arc::new(kr_controller::service::net::pairing::HostPairingClock::new(
+            &kr_ipc::identity::boot_identity().expect("a boot identity"),
+        )),
+        Arc::clone(owned.network.devices()),
+    ));
+    let service = Arc::clone(host.controller.project().service());
+    let actor = kr_protocol::ids::ActorId::new("local:owner").expect("a principal");
+    let params = location_params(
+        host.environment_id,
+        host.work(),
+        LocationPurpose::Destination,
+    );
+    let action_id = kr_ipc::new_uuid();
+    let unproven = kr_project::store::Action {
+        actor_id: actor.clone(),
+        action_id,
+        method: Method::ProjectLocationAuthorise.as_str().to_owned(),
+        payload_digest: kr_protocol::scalars::Digest256::from_bytes([1; 32]),
+    };
+    let first = service
+        .project_location_authorise(&actor, &params, Some(&unproven), Some(authority.as_ref()))
+        .expect("the challenge is issued");
+    let LocationAuthorisation::ConfirmationRequired { request } = first.outcome else {
+        panic!("the first submission is answered with its challenge");
+    };
+    let confirmed = proven(&params, signed(&owner, &request));
+    let submission = kr_project::store::Action {
+        payload_digest: kr_protocol::scalars::Digest256::from_bytes([2; 32]),
+        ..unproven
+    };
+    let start = Arc::new(std::sync::Barrier::new(2));
+    let copies: Vec<_> = (0..2)
+        .map(|_| {
+            let service = Arc::clone(&service);
+            let authority = Arc::clone(&authority);
+            let actor = actor.clone();
+            let confirmed = confirmed.clone();
+            let submission = submission.clone();
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                service.project_location_authorise(
+                    &actor,
+                    &confirmed,
+                    Some(&submission),
+                    Some(authority.as_ref() as &dyn kr_project::policy::OwnerAuthority),
+                )
+            })
+        })
+        .collect();
+    let answers: Vec<ProjectLocationAuthoriseResult> = copies
+        .into_iter()
+        .map(|copy| {
+            copy.join()
+                .expect("the copy runs")
+                .expect("each copy is answered with the location, not a spent challenge")
+        })
+        .collect();
+    assert_eq!(
+        answers[0], answers[1],
+        "both copies are given the one answer"
+    );
+    let LocationAuthorisation::Authorised { location } = &answers[0].outcome else {
+        panic!("the confirmed submission authorises");
+    };
+    let mut control = client(host).await;
+    assert_eq!(
+        locations(&mut control, host.environment_id).await,
+        vec![location.clone()]
+    );
+    // The challenge was spent exactly once: the owner's proof answers nothing now.
+    let spent = authority
+        .accept(
+            &kr_project::policy::Enlargement {
+                action_digest: request.action_digest,
+                rights: request.destination_rights.clone(),
+            },
+            &signed(&owner, &request),
+        )
+        .expect_err("a spent challenge accepts nothing");
+    assert_eq!(spent.code, ErrorCode::OwnerConfirmationRequired);
+    drop(control);
+    let _ = owned.stop().await;
+}
+
+/// A reauthorisation whose challenge is spent and whose effect then fails keeps that failure as
+/// the action's answer, so a repeat learns it without a second ceremony, and the failure enlarged
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failure_after_the_challenge_is_consumed_retains_its_error() {
+    use kr_protocol::project::{LocationPurpose, LocationState, ProjectLocationWithdrawParams};
+
+    let owner = owner_keys();
+    let owned = owned(&owner).await;
+    let mut control = client(&owned.host).await;
+    let environment_id = owned.host.environment_id;
+    let params = location_params(environment_id, owned.host.work(), LocationPurpose::Source);
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let request = challenged(&mut control, environment_id, action, &params).await;
+    let location = authorised_location(
+        &submit(
+            &mut control,
+            environment_id,
+            Method::ProjectLocationAuthorise,
+            action,
+            &proven(&params, signed(&owner, &request)),
+        )
+        .await
+        .expect("it is authorised"),
+    );
+    drop(control);
+
+    // A replacement daemon holds no handle: the location is dormant until the owner acts again.
+    let (temp, work) = owned.stop().await;
+    let owned = owned_on(temp, work, &owner).await;
+    let mut control = client(&owned.host).await;
+    let listed = locations(&mut control, environment_id).await;
+    assert_eq!(listed[0].state, LocationState::Dormant);
+    let again = kr_protocol::project::ProjectLocationAuthoriseParams {
+        location_id: Nullable(Some(location.location_id)),
+        ..params.clone()
+    };
+    let reauthorise = ActionId::new(kr_ipc::new_uuid());
+    let request = challenged(&mut control, environment_id, reauthorise, &again).await;
+    // The owner withdraws it before confirming the reauthorisation.
+    submit(
+        &mut control,
+        environment_id,
+        Method::ProjectLocationWithdraw,
+        ActionId::new(kr_ipc::new_uuid()),
+        &ProjectLocationWithdrawParams {
+            location_id: location.location_id,
+        },
+    )
+    .await
+    .expect("the withdrawal is performed");
+    let confirmed = proven(&again, signed(&owner, &request));
+    let refusal = failure(
+        submit(
+            &mut control,
+            environment_id,
+            Method::ProjectLocationAuthorise,
+            reauthorise,
+            &confirmed,
+        )
+        .await,
+    );
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+    let repeated = failure(
+        submit(
+            &mut control,
+            environment_id,
+            Method::ProjectLocationAuthorise,
+            reauthorise,
+            &confirmed,
+        )
+        .await,
+    );
+    assert_eq!(repeated, refusal, "the kept failure answers the repeat");
+    let listed = locations(&mut control, environment_id).await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0].state,
+        LocationState::Withdrawn,
+        "the spent confirmation revived nothing"
+    );
+    drop(control);
+    let _ = owned.stop().await;
+}
+
+/// An owner location names no grant, so its challenge names no recipient device and carries both
+/// rights; a grant this host did not issue to a paired device has no location at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_location_confirmation_is_bound_to_a_null_grant() {
+    use kr_protocol::project::LocationPurpose;
+    use kr_protocol::rights::ActionRight;
+
+    let owner = owner_keys();
+    let owned = owned(&owner).await;
+    let host = &owned.host;
+    let mut control = client(host).await;
+    let params = location_params(host.environment_id, host.work(), LocationPurpose::Source);
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let request = challenged(&mut control, host.environment_id, action, &params).await;
+    assert!(
+        request.destination_keys.0.is_none(),
+        "no device is its recipient"
+    );
+    assert_eq!(
+        request.destination_rights,
+        [ActionRight::ProjectCreate, ActionRight::WorkspaceManage]
+            .into_iter()
+            .collect(),
+        "both rights, unintersected"
+    );
+    // The owner signing a challenge that claims a recipient is not signing this one.
+    let mut addressed = request.clone();
+    addressed.destination_keys = Nullable(Some(owner.public_keys()));
+    let refusal = failure(
+        submit(
+            &mut control,
+            host.environment_id,
+            Method::ProjectLocationAuthorise,
+            action,
+            &proven(&params, signed(&owner, &addressed)),
+        )
+        .await,
+    );
+    assert_eq!(refusal.code, ErrorCode::OwnerConfirmationRequired);
+    let location = authorised_location(
+        &submit(
+            &mut control,
+            host.environment_id,
+            Method::ProjectLocationAuthorise,
+            action,
+            &proven(&params, signed(&owner, &request)),
+        )
+        .await
+        .expect("the owner's own location is authorised"),
+    );
+    assert!(location.grant_id.0.is_none());
+    // A grant no paired device holds is refused before any challenge is issued.
+    let unissued = kr_protocol::project::ProjectLocationAuthoriseParams {
+        grant_id: Nullable(Some(kr_protocol::ids::GrantId::new(kr_ipc::new_uuid()))),
+        ..params
+    };
+    let refusal = failure(
+        submit(
+            &mut control,
+            host.environment_id,
+            Method::ProjectLocationAuthorise,
+            ActionId::new(kr_ipc::new_uuid()),
+            &unissued,
+        )
+        .await,
+    );
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+    drop(control);
+    let _ = owned.stop().await;
+}
+
+/// Asks for a binding's challenge and returns the submission that carries the owner's proof.
+async fn binding(
+    control: &mut LocalClient,
+    owner: &kr_crypto::keys::DeviceKeys,
+    environment_id: EnvironmentId,
+    action: ActionId,
+    params: &kr_protocol::project::ProjectLocationAttachParams,
+) -> std::result::Result<kr_protocol::project::ProjectLocationAttachParams, ProtocolError> {
+    let first: kr_protocol::project::ProjectLocationAttachResult = typed(
+        &submit(
+            control,
+            environment_id,
+            Method::ProjectLocationAttach,
+            action,
+            params,
+        )
+        .await?,
+    );
+    let kr_protocol::project::LocationAttachment::ConfirmationRequired { request } = first.outcome
+    else {
+        panic!("a binding's first submission is answered with its challenge");
+    };
+    Ok(kr_protocol::project::ProjectLocationAttachParams {
+        owner_confirmation: Nullable(Some(signed(owner, &request))),
+        ..params.clone()
+    })
+}
+
+/// Authorises one location through the daemon.
+async fn authorise(
+    control: &mut LocalClient,
+    owner: &kr_crypto::keys::DeviceKeys,
+    params: &kr_protocol::project::ProjectLocationAuthoriseParams,
+) -> kr_protocol::project::AuthorisedLocation {
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let request = challenged(control, params.environment_id, action, params).await;
+    authorised_location(
+        &submit(
+            control,
+            params.environment_id,
+            Method::ProjectLocationAuthorise,
+            action,
+            &proven(params, signed(owner, &request)),
+        )
+        .await
+        .expect("the owner's confirmation authorises it"),
+    )
+}
+
+async fn initialised(
+    control: &mut LocalClient,
+    host: &Host,
+    name: &str,
+) -> kr_protocol::ids::ProjectRepositoryId {
+    let created: ProjectInitResult = typed(
+        &submit(
+            control,
+            host.environment_id,
+            Method::ProjectInit,
+            ActionId::new(kr_ipc::new_uuid()),
+            &ProjectInitParams {
+                destination: host.destination(name),
+                label: name.to_owned(),
+                initial_branch: Nullable(Some("main".to_owned())),
+            },
+        )
+        .await
+        .expect("the repository is created"),
+    );
+    created.project.project_repository_id
+}
+
+fn attach_params(
+    project: kr_protocol::ids::ProjectRepositoryId,
+    location: kr_protocol::ids::ProjectLocationId,
+) -> kr_protocol::project::ProjectLocationAttachParams {
+    kr_protocol::project::ProjectLocationAttachParams {
+        project_repository_id: project,
+        location_id: Nullable(Some(location)),
+        owner_confirmation: Nullable::null(),
+    }
+}
+
+/// A binding is proved through the location's held handle, confirmed by the owner, and retried
+/// from its record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn attachment_completes_and_its_retry_returns_the_receipt() {
+    use kr_protocol::project::{LocationAttachment, LocationPurpose, ProjectLocationAttachResult};
+
+    let owner = owner_keys();
+    let owned = owned(&owner).await;
+    let host = &owned.host;
+    let mut control = client(host).await;
+    let project = initialised(&mut control, host, "bound").await;
+    let location = authorise(
+        &mut control,
+        &owner,
+        &location_params(host.environment_id, host.work(), LocationPurpose::Source),
+    )
+    .await;
+    let params = attach_params(project, location.location_id);
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let confirmed = binding(&mut control, &owner, host.environment_id, action, &params)
+        .await
+        .expect("the challenge is issued");
+    let confirmed = composed(
+        &mut control,
+        host.environment_id,
+        Method::ProjectLocationAttach,
+        action,
+        &confirmed,
+    )
+    .await;
+    let answer: ProjectLocationAttachResult = typed(
+        &control
+            .repeat(&confirmed)
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the binding is confirmed"),
+    );
+    let LocationAttachment::Bound {
+        project: summary,
+        source,
+    } = &answer.outcome
+    else {
+        panic!("a confirmed binding is bound");
+    };
+    assert_eq!(summary.project_repository_id, project);
+    let source = source.0.as_ref().expect("the binding names its location");
+    assert_eq!(source.location_id, location.location_id);
+    assert_eq!(source.relative_path, "bound");
+    // The confirmed submission again, from another connection: the receipt, not a second binding.
+    let mut again = client(host).await;
+    let retried: ProjectLocationAttachResult = typed(
+        &again
+            .repeat(&confirmed)
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the retry is answered from the record"),
+    );
+    assert_eq!(retried, answer);
+    drop((control, again));
+    let _ = owned.stop().await;
+}
+
+/// A proof is for the binding it was issued for: another repository, another location or another
+/// action's challenge is refused, and the binding each challenge was issued for still works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attachment_proof_for_another_repository_or_location_is_refused() {
+    use kr_protocol::project::LocationPurpose;
+
+    let owner = owner_keys();
+    let owned = owned(&owner).await;
+    let host = &owned.host;
+    let mut control = client(host).await;
+    let first = initialised(&mut control, host, "first").await;
+    let second = initialised(&mut control, host, "second").await;
+    let location = authorise(
+        &mut control,
+        &owner,
+        &location_params(host.environment_id, host.work(), LocationPurpose::Source),
+    )
+    .await;
+    let other_location = authorise(
+        &mut control,
+        &owner,
+        &location_params(host.environment_id, host.work(), LocationPurpose::Source),
+    )
+    .await;
+    let first_action = ActionId::new(kr_ipc::new_uuid());
+    let second_action = ActionId::new(kr_ipc::new_uuid());
+    let first_confirmed = binding(
+        &mut control,
+        &owner,
+        host.environment_id,
+        first_action,
+        &attach_params(first, location.location_id),
+    )
+    .await
+    .expect("the first binding's challenge");
+    let second_confirmed = binding(
+        &mut control,
+        &owner,
+        host.environment_id,
+        second_action,
+        &attach_params(second, location.location_id),
+    )
+    .await
+    .expect("the second binding's challenge");
+    let first_proof = first_confirmed.owner_confirmation.clone();
+
+    for (action, params, what) in [
+        (
+            second_action,
+            kr_protocol::project::ProjectLocationAttachParams {
+                owner_confirmation: first_proof.clone(),
+                ..attach_params(second, location.location_id)
+            },
+            "the first repository's proof for the second repository",
+        ),
+        (
+            first_action,
+            kr_protocol::project::ProjectLocationAttachParams {
+                owner_confirmation: first_proof.clone(),
+                ..attach_params(first, other_location.location_id)
+            },
+            "the first binding's proof for another location",
+        ),
+        (
+            ActionId::new(kr_ipc::new_uuid()),
+            first_confirmed.clone(),
+            "the first binding's proof under an action that was never challenged",
+        ),
+    ] {
+        let refusal = failure(
+            submit(
+                &mut control,
+                host.environment_id,
+                Method::ProjectLocationAttach,
+                action,
+                &params,
+            )
+            .await,
+        );
+        assert_eq!(refusal.code, ErrorCode::OwnerConfirmationRequired, "{what}");
+    }
+    // Nothing was spent by those refusals, and each binding is still the owner's to confirm.
+    for (action, confirmed) in [
+        (first_action, first_confirmed),
+        (second_action, second_confirmed),
+    ] {
+        submit(
+            &mut control,
+            host.environment_id,
+            Method::ProjectLocationAttach,
+            action,
+            &confirmed,
+        )
+        .await
+        .expect("the binding its challenge was issued for is confirmed");
+    }
+    drop(control);
+    let _ = owned.stop().await;
+}

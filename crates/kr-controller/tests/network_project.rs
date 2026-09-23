@@ -1776,3 +1776,120 @@ async fn a_device_is_refused_a_change_set_write_this_host_cannot_withdraw() {
     session.close();
     host.stop().await;
 }
+
+/// The owner's four location methods are the owner's alone. A paired device that asks for any of
+/// them is told the method is not available, in the words an unlisted method gets, before its
+/// parameters are read, whatever rights its grant carries; the registry says the same for every
+/// other ingress that is not the local one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owner_methods_reject_every_nonlocal_ingress() {
+    use kr_protocol::actor::ActorIngress;
+    use kr_protocol::authority::AuthorityDecision;
+    use kr_protocol::project::{
+        LocationPurpose, ProjectLocationAttachParams, ProjectLocationAuthoriseParams,
+        ProjectLocationListParams, ProjectLocationListResult, ProjectLocationWithdrawParams,
+    };
+
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let mut control = host.client().await;
+    let mut rights = PROJECT_RIGHTS.to_vec();
+    rights.push(ActionRight::HostManage);
+    let (_device, session) = net_support::paired_device(&host, &owner, &rights).await;
+    let location = kr_protocol::ids::ProjectLocationId::new(kr_ipc::new_uuid());
+    const NOT_AVAILABLE: &str = "the method is not available";
+
+    let listed = session
+        .read::<_, ProjectLocationListResult>(
+            Method::ProjectLocationList,
+            &ProjectLocationListParams {
+                environment_id: host.environment_id,
+                grant_id: Nullable::null(),
+            },
+        )
+        .await
+        .expect_err("a device lists no location");
+    assert_eq!(listed.code(), ErrorCode::PermissionDenied);
+    assert_eq!(said(&listed), NOT_AVAILABLE);
+    let writes: Vec<(Method, ParamsValue)> = vec![
+        (
+            Method::ProjectLocationAuthorise,
+            ParamsValue::from_typed(&ProjectLocationAuthoriseParams {
+                location_id: Nullable::null(),
+                environment_id: host.environment_id,
+                grant_id: Nullable::null(),
+                purpose: LocationPurpose::Source,
+                label: "a device's own".to_owned(),
+                path: host.work().display().to_string(),
+                owner_confirmation: Nullable::null(),
+            })
+            .expect("encodes"),
+        ),
+        (
+            Method::ProjectLocationWithdraw,
+            ParamsValue::from_typed(&ProjectLocationWithdrawParams {
+                location_id: location,
+            })
+            .expect("encodes"),
+        ),
+        (
+            Method::ProjectLocationAttach,
+            ParamsValue::from_typed(&ProjectLocationAttachParams {
+                project_repository_id: kr_protocol::ids::ProjectRepositoryId::new(
+                    kr_ipc::new_uuid(),
+                ),
+                location_id: Nullable::some(location),
+                owner_confirmation: Nullable::null(),
+            })
+            .expect("encodes"),
+        ),
+        // Parameters that are not the method's at all are refused the same way, because the
+        // refusal comes before anything reads them.
+        (
+            Method::ProjectLocationAuthorise,
+            ParamsValue::from_typed(&"not the parameters of anything").expect("encodes"),
+        ),
+    ];
+    for (method, params) in writes {
+        let error = remote_mutation(&session, host.environment_id, method, &params)
+            .await
+            .expect_err("a device reaches no owner method");
+        assert_eq!(
+            error.code(),
+            ErrorCode::PermissionDenied,
+            "{}",
+            method.as_str()
+        );
+        assert_eq!(said(&error), NOT_AVAILABLE, "{}", method.as_str());
+    }
+    for method in [
+        Method::ProjectLocationList,
+        Method::ProjectLocationAuthorise,
+        Method::ProjectLocationWithdraw,
+        Method::ProjectLocationAttach,
+    ] {
+        for ingress in [ActorIngress::PairedDevice, ActorIngress::Workflow] {
+            assert!(
+                !matches!(
+                    kr_protocol::method::decide(method.as_str(), method.entry().version, ingress),
+                    AuthorityDecision::Listed(_)
+                ),
+                "{} is not listed for {ingress:?}",
+                method.as_str()
+            );
+        }
+    }
+    // The owner's own door is the one that serves them.
+    let owners: ProjectLocationListResult = locally(
+        &mut control,
+        Method::ProjectLocationList,
+        &ProjectLocationListParams {
+            environment_id: host.environment_id,
+            grant_id: Nullable::null(),
+        },
+    )
+    .await;
+    assert!(owners.locations.is_empty());
+    session.close();
+    host.stop().await;
+}

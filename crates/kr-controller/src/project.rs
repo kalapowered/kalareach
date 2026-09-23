@@ -22,19 +22,31 @@
 //!
 //! The daemon also gives the service the one thing it cannot know for itself: which sessions are
 //! bound to a workspace and still live, which is what refuses a removal.
+//!
+//! And it lends the service this host's owner. Authorising a location and binding a repository to
+//! one enlarge what this host will do, so the owner confirms each through the ceremony this host
+//! already runs for its other sensitive actions: a challenge bound to the exact digest, the rights,
+//! this host and a short expiry, answered under the enrolled owner signer and spent once. A host
+//! with no enrolled owner confirms nothing and authorises nothing.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
+use kr_pairing::confirm::{ConfirmationExpectation, ConfirmationLedger, HostEnrolment};
+use kr_pairing::platform::PairingClock;
 use kr_project::ProjectService;
+use kr_project::policy::{Enlargement, GrantReach, OwnerAuthority};
 use kr_project::store::{Action, RetainedOutcome};
 use kr_protocol::envelope::{
     ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::{ActorId, RequestId};
+use kr_protocol::ids::{ActorId, DeviceId, GrantId, RequestId};
 use kr_protocol::method::{Method, MethodGroup};
+use kr_protocol::pairing::{OwnerConfirmationProof, OwnerConfirmationRequest, SensitiveAction};
+use kr_protocol::scalars::{AuthorisationKey, EndpointKey};
 
 use crate::error::{ControllerError, Result};
+use crate::service::net::devices::DeviceDirectory;
 
 /// What a project call answers with: the method's result, or the refusal the service decided.
 pub type Answer<T> = std::result::Result<T, ProtocolError>;
@@ -43,6 +55,141 @@ pub type Answer<T> = std::result::Result<T, ProtocolError>;
 #[derive(Debug)]
 pub struct ProjectModule {
     service: Arc<ProjectService>,
+    /// This host's owner, once one is enrolled.
+    owner: OnceLock<Arc<HostOwner>>,
+}
+
+/// This host's owner, as the project service's location decisions reach it.
+///
+/// The challenge is issued and consumed here, against this host's own ledger, identity and
+/// enrolled signer. A challenge the caller made up, one issued for another digest, another set of
+/// rights or another host, and one already spent are all refused before the service acts.
+pub struct HostOwner {
+    host_device_id: DeviceId,
+    host_endpoint_id: EndpointKey,
+    signer: AuthorisationKey,
+    enrolment: HostEnrolment,
+    clock: Arc<dyn PairingClock + Send + Sync>,
+    ledger: Mutex<ConfirmationLedger>,
+    devices: Arc<DeviceDirectory>,
+}
+
+impl std::fmt::Debug for HostOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HostOwner")
+            .field("host_device_id", &self.host_device_id)
+            .field("enrolment", &self.enrolment)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HostOwner {
+    /// Builds the owner a network registration enrolled.
+    #[must_use]
+    pub fn new(
+        host_device_id: DeviceId,
+        host_endpoint_id: EndpointKey,
+        signer: AuthorisationKey,
+        enrolment: HostEnrolment,
+        clock: Arc<dyn PairingClock + Send + Sync>,
+        devices: Arc<DeviceDirectory>,
+    ) -> Self {
+        Self {
+            host_device_id,
+            host_endpoint_id,
+            signer,
+            enrolment,
+            clock,
+            ledger: Mutex::new(ConfirmationLedger::new()),
+            devices,
+        }
+    }
+
+    fn ledger(&self) -> std::sync::MutexGuard<'_, ConfirmationLedger> {
+        self.ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl OwnerAuthority for HostOwner {
+    fn challenge(
+        &self,
+        enlargement: &Enlargement,
+    ) -> std::result::Result<OwnerConfirmationRequest, ProtocolError> {
+        let request = kr_pairing::confirm::request_confirmation(
+            self.clock.as_ref(),
+            SensitiveAction::EnlargeGrant,
+            enlargement.action_digest,
+            // The enlargement is named by its digest, which covers the grant and the device it was
+            // issued to where there is one. This host keeps no complete key set for a paired
+            // device, so it names none rather than one it would have to make up.
+            None,
+            enlargement.rights.iter().copied().collect(),
+            self.host_device_id,
+            self.host_endpoint_id,
+        )
+        .map_err(|error| refused(&error))?;
+        let mut ledger = self.ledger();
+        ledger.expire(self.clock.as_ref());
+        ledger.issue(&request, self.clock.as_ref());
+        Ok(request)
+    }
+
+    fn accept(
+        &self,
+        enlargement: &Enlargement,
+        proof: &OwnerConfirmationProof,
+    ) -> std::result::Result<(), ProtocolError> {
+        kr_pairing::confirm::accept_confirmation(
+            &mut self.ledger(),
+            self.clock.as_ref(),
+            // The ledger compares this with the challenge it issued, member for member, so a
+            // challenge the caller composed is refused before its signature is believed.
+            &proof.request,
+            proof,
+            // This host's own enrolled signer, never one the proof supplies.
+            &self.signer,
+            self.enrolment,
+            &ConfirmationExpectation {
+                action: SensitiveAction::EnlargeGrant,
+                action_digest: enlargement.action_digest,
+                host_device_id: self.host_device_id,
+                host_endpoint_id: self.host_endpoint_id,
+                destination_keys: None,
+                destination_rights: &enlargement.rights,
+            },
+        )
+        .map_err(|error| refused(&error))
+    }
+
+    fn grant(&self, grant_id: GrantId) -> std::result::Result<GrantReach, ProtocolError> {
+        let now_ms = kr_ipc::now_ms().get();
+        let records = self
+            .devices
+            .devices()
+            .map_err(|error| error.to_protocol_error())?;
+        let record = records
+            .into_iter()
+            .find(|record| crate::service::net::devices::grant_id_of(record) == grant_id)
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    format!("grant {grant_id} is not one this host issued to a paired device"),
+                )
+            })?;
+        if !record.is_paired() || !record.grant.expiry.is_valid_at(now_ms) {
+            return Err(ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                format!("grant {grant_id} was revoked or has expired"),
+            ));
+        }
+        Ok(GrantReach {
+            recipient_device_id: record.device_id,
+            actions: record.grant.actions.clone(),
+        })
+    }
 }
 
 impl ProjectModule {
@@ -77,6 +224,7 @@ impl ProjectModule {
         })?;
         Ok(Self {
             service: Arc::new(service),
+            owner: OnceLock::new(),
         })
     }
 
@@ -84,6 +232,24 @@ impl ProjectModule {
     #[must_use]
     pub const fn service(&self) -> &Arc<ProjectService> {
         &self.service
+    }
+
+    /// Lends the service this host's owner, once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::NotConfigured`] when an owner is already enrolled: a host has one
+    /// owner signer, and a second enrolment would be a second authority over the same decisions.
+    pub fn enrol_owner(&self, owner: Arc<HostOwner>) -> Result<()> {
+        self.owner.set(owner).map_err(|_| {
+            ControllerError::NotConfigured(
+                "this host's owner is already enrolled for its project locations".to_owned(),
+            )
+        })
+    }
+
+    fn owner(&self) -> Option<Arc<HostOwner>> {
+        self.owner.get().cloned()
     }
 
     /// Returns true when this daemon serves the method.
@@ -126,12 +292,20 @@ impl ProjectModule {
                 let params: kr_protocol::project::ProjectAdoptParams = parse(&mutation.params)?;
                 Some(params.destination.environment_id)
             }
-            // The remaining mutations name a repository, a workspace or an operation, none of
-            // which the envelope's target can carry. The environment is checked for every mutation
-            // before this point, and the service checks the named object against its own record.
-            Method::ProjectOperationCancel | Method::WorkspaceCreate | Method::WorkspaceRemove => {
-                None
+            Method::ProjectLocationAuthorise => {
+                let params: kr_protocol::project::ProjectLocationAuthoriseParams =
+                    parse(&mutation.params)?;
+                Some(params.environment_id)
             }
+            // The remaining mutations name a repository, a workspace, an operation or a location,
+            // none of which the envelope's target can carry. The environment is checked for every
+            // mutation before this point, and the service checks the named object against its own
+            // record.
+            Method::ProjectOperationCancel
+            | Method::WorkspaceCreate
+            | Method::WorkspaceRemove
+            | Method::ProjectLocationWithdraw
+            | Method::ProjectLocationAttach => None,
             _ => {
                 return Err(ControllerError::InvalidArgument(format!(
                     "{} is not a project mutation this daemon serves",
@@ -217,6 +391,9 @@ impl ProjectModule {
             Method::ProjectRead => encode(&service.project_read(&typed(&params)?)?),
             Method::WorkspaceList => encode(&service.workspace_list(&typed(&params)?)?),
             Method::WorkspaceRead => encode(&service.workspace_read(&typed(&params)?)?),
+            Method::ProjectLocationList => {
+                encode(&service.project_location_list(&typed(&params)?)?)
+            }
             _ => Err(ProtocolError::new(
                 ErrorCode::InvalidArgument,
                 format!(
@@ -254,6 +431,18 @@ impl ProjectModule {
         let params = mutation.params.clone();
         let action_id = mutation.action_id.get();
         let name = method.as_str();
+        if matches!(
+            method,
+            Method::ProjectLocationAuthorise | Method::ProjectLocationAttach
+        ) {
+            let owner = self.owner();
+            return blocking(move || {
+                confirmed(
+                    &service, &actor, action_id, name, digest, method, &params, owner, &admission,
+                )
+            })
+            .await;
+        }
         blocking(move || {
             if let Some(retained) = service.retained_action(&actor, action_id, name, digest)? {
                 return match retained {
@@ -315,6 +504,9 @@ impl ProjectModule {
                     Method::WorkspaceRemove => {
                         encode(&service.workspace_remove(&typed(&params)?, performed)?)
                     }
+                    Method::ProjectLocationWithdraw => {
+                        encode(&service.project_location_withdraw(&typed(&params)?, performed)?)
+                    }
                     _ => Err(ProtocolError::new(
                         ErrorCode::InvalidArgument,
                         format!(
@@ -354,6 +546,80 @@ impl ProjectModule {
             }
         })
         .await
+    }
+}
+
+/// The owner-confirmation refusal a caller is told, under the ceremony's own code.
+fn refused(error: &kr_pairing::PairingError) -> ProtocolError {
+    ProtocolError::new(
+        error.code(),
+        format!("the owner's confirmation does not authorise this: {error}"),
+    )
+}
+
+/// Performs one of the owner's two confirmed location decisions.
+///
+/// These keep their own record rather than having one kept here. The first submission of each is
+/// answered with a challenge and performs nothing, so it is not an outcome to keep: a record of it
+/// would refuse the proof-bearing submission of the same action as a conflicting request. The
+/// second submission keeps its answer in the transaction that performs it, and a failure after its
+/// challenge is spent is kept by the service too. A refusal before anything was spent is kept by
+/// nobody, and the same action can be submitted again.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one confirmed decision is its service, its actor, its action, its method and \
+              digest, its parameters, the owner that confirms it and the admission it runs under; \
+              each is part of the decision, and a struct would hide which of them a caller left out"
+)]
+fn confirmed<A>(
+    service: &ProjectService,
+    actor: &ActorId,
+    action_id: kr_protocol::scalars::Uuid,
+    name: &str,
+    digest: kr_protocol::scalars::Digest256,
+    method: Method,
+    params: &ParamsValue,
+    owner: Option<Arc<HostOwner>>,
+    admission: &A,
+) -> Answer<ParamsValue>
+where
+    A: Fn() -> std::result::Result<(), ProtocolError>,
+{
+    // A retry of an answered action is answered before its admission is asked about, as every
+    // other mutation's is: a receipt stays readable after the freshness that admitted it is gone.
+    if let Some(retained) = service.retained_action(actor, action_id, name, digest)? {
+        return match retained {
+            RetainedOutcome::Ok(result) => kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
+                .map(ParamsValue::new)
+                .map_err(|error| {
+                    ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string())
+                }),
+            RetainedOutcome::Error { code, detail } => Err(ProtocolError::new(code, detail)),
+        };
+    }
+    admission()?;
+    let claim = Action {
+        actor_id: actor.clone(),
+        action_id,
+        method: name.to_owned(),
+        payload_digest: digest,
+    };
+    let performed = kr_project::store::Performed::from(Some(&claim)).admitted(admission);
+    let owner = owner.as_deref().map(|owner| owner as &dyn OwnerAuthority);
+    match method {
+        Method::ProjectLocationAuthorise => {
+            encode(&service.project_location_authorise(actor, &typed(params)?, performed, owner)?)
+        }
+        Method::ProjectLocationAttach => {
+            encode(&service.project_location_attach(actor, &typed(params)?, performed, owner)?)
+        }
+        _ => Err(ProtocolError::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "{} is not an owner decision this daemon confirms",
+                method.as_str()
+            ),
+        )),
     }
 }
 
@@ -422,6 +688,10 @@ mod tests {
             Method::WorkspaceCreate,
             Method::WorkspaceRead,
             Method::WorkspaceRemove,
+            Method::ProjectLocationList,
+            Method::ProjectLocationAuthorise,
+            Method::ProjectLocationWithdraw,
+            Method::ProjectLocationAttach,
         ] {
             assert!(
                 ProjectModule::serves(method),
@@ -453,6 +723,10 @@ mod tests {
             Method::WorkspaceCreate,
             Method::WorkspaceRead,
             Method::WorkspaceRemove,
+            Method::ProjectLocationList,
+            Method::ProjectLocationAuthorise,
+            Method::ProjectLocationWithdraw,
+            Method::ProjectLocationAttach,
         ] {
             let decision = kr_protocol::method::decide(
                 method.as_str(),
