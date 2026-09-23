@@ -1040,6 +1040,7 @@ impl Catalogue {
         let entries = verified.index.entries.len() as u64;
         let versions = verified.versions;
         let key = enrolled.key.clone();
+        let accepted_targets = verified.accepted_targets(&enrolled.enrolment.targets_url)?;
         // The index is written whole and flushed before the row that names it commits, in a
         // commit of its own: a document nothing names yet is what a later failure leaves behind,
         // and the receipt says so.
@@ -1069,7 +1070,7 @@ impl Catalogue {
                 entries,
                 versions,
             };
-            changes.activate(&key, &active)?;
+            changes.activate(&key, &active, &accepted_targets)?;
             let repository = RepositoryView {
                 enrolment: current.enrolment,
                 active: Some(active),
@@ -1435,47 +1436,22 @@ impl Catalogue {
             })?;
         self.check_reachable(&enrolled.enrolment)?;
 
-        // The metadata is read again rather than kept from the sync, so expired metadata blocks
-        // this too. What it may not do is admit a different generation: a payload is fetched out
-        // of the generation this host accepted, and one the repository has moved on from is an
-        // absence rather than a quiet substitution.
-        let ledger = ledger_of(store, enrolled)?;
-        let verified = trust::verify(
-            &enrolled.enrolment,
-            &store.datastore(),
-            &ledger,
-            &self.transport,
-            &mut |_| Ok(()),
-        )
-        .await?;
-        let index_digest = verified
-            .index
-            .digest()
-            .map_err(|source| CatalogueError::Integrity {
-                detail: format!("the index could not be rendered: {source}"),
-            })?;
-        if verified.generation.get() != accepted.generation || index_digest != accepted.index_digest
-        {
-            return Err(CatalogueError::UnavailableOffline {
-                detail: format!(
-                    "{target} is not cached here and {id} now publishes generation {}; \
-                     synchronise before installing from generation {}",
-                    verified.generation.get(),
-                    accepted.generation
-                ),
-            });
-        }
-        let declared = verified
-            .target(target)
+        // The payload is fetched as the accepted generation named it, from where that generation
+        // said it is, and nothing the repository has published since is read. A generation this
+        // host accepted, or pinned, stays installable while its bytes are there, and a newer one
+        // never stands in for it: the newer generation is a sync's to verify and accept.
+        let accepted_target = self
+            .db
+            .read(|records| records.accepted_target(&enrolled.key, accepted.generation, target))?
             .ok_or_else(|| CatalogueError::NotFound {
                 detail: format!("{target} is not in {id}'s accepted generation"),
             })?;
-        if declared.digest != digest {
+        if accepted_target.record.digest != digest {
             return Err(CatalogueError::Integrity {
                 detail: format!(
                     "{target} is pinned at {} and was asked for by {digest}; a payload is fetched \
                      by content hash",
-                    declared.digest
+                    accepted_target.record.digest
                 ),
             });
         }
@@ -1486,13 +1462,16 @@ impl Catalogue {
             &*self.broker,
             &enrolled.key,
             store,
-            declared.length,
+            accepted_target.record.length,
             target,
             &BTreeSet::new(),
         )?;
-        let bytes = verified
-            .read_target(target, declared, &ledger_of(store, enrolled)?)
-            .await?;
+        let bytes = trust::fetch_accepted(
+            &self.transport,
+            &accepted_target,
+            &ledger_of(store, enrolled)?,
+        )
+        .await?;
         committed(authority, &Effect::Payload(digest), |permit| {
             store.cache_payload(permit, digest, &bytes)
         })?;

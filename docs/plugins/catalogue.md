@@ -91,9 +91,12 @@ anything is fetched, and reported complete only when all of it is here: fetching
 time and making room for each in turn would evict the ones already fetched and finish with part of
 a generation.
 
-A payload is fetched out of the generation this host accepted, and no other. A repository that has
-moved on to a later generation is an absence until the host synchronises, not a quiet substitution
-of whatever it publishes now.
+A payload is fetched out of the generation this host accepted, and no other. When a generation is
+accepted, every target it pins is kept with it: the digest, the length and the location the client
+resolved. A payload is fetched from that location and checked against that digest and length, and
+no metadata is read to do it. A repository that has moved on to a later generation therefore does
+not make the accepted one uninstallable while its bytes are still there, and it does not stand in
+for it either: the later generation is a sync's to verify and accept.
 
 ## Two activations, each atomic on its own
 

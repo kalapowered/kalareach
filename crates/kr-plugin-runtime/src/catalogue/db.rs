@@ -44,7 +44,7 @@ use crate::catalogue::install::{DisablePolicy, Installation};
 use crate::catalogue::repository::{
     CapabilityCeiling, Enrolment, EnrolmentKey, RepositoryId, RepositoryKind,
 };
-use crate::catalogue::trust::MetadataVersions;
+use crate::catalogue::trust::{AcceptedTarget, MetadataVersions, TargetRecord};
 
 /// The database file, beside the repositories' directories.
 pub const DATABASE_FILE: &str = "catalogue.sqlite3";
@@ -375,6 +375,17 @@ CREATE TABLE IF NOT EXISTS accepted_generations (
     versions       TEXT NOT NULL,
     PRIMARY KEY (enrolment_key, generation)
 );
+CREATE TABLE IF NOT EXISTS accepted_targets (
+    enrolment_key  TEXT NOT NULL,
+    generation     INTEGER NOT NULL,
+    target         TEXT NOT NULL,
+    digest         TEXT NOT NULL,
+    length         INTEGER NOT NULL,
+    location       TEXT NOT NULL,
+    PRIMARY KEY (enrolment_key, generation, target),
+    FOREIGN KEY (enrolment_key, generation)
+        REFERENCES accepted_generations(enrolment_key, generation) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS installations (
     environment_id  TEXT NOT NULL,
     plugin_id       TEXT NOT NULL,
@@ -461,6 +472,40 @@ impl Records<'_> {
             .map_err(|source| self.failure(&source))?
             .map(EnrolmentRow::into_enrolled)
             .transpose()
+    }
+
+    /// Returns one target of one accepted generation, as it was accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when the record cannot be read.
+    pub fn accepted_target(
+        &self,
+        key: &EnrolmentKey,
+        generation: u64,
+        name: &str,
+    ) -> CatalogueResult<Option<AcceptedTarget>> {
+        let row: Option<(String, i64, String)> = self
+            .transaction
+            .query_row(
+                "SELECT digest, length, location FROM accepted_targets
+                  WHERE enrolment_key = ?1 AND generation = ?2 AND target = ?3",
+                params![key.as_str(), number(generation)?, name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|source| self.failure(&source))?;
+        row.map(|(digest, length, found_at)| {
+            Ok(AcceptedTarget {
+                name: name.to_owned(),
+                record: TargetRecord {
+                    digest: PayloadDigest::parse(&digest).map_err(unreadable)?,
+                    length: unsigned(length)?,
+                },
+                location: location(&found_at)?,
+            })
+        })
+        .transpose()
     }
 
     /// Returns one enrolment by its key, where it is still enrolled.
@@ -696,7 +741,12 @@ impl Changes<'_> {
     /// # Errors
     ///
     /// Returns [`CatalogueError::StorageUnavailable`] when it cannot be written.
-    pub fn activate(&self, key: &EnrolmentKey, active: &ActiveGeneration) -> CatalogueResult<()> {
+    pub fn activate(
+        &self,
+        key: &EnrolmentKey,
+        active: &ActiveGeneration,
+        targets: &[AcceptedTarget],
+    ) -> CatalogueResult<()> {
         self.execute(
             "INSERT INTO accepted_generations
                  (enrolment_key, generation, index_digest, index_bytes, entries, versions)
@@ -711,6 +761,30 @@ impl Changes<'_> {
                 json(&active.versions)?,
             ],
         )?;
+        // What the generation pinned is kept with it, so its exact bytes stay fetchable after the
+        // repository publishes something newer. A generation accepted again is the same
+        // generation, pinning the same things.
+        let mut insert = self
+            .transaction
+            .prepare_cached(
+                "INSERT INTO accepted_targets
+                     (enrolment_key, generation, target, digest, length, location)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (enrolment_key, generation, target) DO NOTHING",
+            )
+            .map_err(|source| self.failure(&source))?;
+        for target in targets {
+            insert
+                .execute(params![
+                    key.as_str(),
+                    number(active.generation)?,
+                    target.name,
+                    target.record.digest.to_string(),
+                    number(target.record.length)?,
+                    target.location.as_str(),
+                ])
+                .map_err(|source| self.failure(&source))?;
+        }
         self.execute(
             "UPDATE enrolments SET active_generation = ?2 WHERE enrolment_key = ?1",
             params![key.as_str(), number(active.generation)?],

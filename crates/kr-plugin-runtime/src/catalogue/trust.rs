@@ -116,6 +116,22 @@ pub struct TargetRecord {
     pub length: u64,
 }
 
+/// One target of an accepted generation, kept with that generation.
+///
+/// The client resolved it through the generation's signed metadata when the generation was
+/// accepted. Kept with the generation, it is what lets the exact bytes it names be fetched from
+/// where they were accepted after the repository publishes something newer, without reading the
+/// newer metadata and without letting the newer metadata stand in for the accepted one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptedTarget {
+    /// The target name.
+    pub name: String,
+    /// What the generation's metadata pinned it at.
+    pub record: TargetRecord,
+    /// Where its bytes are fetched from, by the client's own location rule.
+    pub location: url::Url,
+}
+
 /// A generation whose metadata verified.
 #[derive(Debug)]
 pub struct VerifiedGeneration {
@@ -142,6 +158,61 @@ pub struct VerifiedGeneration {
 }
 
 impl VerifiedGeneration {
+    /// Returns every target this generation pins, each with the location it is fetched from.
+    ///
+    /// The location follows the client's own rule for this repository's root: the targets location
+    /// with a trailing slash, joined with the target's name, which is prefixed by its SHA-256 where
+    /// the root publishes consistent snapshots. A name that would leave the targets location is
+    /// refused, as the client refuses it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::Untrusted`] for a name the client would not fetch.
+    pub fn accepted_targets(&self, targets_url: &url::Url) -> CatalogueResult<Vec<AcceptedTarget>> {
+        let base = if targets_url.as_str().ends_with('/') {
+            targets_url.clone()
+        } else {
+            url::Url::parse(&format!("{targets_url}/")).map_err(|source| {
+                CatalogueError::Untrusted {
+                    detail: format!("{targets_url} is not a targets location: {source}"),
+                }
+            })?
+        };
+        let consistent = self.repository.root().signed.consistent_snapshot;
+        self.targets
+            .iter()
+            .map(|(name, record)| {
+                let target =
+                    TargetName::new(name.as_str()).map_err(|source| CatalogueError::Untrusted {
+                        detail: format!("{name} is not a target name the client fetches: {source}"),
+                    })?;
+                let file = if consistent {
+                    let digest: String = record
+                        .digest
+                        .as_bytes()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect();
+                    format!("{digest}.{}", target.resolved())
+                } else {
+                    target.resolved().to_owned()
+                };
+                let location = base
+                    .join(&file)
+                    .ok()
+                    .filter(|location| location.as_str().starts_with(base.as_str()))
+                    .ok_or_else(|| CatalogueError::Untrusted {
+                        detail: format!("{name} does not name a file inside {base}"),
+                    })?;
+                Ok(AcceptedTarget {
+                    name: name.clone(),
+                    record: *record,
+                    location,
+                })
+            })
+            .collect()
+    }
+
     /// Returns the record the metadata pins for one target name.
     #[must_use]
     pub fn target(&self, name: &str) -> Option<TargetRecord> {
@@ -218,6 +289,62 @@ impl VerifiedGeneration {
         ledger.check_payload_bytes(actual, Stage::Actual, name)?;
         Ok(bytes)
     }
+}
+
+/// Fetches one target of an accepted generation from where it was accepted, reading no metadata.
+///
+/// The generation's signed metadata was verified when it was accepted, and this target's digest
+/// and length are what it pinned then. The bytes are bounded by that length as they arrive and have
+/// to hash to that digest, so what this returns is exactly what the accepted generation named,
+/// whatever the repository has published since.
+///
+/// # Errors
+///
+/// Returns [`CatalogueError::ResourceLimit`] when the pinned length is past the payload budget,
+/// [`CatalogueError::UnavailableOffline`] when the bytes cannot be fetched, and
+/// [`CatalogueError::Integrity`] when what arrived is not what the generation pinned.
+pub async fn fetch_accepted(
+    transport: &std::sync::Arc<dyn tough::Transport + Send + Sync>,
+    target: &AcceptedTarget,
+    ledger: &BudgetLedger,
+) -> CatalogueResult<Vec<u8>> {
+    use futures::StreamExt as _;
+
+    let name = target.name.as_str();
+    let length = target.record.length;
+    ledger.check_payload_bytes(length, Stage::Declared, name)?;
+    let unavailable = |error: &tough::TransportError| CatalogueError::UnavailableOffline {
+        detail: match error.kind() {
+            tough::TransportErrorKind::FileNotFound => {
+                format!("the repository no longer carries {name}")
+            }
+            _ => format!("{name} could not be fetched: {error}"),
+        },
+    };
+    let mut stream = transport
+        .fetch(target.location.clone())
+        .await
+        .map_err(|error| unavailable(&error))?;
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| unavailable(&error))?;
+        if (bytes.len() as u64).saturating_add(chunk.len() as u64) > length {
+            return Err(CatalogueError::Integrity {
+                detail: format!("{name} is longer than the {length} bytes its generation pinned"),
+            });
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let actual = bytes.len() as u64;
+    if actual != length || PayloadDigest::of(&bytes) != target.record.digest {
+        return Err(CatalogueError::Integrity {
+            detail: format!(
+                "{name} arrived as {actual} bytes and is not the payload its generation pinned"
+            ),
+        });
+    }
+    ledger.check_payload_bytes(actual, Stage::Actual, name)?;
+    Ok(bytes)
 }
 
 /// Verifies one generation of a repository.

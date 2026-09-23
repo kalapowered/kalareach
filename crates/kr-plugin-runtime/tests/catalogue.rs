@@ -520,8 +520,10 @@ async fn kr_req_11_05_a_payload_is_fetched_only_out_of_the_accepted_generation()
     .await;
     catalogue.sync(&repository()).await.expect("generation one");
 
-    // The repository publishes a second generation. This host has not accepted it, so a payload
-    // is not fetched out of it: the answer is an absence, not a quiet substitution.
+    // The repository publishes a second generation in place of the first, whose package files are
+    // gone. This host has not accepted the second, so nothing is fetched out of it: the payload is
+    // fetched as the first generation named it, and its absence is the answer, not a quiet
+    // substitution.
     let second = Generation::build(
         &home.path().join("second"),
         GenerationSpec {
@@ -544,7 +546,15 @@ async fn kr_req_11_05_a_payload_is_fetched_only_out_of_the_accepted_generation()
         .await
         .expect_err("a generation this host has not accepted");
     assert_eq!(refusal.code(), ErrorCode::PackageUnavailableOffline);
-    assert!(refusal.to_string().contains("synchronise"), "{refusal}");
+    assert!(
+        refusal
+            .to_string()
+            .contains("packages/kalareach/example-declarative/0.1.0/"),
+        "the absence names the accepted generation's own target: {refusal}"
+    );
+    let store = catalogue.store(&repository()).expect("enrolled");
+    assert!(absent(&store, first.manifest_digest()));
+    assert!(absent(&store, second.manifest_digest()));
 }
 
 #[tokio::test]
@@ -2636,6 +2646,85 @@ async fn kr_req_11_09_installed_operations_survive_the_repository_being_removed(
 // ---------------------------------------------------------------------------------------------
 // What is installed is the package this host checked, fetched as its accepted generation named it
 // ---------------------------------------------------------------------------------------------
+
+/// Reads the local repository and keeps the location of every fetch.
+#[derive(Clone, Debug, Default)]
+struct Watched {
+    fetched: Arc<std::sync::Mutex<Vec<url::Url>>>,
+}
+
+#[tough::async_trait]
+impl tough::Transport for Watched {
+    async fn fetch(&self, url: url::Url) -> Result<tough::TransportStream, tough::TransportError> {
+        self.fetched.lock().expect("the list").push(url.clone());
+        tough::FilesystemTransport.fetch(url).await
+    }
+}
+
+/// A generation this host accepted stays installable after the repository publishes a newer one,
+/// and installing from it reads no metadata at all.
+///
+/// The payloads are fetched as the accepted generation named them, from where it said they are.
+/// Reading the current metadata instead would find generation 2 and refuse, which would make an
+/// accepted, or pinned, generation uninstallable while its exact bytes are still there.
+#[tokio::test]
+async fn an_accepted_generation_stays_installable_after_the_repository_moves_on() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let first = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &first,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("the first generation");
+    drop(catalogue);
+
+    // The repository moves on to generation 2, and the first generation's package files are still
+    // where it named them.
+    let second = Generation::build(
+        &home.path().join("second"),
+        GenerationSpec {
+            generation: 2,
+            package_version: "0.2.0".to_owned(),
+            keys: Some(first.keys()),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    support::copy_tree(&second.metadata_dir(), &first.metadata_dir());
+    support::copy_tree(&second.targets_dir(), &first.targets_dir());
+
+    let mut catalogue = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+    let watched = Watched::default();
+    catalogue.set_transport(Arc::new(watched.clone()));
+    let installation = catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &version(),
+            first.manifest_digest(),
+            InstallationGrant::none(),
+        )
+        .await
+        .expect("installable from the generation this host accepted");
+    assert_eq!(installation.package_digest, first.manifest_digest());
+
+    let fetched = watched.fetched.lock().expect("the list").clone();
+    let metadata = first.metadata_url();
+    assert!(!fetched.is_empty(), "the payloads were fetched");
+    assert!(
+        fetched
+            .iter()
+            .all(|url| !url.as_str().starts_with(metadata.as_str())),
+        "no metadata was read: {fetched:?}"
+    );
+}
 
 /// One change an index can make to what it says about a package.
 type EntryEdit = fn(&mut kr_plugin_sdk::catalogue::IndexEntry);
