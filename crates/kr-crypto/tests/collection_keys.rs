@@ -368,6 +368,7 @@ fn removing_two_members_advances_the_epoch_once() {
             first_leaving.envelope.key_id(),
             second_leaving.envelope.key_id(),
         ])
+        .expect("a rotation after this epoch")
         .expect("both are members");
     assert_eq!(
         revocation.removed,
@@ -394,7 +395,12 @@ fn removing_two_members_advances_the_epoch_once() {
     check_successor(&second, &third).expect("two removals, one epoch step");
 
     // Naming nobody in the set changes nothing and reports nothing.
-    assert!(members.revoke(&[first_leaving.envelope.key_id()]).is_none());
+    assert!(
+        members
+            .revoke(&[first_leaving.envelope.key_id()])
+            .expect("a rotation after this epoch")
+            .is_none()
+    );
     assert_eq!(members.key_epoch(), SyncKeyEpoch::new(1));
 }
 
@@ -492,6 +498,7 @@ fn removing_members_rotates_and_claims_no_retroactive_secrecy() {
     let mut members = CollectionMembers::of_record(&second);
     let revocation = members
         .revoke(&[leaving.envelope.key_id()])
+        .expect("a rotation after this epoch")
         .expect("a member");
     assert!(!revocation.claims_retroactive_secrecy());
     let sentence = revocation.describe_settings_sync();

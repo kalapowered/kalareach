@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use kr_protocol::ids::{BackupGeneration, BackupObjectId};
 use kr_protocol::scalars::{KeyId, StoredEnvelopeKey};
 
+use crate::error::{CryptoError, Result};
 use crate::kdf::RecoveryRecipient;
 use crate::secret::SymmetricKey;
 
@@ -49,10 +50,17 @@ impl KeyRotation {
         Self(value)
     }
 
-    /// Returns the rotation after this one.
+    /// Returns the rotation after this one, or nothing after the last.
+    ///
+    /// A rotation that stood still would be no rotation: the recipients a revocation removes would
+    /// hold a wrap of the key the next generation is sealed under. So the last rotation has no
+    /// successor, and a revocation that needs one is refused.
     #[must_use]
-    const fn next(self) -> Self {
-        Self(self.0.saturating_add(1))
+    pub const fn next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
     }
 }
 
@@ -149,34 +157,40 @@ impl ArchiveRecipients {
     /// rotation once for the whole step, however many recipients leave in it: one new key replaces
     /// the one they all held. What it does *not* do is take anything back: see
     /// [`still_readable_after_revocation`].
-    pub fn revoke(&mut self, key_ids: &[KeyId]) -> Option<Revocation> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::RotationExhausted`] when a mutable shared collection is at its last
+    /// rotation. The set is then left as it was: removing recipients without rotating would leave
+    /// them a wrap of the next generation's key.
+    pub fn revoke(&mut self, key_ids: &[KeyId]) -> Result<Option<Revocation>> {
         let mut removed: Vec<KeyId> = Vec::new();
-        self.keys.retain(|key| {
+        for key in &self.keys {
             let id = crate::backup::recipient_key_id(key);
-            if key_ids.contains(&id) {
-                if !removed.contains(&id) {
-                    removed.push(id);
-                }
-                false
-            } else {
-                true
+            if key_ids.contains(&id) && !removed.contains(&id) {
+                removed.push(id);
             }
-        });
+        }
         if removed.is_empty() {
-            return None;
+            return Ok(None);
         }
         let rotates_object_keys = self.kind == CollectionKind::MutableShared;
-        if rotates_object_keys {
-            // Advancing the rotation is the rotation. Every object staged before it is refused by
-            // `seal_archive` and staged again under a new key when it is resumed, so the removed
-            // recipients' wraps open nothing written after this point.
-            self.rotation = self.rotation.next();
-        }
-        Some(Revocation {
+        // Advancing the rotation is the rotation. Every object staged before it is refused by
+        // `seal_archive` and staged again under a new key when it is resumed, so the removed
+        // recipients' wraps open nothing written after this point.
+        let rotation = if rotates_object_keys {
+            self.rotation.next().ok_or(CryptoError::RotationExhausted)?
+        } else {
+            self.rotation
+        };
+        self.keys
+            .retain(|key| !removed.contains(&crate::backup::recipient_key_id(key)));
+        self.rotation = rotation;
+        Ok(Some(Revocation {
             removed,
             rotates_object_keys,
-            rotation: self.rotation,
-        })
+            rotation,
+        }))
     }
 }
 

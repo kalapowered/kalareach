@@ -459,14 +459,20 @@ impl CollectionMembers {
     ///
     /// The epoch advances once however many leave, because one new key replaces the one they all
     /// held. Returns `None` when the set names none of them.
-    pub fn revoke(&mut self, stored_envelope_key_ids: &[KeyId]) -> Option<Revocation> {
-        let revocation = self.recipients.revoke(stored_envelope_key_ids)?;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::RotationExhausted`] at the last epoch, removing nobody.
+    pub fn revoke(&mut self, stored_envelope_key_ids: &[KeyId]) -> Result<Option<Revocation>> {
+        let Some(revocation) = self.recipients.revoke(stored_envelope_key_ids)? else {
+            return Ok(None);
+        };
         self.members.retain(|member| {
             !revocation
                 .removed
                 .contains(&member.stored_envelope_key_id())
         });
-        Some(revocation)
+        Ok(Some(revocation))
     }
 
     /// Returns the epoch the members' key is at.

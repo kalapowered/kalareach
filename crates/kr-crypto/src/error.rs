@@ -111,6 +111,13 @@ pub enum CryptoError {
         message: String,
     },
 
+    /// A mutable shared collection is at its last key rotation and cannot rotate again.
+    ///
+    /// A revocation that needs a new rotation is refused whole rather than leave the removed
+    /// recipients a wrap of the key the next generation is sealed under.
+    #[error("this collection's keys are at their last rotation and cannot rotate again")]
+    RotationExhausted,
+
     /// A stored secret was not the length its purpose requires.
     #[error("the stored secret for {name} is {actual} bytes, not {expected}")]
     StoredSecretLength {

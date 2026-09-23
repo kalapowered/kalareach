@@ -1128,6 +1128,7 @@ fn revoking_a_recipient_removes_it_from_every_future_wrap() {
 
     let revocation = recipients
         .revoke(&[leaving.key_id()])
+        .expect("an owned set does not rotate")
         .expect("the set named it");
     assert_eq!(revocation.removed, vec![leaving.key_id()]);
     assert!(!recipients.contains(&leaving.key_id()));
@@ -1185,7 +1186,12 @@ fn revoking_a_recipient_removes_it_from_every_future_wrap() {
     assert_eq!(restored.plaintext.expose(), b"one");
 
     // Revoking something that is not in the set changes nothing.
-    assert!(recipients.revoke(&[leaving.key_id()]).is_none());
+    assert!(
+        recipients
+            .revoke(&[leaving.key_id()])
+            .expect("an owned set does not rotate")
+            .is_none()
+    );
 }
 
 #[test]
@@ -1211,7 +1217,10 @@ fn a_mutable_shared_collection_rotates_its_keys_and_an_owned_one_does_not() {
     .expect("a sealed archive");
     let original = member_key(&parties, &published, staged.object_id());
 
-    let rotated = shared.revoke(&[leaving.key_id()]).expect("a revocation");
+    let rotated = shared
+        .revoke(&[leaving.key_id()])
+        .expect("a rotation after this one")
+        .expect("a revocation");
     assert!(rotated.rotates_object_keys);
     assert!(
         !rotated.may_reuse_staged_ciphertext(),
@@ -1271,7 +1280,10 @@ fn a_mutable_shared_collection_rotates_its_keys_and_an_owned_one_does_not() {
     assert!(owned.add(*parties.device.public()));
     assert!(owned.add(*leaving.public()));
     let staged = stage_at(1, "a.cbor", b"my content", owned.rotation());
-    let plain = owned.revoke(&[leaving.key_id()]).expect("a revocation");
+    let plain = owned
+        .revoke(&[leaving.key_id()])
+        .expect("an owned set does not rotate")
+        .expect("a revocation");
     assert!(!plain.rotates_object_keys);
     assert!(plain.may_reuse_staged_ciphertext());
     assert!(
@@ -1297,6 +1309,42 @@ fn a_mutable_shared_collection_rotates_its_keys_and_an_owned_one_does_not() {
             "the sentence says what the removed device keeps: {sentence}"
         );
     }
+}
+
+/// A mutable shared collection at its last rotation cannot rotate again, and a revocation that
+/// needs a rotation removes nobody: removing a recipient without a new key would leave it a wrap of
+/// the next generation's key.
+#[test]
+fn key_rotation_next_refuses_to_pass_the_last_epoch() {
+    assert_eq!(KeyRotation::INITIAL.next(), Some(KeyRotation::new(1)));
+    let last = KeyRotation::new(u64::MAX);
+    assert_eq!(last.next(), None);
+
+    let parties = Parties::generate();
+    let leaving = StoredEnvelopeKeyPair::generate().expect("a device key");
+    let mut shared = ArchiveRecipients::restored(CollectionKind::MutableShared, last);
+    assert!(shared.add(*parties.device.public()));
+    assert!(shared.add(*leaving.public()));
+    let refused = shared
+        .revoke(&[leaving.key_id()])
+        .expect_err("no rotation follows the last one");
+    assert!(matches!(refused, CryptoError::RotationExhausted));
+    assert!(
+        shared.contains(&leaving.key_id()),
+        "a refused revocation removes nobody"
+    );
+    assert_eq!(shared.rotation(), last);
+
+    // An owned collection does not rotate, so its last rotation stops nothing.
+    let mut owned = ArchiveRecipients::restored(CollectionKind::Owned, last);
+    assert!(owned.add(*parties.device.public()));
+    assert!(owned.add(*leaving.public()));
+    let plain = owned
+        .revoke(&[leaving.key_id()])
+        .expect("an owned set does not rotate")
+        .expect("the set named it");
+    assert_eq!(plain.rotation, last);
+    assert!(!owned.contains(&leaving.key_id()));
 }
 
 #[test]
