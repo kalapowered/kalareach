@@ -248,14 +248,25 @@ pub enum TransitionOutcome {
 
 /// Where the host keeps invitation state across a restart.
 pub trait InvitationStore {
-    /// Writes a record for an invitation that has none yet.
+    /// Writes a record for an invitation that has none yet, with the confirmation it was issued
+    /// under.
+    ///
+    /// Issuing a persistent invitation is one of the actions section 10 gives a fresh owner
+    /// confirmation, and user-presence verification and the challenge-consumption transition are
+    /// part of the host's acceptance record. An implementation writes the record and that
+    /// confirmation's consumption in one transaction, so an invitation never exists without the
+    /// approval that authorised it on record.
     ///
     /// # Errors
     ///
     /// Returns [`PairingError::Store`] when the write fails or the invitation already exists. A
     /// failed write is a failed step: the state machine does not proceed on state it could not
     /// persist.
-    fn create(&self, record: &InvitationRecord) -> Result<()>;
+    fn create(
+        &self,
+        record: &InvitationRecord,
+        issued_under: &OwnerConfirmationProof,
+    ) -> Result<()>;
 
     /// Reads a record.
     ///
@@ -318,8 +329,12 @@ pub trait InvitationStore {
 }
 
 impl<T: InvitationStore + ?Sized> InvitationStore for &T {
-    fn create(&self, record: &InvitationRecord) -> Result<()> {
-        (**self).create(record)
+    fn create(
+        &self,
+        record: &InvitationRecord,
+        issued_under: &OwnerConfirmationProof,
+    ) -> Result<()> {
+        (**self).create(record, issued_under)
     }
 
     fn load(&self, invitation_id: InvitationId) -> Result<Option<InvitationRecord>> {
@@ -687,7 +702,11 @@ impl TestInvitationStore {
 }
 
 impl InvitationStore for TestInvitationStore {
-    fn create(&self, record: &InvitationRecord) -> Result<()> {
+    fn create(
+        &self,
+        record: &InvitationRecord,
+        _issued_under: &OwnerConfirmationProof,
+    ) -> Result<()> {
         self.check_write()?;
         let mut state = self.state.lock().expect("a test store");
         if state.records.contains_key(&record.invitation_id) {

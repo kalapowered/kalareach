@@ -20,7 +20,6 @@
 //! nothing can resume one. What has to survive a restart is the *device record*, and that is in
 //! [`super::devices`], written durably before a pairing is reported as complete.
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use kr_pairing::confirm::{ConfirmationLedger, HostEnrolment, request_confirmation};
@@ -29,9 +28,7 @@ use kr_pairing::direct::{
 };
 use kr_pairing::grants::{GrantIdentities, GrantKind};
 use kr_pairing::host::{HostIdentity, OwnerApproval, OwnerContext};
-use kr_pairing::platform::{
-    InvitationRecord, InvitationStore, LivePeer, PairingClock, PairingCommitment, TransitionOutcome,
-};
+use kr_pairing::platform::{LivePeer, PairingClock};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{DeviceId, GrantId, InvitationId};
 use kr_protocol::pairing::{
@@ -46,7 +43,9 @@ use kr_protocol::scalars::Digest256;
 use kr_transport::preauth::{ConnectionPeer, PairingMethod, PairingSurface};
 
 use super::devices::{DeviceDirectory, DeviceRecord};
+use super::invitations::{InvitationRows, IssueTerms};
 use crate::error::{ControllerError, Result};
+use kr_protocol::invitation::{InviteGrantKind, InviteModeKind};
 
 /// The clock every pairing deadline on this host is measured on.
 ///
@@ -89,165 +88,8 @@ impl PairingClock for HostPairingClock {
     }
 }
 
-/// The invitation state one run of this daemon holds.
-///
-/// Every write is conditional on the record the caller read, which is the contract `kr-pairing`
-/// asks of a store: one invitation may be served by two entry modes at once, and an unconditional
-/// write would let the slower of them undo the faster one's lock or consumption.
-#[derive(Debug, Default)]
-pub struct InvitationState {
-    records: Mutex<BTreeMap<InvitationId, InvitationRecord>>,
-    commitments: Mutex<BTreeMap<InvitationId, PairingCommitment>>,
-}
-
-/// A shared handle on that state, so one invitation can be driven from two places.
-///
-/// It carries the device directory as well, because the commit that consumes an invitation is the
-/// commit that creates the device: section 10 writes the device record, the grant and the consumed
-/// invitation atomically, and a candidate must never be told `committed` for a pairing whose
-/// device record is not there.
-#[derive(Clone, Debug)]
-pub struct SharedInvitations {
-    state: Arc<InvitationState>,
-    devices: Arc<DeviceDirectory>,
-}
-
-impl SharedInvitations {
-    /// Creates empty invitation state that commits into `devices`.
-    #[must_use]
-    pub fn new(devices: Arc<DeviceDirectory>) -> Self {
-        Self {
-            state: Arc::new(InvitationState::default()),
-            devices,
-        }
-    }
-}
-
-impl InvitationStore for SharedInvitations {
-    fn create(&self, record: &InvitationRecord) -> kr_pairing::Result<()> {
-        let mut records = self
-            .state
-            .records
-            .lock()
-            .unwrap_or_else(|held| held.into_inner());
-        if records.contains_key(&record.invitation_id) {
-            return Err(kr_pairing::PairingError::Store {
-                reason: "that invitation already exists".to_owned(),
-            });
-        }
-        records.insert(record.invitation_id, record.clone());
-        Ok(())
-    }
-
-    fn load(&self, invitation_id: InvitationId) -> kr_pairing::Result<Option<InvitationRecord>> {
-        Ok(self
-            .state
-            .records
-            .lock()
-            .unwrap_or_else(|held| held.into_inner())
-            .get(&invitation_id)
-            .cloned())
-    }
-
-    fn transition(
-        &self,
-        expected: &InvitationRecord,
-        next: &InvitationRecord,
-    ) -> kr_pairing::Result<TransitionOutcome> {
-        let mut records = self
-            .state
-            .records
-            .lock()
-            .unwrap_or_else(|held| held.into_inner());
-        match records.get(&expected.invitation_id) {
-            Some(current) if current == expected => {
-                records.insert(next.invitation_id, next.clone());
-                Ok(TransitionOutcome::Written)
-            }
-            Some(current) => Ok(TransitionOutcome::Stale(current.clone())),
-            None => Err(kr_pairing::PairingError::Store {
-                reason: "that invitation has no record".to_owned(),
-            }),
-        }
-    }
-
-    fn commit(
-        &self,
-        expected: &InvitationRecord,
-        next: &InvitationRecord,
-        commitment: &PairingCommitment,
-    ) -> kr_pairing::Result<TransitionOutcome> {
-        // The device record, the commitment and the consumed invitation move together, under one
-        // lock, so nothing can read a committed invitation whose device record is not there.
-        let mut records = self
-            .state
-            .records
-            .lock()
-            .unwrap_or_else(|held| held.into_inner());
-        match records.get(&expected.invitation_id) {
-            Some(current) if current == expected => {
-                // The device record first, and durably: a candidate told `committed` that then
-                // found no record of itself would have been told a pairing succeeded that cannot
-                // authorise anything. A store that cannot write it leaves the invitation
-                // unwritten, and the confirmation that failed has spent the owner's approval and
-                // fenced the invitation: the owner issues another rather than presenting the same
-                // one again.
-                let record = device_record(commitment)
-                    .map_err(|reason| kr_pairing::PairingError::Store { reason })?;
-                self.devices
-                    .commit(&record)
-                    .map_err(|error| kr_pairing::PairingError::Store {
-                        reason: error.to_string(),
-                    })?;
-                self.state
-                    .commitments
-                    .lock()
-                    .unwrap_or_else(|held| held.into_inner())
-                    .insert(commitment.invitation_id, commitment.clone());
-                records.insert(next.invitation_id, next.clone());
-                Ok(TransitionOutcome::Written)
-            }
-            Some(current) => Ok(TransitionOutcome::Stale(current.clone())),
-            None => Err(kr_pairing::PairingError::Store {
-                reason: "that invitation has no record".to_owned(),
-            }),
-        }
-    }
-
-    fn commitment(
-        &self,
-        invitation_id: InvitationId,
-    ) -> kr_pairing::Result<Option<PairingCommitment>> {
-        Ok(self
-            .state
-            .commitments
-            .lock()
-            .unwrap_or_else(|held| held.into_inner())
-            .get(&invitation_id)
-            .cloned())
-    }
-
-    fn unfinished(&self) -> kr_pairing::Result<Vec<InvitationRecord>> {
-        Ok(self
-            .state
-            .records
-            .lock()
-            .unwrap_or_else(|held| held.into_inner())
-            .values()
-            .filter(|record| {
-                matches!(
-                    record.state,
-                    kr_pairing::platform::InvitationState::Open
-                        | kr_pairing::platform::InvitationState::Locked { .. }
-                )
-            })
-            .cloned()
-            .collect())
-    }
-}
-
 /// One direct invitation, and the owner that issued it.
-type Invitation = DirectInvitation<SharedInvitations, HostPairingClock>;
+type Invitation = DirectInvitation<InvitationRows, HostPairingClock>;
 
 /// What an owner confirms when it establishes this host's clock again.
 ///
@@ -263,7 +105,7 @@ pub struct PairingHost {
     /// Whether this host has an owner yet, which decides whether the bootstrap exception applies.
     enrolment: HostEnrolment,
     devices: Arc<DeviceDirectory>,
-    invitations: SharedInvitations,
+    invitations: InvitationRows,
     /// The challenges this host has issued, each consumable once.
     ledger: Mutex<ConfirmationLedger>,
     /// The invitation this host is currently offering. One at a time: an invitation is single use,
@@ -295,7 +137,7 @@ impl PairingHost {
             clock,
             owner_signer,
             enrolment,
-            invitations: SharedInvitations::new(Arc::clone(&devices)),
+            invitations: InvitationRows::new(Arc::clone(&devices)),
             devices,
             ledger: Mutex::new(ConfirmationLedger::new()),
             open: Mutex::new(None),
@@ -363,8 +205,21 @@ impl PairingHost {
         // caller must not be able to make the host sign a bundle naming anything else.
         let mut identity = self.identity.clone();
         identity.network_config = network_config;
+        let terms = IssueTerms {
+            mode: InviteModeKind::Direct,
+            rendezvous_origin: None,
+            grant_kind: match grant_kind {
+                GrantKind::PersonalOwner => InviteGrantKind::PersonalOwner,
+                GrantKind::SessionInvitation => InviteGrantKind::SessionInvitation,
+            },
+            proposed_grant: proposed_grant.clone(),
+            issuing_actor: approval.owner.actor_id.clone(),
+            issuing_ingress: approval.owner.ingress,
+            action: None,
+            issued_at_ms: kr_ipc::now_ms(),
+        };
         let invitation = DirectInvitation::issue(
-            self.invitations.clone(),
+            self.invitations.issuing(terms),
             self.clock.clone(),
             identity,
             proposed_grant,
@@ -696,35 +551,6 @@ impl PairingSurface for PairingHost {
             )),
         }
     }
-}
-
-/// Returns the device record one completed pairing writes.
-///
-/// Every field comes from the commitment: the endpoint identity the candidate proved, the four keys
-/// its transcript bound, the grant the host issued and the display members it declared. Nothing
-/// here is taken from what the candidate asked for.
-fn device_record(commitment: &PairingCommitment) -> std::result::Result<DeviceRecord, String> {
-    let bundle = commitment
-        .client_bundle
-        .as_ref()
-        .ok_or_else(|| "a committed pairing carries the candidate's declaration".to_owned())?;
-    Ok(DeviceRecord {
-        device_id: commitment.device_id,
-        endpoint_id: commitment.client_keys.transport,
-        device_key_revision: bundle.device_key_revision,
-        authorisation: commitment.client_keys.authorisation,
-        // All four keys the owner-approved exchange bound, so another device can seal to this one
-        // through this host's report of it rather than through anything the device says later.
-        stored_envelope: Some(commitment.client_keys.stored_envelope),
-        notification_preview: Some(commitment.client_keys.notification_preview),
-        device_name: bundle.device_name.clone(),
-        platform: bundle.platform,
-        grant: commitment.grant.clone(),
-        paired_at_ms: commitment.committed_at_ms,
-        revoked_at_ms: None,
-        expired_at_ms: None,
-        committed_invitation_id: Some(commitment.invitation_id),
-    })
 }
 
 fn no_invitation() -> ControllerError {

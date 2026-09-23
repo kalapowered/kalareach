@@ -79,6 +79,31 @@ pub fn session_invitation_grant(
     })
 }
 
+/// Builds the grant a personal owner invitation proposes: every right, over every environment and
+/// session, with the whole retained history, valid until revoked.
+///
+/// This is what the host's first owner is paired with, and what any later owner device is paired
+/// with: section 10 keeps persistent co-owner access to explicit owner pairing, and this is that
+/// pairing's grant. It carries `host.manage`, which is what makes the device an owner device whose
+/// approval can confirm the host's sensitive actions.
+#[must_use]
+pub fn personal_owner_grant() -> ProposedGrant {
+    ProposedGrant {
+        parent_grant_id: Nullable::null(),
+        environment_selector: EnvironmentSelector::Any,
+        session_selector: SessionSelector::Any,
+        actions: ActionRight::ALL.iter().copied().collect(),
+        history: HistoryScope {
+            lower_bound_ms: Nullable::some(TimestampMs::new(0)),
+            include_live_screen: true,
+            named_questions: CanonicalSet::new(),
+            named_approvals: CanonicalSet::new(),
+        },
+        expiry: GrantExpiry::Never,
+        organisation: Nullable::null(),
+    }
+}
+
 /// Checks a proposal against the rules for its kind.
 ///
 /// # Errors

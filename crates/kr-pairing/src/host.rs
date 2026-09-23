@@ -446,7 +446,7 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
             deadline_monotonic_ms,
             boot_identity: clock.boot_identity(),
         };
-        store.create(&record)?;
+        store.create(&record, approval.proof)?;
         let issuing_owner = approval.owner.clone();
         Ok(Self {
             store,

@@ -565,12 +565,43 @@ impl DeviceDirectory {
         }
     }
 
-    fn with<T>(&self, body: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T> {
+    pub(crate) fn with<T>(
+        &self,
+        body: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> Result<T> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         body(&connection).map_err(ControllerError::registry)
+    }
+
+    /// Runs `body` inside one immediate transaction on this directory's connection.
+    ///
+    /// The pairing records live in this database, and a completed pairing writes a device row, the
+    /// invitation it consumed, its commitment, its security event and the owner confirmation it
+    /// spent. They are one transaction because a crash between any two of them would leave a device
+    /// with no record of how it was admitted, or a consumed invitation with no device. The
+    /// transaction is taken `IMMEDIATE`, so its reads decide against the rows it then writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever `body` returns, and a registry error when the transaction cannot begin or
+    /// commit. Nothing is written unless it commits.
+    pub(crate) fn transaction<T>(
+        &self,
+        body: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(ControllerError::registry)?;
+        let value = body(&transaction)?;
+        transaction.commit().map_err(ControllerError::registry)?;
+        Ok(value)
     }
 
     /// Records a completed pairing.
@@ -584,39 +615,7 @@ impl DeviceDirectory {
     /// Returns an error when the row cannot be written, including when this endpoint already has a
     /// record: an endpoint identity belongs to one device.
     pub fn commit(&self, record: &DeviceRecord) -> Result<()> {
-        let grant = kr_cbor::to_canonical_vec(&record.grant)
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        let platform = platform_text(record.platform)?;
-        self.with(|connection| {
-            connection
-                .execute(
-                    "INSERT INTO network_devices (
-                         device_id, endpoint_id, device_key_revision, authorisation_key,
-                         device_name, platform, grant_id, grant, paired_at_ms, revoked_at_ms,
-                         expired_at_ms, committed_invitation_id, notification_preview,
-                         stored_envelope_key
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, ?10, ?11, ?12)",
-                    params![
-                        record.device_id.get().as_bytes().as_slice(),
-                        record.endpoint_id.as_bytes().as_slice(),
-                        i64::try_from(record.device_key_revision.get()).unwrap_or(i64::MAX),
-                        record.authorisation.as_bytes().as_slice(),
-                        record.device_name.as_str(),
-                        platform,
-                        record.grant.grant_id.get().as_bytes().as_slice(),
-                        grant,
-                        i64::try_from(record.paired_at_ms.get()).unwrap_or(i64::MAX),
-                        record
-                            .committed_invitation_id
-                            .map(|invitation| invitation.get().as_bytes().to_vec()),
-                        record
-                            .notification_preview
-                            .map(|key| key.as_bytes().to_vec()),
-                        record.stored_envelope.map(|key| key.as_bytes().to_vec()),
-                    ],
-                )
-                .map(|_| ())
-        })
+        self.transaction(|transaction| insert_record(transaction, record))
     }
 
     /// Returns the record of one endpoint, paired or revoked.
@@ -1119,6 +1118,51 @@ impl DeviceDirectory {
 /// reaches the pre-authorisation surface, where pairing's own rules decide, and it reaches nothing
 /// else. What matters here is that it can never be *authorised*, and the handshake asks this
 /// exactly once for that purpose.
+/// Writes one device row inside a transaction the caller holds.
+///
+/// The device record and its grant are one row, written in one statement: section 10 commits them
+/// together, and a row that held one without the other would be a device with no rights or rights
+/// with no device.
+///
+/// # Errors
+///
+/// Returns an error when the row cannot be written, including when this endpoint already has a
+/// record: an endpoint identity belongs to one device.
+pub(crate) fn insert_record(connection: &Connection, record: &DeviceRecord) -> Result<()> {
+    let grant = kr_cbor::to_canonical_vec(&record.grant)
+        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+    let platform = platform_text(record.platform)?;
+    connection
+        .execute(
+            "INSERT INTO network_devices (
+                 device_id, endpoint_id, device_key_revision, authorisation_key,
+                 device_name, platform, grant_id, grant, paired_at_ms, revoked_at_ms,
+                 expired_at_ms, committed_invitation_id, notification_preview,
+                 stored_envelope_key
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, ?10, ?11, ?12)",
+            params![
+                record.device_id.get().as_bytes().as_slice(),
+                record.endpoint_id.as_bytes().as_slice(),
+                i64::try_from(record.device_key_revision.get()).unwrap_or(i64::MAX),
+                record.authorisation.as_bytes().as_slice(),
+                record.device_name.as_str(),
+                platform,
+                record.grant.grant_id.get().as_bytes().as_slice(),
+                grant,
+                i64::try_from(record.paired_at_ms.get()).unwrap_or(i64::MAX),
+                record
+                    .committed_invitation_id
+                    .map(|invitation| invitation.get().as_bytes().to_vec()),
+                record
+                    .notification_preview
+                    .map(|key| key.as_bytes().to_vec()),
+                record.stored_envelope.map(|key| key.as_bytes().to_vec()),
+            ],
+        )
+        .map(|_| ())
+        .map_err(ControllerError::registry)
+}
+
 impl PairedDirectory for DeviceDirectory {
     fn paired_peer(&self, endpoint_id: &EndpointKey) -> Option<PairedPeer> {
         self.record_for_endpoint(endpoint_id)

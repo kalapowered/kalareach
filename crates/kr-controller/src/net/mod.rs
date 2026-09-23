@@ -43,6 +43,7 @@
 pub mod config;
 pub mod devices;
 pub mod dispatch;
+pub mod invitations;
 pub mod pairing;
 pub mod proxy;
 
@@ -968,6 +969,16 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
     let devices = Arc::new(DeviceDirectory::open(
         controller.paths().registry_database(),
     )?);
+    invitations::prepare(&devices)?;
+    // Section 10: a host restart cancels every invitation it left unfinished, because a
+    // candidate's attempt lived only in memory and nothing can resume it. What an invitation
+    // consumed, and how many failed confirmations it had spent, stays on record. This runs before
+    // the listener serves anything, so no candidate can reach an invitation from before the
+    // restart.
+    kr_pairing::host::cancel_unfinished_invitations(&invitations::InvitationRows::new(Arc::clone(
+        &devices,
+    )))
+    .map_err(|error| invitations::from_store_failure(&error))?;
     // The host's own device identity is derived from its environment, so it is the same identity
     // across restarts without anything else having to be stored beside the keys.
     let device_id = DeviceId::new(environment_id.get());

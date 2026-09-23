@@ -156,7 +156,7 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
             deadline_monotonic_ms: clock.monotonic_ms().saturating_add(INVITATION_LIFETIME_MS),
             boot_identity: clock.boot_identity(),
         };
-        store.create(&record)?;
+        store.create(&record, approval.proof)?;
         let expires_at_ms =
             TimestampMs::new(clock.wall_clock_ms().saturating_add(INVITATION_LIFETIME_MS));
         let issuing_owner = approval.owner.clone();
