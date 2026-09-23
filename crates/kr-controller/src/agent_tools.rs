@@ -2332,9 +2332,10 @@ mod tests {
 
     /// KR-REQ-23.33: an installation writes exactly its manifest for the target agent. The change
     /// manifest it returns names the agent, scope, root and entry point it was asked for; every
-    /// file it records exists with the recorded digest, the packaged files are all of them, every
-    /// directory and configuration entry it records is there, and the home tree holds nothing the
-    /// manifest does not name.
+    /// file it records exists with the recorded digest and replaced nothing, the packaged files are
+    /// all of them, every directory it records exists, its configuration entry names the document
+    /// it created and the digest of the whole entry written there, and the home tree holds nothing
+    /// the manifest does not name.
     #[test]
     fn an_installation_writes_the_skill_and_registers_the_server() {
         let tree = Tree::create();
@@ -2365,11 +2366,26 @@ mod tests {
                 ChangeOperation::CreateDirectory { path } => {
                     assert!(Path::new(path).is_dir(), "{path} was created");
                 }
-                ChangeOperation::WriteFile { path, digest, .. } => {
+                ChangeOperation::WriteFile {
+                    path,
+                    digest,
+                    replaced_digest,
+                } => {
+                    assert!(!replaced_digest.is_present(), "{path} replaced nothing");
                     recorded.insert(PathBuf::from(path), *digest);
                 }
-                ChangeOperation::AddConfigurationEntry { path, entry, .. } => {
-                    entries.push((PathBuf::from(path), entry.clone()));
+                ChangeOperation::AddConfigurationEntry {
+                    path,
+                    entry,
+                    digest,
+                    created_document,
+                } => {
+                    entries.push((
+                        PathBuf::from(path),
+                        entry.clone(),
+                        *digest,
+                        *created_document,
+                    ));
                 }
             }
         }
@@ -2381,11 +2397,27 @@ mod tests {
             recorded, packaged,
             "the manifest records every packaged file"
         );
+
+        // The configuration entry: the document it names did not exist and was created, the entry
+        // written is the whole server entry this host declares for the agent, and the digest the
+        // manifest records is the digest of exactly that entry.
+        let document = tree.home().join(".claude.json");
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&document).expect("the document"))
+                .expect("json");
+        let server = &written["mcpServers"]["kalareach"];
+        assert_eq!(
+            *server,
+            installer.entry_value(Format::JsonCommandArgs, Some(AgentTarget::ClaudeCode))
+        );
+        assert_eq!(server["args"], json!(ENTRY_ARGS));
         assert_eq!(
             entries,
             vec![(
-                tree.home().join(".claude.json"),
-                "mcpServers.kalareach".to_owned()
+                document,
+                "mcpServers.kalareach".to_owned(),
+                digest_of(server.to_string().as_bytes()),
+                true
             )]
         );
         let mut written = files_under(&tree.home());

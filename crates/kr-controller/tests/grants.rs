@@ -686,9 +686,9 @@ fn a_method_is_decided_from_the_registry_table_and_never_from_a_capability() {
     }
 }
 
-/// KR-REQ-23.33: the agent-tools methods need the host owner at the machine. A paired device is
-/// refused all three whatever its grant holds, host management included, and the refusal is the
-/// decision itself, taken before anything could be installed, reported or removed.
+/// KR-REQ-23.33: the agent-tools methods need the host owner at the machine. The authority
+/// decision refuses all three to a paired device whatever its grant holds, host management
+/// included.
 #[test]
 fn a_paired_device_cannot_reach_the_agent_tools_whatever_its_grant_holds() {
     let everything = grant(1, None, ActionRight::ALL, GrantExpiry::Never);

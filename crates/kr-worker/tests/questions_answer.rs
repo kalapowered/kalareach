@@ -177,7 +177,7 @@ fn an_answer_to_a_revision_that_is_no_longer_current_is_refused() {
 /// KR-REQ-06.08, KR-REQ-23.32: answering and cancelling a pending question are bound to its exact
 /// revision. An answer or a cancellation naming any other revision is refused and leaves the
 /// question pending, the revision it was shown still answers it, and once its deadline has passed
-/// even that revision is refused as expired.
+/// even that revision is refused as expired, to an answer and to a cancellation alike.
 #[test]
 fn a_pending_question_takes_an_answer_or_a_cancellation_only_for_its_own_revision() {
     let session_id = SessionId::new(Uuid::from_bytes([5; 16]));
@@ -247,29 +247,50 @@ fn a_pending_question_takes_an_answer_or_a_cancellation_only_for_its_own_revisio
     let (resolved, _) = answer(question_id, shown, 2_300).expect("the revision shown answers it");
     assert_eq!(resolved.question.state, QuestionState::Answered);
 
-    // A second question, left until after its deadline, refuses even the revision it was shown.
-    let mut later = create(session_id);
-    later.request_id = "push-after-deadline".to_owned();
-    let (expiring, _) = questions
-        .create(&source, &later, now(3_000))
-        .expect("the agent asks again");
-    let deadline = expiring.question.expires_at_ms.get();
-    assert!(matches!(
-        answer(
-            expiring.question.question_id,
-            expiring.question.revision,
-            deadline + 1
-        ),
-        Err(QuestionError::Expired { .. })
-    ));
-    assert!(matches!(
-        cancel(
-            expiring.question.question_id,
-            expiring.question.revision,
-            deadline + 2
-        ),
-        Err(QuestionError::Expired { .. })
-    ));
+    // Past its deadline a question refuses even the revision it was shown, to an answer and to a
+    // cancellation alike. Each case runs on a ledger of its own, so the call under test is the first
+    // thing to reach the question after its deadline.
+    for cancelling in [false, true] {
+        let questions =
+            Questions::open(None, session_id, SessionEpoch::V1).expect("the question ledger opens");
+        let (expiring, _) = questions
+            .create(&source, &create(session_id), now(3_000))
+            .expect("the agent asks");
+        let question_id = expiring.question.question_id;
+        let expected_revision = expiring.question.revision;
+        let late = now(expiring.question.expires_at_ms.get() + 1);
+        let outcome = if cancelling {
+            questions
+                .cancel(
+                    &QuestionCancelParams {
+                        session_id,
+                        question_id,
+                        expected_revision,
+                    },
+                    late,
+                )
+                .map(|_| ())
+        } else {
+            questions
+                .answer(
+                    &actor_id,
+                    device_id,
+                    &QuestionAnswerParams {
+                        session_id,
+                        question_id,
+                        expected_revision,
+                        answer: QuestionAnswer::Decision { decided: true },
+                    },
+                    late,
+                )
+                .map(|_| ())
+        };
+        assert!(
+            matches!(outcome, Err(QuestionError::Expired { .. })),
+            "a {} after the deadline: {outcome:?}",
+            if cancelling { "cancellation" } else { "answer" }
+        );
+    }
 }
 
 /// KR-REQ-23.31: the private question methods check the helper as well as its caller token. A
