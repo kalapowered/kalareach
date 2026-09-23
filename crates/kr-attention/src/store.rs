@@ -1012,10 +1012,7 @@ fn as_index(value: usize, field: &'static str) -> Result<i64> {
 const ENVIRONMENT: &str = "environment";
 
 fn origin_text(origin: &Origin) -> String {
-    match origin {
-        Origin::Environment => ENVIRONMENT.to_owned(),
-        Origin::Session(session_id) => session_id.to_string(),
-    }
+    origin.to_string()
 }
 
 fn origin_from(text: &str, field: &'static str) -> Result<Origin> {

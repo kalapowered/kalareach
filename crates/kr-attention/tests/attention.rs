@@ -985,7 +985,12 @@ fn one_actor_s_acknowledgement_does_not_silence_the_host_s_reminder() {
     attention
         .acknowledge_keys(
             &actor("device:phone"),
-            &[key(&attention, AttentionRule::AdapterFailed, "git")],
+            // One session's adapter failure is keyed on the adapter within that session.
+            &[key(
+                &attention,
+                AttentionRule::AdapterFailed,
+                &format!("{}|git", session(1)),
+            )],
             reading(1),
         )
         .expect("the store records the acknowledgement");

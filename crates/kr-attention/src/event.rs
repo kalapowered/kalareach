@@ -66,6 +66,16 @@ impl Origin {
     }
 }
 
+/// The environment's own name, or the session's identifier.
+impl core::fmt::Display for Origin {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Environment => formatter.write_str("environment"),
+            Self::Session(session_id) => write!(formatter, "{session_id}"),
+        }
+    }
+}
+
 /// Whether a jump in a source's sequence is a range retention took.
 ///
 /// It is, for every source that numbers each of its records. It is not for the workflow journal's

@@ -1225,6 +1225,105 @@ fn a_notice_is_one_condition_whether_or_not_its_text_came_with_it() {
     );
 }
 
+/// An adapter that fails for two sessions is a failure in each: each is shown to whoever sees its
+/// session, and each ends with its own session's recovery.
+#[test]
+fn an_adapter_failing_for_two_sessions_is_two_failures() {
+    let mut attention = engine();
+    let git = || PluginId::new("git").expect("an identifier");
+    let failed = |session_id: SessionId| {
+        in_session(
+            session_id,
+            AttentionSource::HostEvents,
+            1,
+            0,
+            EventKind::AdapterFailed {
+                plugin_id: git(),
+                session_id: Some(session_id),
+                detail: "the index is locked".to_owned(),
+            },
+        )
+    };
+    feed(&mut attention, &[failed(session(1)), failed(session(2))], 0);
+    let failures = |attention: &Attention| -> Vec<AttentionItem> {
+        owner_inbox(attention)
+            .into_iter()
+            .filter(|item| item.rule == AttentionRule::AdapterFailed)
+            .collect()
+    };
+    assert_eq!(failures(&attention).len(), 2);
+
+    let admits_one = |candidate: SessionId| candidate == session(1);
+    let device = Viewer::Device(DeviceScope {
+        grant_id: grant(1),
+        session_view: true,
+        automation_manage: false,
+        host_manage: false,
+        admits_session: &admits_one,
+    });
+    let seen = attention
+        .inbox(&actor("device:phone"), &device, true)
+        .expect("the store is this owner's");
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].session_id.0, Some(session(1)));
+
+    feed(
+        &mut attention,
+        &[in_session(
+            session(2),
+            AttentionSource::HostEvents,
+            2,
+            1_000,
+            EventKind::AdapterRecovered { plugin_id: git() },
+        )],
+        1_000,
+    );
+    let left = failures(&attention);
+    assert_eq!(
+        left.len(),
+        1,
+        "session two's recovery ends session two's failure"
+    );
+    assert_eq!(left[0].session_id.0, Some(session(1)));
+}
+
+/// A notice with neither an identifier nor a fingerprint is its own record, and a record is named
+/// by its origin as well as its place: two sessions' records about one session never fold.
+#[test]
+fn notices_without_an_identity_from_two_origins_stay_apart() {
+    let mut attention = engine();
+    let notice_from = |origin: SessionId| {
+        in_session(
+            origin,
+            AttentionSource::HostEvents,
+            1,
+            0,
+            EventKind::ApplicationNotice {
+                session_id: session(3),
+                notice: ApplicationNotice {
+                    id: None,
+                    title: None,
+                    body: "build finished".to_owned(),
+                    lease_held: false,
+                    fingerprint: None,
+                },
+            },
+        )
+    };
+    feed(
+        &mut attention,
+        &[notice_from(session(1)), notice_from(session(2))],
+        0,
+    );
+    assert_eq!(
+        owner_inbox(&attention)
+            .iter()
+            .filter(|item| item.rule == AttentionRule::ApplicationNotice)
+            .count(),
+        2
+    );
+}
+
 /// KR-REQ-24.11: the store holds none of a session's text, so privacy mode has nothing to remove
 /// from it and nothing a later read could restore.
 #[test]

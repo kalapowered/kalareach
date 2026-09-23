@@ -464,6 +464,18 @@ fn approval_subject(session_id: SessionId, request_id: &impl core::fmt::Display)
     format!("{session_id}|{request_id}")
 }
 
+/// The subject an adapter failure is keyed on: the adapter, within the origin that reported it.
+///
+/// One adapter can fail for two sessions at once, and each session's failure is its own: a device
+/// that sees one session is shown that session's, and its recovery ends that one. The
+/// environment's own reports keep the adapter alone as their subject.
+fn adapter_subject(origin: Origin, plugin_id: &impl core::fmt::Display) -> String {
+    match origin {
+        Origin::Environment => plugin_id.to_string(),
+        Origin::Session(session_id) => format!("{session_id}|{plugin_id}"),
+    }
+}
+
 impl Engine {
     /// Builds an engine with nothing consumed and nothing in the inbox.
     #[must_use]
@@ -1254,7 +1266,7 @@ impl Engine {
             } => self.raise(
                 raise(
                     AttentionRule::AdapterFailed,
-                    plugin_id.to_string(),
+                    adapter_subject(origin, plugin_id),
                     *session_id,
                     text_of(event, || format!("{plugin_id}: {detail}")),
                     AttentionRouting::OwnerPolicy,
@@ -1262,9 +1274,10 @@ impl Engine {
                 reading,
                 mode,
             ),
-            EventKind::AdapterRecovered { plugin_id } => {
-                self.resolve(AttentionRule::AdapterFailed, &plugin_id.to_string())
-            }
+            EventKind::AdapterRecovered { plugin_id } => self.resolve(
+                AttentionRule::AdapterFailed,
+                &adapter_subject(origin, plugin_id),
+            ),
             EventKind::HostContactLost { detail } => self.raise(
                 raise(
                     AttentionRule::HostContactLost,
@@ -1288,8 +1301,8 @@ impl Engine {
                         format!("{session_id}|fingerprint|{}", fingerprint.to_hex())
                     }
                     (None, None) => format!(
-                        "{session_id}|record|{}|{}",
-                        event.cursor.source, event.cursor.sequence
+                        "{session_id}|record|{}|{}|{}",
+                        event.cursor.origin, event.cursor.source, event.cursor.sequence
                     ),
                 };
                 let routing = if notice.lease_held {
