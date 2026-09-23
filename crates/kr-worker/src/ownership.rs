@@ -787,6 +787,52 @@ mod tests {
         assert_eq!(owned.unestablished().len(), 1);
     }
 
+    /// KR-REQ-07.57: stopping what a session owns never signals a process that has taken over an
+    /// identifier the session recorded. The record is the identifier and a start value, and a
+    /// process running under that identifier now, with another start value, is left alone by both
+    /// the request to stop and the forced stop.
+    #[cfg(unix)]
+    #[test]
+    fn a_process_that_now_holds_a_recorded_identifier_is_never_signalled() {
+        let mut stranger = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("starts a process");
+        let pid = stranger.id();
+        let actual =
+            kr_ipc::identity::process_start_identity(pid).expect("the kernel describes it");
+        // What the session recorded under that identifier: an earlier process, started at
+        // another moment.
+        let recorded = ProcessStartIdentity::new(
+            u64::from(pid),
+            actual.source,
+            actual.start_value.get() ^ 0xFFFF,
+        );
+        let mut owned = OwnedProcesses::establish(
+            OwnershipBoundary::TerminalGroup {
+                group: 1,
+                terminal: None,
+            },
+            kr_ipc::identity::ended_process_identity(4_000_002),
+        );
+        owned.seen.insert(
+            key(&recorded),
+            Recorded {
+                identity: recorded.clone(),
+                forced: false,
+            },
+        );
+        request_stop(&owned);
+        force_stop(&owned);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            stranger.try_wait().expect("asks after it").is_none(),
+            "the process that holds the identifier now was not signalled"
+        );
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+    }
+
     /// KR-REQ-07.57: an owned process is its identifier and its start value together, so a process
     /// that reuses the identifier later is a different one, never mistaken for what was recorded.
     #[test]

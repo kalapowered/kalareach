@@ -39,12 +39,17 @@ use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
 
+mod common;
+
+use common::{carries, produced, retained};
+
 // ---------------------------------------------------------------------------------------------
 // The harness
 // ---------------------------------------------------------------------------------------------
 
 struct Host {
     _temp: kr_ipc::testing::TempHost,
+    service: Arc<WorkerService>,
     runtime: Arc<SessionRuntime>,
     session_id: SessionId,
     journal_path: std::path::PathBuf,
@@ -56,8 +61,8 @@ fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
 }
 
-/// Starts a worker whose journal already holds whatever `prepare` writes into it.
-async fn host_prepared(prepare: impl FnOnce(&std::path::Path)) -> Host {
+/// Starts a worker whose journal already holds whatever `prepare` writes into it, running `script`.
+async fn host_prepared(prepare: impl FnOnce(&std::path::Path), script: &str) -> Host {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
@@ -88,7 +93,7 @@ async fn host_prepared(prepare: impl FnOnce(&std::path::Path)) -> Host {
         std::fs::create_dir_all(parent).expect("the journal directory");
     }
     prepare(&journal_path);
-    let config = session_config(&environment, session_id);
+    let config = session_config(&environment, session_id, script);
     let mut session = Session::open(config).expect("opens the session");
     session.launch().expect("launches the shell");
     let runtime = Arc::new(
@@ -118,6 +123,7 @@ async fn host_prepared(prepare: impl FnOnce(&std::path::Path)) -> Host {
     tokio::spawn(Arc::clone(&service).serve(listener));
     Host {
         _temp: temp,
+        service,
         runtime,
         session_id,
         journal_path,
@@ -127,12 +133,18 @@ async fn host_prepared(prepare: impl FnOnce(&std::path::Path)) -> Host {
 }
 
 async fn host() -> Host {
-    host_prepared(|_| {}).await
+    host_prepared(|_| {}, "sleep 30").await
+}
+
+/// Starts a worker whose root program is `script`, for a test that watches what reaches it.
+async fn host_running(script: &str) -> Host {
+    host_prepared(|_| {}, script).await
 }
 
 fn session_config(
     environment: &kr_ipc::paths::EnvironmentPaths,
     session_id: SessionId,
+    script: &str,
 ) -> SessionConfig {
     SessionConfig {
         session_id,
@@ -141,7 +153,7 @@ fn session_config(
         display_number: DisplayNumber::new(1),
         shell: ShellCommand {
             program: "/bin/sh".to_owned(),
-            arguments: vec!["-c".to_owned(), "sleep 30".to_owned()],
+            arguments: vec!["-c".to_owned(), script.to_owned()],
             cwd: "/".to_owned(),
             environment: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
         },
@@ -1563,12 +1575,49 @@ struct EarlierHistoryGap {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_full_journal_fences_a_rich_mutation_while_raw_input_keeps_flowing() {
     // KR-ACC-028, for the parts this suite can drive: the journal is filled while the input lease
-    // is live, raw input keeps being accepted, a rich mutation is refused before anything is
-    // dispatched, and nothing is left behind for a replay to find. What it does not drive is an
-    // approval, which needs the question ledger, or a native terminal application responding to
-    // the bytes; the fixture's root shell is a `sleep`. Neither is claimed here.
-    let host = host().await;
+    // is live and an application is reading from the terminal; the bytes the person types still
+    // reach it and the interrupt still interrupts it, while a rich mutation and the answer to a
+    // pending decision are refused before anything is dispatched, and nothing is left behind for
+    // a replay to find.
+    let host = host_running(
+        "stty -echo; trap 'printf \"kr-interrupted.\\n\"' INT; printf 'kr-ready.\\n'; \
+         while :; do if IFS= read -r line; then printf 'kr-got:%s\\n' \"$line\"; fi; done",
+    )
+    .await;
+    produced(&host.runtime, b"kr-ready.").await;
     let mut client = cli(&host).await;
+    // A decision is pending, asked by an agent in this session while the store was working.
+    let asker = kr_worker::questions::binding::VerifiedSource {
+        process: kr_ipc::identity::current_process_start_identity().expect("a process identity"),
+        executable: Some("kr-test-agent".to_owned()),
+        session_member: true,
+        ancestry: true,
+        launch_channel: true,
+        connection_id: kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid()),
+    };
+    let now = || kr_worker::questions::Now {
+        utc_ms: kr_ipc::now_ms(),
+        boot_ms: kr_ipc::clock::boot_elapsed_ms(),
+    };
+    let (asked, _) = host
+        .service
+        .questions()
+        .create(
+            &asker,
+            &kr_protocol::question::QuestionCreateParams {
+                session_id: host.session_id,
+                request_id: "push-anyway".to_owned(),
+                kind: kr_protocol::question::QuestionKind::Confirm,
+                context: "Two tests are failing.".to_owned(),
+                question: "Push the branch anyway?".to_owned(),
+                choices: Vec::new(),
+                agent_name: Nullable::some("kr-test-agent".to_owned()),
+                requested_expiry_ms: Nullable::some(kr_protocol::scalars::DurationMs::new(600_000)),
+                wait_ms: Nullable::null(),
+            },
+            now(),
+        )
+        .expect("the agent asks while the store is working");
 
     // An attachment and the input lease, taken while the store is still working.
     let attachment: kr_protocol::attachment::SessionAttachResult = client
@@ -1615,7 +1664,9 @@ async fn a_full_journal_fences_a_rich_mutation_while_raw_input_keeps_flowing() {
                     attachment_id: attachment.attachment.attachment_id,
                     epoch: lease.lease.epoch,
                     sequence: kr_protocol::ids::InputSequence::new(sequence),
-                    bytes: kr_protocol::scalars::Bytes::new(b"echo hello\n".to_vec()),
+                    bytes: kr_protocol::scalars::Bytes::new(
+                        format!("kr-typed-{sequence}\n").into_bytes(),
+                    ),
                 },
             )
             .await
@@ -1623,6 +1674,15 @@ async fn a_full_journal_fences_a_rich_mutation_while_raw_input_keeps_flowing() {
             .map(|value| value.to_typed().expect("decodes"))
             .expect("the terminal still takes input with a full store");
         assert_eq!(written.sequence.get(), sequence);
+    }
+    // And the application reads every line of it.
+    produced(&host.runtime, b"kr-got:kr-typed-3").await;
+    let seen = retained(&host.runtime);
+    for sequence in 0..4 {
+        assert!(
+            carries(&seen, format!("kr-got:kr-typed-{sequence}").as_bytes()),
+            "line {sequence} reached the application"
+        );
     }
 
     // Rich work is fenced, and the refusal is a refusal rather than an uncertain outcome.
@@ -1638,8 +1698,9 @@ async fn a_full_journal_fences_a_rich_mutation_while_raw_input_keeps_flowing() {
         .expect("reaches the worker")
         .expect_err("a full store fences rich work");
     assert_eq!(refused.code, ErrorCode::StorageUnavailable);
-    // An approval is rich work too. Answering a pending decision is refused at the same point,
-    // before anything is dispatched, so no decision is taken that this host could not record.
+    // An approval is rich work too. Answering the pending decision is refused at the same point,
+    // before anything is dispatched, and the decision is still waiting afterwards: nothing was
+    // decided that this host could not record.
     let approval = client
         .mutate(
             Method::QuestionAnswer,
@@ -1647,8 +1708,8 @@ async fn a_full_journal_fences_a_rich_mutation_while_raw_input_keeps_flowing() {
             target(&host),
             &kr_protocol::question::QuestionAnswerParams {
                 session_id: host.session_id,
-                question_id: kr_protocol::ids::QuestionId::new(kr_ipc::new_uuid()),
-                expected_revision: kr_protocol::ids::QuestionRevision::new(1),
+                question_id: asked.question.question_id,
+                expected_revision: asked.question.revision,
                 answer: kr_protocol::question::QuestionAnswer::Decision { decided: true },
             },
         )
@@ -1656,6 +1717,25 @@ async fn a_full_journal_fences_a_rich_mutation_while_raw_input_keeps_flowing() {
         .expect("reaches the worker")
         .expect_err("a full store fences an approval");
     assert_eq!(approval.code, ErrorCode::StorageUnavailable);
+    let (still, _) = host
+        .service
+        .questions()
+        .read_own(
+            &asker,
+            &kr_protocol::question::QuestionReadOwnParams {
+                session_id: host.session_id,
+                question_id: asked.question.question_id,
+                caller_token: asked.caller_token.clone(),
+                wait_ms: Nullable::null(),
+            },
+            now(),
+        )
+        .expect("the agent reads its question");
+    assert_eq!(
+        still.question.state,
+        kr_protocol::question::QuestionState::Pending,
+        "the refused answer decided nothing"
+    );
 
     // Section 7's other exception, through the same admission path the refusal above took: the
     // interrupt is the one way a person has of stopping a running command on a host whose store
@@ -1679,6 +1759,8 @@ async fn a_full_journal_fences_a_rich_mutation_while_raw_input_keeps_flowing() {
         .map(|value| value.to_typed().expect("decodes"))
         .expect("a full store does not take the interrupt away");
     assert_eq!(interrupted.lease.epoch, lease.lease.epoch);
+    // And it interrupted the application.
+    produced(&host.runtime, b"kr-interrupted.").await;
 
     // And nothing can replay it: the store holds no record of the action at all, so there is no
     // dispatch marker for a recovery to turn into an uncertain outcome.
