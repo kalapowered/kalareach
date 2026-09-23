@@ -643,7 +643,8 @@ fn frames_round_trip_and_report_what_is_missing() {
     assert_eq!(second, payload.as_slice());
 }
 
-/// KR-REQ-23.11: a stream header declaring its kind and resource is bounded at 1 KiB.
+/// KR-REQ-23.11: a stream header declaring its kind and resource is bounded at 1 KiB, and one
+/// byte more is refused before it is read.
 #[test]
 fn a_stream_header_stays_inside_its_bound() {
     let header = StreamHeader {
@@ -664,11 +665,19 @@ fn a_stream_header_stays_inside_its_bound() {
     let encoded = header.encode().expect("encode");
     assert!(encoded.len() <= MAX_STREAM_HEADER_LEN);
     assert_eq!(StreamHeader::decode(&encoded).expect("decode"), header);
+
+    // The bound is the 1 KiB section 23 states: a header of exactly 1,024 bytes is read as a
+    // header, and one byte more is refused for its length alone.
+    assert_eq!(MAX_STREAM_HEADER_LEN, 1_024);
+    assert!(!matches!(
+        StreamHeader::decode(&[0u8; 1_024]),
+        Err(FrameError::HeaderTooLarge { .. })
+    ));
     assert_eq!(
-        StreamHeader::decode(&vec![0u8; MAX_STREAM_HEADER_LEN + 1]),
+        StreamHeader::decode(&[0u8; 1_025]),
         Err(FrameError::HeaderTooLarge {
-            len: MAX_STREAM_HEADER_LEN + 1,
-            limit: MAX_STREAM_HEADER_LEN
+            len: 1_025,
+            limit: 1_024
         })
     );
 }

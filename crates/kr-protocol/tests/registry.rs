@@ -365,7 +365,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
     );
 }
 
-/// KR-REQ-23.53: an unlisted method or effect is denied.
+/// KR-REQ-23.53: an unlisted method is denied.
 #[test]
 fn anything_unlisted_is_denied() {
     for name in [

@@ -251,7 +251,7 @@ fn an_application_its_thread_its_binding_and_its_turn_are_distinct_objects() {
 /// KR-REQ-06.05: an action, an upstream approval request and a stream position are distinct
 /// objects. An action identifier is a 16-byte KalaReach identifier; an approval request
 /// identifier stays the upstream's own opaque text and is never turned into a KalaReach
-/// identifier; a cursor is an unsigned 64-bit position, ordered within its stream.
+/// identifier; a cursor is an ordered unsigned 64-bit position.
 #[test]
 fn an_action_an_approval_request_and_a_stream_position_are_distinct_objects() {
     assert_distinct(&[
@@ -300,9 +300,9 @@ fn an_action_an_approval_request_and_a_stream_position_are_distinct_objects() {
 }
 
 /// KR-REQ-06.08: a question and the revision a person answers, a paired device, a host-issued
-/// grant, and a device-owned draft and its revision are distinct objects; answering or cancelling a
-/// question is bound to the exact question revision, and updating a draft to the exact draft
-/// revision.
+/// grant, and a device-owned draft and its revision are distinct objects, and the method registry
+/// binds answering or cancelling a question to the question revision and updating a draft to the
+/// draft revision. The refusal of any other revision is checked where the methods run.
 #[test]
 fn questions_devices_grants_and_drafts_are_distinct_objects() {
     assert_distinct(&[
@@ -343,10 +343,11 @@ fn questions_devices_grants_and_drafts_are_distinct_objects() {
     }
 }
 
-/// KR-REQ-06.10: a capability and its revision are evidence, never permission: a write that asks
-/// for capability evidence also names the rights it needs, and a read still needs the scoped read
-/// authority of a grant. The controller generation and the remote dispatch lease are objects of
-/// their own, a counter and a random identifier.
+/// KR-REQ-06.10: a capability and its revision are objects of their own, and the method registry
+/// never lets capability evidence stand alone: a write that asks for it also names the rights or
+/// the basis it needs, and a read that asks for it names the resources its scoped read is decided
+/// on. The controller generation and the remote dispatch lease are objects of their own, a counter
+/// and a random identifier. The grant decision that ignores capabilities is checked where it runs.
 #[test]
 fn capabilities_and_dispatch_fences_are_distinct_objects() {
     assert_distinct(&[
@@ -385,8 +386,12 @@ fn capabilities_and_dispatch_fences_are_distinct_objects() {
 
     for entry in kr_protocol::method::REGISTRY {
         if matches!(entry.capability, CapabilityRequirement::Required { .. }) {
+            let authority = match entry.effect {
+                EffectClass::Write => !entry.required_rights.is_empty(),
+                EffectClass::Read => !entry.resource_selectors.is_empty(),
+            };
             assert!(
-                entry.effect == EffectClass::Read || !entry.required_rights.is_empty(),
+                authority,
                 "{} asks for capability evidence and no authority",
                 entry.name
             );
