@@ -19,14 +19,17 @@
 //! was asked under changed. An answer whose outcome was unknown when it was kept reconciles the same
 //! way: if it did reach the host, the question is answered and the draft is retired as ended.
 //!
-//! The store is a directory on this device that the caller names, one file per question, readable
-//! only by its owner. An answer can carry anything a person typed, so it does not leave the device
-//! except to the host that asked.
+//! The store is a directory on this device that the caller names, readable only by its owner, with
+//! one file per question. An answer can carry anything a person typed, so it does not leave the
+//! device except to the host that asked. A kept answer is written the way this crate writes a draft:
+//! to a new file of its own, created exclusively and owner-only, flushed, renamed over its name and
+//! the directory flushed after, so two writers never share a file and a reader never sees half of
+//! one.
 
 use std::path::{Path, PathBuf};
 
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
-use kr_protocol::error::ErrorCode;
+use kr_protocol::error::{ErrorCode, RetryCategory};
 use kr_protocol::ids::{QuestionId, QuestionRevision, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::question::{
@@ -257,16 +260,11 @@ impl AnswerDrafts {
     /// Returns [`AnswerError::Store`] when the directory cannot be created.
     pub fn open(directory: impl Into<PathBuf>) -> Result<Self> {
         let directory = directory.into();
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-        builder
-            .create(&directory)
-            .map_err(|error| AnswerError::Store {
-                path: directory.clone(),
-                error,
-            })?;
+        // Created owner-only, and an existing directory narrowed to its owner rather than accepted.
+        crate::drafts::private_directory(&directory).map_err(|error| AnswerError::Store {
+            path: directory.clone(),
+            error,
+        })?;
         Ok(Self { directory })
     }
 
@@ -279,25 +277,23 @@ impl AnswerDrafts {
         let bytes = kr_cbor::to_canonical_vec(draft)
             .map_err(|error| AnswerError::Form(format!("the answer cannot be kept: {error}")))?;
         let path = self.path(draft.question_id);
-        // Written beside its name and renamed over it, so a reader finds the old answer or the new
-        // one and never half of either.
-        let partial = self
-            .directory
-            .join(format!(".{}.partial", draft.question_id));
         let store = |error| AnswerError::Store {
             path: path.clone(),
             error,
         };
-        {
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-            let mut file = options.open(&partial).map_err(store)?;
-            std::io::Write::write_all(&mut file, &bytes).map_err(store)?;
-            file.sync_all().map_err(store)?;
+        // A name of this write's own, so a second writer of the same question writes a file of its
+        // own too, and the last rename is the answer that stays.
+        let unique = crate::drafts::fresh_uuid()
+            .map_err(|error| store(std::io::Error::other(error.to_string())))?;
+        let partial = self
+            .directory
+            .join(format!(".{}.{unique}.partial", draft.question_id));
+        crate::drafts::write_whole(&partial, &bytes).map_err(store)?;
+        if let Err(error) = std::fs::rename(&partial, &path) {
+            let _ = std::fs::remove_file(&partial);
+            return Err(store(error));
         }
-        std::fs::rename(&partial, &path).map_err(store)
+        crate::drafts::sync_directory(&self.directory).map_err(store)
     }
 
     /// Returns every answer kept on this device, oldest first.
@@ -318,6 +314,7 @@ impl AnswerDrafts {
                 error,
             })?;
             let path = entry.path();
+            // A partial write whose process did not live to rename it is not an answer.
             if path.extension().and_then(|extension| extension.to_str()) != Some(EXTENSION) {
                 continue;
             }
@@ -335,7 +332,8 @@ impl AnswerDrafts {
     pub fn discard(&self, question_id: QuestionId) -> Result<()> {
         let path = self.path(question_id);
         match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
+            Ok(()) => crate::drafts::sync_directory(&self.directory)
+                .map_err(|error| AnswerError::Store { path, error }),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(AnswerError::Store { path, error }),
         }
@@ -359,20 +357,25 @@ fn read_draft(path: &Path) -> Result<AnswerDraft> {
     })
 }
 
-/// Returns true when a failure means the answer did not certainly reach the host.
+/// Returns true when a failure leaves the answer untaken or its fate unknown, rather than refused.
 ///
-/// The connection could not be made, it ended before the answer went, or it ended after the answer
-/// went and before the host said what became of it. In the last case the answer may have been
-/// taken; the draft is kept anyway, because the next reconcile reads the question and retires the
-/// draft if it was.
-fn is_lost_connection(error: &ClientError) -> bool {
-    matches!(
-        error,
-        ClientError::Transport(_)
-            | ClientError::Ipc(_)
-            | ClientError::ConnectionEnded
-            | ClientError::SubmissionUncertain { .. }
-    )
+/// Two kinds keep the answer. The host could not be reached or stopped answering, which the
+/// protocol classifies as transient: a connection that could not be made or that ended, a host
+/// busy or without storage for a moment. And the answer went and what became of it is not known,
+/// whether the connection ended before the host's word came back or the host itself said the
+/// outcome is unknown; the answer may have been taken, and the next reconcile reads the question
+/// and retires the draft if it was, so it is never sent twice.
+///
+/// Every other failure is the host's own answer and is shown rather than kept: a refused proof, a
+/// schema or version this build does not share, an answer to a question that already ended.
+fn keeps_the_answer(error: &ClientError) -> bool {
+    match error {
+        ClientError::ConnectionEnded | ClientError::SubmissionUncertain { .. } => true,
+        other => matches!(
+            other.code().retry_category(),
+            RetryCategory::Transient | RetryCategory::OutcomeUnknown
+        ),
+    }
 }
 
 /// Sends a person's answer, or keeps it on this device when the host cannot be reached.
@@ -416,7 +419,7 @@ pub async fn answer<H: QuestionHost>(
             drafts.discard(draft.question_id)?;
             Ok(Answered::Sent(Box::new(question)))
         }
-        Err(error) if is_lost_connection(&error) => {
+        Err(error) if keeps_the_answer(&error) => {
             drafts.keep(&draft)?;
             Ok(Answered::Kept(draft))
         }

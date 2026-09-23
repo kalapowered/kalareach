@@ -1032,7 +1032,7 @@ fn storage(path: &Path, source: std::io::Error) -> DraftError {
     }
 }
 
-fn fresh_uuid() -> Result<Uuid> {
+pub(crate) fn fresh_uuid() -> Result<Uuid> {
     Ok(kr_transport::random::fresh_uuid_v4()?)
 }
 
@@ -1062,7 +1062,7 @@ fn owner_only_builder() -> std::fs::DirBuilder {
 /// accepted. On Windows the directory takes whatever access list it inherits, which this store does
 /// not narrow: what protects it there is the access list of the directory the caller chose, so a
 /// caller puts the store under its own per-user application data rather than somewhere shared.
-fn private_directory(directory: &Path) -> std::io::Result<()> {
+pub(crate) fn private_directory(directory: &Path) -> std::io::Result<()> {
     // Each missing level is created in turn rather than all at once, because a directory is a name
     // in the directory above it and a name is durable only once *that* directory's entry is
     // flushed. One recursive create would make several names and leave every one of them in
@@ -1123,7 +1123,7 @@ fn holder_of(path: &Path) -> &Path {
 /// moment afterwards: a file that was briefly readable is a file that was readable. A failure after
 /// it was created removes it; a process that dies here leaves it, and the next
 /// [`DraftStore::open`] sweeps it away.
-fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
 
     let mut options = std::fs::OpenOptions::new();
@@ -1148,7 +1148,7 @@ fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// Unix only. This build flushes no directory on Windows and makes no claim there that a name it
 /// acknowledged survives losing power. What holds on both is that the new contents are written and
 /// flushed before anything renames them into place, so a reader never sees a file half written.
-fn sync_directory(directory: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_directory(directory: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         std::fs::File::open(directory)?.sync_all()?;

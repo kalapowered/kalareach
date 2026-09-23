@@ -81,6 +81,10 @@ enum Line {
     Up,
     /// It takes the answer and the connection ends before it can say so.
     DropsAfterTaking,
+    /// It takes the answer and says it cannot tell what became of it.
+    TakesWithoutSaying,
+    /// It refuses outright with this code, taking nothing.
+    Refuses(ErrorCode),
 }
 
 /// A host holding one session's questions.
@@ -169,16 +173,25 @@ impl QuestionHost for Host {
         params: QuestionAnswerParams,
     ) -> impl Future<Output = Result<Question, ClientError>> + Send {
         self.answers.lock().expect("the lock").push(params.clone());
-        let taken = self.take(&params);
         let line = *self.line.lock().expect("the lock");
-        async move {
-            match (line, taken) {
-                (Line::DropsAfterTaking, Ok(_)) => Err(ClientError::SubmissionUncertain {
-                    action_id: ActionId::new(Uuid::from_bytes([9; 16])),
-                }),
-                (_, outcome) => outcome,
+        let outcome = match line {
+            Line::Refuses(code) => Err(ClientError::Host(ProtocolError::new(code, "refused"))),
+            Line::Up => self.take(&params),
+            Line::DropsAfterTaking => {
+                self.take(&params)
+                    .and(Err(ClientError::SubmissionUncertain {
+                        action_id: ActionId::new(Uuid::from_bytes([9; 16])),
+                    }))
             }
-        }
+            Line::TakesWithoutSaying => {
+                self.take(&params)
+                    .and(Err(ClientError::Host(ProtocolError::new(
+                        ErrorCode::OutcomeUnknown,
+                        "no result yet",
+                    ))))
+            }
+        };
+        async move { outcome }
     }
 }
 
@@ -324,8 +337,8 @@ async fn a_kept_answer_is_never_sent_to_a_question_that_ended_meanwhile() {
     assert!(host.answers().is_empty());
 }
 
-/// An offered answer reaches the host only when the person sends it, exactly once, naming the
-/// revision the person answered; a second send is refused without reaching the host.
+/// KR-REQ-11.63: an offered answer reaches the host only when the person sends it, exactly once,
+/// naming the revision the person answered; a second send is refused without reaching the host.
 #[tokio::test]
 async fn a_person_sends_an_offered_answer_once() {
     let (_directory, drafts) = store();
@@ -355,8 +368,8 @@ async fn a_person_sends_an_offered_answer_once() {
     assert_eq!(host.answers().len(), 1, "the second send reached nothing");
 }
 
-/// A question that ends between the offer and the send is checked again before anything goes,
-/// so the answer is retired rather than sent.
+/// KR-REQ-11.63: a question that ends between the offer and the send is checked again before
+/// anything goes, so the answer is retired rather than sent to a question that ended.
 #[tokio::test]
 async fn a_question_that_ends_after_the_offer_is_not_sent() {
     let (_directory, drafts) = store();
@@ -379,9 +392,9 @@ async fn a_question_that_ends_after_the_offer_is_not_sent() {
     assert!(drafts.drafts().expect("reads").is_empty());
 }
 
-/// An answer whose connection ended after it went is kept, because its outcome is unknown; the
-/// reconnect then finds the question answered by it and retires the draft, so it is never sent a
-/// second time.
+/// KR-REQ-11.63: an answer whose connection ended after it went is kept, because its outcome is
+/// unknown, and so is one the host itself says it cannot account for; the reconnect then finds the
+/// question answered by it and retires the draft, so it is never sent a second time.
 #[tokio::test]
 async fn an_answer_lost_with_its_connection_is_kept_and_never_sent_twice() {
     let (_directory, drafts) = store();
@@ -412,11 +425,40 @@ async fn an_answer_lost_with_its_connection_is_kept_and_never_sent_twice() {
         }]
     );
     assert_eq!(host.answers().len(), 1, "the answer went once");
+
+    // The host's own word that it cannot tell what became of an answer keeps it the same way.
+    let (_directory, drafts) = store();
+    let asked = question(41);
+    let host = Host::with(vec![asked.clone()]);
+    *host.line.lock().expect("the lock") = Line::TakesWithoutSaying;
+    let outcome = kr_client::answers::answer(
+        Some(&host),
+        &drafts,
+        target(),
+        &asked,
+        yes(),
+        TimestampMs::new(5_000),
+    )
+    .await
+    .expect("kept");
+    let Answered::Kept(kept) = outcome else {
+        panic!("an answer whose outcome the host cannot tell is kept: {outcome:?}");
+    };
+    *host.line.lock().expect("the lock") = Line::Up;
+    assert_eq!(
+        reconcile(&host, &drafts).await.expect("reconciles"),
+        vec![Reconciled::Retired {
+            draft: kept,
+            reason: Retired::Ended(QuestionState::Answered)
+        }]
+    );
+    assert_eq!(host.answers().len(), 1, "the answer went once");
 }
 
-/// While the host can be reached an answer goes at once, and a refusal is the host's: an answer to
-/// a question that already ended is refused and not kept, and an answer that does not fit the
-/// question's form is neither sent nor kept.
+/// KR-REQ-11.63: while the host can be reached an answer goes at once, and a refusal is the host's
+/// to show rather than a draft to keep: an answer to a question that already ended, and one the
+/// host refuses outright for this device, are refused and not kept, and an answer that does not
+/// fit the question's form is neither sent nor kept.
 #[tokio::test]
 async fn an_answer_the_host_refuses_or_the_form_forbids_is_not_kept() {
     let (_directory, drafts) = store();
@@ -449,6 +491,22 @@ async fn an_answer_the_host_refuses_or_the_form_forbids_is_not_kept() {
     .expect_err("refused");
     assert_eq!(refused.code(), ErrorCode::QuestionResolved);
 
+    // A refusal for this device is shown, not kept for later.
+    let refusing = Host::with(vec![question(52)]);
+    *refusing.line.lock().expect("the lock") = Line::Refuses(ErrorCode::PermissionDenied);
+    let denied = kr_client::answers::answer(
+        Some(&refusing),
+        &drafts,
+        target(),
+        &question(52),
+        yes(),
+        TimestampMs::new(6_500),
+    )
+    .await
+    .expect_err("refused");
+    assert_eq!(denied.code(), ErrorCode::PermissionDenied);
+    assert!(drafts.drafts().expect("reads").is_empty());
+
     let wrong_form = kr_client::answers::answer(
         None::<&Host>,
         &drafts,
@@ -464,4 +522,83 @@ async fn an_answer_the_host_refuses_or_the_form_forbids_is_not_kept() {
     assert_eq!(wrong_form.code(), ErrorCode::InvalidArgument);
     assert!(drafts.drafts().expect("reads").is_empty());
     assert_eq!(host.answers().len(), 2);
+    assert_eq!(refusing.answers().len(), 1);
+}
+
+/// KR-REQ-11.63: the store keeps a draft only its owner can read, in a directory only its owner can
+/// read, narrowing one that was looser; a later answer to the same question replaces the earlier
+/// one whole and leaves no partial file behind; and a link planted under a kept answer's name is
+/// replaced rather than written through.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_store_keeps_one_owner_only_file_per_question_and_writes_through_nothing() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = tempfile::TempDir::new().expect("a directory");
+    let answers = directory.path().join("answers");
+    std::fs::create_dir(&answers).expect("a loose directory");
+    std::fs::set_permissions(&answers, std::fs::Permissions::from_mode(0o755)).expect("loosened");
+    let drafts = AnswerDrafts::open(&answers).expect("the store opens");
+    assert_eq!(
+        std::fs::metadata(&answers)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700,
+        "an existing directory is narrowed to its owner"
+    );
+
+    let asked = question(60);
+    // Somebody else's file, and a link to it planted where this question's answer will be kept.
+    let victim = directory.path().join("victim");
+    std::fs::write(&victim, b"somebody else's").expect("writes");
+    std::os::unix::fs::symlink(
+        &victim,
+        answers.join(format!("{}.answer", asked.question_id)),
+    )
+    .expect("plants a link");
+    // And one under the name a write would use if it wrote to a name of its question's alone.
+    let fixed = answers.join(format!(".{}.partial", asked.question_id));
+    std::os::unix::fs::symlink(&victim, &fixed).expect("plants a link");
+
+    answer_offline(&drafts, &asked).await;
+    let later = kr_client::answers::answer(
+        None::<&Host>,
+        &drafts,
+        target(),
+        &asked,
+        QuestionAnswer::Decision { decided: false },
+        TimestampMs::new(6_000),
+    )
+    .await
+    .expect("kept");
+    let Answered::Kept(later) = later else {
+        panic!("kept");
+    };
+    assert_eq!(drafts.drafts().expect("reads"), vec![later]);
+    assert_eq!(
+        std::fs::read(&victim).expect("reads"),
+        b"somebody else's",
+        "nothing was written through the link"
+    );
+    std::fs::remove_file(&fixed).expect("removes the planted link");
+    let names: Vec<String> = std::fs::read_dir(&answers)
+        .expect("lists")
+        .map(|entry| {
+            entry
+                .expect("an entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(names, vec![format!("{}.answer", asked.question_id)]);
+    let kept = answers.join(format!("{}.answer", asked.question_id));
+    let metadata = std::fs::symlink_metadata(&kept).expect("metadata");
+    assert!(
+        metadata.file_type().is_file(),
+        "the link was replaced by the answer"
+    );
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
 }
