@@ -680,9 +680,13 @@ the directory this host opened, required to be the object this host checked, wit
 only directory argument. What it reads once it runs is outside this host's handles, so a writer
 under the same operating-system account could add a driver the audit did not blank between the
 check and the invocation. What keeps that driver from running is the boundary each invocation runs
-inside: on macOS and Linux only Git and the helpers under its own directory execute, whatever a
-writer plants, and Windows refuses every repository operation; `crates/kr-project/README.md` says
-which mechanism holds which guarantee, and what it does not confine. Besides that, this host
+inside. On macOS and Linux an invocation executes Git and the helpers under Git's own directory,
+and nothing a writer plants. A clone, which checks nothing out, may also start two more: the
+approved credential broker's ssh program, for a remote that needs one, and the shell Git opens its
+connection through. On Windows this host starts no Git at all, so every operation that needs Git
+is refused there, while a read of what the journal records, such as `project.list`, still answers.
+`crates/kr-project/README.md` says which mechanism holds which guarantee, and what it does not
+confine. Besides that, this host
 notices. Before each write to the user's own repository (adding a worktree, staging a clone of it,
 pruning a worktree record) it re-reads the configuration and refuses a change; after a review
 refresh it asks the repository where it is again, compares both filesystem identities, re-reads the
@@ -1337,6 +1341,7 @@ repository except through an apply the caller explicitly chose.
 containment cannot keep a repository from being executed from, and cannot bound which ports a
 remote operation reaches, refuses to start Git rather than claiming a confinement it does not have.
 On macOS and Linux the boundary holds and every repository operation runs. On Windows it does not,
-so this host runs no repository operation there and says so in the refusal each call returns. The
-transfer service beneath it is a separate thing and runs on all three: uploads, downloads, the
-staging area, and everything a file's handle answers about its protection.
+so this host starts no Git there: each call that needs Git says so in its refusal, and a read of
+what the journal records still answers. The transfer service beneath it is a separate thing and
+runs on all three: uploads, downloads, the staging area, and everything a file's handle answers
+about its protection.
