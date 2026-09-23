@@ -16,14 +16,20 @@ plugin packages come from and cannot create a source repository.
 | `project.init` | Creates an empty repository at an authorised destination | `project.create` |
 | `project.clone` | Clones a registered repository, a repository beneath a source location or a validated remote into an authorised destination | `project.create` |
 | `project.adopt` | Registers a checkout that is already there, changing nothing in it | `project.create` |
-| `project.operation.cancel` | Stops owned repository work and reports its staging paths | the operation's owner |
+| `project.operation.cancel` | Stops owned repository work and reports its staging paths; the owner also reconciles any operation through a location it names | the operation's owner; the owner, naming a location |
 | `workspace.list` | The workspaces of an environment or of one repository | a scoped view |
 | `workspace.create` | Previews, and then creates, a shared or an isolated working copy | `workspace.manage` |
 | `workspace.read` | One workspace's policy, its bound sessions and what it holds | a scoped read |
-| `workspace.remove` | Removes a workspace under a retention policy | `workspace.manage` |
+| `workspace.remove` | Removes a workspace under a retention policy, through the location it was made in or one the owner names | `workspace.manage` |
 
-A view and a read never delete. `workspace.remove` is the only method that removes anything, and
-what it may remove is the whole of the section below on retention.
+A view and a read never delete. `workspace.remove` is the only method that removes a working tree,
+and what it may remove is the whole of the section below on retention; a reconciliation removes
+only a staging directory this host can prove it made.
+
+A paired device is refused the five repository operations (`project.init`, `project.clone`,
+`project.adopt`, `workspace.create`, `workspace.remove`) on every platform, because each would run
+the Git program for it and this host does not bound what that program reaches; `docs/host/README.md`
+says why. It keeps the four reads, and `project.operation.cancel` for work it started itself.
 
 ## Identity is the object, not the path
 
@@ -45,6 +51,67 @@ single-component name inside it: no separator, no traversal segment, no reserved
 A Git invocation is the exception, and it is stated rather than glossed over. Git resolves the
 directory `-C` names for itself and reads the configuration for itself, so neither is under a handle
 this host holds. What the host does about that is in the limits section below.
+
+## Authorised locations
+
+A **location** is a directory the owner authorised for repository work: opened by this host, kept
+open for as long as the authorisation lasts, and confined to the filesystem it was opened on. The
+handle is the authority. The path the owner named is for a person to read and for a
+reauthorisation to open again; a rename, a case alias or something new at that path reaches a
+different object, and a different object is not the location.
+
+Four methods keep them. They are the owner's alone: they are served on this machine's own socket
+and nowhere else, and they require `host.manage`.
+
+| Method | What it does |
+| --- | --- |
+| `project.location.list` | The environment's locations, or one grant's, oldest first |
+| `project.location.authorise` | Opens a directory and authorises it for one purpose once the owner confirms, or authorises a dormant location again in place |
+| `project.location.withdraw` | Withdraws a location, for good |
+| `project.location.attach` | Binds a registered repository to the source location it is read through once the owner confirms; a null location clears the binding |
+
+**One purpose per location.** A `destination` is a directory a repository or a working copy is
+created in, as one entry, and removed from again; a `source` is one a repository is read from and a
+working copy taken of. A directory wanted as both is authorised twice, so each record is exactly
+what its confirmation covered.
+
+**A location is the owner's.** One that names a grant is not authorised: no paired device reaches a
+repository operation on this host, so there is nothing such a location could admit a device to.
+
+**Authorising takes two submissions of one action.** The first carries no confirmation. The host
+opens the path, holds that handle beside a challenge whose digest covers the request and the
+identity it read through the handle, and answers with the challenge, as
+`{"confirmation_required": {"request": …}}`. Nothing durable is written, and a repeat of the same
+request under the same action identifier is given the same challenge. The owner is shown the
+rights a location carries, `project.create` and `workspace.manage`, and signs. The same action
+submitted again with that proof authorises the directory the held handle is: the proof is checked,
+the action is claimed in the journal before the challenge is spent, and the location, the outbox
+row that announces it and the answer commit in one transaction. A copy of that submission arriving
+meanwhile waits for it and is given its answer, and a repeat after it is answered from the record.
+A challenge lives as long as the daemon's own ledger keeps it, at most 32 are outstanding at once,
+and a restart drops the challenges with the handles they held.
+
+**A restart leaves every active location dormant.** No descriptor survives the process that opened
+it, so a dormant location admits nothing until the owner authorises it again by naming its
+identifier: the same record becomes active with a newly opened handle under a fresh confirmation,
+and every repository, working copy and operation that names it keeps working. Naming an active
+location is refused until it is withdrawn, naming a withdrawn one is refused, and one this host has
+no record of is not found. A path that happens to match never makes two records one.
+
+**A withdrawal is final.** The record stays, withdrawn, and neither a restart nor a
+reauthorisation makes it active again. From the moment the withdrawal commits, no read or effect
+through the location is admitted; what that leaves behind is the subject of the section on
+withdrawal below.
+
+**A repository is read through a source location only once the owner binds it there.**
+`project.location.attach` proves the binding rather than accepting it: the location has to be an
+active source in the repository's environment, and the repository's working tree has to be reached
+beneath the location's handle by name and be the object its record names. That is checked again
+immediately before the binding commits, and binding needs the owner's confirmation the way
+authorising does. Clearing a binding only reduces what is reached, so it needs none.
+
+Each change commits with its outbox row: `project.location.authorised`,
+`project.location.withdrawn` and `project.location.attached`.
 
 ## Destinations and sources
 
@@ -74,7 +141,7 @@ location. A workspace made through a location reads its repository through that 
 an independent clone (a linked worktree writes its path into the repository it shares, which no
 location reaches), and is removed through the location it was made in. A workspace made through no
 location is reached through none: a caller bounded by a grant is refused its removal, whatever it
-may read.
+may read. The owner reaches it, and one whose location was withdrawn, by naming a location, below.
 
 **Every location a request names is asked again before each step.** It is admitted when the request
 is resolved, again inside the transaction that begins the effect, and again immediately before every
@@ -107,6 +174,28 @@ this host found through a handle, every invocation in a staging directory includ
 swapped for a link between two invocations stops the next one. The paths a repository reports are
 compared with the paths the operating system gives for the handles this host holds, and nothing is
 opened by a path Git reported.
+
+### After a withdrawal
+
+A withdrawn location holds no handle, and a recorded path is not authority, so nothing an operation
+or a workspace recorded is reached through it again, whether by the operation that was running, by
+a replacement daemon or by a new location that names the same directory. The owner reaches such a
+row, and one an earlier build wrote with no location, by naming a location explicitly:
+
+| Request | What it does through the named location |
+| --- | --- |
+| `workspace.remove` with `through_location_id` | Finds the working tree beneath it and removes it only while it is the object this host recorded creating, under the same retention rules, and the staging directory the workspace recorded as well |
+| `project.operation.cancel` with `through_location_id` | Reaches any operation in the environment, whoever started it. Once the operation has ended, removes the staging directory it recorded only while that is the object this host recorded creating; the operation's outcome and its action's answer stay as they were |
+
+The location has to be active, the owner's, authorised as a destination, in this environment, and
+contain the recorded path. Only a caller that holds no grant names one: a paired device is refused,
+so a withdrawal stays withdrawn for every device. Everything is resolved from the location's handle
+by name, asking the location before each read and each removal, and what decides is the object the
+descent reaches and the identity the row recorded for it. A directory with no recorded identity, or
+with another object at its name, is kept and named with the reason. A reconciliation asks the
+request's own admission and claims its action in one transaction before it removes anything, so a
+request whose authority lapsed while it waited removes nothing, and a second request under the same
+identifier finds the claim.
 
 ## Creating a repository
 
@@ -162,8 +251,11 @@ holds.
 | What the running operation finds | What it does |
 | --- | --- |
 | The destination holds the staged object | Finishes the operation: writes the repository row and settles the claim |
-| The staging directory still holds it | Finishes the same publication, which is not another clone |
+| The staging directory still holds it | Finishes the same publication, which is not another clone. If that rename fails, as it does when something else took the name, it moved nothing: the object is still staged, so the operation fails with the rename's refusal as its answer, and the staging directory goes through the handle the operation holds |
 | Neither holds it | Records the operation as unknown and keeps the staging path, named in the result |
+
+A running operation whose location is withdrawn before it looks is settled as a replacement daemon
+settles one, below, because it no longer holds anything that reaches the names.
 
 A replacement daemon cannot ask it. No descriptor survives a restart, a recorded path is display
 rather than authority, and a location an operation was bound to is dormant until the owner
@@ -176,7 +268,9 @@ authorises it again, so a replacement looks at nothing and settles what its jour
 
 A row names no location when its request named none, and every row an earlier build wrote names
 none, including rows written for paired devices. Such a row is evidence of no authority, so no
-location reaches it and nothing is removed or looked at on the strength of what it recorded.
+location reaches it and nothing is removed or looked at on the strength of what it recorded. The
+owner reconciles such a row, and any operation a replacement daemon settled without looking,
+through a location it names; the section on withdrawal says how.
 
 A staging sibling's *name* goes on to the row before the directory exists, and the sibling's own
 filesystem identity goes on to it as soon as it does. So the cleanup removes a name this host
@@ -416,9 +510,12 @@ file. No retention policy deletes a tree the user is working in.
 A workspace record survives its removal, so a later read says what happened rather than nothing. An
 isolated workspace's identity is what authorises the removal: it is recorded before anything is
 written into the tree, it is checked before anything is removed, and a workspace whose
-materialisation never recorded one is **refused** rather than removed. This host does not delete a
-directory it cannot prove it created; the directory is left for a person to look at, and the reason
-is on the record.
+materialisation never recorded one is **refused** rather than removed while anything is at its
+path. This host does not delete a directory it cannot prove it created; the directory is left for a
+person to look at, and the reason is on the record. A tree that is not there needs no proof to be
+found absent, so a workspace whose materialisation stopped before it made one is removed. A removal
+that reaches the tree through a location takes away the staging directory the workspace recorded
+too, under the same proof.
 
 The deletion itself goes the way a staging sibling's does. The identity is checked through the open
 handle, and the tree is removed *through that same handle* and through handles the removal opens
@@ -665,11 +762,12 @@ and reading one refuses it: a store that will not open is a daemon that never se
 
 | Table | What it holds |
 | --- | --- |
-| `operations` | One row per creation, keyed by the caller's action identifier: the create token |
+| `operations` | One row per creation, keyed by the caller's action identifier: the create token. It records the authority the operation reached its directories through: the grant it was performed for, and the destination and source locations it named |
 | `operation_paths` | Every staging path an operation left behind or removed |
 | `workspace_progress` | Every path an inclusion will attempt, written as `planned` before it starts, then each outcome as it settles: `carried`, `removed`, `unapplied`, or `leftover` for a copy in progress nobody could take away |
-| `projects` | One row per repository, with both filesystem identities |
-| `workspaces` | One row per working copy, with its policy, its base and its tree's identity |
+| `projects` | One row per repository, with both filesystem identities, the destination location it was created through and the source location the owner bound it to, each with the name beneath it |
+| `workspaces` | One row per working copy, with its policy, its base, its tree's identity, and the location it was made through with the tree's name beneath it |
+| `authorised_locations` | One row per location the owner authorised: the grant it names, its environment, its purpose, its label, the path the owner named and whether it is active, dormant or withdrawn |
 | `workspace_sessions` | Which sessions are bound to a workspace, and which are still live |
 | `workspace_runs` | Which automation runs are bound to it, and which are still live |
 | `workspace_retained` | Dirty content, pinned change sets and review evidence, each identified by its kind, its reason and the change set it names. Indexed by that change set as well as by the workspace, so a deletion counting what holds a version asks the pin's own question |
@@ -703,8 +801,8 @@ names for the owner.
 | What an earlier daemon left | What a replacement does |
 | --- | --- |
 | An operation in `staging` or `publishing` | Settles it from the journal against its create token, as the table above says |
-| A staging sibling a row names, whose operation has ended | Names it as still there, with the reason, unless a cleanup already recorded it removed. Nothing is removed: a recorded name and path are not authority, and a repository a user called `.kr-project-something` is not named at all |
-| A staging sibling a *workspace* row names | The same, whatever state the row is in: the name stays on the row and the workspace says why |
+| A staging sibling a row names, whose operation has ended | Names it as still there, with the reason, unless a cleanup already recorded it removed. Nothing is removed: a recorded name and path are not authority, and a repository a user called `.kr-project-something` is not named at all. The owner reconciles it through a location it names |
+| A staging sibling a *workspace* row names | The same, whatever state the row is in: the name stays on the row and the workspace says why, until a removal through a location takes it away |
 | A workspace in `materialising` | Leaves every file in the directory alone and moves the row to `removal_pending` with the reason, including how many of the inclusion's paths had been applied. The files may be the user's, and this host does not know which of them it wrote; what it does know is that the workspace is not what its creation asked for, so nothing new may hold it and no read calls it ready |
 | A removal reservation | Releases it. The daemon that held it is gone, and leaving it would refuse every later removal of that workspace |
 | An action claim with no result | Consults the object the claim names. A completed operation's own rows reconstruct the result the caller never received, and so do a ready workspace's and a removed one's; that is what the claim settles with. A reconstructed answer is the state the journal holds rather than a replay of the bytes the first call returned, and where a creation's inclusion preview is part of it, the preview says it is not a measurement this host still holds. A reconstructed removal says the working files are gone only for an isolated workspace recorded as removed, because this host records that only after taking the tree away and recovery looks at nothing to say more. An operation still in `staging` or `publishing` is settled from the journal first, as above, and its claim with it. Anything else settles as an unknown outcome naming the object and the state it is in. An open claim is not an answer, and neither is a permanent unknown where the state says otherwise |
@@ -713,13 +811,13 @@ names for the owner.
 
 | Code | When |
 | --- | --- |
-| `INVALID_ARGUMENT` | A destination that exists, a name that is not one component, a policy that disagrees with its kind, a revision the repository does not hold |
+| `INVALID_ARGUMENT` | A destination that exists, or that something took before the publication; a name that is not one component, a policy that disagrees with its kind, a revision the repository does not hold, an operation named for a reconciliation before it has ended |
 | `REPOSITORY_UNTRUSTED` | A transport, a URL, a broker or a configuration this host will not use |
 | `SOURCE_CHANGED` | A repository or a workspace is no longer the object its record names |
-| `RESOURCE_UNAVAILABLE` | No such repository, workspace or operation; a workspace a live session still holds; an operation its owner stopped |
-| `PERMISSION_DENIED` | A cancellation of another actor's work |
+| `RESOURCE_UNAVAILABLE` | No such repository, workspace, operation or location; a workspace a live session still holds; an operation its owner stopped |
+| `PERMISSION_DENIED` | A cancellation of another actor's work that names no location; a caller bounded by a grant that names a location; a location that is not active, not the owner's destination or does not contain the path; a repository operation for a paired device |
 | `ID_CONFLICT` | One action identifier used for two different requests |
-| `OUTCOME_UNKNOWN` | An interrupted publication this host cannot resolve, or an action a copy of itself is still performing |
+| `OUTCOME_UNKNOWN` | An interrupted publication this host cannot resolve, a reconciliation a daemon ended in the middle of, or an action a copy of itself is still performing |
 | `UPSTREAM_UNAVAILABLE` | A Git invocation failed, ran past its deadline, or produced more output than the host accepts |
 | `QUOTA_EXCEEDED` | An inclusion that would copy more than the host moves without being asked |
 | `HOST_NOT_CONFIGURED` | Installed Git is missing or older than the profile needs |

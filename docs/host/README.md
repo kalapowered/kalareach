@@ -1425,45 +1425,43 @@ receives nothing rather than everything.
 
 ### Repositories and working copies over the network
 
-The registry admits a paired device to all ten project and workspace methods, and the daemon serves
-them through the same call a local caller reaches, so a device's `project.list` and the owner's are
-one answer. The mutations take the daemon's own path: the envelope is checked first — a project
-acts on a repository or a working copy, so a target naming a session or an application is refused —
-then the action's route is recorded with this host named as the owner of what it produces, and the
-effect runs on a task a dropped connection cannot cancel part way. `Controller::project_mutation`
-is the one place either door reaches the service from, and it asks about the admission the ingress
-recorded immediately before the write.
+The registry admits a paired device to the ten project and workspace methods, and the daemon serves
+what it serves a device through the same call a local caller reaches, so a device's `project.list`
+and the owner's are one answer. The four methods that keep the owner's authorised locations are
+served on the local socket alone. The mutations take the daemon's own path: the envelope is checked
+first — a project acts on a repository or a working copy, so a target naming a session or an
+application is refused — then the action's route is recorded with this host named as the owner of
+what it produces, and the effect runs on a task a dropped connection cannot cancel part way.
+`Controller::project_mutation` is the one place either door reaches the service from, and it asks
+about the admission the ingress recorded immediately before the write.
 
-What a device is additionally held to is its grant: `project.create` for initialising, cloning and
-adopting, `workspace.manage` for creating and removing a working copy, and `session.view` for the
-two listings. A listing is narrowed to what the grant admits rather than refused: two grants over
-one host list different repositories and different working copies, and a working copy's bound
-sessions are narrowed the same way. `project.read` and `workspace.read` name one subject and
-require no right of their own, so they are refused outright for a subject in an environment the
-grant does not cover — a narrowed listing is not a way to find an identifier an unnarrowed read
-would then answer for — and the session content they carry is narrowed exactly as the listings'
-is.
+What a device is additionally held to is its grant, and `session.view` for the two listings. A
+listing is narrowed to what the grant admits rather than refused: two grants over one host list
+different repositories and different working copies, and a working copy's bound sessions are
+narrowed the same way. `project.read` and `workspace.read` name one subject and require no right of
+their own, so they are refused outright for a subject in an environment the grant does not cover —
+a narrowed listing is not a way to find an identifier an unnarrowed read would then answer for —
+and the session content they carry is narrowed exactly as the listings' is.
 
-**Five of the mutations name a place on this host's filesystem**, and for those the action right is
-not the whole of the restriction. `project.init`, `project.clone` and `project.adopt` carry the
-directory they create a repository in; `workspace.create` names the repository it takes a working
-copy from and, for an isolated one, where its working tree goes; `workspace.remove` names the
-working copy it takes away. Each is decided by **one destination policy**, in one place, rather
-than by a rule written again inside each method: the method says which subjects it names, and the
-policy answers whether the device's grant reaches every one of them.
+**A paired device is refused the five repository operations**, on every platform, whatever its
+grant carries: `project.init`, `project.clone`, `project.adopt`, `workspace.create` and
+`workspace.remove`. Each would run the Git program for the device. This host bounds every name it
+resolves itself to the directories the owner authorised, each reached through a handle it holds,
+but it does not bound what Git reaches once it is running: Git finds its own repository, reads its
+own configuration and follows its own metadata. So the refusal comes at the door, before the
+project service is reached, as `PERMISSION_DENIED` with one sentence that says so and nothing about
+what lies behind it. Every grant keeps the rights it names, and no dispatch follows. A device
+keeps the four reads, and `project.operation.cancel` for work it started itself.
 
-A grant bounded to environments reaches those environments and nothing else, so a device holding
-`project.create` creates repositories where its grant says and nowhere else, and one holding
-`workspace.manage` reaches the working copies of those environments only. An **unbounded** grant
-reaches none of the five: a grant that bounds nothing cannot authorise a host-local path, and the
-refusal says which subject it could not authorise. A device keeps the four reads and
-`project.operation.cancel` for work it started itself either way. For a caller on the machine's own
-socket the authority is the user's own over the user's own filesystem, and the policy does not
-apply: those five run as they always have.
+That cancellation carries the device's grant into the project service, so the service knows the
+caller is bounded: it reaches only the device's own operations, and it may not name a location to
+reconcile an operation through, which is the owner's route to cleaning up after a withdrawn
+location. For a caller on the machine's own socket the authority is the user's own over the user's
+own filesystem: the five run as they always have, and may be bound to locations the owner
+authorised, which `docs/project/README.md` describes.
 
-What the resolution does establish, for the caller that is served, is that the directory it opened
-is the one the effect writes into, by the identity it recorded, so nothing is substituted
-underneath it.
+What a resolution establishes, for the owner, is that the directory it opened is the one the effect
+writes into, by the identity it recorded, so nothing is substituted underneath it.
 
 One further limit, stated rather than implied.
 

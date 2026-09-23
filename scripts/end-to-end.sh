@@ -89,7 +89,7 @@ suites=(
   "kr-controller:shell|which shell a create may launch, what it is labelled as, and the guarded startup entries"
   "kr-controller:contracts|the two contracts the transport names: a revocable registration and a durable commit that outlives its caller"
   "kr-controller:envelope|what the daemon accepts on its client endpoint"
-  "kr-controller:project|real repositories through the daemon: a clone, an adoption, a workspace with its inclusion preview, a verified download into it, and a daemon killed mid-clone whose destination is untouched"
+  "kr-controller:project|real repositories through the daemon: a clone, an adoption, a workspace with its inclusion preview, a verified download into it, a daemon killed mid-clone whose destination is untouched, and the owner authorising a location and binding a repository to one under a fresh confirmation"
   "kr-controller:voice|the voice coordinator against a real daemon: a voice grant written into the host's own store, a call whose end revokes it while the session keeps running, an unlocked-screen action refused without a signed confirmation, and a voice method unreachable from local IPC"
   "kr-controller:changeset|real repositories through the daemon: an immutable version captured while the source keeps changing, an independent materialisation of it, a proposal that writes no working tree, a preflight conflict that writes nothing, and a mutation whose authority has gone that leaves no claim behind"
   "kr-cli:attach|a killed attachment restoring its terminal, and a detach from another window"
