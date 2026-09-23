@@ -12,9 +12,10 @@
 #
 # What a person can see is read from the screen: every claim that something is on screen, in the
 # browser engines, the desktop window and the phones alike, is held to what the system's text
-# recognition reads in an image of it. A page's structure only says where to look; what must be
-# absent is counted in it with hidden elements included. Without text recognition (macOS's Vision
-# framework, compiled here with swiftc) nothing a person sees can be checked, and the run says so.
+# recognition reads in an image of it, taken as the page draws itself, every word whole and in
+# order. A page's structure only says where to look; what must be absent is counted in it with
+# hidden elements included. Without text recognition (macOS's Vision framework, compiled here with
+# swiftc) nothing a person sees can be checked, and the run says so.
 #
 # The page is the harness: the real screen against the scripted host. Its starting state comes from
 # the address (voice_terms, voice_capture, voice_broker), later changes from the host's controls,
@@ -249,27 +250,35 @@ SWIFT
     ocr="$artefacts/read-text"
 }
 
-# True when every one of the words after the image path appears in the text read from it. Every
-# variable here is local: a caller's own word lists must come back exactly as they went in.
+# The words of a text, in lower case, one space between them and one at each end. Spacing, line
+# breaks and punctuation only separate words, so a phrase the screen wrapped or a comma the
+# recogniser missed reads the same, while every word is compared whole: "Unmute" is not "Mute", and
+# "0.01" (the words 0 and 01) is not "00.1".
+words_of() {
+    printf ' %s ' "$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]' |
+        LC_ALL=C sed -E 's/[^[:alnum:]]+/ /g; s/^ +//; s/ +$//' | tr '\n' ' ' | sed -E 's/ +/ /g; s/ $//')"
+}
+
+# True when each of the phrases after the image path is read in it, every word whole and in order.
+# Every variable here is local: a caller's own word lists must come back exactly as they went in.
 image_shows() {
-    local image=$1 text word
+    local image=$1 text phrase
     shift
     text="$("$ocr" "$image" 2>/dev/null)" || return 1
-    # One line of text, so a phrase the screen wrapped still reads as the phrase.
-    text="${text//$'\n'/ }"
-    for word in "$@"; do
-        [[ "$text" == *"$word"* ]] || return 1
+    text="$(words_of "$text")"
+    for phrase in "$@"; do
+        [[ "$text" == *"$(words_of "$phrase")"* ]] || return 1
     done
 }
 
-# True when none of the words after the image path appears in the text read from it.
+# True when none of the phrases after the image path is read in it.
 image_lacks() {
-    local image=$1 text word
+    local image=$1 text phrase
     shift
     text="$("$ocr" "$image" 2>/dev/null)" || return 1
-    text="${text//$'\n'/ }"
-    for word in "$@"; do
-        [[ "$text" == *"$word"* ]] && return 1
+    text="$(words_of "$text")"
+    for phrase in "$@"; do
+        [[ "$text" == *"$(words_of "$phrase")"* ]] && return 1
     done
     return 0
 }
@@ -823,12 +832,18 @@ run_desktop() {
         await page.goto('http://localhost:$port/harness.html?surface=desktop&tab=voice' + query);
         await page.waitForSelector('.kr-voice');
       };
+      // The page is photographed as it draws itself, with nothing paused or changed: an animation
+      // that ends is waited for, a little, and one that never ends is shown as it is.
+      const settled = () => page.waitForFunction(() => document.getAnimations().every((animation) =>
+        animation.playState !== 'running' || animation.effect?.getComputedTiming().endTime === Infinity),
+        undefined, { timeout: 2000 }).catch(() => undefined);
       const shoot = async (row, name, how, words, without = []) => {
         for (const word of words) await page.getByText(word, { exact: false }).first().waitFor({ timeout: 5000 });
         for (const word of without) {
           if ((await page.getByText(word, { exact: false }).count()) !== 0) throw new Error(name + ' carried ' + word);
         }
-        await page.screenshot({ path: '$shots/' + name, fullPage: true, animations: 'disabled' });
+        await settled();
+        await page.screenshot({ path: '$shots/' + name, fullPage: true });
         console.log(['shot', row, name, how, words.join('|'), without.join('|')].join('\t'));
       };
       const start = async () => {

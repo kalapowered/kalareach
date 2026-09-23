@@ -15,11 +15,13 @@
  * What a person can see is read from the screen, never from the page's structure. Every step that
  * says something is on screen captures the place it is drawn and holds its claim to what the
  * system's text recognition reads there; the structure only says where to look and what state the
- * page is in. So no style, clip, cover or colour can make a word count that is not drawn: a word
- * that is not drawn is not read. What must be absent is counted in the structure with hidden
- * elements included, so a hidden copy fails the claim instead of passing it. Before any claim, each
- * check is given a page made to fail it and one made to pass it, and must refuse the first and
- * accept the second.
+ * page is in. So no style, clip, cover, colour or animation can make a word count that is not drawn:
+ * a word that is not drawn is not read. The picture is taken as the page draws it, with nothing
+ * paused or changed, and its words are compared with the claim's whole and in order, so a longer
+ * word or a moved decimal point is a different claim. What must be absent is counted in the
+ * structure with hidden elements included, so a hidden copy fails the claim instead of passing it.
+ * Before any claim, each check is given pages made to fail it and one made to pass it, and must
+ * refuse the first and accept the second.
  *
  * Usage: `assert-voice-surface.ts <harness address> <text reader> <image directory>`. The text
  * reader prints the text it recognises in the image it is given; the one image being read is kept
@@ -109,17 +111,44 @@ const PATIENCE_MS = 5_000
 class ReaderFailure extends Error {}
 
 /**
- * Letters and digits only, in lower case, with the shapes text recognition takes for one another
- * made one (i, l and 1; o and 0). Spacing and punctuation are not compared: a sentence the layout
- * wrapped, or an apostrophe drawn curly, is still the sentence, and no word can be left out of it.
+ * The words of a text, in order: each run of letters and digits, in lower case. Spacing, line breaks
+ * and punctuation only separate words, so a sentence the layout wrapped, an apostrophe drawn curly
+ * or a comma the recogniser missed reads the same. Every word is compared whole and in its place:
+ * "Unmute" is not "Mute", a sentence without its "not" is another sentence, and "0.01" (the words 0
+ * and 01) is not "00.1" (00 and 1).
  */
-function comparable(text: string): string {
-  return text
-    .normalize('NFKC')
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}]/gu, '')
-    .replace(/[i1]/g, 'l')
-    .replace(/0/g, 'o')
+function wordsOf(text: string): string[] {
+  return text.normalize('NFKC').toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []
+}
+
+/** Whether all of `run`, a sequence of words, occurs together and in order in `read`. */
+function includesRun(read: readonly string[], run: readonly string[]): boolean {
+  if (run.length === 0) return false
+  for (let start = 0; start + run.length <= read.length; start += 1) {
+    if (run.every((word, offset) => read[start + offset] === word)) return true
+  }
+  return false
+}
+
+/**
+ * Waits a little for every animation that ends to have ended, so a picture is not taken halfway
+ * through a transition. Nothing on the page is changed to get there: an animation that never ends
+ * is left running, and the picture shows it as a person sees it.
+ */
+async function settled(page: Page): Promise<void> {
+  await page
+    .waitForFunction(
+      () =>
+        document
+          .getAnimations()
+          .every(
+            (animation) =>
+              animation.playState !== 'running' || animation.effect?.getComputedTiming().endTime === Infinity
+          ),
+      undefined,
+      { timeout: 2_000 }
+    )
+    .catch(() => undefined)
 }
 
 /** The text the system's text recognition reads in one image. */
@@ -135,31 +164,33 @@ function readImage(image: string): string {
 
 /**
  * What a person can read in the one element `locator` names: the place is captured as the screen
- * draws it and read by text recognition. Null while it is not one element on screen.
+ * draws it, animations included, and read by text recognition. Null while it is not one element on
+ * screen.
  */
 async function readOnScreen(locator: Locator): Promise<string | null> {
   const image = `${imagesArgument}/kr-voice-reading.png`
+  await settled(locator.page())
   try {
-    await locator.screenshot({ path: image, animations: 'disabled', timeout: 1_000 })
+    await locator.screenshot({ path: image, timeout: 1_000 })
   } catch {
     return null
   }
   return readImage(image)
 }
 
-/** Waits until what is read in `locator` passes `accept`, and fails with what was read. */
+/** Waits until the words read in `locator` pass `accept`, and fails with what was read. */
 async function readUntil(
   locator: Locator,
   what: string,
   wanted: string,
-  accept: (read: string) => boolean
+  accept: (read: readonly string[]) => boolean
 ): Promise<void> {
   const deadline = Date.now() + PATIENCE_MS
   let last = 'nothing, because it was never on screen'
   do {
     const read = await readOnScreen(locator)
     if (read !== null) {
-      if (accept(comparable(read))) return
+      if (accept(wordsOf(read))) return
       last = `"${folded(read)}"`
     }
     await locator.page().waitForTimeout(100)
@@ -167,10 +198,10 @@ async function readUntil(
   throw new Error(`${what} never read ${wanted} on screen; it read ${last}`)
 }
 
-/** The place reads every one of the words. */
-function readsAll(locator: Locator, what: string, words: readonly string[]): Promise<void> {
-  const wanted = words.map(comparable)
-  return readUntil(locator, what, quoted(words), (read) => wanted.every((word) => read.includes(word)))
+/** The place reads each of the phrases, every word whole and in order. */
+function readsAll(locator: Locator, what: string, phrases: readonly string[]): Promise<void> {
+  const wanted = phrases.map(wordsOf)
+  return readUntil(locator, what, quoted(phrases), (read) => wanted.every((run) => includesRun(read, run)))
 }
 
 /**
@@ -178,7 +209,7 @@ function readsAll(locator: Locator, what: string, words: readonly string[]): Pro
  * found by the text they carry, which only says where to look: the claim is what was read.
  */
 async function readSomewhere(page: Page, text: string): Promise<void> {
-  const wanted = comparable(text)
+  const wanted = wordsOf(text)
   const deadline = Date.now() + PATIENCE_MS
   let last = 'nothing, because no element carrying it was on screen'
   do {
@@ -187,7 +218,7 @@ async function readSomewhere(page: Page, text: string): Promise<void> {
     for (let index = 0; index < count; index += 1) {
       const read = await readOnScreen(candidates.nth(index))
       if (read === null) continue
-      if (comparable(read).includes(wanted)) return
+      if (includesRun(wordsOf(read), wanted)) return
       last = `"${folded(read)}"`
     }
     await page.waitForTimeout(100)
@@ -309,11 +340,16 @@ function sectionShows(page: Page, region: string, words: readonly string[]): Ste
 
 /** The voice model reads this name on screen, and nothing else. */
 function modelReads(page: Page, model: string): Step {
-  const wanted = comparable(model)
+  const wanted = wordsOf(model)
   return {
     says: `the voice model reads "${model}"`,
     run: () =>
-      readUntil(page.locator('.kr-voice__provider dd').first(), 'the voice model', `"${model}"`, (read) => read === wanted)
+      readUntil(
+        page.locator('.kr-voice__provider dd').first(),
+        'the voice model',
+        `"${model}"`,
+        (read) => read.length === wanted.length && includesRun(read, wanted)
+      )
   }
 }
 
@@ -666,7 +702,9 @@ const HIDDEN_END: readonly string[] = [
   '<p>The visible start <span style="position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)">and the hidden end</span></p>',
   '<p>The visible start <span style="position:absolute;left:-10000px">and the hidden end</span></p>',
   '<p style="position:relative;display:inline-block">The visible start and the hidden end' +
-    '<span style="position:absolute;top:0;right:0;bottom:0;width:50%;background:#fff"></span></p>'
+    '<span style="position:absolute;top:0;right:0;bottom:0;width:50%;background:#fff"></span></p>',
+  '<style>@keyframes kr-hidden { from, to { opacity: 0 } } .kr-hidden { animation: kr-hidden 1s infinite }</style>' +
+    '<p>The visible start <span class="kr-hidden">and the hidden end</span></p>'
 ]
 
 const CONTROLS = '<div role="group" aria-label="Call controls"><button>Stop the voice</button></div>'
@@ -674,10 +712,11 @@ const CANCEL_PANEL = '<section><h2>Cancel what the agent is doing</h2><button>Ca
 
 /**
  * Every check a claim is made with, held first to pages made to fail it and to a page made to pass
- * it, before any claim: a sentence whose end is not drawn in each way a page can manage that; a
- * section, a name, a capture line, a heading, a button and a running call drawn transparent; a
- * cancellation drawn transparent, drawn over the call controls, or copied among them hidden; and a
- * start control or a call heading that is present but hidden.
+ * it, before any claim: a sentence whose end is not drawn in each way a page can manage that, an
+ * animation that never ends among them; a section, a name, a capture line, a heading, a button and
+ * a running call drawn transparent; a rate drawn with its decimal point moved, and a button named
+ * "Mute" that draws "Unmute"; a cancellation drawn transparent, drawn over the call controls, or
+ * copied among them hidden; and a start control or a call heading that is present but hidden.
  */
 async function checkTheChecks(): Promise<void> {
   const browser = await chromium.launch({ headless: true })
@@ -695,6 +734,7 @@ async function checkTheChecks(): Promise<void> {
       '<section aria-label="What it costs"><h2>What it costs</h2><p>$0.01 <span style="opacity:0">a second</span></p></section>',
       costs
     )
+    await refuses(page, '<section aria-label="What it costs"><h2>What it costs</h2><p>$00.1 a second</p></section>', costs)
 
     const model = modelReads(page, 'gpt-live-1')
     await accepts(page, '<dl class="kr-voice__provider"><dt>Voice model</dt><dd>gpt-live-1</dd></dl>', model)
@@ -746,6 +786,7 @@ async function checkTheChecks(): Promise<void> {
     const pressable = canPress(page, ['Mute microphone'])
     await accepts(page, '<button>Mute microphone</button>', pressable)
     await refuses(page, '<button style="opacity:0">Mute microphone</button>', pressable)
+    await refuses(page, '<button aria-label="Mute microphone">Unmute microphone</button>', pressable)
 
     const noStart = noButton(page, 'Start')
     await accepts(page, '<button>Mute microphone</button>', noStart)
