@@ -268,6 +268,7 @@ fn journal_path(name: &str) -> std::path::PathBuf {
 
 #[test]
 fn the_store_is_write_ahead_logged_with_full_synchronisation() {
+    // KR-REQ-04.06: the receipt journal is an SQLite database, opened in-process.
     // KR-REQ-24.02. Section 24 permits WAL plus full durability and forbids weakening it to meet
     // a latency number, so the settings are asserted rather than assumed.
     let path = journal_path("pragmas");
@@ -282,6 +283,8 @@ fn the_store_is_write_ahead_logged_with_full_synchronisation() {
 
 #[test]
 fn the_intent_is_committed_before_the_caller_could_have_been_answered() {
+    // KR-REQ-04.06: an action receipt is a row in that SQLite journal, which a second connection
+    // reads back.
     // KR-REQ-24.02, first half: acceptance is *committed* before the acknowledgement returns. A
     // second connection to the same file sees the row while the accepting journal is still open,
     // which is true only of a committed transaction. What the store then does with a committed

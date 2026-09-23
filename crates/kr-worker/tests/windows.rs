@@ -163,6 +163,8 @@ fn powershell_in_a_console(command: &str) -> (Pty, Box<dyn Read + Send>, RootShe
 
 #[test]
 fn powershell_seven_is_the_shell_that_runs_inside_the_console(/* KR-REQ-03.03 */) {
+    // KR-REQ-04.01: the worker's terminal is `portable-pty`'s native backend, which on Windows is
+    // a pseudo-console, and a shell runs inside it.
     // The program is asked for by name, so what answers has to be PowerShell 7 rather than the
     // Windows PowerShell 5.1 that `powershell` resolves to.
     let program = powershell();
