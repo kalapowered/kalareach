@@ -124,31 +124,40 @@ fn check_valid_file(name: &str) -> usize {
     cases.len()
 }
 
+/// KR-REQ-23.01, KR-REQ-23.02: every integer argument width in the 64-bit range, at each boundary,
+/// encodes in its shortest form and decodes back to the same bytes.
 #[test]
 fn integer_fixtures_round_trip() {
     assert!(check_valid_file("integers.json") >= 20);
 }
 
+/// KR-REQ-23.01, KR-REQ-23.02: text and byte strings encode with definite, shortest lengths and
+/// round trip byte for byte.
 #[test]
 fn string_fixtures_round_trip() {
     assert!(check_valid_file("strings.json") >= 15);
 }
 
+/// KR-REQ-23.01: text-keyed maps encode in the bytewise order of their complete encoded keys and
+/// round trip byte for byte.
 #[test]
 fn map_ordering_fixtures_round_trip() {
     assert!(check_valid_file("map-ordering.json") >= 8);
 }
 
+/// KR-REQ-23.02: null is a permitted value and round trips wherever a schema declares it.
 #[test]
 fn null_and_absent_fixtures_round_trip() {
     assert!(check_valid_file("null-and-absent.json") >= 4);
 }
 
+/// KR-REQ-23.01, KR-REQ-23.02: arrays, booleans and nesting encode with definite, shortest lengths.
 #[test]
 fn structure_fixtures_round_trip() {
     assert!(check_valid_file("structures.json") >= 5);
 }
 
+/// KR-REQ-23.03: null is not omission; the two encode, and hash, differently.
 #[test]
 fn absent_and_null_have_different_digests() {
     let document = load("null-and-absent.json");
@@ -177,6 +186,7 @@ fn absent_and_null_have_different_digests() {
     );
 }
 
+/// KR-REQ-23.03: signed text is neither Unicode-normalised nor case-folded.
 #[test]
 fn non_ascii_text_is_not_normalised() {
     let document = load("strings.json");
@@ -200,6 +210,9 @@ fn non_ascii_text_is_not_normalised() {
     );
 }
 
+/// KR-REQ-23.02, KR-REQ-23.04, KR-REQ-09.02: tags, floats, indefinite lengths, other simple values,
+/// duplicate and unsorted keys, invalid UTF-8, non-shortest heads, trailing bytes and every depth,
+/// count and length limit are each refused with the rule they break.
 #[test]
 fn invalid_fixtures_are_rejected_with_the_named_rule() {
     let document = load("invalid.json");
@@ -225,6 +238,7 @@ fn invalid_fixtures_are_rejected_with_the_named_rule() {
 /// Rules that describe an internal invariant and have no reachable input.
 const UNREACHABLE_RULES: [&str; 3] = ["integer_out_of_range", "non_canonical", "unrepresentable"];
 
+/// KR-REQ-23.02: every forbidden representation has a fixture that exercises it.
 #[test]
 fn every_error_rule_is_covered_by_a_fixture() {
     let document = load("invalid.json");
@@ -317,6 +331,7 @@ fn signing_input_fixtures_match() {
     }
 }
 
+/// KR-REQ-23.01: the decoder accepts only the order the canonical encoder produces.
 #[test]
 fn decoding_rejects_anything_the_encoder_cannot_produce() {
     // Every valid fixture re-encodes to itself; this asserts the inverse for a hand-built value
