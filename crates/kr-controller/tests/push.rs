@@ -4658,3 +4658,60 @@ async fn a_key_update_that_stopped_between_its_stores_is_finished_at_the_next_st
         "the directory now holds what the journal took first"
     );
 }
+
+/// KR-REQ-16.11: a directory this host cannot write for the moment is a recovery that failed and
+/// says so, not one that finished; once the directory can be written, the same recovery brings it
+/// up to the journal. The start path returns that failure rather than starting past it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_preview_key_recovery_that_cannot_write_the_directory_says_so_and_can_be_repeated() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let controller = start_controller_in(&temp).await;
+    let device_id = DeviceId::new(uuid(10));
+    let (destination_id, _) = paired_with_preview_key(&controller, device_id);
+    let rotated = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair");
+    controller
+        .delivery()
+        .update_preview_key(&destination_id, *rotated.public(), 2, NOW)
+        .expect("the journal takes it");
+
+    // Another writer holds the registry, which is where the device directory lives.
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+    let registry = temp.environment().registry_database();
+    let holder = std::thread::spawn(move || {
+        let connection = rusqlite::Connection::open(&registry).expect("a connection");
+        connection
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("the write lock");
+        held_tx.send(()).expect("the test is waiting");
+        released.recv().expect("the test releases it");
+        connection
+            .execute_batch("ROLLBACK;")
+            .expect("the lock is released");
+    });
+    held_rx.recv().expect("the lock is held");
+    let waiting = Arc::clone(&controller);
+    let refused = tokio::task::spawn_blocking(move || waiting.recover_preview_keys())
+        .await
+        .expect("the recovery ran");
+    assert!(
+        refused.is_err(),
+        "a directory it could not write is a failure"
+    );
+    release.send(()).expect("the holder is waiting");
+    holder.join().expect("the holder");
+
+    assert_eq!(
+        controller
+            .recover_preview_keys()
+            .expect("the directory can be written now"),
+        1
+    );
+    let stored = controller
+        .devices()
+        .record_for_device(device_id)
+        .expect("a read")
+        .expect("the record");
+    assert_eq!(stored.device_key_revision, DeviceKeyRevision::new(2));
+    assert_eq!(stored.notification_preview, Some(*rotated.public()));
+}

@@ -776,10 +776,10 @@ impl Controller {
         // anything. The loop then drives the outbox until the daemon goes.
         controller.delivery_runtime.start().await;
         // A key update that stopped between its two stores is finished here, from the one that
-        // took it first.
-        if let Err(error) = controller.recover_preview_keys() {
-            eprintln!("kr-controller: preview keys were not recovered: {error}");
-        }
+        // took it first. A daemon that cannot write its own device directory does not start as
+        // though it had: the next start tries again, and nothing serves a device from a directory
+        // behind the journal in the meantime.
+        controller.recover_preview_keys()?;
         crate::transfer::serve(&controller)?;
         // The owner's setting is the owner's setting across a restart. A daemon that waited for a
         // client to ask before it looked would leave an enabled setting doing nothing until
