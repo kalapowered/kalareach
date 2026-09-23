@@ -291,22 +291,39 @@ impl StoredCollectionKeys {
     }
 }
 
-impl CollectionKeys for StoredCollectionKeys {
-    fn key(&self, collection: &str, epoch: u64) -> Result<SymmetricKey> {
+impl StoredCollectionKeys {
+    /// Returns the key for one collection and epoch, or nothing when this device does not hold
+    /// it. Asking makes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the name is not one this store admits, the store cannot be read, or
+    /// what it holds under the name is not a key.
+    pub fn held(&self, collection: &str, epoch: u64) -> Result<Option<SymmetricKey>> {
         let name = self.name(collection, epoch)?;
-        let held = self
+        let Some(held) = self
             .store
             .get(&name)
-            .map_err(|error| sealing_failed(&error))?;
-        // A store that holds nothing under this name is a device that was never given the key.
-        // Nothing here makes one: a key drawn at this point would seal content the other devices
-        // cannot read, and would look from here exactly like success.
-        let held = held.ok_or_else(|| no_key(collection, epoch))?;
+            .map_err(|error| sealing_failed(&error))?
+        else {
+            return Ok(None);
+        };
         // A stored value of the wrong length is the store's content and not the caller's argument,
         // which is why it does not go through the classification the cryptography's own failures
         // do: there is no argument here to have been wrong.
         Secret::from_slice("a collection key", held.expose())
+            .map(Some)
             .map_err(|_| corrupt_stored_key(collection, epoch))
+    }
+}
+
+impl CollectionKeys for StoredCollectionKeys {
+    fn key(&self, collection: &str, epoch: u64) -> Result<SymmetricKey> {
+        // A store that holds nothing under this name is a device that was never given the key.
+        // Nothing here makes one: a key drawn at this point would seal content the other devices
+        // cannot read, and would look from here exactly like success.
+        self.held(collection, epoch)?
+            .ok_or_else(|| no_key(collection, epoch))
     }
 }
 
