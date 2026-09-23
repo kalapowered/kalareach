@@ -958,6 +958,13 @@ fn one_excluded_state_keeps_the_key(kind: ShellKind, package: &Package, drive: &
     };
     let serving = session.still_serving("kr-exclusion-served");
     serving.unwrap_or_else(|why| panic!("nothing was working after {named}: {why}; {ready}"));
+    // The rejection covers the whole drive, not the moment after the key: a decision that arrived
+    // while the drive was ending the state is still one the key reached, and the inbox counted it.
+    assert!(
+        session.no_managed_decision_before(0),
+        "{named} reached the managed decision after the key, while the drive was ending:\n{}",
+        session.terminal_output()
+    );
 }
 
 /// The shell's own `read`, reading a line through the editor.

@@ -1433,8 +1433,9 @@ fn a_replayed_character_never_reaches_the_decision(
     // The replay. From here to the end of this drive neither managed decision may be reached: a
     // detach would take the macro's character for the person's gesture, and a consume would take
     // it for one this reader could not attribute. The character came from the reader's own replay,
-    // so the decision is never the worker's at all. Nothing below drops an event unread, and the
-    // check at the end reads everything this session was told while the drive ran.
+    // so the decision is never the worker's at all. The waits below take events off the queue, and
+    // the state reads drop what stood in front of the report they wanted; the inbox counted every
+    // decision as it arrived, so the checks read all of them whatever was taken since.
     session.type_bytes(shellpkg::CTRL_T);
 
     // The reader's own answer while the replay is in flight, which is the only thing that
@@ -1542,11 +1543,12 @@ fn a_replayed_character_never_reaches_the_decision(
     }
 }
 
-/// Whether neither managed decision is anywhere in what this session has been told so far.
+/// Whether neither managed decision arrived since the drive drew its boundary.
 ///
-/// A drive that rejects a decision for a window rejects it for that window only: one that arrives
-/// a moment later lands on the queue and is dropped by the next call that clears it. This reads
-/// the queue whole instead, so the rejection covers everything from the key to here.
+/// A drive that rejects a decision for a window rejects it for that window only, and one that
+/// reads the queue misses a decision a wait has since taken off it. This reads the inbox's count,
+/// which takes every decision in as it arrives and drops it only at the drive's own boundary, so
+/// the rejection covers everything from the key to here.
 fn no_managed_decision(session: &mut Session) -> bool {
     session.no_managed_decision_before(0)
 }
@@ -1718,9 +1720,19 @@ fn the_editor_kept_the_key(
             session.terminal_output()
         )
     });
+    // The rejection covers the whole drive, not the moment after the key. A decision that arrived
+    // late, while the teardown ran or the shell was proving itself, is still one the key reached,
+    // and the inbox counted it as it arrived whatever took it off the queue since.
+    assert!(
+        no_managed_decision(session),
+        "{}: {named} reached the managed decision after the key, while the drive was ending; the \
+         terminal showed:\n{}",
+        case.id,
+        session.terminal_output()
+    );
     format!(
-        "neither managed event in 600 ms, {}, {ready}, and the shell then ran a command of this \
-         session's own with the bridge reporting its reader",
+        "neither managed event from the key to the end of the drive, {}, {ready}, and the shell \
+         then ran a command of this session's own with the bridge reporting its reader",
         if carried_on {
             "the same reader was still the one running"
         } else {
@@ -1931,6 +1943,13 @@ fn the_gesture_follows_the_terminals_own_character(
                 case.id
             )
         });
+    // And the absence holds for the whole drive, not only for the moment after the key.
+    assert!(
+        no_managed_decision(session),
+        "{}: a terminal with no gesture produced a managed decision after the key, while the \
+         drive was ending",
+        case.id
+    );
 }
 
 /// The customisation itself writes the line, and the reader reports what it wrote.
@@ -3569,14 +3588,21 @@ fn a_binding_that_replays_nothing_is_never_taken_for_a_macro() {
     }
 }
 
-/// A managed decision that arrives late is still found.
+/// A managed decision is still counted after a wait has taken it off the queue.
 ///
-/// A drive rejects the decision for the whole of its run, not for a window around the key. One
-/// that arrives while the drive is waiting for something else lands behind what it was waiting
-/// for, so the rejection reads the queue whole; a check that looked only at the events around the
-/// key would pass a gesture that reached the decision a moment after it stopped looking.
+/// A drive rejects the decision for the whole of its run, not for what happens to be left on the
+/// queue when it looks. Every wait takes what it was waiting for and drops what stood in front of
+/// it, and reading the reader's state is one of those waits: a consume that arrived just before
+/// the reader's next report goes with the report. So the inbox counts each decision as it
+/// arrives, and only a boundary a drive draws drops the count. Each step below is one a drive
+/// takes, put to the inbox directly rather than waited for from a shell.
 #[test]
-fn a_managed_decision_that_arrives_late_is_still_read_off_the_queue() {
+fn a_managed_decision_a_wait_took_off_the_queue_is_still_counted() {
+    let received = |id: u64, event: BridgeEvent| shellpkg::Received {
+        id: kr_protocol::ids::RequestId::new(id),
+        event,
+        reader_lifetime: 4,
+    };
     let quiet = |prompt: u64| {
         BridgeEvent::GestureChanged(kr_shell_integration::contract::events::EofGestureChange {
             session_id: race_session(),
@@ -3584,41 +3610,85 @@ fn a_managed_decision_that_arrives_late_is_still_read_off_the_queue() {
             effective_at: PromptGeneration::new(prompt),
         })
     };
-    let detached = BridgeEvent::EofDetach(kr_protocol::root::RootEofDetachParams {
-        session_id: race_session(),
-        fence_id: shellpkg::fence_id(22),
-        prompt_generation: PromptGeneration::new(9),
-        input_epoch: enter_epoch(),
-    });
-    let consumed =
+    let detached = || {
+        BridgeEvent::EofDetach(kr_protocol::root::RootEofDetachParams {
+            session_id: race_session(),
+            fence_id: shellpkg::fence_id(22),
+            prompt_generation: PromptGeneration::new(9),
+            input_epoch: enter_epoch(),
+        })
+    };
+    let consumed = || {
         BridgeEvent::PreEofConsumed(kr_shell_integration::contract::events::PreEofConsumed {
             session_id: race_session(),
             prompt_generation: PromptGeneration::new(9),
             reason: ConsumeReason::FenceMissing,
             hint_printed: true,
-        });
+        })
+    };
 
+    let mut inbox = shellpkg::Inbox::default();
+    inbox.arrive(received(1, quiet(7)));
+    inbox.arrive(received(2, quiet(8)));
     assert_eq!(
-        shellpkg::managed_decisions_in([&quiet(7), &quiet(8)]),
+        inbox.managed_decisions(),
         0,
-        "a run of events holding no decision was read as holding one"
+        "a run of events holding no decision was counted as holding one"
     );
-    // Both decisions, at the very end of everything the drive was told, behind the events it had
-    // been waiting for.
+
+    // A consume just in front of the reader's next report. The state read takes the report and
+    // drops everything in front of it, the consume with the rest.
+    inbox.arrive(received(3, consumed()));
+    inbox.arrive(received(
+        4,
+        BridgeEvent::ReaderIdle(reported(9, 3, true, 0, 0)),
+    ));
+    assert!(
+        inbox.take_reader_report().is_some(),
+        "the reader's report was not taken"
+    );
+    assert!(
+        inbox.waiting().is_empty(),
+        "the report was taken without dropping what stood in front of it, so this is not the \
+         read the check has to survive"
+    );
     assert_eq!(
-        shellpkg::managed_decisions_in([&quiet(7), &quiet(8), &detached]),
+        inbox.managed_decisions(),
         1,
-        "a detach that arrived after the drive stopped looking was missed"
+        "a consume that a state read took off the queue was lost"
+    );
+
+    // A detach in front of the event a wait was waiting for goes the same way.
+    inbox.arrive(received(5, detached()));
+    inbox.arrive(received(6, quiet(9)));
+    assert!(
+        inbox
+            .take_first(|waiting| matches!(waiting.event, BridgeEvent::GestureChanged(_)))
+            .is_some(),
+        "the event the wait was waiting for was not taken"
+    );
+    assert!(
+        inbox.waiting().is_empty(),
+        "the wait left what stood in front of its event on the queue"
     );
     assert_eq!(
-        shellpkg::managed_decisions_in([&quiet(7), &quiet(8), &consumed]),
-        1,
-        "a consume that arrived after the drive stopped looking was missed"
-    );
-    assert_eq!(
-        shellpkg::managed_decisions_in([&detached, &quiet(7), &consumed]),
+        inbox.managed_decisions(),
         2,
-        "a run holding both decisions was counted as holding one"
+        "a detach that a wait took off the queue was lost"
+    );
+
+    // Only a boundary the drive draws drops the count, and what arrives after it counts again.
+    inbox.boundary();
+    assert_eq!(
+        inbox.managed_decisions(),
+        0,
+        "the decisions before a boundary still counted against what came after it"
+    );
+    inbox.arrive(received(7, consumed()));
+    assert_eq!(
+        inbox.managed_decisions(),
+        1,
+        "a decision after the boundary was not counted"
     );
 }
 

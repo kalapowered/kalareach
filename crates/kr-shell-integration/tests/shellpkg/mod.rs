@@ -12,7 +12,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -381,17 +381,12 @@ pub struct Session {
     /// that redrew: an observation made before a lifecycle event is about a reader that is no
     /// longer the one a later key would reach.
     reader_lifetime: u64,
-    /// How many managed decisions have arrived since the last boundary a check drew.
-    ///
-    /// Counted where the frame is read rather than where a check looks, because every wait here
-    /// drops what stood in front of what it was waiting for. Only [`Session::forget_events`]
-    /// clears it, and that is a check saying in as many words that it is done with what came
-    /// before.
-    managed_decisions: usize,
     /// The reader the last successful probe found inside its read.
     reading_reader: Option<stacks::ReaderMark>,
     pending: Vec<u8>,
-    events: VecDeque<Received>,
+    /// What the bridge has sent and no check has taken, with the managed decisions among it
+    /// counted as they arrived.
+    events: Inbox,
     /// Each answer the reader sent, with the instant it was taken off the endpoint: a wait under a
     /// deadline accepts an answer that arrived inside its window, however late it notices it.
     answers: HashMap<RequestId, (Instant, BridgeAnswer)>,
@@ -560,10 +555,9 @@ impl Session {
             closure_expected: false,
             budget: None,
             reader_lifetime: 0,
-            managed_decisions: 0,
             reading_reader: None,
             pending: Vec::new(),
-            events: VecDeque::new(),
+            events: Inbox::default(),
             answers: HashMap::new(),
             next_request: 1,
             output,
@@ -886,14 +880,6 @@ impl Session {
                     ) {
                         self.reader_lifetime += 1;
                     }
-                    // A managed decision is counted where it arrives, not where it is read. Every
-                    // wait here takes what it was waiting for off the queue and drops what was in
-                    // front of it, so a decision that arrived behind something else would be gone
-                    // before the check that rejects it ran. Counted here it cannot be lost by any
-                    // of them.
-                    if stacks::is_managed_decision(&event) {
-                        self.managed_decisions += 1;
-                    }
                     let outcome = self.routine_answer(&event);
                     if let Some(result) = outcome {
                         // A routine acknowledgement is not a check's own write, so a bridge that
@@ -904,7 +890,10 @@ impl Session {
                             deadline,
                         );
                     }
-                    self.events.push_back(Received {
+                    // The one way an event reaches the queue, and the inbox counts a managed
+                    // decision as it takes it in: a wait that later drops it from the queue
+                    // cannot drop it from the count.
+                    self.events.arrive(Received {
                         id,
                         event,
                         reader_lifetime: self.reader_lifetime,
@@ -978,22 +967,13 @@ impl Session {
     {
         let deadline = self.deadline_for(REPLY);
         loop {
-            if let Some(position) = self
-                .events
-                .iter()
-                .position(|received| accept(&received.event))
-            {
-                self.events.drain(..position);
-                let received = self.events.pop_front().expect("the event is there");
+            if let Some(received) = self.events.take_first(|received| accept(&received.event)) {
                 return (received.id, received.event);
             }
             assert!(
                 !deadline.passed(),
                 "no {what} arrived; the events were {:?}\nterminal output:\n{}",
-                self.events
-                    .iter()
-                    .map(|received| name_of(&received.event))
-                    .collect::<Vec<_>>(),
+                self.events.waiting(),
                 self.terminal_output()
             );
             self.pump(Duration::from_millis(50));
@@ -1007,12 +987,11 @@ impl Session {
     {
         let deadline = Instant::now() + self.bounded(within);
         loop {
-            if let Some(position) = self
+            if self
                 .events
-                .iter()
-                .position(|received| accept(&received.event))
+                .take_first(|received| accept(&received.event))
+                .is_some()
             {
-                self.events.drain(..=position);
                 return true;
             }
             if Instant::now() >= deadline {
@@ -1022,18 +1001,16 @@ impl Session {
         }
     }
 
-    /// Drops every event received so far.
+    /// Drops every event received so far, and the count of managed decisions with them.
     ///
     /// The pump before it is what makes this a boundary rather than a guess: anything the reader
     /// had already sent is taken off the endpoint and dropped with the rest. It answers to the
-    /// budget in force, so a caller that has little left drops what is here and goes on.
+    /// budget in force, so a caller that has little left drops what is here and goes on. This is
+    /// the only boundary a check draws, and a drive that rejects the managed decision draws it
+    /// before its first key and nowhere after.
     pub fn forget_events(&mut self) {
         self.pump(Duration::from_millis(200));
-        self.events.clear();
-        // The count of managed decisions is dropped with them, and only here: this is the one
-        // place a check says it is done with everything that came before, so it is the one place
-        // the count of what came before may go.
-        self.managed_decisions = 0;
+        self.events.boundary();
     }
 
     /// Answers one event.
@@ -1867,6 +1844,7 @@ fn a_terminal_that_stopped_reading_ends_a_write_at_its_deadline() {
 
 mod cases;
 mod dialect;
+mod inbox;
 mod stacks;
 
 // Each test binary that includes this module uses one part of it: the four package suites use the
@@ -1875,5 +1853,7 @@ mod stacks;
 #[allow(unused_imports)]
 pub use cases::*;
 pub use dialect::*;
+#[allow(unused_imports)]
+pub use inbox::*;
 #[allow(unused_imports)]
 pub use stacks::*;

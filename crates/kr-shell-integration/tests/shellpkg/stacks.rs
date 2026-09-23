@@ -271,32 +271,6 @@ pub fn replay_seen(acknowledgement: &kr_protocol::root::FenceAcknowledgement) ->
         || acknowledgement.snapshot.queued_keys > U64::ZERO
 }
 
-/// Whether this event is one of the two decisions the worker manages the gesture with.
-///
-/// The one rule, asked where a frame arrives and asked again of a run of events, so a decision
-/// cannot be one thing to the session's count and another to a check that reads the queue.
-#[must_use]
-pub fn is_managed_decision(event: &BridgeEvent) -> bool {
-    matches!(
-        event,
-        BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
-    )
-}
-
-/// How many managed decisions a run of events holds, wherever in it they are.
-///
-/// Not a window. A decision that arrived while a drive was waiting for something else sits behind
-/// whatever it was waiting for, and a check that read only the events around the key would pass a
-/// gesture that reached the decision a moment late. The session counts them where they arrive for
-/// the same reason, so that a wait which drops what stood in front of it cannot lose one.
-#[must_use]
-pub fn managed_decisions_in<'a>(events: impl IntoIterator<Item = &'a BridgeEvent>) -> usize {
-    events
-        .into_iter()
-        .filter(|event| is_managed_decision(event))
-        .count()
-}
-
 /// What one report of the reader's says about the probe a session is waiting out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadinessStep {
@@ -1132,10 +1106,9 @@ impl Session {
             closure_expected: false,
             budget: None,
             reader_lifetime: 0,
-            managed_decisions: 0,
             reading_reader: None,
             pending: Vec::new(),
-            events: std::collections::VecDeque::new(),
+            events: Inbox::default(),
             answers: std::collections::HashMap::new(),
             next_request: 1,
             output,
@@ -1543,17 +1516,16 @@ impl Session {
         }
     }
 
-    /// Whether either managed decision is anywhere in what this session has been told.
+    /// Whether no more than `allowed` managed decisions arrived since the drive's boundary.
     ///
-    /// Not a window. Everything on the queue is read, so a decision that arrived while the drive
-    /// was waiting for something else is still found. `allowed` is how many of them the drive
-    /// asked for itself, which are the ones at the end of the queue.
+    /// Not a window, and not the queue. The inbox counts every decision as it arrives, so one
+    /// that arrived while the drive was waiting for something else, and one that a later wait took
+    /// off the queue with what stood in front of it, are both still counted here. What is read is
+    /// everything since the last [`Session::forget_events`], after whatever is already on the
+    /// endpoint has been taken in. `allowed` is how many of them the drive asked for itself.
     pub fn no_managed_decision_before(&mut self, allowed: usize) -> bool {
         self.pump(Duration::from_millis(200));
-        // The session's own count, not the queue's: a wait that took what it was waiting for off
-        // the queue drops what stood in front of it, and a decision that arrived behind something
-        // else would be gone from the queue before this ran.
-        self.managed_decisions <= allowed
+        self.events.managed_decisions() <= allowed
     }
 
     /// Whether the reader this session is looking at is still the one a report named.
@@ -1588,16 +1560,13 @@ impl Session {
     ///
     /// What is in front of it is dropped, as [`Session::expect_event`] drops it: each call asks
     /// for the next thing the reader said about itself. Nothing is dropped unread, though: the
-    /// lifecycle events this passes have already been counted, on the endpoint, so a report taken
-    /// from behind a reader's leave carries a stamp that says so.
+    /// lifecycle events this passes were counted on the endpoint, so a report taken from behind a
+    /// reader's leave carries a stamp that says so, and a managed decision it passes was counted
+    /// by the inbox as it arrived.
     fn take_reader_report(&mut self) -> Option<ReaderReport> {
-        while let Some(received) = self.events.pop_front() {
-            if let BridgeEvent::ReaderIdle(idle) = received.event {
-                let mark = ReaderMark::of(&idle, received.reader_lifetime);
-                return Some(ReaderReport { mark, idle });
-            }
-        }
-        None
+        let (idle, lifetime) = self.events.take_reader_report()?;
+        let mark = ReaderMark::of(&idle, lifetime);
+        Some(ReaderReport { mark, idle })
     }
 
     /// Waits until `deadline` for the next report of the reader's that `accept` takes.
@@ -1879,36 +1848,43 @@ impl Session {
     /// Panics when the startup entry never activates or no reader reports itself, which is a
     /// package that did not come up rather than one that was slow.
     pub fn first_prompt_within(&mut self, within: Duration) -> RootEditorEnterParams {
-        for what in ["hooks_activated", "the first editor entry"] {
-            let deadline = Instant::now() + within;
-            loop {
-                let found = self.events.iter().position(|received| match what {
-                    "hooks_activated" => {
-                        matches!(received.event, BridgeEvent::HooksActivated(_))
-                    }
-                    _ => matches!(received.event, BridgeEvent::EditorEnter(_)),
-                });
-                if let Some(position) = found {
-                    self.events.drain(..position);
-                    if what == "hooks_activated" {
-                        self.events.pop_front();
-                    }
-                    break;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "no {what} arrived in {within:?}; the terminal showed:\n{}",
-                    self.terminal_output()
-                );
-                self.pump(Duration::from_millis(100));
-            }
-        }
+        self.first_within("hooks_activated", within, |event| {
+            matches!(event, BridgeEvent::HooksActivated(_))
+        });
+        let received = self.first_within("the first editor entry", within, |event| {
+            matches!(event, BridgeEvent::EditorEnter(_))
+        });
         // From here the shell has a reader, so a key typed at it is a step it takes.
         self.reading = true;
-        let received = self.events.pop_front().expect("the entry is there");
         let entry = as_enter(&received.event).clone();
         self.last_entry = Some(entry.clone());
         entry
+    }
+
+    /// Waits up to `within` of its own for the first event `accept` takes, dropping what is in
+    /// front of it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no such event arrives, naming `what` it was.
+    fn first_within(
+        &mut self,
+        what: &str,
+        within: Duration,
+        accept: impl Fn(&BridgeEvent) -> bool,
+    ) -> Received {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(received) = self.events.take_first(|received| accept(&received.event)) {
+                return received;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no {what} arrived in {within:?}; the terminal showed:\n{}",
+                self.terminal_output()
+            );
+            self.pump(Duration::from_millis(100));
+        }
     }
 
     /// The primary reader that is running now, rather than the first one still in the queue.
@@ -1923,15 +1899,13 @@ impl Session {
     pub fn latest_prompt(&mut self) -> RootEditorEnterParams {
         let mut newest = self.next_prompt();
         self.pump(Duration::from_millis(200));
-        while let Some(position) = self.events.iter().position(|received| {
+        while let Some(received) = self.events.take_first(|received| {
             matches!(
                 &received.event,
                 BridgeEvent::EditorEnter(params)
                     if params.reader_context == kr_protocol::root::ReaderContext::Primary
             )
         }) {
-            self.events.drain(..position);
-            let received = self.events.pop_front().expect("the entry is there");
             newest = as_enter(&received.event).clone();
         }
         self.last_entry = Some(newest.clone());
@@ -1949,7 +1923,7 @@ impl Session {
         deadline: Deadline,
     ) -> Option<RootEditorEnterParams> {
         loop {
-            let found = self.events.iter().position(|received| {
+            let found = self.events.take_first(|received| {
                 received.reader_lifetime > lifecycle
                     && matches!(
                         &received.event,
@@ -1957,9 +1931,7 @@ impl Session {
                             if params.reader_context == kr_protocol::root::ReaderContext::Primary
                     )
             });
-            if let Some(position) = found {
-                self.events.drain(..position);
-                let received = self.events.pop_front().expect("the entry is there");
+            if let Some(received) = found {
                 let entry = as_enter(&received.event).clone();
                 self.last_entry = Some(entry.clone());
                 return Some(entry);
