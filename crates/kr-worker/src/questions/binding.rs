@@ -26,9 +26,20 @@
 //!
 //! Environment variables take no part in any of this. `KR_SESSION` helps a helper find a socket;
 //! what happens after it connects is decided here.
+//!
+//! # The agent a source belongs to
+//!
+//! A session is one binding; the agent a question comes from is another. Section 11 records an
+//! agent thread or binding revision only when a qualified bridge supplies one, and invalidates the
+//! unanswered questions asked under a binding when a switch is detected. [`AgentBindings`] is how
+//! this ledger learns both: which bridged application instance a verified source belongs to and at
+//! which revision, and where that instance's binding stands now. The worker's broker answers it
+//! for the instances whose integration observes the upstream owner and its thread. A source that no
+//! bridge describes gets no revision, its question is application-scoped, and no thread-switch
+//! detection is claimed for it.
 
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
-use kr_protocol::ids::ConnectionId;
+use kr_protocol::ids::{AgentBindingRevision, ApplicationInstanceId, ConnectionId};
 
 use crate::ownership::OwnershipBoundary;
 use crate::questions::error::{QuestionError, Result};
@@ -81,6 +92,36 @@ impl VerifiedSource {
             self.process.start_value.get()
         )
     }
+}
+
+/// The bridged application instance a source belongs to, and the binding a question from it is
+/// asked under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentBinding {
+    /// The application instance, as the worker's broker names it.
+    pub application_instance_id: ApplicationInstanceId,
+    /// The revision its binding is at: it advances when the upstream owner or the selected thread
+    /// changes.
+    pub revision: AgentBindingRevision,
+}
+
+/// What a qualified bridge says about the agents in this session.
+///
+/// Implemented by the worker's broker. A ledger with none of these records no binding revision and
+/// invalidates nothing on a switch, which is the application-scoped case section 11 allows for a
+/// helper no bridge describes.
+pub trait AgentBindings: Send + Sync + std::fmt::Debug {
+    /// Returns the bridged instance a verified source belongs to, and its revision now.
+    ///
+    /// A source belongs to an instance when it is that instance's process or descends from it, by a
+    /// parent chain the kernel confirms link by link. None when no bridged instance holds it.
+    fn binding_of(&self, source: &VerifiedSource) -> Option<AgentBinding>;
+
+    /// Returns the revision one instance's binding is at now, or None when the instance has ended.
+    fn current(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+    ) -> Option<AgentBindingRevision>;
 }
 
 /// Binds the caller on this connection to this session.
@@ -196,41 +237,48 @@ fn contains(boundary: &OwnershipBoundary, pid: u32) -> bool {
 /// Each link is checked by start identity, so a parent identifier that has been recycled since the
 /// child was created does not complete the chain.
 fn descends_from(from: &ProcessStartIdentity, root: &ProcessStartIdentity) -> bool {
-    let root_pid = u32::try_from(root.pid.get()).unwrap_or(u32::MAX);
+    nearest_of(from, std::slice::from_ref(root)).is_some()
+}
+
+/// Returns the nearest of `candidates` that is `from` itself or one of its ancestors.
+///
+/// Every link is read from the kernel, and a candidate matches only by its full start identity, so
+/// an identifier recycled since the candidate's process started is not it.
+pub(crate) fn nearest_of(
+    from: &ProcessStartIdentity,
+    candidates: &[ProcessStartIdentity],
+) -> Option<usize> {
     let mut current = from.clone();
     for _ in 0..MAX_ANCESTRY_DEPTH {
+        if let Some(found) = candidates
+            .iter()
+            .position(|candidate| candidate.matches(&current))
+        {
+            return Some(found);
+        }
         let current_pid = u32::try_from(current.pid.get()).unwrap_or(u32::MAX);
-        if current_pid == root_pid {
-            return current.matches(root);
-        }
-        let Some(parent_pid) = platform::parent(current_pid) else {
-            return false;
-        };
+        let parent_pid = platform::parent(current_pid)?;
         if parent_pid == 0 || parent_pid == current_pid {
-            return false;
+            return None;
         }
-        let Ok(parent) = kr_ipc::identity::process_start_identity(parent_pid) else {
-            return false;
-        };
+        let parent = kr_ipc::identity::process_start_identity(parent_pid).ok()?;
         // A parent starts before its child. Every source's start value increases with time within
         // one boot, so a candidate parent that started later is an identifier the kernel has
         // handed to something else since this child was created, and the chain stops there rather
         // than climbing through a stranger.
         if parent.source != current.source || parent.start_value.get() > current.start_value.get() {
-            return false;
+            return None;
         }
         // The child is read again, identity and parent together. If its identifier changed owners
         // between the first read and this one, both parent readings describe the replacement's
         // family rather than this one's, and the chain stops rather than climbing somebody else's.
-        let Ok(again) = kr_ipc::identity::process_start_identity(current_pid) else {
-            return false;
-        };
+        let again = kr_ipc::identity::process_start_identity(current_pid).ok()?;
         if !again.matches(&current) || platform::parent(current_pid) != Some(parent_pid) {
-            return false;
+            return None;
         }
         current = parent;
     }
-    false
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -391,6 +439,23 @@ mod tests {
                 .to_string()
                 .contains("no longer the one that opened it")
         );
+    }
+
+    #[test]
+    fn the_nearest_managed_ancestor_is_found_by_its_full_identity() {
+        let mine =
+            kr_ipc::identity::process_start_identity(std::process::id()).expect("an identity");
+        let parent_pid = platform::parent(std::process::id()).expect("a parent");
+        let parent = kr_ipc::identity::process_start_identity(parent_pid).expect("its identity");
+        // This process is its own nearest candidate, and its parent is found when it is not one.
+        assert_eq!(nearest_of(&mine, &[parent.clone(), mine.clone()]), Some(1));
+        assert_eq!(nearest_of(&mine, std::slice::from_ref(&parent)), Some(0));
+        // The same identifiers with start values the kernel never reported are nobody's.
+        let mut recycled = parent;
+        recycled.start_value = kr_protocol::scalars::U64::new(recycled.start_value.get() ^ 0xFFFF);
+        let mut stranger = mine.clone();
+        stranger.start_value = kr_protocol::scalars::U64::new(stranger.start_value.get() ^ 0xFFFF);
+        assert_eq!(nearest_of(&mine, &[recycled, stranger]), None);
     }
 
     #[test]
