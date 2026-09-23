@@ -152,6 +152,11 @@ impl Host {
         }
     }
 
+    /// The daemon's registry database, for a suite that holds a row as an earlier host wrote it.
+    pub fn registry_database(&self) -> PathBuf {
+        self.temp.environment().registry_database()
+    }
+
     /// Connects one local client on the daemon's own socket.
     pub async fn client(&self) -> LocalClient {
         LocalClient::connect(&self.endpoint, LocalClientKind::Cli, build())
@@ -195,6 +200,11 @@ pub struct Device {
 }
 
 impl Device {
+    /// The device's own keys, for a suite that signs as the device.
+    pub const fn keys(&self) -> &DeviceKeys {
+        &self.keys
+    }
+
     /// Creates a device that has not been paired with anything.
     pub async fn create() -> Self {
         let keys = DeviceKeys::generate().expect("device keys");

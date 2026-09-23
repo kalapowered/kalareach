@@ -151,11 +151,12 @@ use crate::session::{
     SessionReadResult, SessionSummary,
 };
 use crate::sharing::{
-    AuthorityFeedStatus, DeviceListParams, DeviceListResult, DevicePreviewKeyUpdateParams,
-    DevicePreviewKeyUpdateResult, DeviceRevokeParams, DeviceSummary, GrantCreateParams,
-    GrantCreateResult, GrantListParams, GrantListResult, GrantRevokeParams, GrantSummary,
-    InvitationPreview, LiveScreenPreview, NamedApprovalPreview, NamedQuestionPreview,
-    OfflineValidityPolicy, RevocationResult, RoleSelection,
+    AuthorityFeedStatus, DeviceKeysCompleteParams, DeviceKeysCompleteResult, DeviceKeysDeclaration,
+    DeviceListParams, DeviceListResult, DevicePreviewKeyUpdateParams, DevicePreviewKeyUpdateResult,
+    DeviceRevokeParams, DeviceSummary, GrantCreateParams, GrantCreateResult, GrantListParams,
+    GrantListResult, GrantRevokeParams, GrantSummary, InvitationPreview, LiveScreenPreview,
+    NamedApprovalPreview, NamedQuestionPreview, OfflineValidityPolicy, RevocationResult,
+    RoleSelection,
 };
 use crate::skill::{
     AgentToolsInstallResult, AgentToolsParams, AgentToolsRemoveResult, AgentToolsStatusResult,
@@ -325,6 +326,9 @@ pub fn protocol_schema() -> Value {
         "authority_feed_status" => AuthorityFeedStatus,
         "device_list_params" => DeviceListParams,
         "device_list_result" => DeviceListResult,
+        "device_keys_complete_params" => DeviceKeysCompleteParams,
+        "device_keys_complete_result" => DeviceKeysCompleteResult,
+        "device_keys_declaration" => DeviceKeysDeclaration,
         "device_preview_key_update_params" => DevicePreviewKeyUpdateParams,
         "device_preview_key_update_result" => DevicePreviewKeyUpdateResult,
         "device_revoke_params" => DeviceRevokeParams,

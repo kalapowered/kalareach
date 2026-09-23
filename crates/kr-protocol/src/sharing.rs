@@ -597,6 +597,14 @@ pub struct DeviceSummary {
     pub acknowledged_at_ms: Nullable<TimestampMs>,
     /// Whether the device has been revoked.
     pub revoked: bool,
+    /// The device's four purpose-separated public keys, as its pairing bound them.
+    ///
+    /// Null for a device paired before this host kept all four, until it declares the rest through
+    /// `device.keys.complete`. Another device seals to a device's stored-envelope key only when this
+    /// host reports it, because the pairing the owner approved is what binds it to the device.
+    pub keys: Nullable<crate::pairing::DevicePublicKeys>,
+    /// Whether the device's grant lets it manage this host, which is what an owner's device holds.
+    pub manages_host: bool,
 }
 
 /// The result of `device.list`.
@@ -645,6 +653,62 @@ pub struct DevicePreviewKeyUpdateResult {
     pub revision: DeviceKeyRevision,
     /// The key now on record.
     pub notification_preview: crate::scalars::NotificationPreviewKey,
+}
+
+/// The domain a device's declaration of its own public keys is signed under.
+pub const DEVICE_KEYS_DOMAIN: &str = "kr-device-keys/1";
+
+/// What a device signs to declare its four public keys to a host that recorded only two of them.
+///
+/// A device paired before its host kept every key declares the rest once. The declaration names
+/// the device and all four keys, and it is signed by the authorisation key the host recorded at
+/// pairing, which is what binds the new keys to the device the owner approved: the same binding the
+/// signed bundle gave the keys the host did record.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceKeysDeclaration {
+    /// The device, as the host named it when it committed the pairing.
+    pub device_id: DeviceId,
+    /// All four of the device's public keys.
+    pub keys: crate::pairing::DevicePublicKeys,
+}
+
+impl DeviceKeysDeclaration {
+    /// Builds the canonical bytes the signature covers: `CBOR(["kr-device-keys/1", declaration])`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a CBOR error when the declaration cannot be represented in KR-CBOR-1.
+    pub fn signing_input(&self) -> Result<Vec<u8>, kr_cbor::CborError> {
+        Ok(kr_cbor::encode(&kr_cbor::signing_value(
+            DEVICE_KEYS_DOMAIN,
+            vec![kr_cbor::to_canonical_value(self)?],
+        )))
+    }
+}
+
+/// Parameters of `device.keys.complete`.
+///
+/// The device is the one the connection authenticated as; the parameters name nothing else.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceKeysCompleteParams {
+    /// All four of the device's public keys. The two the host recorded at pairing must be among
+    /// them unchanged.
+    pub keys: crate::pairing::DevicePublicKeys,
+    /// The Ed25519 signature over [`DeviceKeysDeclaration::signing_input`], by the authorisation
+    /// key the host recorded for this device.
+    pub signature: crate::scalars::Signature64,
+}
+
+/// The result of `device.keys.complete`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceKeysCompleteResult {
+    /// The device whose keys are on record.
+    pub device_id: DeviceId,
+    /// The four keys now on record.
+    pub keys: crate::pairing::DevicePublicKeys,
 }
 
 /// Why a host would not answer under an organisation's authority.

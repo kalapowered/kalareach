@@ -4013,6 +4013,11 @@ impl Controller {
                 acknowledged_revision: kr_protocol::scalars::Nullable(acknowledged),
                 acknowledged_at_ms: kr_protocol::scalars::Nullable::null(),
                 revoked: record.revoked_at_ms.is_some(),
+                keys: kr_protocol::scalars::Nullable(record.public_keys()),
+                manages_host: record
+                    .grant
+                    .actions
+                    .contains(&kr_protocol::rights::ActionRight::HostManage),
             });
         }
         devices.sort_by_key(|device| device.device_id);
@@ -4022,6 +4027,75 @@ impl Controller {
             feed_synchronised_at_ms: status.last_synchronised_at_ms,
             feed_stale: status.stale,
         })
+    }
+
+    /// Records the four keys a device paired before this host kept them all declares, once.
+    ///
+    /// The device is the one the connection authenticated as, and the declaration is signed by the
+    /// authorisation key this host recorded when it committed the pairing: that key is what binds
+    /// the two new keys to the device the owner approved, as the signed bundle bound the other two.
+    /// The transport and authorisation keys must be the ones on record and the four must be four
+    /// different keys. A record that already holds its keys answers a declaration of the same keys
+    /// with the record and a declaration of any others with a refusal: a declaration completes a
+    /// record, it never replaces a key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::PermissionDenied`] for a device this host no longer pairs with,
+    /// for keys that are not the recorded ones, for a signature that does not verify and for a
+    /// declaration of keys other than the ones on record; [`ControllerError::InvalidArgument`] for
+    /// malformed parameters or a key declared for two purposes; and a storage error when the record
+    /// cannot be written.
+    pub(crate) fn device_keys_complete(
+        &self,
+        device_id: kr_protocol::ids::DeviceId,
+        params: &ParamsValue,
+    ) -> Result<ParamsValue> {
+        let params: kr_protocol::sharing::DeviceKeysCompleteParams = parse(params)?;
+        let denied = |detail: &str| ControllerError::PermissionDenied {
+            detail: detail.to_owned(),
+        };
+        let record = self
+            .devices
+            .record_for_device(device_id)?
+            .filter(net::devices::DeviceRecord::is_paired)
+            .ok_or_else(|| denied("this host does not pair with that device"))?;
+        let keys = params.keys;
+        if keys.transport != record.endpoint_id || keys.authorisation != record.authorisation {
+            return Err(denied(
+                "the declared transport and authorisation keys are not the ones this host \
+                 recorded at pairing",
+            ));
+        }
+        if !keys.purposes_are_distinct() {
+            return Err(ControllerError::InvalidArgument(
+                "each of a device's four keys is a different key".to_owned(),
+            ));
+        }
+        let declaration = kr_protocol::sharing::DeviceKeysDeclaration { device_id, keys };
+        kr_crypto::sign::verify_object(
+            &record.authorisation,
+            kr_protocol::sharing::DEVICE_KEYS_DOMAIN,
+            &declaration,
+            &params.signature,
+        )
+        .map_err(|_| {
+            denied(
+                "the declaration is not signed by the authorisation key this host recorded for \
+                 the device",
+            )
+        })?;
+        let stored = self
+            .devices
+            .complete_keys(device_id, &keys.stored_envelope, &keys.notification_preview)?
+            .ok_or_else(|| denied("this host does not pair with that device"))?;
+        if stored.public_keys() != Some(keys) {
+            return Err(denied(
+                "this device's keys are already on record, and a declaration does not replace a \
+                 key",
+            ));
+        }
+        encode(&kr_protocol::sharing::DeviceKeysCompleteResult { device_id, keys })
     }
 
     /// Performs one authority change under a durable claim, and records what it produced.

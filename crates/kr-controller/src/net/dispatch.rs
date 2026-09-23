@@ -632,6 +632,11 @@ impl RemoteConnection {
                 let answer = self.controller.read_method(&actor_id, request).await;
                 self.narrow(answer)
             }
+            // The devices this host paired and the keys their pairing bound. An owner's other
+            // device reads it to learn a device's keys from the pairing the owner approved rather
+            // than from anything the device says of itself; the registry requires `host.manage`,
+            // and the grant check above has applied it.
+            Method::DeviceList => self.controller.read_method(&actor_id, request).await,
             // The daemon answers these itself, and what it answers with is narrowed to the grant:
             // a list is every session this actor may observe, not every session this host runs.
             Method::SessionList | Method::SessionRead => {
@@ -1043,6 +1048,35 @@ impl RemoteConnection {
                     .controller
                     .preview_key_update_action(&actor_id, mutation)
                     .await
+                {
+                    Ok(value) => ControlFrame::Response(Response {
+                        request_id: mutation.request_id,
+                        outcome: Outcome::Ok(value),
+                    }),
+                    Err(error) => failure(mutation.request_id, error.to_protocol_error()),
+                }
+            }
+            // A device completing its own record: the daemon's own effect, on this device's own
+            // row and nothing else. The parameters name no device; the one written is the one this
+            // connection authenticated as, and a retry of the same declaration is answered with the
+            // same record.
+            Method::DeviceKeysComplete => {
+                if self.controller.clock.now() >= accepted.deadline {
+                    return failure(
+                        mutation.request_id,
+                        ProtocolError::new(
+                            ErrorCode::PermissionDenied,
+                            "the deadline this action was admitted under passed before it could \
+                             run",
+                        ),
+                    );
+                }
+                if let Err(refusal) = self.claim_route(mutation, None) {
+                    return failure(mutation.request_id, refusal.into_error());
+                }
+                match self
+                    .controller
+                    .device_keys_complete(self.device.device_id, &mutation.params)
                 {
                     Ok(value) => ControlFrame::Response(Response {
                         request_id: mutation.request_id,

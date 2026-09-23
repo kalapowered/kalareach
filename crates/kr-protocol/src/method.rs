@@ -461,6 +461,13 @@ methods! {
     freshness: ActionWindow, confirmation: None, idempotency: ACTION,
     doc: "Rotate this device's own notification-preview key through its paired proof.";
 
+    DeviceKeysComplete = "device.keys.complete", Devices,
+    effect: Write, ingress: [PairedDevice], rights: [basis(ResourceOwner)], selectors: [Device],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Declare this device's own four public keys once, signed by the authorisation key its \
+          pairing recorded, so the host keeps every key it binds.";
+
     // ----- Plugin catalogues ----------------------------------------------------------------
     CatalogueList = "catalogue.list", PluginCatalogues,
     effect: Read, ingress: [LocalIpc, PairedDevice], rights: [req(HostManage)],

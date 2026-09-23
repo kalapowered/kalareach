@@ -96,6 +96,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         "device.list",
         "device.revoke",
         "device.preview_key.update",
+        "device.keys.complete",
         "catalogue.list",
         "catalogue.add",
         "catalogue.sync",

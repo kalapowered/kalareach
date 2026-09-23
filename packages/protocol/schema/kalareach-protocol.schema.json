@@ -7595,6 +7595,63 @@
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
+    "DeviceKeysCompleteParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `device.keys.complete`.\n\nThe device is the one the connection authenticated as; the parameters name nothing else.",
+      "properties": {
+        "keys": {
+          "$ref": "#/$defs/DevicePublicKeys",
+          "description": "All four of the device's public keys. The two the host recorded at pairing must be among\nthem unchanged."
+        },
+        "signature": {
+          "$ref": "#/$defs/Signature64",
+          "description": "The Ed25519 signature over [`DeviceKeysDeclaration::signing_input`], by the authorisation\nkey the host recorded for this device."
+        }
+      },
+      "required": [
+        "keys",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "DeviceKeysCompleteResult": {
+      "additionalProperties": false,
+      "description": "The result of `device.keys.complete`.",
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The device whose keys are on record."
+        },
+        "keys": {
+          "$ref": "#/$defs/DevicePublicKeys",
+          "description": "The four keys now on record."
+        }
+      },
+      "required": [
+        "device_id",
+        "keys"
+      ],
+      "type": "object"
+    },
+    "DeviceKeysDeclaration": {
+      "additionalProperties": false,
+      "description": "What a device signs to declare its four public keys to a host that recorded only two of them.\n\nA device paired before its host kept every key declares the rest once. The declaration names\nthe device and all four keys, and it is signed by the authorisation key the host recorded at\npairing, which is what binds the new keys to the device the owner approved: the same binding the\nsigned bundle gave the keys the host did record.",
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The device, as the host named it when it committed the pairing."
+        },
+        "keys": {
+          "$ref": "#/$defs/DevicePublicKeys",
+          "description": "All four of the device's public keys."
+        }
+      },
+      "required": [
+        "device_id",
+        "keys"
+      ],
+      "type": "object"
+    },
     "DeviceListParams": {
       "additionalProperties": false,
       "description": "Parameters of `device.list`.",
@@ -7812,6 +7869,21 @@
           "$ref": "#/$defs/GrantId",
           "description": "The grant it holds."
         },
+        "keys": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DevicePublicKeys"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The device's four purpose-separated public keys, as its pairing bound them.\n\nNull for a device paired before this host kept all four, until it declares the rest through\n`device.keys.complete`. Another device seals to a device's stored-envelope key only when this\nhost reports it, because the pairing the owner approved is what binds it to the device."
+        },
+        "manages_host": {
+          "description": "Whether the device's grant lets it manage this host, which is what an owner's device holds.",
+          "type": "boolean"
+        },
         "paired_at_ms": {
           "$ref": "#/$defs/TimestampMs",
           "description": "When it was paired."
@@ -7828,7 +7900,9 @@
         "paired_at_ms",
         "acknowledged_revision",
         "acknowledged_at_ms",
-        "revoked"
+        "revoked",
+        "keys",
+        "manages_host"
       ],
       "type": "object"
     },
@@ -14556,6 +14630,11 @@
         {
           "const": "device.preview_key.update",
           "description": "Rotate this device's own notification-preview key through its paired proof.",
+          "type": "string"
+        },
+        {
+          "const": "device.keys.complete",
+          "description": "Declare this device's own four public keys once, signed by the authorisation key its pairing recorded, so the host keeps every key it binds.",
           "type": "string"
         },
         {
@@ -29463,6 +29542,15 @@
     },
     "desktop_context": {
       "$ref": "#/$defs/DesktopContext"
+    },
+    "device_keys_complete_params": {
+      "$ref": "#/$defs/DeviceKeysCompleteParams"
+    },
+    "device_keys_complete_result": {
+      "$ref": "#/$defs/DeviceKeysCompleteResult"
+    },
+    "device_keys_declaration": {
+      "$ref": "#/$defs/DeviceKeysDeclaration"
     },
     "device_list_params": {
       "$ref": "#/$defs/DeviceListParams"

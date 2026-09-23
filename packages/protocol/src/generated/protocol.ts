@@ -1464,6 +1464,9 @@ export interface KalaReachProtocol {
   decoding_trust?: DecodingTrust
   desktop_capability_report?: DesktopCapabilityReport
   desktop_context?: DesktopContext1
+  device_keys_complete_params?: DeviceKeysCompleteParams
+  device_keys_complete_result?: DeviceKeysCompleteResult
+  device_keys_declaration?: DeviceKeysDeclaration
   device_list_params?: DeviceListParams
   device_list_result?: DeviceListResult
   device_preview_key_update_params?: DevicePreviewKeyUpdateParams
@@ -7989,6 +7992,108 @@ export interface DesktopContext1 {
   worker_profile: 'desktop_bound' | 'headless_user'
 }
 /**
+ * Parameters of `device.keys.complete`.
+ *
+ * The device is the one the connection authenticated as; the parameters name nothing else.
+ */
+export interface DeviceKeysCompleteParams {
+  keys: DevicePublicKeys
+  /**
+   * The Ed25519 signature over [`DeviceKeysDeclaration::signing_input`], by the authorisation
+   * key the host recorded for this device.
+   */
+  signature: string
+}
+/**
+ * All four of the device's public keys. The two the host recorded at pairing must be among
+ * them unchanged.
+ */
+export interface DevicePublicKeys {
+  /**
+   * The Ed25519 authorisation key.
+   */
+  authorisation: string
+  /**
+   * The X25519 notification-preview key.
+   */
+  notification_preview: string
+  /**
+   * The X25519 stored-envelope key.
+   */
+  stored_envelope: string
+  /**
+   * The iroh transport identity.
+   */
+  transport: string
+}
+/**
+ * The result of `device.keys.complete`.
+ */
+export interface DeviceKeysCompleteResult {
+  /**
+   * One paired device.
+   */
+  device_id: string
+  keys: DevicePublicKeys1
+}
+/**
+ * The four keys now on record.
+ */
+export interface DevicePublicKeys1 {
+  /**
+   * The Ed25519 authorisation key.
+   */
+  authorisation: string
+  /**
+   * The X25519 notification-preview key.
+   */
+  notification_preview: string
+  /**
+   * The X25519 stored-envelope key.
+   */
+  stored_envelope: string
+  /**
+   * The iroh transport identity.
+   */
+  transport: string
+}
+/**
+ * What a device signs to declare its four public keys to a host that recorded only two of them.
+ *
+ * A device paired before its host kept every key declares the rest once. The declaration names
+ * the device and all four keys, and it is signed by the authorisation key the host recorded at
+ * pairing, which is what binds the new keys to the device the owner approved: the same binding the
+ * signed bundle gave the keys the host did record.
+ */
+export interface DeviceKeysDeclaration {
+  /**
+   * One paired device.
+   */
+  device_id: string
+  keys: DevicePublicKeys2
+}
+/**
+ * All four of the device's public keys.
+ */
+export interface DevicePublicKeys2 {
+  /**
+   * The Ed25519 authorisation key.
+   */
+  authorisation: string
+  /**
+   * The X25519 notification-preview key.
+   */
+  notification_preview: string
+  /**
+   * The X25519 stored-envelope key.
+   */
+  stored_envelope: string
+  /**
+   * The iroh transport identity.
+   */
+  transport: string
+}
+/**
  * Parameters of `device.list`.
  */
 export interface DeviceListParams {
@@ -8046,6 +8151,18 @@ export interface DeviceSummary {
    */
   grant_id: string
   /**
+   * The device's four purpose-separated public keys, as its pairing bound them.
+   *
+   * Null for a device paired before this host kept all four, until it declares the rest through
+   * `device.keys.complete`. Another device seals to a device's stored-envelope key only when this
+   * host reports it, because the pairing the owner approved is what binds it to the device.
+   */
+  keys: DevicePublicKeys3 | null
+  /**
+   * Whether the device's grant lets it manage this host, which is what an owner's device holds.
+   */
+  manages_host: boolean
+  /**
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   paired_at_ms: string
@@ -8053,6 +8170,30 @@ export interface DeviceSummary {
    * Whether the device has been revoked.
    */
   revoked: boolean
+}
+/**
+ * One device's four purpose-separated public keys.
+ *
+ * An authenticated pairing exchange binds these public keys and their explicit purposes to one
+ * device record.
+ */
+export interface DevicePublicKeys3 {
+  /**
+   * The Ed25519 authorisation key.
+   */
+  authorisation: string
+  /**
+   * The X25519 notification-preview key.
+   */
+  notification_preview: string
+  /**
+   * The X25519 stored-envelope key.
+   */
+  stored_envelope: string
+  /**
+   * The iroh transport identity.
+   */
+  transport: string
 }
 /**
  * Parameters of `device.preview_key.update`.
@@ -8554,7 +8695,7 @@ export interface DirectChallenge {
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   expires_at_ms: string
-  host_keys: DevicePublicKeys
+  host_keys: DevicePublicKeys4
   /**
    * The fresh host nonce.
    */
@@ -8565,9 +8706,12 @@ export interface DirectChallenge {
   invitation_id: string
 }
 /**
- * The host's complete purpose-key bundle.
+ * One device's four purpose-separated public keys.
+ *
+ * An authenticated pairing exchange binds these public keys and their explicit purposes to one
+ * device record.
  */
-export interface DevicePublicKeys {
+export interface DevicePublicKeys4 {
   /**
    * The Ed25519 authorisation key.
    */
@@ -8589,7 +8733,7 @@ export interface DevicePublicKeys {
  * The proof a candidate submits in direct mode.
  */
 export interface DirectRedeemProof {
-  client_keys: DevicePublicKeys1
+  client_keys: DevicePublicKeys5
   /**
    * The candidate's fresh nonce.
    */
@@ -8624,9 +8768,12 @@ export interface DirectRedeemProof {
   signature: string
 }
 /**
- * The candidate's complete purpose-key bundle.
+ * One device's four purpose-separated public keys.
+ *
+ * An authenticated pairing exchange binds these public keys and their explicit purposes to one
+ * device record.
  */
-export interface DevicePublicKeys1 {
+export interface DevicePublicKeys5 {
   /**
    * The Ed25519 authorisation key.
    */
@@ -10583,7 +10730,7 @@ export interface OwnerConfirmationRequest {
   /**
    * The keys the action sends authority to. Null when the action has no destination device.
    */
-  destination_keys: DevicePublicKeys2 | null
+  destination_keys: DevicePublicKeys3 | null
   /**
    * The rights the action would grant.
    */
@@ -10604,30 +10751,6 @@ export interface OwnerConfirmationRequest {
    * The host's fresh challenge nonce.
    */
   nonce: string
-}
-/**
- * One device's four purpose-separated public keys.
- *
- * An authenticated pairing exchange binds these public keys and their explicit purposes to one
- * device record.
- */
-export interface DevicePublicKeys2 {
-  /**
-   * The Ed25519 authorisation key.
-   */
-  authorisation: string
-  /**
-   * The X25519 notification-preview key.
-   */
-  notification_preview: string
-  /**
-   * The X25519 stored-envelope key.
-   */
-  stored_envelope: string
-  /**
-   * The iroh transport identity.
-   */
-  transport: string
 }
 /**
  * The role and the explicit choices on top of it.
@@ -12011,6 +12134,7 @@ export interface MethodEntry {
     | 'device.list'
     | 'device.revoke'
     | 'device.preview_key.update'
+    | 'device.keys.complete'
     | 'catalogue.list'
     | 'catalogue.add'
     | 'catalogue.sync'
@@ -12460,7 +12584,7 @@ export interface OwnerConfirmationRequest1 {
   /**
    * The keys the action sends authority to. Null when the action has no destination device.
    */
-  destination_keys: DevicePublicKeys2 | null
+  destination_keys: DevicePublicKeys3 | null
   /**
    * The rights the action would grant.
    */
@@ -13439,7 +13563,7 @@ export interface OwnerConfirmationRequest2 {
   /**
    * The keys the action sends authority to. Null when the action has no destination device.
    */
-  destination_keys: DevicePublicKeys2 | null
+  destination_keys: DevicePublicKeys3 | null
   /**
    * The rights the action would grant.
    */
@@ -13605,7 +13729,7 @@ export interface OwnerConfirmationRequest3 {
   /**
    * The keys the action sends authority to. Null when the action has no destination device.
    */
-  destination_keys: DevicePublicKeys2 | null
+  destination_keys: DevicePublicKeys3 | null
   /**
    * The rights the action would grant.
    */
@@ -18352,6 +18476,7 @@ export interface ServiceRequestPayload {
     | 'device.list'
     | 'device.revoke'
     | 'device.preview_key.update'
+    | 'device.keys.complete'
     | 'catalogue.list'
     | 'catalogue.add'
     | 'catalogue.sync'
@@ -19388,7 +19513,7 @@ export interface ClientBundle {
    * The candidate's iroh endpoint identity.
    */
   endpoint_id: string
-  keys: DevicePublicKeys3
+  keys: DevicePublicKeys6
   /**
    * The candidate's platform.
    */
@@ -19397,7 +19522,7 @@ export interface ClientBundle {
 /**
  * The candidate's purpose-separated public keys.
  */
-export interface DevicePublicKeys3 {
+export interface DevicePublicKeys6 {
   /**
    * The Ed25519 authorisation key.
    */
@@ -19453,7 +19578,7 @@ export interface HostBundle {
    * The invitation this bundle answers.
    */
   invitation_id: string
-  keys: DevicePublicKeys4
+  keys: DevicePublicKeys7
   network_config: NetworkConfig
   proposed_grant: ProposedGrant1
 }
@@ -19463,7 +19588,7 @@ export interface HostBundle {
  * An authenticated pairing exchange binds these public keys and their explicit purposes to one
  * device record.
  */
-export interface DevicePublicKeys4 {
+export interface DevicePublicKeys7 {
   /**
    * The Ed25519 authorisation key.
    */
