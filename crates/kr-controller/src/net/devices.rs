@@ -21,9 +21,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use kr_crypto::connect::PairedPeer;
+use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::grant::Grant;
 use kr_protocol::identity::BootIdentity;
-use kr_protocol::ids::{ActorId, DeviceId, DeviceKeyRevision, GrantId};
+use kr_protocol::ids::{ActionId, ActorId, DeviceId, DeviceKeyRevision, GrantId};
 use kr_protocol::pairing::{DeviceName, DevicePlatform, DevicePublicKeys};
 use kr_protocol::scalars::{
     AuthorisationKey, Digest256, EndpointKey, NotificationPreviewKey, StoredEnvelopeKey,
@@ -241,6 +242,49 @@ pub struct RoutedAction {
     pub payload_digest: Option<Digest256>,
 }
 
+/// What one declaration of a device's keys ended as, kept with the keys it wrote.
+///
+/// A completion and a refusal are both answers: an exact retry of either is given the same one,
+/// after the window it arrived in has gone. A failure to reach the store is neither, and nothing is
+/// kept for it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum KeyDeclaration {
+    /// The record holds the four keys declared.
+    Completed {
+        /// The device.
+        device_id: DeviceId,
+        /// The four keys on record.
+        keys: DevicePublicKeys,
+    },
+    /// The declaration was refused, for good.
+    Refused {
+        /// The code the device was given.
+        code: ErrorCode,
+        /// What it was told.
+        message: String,
+    },
+}
+
+impl KeyDeclaration {
+    /// Records a refusal as the device is given it.
+    fn refused(refusal: &ProtocolError) -> Self {
+        Self::Refused {
+            code: refusal.code,
+            message: refusal.message.clone(),
+        }
+    }
+}
+
+/// One recorded declaration, with the digest of the request that made it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedDeclaration {
+    /// The digest of the mutation that made the declaration.
+    pub payload_digest: Digest256,
+    /// What it ended as.
+    pub outcome: KeyDeclaration,
+}
+
 /// What claiming one action's route found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionRoute {
@@ -424,6 +468,14 @@ impl DeviceDirectory {
                      recorded_at_ms INTEGER NOT NULL,
                      PRIMARY KEY (actor_id, action_id)
                  );
+                 CREATE TABLE IF NOT EXISTS network_key_declarations (
+                     actor_id TEXT NOT NULL,
+                     action_id BLOB NOT NULL,
+                     payload_digest BLOB NOT NULL,
+                     outcome BLOB NOT NULL,
+                     recorded_at_ms INTEGER NOT NULL,
+                     PRIMARY KEY (actor_id, action_id)
+                 );
                  CREATE TABLE IF NOT EXISTS network_grant_deadlines (
                      device_id BLOB PRIMARY KEY NOT NULL,
                      boot_value BLOB NOT NULL,
@@ -590,43 +642,101 @@ impl DeviceDirectory {
         .transpose()
     }
 
-    /// Records the two keys a device paired before this host kept them declares, and nothing more.
+    /// Decides one declaration of a device's keys and records what it ended as, in one step.
     ///
-    /// The row is written only while it holds no stored-envelope key and either no preview key or
-    /// the one declared, which a preview-key update may have recorded first, and while the device
-    /// is still paired. So a declaration completes a record and never replaces a key, and a
-    /// revocation that lands first stops it: a second declaration, of the same keys or of others,
-    /// changes nothing.
-    /// Returns the record as it stands afterwards, which the caller compares with what was declared.
+    /// One immediate transaction holds all of it, so nothing can separate the parts. When the same
+    /// action already has a recorded outcome, that is the answer. Otherwise `admitted` is asked
+    /// with the directory's lock and the database's write lock both held, and nothing is awaited
+    /// between its answer and the commit; a lapsed admission is a refusal. Then `declared`, the
+    /// declaration's own checks already made, decides; a refusal there is recorded the same way.
+    /// Last, the two keys are written while the row holds no stored-envelope key, holds either no
+    /// preview key or the one declared (a preview-key update may have recorded it first), and the
+    /// device is still paired: a declaration completes a record and never replaces a key, so a
+    /// record that already holds the declared keys completes and one that holds others refuses.
+    ///
+    /// The outcome is written beside the keys, so a retry whose reply was lost finds what happened
+    /// however the attempt ended. A failure to reach a store is returned instead and keeps nothing,
+    /// and the next attempt decides afresh.
     ///
     /// # Errors
     ///
-    /// Returns an error when the row cannot be written or read back.
-    pub fn complete_keys(
+    /// Returns an error when the database cannot be read or written, and whatever `admitted` fails
+    /// with when that is not a lapsed admission.
+    #[allow(clippy::too_many_arguments)]
+    pub fn declare_keys(
         &self,
+        actor_id: &ActorId,
+        action_id: ActionId,
+        payload_digest: Digest256,
         device_id: DeviceId,
-        stored_envelope: &StoredEnvelopeKey,
-        notification_preview: &NotificationPreviewKey,
-    ) -> Result<Option<DeviceRecord>> {
-        self.with(|connection| {
-            connection
-                .execute(
-                    "UPDATE network_devices
-                        SET stored_envelope_key = ?2, notification_preview = ?3
-                      WHERE device_id = ?1
-                        AND stored_envelope_key IS NULL
-                        AND (notification_preview IS NULL OR notification_preview = ?3)
-                        AND revoked_at_ms IS NULL
-                        AND expired_at_ms IS NULL",
-                    params![
-                        device_id.get().as_bytes().as_slice(),
-                        stored_envelope.as_bytes().as_slice(),
-                        notification_preview.as_bytes().as_slice(),
-                    ],
-                )
-                .map(|_| ())
-        })?;
-        self.record_for_device(device_id)
+        declared: std::result::Result<DevicePublicKeys, ProtocolError>,
+        admitted: impl FnOnce() -> Result<()>,
+        now_ms: TimestampMs,
+    ) -> Result<RecordedDeclaration> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Immediate, for the reason `claim_action_route` gives. Dropping it without a commit rolls
+        // back everything it wrote.
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(ControllerError::registry)?;
+        if let Some(recorded) = read_declaration(&transaction, actor_id, action_id)? {
+            transaction.commit().map_err(ControllerError::registry)?;
+            return Ok(recorded);
+        }
+        let outcome = match admitted() {
+            Err(
+                lapse @ (ControllerError::PermissionDenied { .. }
+                | ControllerError::WindowExpired { .. }),
+            ) => KeyDeclaration::refused(&lapse.to_protocol_error()),
+            Err(failure) => return Err(failure),
+            Ok(()) => match declared {
+                Err(refusal) => KeyDeclaration::refused(&refusal),
+                Ok(keys) => write_declared_keys(&transaction, device_id, keys)
+                    .map_err(ControllerError::registry)?,
+            },
+        };
+        let encoded = kr_cbor::to_canonical_vec(&outcome).map_err(ControllerError::registry)?;
+        transaction
+            .execute(
+                "INSERT INTO network_key_declarations
+                     (actor_id, action_id, payload_digest, outcome, recorded_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    actor_id.as_str(),
+                    action_id.get().as_bytes().as_slice(),
+                    payload_digest.as_bytes().as_slice(),
+                    encoded,
+                    i64::try_from(now_ms.get()).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(ControllerError::registry)?;
+        transaction.commit().map_err(ControllerError::registry)?;
+        Ok(RecordedDeclaration {
+            payload_digest,
+            outcome,
+        })
+    }
+
+    /// Returns what one action's declaration ended as, when this host recorded one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the row cannot be read.
+    pub fn recorded_declaration(
+        &self,
+        actor_id: &ActorId,
+        action_id: ActionId,
+    ) -> Result<Option<RecordedDeclaration>> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        read_declaration(&connection, actor_id, action_id)
     }
 
     /// Returns the record of one device, paired or revoked.
@@ -1065,6 +1175,95 @@ fn read_record(row: &rusqlite::Row<'_>) -> Result<DeviceRecord> {
     })
 }
 
+/// Writes a declaration's two further keys, and says what the row holds afterwards.
+///
+/// The row is written only while it holds no stored-envelope key, holds either no preview key or
+/// the one declared, and the device is still paired, so a revocation that landed first stops it and
+/// a key already on record is never replaced. A preview key may be there already: pairing records
+/// it, and so does each preview-key update, at a new key revision this write leaves alone. What the
+/// row then holds decides the outcome: the declared keys complete, anything else refuses.
+fn write_declared_keys(
+    connection: &Connection,
+    device_id: DeviceId,
+    keys: DevicePublicKeys,
+) -> rusqlite::Result<KeyDeclaration> {
+    let device = device_id.get().as_bytes().to_vec();
+    connection.execute(
+        "UPDATE network_devices
+            SET stored_envelope_key = ?2, notification_preview = ?3
+          WHERE device_id = ?1
+            AND stored_envelope_key IS NULL
+            AND (notification_preview IS NULL OR notification_preview = ?3)
+            AND revoked_at_ms IS NULL
+            AND expired_at_ms IS NULL",
+        params![
+            device,
+            keys.stored_envelope.as_bytes().as_slice(),
+            keys.notification_preview.as_bytes().as_slice(),
+        ],
+    )?;
+    let held = connection
+        .query_row(
+            "SELECT stored_envelope_key, notification_preview, revoked_at_ms, expired_at_ms
+               FROM network_devices WHERE device_id = ?1",
+            params![device],
+            |row| {
+                Ok((
+                    row.get::<_, Option<Vec<u8>>>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                    row.get::<_, Option<i64>>(2)?.is_none()
+                        && row.get::<_, Option<i64>>(3)?.is_none(),
+                ))
+            },
+        )
+        .optional()?;
+    Ok(match held {
+        Some((stored, preview, true))
+            if stored.as_deref() == Some(keys.stored_envelope.as_bytes().as_slice())
+                && preview.as_deref() == Some(keys.notification_preview.as_bytes().as_slice()) =>
+        {
+            KeyDeclaration::Completed { device_id, keys }
+        }
+        Some((_, _, true)) => KeyDeclaration::Refused {
+            code: ErrorCode::PermissionDenied,
+            message: "the keys on record for this device are not the ones declared, and a \
+                      declaration does not replace a key"
+                .to_owned(),
+        },
+        Some((_, _, false)) | None => KeyDeclaration::Refused {
+            code: ErrorCode::PermissionDenied,
+            message: "this host does not pair with that device".to_owned(),
+        },
+    })
+}
+
+/// Reads one action's recorded declaration on a connection the caller already holds.
+fn read_declaration(
+    connection: &Connection,
+    actor_id: &ActorId,
+    action_id: ActionId,
+) -> Result<Option<RecordedDeclaration>> {
+    let row = connection
+        .query_row(
+            "SELECT payload_digest, outcome FROM network_key_declarations
+              WHERE actor_id = ?1 AND action_id = ?2",
+            params![actor_id.as_str(), action_id.get().as_bytes().as_slice()],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()
+        .map_err(ControllerError::registry)?;
+    let Some((digest, outcome)) = row else {
+        return Ok(None);
+    };
+    let payload_digest = Digest256::from_bytes(key(&digest)?);
+    let outcome = kr_cbor::from_canonical_slice(&outcome, &kr_cbor::Limits::DEFAULT)
+        .map_err(ControllerError::registry)?;
+    Ok(Some(RecordedDeclaration {
+        payload_digest,
+        outcome,
+    }))
+}
+
 /// Returns the grant identity a row records, for a caller that wants it without the grant.
 #[must_use]
 pub fn grant_id_of(record: &DeviceRecord) -> GrantId {
@@ -1242,6 +1441,58 @@ mod tests {
         );
     }
 
+    /// The four keys `device` declares, with the two further ones taken from `byte`.
+    fn declared(device: &DeviceRecord, byte: u8) -> DevicePublicKeys {
+        DevicePublicKeys {
+            transport: device.endpoint_id,
+            authorisation: device.authorisation,
+            stored_envelope: StoredEnvelopeKey::from_bytes([byte; 32]),
+            notification_preview: NotificationPreviewKey::from_bytes([byte ^ 0xff; 32]),
+        }
+    }
+
+    fn action(byte: u8) -> ActionId {
+        ActionId::new(Uuid::from_bytes([byte; 16]))
+    }
+
+    fn digest(byte: u8) -> Digest256 {
+        Digest256::from_bytes([byte; 32])
+    }
+
+    /// Declares `keys` for `device` under `action`, with its admission standing.
+    fn declare(
+        directory: &DeviceDirectory,
+        device: &DeviceRecord,
+        action_byte: u8,
+        declared: std::result::Result<DevicePublicKeys, ProtocolError>,
+    ) -> Result<RecordedDeclaration> {
+        directory.declare_keys(
+            &device.principal(),
+            action(action_byte),
+            digest(action_byte),
+            device.device_id,
+            declared,
+            || Ok(()),
+            TimestampMs::new(1_764_003_800_000),
+        )
+    }
+
+    fn an_earlier_device(directory: &DeviceDirectory, byte: u8) -> DeviceRecord {
+        let mut earlier = record(byte);
+        earlier.stored_envelope = None;
+        earlier.notification_preview = None;
+        directory.commit(&earlier).expect("committed");
+        earlier
+    }
+
+    fn keys_of(directory: &DeviceDirectory, device: &DeviceRecord) -> Option<DevicePublicKeys> {
+        directory
+            .record_for_device(device.device_id)
+            .expect("read")
+            .expect("present")
+            .public_keys()
+    }
+
     #[test]
     fn a_preview_key_is_updated_on_the_device_record() {
         let directory = DeviceDirectory::in_memory().expect("a directory");
@@ -1317,67 +1568,311 @@ mod tests {
         let directory = DeviceDirectory::in_memory().expect("a directory");
         let complete = record(1);
         directory.commit(&complete).expect("committed");
-        let read = directory
-            .record_for_device(complete.device_id)
-            .expect("read")
-            .expect("present");
-        assert!(read.public_keys().is_some());
-        assert_eq!(read.public_keys(), complete.public_keys());
+        assert!(keys_of(&directory, &complete).is_some());
+        assert_eq!(keys_of(&directory, &complete), complete.public_keys());
 
         // A device paired before this host kept every key has two of them.
-        let mut earlier = record(2);
-        earlier.stored_envelope = None;
-        earlier.notification_preview = None;
-        directory.commit(&earlier).expect("committed");
-        let before = directory
-            .record_for_device(earlier.device_id)
-            .expect("read")
-            .expect("present");
-        assert!(before.public_keys().is_none());
+        let earlier = an_earlier_device(&directory, 2);
+        assert!(keys_of(&directory, &earlier).is_none());
 
-        let stored = StoredEnvelopeKey::from_bytes([0x21; 32]);
-        let preview = NotificationPreviewKey::from_bytes([0x22; 32]);
-        let completed = directory
-            .complete_keys(earlier.device_id, &stored, &preview)
-            .expect("written")
-            .expect("present");
-        assert_eq!(completed.stored_envelope, Some(stored));
-        assert_eq!(completed.notification_preview, Some(preview));
+        let keys = declared(&earlier, 0x21);
+        let completed = declare(&directory, &earlier, 1, Ok(keys)).expect("decided");
+        assert_eq!(
+            completed.outcome,
+            KeyDeclaration::Completed {
+                device_id: earlier.device_id,
+                keys
+            }
+        );
+        assert_eq!(keys_of(&directory, &earlier), Some(keys));
 
-        // A second declaration changes nothing, whatever it declares: a declaration completes a
-        // record and never replaces a key.
+        // Another declaration of the same keys completes as well; one of other keys is refused
+        // and changes nothing, because a declaration completes a record and never replaces a key.
+        assert_eq!(
+            declare(&directory, &earlier, 2, Ok(keys))
+                .expect("decided")
+                .outcome,
+            completed.outcome
+        );
+        let replaced =
+            declare(&directory, &earlier, 3, Ok(declared(&earlier, 0x31))).expect("decided");
+        assert!(matches!(
+            replaced.outcome,
+            KeyDeclaration::Refused {
+                code: ErrorCode::PermissionDenied,
+                ..
+            }
+        ));
+        assert_eq!(keys_of(&directory, &earlier), Some(keys));
+    }
+
+    #[test]
+    fn an_outcome_is_recorded_with_the_write_and_answers_the_same_action_first() {
+        let directory = DeviceDirectory::in_memory().expect("a directory");
+        let earlier = an_earlier_device(&directory, 5);
+        let keys = declared(&earlier, 0x61);
+        let first = declare(&directory, &earlier, 7, Ok(keys)).expect("decided");
+        assert_eq!(
+            directory
+                .recorded_declaration(&earlier.principal(), action(7))
+                .expect("read"),
+            Some(first.clone())
+        );
+
+        // The same action again is answered from its record, before anything else is asked: not
+        // its admission, which may have lapsed since, and not what it declares.
         let again = directory
-            .complete_keys(
+            .declare_keys(
+                &earlier.principal(),
+                action(7),
+                digest(7),
                 earlier.device_id,
-                &StoredEnvelopeKey::from_bytes([0x31; 32]),
-                &NotificationPreviewKey::from_bytes([0x32; 32]),
+                Ok(declared(&earlier, 0x71)),
+                || panic!("a recorded action is not admitted again"),
+                TimestampMs::new(1_764_003_900_000),
             )
-            .expect("written")
-            .expect("present");
-        assert_eq!(again.stored_envelope, Some(stored));
-        assert_eq!(again.notification_preview, Some(preview));
+            .expect("answered");
+        assert_eq!(again, first);
+
+        // The record is the actor's own: another actor's action under the same identifier is not
+        // it.
+        let other = record(6);
+        assert_eq!(
+            directory
+                .recorded_declaration(&other.principal(), action(7))
+                .expect("read"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_lapsed_admission_or_a_failed_check_is_recorded_as_a_refusal_and_writes_no_key() {
+        let directory = DeviceDirectory::in_memory().expect("a directory");
+        let earlier = an_earlier_device(&directory, 8);
+        let keys = declared(&earlier, 0x81);
+
+        let lapsed = directory
+            .declare_keys(
+                &earlier.principal(),
+                action(1),
+                digest(1),
+                earlier.device_id,
+                Ok(keys),
+                || {
+                    Err(ControllerError::WindowExpired {
+                        detail: "the deadline this action was admitted under has passed".to_owned(),
+                    })
+                },
+                TimestampMs::new(1_764_003_800_000),
+            )
+            .expect("decided");
+        assert_eq!(
+            lapsed.outcome,
+            KeyDeclaration::Refused {
+                code: ErrorCode::PermissionDenied,
+                message: "the deadline this action was admitted under has passed".to_owned(),
+            }
+        );
+        assert!(keys_of(&directory, &earlier).is_none());
+
+        let unsigned = declare(
+            &directory,
+            &earlier,
+            2,
+            Err(ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "the declaration is not signed by the recorded key",
+            )),
+        )
+        .expect("decided");
+        assert_eq!(
+            unsigned.outcome,
+            KeyDeclaration::Refused {
+                code: ErrorCode::PermissionDenied,
+                message: "the declaration is not signed by the recorded key".to_owned(),
+            }
+        );
+        assert!(keys_of(&directory, &earlier).is_none());
+        for (byte, refused) in [(1, &lapsed), (2, &unsigned)] {
+            assert_eq!(
+                directory
+                    .recorded_declaration(&earlier.principal(), action(byte))
+                    .expect("read")
+                    .as_ref(),
+                Some(refused)
+            );
+        }
+
+        // A later action that stands completes the record.
+        let completed = declare(&directory, &earlier, 3, Ok(keys)).expect("decided");
+        assert!(matches!(
+            completed.outcome,
+            KeyDeclaration::Completed { .. }
+        ));
+    }
+
+    #[test]
+    fn the_admission_is_asked_with_the_directory_and_the_database_write_lock_held() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("registry.sqlite");
+        let directory = DeviceDirectory::open(&path).expect("a directory");
+        let earlier = an_earlier_device(&directory, 10);
+
+        // Every wait comes before the question: once it is asked, no other writer can take the
+        // database and nobody else holds the directory, so the answer still stands at the commit.
+        let mut asked = false;
+        let completed = directory
+            .declare_keys(
+                &earlier.principal(),
+                action(1),
+                digest(1),
+                earlier.device_id,
+                Ok(declared(&earlier, 0xa1)),
+                || {
+                    asked = true;
+                    assert!(
+                        directory.connection.try_lock().is_err(),
+                        "the directory is held"
+                    );
+                    let other = Connection::open(&path).expect("another connection");
+                    other
+                        .busy_timeout(std::time::Duration::ZERO)
+                        .expect("no wait");
+                    assert!(
+                        other.execute_batch("BEGIN IMMEDIATE").is_err(),
+                        "the database's write lock is held"
+                    );
+                    Ok(())
+                },
+                TimestampMs::new(1_764_003_800_000),
+            )
+            .expect("decided");
+        assert!(asked);
+        assert!(matches!(
+            completed.outcome,
+            KeyDeclaration::Completed { .. }
+        ));
+    }
+
+    #[test]
+    fn a_failure_between_the_write_and_the_record_keeps_neither() {
+        let directory = DeviceDirectory::in_memory().expect("a directory");
+        let earlier = an_earlier_device(&directory, 9);
+        let keys = declared(&earlier, 0x91);
+
+        // A store that cannot keep the outcome, after the keys were written in the same
+        // transaction.
+        directory
+            .with(|connection| {
+                connection.execute_batch(
+                    "CREATE TRIGGER no_outcomes BEFORE INSERT ON network_key_declarations
+                     BEGIN SELECT RAISE(ABORT, 'the disk is full'); END;",
+                )
+            })
+            .expect("a trigger");
+        assert!(declare(&directory, &earlier, 1, Ok(keys)).is_err());
+        assert!(
+            keys_of(&directory, &earlier).is_none(),
+            "keys without their outcome are not kept"
+        );
+
+        // An admission that could not be asked decides nothing either.
+        directory
+            .with(|connection| connection.execute_batch("DROP TRIGGER no_outcomes"))
+            .expect("dropped");
+        let unasked = directory.declare_keys(
+            &earlier.principal(),
+            action(1),
+            digest(1),
+            earlier.device_id,
+            Ok(keys),
+            || Err(ControllerError::registry("the registry is locked")),
+            TimestampMs::new(1_764_003_800_000),
+        );
+        assert!(matches!(
+            unasked,
+            Err(ControllerError::RegistryUnavailable { .. })
+        ));
+        assert_eq!(
+            directory
+                .recorded_declaration(&earlier.principal(), action(1))
+                .expect("read"),
+            None
+        );
+        assert!(keys_of(&directory, &earlier).is_none());
+
+        // The same action then decides afresh.
+        let completed = declare(&directory, &earlier, 1, Ok(keys)).expect("decided");
+        assert!(matches!(
+            completed.outcome,
+            KeyDeclaration::Completed { .. }
+        ));
+        assert_eq!(keys_of(&directory, &earlier), Some(keys));
+    }
+
+    #[test]
+    fn a_record_holding_its_preview_key_completes_with_that_key_and_refuses_another() {
+        let directory = DeviceDirectory::in_memory().expect("a directory");
+        // A device a host kept three of its keys for: the preview key from its pairing, replaced
+        // since by an update at a new key revision.
+        let mut earlier = record(11);
+        earlier.stored_envelope = None;
+        directory.commit(&earlier).expect("committed");
+        let rotated = NotificationPreviewKey::from_bytes([0x77; 32]);
+        assert_eq!(
+            directory
+                .update_preview_key(earlier.device_id, rotated, DeviceKeyRevision::new(2))
+                .expect("a write"),
+            PreviewKeyOutcome::Recorded
+        );
+
+        // A declaration naming the preview key the update replaced is refused and writes nothing.
+        let mut replaced = declared(&earlier, 0x61);
+        replaced.notification_preview = earlier.notification_preview.expect("a preview key");
+        let refused = declare(&directory, &earlier, 1, Ok(replaced)).expect("decided");
+        assert!(matches!(
+            refused.outcome,
+            KeyDeclaration::Refused {
+                code: ErrorCode::PermissionDenied,
+                ..
+            }
+        ));
+        assert!(keys_of(&directory, &earlier).is_none());
+
+        // One naming the key on record completes the record and leaves its key revision alone.
+        let mut current = declared(&earlier, 0x61);
+        current.notification_preview = rotated;
+        let completed = declare(&directory, &earlier, 2, Ok(current)).expect("decided");
+        assert!(matches!(
+            completed.outcome,
+            KeyDeclaration::Completed { .. }
+        ));
+        let stored = directory
+            .record_for_device(earlier.device_id)
+            .expect("a read")
+            .expect("the record");
+        assert_eq!(stored.public_keys(), Some(current));
+        assert_eq!(stored.device_key_revision, DeviceKeyRevision::new(2));
     }
 
     #[test]
     fn a_revoked_device_cannot_complete_its_keys() {
         let directory = DeviceDirectory::in_memory().expect("a directory");
-        let mut earlier = record(3);
-        earlier.stored_envelope = None;
-        earlier.notification_preview = None;
-        directory.commit(&earlier).expect("committed");
+        let earlier = an_earlier_device(&directory, 3);
         directory
             .revoke(earlier.device_id, TimestampMs::new(5))
             .expect("revoked");
-        let after = directory
-            .complete_keys(
-                earlier.device_id,
-                &StoredEnvelopeKey::from_bytes([0x41; 32]),
-                &NotificationPreviewKey::from_bytes([0x42; 32]),
-            )
-            .expect("read back")
-            .expect("present");
+        let refused =
+            declare(&directory, &earlier, 1, Ok(declared(&earlier, 0x41))).expect("decided");
+        assert_eq!(
+            refused.outcome,
+            KeyDeclaration::Refused {
+                code: ErrorCode::PermissionDenied,
+                message: "this host does not pair with that device".to_owned(),
+            }
+        );
         assert!(
-            after.public_keys().is_none(),
+            keys_of(&directory, &earlier).is_none(),
             "a revoked device's record is not completed"
         );
     }
@@ -1431,14 +1926,12 @@ mod tests {
             .expect("present");
         assert!(read.is_paired(), "the earlier device keeps its host access");
         assert!(read.public_keys().is_none());
-        let completed = directory
-            .complete_keys(
-                device.device_id,
-                &StoredEnvelopeKey::from_bytes([0x51; 32]),
-                &NotificationPreviewKey::from_bytes([0x52; 32]),
-            )
-            .expect("written")
-            .expect("present");
-        assert!(completed.public_keys().is_some());
+        let keys = declared(&device, 0x51);
+        let completed = declare(&directory, &device, 1, Ok(keys)).expect("decided");
+        assert!(matches!(
+            completed.outcome,
+            KeyDeclaration::Completed { .. }
+        ));
+        assert_eq!(keys_of(&directory, &device), Some(keys));
     }
 }

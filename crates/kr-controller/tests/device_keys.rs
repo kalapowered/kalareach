@@ -297,3 +297,59 @@ async fn an_exact_retry_of_a_completion_is_answered_from_its_record_after_a_reco
         .expect_err("a reused action identity");
     assert_eq!(reused.code, ErrorCode::IdConflict);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exact_retry_of_a_refused_declaration_is_given_the_same_refusal_after_a_reconnect() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = Device::create().await;
+    let record = net_support::pair_with(&host, &device, &owner, net_support::proposal(OWNER)).await;
+    as_an_earlier_host_wrote_it(&host, record.device_id);
+
+    let stranger = DeviceKeys::generate().expect("other keys");
+    let forged = declaration(record.device_id, device.keys().public_keys(), &stranger);
+    let action = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+    let target = ActionTarget::environment(host.environment_id);
+
+    let first_connection = RawDevice::connect(&host, &device, &record).await;
+    first_connection.claim();
+    let first = first_connection
+        .mutate(Method::DeviceKeysComplete, action, target.clone(), &forged)
+        .await
+        .expect_err("a declaration another key signed");
+    assert_eq!(first.code, ErrorCode::PermissionDenied);
+    let window = first_connection.action_window_id();
+    first_connection.close();
+
+    // The refusal was this action's answer, and it is given again: the exact retry, presented on
+    // a later connection in the window it was first sent in, is answered from the record of what
+    // happened rather than told that its window has gone.
+    let later_connection = RawDevice::connect(&host, &device, &record).await;
+    later_connection.claim();
+    let replayed = later_connection
+        .mutate_in(
+            window,
+            Method::DeviceKeysComplete,
+            action,
+            target.clone(),
+            &forged,
+        )
+        .await
+        .expect_err("the same refusal");
+    assert_eq!(replayed, first);
+
+    // It wrote nothing, and the device's own declaration under an action of its own completes the
+    // record.
+    let completed: DeviceKeysCompleteResult = later_connection
+        .mutate(
+            Method::DeviceKeysComplete,
+            kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+            target,
+            &declaration(record.device_id, device.keys().public_keys(), device.keys()),
+        )
+        .await
+        .expect("the device's own declaration")
+        .to_typed()
+        .expect("a completion result");
+    assert_eq!(completed.keys, device.keys().public_keys());
+}

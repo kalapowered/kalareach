@@ -1829,9 +1829,25 @@ impl Controller {
                 | Method::GrantRevoke
                 | Method::DeviceRevoke
                 | Method::DevicePreviewKeyUpdate
-                | Method::DeviceKeysComplete
         ) {
             return self.retained_authority_change(actor_id, mutation);
+        }
+        // A declaration of a device's keys is answered the same way, from the outcome the device
+        // directory recorded beside the keys: a completion or a refusal alike, so a retry whose
+        // reply was lost is told what happened rather than that its window is gone.
+        if method == Method::DeviceKeysComplete {
+            let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).ok()?;
+            return match self
+                .devices
+                .recorded_declaration(actor_id, mutation.action_id)
+            {
+                Ok(Some(recorded)) => Some(respond(
+                    mutation.request_id,
+                    declaration_answer(mutation, &digest, recorded),
+                )),
+                Ok(None) => None,
+                Err(error) => Some(respond(mutation.request_id, Err(error))),
+            };
         }
         // A voice change is one of those records: section 9 keeps a receipt readable after the
         // window that admitted it has expired, and a retry that cannot reach its result would
@@ -4040,73 +4056,102 @@ impl Controller {
     /// with the record and a declaration of any others with a refusal: a declaration completes a
     /// record, it never replaces a key.
     ///
+    /// The declaration's own checks come first, before the registry is taken: the keys they
+    /// compare never change for a device, and the write checks its pairing again. The admission
+    /// the declaration carries, the write and the record of the outcome are then one transaction
+    /// in the device directory, taken with the registry held, so a revocation or a deadline that
+    /// passed while this waited stops the write, and whatever the declaration ends as is kept with
+    /// it. A retry of the same action is answered from that record; a failure to reach a store
+    /// keeps nothing.
+    ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::PermissionDenied`] for a device this host no longer pairs with,
-    /// for keys that are not the recorded ones, for a signature that does not verify and for a
-    /// declaration of keys other than the ones on record; [`ControllerError::InvalidArgument`] for
-    /// malformed parameters or a key declared for two purposes; and a storage error when the record
-    /// cannot be written.
-    async fn device_keys_complete(
+    /// Returns the refusal the device is given: [`ControllerError::PermissionDenied`] for a device
+    /// this host no longer pairs with, for keys that are not the recorded ones, for a signature
+    /// that does not verify, for a declaration of keys other than the ones on record and for an
+    /// admission that has lapsed; [`ControllerError::InvalidArgument`] for malformed parameters or
+    /// a key declared for two purposes; [`ControllerError::IdConflict`] for an action identifier
+    /// this host recorded with another request; and a storage error when a store cannot be
+    /// reached.
+    pub(crate) async fn device_keys_declared(
         &self,
+        actor_id: &ActorId,
         device_id: kr_protocol::ids::DeviceId,
         mutation: &MutationRequest,
         carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
-        let params: kr_protocol::sharing::DeviceKeysCompleteParams = parse(&mutation.params)?;
-        let denied = |detail: &str| ControllerError::PermissionDenied {
-            detail: detail.to_owned(),
+        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        let declared = self.declared_keys(device_id, mutation)?;
+        let recorded = {
+            let registry = self.registry.lock().await;
+            self.devices.declare_keys(
+                actor_id,
+                mutation.action_id,
+                digest,
+                device_id,
+                declared,
+                || self.check_admission(&registry, &carried),
+                kr_ipc::now_ms(),
+            )?
         };
-        let record = self
+        declaration_answer(mutation, &digest, recorded)
+    }
+
+    /// Makes a declaration's own checks, the ones made before its transaction.
+    ///
+    /// The outer error is a store that could not be read, which decides nothing; the inner one is
+    /// a refusal, which a retry of the same declaration would meet again.
+    fn declared_keys(
+        &self,
+        device_id: kr_protocol::ids::DeviceId,
+        mutation: &MutationRequest,
+    ) -> Result<std::result::Result<kr_protocol::pairing::DevicePublicKeys, ProtocolError>> {
+        let denied = |detail: &str| {
+            Err(ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                detail.to_owned(),
+            ))
+        };
+        let params: kr_protocol::sharing::DeviceKeysCompleteParams = match parse(&mutation.params) {
+            Ok(params) => params,
+            Err(refusal) => return Ok(Err(refusal.to_protocol_error())),
+        };
+        let Some(record) = self
             .devices
             .record_for_device(device_id)?
             .filter(net::devices::DeviceRecord::is_paired)
-            .ok_or_else(|| denied("this host does not pair with that device"))?;
+        else {
+            return Ok(denied("this host does not pair with that device"));
+        };
         let keys = params.keys;
         if keys.transport != record.endpoint_id || keys.authorisation != record.authorisation {
-            return Err(denied(
+            return Ok(denied(
                 "the declared transport and authorisation keys are not the ones this host \
                  recorded at pairing",
             ));
         }
         if !keys.purposes_are_distinct() {
-            return Err(ControllerError::InvalidArgument(
-                "each of a device's four keys is a different key".to_owned(),
-            ));
+            return Ok(Err(ProtocolError::new(
+                ErrorCode::InvalidArgument,
+                "each of a device's four keys is a different key",
+            )));
         }
         let declaration = kr_protocol::sharing::DeviceKeysDeclaration { device_id, keys };
-        kr_crypto::sign::verify_object(
+        if kr_crypto::sign::verify_object(
             &record.authorisation,
             kr_protocol::sharing::DEVICE_KEYS_DOMAIN,
             &declaration,
             &params.signature,
         )
-        .map_err(|_| {
-            denied(
+        .is_err()
+        {
+            return Ok(denied(
                 "the declaration is not signed by the authorisation key this host recorded for \
                  the device",
-            )
-        })?;
-        // The admission is asked about again with the registry held and nothing awaited before the
-        // write, so a revocation or a deadline that passed while this waited stops it here; the
-        // write itself also refuses a row that is no longer paired.
-        let stored = {
-            let registry = self.registry.lock().await;
-            self.check_admission(&registry, &carried)?;
-            self.devices.complete_keys(
-                device_id,
-                &keys.stored_envelope,
-                &keys.notification_preview,
-            )?
-        }
-        .ok_or_else(|| denied("this host does not pair with that device"))?;
-        if stored.public_keys() != Some(keys) {
-            return Err(denied(
-                "this device's keys are already on record, and a declaration does not replace a \
-                 key",
             ));
         }
-        encode(&kr_protocol::sharing::DeviceKeysCompleteResult { device_id, keys })
+        Ok(Ok(keys))
     }
 
     /// Performs one authority change under a durable claim, and records what it produced.
@@ -4115,21 +4160,6 @@ impl Controller {
     /// two `grant.revoke` calls under one action identifier would otherwise advance the revision
     /// twice and fence the host twice for one withdrawal. A claim this host already answered is
     /// answered again from its record rather than performed a second time.
-    /// Serves `device.keys.complete` for a paired device, as an authority change.
-    ///
-    /// # Errors
-    ///
-    /// Returns the refusal the device is given.
-    pub(crate) async fn device_keys_declared(
-        &self,
-        actor_id: &ActorId,
-        mutation: &MutationRequest,
-        carried: crate::authority::AdmittedMutation,
-    ) -> Result<ParamsValue> {
-        self.authority_change(actor_id, mutation, Method::DeviceKeysComplete, carried)
-            .await
-    }
-
     async fn authority_change(
         &self,
         actor_id: &ActorId,
@@ -4147,18 +4177,6 @@ impl Controller {
             Method::DeviceRevoke => self.device_revoke(mutation, carried).await?,
             Method::DevicePreviewKeyUpdate => {
                 self.device_preview_key_update(actor_id, mutation).await?
-            }
-            // A device completing its own record changes what this host reports about a paired
-            // device, so it is held to the same claim and the same retained answer: a retry whose
-            // reply was lost is answered from the record of what it did, after its window is gone.
-            Method::DeviceKeysComplete => {
-                let device_id = self.paired_device(actor_id).ok_or_else(|| {
-                    ControllerError::PermissionDenied {
-                        detail: "only a paired device declares its own keys".to_owned(),
-                    }
-                })?;
-                self.device_keys_complete(device_id, mutation, carried)
-                    .await?
             }
             _ => {
                 return Err(ControllerError::InvalidArgument(format!(
@@ -7642,6 +7660,31 @@ fn is_owners_own_socket(actor_id: &ActorId) -> bool {
 
 /// How the local listener names the operating-system peer it admitted.
 const LOCAL_PRINCIPAL_PREFIX: &str = "local:";
+
+/// Answers a key declaration from its recorded outcome.
+///
+/// The record is keyed by the actor and the action, and the digest decides whether this is the
+/// same request or a reused identifier.
+fn declaration_answer(
+    mutation: &MutationRequest,
+    digest: &kr_protocol::scalars::Digest256,
+    recorded: net::devices::RecordedDeclaration,
+) -> Result<ParamsValue> {
+    if recorded.payload_digest != *digest {
+        return Err(ControllerError::IdConflict {
+            token: mutation.action_id.to_string(),
+        });
+    }
+    match recorded.outcome {
+        net::devices::KeyDeclaration::Completed { device_id, keys } => {
+            encode(&kr_protocol::sharing::DeviceKeysCompleteResult { device_id, keys })
+        }
+        net::devices::KeyDeclaration::Refused { code, message } => Err(ControllerError::Refused {
+            code,
+            detail: message,
+        }),
+    }
+}
 
 fn respond(request_id: RequestId, outcome: Result<ParamsValue>) -> ControlFrame {
     match outcome {

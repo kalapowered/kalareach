@@ -1057,10 +1057,10 @@ impl RemoteConnection {
                 }
             }
             // A device completing its own record: the daemon's own effect, on this device's own
-            // row and nothing else, held to the claim and the retained answer an authority change
-            // is. The parameters name no device; the one written is the one this connection
-            // authenticated as, and the admission travels with the declaration so the write asks
-            // about it again.
+            // row and nothing else. The parameters name no device; the one written is the one this
+            // connection authenticated as. The admission travels with the declaration, so the
+            // transaction that writes the keys asks about it again and records the outcome beside
+            // them, which is what a retry of this action is answered from.
             Method::DeviceKeysComplete => {
                 if let Err(refusal) = self.claim_route(mutation, None) {
                     return failure(mutation.request_id, refusal.into_error());
@@ -1072,7 +1072,7 @@ impl RemoteConnection {
                 };
                 match self
                     .controller
-                    .device_keys_declared(&actor_id, mutation, carried)
+                    .device_keys_declared(&actor_id, self.device.device_id, mutation, carried)
                     .await
                 {
                     Ok(value) => ControlFrame::Response(Response {
