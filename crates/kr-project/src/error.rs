@@ -96,6 +96,31 @@ pub enum ProjectError {
         /// The identifier that was named.
         operation: Diagnostic,
     },
+    /// The named authorised location does not exist here.
+    UnknownLocation {
+        /// The identifier that was named.
+        location: Diagnostic,
+    },
+    /// An enlargement of authority arrived without the owner's confirmation of exactly it.
+    ///
+    /// The proof answers another challenge, or there is no outstanding challenge for this action
+    /// to answer. Nothing was performed and nothing is retained: the same action submitted without
+    /// a proof is answered with a challenge.
+    Unconfirmed {
+        /// What was missing or did not match.
+        detail: Diagnostic,
+    },
+    /// The daemon declined something this service asked it: an owner confirmation, or whether a
+    /// grant is current.
+    ///
+    /// The daemon decides under which code, and this carries it rather than translating it, as
+    /// [`Self::NotAdmitted`] does for an admission.
+    Declined {
+        /// The code the daemon decided.
+        code: ErrorCode,
+        /// What it said.
+        detail: Diagnostic,
+    },
     /// The destination is not usable for this operation.
     Destination {
         /// What is wrong with it.
@@ -241,6 +266,9 @@ impl ProjectError {
             Self::UnknownProject { .. } => "UnknownProject",
             Self::UnknownWorkspace { .. } => "UnknownWorkspace",
             Self::UnknownOperation { .. } => "UnknownOperation",
+            Self::UnknownLocation { .. } => "UnknownLocation",
+            Self::Unconfirmed { .. } => "Unconfirmed",
+            Self::Declined { .. } => "Declined",
             Self::Destination { .. } => "Destination",
             Self::AdoptionRequired { .. } => "AdoptionRequired",
             Self::IdentityChanged { .. } => "IdentityChanged",
@@ -276,6 +304,7 @@ impl ProjectError {
             Self::UnknownProject { project } => format!("no repository {project}"),
             Self::UnknownWorkspace { workspace } => format!("no workspace {workspace}"),
             Self::UnknownOperation { operation } => format!("no repository operation {operation}"),
+            Self::UnknownLocation { location } => format!("no authorised location {location}"),
             Self::IdConflict { action, method } => {
                 format!("action {action} was already used for {method}")
             }
@@ -293,6 +322,8 @@ impl ProjectError {
             | Self::PermissionDenied { detail }
             | Self::OutcomeUnknown { detail }
             | Self::NotAdmitted { detail, .. }
+            | Self::Unconfirmed { detail }
+            | Self::Declined { detail, .. }
             | Self::Retained { detail, .. }
             | Self::Cancelled { detail }
             | Self::QuotaExceeded { detail }
@@ -323,7 +354,9 @@ impl ProjectError {
             Self::WrongEnvironment { .. } => ErrorCode::EnvironmentUnavailable,
             Self::UnknownProject { .. }
             | Self::UnknownWorkspace { .. }
-            | Self::UnknownOperation { .. } => ErrorCode::ResourceUnavailable,
+            | Self::UnknownOperation { .. }
+            | Self::UnknownLocation { .. } => ErrorCode::ResourceUnavailable,
+            Self::Unconfirmed { .. } => ErrorCode::OwnerConfirmationRequired,
             // A destination that is taken, a repository whose identity moved and a configuration
             // this host will not execute are all the same answer to a caller: change the thing you
             // named and ask again.
@@ -341,7 +374,9 @@ impl ProjectError {
             Self::PermissionDenied { .. } => ErrorCode::PermissionDenied,
             Self::IdConflict { .. } => ErrorCode::IdConflict,
             Self::OutcomeUnknown { .. } => ErrorCode::OutcomeUnknown,
-            Self::NotAdmitted { code, .. } | Self::Retained { code, .. } => *code,
+            Self::NotAdmitted { code, .. }
+            | Self::Declined { code, .. }
+            | Self::Retained { code, .. } => *code,
             Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
         }
     }
@@ -405,6 +440,16 @@ mod tests {
             },
             ProjectError::UnknownOperation {
                 operation: HOSTILE.to_owned().into(),
+            },
+            ProjectError::UnknownLocation {
+                location: HOSTILE.to_owned().into(),
+            },
+            ProjectError::Unconfirmed {
+                detail: HOSTILE.to_owned().into(),
+            },
+            ProjectError::Declined {
+                code: ErrorCode::PermissionDenied,
+                detail: HOSTILE.to_owned().into(),
             },
             ProjectError::Destination {
                 detail: HOSTILE.to_owned().into(),

@@ -820,3 +820,190 @@ pub const fn include_everything() -> kr_protocol::project::InclusionPolicy {
         generated_artefacts: Include,
     }
 }
+
+/// The daemon's owner, as the location tests stand it in.
+///
+/// It issues challenges the way the daemon's ceremony does, keeps them outstanding, and accepts a
+/// proof only when it answers a challenge it issued for exactly the enlargement the service
+/// presents, carrying the signature [`sign`] makes. Each challenge is consumed once. Grants are the
+/// ones a test gives it, and a grant a test revokes is refused as the daemon would refuse it.
+#[derive(Debug, Default)]
+pub struct TestOwner {
+    outstanding: std::sync::Mutex<
+        Vec<(
+            kr_protocol::pairing::OwnerConfirmationRequest,
+            kr_project::policy::Enlargement,
+        )>,
+    >,
+    grants: std::sync::Mutex<
+        std::collections::BTreeMap<kr_protocol::ids::GrantId, kr_project::policy::GrantReach>,
+    >,
+    issued: std::sync::atomic::AtomicU64,
+}
+
+/// The signature a test owner's proof carries.
+const TEST_SIGNATURE: [u8; 64] = [0x5a; 64];
+
+impl TestOwner {
+    /// Adds a grant this owner will say stands.
+    pub fn grant_to(
+        &self,
+        grant_id: kr_protocol::ids::GrantId,
+        actions: &[kr_protocol::rights::ActionRight],
+    ) {
+        self.grants.lock().expect("the grants").insert(
+            grant_id,
+            kr_project::policy::GrantReach {
+                recipient_device_id: kr_protocol::ids::DeviceId::new(grant_id.get()),
+                actions: actions.iter().copied().collect(),
+            },
+        );
+    }
+
+    /// Takes a grant away, as a revocation does.
+    pub fn revoke(&self, grant_id: kr_protocol::ids::GrantId) {
+        self.grants.lock().expect("the grants").remove(&grant_id);
+    }
+
+    /// Returns how many challenges this owner has issued.
+    #[must_use]
+    pub fn issued(&self) -> u64 {
+        self.issued.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Returns how many challenges are still outstanding.
+    #[must_use]
+    pub fn outstanding(&self) -> usize {
+        self.outstanding.lock().expect("the challenges").len()
+    }
+}
+
+impl kr_project::policy::OwnerAuthority for TestOwner {
+    fn challenge(
+        &self,
+        enlargement: &kr_project::policy::Enlargement,
+    ) -> Result<kr_protocol::pairing::OwnerConfirmationRequest, kr_protocol::error::ProtocolError>
+    {
+        let number = self
+            .issued
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .wrapping_add(1);
+        let mut identity = [0_u8; 16];
+        identity[..8].copy_from_slice(&number.to_be_bytes());
+        let request = kr_protocol::pairing::OwnerConfirmationRequest {
+            confirmation_id: kr_protocol::ids::ConfirmationId::new(
+                kr_protocol::scalars::Uuid::from_bytes(identity),
+            ),
+            action: kr_protocol::pairing::SensitiveAction::EnlargeGrant,
+            action_digest: enlargement.action_digest,
+            destination_keys: kr_protocol::scalars::Nullable(None),
+            destination_rights: enlargement.rights.clone(),
+            host_device_id: kr_protocol::ids::DeviceId::new(
+                kr_protocol::scalars::Uuid::from_bytes([0x11; 16]),
+            ),
+            host_endpoint_id: kr_protocol::scalars::EndpointKey::from_bytes([0x22; 32]),
+            nonce: kr_protocol::scalars::Nonce256::from_bytes([0x33; 32]),
+            expires_at_ms: kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get() + 120_000),
+        };
+        self.outstanding
+            .lock()
+            .expect("the challenges")
+            .push((request.clone(), enlargement.clone()));
+        Ok(request)
+    }
+
+    fn accept(
+        &self,
+        enlargement: &kr_project::policy::Enlargement,
+        proof: &kr_protocol::pairing::OwnerConfirmationProof,
+    ) -> Result<(), kr_protocol::error::ProtocolError> {
+        let refused = |why: &str| {
+            kr_protocol::error::ProtocolError::new(
+                kr_protocol::error::ErrorCode::OwnerConfirmationRequired,
+                format!("the owner's confirmation does not authorise this: {why}"),
+            )
+        };
+        if proof.signature != kr_protocol::scalars::Signature64::from_bytes(TEST_SIGNATURE) {
+            return Err(refused("the signature is not the owner's"));
+        }
+        let mut outstanding = self.outstanding.lock().expect("the challenges");
+        let Some(position) = outstanding
+            .iter()
+            .position(|(request, _)| request == &proof.request)
+        else {
+            return Err(refused("no such challenge is outstanding"));
+        };
+        if &outstanding[position].1 != enlargement
+            || proof.request.action_digest != enlargement.action_digest
+            || proof.request.destination_rights != enlargement.rights
+        {
+            return Err(refused("the challenge was issued for something else"));
+        }
+        outstanding.remove(position);
+        Ok(())
+    }
+
+    fn grant(
+        &self,
+        grant_id: kr_protocol::ids::GrantId,
+    ) -> Result<kr_project::policy::GrantReach, kr_protocol::error::ProtocolError> {
+        self.grants
+            .lock()
+            .expect("the grants")
+            .get(&grant_id)
+            .cloned()
+            .ok_or_else(|| {
+                kr_protocol::error::ProtocolError::new(
+                    kr_protocol::error::ErrorCode::PermissionDenied,
+                    format!("grant {grant_id} was revoked or has expired"),
+                )
+            })
+    }
+}
+
+/// The owner's proof for one challenge.
+#[must_use]
+pub fn sign(
+    request: &kr_protocol::pairing::OwnerConfirmationRequest,
+) -> kr_protocol::pairing::OwnerConfirmationProof {
+    kr_protocol::pairing::OwnerConfirmationProof {
+        request: request.clone(),
+        channel: kr_protocol::pairing::ConfirmationChannel::EnrolledPresenceSigner,
+        signer_key_id: kr_protocol::scalars::KeyId::from_bytes([0x44; 32]),
+        signature: kr_protocol::scalars::Signature64::from_bytes(TEST_SIGNATURE),
+    }
+}
+
+/// One submission of an action. The same action identifier carries a different payload digest
+/// once its proof is added, as a real submission's does.
+#[must_use]
+pub fn submission(method: &str, seed: u8, proven: bool) -> kr_project::store::Action {
+    let mut digest = [seed; 32];
+    if proven {
+        digest[0] ^= 0x80;
+    }
+    kr_project::store::Action {
+        actor_id: actor(),
+        action_id: kr_protocol::scalars::Uuid::from_bytes([seed; 16]),
+        method: method.to_owned(),
+        payload_digest: kr_protocol::scalars::Digest256::from_bytes(digest),
+    }
+}
+
+/// Returns the kinds of every event the outbox of one environment's journal holds, in order.
+///
+/// Read from the file rather than through the service, because what is being established is what
+/// a consumer of the outbox would read.
+#[must_use]
+pub fn outbox(host: &TempHost) -> Vec<(String, String)> {
+    let journal = ProjectService::root_of(&host.environment()).join("projects.sqlite");
+    let connection = rusqlite::Connection::open(&journal).expect("the journal opens");
+    let mut statement = connection
+        .prepare("SELECT kind, subject FROM events ORDER BY sequence")
+        .expect("the outbox reads");
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("the outbox reads")
+        .map(|row| row.expect("an event"))
+        .collect()
+}

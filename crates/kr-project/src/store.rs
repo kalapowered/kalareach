@@ -30,8 +30,8 @@ use std::path::Path;
 
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{
-    ActionId, ActorId, ChangeSetId, EnvironmentId, ProjectRepositoryId, SessionId, WorkflowRunId,
-    WorkspaceId,
+    ActionId, ActorId, ChangeSetId, EnvironmentId, ProjectLocationId, ProjectRepositoryId,
+    SessionId, WorkflowRunId, WorkspaceId,
 };
 use kr_protocol::project::{
     AdoptionFlow, DestinationState, InclusionChoice, InclusionPolicy, IsolationMechanism,
@@ -48,7 +48,7 @@ use crate::identity::RepositoryIdentity;
 use crate::operation::StagedWitness;
 
 /// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// What an inclusion records for a path whose outcome it has not established.
 pub const PROGRESS_PLANNED: &str = "planned";
@@ -81,6 +81,25 @@ pub struct ProjectRow {
     pub remote: Option<RemoteSpecification>,
     /// When the record was written.
     pub created_at_ms: TimestampMs,
+    /// The destination location it was created or adopted through, and its name there.
+    ///
+    /// Provenance, not authority: a destination is where something may be created, and reading
+    /// the repository later is a source's business. Nothing reaches the repository through this.
+    pub created_through: Option<LocatedName>,
+    /// The source location it is read through, and its working tree's name beneath it.
+    ///
+    /// Written by the owner's explicit binding and by nothing else. A repository with none is
+    /// reachable through no location, whatever created it and whenever it was recorded.
+    pub source: Option<LocatedName>,
+}
+
+/// One name beneath one authorised location.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocatedName {
+    /// The location.
+    pub location_id: ProjectLocationId,
+    /// The name beneath it, one component or several.
+    pub relative_path: String,
 }
 
 /// What one operation state change records beside the state.
@@ -464,7 +483,11 @@ impl Store {
                      remote_url            TEXT,
                      remote_provider       TEXT,
                      remote_broker         TEXT,
-                     created_at_ms         INTEGER NOT NULL
+                     created_at_ms         INTEGER NOT NULL,
+                     created_location_id   BLOB,
+                     created_relative_path TEXT,
+                     source_location_id    BLOB,
+                     source_relative_path  TEXT
                  );
                  CREATE TABLE IF NOT EXISTS workspaces (
                      workspace_id          BLOB PRIMARY KEY,
@@ -577,7 +600,20 @@ impl Store {
                  CREATE TABLE IF NOT EXISTS cursors (
                      consumer TEXT PRIMARY KEY,
                      sequence INTEGER NOT NULL
-                 );",
+                 );
+                 CREATE TABLE IF NOT EXISTS authorised_locations (
+                     location_id      BLOB PRIMARY KEY,
+                     grant_id         BLOB,
+                     environment_id   BLOB NOT NULL,
+                     purpose          TEXT NOT NULL,
+                     label            TEXT NOT NULL,
+                     path             TEXT NOT NULL,
+                     state            TEXT NOT NULL,
+                     authorised_at_ms INTEGER NOT NULL,
+                     withdrawn_at_ms  INTEGER
+                 );
+                 CREATE INDEX IF NOT EXISTS authorised_location_grant
+                     ON authorised_locations (grant_id, environment_id, state);",
             )
             .map_err(ProjectError::store)?;
         let recorded: Option<i64> = transaction
@@ -608,7 +644,10 @@ impl Store {
             // version moves on for a change that adds no column at all. Version 5 is where a
             // retained item stopped being identified by its reason alone, so that protecting a
             // reason cannot make two items one. Version 6 is where the rule reached inside a
-            // recorded answer, which holds free text of its own.
+            // recorded answer, which holds free text of its own. Version 7 is where the owner's
+            // authorised locations arrived, with the two location pairs a repository carries; an
+            // earlier repository gains both pairs empty, which is what reachable through no
+            // location means.
             Some(version) if version < SCHEMA_VERSION => {
                 add_missing_columns(&transaction)?;
                 rebuild_retained_items(&transaction)?;
@@ -650,6 +689,11 @@ impl Store {
     /// Returns [`ProjectError::StoreUnavailable`] when the transaction cannot be started.
     pub fn transaction(&mut self) -> Result<Transaction<'_>> {
         self.connection.transaction().map_err(ProjectError::store)
+    }
+
+    /// Returns the connection, for a read that is one statement.
+    pub(crate) const fn connection(&self) -> &Connection {
+        &self.connection
     }
 
     // ----- operations -----------------------------------------------------------------------
@@ -2182,7 +2226,7 @@ pub fn claim_action(
 }
 
 /// Fills in a claim's result inside a transaction.
-fn settle_claim(
+pub(crate) fn settle_claim(
     transaction: &Transaction<'_>,
     action: &Action,
     result: Option<&[u8]>,
@@ -2229,7 +2273,7 @@ fn settle_claim_on(
 }
 
 /// Writes one event in the outbox of a transaction.
-fn announce(
+pub(crate) fn announce(
     transaction: &Transaction<'_>,
     kind: &str,
     subject: &str,
@@ -2254,7 +2298,8 @@ const OPERATION_COLUMNS: &str = "action_id, actor_id, environment_id, project_re
 /// The columns a repository row is read from.
 const PROJECT_COLUMNS: &str = "project_repository_id, environment_id, label, origin, state, \
      git_dir_device, git_dir_file_id, work_tree_device, work_tree_file_id, display_path, \
-     remote_name, remote_transport, remote_url, remote_provider, remote_broker, created_at_ms";
+     remote_name, remote_transport, remote_url, remote_provider, remote_broker, created_at_ms, \
+     created_location_id, created_relative_path, source_location_id, source_relative_path";
 
 /// Puts the free-text reasons a store already holds through the rule.
 fn protect_recorded_reasons(transaction: &Transaction<'_>) -> Result<()> {
@@ -2460,6 +2505,10 @@ fn add_missing_columns(transaction: &Transaction<'_>) -> Result<()> {
         ("workspaces", "staging_file_id", "INTEGER"),
         ("workspaces", "removal_action", "BLOB"),
         ("workspaces", "detail", "TEXT"),
+        ("projects", "created_location_id", "BLOB"),
+        ("projects", "created_relative_path", "TEXT"),
+        ("projects", "source_location_id", "BLOB"),
+        ("projects", "source_relative_path", "TEXT"),
     ];
     for (table, column, kind) in ADDED {
         let present: i64 = transaction
@@ -2605,8 +2654,11 @@ fn insert_project(transaction: &Transaction<'_>, row: &ProjectRow) -> Result<()>
             "INSERT INTO projects (project_repository_id, environment_id, label, origin, state,
                                    git_dir_device, git_dir_file_id, work_tree_device,
                                    work_tree_file_id, display_path, remote_name, remote_transport,
-                                   remote_url, remote_provider, remote_broker, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                                   remote_url, remote_provider, remote_broker, created_at_ms,
+                                   created_location_id, created_relative_path,
+                                   source_location_id, source_relative_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                     ?18, ?19, ?20)",
             params![
                 row.project_repository_id.get().as_bytes().to_vec(),
                 row.environment_id.get().as_bytes().to_vec(),
@@ -2624,10 +2676,116 @@ fn insert_project(transaction: &Transaction<'_>, row: &ProjectRow) -> Result<()>
                 remote.map(|remote| remote.provider.clone()),
                 remote.map(|remote| remote.credential_broker.clone()),
                 i64_of(row.created_at_ms.get()),
+                row.created_through.as_ref().map(|named| named
+                    .location_id
+                    .get()
+                    .as_bytes()
+                    .to_vec()),
+                row.created_through
+                    .as_ref()
+                    .map(|named| named.relative_path.clone()),
+                row.source
+                    .as_ref()
+                    .map(|named| named.location_id.get().as_bytes().to_vec()),
+                row.source.as_ref().map(|named| named.relative_path.clone()),
             ],
         )
         .map_err(ProjectError::store)?;
     Ok(())
+}
+
+/// Returns one repository, read inside a transaction the caller holds.
+///
+/// # Errors
+///
+/// Returns [`ProjectError::StoreUnavailable`] when the row cannot be read.
+pub(crate) fn project_in(
+    connection: &Connection,
+    id: ProjectRepositoryId,
+) -> Result<Option<ProjectRow>> {
+    connection
+        .query_row(
+            &format!("SELECT {PROJECT_COLUMNS} FROM projects WHERE project_repository_id = ?1"),
+            params![id.get().as_bytes().to_vec()],
+            read_project,
+        )
+        .optional()
+        .map_err(ProjectError::store)
+}
+
+/// Writes or clears the source location one repository is read through.
+///
+/// # Errors
+///
+/// Returns [`ProjectError::StoreUnavailable`] when the write fails, and
+/// [`ProjectError::UnknownProject`] when there is no such repository.
+pub(crate) fn set_project_source(
+    connection: &Connection,
+    id: ProjectRepositoryId,
+    source: Option<&LocatedName>,
+) -> Result<()> {
+    let changed = connection
+        .execute(
+            "UPDATE projects SET source_location_id = ?2, source_relative_path = ?3
+              WHERE project_repository_id = ?1",
+            params![
+                id.get().as_bytes().to_vec(),
+                source.map(|named| named.location_id.get().as_bytes().to_vec()),
+                source.map(|named| named.relative_path.clone()),
+            ],
+        )
+        .map_err(ProjectError::store)?;
+    if changed == 0 {
+        return Err(ProjectError::UnknownProject {
+            project: id.to_string().into(),
+        });
+    }
+    Ok(())
+}
+
+/// Returns how many workspaces are selected on one repository, read inside a transaction.
+///
+/// # Errors
+///
+/// Returns [`ProjectError::StoreUnavailable`] when the count cannot be read.
+pub(crate) fn workspace_count_in(
+    connection: &Connection,
+    environment_id: EnvironmentId,
+    project: ProjectRepositoryId,
+) -> Result<u64> {
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM workspaces WHERE environment_id = ?1 AND project_repository_id = ?2",
+            params![
+                environment_id.get().as_bytes().to_vec(),
+                project.get().as_bytes().to_vec()
+            ],
+            |row| row.get(0),
+        )
+        .map_err(ProjectError::store)?;
+    Ok(u64_of(count))
+}
+
+/// Reads one location pair out of a stored row: both columns or neither.
+///
+/// A pair with only one half is not a name beneath a location, so it reads as none rather than as
+/// a location with no name or a name with no location.
+fn located_name(
+    row: &rusqlite::Row<'_>,
+    location: usize,
+    relative: usize,
+) -> rusqlite::Result<Option<LocatedName>> {
+    let location_id: Option<Vec<u8>> = row.get(location)?;
+    let relative_path: Option<String> = row.get(relative)?;
+    Ok(
+        match (location_id.as_deref().and_then(uuid_of), relative_path) {
+            (Some(location_id), Some(relative_path)) => Some(LocatedName {
+                location_id: ProjectLocationId::new(location_id),
+                relative_path,
+            }),
+            _ => None,
+        },
+    )
 }
 
 fn read_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectRow> {
@@ -2669,6 +2827,8 @@ fn read_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectRow> {
         display_path: row.get(9)?,
         remote,
         created_at_ms: TimestampMs::new(u64_of(row.get::<_, i64>(15)?)),
+        created_through: located_name(row, 16, 17)?,
+        source: located_name(row, 18, 19)?,
     })
 }
 
@@ -3456,6 +3616,8 @@ mod tests {
                     display_path: "/tmp/done".to_owned(),
                     remote: None,
                     created_at_ms: TimestampMs::new(4_000),
+                    created_through: None,
+                    source: None,
                 },
                 row.action_id,
                 None,
@@ -4059,5 +4221,71 @@ mod tests {
                 Performed::default(),
             )
             .expect("nothing holds it now");
+    }
+
+    #[test]
+    fn a_store_from_before_the_location_policy_gains_it_and_its_repositories_reach_no_location() {
+        // The shape the last build wrote: a repository table with no location pairs and no table
+        // of locations at all. Opening it adds both, and a repository recorded before the policy
+        // existed reads as reachable through no location, which is what it is.
+        let directory = tempfile::tempdir().expect("a directory");
+        let journal = directory.path().join("before.sqlite");
+        let before = Connection::open(&journal).expect("the earlier store opens");
+        before
+            .execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version (version) VALUES (6);
+                 CREATE TABLE projects (
+                     project_repository_id BLOB PRIMARY KEY,
+                     environment_id        BLOB NOT NULL,
+                     label                 TEXT NOT NULL,
+                     origin                TEXT NOT NULL,
+                     state                 TEXT NOT NULL,
+                     git_dir_device        INTEGER NOT NULL,
+                     git_dir_file_id       INTEGER NOT NULL,
+                     work_tree_device      INTEGER NOT NULL,
+                     work_tree_file_id     INTEGER NOT NULL,
+                     display_path          TEXT NOT NULL,
+                     remote_name           TEXT,
+                     remote_transport      TEXT,
+                     remote_url            TEXT,
+                     remote_provider       TEXT,
+                     remote_broker         TEXT,
+                     created_at_ms         INTEGER NOT NULL
+                 );",
+            )
+            .expect("the earlier shape is written");
+        before
+            .execute(
+                "INSERT INTO projects (project_repository_id, environment_id, label, origin, state,
+                                       git_dir_device, git_dir_file_id, work_tree_device,
+                                       work_tree_file_id, display_path, created_at_ms)
+                 VALUES (?1, ?2, 'earlier', 'adopted', 'ready', 1, 2, 1, 3, '/tmp/earlier', 5)",
+                params![
+                    [61_u8; 16].to_vec(),
+                    environment().get().as_bytes().to_vec()
+                ],
+            )
+            .expect("a repository an earlier build recorded");
+        drop(before);
+        let store = Store::open(&journal, environment()).expect("this build opens it");
+        let project = store
+            .project(ProjectRepositoryId::new(Uuid::from_bytes([61; 16])))
+            .expect("the repository reads")
+            .expect("and it is there");
+        assert_eq!(project.created_through, None);
+        assert_eq!(project.source, None);
+        let locations: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM authorised_locations", [], |row| {
+                row.get(0)
+            })
+            .expect("the table of locations exists");
+        assert_eq!(locations, 0);
+        let version: i64 = store
+            .connection
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .expect("the version reads");
+        assert_eq!(version, SCHEMA_VERSION);
     }
 }

@@ -125,11 +125,17 @@ impl CreatePlan {
 /// The project service of one environment.
 #[derive(Debug)]
 pub struct ProjectService {
-    environment_id: EnvironmentId,
+    pub(crate) environment_id: EnvironmentId,
     store: Mutex<Store>,
     profile: RestrictedProfile,
     brokers: BrokerRegistry,
-    clock: Arc<dyn Clock>,
+    pub(crate) clock: Arc<dyn Clock>,
+    /// The owner's active locations and the handles held for them.
+    pub(crate) policy: crate::policy::LocationPolicy,
+    /// The challenges issued for a location decision and not yet answered.
+    pub(crate) challenges: crate::policy::Challenges,
+    /// One confirmation transition at a time for each actor and action.
+    pub(crate) transitions: crate::policy::Transitions,
     /// The cancellation flag of every operation this process is running.
     ///
     /// Taken for as long as one map operation, never across a subprocess and never while the
@@ -160,16 +166,22 @@ impl ProjectService {
             .map_err(ProjectError::staging)?;
         let profile = RestrictedProfile::prepare(&root, paths.environment_id())?;
         let brokers = BrokerRegistry::discover(profile.git());
-        let store = Store::open(
+        let mut store = Store::open(
             root.join(crate::store::STORE_FILE_NAME),
             paths.environment_id(),
         )?;
+        // No descriptor survives the process that opened it, so every location this environment
+        // held active is dormant from here until the owner authorises it again.
+        crate::policy::load_dormant(&mut store, clock.now_ms())?;
         Ok(Self {
             environment_id: paths.environment_id(),
             store: Mutex::new(store),
             profile,
             brokers,
             clock,
+            policy: crate::policy::LocationPolicy::default(),
+            challenges: crate::policy::Challenges::default(),
+            transitions: crate::policy::Transitions::default(),
             running: Mutex::new(BTreeMap::new()),
         })
     }
@@ -213,7 +225,7 @@ impl ProjectService {
         self.brokers = brokers;
     }
 
-    fn locked(&self) -> Result<std::sync::MutexGuard<'_, Store>> {
+    pub(crate) fn locked(&self) -> Result<std::sync::MutexGuard<'_, Store>> {
         self.store
             .lock()
             .map_err(|_| ProjectError::StoreUnavailable {
@@ -229,11 +241,11 @@ impl ProjectService {
     /// transaction and needs the guard mutably. Bound to a local by every caller, never taken in
     /// the head of a condition or a loop: a temporary guard there lives for the whole body, and a
     /// helper that takes the same lock would wait for itself.
-    fn writable(&self) -> Result<std::sync::MutexGuard<'_, Store>> {
+    pub(crate) fn writable(&self) -> Result<std::sync::MutexGuard<'_, Store>> {
         self.locked()
     }
 
-    fn check_environment(&self, named: EnvironmentId) -> Result<()> {
+    pub(crate) fn check_environment(&self, named: EnvironmentId) -> Result<()> {
         if named == self.environment_id {
             Ok(())
         } else {
@@ -872,6 +884,8 @@ impl ProjectService {
             display_path: path.display().to_string(),
             remote: row.remote.clone(),
             created_at_ms: self.clock.now_ms(),
+            created_through: None,
+            source: None,
         };
         let summary = self.summarise(&project, 0);
         let operation = self.operation_record(row, OperationState::Completed, None);
@@ -1362,6 +1376,8 @@ impl ProjectService {
             display_path: path.display().to_string(),
             remote: plan.remote().cloned(),
             created_at_ms: self.clock.now_ms(),
+            created_through: None,
+            source: None,
         };
         let summary = self.summarise(&project, 0);
         let operation = self.operation_record(row, OperationState::Completed, None);
@@ -2531,7 +2547,7 @@ impl ProjectService {
     ///
     /// Asking twice is how two copies of one action end up with two answers, so every caller that
     /// can find an effect already done uses this.
-    fn answer_from_record<T: serde::de::DeserializeOwned + serde::Serialize>(
+    pub(crate) fn answer_from_record<T: serde::de::DeserializeOwned + serde::Serialize>(
         &self,
         action: Option<&Action>,
     ) -> Result<Option<T>> {
@@ -2608,7 +2624,7 @@ impl ProjectService {
         Ok(output.text().trim().to_owned())
     }
 
-    fn summarise(&self, row: &ProjectRow, workspace_count: u64) -> ProjectSummary {
+    pub(crate) fn summarise(&self, row: &ProjectRow, workspace_count: u64) -> ProjectSummary {
         ProjectSummary {
             project_repository_id: row.project_repository_id,
             environment_id: row.environment_id,
@@ -2813,7 +2829,7 @@ fn check_destination(
     }
 }
 
-fn check_label(label: &str) -> Result<()> {
+pub(crate) fn check_label(label: &str) -> Result<()> {
     if label.is_empty() || label.chars().count() > MAX_LABEL_LEN {
         return Err(ProjectError::InvalidArgument(
             format!("a label is between one and {MAX_LABEL_LEN} characters").into(),
@@ -2873,7 +2889,7 @@ fn name_of(path: &str) -> String {
         .unwrap_or_default()
 }
 
-fn new_uuid() -> Uuid {
+pub(crate) fn new_uuid() -> Uuid {
     Uuid::from_bytes(*uuid::Uuid::new_v4().as_bytes())
 }
 

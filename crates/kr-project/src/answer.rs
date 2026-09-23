@@ -19,6 +19,7 @@
 use kr_protocol::method::Method;
 use kr_protocol::project::{
     InclusionPreview, OperationRecord, ProjectAdoptResult, ProjectCloneResult, ProjectInitResult,
+    ProjectLocationAttachResult, ProjectLocationAuthoriseResult, ProjectLocationWithdrawResult,
     ProjectOperationCancelResult, RetainedItem, WorkspaceCreateResult, WorkspaceRemoveResult,
     WorkspaceSummary,
 };
@@ -33,7 +34,7 @@ use crate::error::{ProjectError, Result};
 ///
 /// # Errors
 ///
-/// Returns [`ProjectError::StoreUnavailable`] when the method is not one of the six that record a
+/// Returns [`ProjectError::StoreUnavailable`] when the method is not one of the nine that record a
 /// result, or when the stored bytes are not that method's result.
 pub fn protect_stored_result(method: &str, encoded: &[u8]) -> Result<Vec<u8>> {
     match Method::from_wire(method) {
@@ -43,6 +44,11 @@ pub fn protect_stored_result(method: &str, encoded: &[u8]) -> Result<Vec<u8>> {
         Some(Method::ProjectOperationCancel) => rewrite::<ProjectOperationCancelResult>(encoded),
         Some(Method::WorkspaceCreate) => rewrite::<WorkspaceCreateResult>(encoded),
         Some(Method::WorkspaceRemove) => rewrite::<WorkspaceRemoveResult>(encoded),
+        Some(Method::ProjectLocationAuthorise) => {
+            rewrite::<ProjectLocationAuthoriseResult>(encoded)
+        }
+        Some(Method::ProjectLocationWithdraw) => rewrite::<ProjectLocationWithdrawResult>(encoded),
+        Some(Method::ProjectLocationAttach) => rewrite::<ProjectLocationAttachResult>(encoded),
         _ => Err(ProjectError::StoreUnavailable {
             detail: format!(
                 "a recorded answer to {} is not one this build can read back",
@@ -70,7 +76,7 @@ where
 /// One answer, or a part of one, whose diagnostics can be put through the rule in place.
 ///
 /// Implemented for every result a mutation records, so a result type that gains a diagnostic field
-/// gains it here rather than in six separate places.
+/// gains it here rather than in nine separate places.
 trait Protected {
     /// Replaces every diagnostic this value carries with what this host will repeat.
     fn protect(&mut self);
@@ -170,6 +176,23 @@ impl Protected for WorkspaceRemoveResult {
         self.workspace.protect();
         self.retained.protect();
     }
+}
+
+// The owner's location decisions carry no diagnostic. A location's label and path, a repository's
+// summary and the name a binding resolved by are all values the owner named or the host recorded,
+// and replacing them would answer a different question. A challenge is never recorded at all: it is
+// the answer to a submission that performs nothing.
+
+impl Protected for ProjectLocationAuthoriseResult {
+    fn protect(&mut self) {}
+}
+
+impl Protected for ProjectLocationWithdrawResult {
+    fn protect(&mut self) {}
+}
+
+impl Protected for ProjectLocationAttachResult {
+    fn protect(&mut self) {}
 }
 
 #[cfg(test)]

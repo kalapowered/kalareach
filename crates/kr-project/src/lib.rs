@@ -22,6 +22,7 @@
 //! | [`credential`] | Remotes, providers, the approved credential brokers and the transports this host uses |
 //! | [`store`] | `projects.sqlite`: repositories, workspaces, operations, retained items, action claims |
 //! | [`operation`] | Authorised destinations, the private staging sibling, the publication and its reconciliation |
+//! | [`policy`] | The owner's authorised locations, the handles held for them, and the owner's confirmation of each |
 //! | [`workspace`] | The explicit choice, the inclusion preview, and what a creation copies |
 //! | [`service`] | The ten methods, recovery and the sessions a workspace is bound to |
 //! | [`error`] | The failures above, each mapped to one stable protocol error code |
@@ -97,6 +98,7 @@ pub mod error;
 pub mod git;
 pub mod identity;
 pub mod operation;
+pub mod policy;
 pub mod service;
 pub mod store;
 pub mod workspace;
