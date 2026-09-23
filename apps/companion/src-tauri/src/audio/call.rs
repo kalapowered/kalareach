@@ -140,22 +140,25 @@ impl DesktopVoiceCall {
 
         // Captured audio goes nowhere unless the gate says the microphone may carry it now: after
         // the deadline, while muted, or once the system takes the device, a frame is dropped here
-        // rather than trusted to a flag somewhere else.
+        // rather than trusted to a flag somewhere else. The recorder counts as running from the
+        // first frame that arrives, not from the device saying it started: a device that started
+        // and delivers nothing heard nothing.
         let gate = Arc::clone(&self.gate);
         let start = self.start_time;
+        let mut arrived = false;
         let started = device.start(move |_captured_pcm| {
             let now = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if !arrived {
+                arrived = true;
+                gate.recorder(true, now);
+            }
             if gate.capture_enabled(now) {
                 // Media path forwards captured PCM frames to encoder.
             }
         });
-        match started {
-            // The recorder is running, so from here the gate may let it carry speech.
-            Ok(()) => self.gate.recorder(true, self.now_ms()),
+        if started.is_err() {
             // A device that never started heard nothing, and the record must not say otherwise.
-            Err(_) => {
-                self.gate.revoke(permit.generation, self.now_ms());
-            }
+            self.gate.revoke(permit.generation, self.now_ms());
         }
         started
     }
