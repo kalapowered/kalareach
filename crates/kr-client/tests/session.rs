@@ -310,6 +310,7 @@ async fn connect(client: &Side, host: &Side) -> Session {
     Session::start(Arc::new(transport)).expect("a session")
 }
 
+/// KR-REQ-10.01: the native client library connects to a host over iroh in Rust.
 #[tokio::test]
 async fn one_connection_carries_one_session() {
     let host = side(1, true).await;

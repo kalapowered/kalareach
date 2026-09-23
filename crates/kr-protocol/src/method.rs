@@ -1536,6 +1536,8 @@ mod tests {
         ("agent.snapshot", &[ActionRight::SessionView]),
     ];
 
+    /// KR-REQ-23.32: `question.read` needs `session.view`, and answering or cancelling needs
+    /// `question.respond`.
     #[test]
     fn every_method_maps_to_exactly_the_rights_section_twenty_three_names() {
         for (name, expected) in MAPPING {

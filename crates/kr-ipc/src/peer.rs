@@ -59,6 +59,7 @@ impl PeerIdentity {
 mod tests {
     use super::*;
 
+    /// KR-REQ-23.10: a local peer running as another user is refused.
     #[test]
     fn another_user_is_refused() {
         let peer = PeerIdentity {

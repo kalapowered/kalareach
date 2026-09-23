@@ -679,6 +679,7 @@ fn sharing_needs_issuer_or_delegation_authority() {
     }
 }
 
+/// KR-REQ-23.33: installing and removing agent tools needs host-owner authority.
 #[test]
 fn host_management_methods_require_the_host_manage_right() {
     for name in [

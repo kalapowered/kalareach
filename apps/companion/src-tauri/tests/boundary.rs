@@ -124,6 +124,7 @@ fn an_image_may_come_only_from_the_bundle_or_from_bytes_the_application_produced
     );
 }
 
+/// KR-REQ-10.01: the WebView connects to nothing but the application's own IPC channel.
 #[test]
 fn nothing_connects_anywhere_but_the_applications_own_channel() {
     let policy = policy();
@@ -138,6 +139,7 @@ fn nothing_connects_anywhere_but_the_applications_own_channel() {
     }
 }
 
+/// KR-REQ-10.01: the WebView holds no shell, filesystem or general network capability.
 #[test]
 fn the_capabilities_grant_no_shell_no_filesystem_and_no_general_http() {
     let capabilities = capabilities();

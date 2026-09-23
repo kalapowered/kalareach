@@ -122,6 +122,7 @@ fn the_originating_agent_is_told_the_answering_device_the_actor_and_the_revision
     assert_eq!(record.answered_at_ms, TimestampMs::new(2_000));
 }
 
+/// KR-REQ-23.32: an answer names the exact revision, and one that is no longer current is refused.
 #[test]
 fn an_answer_to_a_revision_that_is_no_longer_current_is_refused() {
     let session_id = SessionId::new(Uuid::from_bytes([4; 16]));

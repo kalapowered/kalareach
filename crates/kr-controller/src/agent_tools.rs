@@ -2263,6 +2263,7 @@ mod tests {
     /// Both are checked against the files this binary carries. A skill package that changed
     /// without its manifest changing would install files whose hashes do not describe them, and a
     /// removal reads those hashes to decide what is safe to delete.
+    /// KR-REQ-23.33: the change manifest names every file with the hash of what is installed.
     #[test]
     fn the_packaged_files_match_the_manifest_and_the_fixture() {
         let manifest: Value = serde_json::from_str(MANIFEST_JSON).expect("the manifest is JSON");
@@ -2306,6 +2307,7 @@ mod tests {
         }
     }
 
+    /// KR-REQ-23.33: an installation writes exactly its manifest for the target agent.
     #[test]
     fn an_installation_writes_the_skill_and_registers_the_server() {
         let tree = Tree::create();
@@ -2347,6 +2349,7 @@ mod tests {
         assert!(again.already_installed);
     }
 
+    /// KR-REQ-23.33: status reports the installation against its exact manifest.
     #[test]
     fn status_reports_what_changed_since_the_installation() {
         let tree = Tree::create();
@@ -2369,6 +2372,7 @@ mod tests {
         assert!(status.drift[0].contains("has changed"));
     }
 
+    /// KR-REQ-23.33: a removal undoes exactly its own recorded changes.
     #[test]
     fn a_removal_undoes_its_own_changes_and_leaves_everything_else() {
         let tree = Tree::create();
@@ -3358,6 +3362,7 @@ mod tests {
         }
     }
 
+    /// KR-REQ-23.33: a project-scope change needs its project directory.
     #[test]
     fn a_project_scope_installation_needs_the_project_directory() {
         let tree = Tree::create();

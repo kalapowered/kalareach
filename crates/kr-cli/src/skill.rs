@@ -339,6 +339,7 @@ mod tests {
         assert!(error.to_string().contains("qoder-cli"));
     }
 
+    /// KR-REQ-23.33: an agent-tools change names its scope, user or project.
     #[test]
     fn a_scope_is_user_or_project() {
         assert!(parse("codex", "global", None).is_err());
@@ -347,6 +348,7 @@ mod tests {
         assert!(!params.project_dir.is_present());
     }
 
+    /// KR-REQ-23.33: a project scope names the directory it will write to.
     #[test]
     fn a_project_scope_resolves_the_directory_it_will_write_to() {
         // An absolute path is used as it stands. What counts as absolute is the platform's own

@@ -748,6 +748,7 @@ mod tests {
         }
     }
 
+    /// KR-REQ-10.01: the WebView reaches only the named commands the native side validates.
     #[test]
     fn no_command_reaches_a_method_outside_the_named_set() {
         // The page cannot name a method, so the reachable set is exactly the methods these
@@ -838,6 +839,7 @@ mod tests {
         assert!(safe_file_name(&"a".repeat(300)).is_err());
     }
 
+    /// KR-REQ-10.01: parameters from the WebView are validated before anything is sent.
     #[test]
     fn parameters_that_are_not_the_methods_shape_are_refused_before_anything_is_sent() {
         let refusal: Result<kr_protocol::session::SessionReadParams> =
@@ -846,6 +848,7 @@ mod tests {
         assert_eq!(error.code, kr_protocol::error::ErrorCode::InvalidArgument);
     }
 
+    /// KR-REQ-10.01: an unknown field from the WebView is refused.
     #[test]
     fn a_parameter_map_with_an_unknown_field_is_refused() {
         let refusal: Result<kr_protocol::session::SessionReadParams> = decode(serde_json::json!({

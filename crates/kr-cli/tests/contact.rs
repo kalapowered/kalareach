@@ -652,6 +652,7 @@ async fn a_cancelled_question_stays_cancelled() {
 }
 
 /// A token from one question does not reach another.
+/// KR-REQ-23.31: a private question method checks the caller token of the question it names.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_token_reaches_only_the_question_it_was_issued_for() {
     let hosted = hosted().await;
@@ -752,6 +753,8 @@ async fn a_wait_that_times_out_returns_the_same_question() {
 }
 
 /// Outside a session, every tool refuses and creates nothing.
+/// KR-REQ-23.31: a helper the host cannot verify as inside the session is refused, whatever it
+/// claims about the session.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_helper_outside_a_session_is_told_how_to_get_into_one() {
     // A host tree with a live session in it, and a tool server that is not inside that session:

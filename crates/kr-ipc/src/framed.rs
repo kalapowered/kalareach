@@ -444,6 +444,8 @@ mod tests {
         (endpoint, listener, host)
     }
 
+    /// KR-REQ-23.10: a local connection carries the typed frames of the network protocol, and the
+    /// host authenticates its peer from the operating system.
     #[tokio::test]
     async fn frames_round_trip_and_the_peer_is_authenticated() {
         let (endpoint, listener, _host) = pair();
@@ -518,6 +520,7 @@ mod tests {
         server.abort();
     }
 
+    /// KR-REQ-23.10: a local frame's declared length is checked before its buffer exists.
     #[tokio::test]
     async fn an_over_long_declared_length_is_refused_before_the_buffer_exists() {
         let (endpoint, listener, _host) = pair();
