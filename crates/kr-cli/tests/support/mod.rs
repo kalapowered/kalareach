@@ -63,14 +63,15 @@ pub fn command_binaries() -> &'static Path {
 
 /// What this run calls its directory: the suite, the process, and a token of this run's own.
 ///
-/// The token is what makes the name this run's and no other's. A process number comes round again:
-/// the operating system gives it to a later process, which would then want a name an earlier one
-/// had already used, and a name two runs can both want is a name one of them can take away from
+/// The token keeps a later run from wanting an earlier run's name. A process number comes round
+/// again: the operating system gives it to a later process, which would then want a name an earlier
+/// one had already used, and a name two runs can both want is a name one of them can take away from
 /// the other. The token is the time the name is made, in nanoseconds on the system clock every
-/// platform has, and a value the standard library draws for this process from the operating
-/// system. A later process given the same number makes its name later, so the time separates the
-/// two; a clock that was set back can repeat a time, and the drawn value is what makes that
-/// repetition harmless.
+/// platform has, and a value the standard library draws for this process from the operating system.
+/// Neither is certain to differ between two runs: a clock can tick more coarsely than a nanosecond
+/// or be set back, and a drawn value can repeat. Both repeating along with the process number is
+/// too unlikely to plan for, and even then nothing is shared: `create_dir` refuses a name that is
+/// already there, and the test that asked for the directory fails.
 ///
 /// The number stays in the name because the sweep below reads it, and the suite's name stays in it
 /// because a person looking at a temporary directory should be able to see which test made what.
@@ -144,7 +145,7 @@ fn take_it_away_when_this_run_ends(root: &Path) {
 ///
 /// Only names of the form above are considered, and nothing else in the temporary directory is
 /// touched. That is what makes this safe to do while other runs are going on: a name carrying a
-/// token of one run's own is a name no other run can ever produce, so a directory found under one
+/// run's token belongs to the one run whose `create_dir` made it, so a directory found under one
 /// either belongs to a run that is still going - and is left alone - or to one that has ended. The
 /// directories that earlier versions of these suites left under a name of a process number alone
 /// are not this sweep's to judge, because a number comes round again and a name two runs can both
