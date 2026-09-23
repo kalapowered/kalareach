@@ -524,7 +524,13 @@ impl Host {
                     .await
                     .expect("the worker proves it is the one the descriptor names");
                 client
-                    .request(Method::EventsSnapshot, &EventsSnapshotParams { session_id })
+                    .request(
+                        Method::EventsSnapshot,
+                        &EventsSnapshotParams {
+                            session_id,
+                            agent_resources_from: kr_protocol::scalars::Nullable::null(),
+                        },
+                    )
                     .await
                     .expect("the request reaches the worker")
                     .unwrap_or_else(|error| panic!("the worker refused the snapshot: {error}"))

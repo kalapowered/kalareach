@@ -247,7 +247,10 @@ impl Host {
         let snapshot: kr_protocol::recovery::EventsSnapshotResult = client
             .request(
                 Method::EventsSnapshot,
-                &kr_protocol::recovery::EventsSnapshotParams { session_id },
+                &kr_protocol::recovery::EventsSnapshotParams {
+                    session_id,
+                    agent_resources_from: kr_protocol::scalars::Nullable::null(),
+                },
             )
             .await
             .expect("the call reaches the worker")
