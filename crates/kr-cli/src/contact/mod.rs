@@ -242,72 +242,46 @@ pub struct SendNotificationParams {
     pub safe_session_link: Option<String>,
 }
 
-/// How long a call whose token fired waits for the client's cancellation notice.
-///
-/// rmcp cancels a call's token as it reads the client's `notifications/cancelled`, and hands the
-/// notice itself to [`ServerHandler::on_cancelled`] a moment later, on a task of its own. The token
-/// also fires when the service stops because its input closed, and then no notice comes at all.
-/// This is how long the difference is given to show.
-const NOTICE_WITHIN: std::time::Duration = std::time::Duration::from_secs(1);
-
 /// How long the server waits, on its way out, for the calls it is still finishing.
 const CALLS_FINISH_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How many cancellation notices are remembered for calls that have not looked for theirs.
+/// The calls that are running, and which of them the client has cancelled with its own notice.
 ///
-/// A notice can name a call that already finished, and nothing looks for that one. The oldest go.
-const NOTICES_KEPT: usize = 256;
-
-/// The tool calls the client cancelled, by the identifiers its notices named.
+/// A call is here from the moment its handler starts until it returns, so a notice that names it
+/// is kept for as long as the call can look for it, however slowly either side runs, and a notice
+/// that names no running call is not kept at all.
 #[derive(Debug, Default)]
-struct Notices {
-    named: std::sync::Mutex<std::collections::VecDeque<RequestId>>,
-    arrived: tokio::sync::Notify,
-}
-
-impl Notices {
-    fn record(&self, id: RequestId) {
-        if let Ok(mut named) = self.named.lock() {
-            named.push_back(id);
-            while named.len() > NOTICES_KEPT {
-                named.pop_front();
-            }
-        }
-        self.arrived.notify_waiters();
-    }
-
-    /// Returns true when the client's notice names this call, waiting up to `within` for it.
-    async fn named(&self, id: &RequestId, within: std::time::Duration) -> bool {
-        let deadline = tokio::time::Instant::now() + within;
-        loop {
-            // Registered before the list is read, so a notice recorded in between still wakes it.
-            let arrived = self.arrived.notified();
-            tokio::pin!(arrived);
-            arrived.as_mut().enable();
-            if let Ok(mut named) = self.named.lock()
-                && let Some(position) = named.iter().position(|named| named == id)
-            {
-                named.remove(position);
-                return true;
-            }
-            if tokio::time::timeout_at(deadline, arrived).await.is_err() {
-                return false;
-            }
-        }
-    }
-}
-
-/// The calls still running, which the server lets finish before it exits.
-#[derive(Debug, Default)]
-struct Running {
-    count: std::sync::atomic::AtomicUsize,
+struct Calls {
+    /// Each running call, and whether a notice from the client has named it.
+    running: std::sync::Mutex<std::collections::HashMap<RequestId, bool>>,
     idle: tokio::sync::Notify,
 }
 
-impl Running {
-    fn enter(self: &Arc<Self>) -> RunningCall {
-        self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        RunningCall(Arc::clone(self))
+impl Calls {
+    fn enter(self: &Arc<Self>, call: RequestId) -> RunningCall {
+        if let Ok(mut running) = self.running.lock() {
+            running.insert(call.clone(), false);
+        }
+        RunningCall {
+            calls: Arc::clone(self),
+            call,
+        }
+    }
+
+    /// Records the client's notice for a call that is running.
+    fn noticed(&self, call: &RequestId) {
+        if let Ok(mut running) = self.running.lock()
+            && let Some(named) = running.get_mut(call)
+        {
+            *named = true;
+        }
+    }
+
+    /// Returns true when the client's notice has named this call.
+    fn was_noticed(&self, call: &RequestId) -> bool {
+        self.running
+            .lock()
+            .is_ok_and(|running| running.get(call).copied().unwrap_or(false))
     }
 
     /// Returns once no call is running.
@@ -316,7 +290,11 @@ impl Running {
             let idle = self.idle.notified();
             tokio::pin!(idle);
             idle.as_mut().enable();
-            if self.count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            if self
+                .running
+                .lock()
+                .map_or(true, |running| running.is_empty())
+            {
                 return;
             }
             idle.await;
@@ -324,19 +302,55 @@ impl Running {
     }
 }
 
-/// One running call, counted until it is dropped.
-struct RunningCall(Arc<Running>);
+/// One running call, forgotten when it is dropped.
+struct RunningCall {
+    calls: Arc<Calls>,
+    call: RequestId,
+}
 
 impl Drop for RunningCall {
     fn drop(&mut self) {
-        if self
-            .0
-            .count
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
-            == 1
-        {
-            self.0.idle.notify_waiters();
+        let empty = self.calls.running.lock().is_ok_and(|mut running| {
+            running.remove(&self.call);
+            running.is_empty()
+        });
+        if empty {
+            self.calls.idle.notify_waiters();
         }
+    }
+}
+
+/// This server's input, which records when it closed.
+///
+/// rmcp fires the token of every running call when its input closes, and the same token for a
+/// call the client cancelled with its own notice. The close is recorded here, as the stream ends
+/// and before rmcp can read that it has, so a token that fires while the input is still open was
+/// fired by the client's notice and by nothing else.
+struct WatchedInput<R> {
+    inner: R,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for WatchedInput<R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let room = buffer.remaining();
+        let before = buffer.filled().len();
+        let read = std::pin::Pin::new(&mut this.inner).poll_read(context, buffer);
+        let ended = match &read {
+            // No bytes into a buffer that had room is the end of the stream.
+            std::task::Poll::Ready(Ok(())) => room > 0 && buffer.filled().len() == before,
+            std::task::Poll::Ready(Err(_)) => true,
+            std::task::Poll::Pending => false,
+        };
+        if ended {
+            this.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        read
     }
 }
 
@@ -357,10 +371,10 @@ pub struct Contact {
     /// A helper is inside one session for the whole of its life, and a short disconnection does
     /// not move it. Resolving again on every call would ask the same kernel the same question.
     bound: Arc<tokio::sync::Mutex<Option<Bound>>>,
-    /// The calls the client cancelled with a notice of its own.
-    notices: Arc<Notices>,
-    /// The calls that are asking or waiting, which the server finishes before it exits.
-    running: Arc<Running>,
+    /// The calls that are running, and which the client cancelled with a notice of its own.
+    calls: Arc<Calls>,
+    /// Whether this server's input has closed.
+    input_closed: Arc<std::sync::atomic::AtomicBool>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -381,8 +395,8 @@ impl Contact {
         Self {
             build_id,
             bound: Arc::new(tokio::sync::Mutex::new(None)),
-            notices: Arc::new(Notices::default()),
-            running: Arc::new(Running::default()),
+            calls: Arc::new(Calls::default()),
+            input_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tool_router: Self::tool_router(),
         }
     }
@@ -401,7 +415,7 @@ impl Contact {
         Parameters(params): Parameters<AskUserParams>,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, McpError> {
-        let _running = self.running.enter();
+        let _running = self.calls.enter(context.id.clone());
         Ok(self
             .create(params, &context.ct, &context.id)
             .await
@@ -421,7 +435,7 @@ impl Contact {
         Parameters(params): Parameters<WaitForAnswerParams>,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResult, McpError> {
-        let _running = self.running.enter();
+        let _running = self.calls.enter(context.id.clone());
         Ok(self
             .wait(params, &context.ct, &context.id)
             .await
@@ -661,10 +675,11 @@ impl Contact {
 
     /// Carries out what a fired token means for the question its call was asking or waiting on.
     ///
-    /// When the client's notice names the call, the client cancelled it, and section 11's upstream
-    /// cancellation cancels the question. When no notice comes, the token fired because this server
-    /// is stopping: nothing cancelled the call, the question is left as it is, and it ends with this
-    /// process.
+    /// The client cancelled the call when its notice named the call, or when the token fired while
+    /// this server's input was still open, which nothing but a notice does; then section 11's
+    /// upstream cancellation cancels the question. Otherwise the token fired because the input
+    /// closed and this server is stopping: nothing cancelled the call, the question is left as it
+    /// is, and it ends with this process.
     async fn cancelled(
         &self,
         call: &RequestId,
@@ -672,7 +687,7 @@ impl Contact {
         question_id: QuestionId,
         token: &CallerToken,
     ) -> CliResult<Question> {
-        if self.notices.named(call, NOTICE_WITHIN).await {
+        if self.cancelled_by_the_client(call) {
             return self.cancel_for_the_call(bound, question_id, token).await;
         }
         Err(CliError::Refused(ProtocolError::new(
@@ -680,6 +695,11 @@ impl Contact {
             "the tool server is stopping; the question was not cancelled, and it ends when this \
              process does",
         )))
+    }
+
+    /// Returns true when a fired token was the client's own cancellation of this call.
+    fn cancelled_by_the_client(&self, call: &RequestId) -> bool {
+        self.calls.was_noticed(call) || !self.input_closed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Cancels the question a cancelled tool call was creating or waiting on, and returns it.
@@ -751,7 +771,7 @@ impl ServerHandler for Contact {
         _context: NotificationContext<RoleServer>,
     ) -> impl Future<Output = ()> + MaybeSendFuture + '_ {
         if let Some(call) = notification.request_id {
-            self.notices.record(call);
+            self.calls.noticed(&call);
         }
         std::future::ready(())
     }
@@ -773,9 +793,13 @@ impl ServerHandler for Contact {
 /// Returns an error when the transport fails.
 pub async fn run_stdio(build_id: BuildId) -> CliResult<()> {
     let contact = Contact::new(build_id);
-    let running = Arc::clone(&contact.running);
+    let calls = Arc::clone(&contact.calls);
+    let input = WatchedInput {
+        inner: tokio::io::stdin(),
+        closed: Arc::clone(&contact.input_closed),
+    };
     let service = contact
-        .serve(rmcp::transport::stdio())
+        .serve((input, tokio::io::stdout()))
         .await
         .map_err(|error| CliError::Other(format!("the tool server could not start: {error}")))?;
     let stopped = service
@@ -784,7 +808,7 @@ pub async fn run_stdio(build_id: BuildId) -> CliResult<()> {
         .map_err(|error| CliError::Other(format!("the tool server stopped: {error}")));
     // A call the client cancelled just before its input closed may still be cancelling its
     // question. It is given a bounded moment to finish, so the process does not exit under it.
-    let _ = tokio::time::timeout(CALLS_FINISH_WITHIN, running.finished()).await;
+    let _ = tokio::time::timeout(CALLS_FINISH_WITHIN, calls.finished()).await;
     stopped?;
     Ok(())
 }
@@ -1125,42 +1149,54 @@ mod tests {
         );
     }
 
-    /// KR-REQ-11.63: a fired token is an upstream cancellation only when the client's own notice
-    /// names the call, and the notice may be recorded a moment after the token fired. With no notice
-    /// the token fired because the server is stopping, and nothing is cancelled.
+    /// KR-REQ-11.63: a fired token is the client's cancellation when the client's notice named
+    /// the call, whenever that notice is recorded, or when it fired while the input was still open;
+    /// once the input has closed, a token with no notice behind it fired because the server is
+    /// stopping, and nothing is cancelled. A notice for a call that is not running is not kept.
+    #[test]
+    fn a_fired_token_is_the_clients_cancellation_unless_the_input_closed_first() {
+        let contact = Contact::new(BuildId::new("kr-test/0").expect("a build identifier"));
+        let call = RequestId::Number(7);
+        let running = contact.calls.enter(call.clone());
+        assert!(
+            contact.cancelled_by_the_client(&call),
+            "a token that fires on an open input fired for a notice, however late the notice"
+        );
+        contact
+            .input_closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !contact.cancelled_by_the_client(&call),
+            "after the input closed, a token with no notice behind it is the server stopping"
+        );
+        contact.calls.noticed(&call);
+        assert!(
+            contact.cancelled_by_the_client(&call),
+            "a notice for the call counts even after the input closed"
+        );
+        drop(running);
+        contact.calls.noticed(&RequestId::Number(8));
+        assert!(
+            contact.calls.running.lock().expect("the lock").is_empty(),
+            "nothing is kept for calls that are not running"
+        );
+    }
+
+    /// The input records its close as the stream ends, before a reader can act on the end.
     #[tokio::test]
-    async fn only_the_clients_own_notice_makes_a_fired_token_a_cancellation() {
-        let notices = Arc::new(Notices::default());
-        let later = Arc::clone(&notices);
-        let recorded = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            later.record(RequestId::Number(7));
-        });
-        assert!(
-            notices
-                .named(&RequestId::Number(7), std::time::Duration::from_secs(5))
-                .await,
-            "a notice recorded after the token fired is found"
-        );
-        recorded.await.expect("recorded");
-        assert!(
-            !notices
-                .named(&RequestId::Number(7), std::time::Duration::from_millis(50))
-                .await,
-            "a notice is taken once"
-        );
-        assert!(
-            !notices
-                .named(&RequestId::Number(8), std::time::Duration::from_millis(50))
-                .await,
-            "no notice is no cancellation"
-        );
-        for id in 0..(NOTICES_KEPT as i64 + 10) {
-            notices.record(RequestId::Number(id));
-        }
-        assert!(
-            notices.named.lock().expect("the lock").len() <= NOTICES_KEPT,
-            "notices nobody looks for are not kept without bound"
-        );
+    async fn the_watched_input_records_its_close_as_the_stream_ends() {
+        use tokio::io::AsyncReadExt as _;
+
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut input = WatchedInput {
+            inner: &b"one frame"[..],
+            closed: Arc::clone(&closed),
+        };
+        let mut buffer = [0_u8; 4];
+        assert_eq!(input.read(&mut buffer).await.expect("reads"), 4);
+        assert!(!closed.load(std::sync::atomic::Ordering::SeqCst));
+        let mut rest = Vec::new();
+        input.read_to_end(&mut rest).await.expect("reads");
+        assert!(closed.load(std::sync::atomic::Ordering::SeqCst));
     }
 }
