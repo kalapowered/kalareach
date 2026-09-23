@@ -236,6 +236,16 @@ fn run_exchange(
     host: &mut Host<'_>,
     entered: &EnteredCode,
 ) -> Result<(ClientAttempt, String), PairingError> {
+    run_exchange_with(harness, host, entered, client_bundle(&harness.client_keys))
+}
+
+/// Runs a complete exchange in which the candidate declares and signs `bundle`.
+fn run_exchange_with(
+    harness: &Harness,
+    host: &mut Host<'_>,
+    entered: &EnteredCode,
+    bundle: ClientBundle,
+) -> Result<(ClientAttempt, String), PairingError> {
     let budget = TestClientBudgetStore::new().expect("a store");
     let service = TestClient::new(LocatorRecord {
         invitation_id: host.invitation_id(),
@@ -258,11 +268,8 @@ fn run_exchange(
     let host_frame =
         host.seal_host_bundle(admission.attempt_id, &harness.host_keys.authorisation)?;
     client.open_host_bundle(&host_frame, &harness.clock)?;
-    let client_frame = client.seal_client_bundle(
-        &harness.client_keys.authorisation,
-        client_bundle(&harness.client_keys),
-        &harness.clock,
-    )?;
+    let client_frame =
+        client.seal_client_bundle(&harness.client_keys.authorisation, bundle, &harness.clock)?;
     host.open_client_bundle(admission.attempt_id, &client_frame)?;
 
     let host_peer = harness.host_peer();
@@ -1338,6 +1345,45 @@ fn the_host_checks_the_candidate_it_is_talking_to_and_refuses_early_data() {
 
     let client_peer = harness.client_peer();
     host.finish(&request, &client_peer).expect("a pairing");
+}
+
+/// KR-REQ-10.26: a device name is display text and never authority. A candidate whose validly
+/// signed bundle names it after the issuing owner, or after the host itself, is committed like any
+/// other: under the device identity the host assigns, with the invitation's grant and nothing
+/// more, and the name is kept only as the name.
+#[test]
+fn a_device_name_confers_no_authority() {
+    let mut grants = Vec::new();
+    for name in ["A phone", "owner-1", "The host's own owner device"] {
+        let harness = Harness::new();
+        let mut host = harness.issue();
+        let entered = EnteredCode::parse(&host.code().display_text()).expect("the code");
+        let mut bundle = client_bundle(&harness.client_keys);
+        bundle.device_name = DeviceName::new(name).expect("a name");
+        run_exchange_with(&harness, &mut host, &entered, bundle).expect("a pairing");
+        let committed = approve(&harness, &mut host).expect("a commitment");
+        assert_eq!(
+            committed
+                .client_bundle
+                .as_ref()
+                .expect("the candidate's declaration")
+                .device_name
+                .as_str(),
+            name
+        );
+        assert_eq!(
+            committed.device_id,
+            harness.grant_identities().recipient_device_id,
+            "{name}: the device identity is the one the host assigned"
+        );
+        assert_ne!(committed.device_id, harness.host_device_id);
+        assert_eq!(committed.grant.actions, proposal().actions, "{name}");
+        grants.push(committed.grant);
+    }
+    assert!(
+        grants.windows(2).all(|pair| pair[0] == pair[1]),
+        "the grant is the same whatever the name says"
+    );
 }
 
 /// KR-REQ-10.29, KR-REQ-23.26: `pair.confirm` needs the issuing owner and the exact transcript and

@@ -352,7 +352,7 @@ mod tests {
         assert!(EnteredCode::parse("aB3xYz79Q\u{00e9}").is_err());
     }
 
-    /// KR-REQ-10.12: the six secret characters never appear in a log or debug rendering.
+    /// KR-REQ-10.12: the six secret characters never appear in the debug rendering of a code.
     #[test]
     fn a_code_redacts_its_secret_half() {
         let code = EnteredCode::parse("aB3x-Yz7-9Qw").expect("a code");

@@ -2395,6 +2395,42 @@ mod tests {
             QrPayload::from_canonical_bytes(&unknown),
             Err(QrPayloadError::UnsupportedMode { .. })
         ));
+
+        // A payload that is complete except for its mode is not read as either mode.
+        let mut map = kr_cbor::CanonicalMap::new();
+        map.insert("version".to_owned(), CanonicalValue::Integer(1u64.into()))
+            .expect("a fresh key");
+        map.insert(
+            "rendezvous_origin".to_owned(),
+            CanonicalValue::text(origin().as_str()),
+        )
+        .expect("a fresh key");
+        map.insert("code".to_owned(), CanonicalValue::text("aB3x-Yz7-9Qw"))
+            .expect("a fresh key");
+        let unmarked = kr_cbor::encode(&CanonicalValue::Map(map));
+        assert!(QrPayload::from_canonical_bytes(&unmarked).is_err());
+        let direct = kr_cbor::decode(
+            &QrPayload::Direct(Box::new(sample_direct_payload()))
+                .to_canonical_bytes()
+                .expect("canonical bytes"),
+            &kr_cbor::Limits::DEFAULT,
+        )
+        .expect("a value");
+        let CanonicalValue::Map(direct) = direct else {
+            panic!("a QR payload is a map");
+        };
+        let mut unmarked = kr_cbor::CanonicalMap::new();
+        for (key, value) in direct.entries() {
+            if key != "mode" {
+                unmarked
+                    .insert(key.clone(), value.clone())
+                    .expect("a fresh key");
+            }
+        }
+        assert!(
+            QrPayload::from_canonical_bytes(&kr_cbor::encode(&CanonicalValue::Map(unmarked)))
+                .is_err()
+        );
     }
 
     /// KR-REQ-10.07, KR-REQ-10.52: only interactive channels confirm, and the terminal only at
