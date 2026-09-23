@@ -1271,6 +1271,32 @@ impl Store {
         transaction.commit().map_err(ProjectError::store)
     }
 
+    /// Begins the owner's reconciliation of one ended operation through a location: asks the
+    /// admission the request carries, and every location it reaches through, and claims its action
+    /// with the operation as its subject, in one transaction before anything is removed.
+    ///
+    /// So a request whose authority lapsed while it waited does not begin, and a second copy of
+    /// the action, or another request under the same identifier, finds the claim rather than
+    /// removing anything itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::NotAdmitted`] when the admission no longer stands, the location's
+    /// refusal, [`ProjectError::IdConflict`] when the action was used for another request, or
+    /// [`ProjectError::OutcomeUnknown`] when another copy of it claimed first.
+    pub fn begin_reconciliation(
+        &mut self,
+        operation: ActionId,
+        performed: Performed<'_>,
+    ) -> Result<()> {
+        let transaction = self.transaction()?;
+        performed.admit()?;
+        if let Some(action) = performed.action() {
+            claim_action(&transaction, action, Some(operation.get()))?;
+        }
+        transaction.commit().map_err(ProjectError::store)
+    }
+
     /// Reserves a workspace for removal, in one transaction with everything the decision needs.
     ///
     /// The check and the reservation have to be one step. Otherwise a session or a run bound

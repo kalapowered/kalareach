@@ -2339,3 +2339,198 @@ fn the_owner_reconciles_a_legacy_and_an_unknown_operation() {
     let detail = reconciled.operation.detail.0.expect("the record says why");
     assert!(detail.contains("recorded no identity"), "{detail}");
 }
+
+#[test]
+fn an_owner_reconciliation_is_admitted_and_claimed_before_it_removes_anything() {
+    // The owner's reconciliation through a location removes a directory, so it is performed like
+    // every other effect: the request's own admission is asked, and its action claimed, in one
+    // transaction before anything is removed. A request whose authority lapsed while it waited
+    // removes nothing and claims nothing; a second request under the same identifier with another
+    // payload finds the claim and removes nothing; and a daemon that ends after the claim leaves
+    // an answer a restart settles as what it is, not as the operation's own.
+    let mut fixture = Fixture::create();
+    let owner = support::TestOwner::default();
+    let source = ordinary_repository(fixture.work(), "source");
+    cloned(&fixture, &source, "first", 100);
+    cloned(&fixture, &source, "second", 101);
+    cloned(&fixture, &source, "third", 102);
+    let operation =
+        |seed: u8| kr_protocol::ids::ActionId::new(action("project.clone", seed).action_id);
+    let work = fixture.work().to_path_buf();
+    let staging = |name: &str| work.join(format!("{STAGING_PREFIX}{name}"));
+    let journal = rusqlite::Connection::open(
+        kr_project::ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    // Two failed operations, each with the staging directory it made still there.
+    for (seed, name) in [(100, "first-left"), (101, "second-left")] {
+        support::staging_directory(&staging(name));
+        let (device, file) = identity_of(&staging(name));
+        journal
+            .execute(
+                "UPDATE operations SET state = 'failed', staging_name = ?2, staging_device = ?3,
+                        staging_file_id = ?4
+                  WHERE action_id = ?1",
+                rusqlite::params![
+                    operation(seed).get().as_bytes().to_vec(),
+                    format!("{STAGING_PREFIX}{name}"),
+                    device,
+                    file,
+                ],
+            )
+            .expect("the operation keeps its staging directory");
+    }
+    let location = support::authorise_location(
+        fixture.service(),
+        &owner,
+        fixture.work(),
+        LocationPurpose::Destination,
+        103,
+    );
+    let reconcile = |seed: u8| ProjectOperationCancelParams {
+        operation_action_id: operation(seed),
+        through_location_id: Nullable(Some(location)),
+    };
+    let cancelling = |id: u8, digest: u8| kr_project::store::Action {
+        actor_id: actor(),
+        action_id: kr_protocol::scalars::Uuid::from_bytes([id; 16]),
+        method: "project.operation.cancel".to_owned(),
+        payload_digest: kr_protocol::scalars::Digest256::from_bytes([digest; 32]),
+    };
+
+    // A request whose authority lapsed after the daemon admitted it removes nothing and claims
+    // nothing.
+    let lapsed = cancelling(104, 104);
+    let asked = std::sync::atomic::AtomicUsize::new(0);
+    let admission = || {
+        asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(ProtocolError::new(
+            ErrorCode::PermissionDenied,
+            "the authority this action was admitted under was withdrawn",
+        ))
+    };
+    let refusal = fixture
+        .service()
+        .project_operation_cancel(
+            &actor(),
+            &reconcile(100),
+            Performed::from(Some(&lapsed)).admitted(&admission),
+        )
+        .expect_err("the reconciliation does not begin");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    assert!(refusal.to_string().contains("withdrawn"), "{refusal}");
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(staging("first-left").join("tree").is_dir());
+    assert!(
+        fixture
+            .service()
+            .retained_action(
+                &actor(),
+                lapsed.action_id,
+                &lapsed.method,
+                lapsed.payload_digest
+            )
+            .expect("the journal reads")
+            .is_none(),
+        "nothing was claimed"
+    );
+
+    // Two requests under one identifier: the second, with another payload, arrives while the
+    // first holds its claim and has removed nothing yet.
+    let first = cancelling(105, 105);
+    let other = cancelling(105, 106);
+    let (claimed, waiting) = std::sync::mpsc::channel::<()>();
+    let (go, released) = std::sync::mpsc::channel::<()>();
+    let claimed = std::sync::Mutex::new(claimed);
+    let released = std::sync::Mutex::new(released);
+    let once = std::sync::atomic::AtomicBool::new(false);
+    fixture.before_reconciling(Arc::new(move || {
+        if !once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let _ = claimed.lock().expect("the channel").send(());
+            let _ = released
+                .lock()
+                .expect("the channel")
+                .recv_timeout(Duration::from_secs(60));
+        }
+    }));
+    let fixture = &fixture;
+    let answered = std::thread::scope(|scope| {
+        let running = scope.spawn(|| {
+            fixture.service().project_operation_cancel(
+                &actor(),
+                &reconcile(100),
+                Performed::from(Some(&first)),
+            )
+        });
+        waiting
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the first request claims its action");
+        let conflict = fixture
+            .service()
+            .project_operation_cancel(&actor(), &reconcile(101), Performed::from(Some(&other)))
+            .expect_err("one identifier is one request");
+        assert_eq!(conflict.code(), ErrorCode::IdConflict, "{conflict}");
+        assert!(
+            staging("second-left").join("tree").is_dir(),
+            "the other request removed nothing"
+        );
+        let _ = go.send(());
+        running.join().expect("the first request finishes")
+    })
+    .expect("the first request reconciles");
+    support::assert_absent(&staging("first-left"), "the first request's directory");
+    assert!(staging("second-left").join("tree").is_dir());
+    let repeated = fixture
+        .service()
+        .project_operation_cancel(&actor(), &reconcile(100), Performed::from(Some(&first)))
+        .expect("a repeat is answered from the record");
+    assert_eq!(repeated, answered);
+    let conflict = fixture
+        .service()
+        .project_operation_cancel(&actor(), &reconcile(101), Performed::from(Some(&other)))
+        .expect_err("still one request");
+    assert_eq!(conflict.code(), ErrorCode::IdConflict);
+
+    // A daemon that ended after claiming a reconciliation of a completed operation: a restart
+    // settles the claim as an outcome it cannot establish, naming the operation, and does not
+    // answer it with the operation's own result.
+    let interrupted = cancelling(107, 107);
+    journal
+        .execute(
+            "INSERT INTO actions (actor_id, action_id, method, payload_digest, subject, result,
+                                  error_code, error_detail, recorded_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, 1)",
+            rusqlite::params![
+                interrupted.actor_id.as_str(),
+                interrupted.action_id.as_bytes().to_vec(),
+                interrupted.method,
+                interrupted.payload_digest.as_bytes().to_vec(),
+                operation(102).get().as_bytes().to_vec(),
+            ],
+        )
+        .expect("the claim a daemon that ended left");
+    drop(journal);
+    let replacement = fixture.reopen();
+    let recovery = replacement.recover().expect("recovery runs");
+    assert!(recovery.claims_settled >= 1);
+    match replacement
+        .retained_action(
+            &actor(),
+            interrupted.action_id,
+            &interrupted.method,
+            interrupted.payload_digest,
+        )
+        .expect("the journal reads")
+    {
+        Some(kr_project::store::RetainedOutcome::Error { code, detail }) => {
+            assert_eq!(code, ErrorCode::OutcomeUnknown);
+            assert!(
+                detail.contains(&format!("reading operation {}", operation(102))),
+                "{detail}"
+            );
+        }
+        other => panic!("the claim is settled as unknown: {other:?}"),
+    }
+    assert!(staging("second-left").join("tree").is_dir());
+}

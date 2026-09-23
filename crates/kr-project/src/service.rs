@@ -161,7 +161,8 @@ pub struct ProjectService {
     /// Taken for as long as one map operation, never across a subprocess and never while the
     /// journal's lock is held, so there is one order and no way to deadlock against the store.
     running: Mutex<BTreeMap<ActionId, Arc<Cancellation>>>,
-    /// What a test runs immediately before a running operation's reconciliation reads its names.
+    /// What a test runs immediately before a reconciliation reads or removes anything beneath its
+    /// location.
     #[cfg(feature = "git-fixtures")]
     reconciling: Option<Hook>,
 }
@@ -232,11 +233,12 @@ impl ProjectService {
         self.profile.interpose(interposition);
     }
 
-    /// Runs something immediately before a running operation's reconciliation reads its names.
+    /// Runs something immediately before a reconciliation reads or removes anything beneath its
+    /// location: a running operation's, between the question it asks first and the read that asks
+    /// it again, and the owner's, between the claim of its action and the removal.
     ///
-    /// Compiled with the fixtures, so that a test can act in the window between the question a
-    /// reconciliation asks first and the read that asks it again, where no Git child runs for an
-    /// interposition to act beside. Nothing in the service sets it.
+    /// Compiled with the fixtures, so that a test can act in windows where no Git child runs for
+    /// an interposition to act beside. Nothing in the service sets it.
     #[cfg(feature = "git-fixtures")]
     pub fn before_reconciling(&mut self, act: Arc<dyn Fn() + Send + Sync>) {
         self.reconciling = Some(Hook(act));
@@ -493,6 +495,18 @@ impl ProjectService {
                 settled += u64::from(self.settle_unknown(&action, &detail)? > 0);
                 continue;
             };
+            // A reconciliation's claim names the operation it reconciled, and its answer is not
+            // that operation's: what it removed is on the operation's own record, and what the
+            // daemon that ended was answering with is not something the journal holds.
+            if record.method == Method::ProjectOperationCancel.as_str() {
+                let detail = format!(
+                    "the daemon that performed this reconciliation ended before it recorded the \
+                     result; reading operation {subject} says which of its staging paths are \
+                     still there"
+                );
+                settled += u64::from(self.settle_unknown(&action, &detail)? > 0);
+                continue;
+            }
             // The claim names what it acted on, so the durable state of that object is consulted
             // before anything is called unknown.
             let operation = self.locked()?.operation(ActionId::new(subject))?;
@@ -1850,6 +1864,13 @@ impl ProjectService {
         performed: impl Into<Performed<'a>>,
     ) -> Result<ProjectOperationCancelResult> {
         let performed = performed.into();
+        // A copy of this action that already settled is answered from its record, and one still
+        // in flight is told so, before anything is looked at again.
+        if let Some(answered) =
+            self.answer_from_record::<ProjectOperationCancelResult>(performed.action())?
+        {
+            return Ok(answered);
+        }
         let through = params.through_location_id.0;
         if let (Some(grant), Some(_)) = (performed.grant(), through) {
             return Err(ProjectError::PermissionDenied {
@@ -1921,58 +1942,121 @@ impl ProjectService {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
+        let stopped = flag.map_or(0, |flag| flag.stopped());
         if let Some(location_id) = through {
-            let current = self.locked()?.operation(row.action_id)?.ok_or_else(|| {
-                ProjectError::UnknownOperation {
-                    operation: row.action_id.to_string().into(),
-                }
-            })?;
-            self.reconcile_staging(&current, location_id)?;
+            return self.reconcile_staging(row.action_id, location_id, performed, stopped);
         }
         Ok(ProjectOperationCancelResult {
             operation: self.read_operation(row.action_id)?,
-            stopped_processes: U64::new(flag.map_or(0, |flag| flag.stopped())),
+            stopped_processes: U64::new(stopped),
         })
     }
 
     /// Takes away, through a location the owner named, the staging directory an ended operation
-    /// recorded, and records what that left.
+    /// recorded, records what that left, and answers with the operation's record.
     ///
     /// Only what the row's recorded identity proves this host created goes: a directory whose
     /// identity is not the recorded one, or one that recorded none, is kept and named with the
     /// reason, and so is one a removal could not finish. A directory a cleanup already recorded as
     /// removed is not looked for again. Nothing about the operation's outcome changes.
-    fn reconcile_staging(&self, row: &OperationRow, location_id: ProjectLocationId) -> Result<()> {
+    ///
+    /// Before anything is removed, the request's own admission and the location's are asked, and
+    /// the action is claimed with the operation as its subject, in one transaction. The answer then
+    /// settles that claim, so a copy of the action finds it rather than removing anything itself.
+    fn reconcile_staging(
+        &self,
+        operation: ActionId,
+        location_id: ProjectLocationId,
+        performed: Performed<'_>,
+        stopped: u64,
+    ) -> Result<ProjectOperationCancelResult> {
+        let row =
+            self.locked()?
+                .operation(operation)?
+                .ok_or_else(|| ProjectError::UnknownOperation {
+                    operation: operation.to_string().into(),
+                })?;
         if matches!(
             row.state,
             OperationState::Staging | OperationState::Publishing
         ) {
             return Err(ProjectError::WrongState {
                 detail: format!(
-                    "operation {} has not ended, so the staging directory it recorded may still be \
-                     in use and is not reconciled; ask again once it has ended",
-                    row.action_id
+                    "operation {operation} has not ended, so the staging directory it recorded may \
+                     still be in use and is not reconciled; ask again once it has ended"
                 )
                 .into(),
             });
         }
+        let answer = || -> Result<ProjectOperationCancelResult> {
+            Ok(ProjectOperationCancelResult {
+                operation: self.read_operation(operation)?,
+                stopped_processes: U64::new(stopped),
+            })
+        };
         let Some(name) = row.staging_name.as_deref() else {
-            return Ok(());
+            return answer();
         };
         let shown = Path::new(&row.parent_path).join(name);
         let path = shown.display().to_string();
         let removed = self
             .locked()?
-            .staging_paths(row.action_id)?
+            .staging_paths(operation)?
             .into_iter()
             .any(|recorded| recorded.path == path && recorded.removed);
         if removed {
-            return Ok(());
+            return answer();
         }
         let reach = self.recorded_reach(location_id, &shown, "the staging directory")?;
+        // The guard is released at the end of this statement: answering from the record below
+        // takes the same lock.
+        let begun = self
+            .writable()?
+            .begin_reconciliation(operation, performed.reaching(reach.admission.as_ref()));
+        match begun {
+            Ok(()) => {}
+            // Another copy of this action claimed first: its record is the answer, or says that
+            // its effect is still in flight.
+            Err(ProjectError::OutcomeUnknown { .. }) if performed.action().is_some() => {
+                if let Some(answered) =
+                    self.answer_from_record::<ProjectOperationCancelResult>(performed.action())?
+                {
+                    return Ok(answered);
+                }
+                return Err(ProjectError::OutcomeUnknown {
+                    detail: format!(
+                        "another copy of this action is reconciling operation {operation}"
+                    )
+                    .into(),
+                });
+            }
+            Err(error) => return Err(error),
+        }
+        // A test can act here, between the claim and the removal.
+        #[cfg(feature = "git-fixtures")]
+        if let Some(hook) = &self.reconciling {
+            (hook.0)();
+        }
         let cleanup = self.remove_recorded_staging(&reach, row.staging_identity, &shown);
-        self.writable()?
-            .record_staging_path(row.action_id, &path, cleanup.gone(), cleanup.why())
+        let outcome = self
+            .writable()
+            .and_then(|mut store| {
+                store.record_staging_path(operation, &path, cleanup.gone(), cleanup.why())
+            })
+            .and_then(|()| answer());
+        // The claim is settled with what the caller is told. A journal that refuses even that
+        // leaves the claim open, which a repeat is told about and a restart settles.
+        if let Some(action) = performed.action() {
+            let _ = self.writable().and_then(|store| match &outcome {
+                Ok(answered) => {
+                    let encoded =
+                        kr_cbor::to_canonical_vec(answered).map_err(ProjectError::store)?;
+                    store.settle(action, Some(&encoded), None)
+                }
+                Err(error) => store.settle(action, None, Some((error.code(), &error.to_string()))),
+            });
+        }
+        outcome
     }
 
     /// Admits a location for the owner's reconciliation: an active destination of the owner's in
@@ -2828,7 +2912,14 @@ impl ProjectService {
     /// its own configuration is never read.
     fn populated_submodules(&self, opened: &OpenedRepository) -> Result<Vec<String>> {
         let mut populated = Vec::new();
-        for path in crate::workspace::submodule_paths(&self.profile, opened)? {
+        let paths = crate::workspace::submodule_paths(&self.profile, opened)?;
+        // The directories are looked at through the working tree's handle, which is a read through
+        // the repository's location when it was reached through one, so that location is asked
+        // first, once, for this read.
+        if let Some(admission) = opened.admission() {
+            admission.admit()?;
+        }
+        for path in paths {
             let Ok(name) = kr_transfer::RelativeName::parse(&path) else {
                 populated.push(path);
                 continue;
@@ -2836,10 +2927,11 @@ impl ProjectService {
             let Ok(directory) = opened.work_tree().subdirectory(&name) else {
                 // Only a plain absence is absence. A path this host could not open, or one that
                 // is not a directory at all, is a path it has not established anything about, so
-                // it counts as work it has not read.
+                // it counts as work it has not read. Absence is asked of the same handle, never
+                // of a path.
                 let absent = matches!(
-                    std::fs::symlink_metadata(opened.top_level().join(&path)),
-                    Err(ref failure) if failure.kind() == std::io::ErrorKind::NotFound
+                    opened.work_tree().probe(&name),
+                    Err(kr_transfer::Escape::NotFound { .. })
                 );
                 if !absent {
                     populated.push(path);
