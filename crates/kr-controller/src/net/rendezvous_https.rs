@@ -97,6 +97,13 @@ const CLOSE_DEADLINE: Duration = Duration::from_secs(1);
 /// A real answer's head is a few hundred bytes.
 pub const MAX_UPGRADE_ANSWER_BYTES: usize = 16 * 1024;
 
+/// How many of the room's pings may arrive while the socket cannot take the answers to them.
+///
+/// The WebSocket library answers every ping itself and holds the answer until the socket takes
+/// it, so a room that stops reading and keeps pinging would otherwise grow that queue without
+/// bound.
+pub const MAX_UNANSWERED_PINGS: u32 = 32;
+
 /// The rendezvous service a deployed host reaches over HTTPS.
 ///
 /// kr-pairing asks for a reservation and a release synchronously, on the blocking thread a pairing
@@ -268,7 +275,9 @@ async fn open_room(
 /// the value fits. So the answer is read here first, into a buffer of at most
 /// [`MAX_UPGRADE_ANSWER_BYTES`], and handed on only once its head is complete and every accept
 /// value in it is one SHA-1 digest in base64; anything else is an error of the stream, which ends
-/// the attachment. After the head, reads and writes go straight to the stream.
+/// the attachment. The answer must begin with its status line: the library skips blank lines in
+/// front of one, and they would put the end of a head where this guard looks for it. After the
+/// head, reads and writes go straight to the stream.
 pub struct UpgradeGuard<S> {
     stream: S,
     answer: Answered,
@@ -323,6 +332,13 @@ impl<S: AsyncRead + Unpin> AsyncRead for UpgradeGuard<S> {
                         return Poll::Ready(Ok(()));
                     }
                     head.extend_from_slice(into.filled());
+                    let start = head.len().min(STATUS_LINE_START.len());
+                    if head[..start] != STATUS_LINE_START[..start] {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "the room's answer to the upgrade does not begin with a status line",
+                        )));
+                    }
                     if let Some(end) = head.windows(4).position(|window| window == b"\r\n\r\n") {
                         check_upgrade_head(&head[..end + 4])?;
                         let read = std::mem::take(head);
@@ -369,10 +385,14 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for UpgradeGuard<S> {
     }
 }
 
+/// How an answer to the upgrade begins: its status line.
+const STATUS_LINE_START: &[u8] = b"HTTP/";
+
 /// Refuses an answer carrying a `Sec-WebSocket-Accept` that is anything but one SHA-1 digest in
 /// padded base64, on whichever line it appears: the value is decoded into twenty bytes, and a
-/// longer one does not fit. A value is measured from after its leading spaces to the end of its
-/// line, so one the library would read shorter is measured at least as long here.
+/// longer one does not fit. A value is trimmed exactly as the library's parser trims it (spaces
+/// and tabs in front, spaces, tabs and line ends behind), so what is checked here is what the
+/// library decodes.
 fn check_upgrade_head(head: &[u8]) -> io::Result<()> {
     for line in head.split(|byte| *byte == b'\n') {
         let Some(colon) = line.iter().position(|byte| *byte == b':') else {
@@ -384,8 +404,17 @@ fn check_upgrade_head(head: &[u8]) -> io::Result<()> {
         {
             continue;
         }
-        let value = line[colon + 1..].trim_ascii_start();
-        let value = value.strip_suffix(b"\r").unwrap_or(value);
+        let value = &line[colon + 1..];
+        let start = value
+            .iter()
+            .position(|byte| !matches!(byte, b' ' | b'\t'))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+            .map_or(start, |last| last + 1)
+            .max(start);
+        let value = &value[start..end];
         let digest = value.len() == 28
             && value[27] == b'='
             && value[..27]
@@ -465,6 +494,8 @@ async fn carry<S>(
     tokio::pin!(relay_gone);
     let mut delivering: Option<Delivery> = None;
     let mut unflushed = false;
+    // Pings read since the socket last took everything queued for it, answers included.
+    let mut unanswered_pings = 0_u32;
     std::future::poll_fn(|cx| {
         loop {
             if relay_gone.as_mut().poll(cx).is_ready() {
@@ -492,10 +523,17 @@ async fn carry<S>(
                         delivering = Some((frame, Box::pin(to_relay.clone().reserve_owned())));
                         moved = true;
                     }
-                    // The library answers a ping itself.
-                    Poll::Ready(Some(Ok(message))) if message.is_ping() || message.is_pong() => {
+                    // The library answers a ping itself, and the answer waits in its queue until a
+                    // flush takes it; a room that pings without reading gets only so many.
+                    Poll::Ready(Some(Ok(message))) if message.is_ping() => {
+                        unanswered_pings += 1;
+                        if unanswered_pings > MAX_UNANSWERED_PINGS {
+                            return Poll::Ready(());
+                        }
+                        unflushed = true;
                         moved = true;
                     }
+                    Poll::Ready(Some(Ok(message))) if message.is_pong() => moved = true,
                     // Text is no frame of the room's, and a close, an error or the end ends it.
                     Poll::Ready(_) => return Poll::Ready(()),
                     Poll::Pending => {}
@@ -521,7 +559,10 @@ async fn carry<S>(
             }
             if unflushed {
                 match socket.poll_flush_unpin(cx) {
-                    Poll::Ready(Ok(())) => unflushed = false,
+                    Poll::Ready(Ok(())) => {
+                        unflushed = false;
+                        unanswered_pings = 0;
+                    }
                     Poll::Ready(Err(_)) => return Poll::Ready(()),
                     Poll::Pending => {}
                 }
@@ -1276,15 +1317,25 @@ mod tests {
     /// Takes the next connection's TLS, reads the host's upgrade request, and answers it with
     /// `answer`, as a room that does not speak the upgrade properly would.
     async fn answer_upgrade(room: &LoopbackRoom, answer: Vec<u8>) {
+        answer_upgrade_in_pieces(room, vec![answer]).await;
+    }
+
+    /// As [`answer_upgrade`], with the answer written a piece at a time, so the host reads it in
+    /// fragments.
+    async fn answer_upgrade_in_pieces(room: &LoopbackRoom, pieces: Vec<Vec<u8>>) {
         let (stream, _) = room.listener.accept().await.expect("a connection");
         let mut stream = room.acceptor.accept(stream).await.expect("TLS");
         let mut head = Vec::new();
         while !head.ends_with(b"\r\n\r\n") {
             head.push(stream.read_u8().await.expect("the request"));
         }
-        // The host may stop reading part way through, which ends this write.
-        let _ = stream.write_all(&answer).await;
-        let _ = stream.flush().await;
+        for piece in pieces {
+            // The host may stop reading part way through, which ends this write.
+            if stream.write_all(&piece).await.is_err() || stream.flush().await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         // Held open, so the host's side of the answer is decided by what it read.
         let _ = tokio::time::timeout(WATCHDOG, stream.read_u8()).await;
     }
@@ -1346,10 +1397,97 @@ mod tests {
         );
     }
 
-    /// While the socket can take no more of the relay's frames, the room's frames still reach the
-    /// relay: neither direction waits for the other.
+    /// Splits `answer` into pieces of `size` bytes.
+    fn pieces(answer: &[u8], size: usize) -> Vec<Vec<u8>> {
+        answer.chunks(size).map(<[u8]>::to_vec).collect()
+    }
+
+    /// Blank lines in front of the status line, which the library's parser skips, do not let an
+    /// answer past the guard: an answer that never ends and one whose accept value is too long
+    /// are both refused, however their bytes arrive.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_rooms_frames_reach_the_relay_while_the_socket_can_take_no_more() {
+    async fn blank_lines_in_front_of_an_answer_do_not_let_it_past() {
+        let authority = Authority::new("rendezvous test authority");
+        let mut endless = b"\r\n\r\nHTTP/1.1 101 Switching Protocols\r\nX-Padding: ".to_vec();
+        endless.resize(endless.len() + 256 * 1024, b'a');
+        let long_accept = concat!(
+            "\r\n\r\n",
+            "HTTP/1.1 101 Switching Protocols\r\n",
+            "Upgrade: websocket\r\n",
+            "Connection: Upgrade\r\n",
+            "Sec-WebSocket-Accept: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n",
+            "\r\n"
+        )
+        .as_bytes()
+        .to_vec();
+        for answer in [
+            pieces(&endless, 1500),
+            pieces(&long_accept, 3),
+            vec![long_accept],
+        ] {
+            let room = LoopbackRoom::start(&authority).await;
+            let client = authority.trusted_by();
+            let attempted = Instant::now();
+            let (attached, ()) = tokio::time::timeout(WATCHDOG, async {
+                tokio::join!(
+                    client.attach(&room.origin, &locator(), &SymmetricKey::from_bytes([5; 32])),
+                    answer_upgrade_in_pieces(&room, answer)
+                )
+            })
+            .await
+            .expect("the attempt ends");
+            assert_eq!(
+                attached.expect_err("refused").code(),
+                ErrorCode::RendezvousUnavailable
+            );
+            let took = attempted.elapsed();
+            assert!(
+                took < ATTACH_DEADLINE / 2,
+                "refused {took:?} after the attempt began"
+            );
+        }
+    }
+
+    /// The guard trims an accept value as the library's parser does, so a correct digest with
+    /// optional whitespace around it passes, and anything that is not one digest does not.
+    #[test]
+    fn an_accept_value_is_checked_as_the_library_reads_it() {
+        let head = |value: &str| {
+            format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                 Sec-WebSocket-Accept:{value}\r\n\r\n"
+            )
+        };
+        let digest = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+        for passes in [
+            format!(" {digest}"),
+            digest.to_owned(),
+            format!(" \t{digest} \t"),
+            format!("{digest}\t"),
+        ] {
+            assert!(
+                check_upgrade_head(head(&passes).as_bytes()).is_ok(),
+                "{passes:?}"
+            );
+        }
+        for refused in [
+            format!(" {digest}A"),
+            " AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            " s3pPLMBiTxaQ9kYGzzhZRbK+xOoA".to_owned(),
+            " s3pPLMBiTxaQ 9kYGzzhZRbK+xO=".to_owned(),
+            String::new(),
+        ] {
+            assert!(
+                check_upgrade_head(head(&refused).as_bytes()).is_err(),
+                "{refused:?}"
+            );
+        }
+    }
+
+    /// A room that stops reading and keeps pinging ends its socket once the answers it has not
+    /// taken reach their bound, rather than growing the queue they wait in.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_room_that_pings_without_reading_loses_its_socket() {
         let authority = Authority::new("rendezvous test authority");
         let room = LoopbackRoom::start(&authority).await;
         let client = authority.trusted_by();
@@ -1362,11 +1500,27 @@ mod tests {
         .await
         .expect("the host attaches");
         let mut socket = attached.expect("attached");
-        let attempt_id = AttemptId::new(Uuid::from_bytes([7; 16]));
+        fill(&mut socket).await;
 
-        // The room reads nothing, and the relay sends until the socket takes no more.
+        tokio::time::timeout(WATCHDOG, async {
+            for _ in 0..=MAX_UNANSWERED_PINGS {
+                end.send(Message::ping(vec![1, 2, 3]))
+                    .await
+                    .expect("a ping");
+            }
+        })
+        .await
+        .expect("the pings are sent");
+        let ended = tokio::time::timeout(WATCHDOG, socket.incoming.recv())
+            .await
+            .expect("the socket ends");
+        assert_eq!(ended, None, "the socket ended at the bound");
+    }
+
+    /// Sends the relay's frames until the socket takes no more, the room reading nothing.
+    async fn fill(socket: &mut RoomSocket) {
         let large = ClientFrame::Relay {
-            attempt_id,
+            attempt_id: AttemptId::new(Uuid::from_bytes([7; 16])),
             payload: Bytes::new(vec![0; super::super::rendezvous::MAX_FRAME_PAYLOAD_BYTES]),
         };
         tokio::time::timeout(WATCHDOG, async {
@@ -1385,6 +1539,26 @@ mod tests {
         })
         .await
         .expect("the socket fills");
+    }
+
+    /// While the socket can take no more of the relay's frames, the room's frames still reach the
+    /// relay: neither direction waits for the other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_rooms_frames_reach_the_relay_while_the_socket_can_take_no_more() {
+        let authority = Authority::new("rendezvous test authority");
+        let room = LoopbackRoom::start(&authority).await;
+        let client = authority.trusted_by();
+        let (attached, (_, _, mut end)) = tokio::time::timeout(WATCHDOG, async {
+            tokio::join!(
+                client.attach(&room.origin, &locator(), &SymmetricKey::from_bytes([5; 32])),
+                room.attached()
+            )
+        })
+        .await
+        .expect("the host attaches");
+        let mut socket = attached.expect("attached");
+        let attempt_id = AttemptId::new(Uuid::from_bytes([7; 16]));
+        fill(&mut socket).await;
 
         let opened = ServiceFrame::AttemptOpened { attempt_id };
         send(&mut end, &opened).await;
