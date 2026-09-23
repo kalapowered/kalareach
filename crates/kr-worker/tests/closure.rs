@@ -343,9 +343,11 @@ async fn a_client_that_stopped_reading_holds_the_worker_only_until_the_bound() {
     let host = host("read -r _; head -c 2000000 /dev/zero | tr '\\0' x; read -r _; exit 0").await;
     let (stalled, mut keys) = attached_holding_the_keys(&host).await;
     keys.release(&host.runtime);
-    // The session says when this client has fallen a whole queue behind: output it was owed has
-    // not been taken off the connection, so nothing behind that output can be either. That is the
-    // moment the closure is let happen, rather than a guess at how much a socket holds.
+    // The session says when this client has fallen a whole queue behind: a megabyte it was owed
+    // had not been taken off the connection. That is the moment the closure is let happen. A
+    // local socket holds a few hundred kilobytes at the most, so the notice queued behind that
+    // megabyte cannot be written while the client reads nothing; a transport that held it all
+    // would let the notice through and fail the check below, never pass it wrongly.
     until(
         "the client that stopped reading to fall a whole queue behind",
         || host.runtime.session().is_resynchronising(keys.attachment()),
