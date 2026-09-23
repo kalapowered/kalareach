@@ -24,22 +24,24 @@ use kr_protocol::automation::{
     WorkflowReadParams, WorkflowReadResult, WorkflowRunParams, WorkflowRunResult,
 };
 use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::{CausalRootId, PluginId, WorkflowId, WorkflowRunId, WorkspaceId};
+use kr_protocol::ids::{
+    CausalRootId, EnvironmentId, PluginId, WorkflowId, WorkflowRunId, WorkspaceId,
+};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 
+use crate::Host;
 use crate::admission::AdmissionController;
 use crate::authority::{self, AuthoritySource};
 use crate::causal::CausalContext;
 use crate::definition::validate_definition;
-use crate::engine::{ActionRunner, WorkflowEngine};
+use crate::engine::WorkflowEngine;
 use crate::error::{AutomationError, Result};
 use crate::source_workflow::{QuiescenceManager, QuiescenceReservation, SourceWorkflowCoordinator};
 use crate::store::{
     Acted, ActionKey, ActionRecord, AttentionSubject, InstalledDefinition, Journal, Submitted,
     WorkflowStore,
 };
-use crate::{HostClock, SystemClock};
 
 /// The identifier an attention record is raised about.
 ///
@@ -95,6 +97,7 @@ pub struct AutomationService {
     store: Arc<WorkflowStore>,
     admission: Mutex<AdmissionController>,
     authority: Arc<dyn AuthoritySource>,
+    environment_id: EnvironmentId,
     engine: Arc<WorkflowEngine>,
     source_workflow: Arc<SourceWorkflowCoordinator>,
 }
@@ -109,91 +112,41 @@ impl std::fmt::Debug for AutomationService {
 }
 
 impl AutomationService {
-    /// Opens the automation service on the workflow journal in `state_dir`.
-    ///
-    /// `runner` is what actually carries out an action node. There is no default: a service
-    /// with nothing behind its action kinds would write success receipts for work nobody did,
-    /// and a later node, review or deployment would read them as proof.
-    ///
-    /// `authority` is where the grant a definition names is read from. There is no default here
-    /// either: a service that believed whatever grant a request carried would let a caller
-    /// describe authority it does not hold.
+    /// Opens the automation service on the workflow journal in `state_dir`, for `host`.
     ///
     /// # Errors
     ///
     /// Returns the journal's refusal when it cannot be opened.
-    pub fn open(
-        state_dir: impl AsRef<Path>,
-        runner: Arc<dyn ActionRunner>,
-        authority: Arc<dyn AuthoritySource>,
-    ) -> Result<Self> {
-        Self::on_store(
+    pub fn open(state_dir: impl AsRef<Path>, host: Host) -> Result<Self> {
+        Ok(Self::on_store(
             Arc::new(WorkflowStore::open(state_dir)?),
-            runner,
-            authority,
-            Arc::new(SystemClock),
-        )
+            host,
+        ))
     }
 
-    /// Opens the automation service on the workflow journal in `state_dir`, reading `clock`.
-    ///
-    /// # Errors
-    ///
-    /// Returns the journal's refusal when it cannot be opened.
-    pub fn open_with_clock(
-        state_dir: impl AsRef<Path>,
-        runner: Arc<dyn ActionRunner>,
-        authority: Arc<dyn AuthoritySource>,
-        clock: Arc<dyn HostClock>,
-    ) -> Result<Self> {
-        Self::on_store(
-            Arc::new(WorkflowStore::open(state_dir)?),
-            runner,
-            authority,
-            clock,
-        )
-    }
-
-    /// Creates an automation service whose journal lives only in memory, reading `clock`.
+    /// Creates an automation service whose journal lives only in memory, for `host`.
     ///
     /// # Errors
     ///
     /// Returns the journal's refusal when its schema cannot be created.
-    pub fn in_memory_with_clock(
-        runner: Arc<dyn ActionRunner>,
-        authority: Arc<dyn AuthoritySource>,
-        clock: Arc<dyn HostClock>,
-    ) -> Result<Self> {
-        Self::on_store(
-            Arc::new(WorkflowStore::in_memory()?),
-            runner,
-            authority,
-            clock,
-        )
+    pub fn in_memory(host: Host) -> Result<Self> {
+        Ok(Self::on_store(Arc::new(WorkflowStore::in_memory()?), host))
     }
 
-    #[allow(clippy::unnecessary_wraps)]
-    fn on_store(
-        store: Arc<WorkflowStore>,
-        runner: Arc<dyn ActionRunner>,
-        authority: Arc<dyn AuthoritySource>,
-        clock: Arc<dyn HostClock>,
-    ) -> Result<Self> {
-        let engine = Arc::new(WorkflowEngine::with_clock(
-            Arc::clone(&store),
-            runner,
-            Arc::clone(&authority),
-            clock,
-        ));
+    fn on_store(store: Arc<WorkflowStore>, host: Host) -> Self {
+        let environment_id = host.environment_id;
+        let authority = Arc::clone(&host.authority);
+        let engine = Arc::new(WorkflowEngine::new(Arc::clone(&store), host));
         let quiescence = Arc::new(QuiescenceManager::new());
 
-        Ok(Self {
+        Self {
             store,
             admission: Mutex::new(AdmissionController::new()),
             authority,
+            environment_id,
             engine,
             source_workflow: Arc::new(SourceWorkflowCoordinator::new(quiescence)),
-        })
+        }
     }
 
     /// Accessor for the store.
@@ -252,7 +205,7 @@ impl AutomationService {
             .authority
             .grant(params.definition.grant_reference, now_ms)?;
         validate_definition(&params.definition, &grant)?;
-        authority::check_definition(&grant, &params.definition)?;
+        authority::check_definition(&grant, &params.definition, self.environment_id)?;
 
         // The request and the document it carries must name the same workflow, the same
         // revision and the same grant. Anything else lets one revision be installed under
@@ -422,7 +375,7 @@ impl AutomationService {
         // installed, and the engine reads it once more before each node it dispatches.
         let grant = self.authority.grant(def.grant_reference, now_ms)?;
         validate_definition(&def, &grant)?;
-        authority::check_definition(&grant, &def)?;
+        authority::check_definition(&grant, &def, self.environment_id)?;
 
         // Establish the causal context from the host's own records.
         let causal = match params.causal_parent.0.as_ref() {

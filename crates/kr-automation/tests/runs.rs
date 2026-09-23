@@ -67,11 +67,13 @@ async fn topological_execution_respects_dependencies() {
         },
     );
 
-    let engine = WorkflowEngine::with_clock(
+    let engine = WorkflowEngine::new(
         store.clone(),
-        runner,
-        authority(),
-        Arc::new(kr_automation::ManualClock::new(1000)),
+        common::host(
+            runner,
+            authority(),
+            Arc::new(kr_automation::ManualClock::new(1000)),
+        ),
     );
 
     let n1 = WorkflowNode {
@@ -159,11 +161,13 @@ async fn edge_condition_branching_success_and_failure() {
         },
     );
 
-    let engine = WorkflowEngine::with_clock(
+    let engine = WorkflowEngine::new(
         store.clone(),
-        runner,
-        authority(),
-        Arc::new(kr_automation::ManualClock::new(1000)),
+        common::host(
+            runner,
+            authority(),
+            Arc::new(kr_automation::ManualClock::new(1000)),
+        ),
     );
 
     let n1 = WorkflowNode {
@@ -246,11 +250,13 @@ async fn unknown_predecessor_outcome_pauses_dependants_for_review() {
         },
     );
 
-    let engine = WorkflowEngine::with_clock(
+    let engine = WorkflowEngine::new(
         store.clone(),
-        runner,
-        authority(),
-        Arc::new(kr_automation::ManualClock::new(1000)),
+        common::host(
+            runner,
+            authority(),
+            Arc::new(kr_automation::ManualClock::new(1000)),
+        ),
     );
 
     let n1 = WorkflowNode {
@@ -325,11 +331,11 @@ async fn enable_and_pause_decide_whether_a_revision_runs() {
         vec![],
     );
 
-    let service = AutomationService::in_memory_with_clock(
+    let service = AutomationService::in_memory(common::host(
         Arc::new(MockActionRunner::new()),
         authority(),
         Arc::new(ManualClock::new(1_000)),
-    )
+    ))
     .expect("a service");
     service
         .submit_install(
@@ -422,11 +428,13 @@ async fn an_uncertain_dispatch_pauses_dependants_rather_than_failing_them() {
     }
 
     let store = Arc::new(WorkflowStore::in_memory().unwrap());
-    let engine = WorkflowEngine::with_clock(
+    let engine = WorkflowEngine::new(
         store.clone(),
-        Arc::new(UncertainRunner),
-        authority(),
-        Arc::new(kr_automation::ManualClock::new(1000)),
+        common::host(
+            Arc::new(UncertainRunner),
+            authority(),
+            Arc::new(kr_automation::ManualClock::new(1000)),
+        ),
     );
 
     let n1 = WorkflowNode {
@@ -498,11 +506,13 @@ async fn cancellation_stops_undispatched_nodes() {
             if dispatch.node.node_id == "step1"
                 && let Some(store) = self.store.lock().unwrap().as_ref()
             {
-                let engine = WorkflowEngine::with_clock(
+                let engine = WorkflowEngine::new(
                     Arc::clone(store),
-                    Arc::new(MockActionRunner::new()),
-                    authority(),
-                    Arc::new(kr_automation::ManualClock::new(1000)),
+                    common::host(
+                        Arc::new(MockActionRunner::new()),
+                        authority(),
+                        Arc::new(kr_automation::ManualClock::new(1000)),
+                    ),
                 );
                 engine.cancel_run(self.run_id, 1_500).unwrap();
             }
@@ -520,11 +530,13 @@ async fn cancellation_stops_undispatched_nodes() {
         store: Mutex::new(Some(Arc::clone(&store))),
         run_id,
     });
-    let engine = WorkflowEngine::with_clock(
+    let engine = WorkflowEngine::new(
         Arc::clone(&store),
-        runner,
-        authority(),
-        Arc::new(kr_automation::ManualClock::new(1000)),
+        common::host(
+            runner,
+            authority(),
+            Arc::new(kr_automation::ManualClock::new(1000)),
+        ),
     );
 
     let n1 = WorkflowNode {
@@ -620,11 +632,11 @@ async fn a_pause_mid_run_stops_the_next_node() {
     );
 
     let service = Arc::new(
-        AutomationService::in_memory_with_clock(
+        AutomationService::in_memory(common::host(
             Arc::new(MockActionRunner::new()),
             authority(),
             Arc::new(ManualClock::new(1_000)),
-        )
+        ))
         .expect("a service"),
     );
     service

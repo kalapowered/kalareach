@@ -148,11 +148,13 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
     let root;
     let mut parent;
     {
-        let service = AutomationService::open_with_clock(
+        let service = AutomationService::open(
             journal.path(),
-            Arc::new(MockActionRunner::new()),
-            authority(),
-            clock.clone(),
+            common::host(
+                Arc::new(MockActionRunner::new()),
+                authority(),
+                clock.clone(),
+            ),
         )
         .expect("the journal opens");
         for def in &workflows {
@@ -180,11 +182,13 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
     // Each further step is a fresh process against the same journal.
     let mut steps = 1_u64;
     let refusal = loop {
-        let service = AutomationService::open_with_clock(
+        let service = AutomationService::open(
             journal.path(),
-            Arc::new(MockActionRunner::new()),
-            authority(),
-            clock.clone(),
+            common::host(
+                Arc::new(MockActionRunner::new()),
+                authority(),
+                clock.clone(),
+            ),
         )
         .expect("the journal reopens");
 
@@ -224,11 +228,13 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
     );
 
     // The pause survives the restart that follows it, and nothing else gets in.
-    let service = AutomationService::open_with_clock(
+    let service = AutomationService::open(
         journal.path(),
-        Arc::new(MockActionRunner::new()),
-        authority(),
-        clock.clone(),
+        common::host(
+            Arc::new(MockActionRunner::new()),
+            authority(),
+            clock.clone(),
+        ),
     )
     .expect("the journal reopens");
 
@@ -275,11 +281,13 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
 
     // The item is in the attention state, not in a process. Both come back after a restart,
     // and the settled record is not delivered a second time.
-    let after_restart = AutomationService::open_with_clock(
+    let after_restart = AutomationService::open(
         journal.path(),
-        Arc::new(MockActionRunner::new()),
-        authority(),
-        clock.clone(),
+        common::host(
+            Arc::new(MockActionRunner::new()),
+            authority(),
+            clock.clone(),
+        ),
     )
     .expect("the journal reopens");
     let mut attention = attention_at(&inbox, 2_100_000);
@@ -305,11 +313,11 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
 /// A workflow cannot retrigger on its own descendants unless the reviewed definition says so.
 #[tokio::test]
 async fn self_retrigger_is_refused_without_explicit_recurrence() {
-    let service = AutomationService::in_memory_with_clock(
+    let service = AutomationService::in_memory(common::host(
         Arc::new(MockActionRunner::new()),
         authority(),
         Arc::new(ManualClock::new(1_000)),
-    )
+    ))
     .expect("a service");
     let mut def = recurring_workflow(3, "self-trigger", "run_tests");
     def.explicit_recurrence = false;
@@ -346,11 +354,11 @@ async fn self_retrigger_is_refused_without_explicit_recurrence() {
 /// The root and the depth come from the host's records, not from what the request claims.
 #[tokio::test]
 async fn a_request_cannot_name_its_own_causal_root() {
-    let service = AutomationService::in_memory_with_clock(
+    let service = AutomationService::in_memory(common::host(
         Arc::new(MockActionRunner::new()),
         authority(),
         Arc::new(ManualClock::new(1_000)),
-    )
+    ))
     .expect("a service");
     let first = recurring_workflow(4, "first", "run_tests");
     let second = recurring_workflow(5, "second", "run_tests");
@@ -426,11 +434,13 @@ async fn a_request_cannot_name_its_own_causal_root() {
 async fn created_sessions_are_reserved_against_the_chain() {
     let clock = Arc::new(ManualClock::new(1_000));
     let journal = tempfile::tempdir().expect("a journal directory");
-    let service = AutomationService::open_with_clock(
+    let service = AutomationService::open(
         journal.path(),
-        Arc::new(MockActionRunner::new()),
-        authority(),
-        clock.clone(),
+        common::host(
+            Arc::new(MockActionRunner::new()),
+            authority(),
+            clock.clone(),
+        ),
     )
     .expect("a service");
 
@@ -487,11 +497,13 @@ async fn created_sessions_are_reserved_against_the_chain() {
 async fn an_expired_lifetime_stops_further_actions() {
     let clock = Arc::new(ManualClock::new(1_000));
     let journal = tempfile::tempdir().expect("a journal directory");
-    let service = AutomationService::open_with_clock(
+    let service = AutomationService::open(
         journal.path(),
-        Arc::new(MockActionRunner::new()),
-        authority(),
-        clock.clone(),
+        common::host(
+            Arc::new(MockActionRunner::new()),
+            authority(),
+            clock.clone(),
+        ),
     )
     .expect("a service");
 
@@ -528,11 +540,13 @@ async fn an_expired_lifetime_stops_further_actions() {
 async fn rearm_is_authorised_and_refuses_late_descendants() {
     let clock = Arc::new(ManualClock::new(1_000));
     let journal = tempfile::tempdir().expect("a journal directory");
-    let service = AutomationService::open_with_clock(
+    let service = AutomationService::open(
         journal.path(),
-        Arc::new(MockActionRunner::new()),
-        authority(),
-        clock.clone(),
+        common::host(
+            Arc::new(MockActionRunner::new()),
+            authority(),
+            clock.clone(),
+        ),
     )
     .expect("a service");
 
@@ -723,11 +737,11 @@ fn budget_persists_across_store_reopen() {
 /// An unauthenticated external callback starts a new chain under host-wide limits.
 #[tokio::test]
 async fn an_external_callback_is_a_new_external_trigger() {
-    let service = AutomationService::in_memory_with_clock(
+    let service = AutomationService::in_memory(common::host(
         Arc::new(MockActionRunner::new()),
         authority(),
         Arc::new(ManualClock::new(1_000)),
-    )
+    ))
     .expect("a service");
     let def = recurring_workflow(9, "callback", "run_tests");
     install_and_enable(&service, &def, 1_000);

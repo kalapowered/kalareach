@@ -172,11 +172,11 @@ async fn a_breached_workflow_limit_pauses_the_workflow_and_raises_one_item() {
         vec![],
     );
 
-    let service = AutomationService::in_memory_with_clock(
+    let service = AutomationService::in_memory(common::host(
         Arc::new(MockActionRunner::new()),
         authority(),
         Arc::new(ManualClock::new(1_000)),
-    )
+    ))
     .expect("a service");
     service
         .submit_install(
@@ -292,11 +292,11 @@ async fn a_redelivered_trigger_neither_spends_an_allowance_nor_pauses_the_workfl
         vec![],
     );
 
-    let service = AutomationService::in_memory_with_clock(
+    let service = AutomationService::in_memory(common::host(
         Arc::new(MockActionRunner::new()),
         authority(),
         Arc::new(ManualClock::new(1_000)),
-    )
+    ))
     .expect("a service");
     service
         .submit_install(

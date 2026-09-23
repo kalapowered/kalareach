@@ -56,14 +56,25 @@ same transaction as its effect.
 ## The grant a workflow acts under
 
 A definition names a grant identifier and nothing more. The host reads that grant from its own
-grant store, and reads it again immediately before every node it dispatches.
+grant store and decides it under its own policy, and does so again immediately before every node
+it dispatches and once more where the node's effect begins.
 
 * **Read, never supplied.** Nothing a caller passes in decides what a run may do. A grant this
   host never issued names no workflow it will install.
+* **Decided under the host's policy.** The grant is intersected with the host's policy as it
+  stands: a revoked ancestor, the clock floor (a clock wound back does not revive an expiry the
+  host already refused), redemption, expiry, an authority revision the host never issued, the
+  organisation lease a grant requires and the bounded offline validity for a grant held by a
+  paired device. The rights the policy leaves are the rights the node is checked against.
 * **Withdrawn is withdrawn.** A grant that has expired, has been revoked, has a revoked ancestor,
   or has never had its invitation redeemed admits no run. A withdrawal that lands between two
   nodes of a run stops the run where it stands: the node that has not been dispatched is paused,
   and nothing is claimed about the node that already ran.
+* **Asked again where the effect begins.** The host's own action runner reads the grant once more
+  inside the task that performs the effect, after the wait for that task. A refusal there pauses
+  the node and its run exactly as a refusal a moment earlier would have, because no action was
+  performed. The change-set service's own lock and preparation come after that last check, and
+  that service takes no admission into its own transaction.
 * **Each node needs the right its effect needs.** A `shell_command` or `run_tests` node needs
   `terminal.input`, `create_session` needs `session.create`, `request_review` needs
   `agent.prompt` and `session.view`, `capture_changeset` needs `changeset.create`,
@@ -71,9 +82,13 @@ grant store, and reads it again immediately before every node it dispatches.
   These are the rights the methods that perform the same effects require, so a workflow is not a
   way around the method a person would otherwise have called, and a view-only invitation cannot
   obtain terminal input through one.
-* **Scope is checked too.** A definition scoped to an environment or a session is refused unless
-  the grant covers it, and a shell node's declared execution environment has to be one the grant
-  admits.
+* **Scope is checked too.** Every node's effect happens in the environment this host serves, so
+  the grant has to cover that environment whether or not the definition names one, and a
+  definition scoped to another environment runs nothing here. A definition scoped to a session is
+  refused unless the grant covers it, and a shell node's declared execution environment has to be
+  one the grant admits. A capture node has to name the workspace the definition is scoped to, and
+  a materialisation is refused where it would begin when the version it names was captured from
+  another workspace or another environment.
 
 ## What a node actually does
 

@@ -65,8 +65,12 @@ fn run_params(definition: &WorkflowDefinition, event_id: &str) -> WorkflowRunPar
 }
 
 fn service(runner: Arc<dyn ActionRunner>, table: Arc<GrantTable>) -> AutomationService {
-    AutomationService::in_memory_with_clock(runner, table, Arc::new(ManualClock::new(1_000)))
-        .expect("a service")
+    AutomationService::in_memory(common::host(
+        runner,
+        table,
+        Arc::new(ManualClock::new(1_000)),
+    ))
+    .expect("a service")
 }
 
 /// A runner that puts the workflow's grant into another standing while the first node runs.
@@ -301,11 +305,13 @@ impl ActionRunner for CancelsAndRevokes {
         if dispatch.node.node_id == "first" {
             *self.run_id.lock().unwrap() = Some(dispatch.run_id);
             if let Some(store) = self.store.lock().unwrap().as_ref() {
-                kr_automation::WorkflowEngine::with_clock(
+                kr_automation::WorkflowEngine::new(
                     Arc::clone(store),
-                    Arc::new(MockActionRunner::new()),
-                    Arc::clone(&self.table) as Arc<dyn kr_automation::AuthoritySource>,
-                    Arc::new(ManualClock::new(1_500)),
+                    common::host(
+                        Arc::new(MockActionRunner::new()),
+                        Arc::clone(&self.table) as Arc<dyn kr_automation::AuthoritySource>,
+                        Arc::new(ManualClock::new(1_500)),
+                    ),
                 )
                 .cancel_run(dispatch.run_id, 1_500)
                 .expect("the run is cancelled");
@@ -453,4 +459,104 @@ async fn a_capture_node_outside_the_declared_workspace_is_refused() {
         refusal.to_string().contains("scoped to workspace"),
         "{refusal}"
     );
+}
+
+/// A runner that asks the grant again and is refused before its effect begins.
+#[derive(Debug)]
+struct RefusesBeforeItsEffect;
+
+impl ActionRunner for RefusesBeforeItsEffect {
+    fn execute(
+        &self,
+        _dispatch: &kr_automation::Dispatch<'_>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = kr_automation::Result<ActionOutcome>> + Send>,
+    > {
+        Box::pin(async {
+            Err(kr_automation::AutomationError::PermissionDenied(
+                "the grant was revoked while the effect waited to begin".to_owned(),
+            ))
+        })
+    }
+}
+
+/// A revocation that completes after the engine's last check and before the effect begins is
+/// still a refusal. The runner asks again where the effect starts; the node and its run pause
+/// rather than failing, because no action was performed.
+#[tokio::test]
+async fn a_refusal_where_the_effect_begins_pauses_the_node_and_its_run() {
+    let grant_id = test_grant_id(11);
+    let definition = create_workflow_definition(
+        test_wf_id(11),
+        1,
+        "refused at the effect",
+        grant_id,
+        vec![node("only", "run_tests")],
+        vec![],
+    );
+    let service = service(
+        Arc::new(RefusesBeforeItsEffect),
+        common::standing(grant_id, GrantStanding::Active),
+    );
+    service
+        .submit_install(&install_params(&definition), 1_000)
+        .expect("installs");
+    service
+        .submit_enable(
+            &WorkflowEnableParams {
+                workflow_id: definition.workflow_id,
+                revision: definition.revision,
+            },
+            1_000,
+        )
+        .expect("enables");
+
+    let refusal = service
+        .submit_run(&run_params(&definition, "evt-1"), 1_000)
+        .await
+        .expect_err("the refusal comes back to the caller");
+    assert!(refusal.to_string().contains("revoked"), "{refusal}");
+
+    let runs = service
+        .store()
+        .list_runs(Some(definition.workflow_id))
+        .expect("the journal");
+    assert_eq!(
+        runs[0].status,
+        kr_protocol::automation::WorkflowRunStatus::Paused
+    );
+    let receipts = service
+        .store()
+        .list_node_receipts(runs[0].run_id)
+        .expect("the journal");
+    assert_eq!(receipts[0].status, NodeStatus::Paused);
+    assert!(receipts[0].output.0.is_none(), "nothing was performed");
+}
+
+/// A grant whose environment selector does not cover the environment this host serves admits no
+/// definition here, even when the definition declares no environment of its own.
+#[tokio::test]
+async fn a_grant_that_does_not_cover_this_environment_installs_nothing_here() {
+    let grant_id = test_grant_id(12);
+    let mut grant = common::grant_of(grant_id, ActionRight::ALL);
+    grant.environment_selector = kr_protocol::grant::EnvironmentSelector::These {
+        environment_ids: [EnvironmentId::new(Uuid::from_bytes([0x44; 16]))]
+            .into_iter()
+            .collect(),
+    };
+    let table = GrantTable::new();
+    table.insert(grant);
+    let service = service(Arc::new(MockActionRunner::new()), Arc::new(table));
+    let definition = create_workflow_definition(
+        test_wf_id(12),
+        1,
+        "elsewhere",
+        grant_id,
+        vec![node("only", "run_tests")],
+        vec![],
+    );
+    let refusal = service
+        .submit_install(&install_params(&definition), 1_000)
+        .expect_err("the grant does not reach this environment");
+    assert!(refusal.to_string().contains("environment"), "{refusal}");
 }

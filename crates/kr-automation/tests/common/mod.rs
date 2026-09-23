@@ -183,3 +183,24 @@ impl Submit for kr_automation::AutomationService {
         .await
     }
 }
+
+/// The environment these suites' host serves.
+#[must_use]
+pub fn environment() -> kr_protocol::ids::EnvironmentId {
+    kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([0xe0; 16]))
+}
+
+/// A host serving [`environment`], with the runner, the grants and the clock a suite chose.
+#[must_use]
+pub fn host(
+    runner: Arc<dyn kr_automation::ActionRunner>,
+    authority: Arc<dyn kr_automation::AuthoritySource>,
+    clock: Arc<dyn kr_automation::HostClock>,
+) -> kr_automation::Host {
+    kr_automation::Host {
+        environment_id: environment(),
+        runner,
+        authority,
+        clock,
+    }
+}

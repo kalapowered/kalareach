@@ -91,7 +91,8 @@ impl Host {
     /// Writes one live grant into this daemon's own grant store.
     ///
     /// A definition names a grant and the host reads it from here, so a test that installs one
-    /// puts the grant in first, exactly as a person sharing a session would have.
+    /// puts the grant in first, exactly as a person sharing a session would have. It carries the
+    /// authority revision the host is at, as a grant the host issued now would.
     fn issue(&self, grant_id: GrantId, rights: &[ActionRight]) -> Grant {
         let device_id = kr_protocol::ids::DeviceId::new(self.environment_id.get());
         let grant = Grant {
@@ -99,7 +100,7 @@ impl Host {
             parent_grant_id: Nullable::null(),
             issuer_device_id: device_id,
             recipient_device_id: device_id,
-            authority_revision: AuthorityRevision::new(1),
+            authority_revision: self.controller.policy().authority_revision(),
             environment_selector: EnvironmentSelector::Any,
             session_selector: SessionSelector::Any,
             actions: rights.iter().copied().collect(),
@@ -554,6 +555,48 @@ async fn an_automation_run_captures_a_change_set_and_the_version_names_the_run()
         "{materialised:?}"
     );
 
+    // A definition scoped to another workspace cannot read this one's work through a version
+    // identifier. The version names the workspace it was captured from, and the host compares the
+    // two where the effect would begin: the run pauses and nothing is materialised.
+    host.issue(grant_id(11), &[ActionRight::WorkspaceManage]);
+    let mut elsewhere = definition(
+        workflow_id(11),
+        grant_id(11),
+        "materialise-from-elsewhere",
+        WorkflowNode {
+            node_id: "materialise".to_owned(),
+            action_kind: "materialize_changeset".to_owned(),
+            action_params: serde_json::to_string(&materialise_params)
+                .expect("the node's typed parameters"),
+            declared_environment: Nullable::null(),
+        },
+    );
+    elsewhere.resource_scope = WorkflowResourceScope {
+        workspace_id: Nullable::some(WorkspaceId::new(Uuid::from_bytes([0x5c; 16]))),
+        ..WorkflowResourceScope::default()
+    };
+    install(&mut control, &host, &elsewhere).await;
+    enable(&mut control, &host, &elsewhere).await;
+    let refused = failure(start(&mut control, &host, &elsewhere, "evt-elsewhere").await);
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(refused.message.contains("workspace"), "{refused:?}");
+    let read_elsewhere: WorkflowReadResult = typed(
+        &control
+            .request(
+                Method::WorkflowRead,
+                &WorkflowReadParams {
+                    workflow_id: Nullable::some(elsewhere.workflow_id),
+                    revision: Nullable::some(elsewhere.revision),
+                    run_id: Nullable::null(),
+                    causal_root_id: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("workflow.read succeeds"),
+    );
+    assert_eq!(read_elsewhere.runs[0].status, WorkflowRunStatus::Paused);
+
     // `workflow.pause` stops the revision, and a later trigger is refused for that reason.
     let paused: WorkflowPauseResult = typed(
         &control
@@ -855,6 +898,64 @@ async fn a_repeat_over_a_new_connection_is_answered_from_its_record() {
             .expect("workflow.read succeeds"),
     );
     assert_eq!(read.runs.len(), 1, "the repeat started nothing");
+
+    host.clients.abort();
+}
+
+/// A grant stands only as this host's policy leaves it. One that claims an authority revision this
+/// host never issued is refused before anything is installed, although its own record says active.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_the_host_policy_refuses_installs_no_workflow() {
+    let host = host().await;
+    let mut control = client(&host).await;
+
+    let mut grant = host.issue(grant_id(6), &[ActionRight::TerminalInput]);
+    grant.authority_revision = AuthorityRevision::new(1_000_000);
+    let unissued = grant_id(7);
+    host.controller
+        .sharing()
+        .grants()
+        .issue(&GrantRecord {
+            grant: Grant {
+                grant_id: unissued,
+                ..grant
+            },
+            session_id: None,
+            issued_at_ms: 1_000,
+            activated_at_ms: Some(1_000),
+            revoked_at_ms: None,
+            revoked_by_parent: None,
+        })
+        .expect("the grant is written");
+    let document = definition(
+        workflow_id(6),
+        unissued,
+        "under a revision nobody issued",
+        WorkflowNode {
+            node_id: "tests".to_owned(),
+            action_kind: "run_tests".to_owned(),
+            action_params: r#"{"suite": "unit"}"#.to_owned(),
+            declared_environment: Nullable::null(),
+        },
+    );
+    let refused = failure(
+        control
+            .mutate(
+                Method::WorkflowInstall,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &WorkflowInstallParams {
+                    workflow_id: document.workflow_id,
+                    revision: document.revision,
+                    definition: document.clone(),
+                    grant_reference: document.grant_reference,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon"),
+    );
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(refused.message.contains("revision"), "{refused:?}");
 
     host.clients.abort();
 }

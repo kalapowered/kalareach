@@ -24,7 +24,7 @@
 
 use kr_protocol::automation::{WorkflowDefinition, WorkflowNode};
 use kr_protocol::grant::Grant;
-use kr_protocol::ids::GrantId;
+use kr_protocol::ids::{EnvironmentId, GrantId};
 use kr_protocol::rights::ActionRight;
 
 use crate::error::{AutomationError, Result};
@@ -75,23 +75,40 @@ pub fn node_rights(action_kind: &str) -> Result<&'static [ActionRight]> {
 
 /// Checks that `grant` is the definition's own grant and covers the resources it names.
 ///
+/// `environment_id` is the environment this host serves, which is where every node's effect
+/// happens whatever the definition declares. The grant has to admit it, and a definition scoped to
+/// another environment runs nothing here: leaving the environment out of a definition does not
+/// leave it out of the check.
+///
 /// # Errors
 ///
-/// Returns [`AutomationError::PermissionDenied`] when the grant is another one, or when it does
-/// not cover the environment or the session the definition is scoped to.
-pub fn check_scope(grant: &Grant, definition: &WorkflowDefinition) -> Result<()> {
+/// Returns [`AutomationError::PermissionDenied`] when the grant is another one, when it does not
+/// cover this environment or the session the definition is scoped to, or when the definition is
+/// scoped to another environment.
+pub fn check_scope(
+    grant: &Grant,
+    definition: &WorkflowDefinition,
+    environment_id: EnvironmentId,
+) -> Result<()> {
     if grant.grant_id != definition.grant_reference {
         return Err(AutomationError::PermissionDenied(format!(
             "grant {} is not workflow {}'s grant {}",
             grant.grant_id, definition.workflow_id, definition.grant_reference
         )));
     }
-    if let Some(environment_id) = definition.resource_scope.environment_id.0
-        && !grant.environment_selector.admits(environment_id)
+    if !grant.environment_selector.admits(environment_id) {
+        return Err(AutomationError::PermissionDenied(format!(
+            "grant {} does not cover environment {environment_id}, which is where this host acts",
+            grant.grant_id
+        )));
+    }
+    if let Some(declared) = definition.resource_scope.environment_id.0
+        && declared != environment_id
     {
         return Err(AutomationError::PermissionDenied(format!(
-            "grant {} does not cover environment {environment_id}",
-            grant.grant_id
+            "workflow {} is scoped to environment {declared}, and this host acts in \
+             {environment_id}",
+            definition.workflow_id
         )));
     }
     if let Some(session_id) = definition.resource_scope.session_id.0
@@ -110,13 +127,15 @@ pub fn check_scope(grant: &Grant, definition: &WorkflowDefinition) -> Result<()>
 /// # Errors
 ///
 /// Returns [`AutomationError::PermissionDenied`] when the grant lacks a right the node's action
-/// kind needs, or does not admit the environment a shell node declares.
+/// kind needs, does not admit this environment, or does not admit the environment a shell node
+/// declares.
 pub fn check_node(
     grant: &Grant,
     definition: &WorkflowDefinition,
     node: &WorkflowNode,
+    environment_id: EnvironmentId,
 ) -> Result<()> {
-    check_scope(grant, definition)?;
+    check_scope(grant, definition, environment_id)?;
     for right in node_rights(&node.action_kind)? {
         if !grant.permits(*right) {
             return Err(AutomationError::PermissionDenied(format!(
@@ -164,9 +183,13 @@ pub fn check_node(
 /// # Errors
 ///
 /// Returns the first refusal [`check_node`] produces.
-pub fn check_definition(grant: &Grant, definition: &WorkflowDefinition) -> Result<()> {
+pub fn check_definition(
+    grant: &Grant,
+    definition: &WorkflowDefinition,
+    environment_id: EnvironmentId,
+) -> Result<()> {
     for node in &definition.nodes {
-        check_node(grant, definition, node)?;
+        check_node(grant, definition, node, environment_id)?;
     }
     Ok(())
 }
@@ -305,6 +328,11 @@ mod tests {
     use kr_protocol::ids::{EnvironmentId, SessionId, WorkflowId};
     use kr_protocol::scalars::{Nullable, Uuid};
 
+    /// The environment this host serves in these cases.
+    fn here() -> EnvironmentId {
+        EnvironmentId::new(Uuid::from_bytes([5; 16]))
+    }
+
     fn grant_with(rights: &[ActionRight]) -> Grant {
         grant_of(GrantId::new(Uuid::from_bytes([7; 16])), rights)
     }
@@ -339,11 +367,12 @@ mod tests {
         let view_only = grant_with(&[ActionRight::SessionView]);
         let definition = definition_with(node("shell_command"));
         let refusal =
-            check_definition(&view_only, &definition).expect_err("a shell node is refused");
+            check_definition(&view_only, &definition, here()).expect_err("a shell node is refused");
         assert!(refusal.to_string().contains("terminal.input"), "{refusal}");
 
         let with_terminal = grant_with(&[ActionRight::SessionView, ActionRight::TerminalInput]);
-        check_definition(&with_terminal, &definition).expect("a broad shell grant admits it");
+        check_definition(&with_terminal, &definition, here())
+            .expect("a broad shell grant admits it");
     }
 
     #[test]
@@ -357,7 +386,7 @@ mod tests {
             ..WorkflowResourceScope::default()
         };
         let refusal =
-            check_definition(&grant, &definition).expect_err("the session is not covered");
+            check_definition(&grant, &definition, here()).expect_err("the session is not covered");
         assert!(refusal.to_string().contains("session"), "{refusal}");
     }
 
@@ -373,9 +402,38 @@ mod tests {
         let mut shell = node("shell_command");
         shell.declared_environment = Nullable::some(environment_id);
         let definition = definition_with(shell);
-        let refusal =
-            check_definition(&grant, &definition).expect_err("the environment is not admitted");
+        let refusal = check_definition(&grant, &definition, here())
+            .expect_err("the environment is not admitted");
         assert!(refusal.to_string().contains("environment"), "{refusal}");
+    }
+
+    /// Leaving the environment out of a definition does not leave it out of the check: the grant
+    /// has to admit the environment the effect happens in.
+    #[test]
+    fn a_grant_that_does_not_cover_this_environment_covers_no_node_here() {
+        let mut grant = grant_with(&[ActionRight::AgentPrompt, ActionRight::SessionView]);
+        grant.environment_selector = EnvironmentSelector::These {
+            environment_ids: [EnvironmentId::new(Uuid::from_bytes([6; 16]))]
+                .into_iter()
+                .collect(),
+        };
+        let definition = definition_with(node("request_review"));
+        let refusal = check_definition(&grant, &definition, here())
+            .expect_err("this environment is not covered");
+        assert!(refusal.to_string().contains("environment"), "{refusal}");
+    }
+
+    #[test]
+    fn a_definition_scoped_to_another_environment_runs_nothing_here() {
+        let grant = grant_with(&[ActionRight::AgentPrompt, ActionRight::SessionView]);
+        let mut definition = definition_with(node("request_review"));
+        definition.resource_scope = WorkflowResourceScope {
+            environment_id: Nullable::some(EnvironmentId::new(Uuid::from_bytes([6; 16]))),
+            ..WorkflowResourceScope::default()
+        };
+        let refusal = check_definition(&grant, &definition, here())
+            .expect_err("another environment's workflow does not run here");
+        assert!(refusal.to_string().contains("scoped"), "{refusal}");
     }
 
     #[test]

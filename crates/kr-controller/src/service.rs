@@ -353,8 +353,9 @@ pub struct Controller {
     /// leases it holds and the optional bounded offline-validity policy its owner chose.
     ///
     /// Every request intersects its grant with this, so it is read far more often than it is
-    /// written and a plain lock is what it wants. Shared with the delivery runtime, which
-    /// intersects an external destination's grant with the same policy at every question.
+    /// written and a plain lock is what it wants. It is shared rather than owned outright: the
+    /// delivery runtime intersects an external destination's grant with the same policy at every
+    /// question, and the automation service decides each node it dispatches under it.
     policy: Arc<std::sync::Mutex<crate::grants::HostPolicy>>,
     /// This host's half of the remote authority feed: the revisions only it issues, the revocation
     /// records it retains, and the synchronisation it owes before it serves remote work again.
@@ -626,12 +627,15 @@ impl Controller {
         feed.note_revision(authority_revision);
         sharing.grants().store_feed(&feed.snapshot())?;
         // The automation service reads the grant each definition names from the grant store this
-        // daemon already holds, and carries out its change-set nodes through the change-set
-        // service, so it takes both rather than opening anything of its own beside its journal.
+        // daemon already holds, under this daemon's own policy, and carries out its change-set
+        // nodes through the change-set service, so it takes all three rather than opening anything
+        // of its own beside its journal.
         let automation = Arc::new(
             crate::automation::AutomationModule::open(
                 &setup.paths,
+                setup.environment_id,
                 Arc::clone(&sharing),
+                Arc::clone(&policy),
                 Arc::clone(changesets.service()),
             )
             .await?,

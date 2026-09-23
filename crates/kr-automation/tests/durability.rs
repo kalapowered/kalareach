@@ -177,11 +177,11 @@ fn read_answers_about_the_revision_it_was_asked_about() {
     use kr_protocol::scalars::{Nullable, U64};
     use std::sync::Arc;
 
-    let service = AutomationService::in_memory_with_clock(
+    let service = AutomationService::in_memory(common::host(
         Arc::new(MockActionRunner::new()),
         authority(),
         Arc::new(ManualClock::new(1_000)),
-    )
+    ))
     .expect("a service");
 
     let workflow_id = test_wf_id(5);

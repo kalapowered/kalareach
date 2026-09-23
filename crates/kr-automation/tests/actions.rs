@@ -108,11 +108,11 @@ impl ActionRunner for Held {
 async fn a_repeat_during_its_run_is_told_where_the_run_stands_and_starts_nothing() {
     let runner = Arc::new(Held::default());
     let service = Arc::new(
-        AutomationService::in_memory_with_clock(
+        AutomationService::in_memory(common::host(
             Arc::clone(&runner) as Arc<dyn ActionRunner>,
             common::every_right(&[grant_id(1)]),
             Arc::new(ManualClock::new(1_000)),
-        )
+        ))
         .expect("a service"),
     );
     let definition = one_node(workflow_id(1), grant_id(1));
@@ -196,11 +196,11 @@ async fn a_repeat_during_its_run_is_told_where_the_run_stands_and_starts_nothing
 /// same action submitted while still admitted is decided afresh.
 #[test]
 fn a_lapsed_admission_performs_nothing_and_leaves_no_record() {
-    let service = AutomationService::in_memory_with_clock(
+    let service = AutomationService::in_memory(common::host(
         Arc::new(kr_automation::MockActionRunner::new()),
         common::every_right(&[grant_id(2)]),
         Arc::new(ManualClock::new(1_000)),
-    )
+    ))
     .expect("a service");
     let definition = one_node(workflow_id(2), grant_id(2));
     let key = common::fresh_action(Method::WorkflowInstall);
@@ -258,11 +258,11 @@ fn a_lapsed_admission_performs_nothing_and_leaves_no_record() {
 /// the first one's identifier.
 #[test]
 fn a_repeated_refusal_is_answered_as_it_was_decided() {
-    let service = AutomationService::in_memory_with_clock(
+    let service = AutomationService::in_memory(common::host(
         Arc::new(kr_automation::MockActionRunner::new()),
         common::every_right(&[grant_id(3)]),
         Arc::new(ManualClock::new(1_000)),
-    )
+    ))
     .expect("a service");
     let definition = one_node(workflow_id(3), grant_id(3));
     let enable = WorkflowEnableParams {
@@ -345,11 +345,11 @@ impl ActionRunner for CancelledWhileRunning {
 #[tokio::test]
 async fn a_cancellation_during_an_action_is_not_overwritten_by_its_late_success() {
     let runner = Arc::new(CancelledWhileRunning::default());
-    let service = AutomationService::in_memory_with_clock(
+    let service = AutomationService::in_memory(common::host(
         Arc::clone(&runner) as Arc<dyn ActionRunner>,
         common::every_right(&[grant_id(4)]),
         Arc::new(ManualClock::new(1_000)),
-    )
+    ))
     .expect("a service");
     runner
         .store

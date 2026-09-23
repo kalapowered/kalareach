@@ -394,6 +394,74 @@ pub fn decide(
     })
 }
 
+/// Intersects one grant with this host's current policy at the moment the host acts on it itself.
+///
+/// A workflow node is this host's own action, taken under the grant a definition names rather
+/// than under a request a caller sent, so nothing here is decided against the method registry or
+/// against a request's selectors: the node's own rights and resources are the automation engine's
+/// to check against what this returns. What is decided here is whether the grant stands under this
+/// host's policy at this moment, and which of its rights the policy leaves. The rules are the ones
+/// [`decide`] applies before it reaches the method table, in the same order: revocation and a
+/// revoked ancestor, the clock floor, redemption, expiry, an unissued revision, and the policy
+/// intersection with its membership leases and bounded offline validity.
+///
+/// `policy` is read and not written. The floor it keeps is raised where requests are decided;
+/// here it only stops a clock wound back from reviving an expiry this host already refused.
+///
+/// This host resolves no account for a grant's recipient here, so a grant that requires an
+/// organisation membership is refused rather than answered by somebody else's lease.
+///
+/// # Errors
+///
+/// Returns the first rule that refused, as a [`Refusal`].
+pub fn standing_at_dispatch(
+    record: &GrantRecord,
+    policy: &HostPolicy,
+    environment_id: EnvironmentId,
+    ingress: kr_protocol::actor::ActorIngress,
+    now_ms: u64,
+) -> std::result::Result<CanonicalSet<ActionRight>, Refusal> {
+    let grant = &record.grant;
+    if record.revoked_at_ms.is_some() {
+        return Err(match record.revoked_by_parent {
+            Some(parent_grant_id) => Refusal::ParentRevoked { parent_grant_id },
+            None => Refusal::Revoked {
+                grant_id: grant.grant_id,
+            },
+        });
+    }
+    let now_ms = policy.settled_now(now_ms);
+    if !record.is_active() {
+        return Err(Refusal::NotRedeemed {
+            grant_id: grant.grant_id,
+        });
+    }
+    if !grant.expiry.is_valid_at(now_ms) {
+        let expired_at_ms = match grant.expiry {
+            kr_protocol::grant::GrantExpiry::Never => now_ms,
+            kr_protocol::grant::GrantExpiry::At { expires_at_ms } => expires_at_ms.get(),
+        };
+        return Err(Refusal::Expired { expired_at_ms });
+    }
+    if grant.authority_revision.get() > policy.authority_revision().get() {
+        return Err(Refusal::UnissuedAuthority {
+            grant_revision: grant.authority_revision,
+            current_revision: policy.authority_revision(),
+        });
+    }
+    let request = AccessRequest {
+        method: Method::WorkflowRun,
+        ingress,
+        environment_id,
+        session_id: None,
+        claims_geometry: false,
+        recipient_account: None,
+        own_subject: None,
+        now_ms,
+    };
+    Ok(policy.intersect(grant, &request, now_ms)?.rights)
+}
+
 /// Whether a conditional requirement applies to this request.
 ///
 /// A condition this host cannot evaluate is treated as holding, so the requirement is checked

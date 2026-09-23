@@ -78,6 +78,35 @@ pub(crate) fn new_uuid() -> kr_protocol::scalars::Uuid {
     kr_protocol::scalars::Uuid::from_bytes(uuid::Uuid::new_v4().into_bytes())
 }
 
+/// What the host that runs workflows hands the automation service.
+///
+/// None of it has a default. A service with no runner behind its action kinds would write success
+/// receipts for work nobody did; one that believed whatever grant a request carried would let a
+/// caller describe authority it does not hold; and one that did not know which environment it acts
+/// in could not tell whether a grant covers the place its effects happen.
+#[derive(Clone)]
+pub struct Host {
+    /// The environment this host serves, which is where every node's effect happens.
+    pub environment_id: kr_protocol::ids::EnvironmentId,
+    /// What carries out an action node.
+    pub runner: std::sync::Arc<dyn ActionRunner>,
+    /// Where the grant a definition names is read from, as it stands now.
+    pub authority: std::sync::Arc<dyn AuthoritySource>,
+    /// The clock the engine reads before each reservation and each receipt.
+    pub clock: std::sync::Arc<dyn HostClock>,
+}
+
+impl std::fmt::Debug for Host {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Host")
+            .field("environment_id", &self.environment_id)
+            .field("authority", &self.authority)
+            .field("clock", &self.clock)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The clock the engine reads before each reservation.
 ///
 /// A run dispatches its nodes over time, and a causal chain's lifetime can run out between two
@@ -125,6 +154,23 @@ impl ManualClock {
 impl HostClock for ManualClock {
     fn now_ms(&self) -> u64 {
         self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// A host for the crate's own tests, serving one fixed environment.
+#[cfg(test)]
+pub(crate) fn test_host(
+    runner: std::sync::Arc<dyn ActionRunner>,
+    authority: std::sync::Arc<dyn AuthoritySource>,
+    clock: std::sync::Arc<dyn HostClock>,
+) -> Host {
+    Host {
+        environment_id: kr_protocol::ids::EnvironmentId::new(
+            kr_protocol::scalars::Uuid::from_bytes([0xe0; 16]),
+        ),
+        runner,
+        authority,
+        clock,
     }
 }
 

@@ -8,16 +8,18 @@
 //!   checked against current authority; a mutation carries an action window, is checked against
 //!   the method registry and its rights, and runs on a task a dropped connection cannot cancel
 //!   part way through.
-//! * The admission is checked once more immediately before the write, because everything in
-//!   between can wait: for this task to be scheduled, for a blocking thread, for a journal's lock.
-//! * **The grant a definition names is this host's own.** The engine never sees a grant a request
-//!   carried. It asks [`HostGrants`], which reads the daemon's grant store, so an expiry, a
-//!   revocation or a revoked ancestor decides what a workflow may do, and it decides that again
-//!   before every node the run dispatches.
+//! * The admission the daemon accepted a mutation under is carried into the workflow journal and
+//!   asked inside the transaction that performs the action, immediately before its first write.
+//! * **The grant a definition names is this host's own, as its policy stands.** The engine never
+//!   sees a grant a request carried. It asks [`HostGrants`], which reads the daemon's grant store
+//!   and intersects the grant with the host's policy: revocation and a revoked ancestor, the clock
+//!   floor, expiry, the organisation leases and the bounded offline validity. It decides that
+//!   again before every node a run dispatches.
 //! * **An action is a real effect or it is a refusal.** [`HostActions`] carries out the change-set
 //!   nodes against the environment's own change-set service, binding each result to the run that
-//!   asked for it. Every other action kind is refused by name. Nothing here writes a success
-//!   receipt for work that was never done.
+//!   asked for it, and asks the grant once more inside the task that performs the effect. Every
+//!   other action kind is refused by name. Nothing here writes a success receipt for work that was
+//!   never done.
 //!
 //! The journal lives in the environment's state directory beside the registry, because section 24
 //! requires a causal budget to survive a restart and a reboot, and a runtime directory does not
@@ -27,14 +29,15 @@ use std::sync::Arc;
 
 use kr_automation::{
     ActionKey, ActionOutcome, ActionRunner, Answer as Recorded, AuthoritySource, AutomationService,
-    Dispatch, Submitted, WorkflowStore,
+    Dispatch, Host, Submitted, SystemClock, WorkflowStore,
 };
 use kr_changeset::ChangeSetService;
 use kr_changeset::materialise;
 use kr_changeset::service::CaptureOrder;
+use kr_protocol::actor::ActorIngress;
 use kr_protocol::automation::{
-    WorkflowEnableParams, WorkflowInstallParams, WorkflowPauseParams, WorkflowReadParams,
-    WorkflowRunParams,
+    WorkflowDefinition, WorkflowEnableParams, WorkflowInstallParams, WorkflowNode,
+    WorkflowPauseParams, WorkflowReadParams, WorkflowRunParams,
 };
 use kr_protocol::changeset::{ChangesetCaptureParams, ChangesetMaterializeParams, Provenance};
 use kr_protocol::envelope::{
@@ -42,12 +45,12 @@ use kr_protocol::envelope::{
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::grant::Grant;
-use kr_protocol::ids::{ActorId, GrantId, RequestId};
+use kr_protocol::ids::{ActorId, EnvironmentId, GrantId, RequestId};
 use kr_protocol::method::{Method, MethodGroup};
 use kr_protocol::scalars::Nullable;
-use kr_protocol::sharing::GrantState;
 
 use crate::error::{ControllerError, Result};
+use crate::grants::HostPolicy;
 use crate::sharing::SharingService;
 
 /// What an automation call answers with: the method's result, or the refusal the service decided.
@@ -56,19 +59,33 @@ pub type Answer<T> = std::result::Result<T, ProtocolError>;
 /// This host's grants, as the automation engine reads them.
 ///
 /// A definition names a grant identifier and nothing more. Whether that grant still authorises
-/// anything is the grant store's to say: it holds the expiry, the revocation and the cascade a
-/// revoked ancestor causes. Asking it here, rather than trusting a grant a request carried, is
-/// what stops a workflow from acting under authority nobody holds.
+/// anything is the grant store's and the host policy's to say: the store holds the expiry, the
+/// revocation and the cascade a revoked ancestor causes, and the policy holds the clock floor, the
+/// organisation leases and the bounded offline validity. Asking both here, rather than trusting a
+/// grant a request carried, is what stops a workflow from acting under authority nobody holds.
+///
+/// The policy is the daemon's own, shared rather than copied: it is built once when the daemon
+/// starts, and every change the daemon accepts to it is what this reads the next time it is asked.
 #[derive(Debug)]
 pub struct HostGrants {
     sharing: Arc<SharingService>,
+    policy: Arc<std::sync::Mutex<HostPolicy>>,
+    environment_id: EnvironmentId,
 }
 
 impl HostGrants {
-    /// Reads grants from the daemon's own store.
+    /// Reads grants from the daemon's own store, under the daemon's own policy.
     #[must_use]
-    pub const fn new(sharing: Arc<SharingService>) -> Self {
-        Self { sharing }
+    pub const fn new(
+        sharing: Arc<SharingService>,
+        policy: Arc<std::sync::Mutex<HostPolicy>>,
+        environment_id: EnvironmentId,
+    ) -> Self {
+        Self {
+            sharing,
+            policy,
+            environment_id,
+        }
     }
 }
 
@@ -86,18 +103,39 @@ impl AuthoritySource for HostGrants {
                     "grant {grant_id} is not one this host issued"
                 ))
             })?;
-        match record.state(now_ms) {
-            GrantState::Active => Ok(record.grant),
-            GrantState::Revoked => Err(kr_automation::AutomationError::PermissionDenied(format!(
-                "grant {grant_id} has been revoked"
-            ))),
-            GrantState::Expired => Err(kr_automation::AutomationError::PermissionDenied(format!(
-                "grant {grant_id} has expired"
-            ))),
-            GrantState::Pending => Err(kr_automation::AutomationError::PermissionDenied(format!(
-                "grant {grant_id} has not been redeemed"
-            ))),
+        // A grant this host holds for itself is the owner's own authority at this machine; any
+        // other recipient is a device that reached the host over the network, and the bounded
+        // offline validity is about exactly that access.
+        let ingress = if record.grant.recipient_device_id == self.sharing.host_device_id() {
+            ActorIngress::LocalIpc
+        } else {
+            ActorIngress::PairedDevice
+        };
+        let rights = {
+            let policy = self
+                .policy
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::grants::standing_at_dispatch(
+                &record,
+                &policy,
+                self.environment_id,
+                ingress,
+                now_ms,
+            )
         }
+        .map_err(|refusal| {
+            kr_automation::AutomationError::PermissionDenied(format!(
+                "grant {grant_id}: {}",
+                refusal.detail()
+            ))
+        })?;
+        // The grant as this host's policy leaves it: an organisation lease that narrows a role
+        // narrows what the workflow may do, and the node is checked against the result.
+        Ok(Grant {
+            actions: rights,
+            ..record.grant
+        })
     }
 }
 
@@ -112,21 +150,32 @@ impl AuthoritySource for HostGrants {
 /// nobody produced.
 pub struct HostActions {
     changesets: Arc<ChangeSetService>,
+    authority: Arc<dyn AuthoritySource>,
+    environment_id: EnvironmentId,
 }
 
 impl std::fmt::Debug for HostActions {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("HostActions")
+            .field("environment_id", &self.environment_id)
             .finish_non_exhaustive()
     }
 }
 
 impl HostActions {
-    /// Carries out change-set nodes against `changesets`.
+    /// Carries out change-set nodes against `changesets`, asking `authority` before each effect.
     #[must_use]
-    pub const fn new(changesets: Arc<ChangeSetService>) -> Self {
-        Self { changesets }
+    pub fn new(
+        changesets: Arc<ChangeSetService>,
+        authority: Arc<dyn AuthoritySource>,
+        environment_id: EnvironmentId,
+    ) -> Self {
+        Self {
+            changesets,
+            authority,
+            environment_id,
+        }
     }
 }
 
@@ -138,18 +187,30 @@ impl ActionRunner for HostActions {
         Box<dyn std::future::Future<Output = kr_automation::Result<ActionOutcome>> + Send>,
     > {
         let changesets = Arc::clone(&self.changesets);
-        let action_kind = dispatch.node.action_kind.clone();
-        let params = dispatch.node.action_params.clone();
+        let authority = Arc::clone(&self.authority);
+        let environment_id = self.environment_id;
+        let definition = dispatch.definition.clone();
+        let node = dispatch.node.clone();
         let run_id = dispatch.run_id;
         Box::pin(async move {
-            match action_kind.as_str() {
+            match node.action_kind.as_str() {
                 "capture_changeset" => {
-                    let asked: ChangesetCaptureParams = serde_json::from_str(&params)?;
-                    Ok(blocking(move || capture(&changesets, &asked, run_id)).await)
+                    let asked: ChangesetCaptureParams = serde_json::from_str(&node.action_params)?;
+                    blocking(move || {
+                        still_authorised(&*authority, &definition, &node, environment_id)?;
+                        Ok(capture(&changesets, &asked, run_id))
+                    })
+                    .await
                 }
                 "materialize_changeset" => {
-                    let asked: ChangesetMaterializeParams = serde_json::from_str(&params)?;
-                    Ok(blocking(move || materialise_version(&changesets, &asked)).await)
+                    let asked: ChangesetMaterializeParams =
+                        serde_json::from_str(&node.action_params)?;
+                    blocking(move || {
+                        still_authorised(&*authority, &definition, &node, environment_id)?;
+                        version_in_scope(&changesets, &definition, &asked, environment_id)?;
+                        Ok(materialise_version(&changesets, &asked))
+                    })
+                    .await
                 }
                 other => Err(kr_automation::AutomationError::ActionUnavailable {
                     action_kind: other.to_owned(),
@@ -157,6 +218,56 @@ impl ActionRunner for HostActions {
             }
         })
     }
+}
+
+/// Asks the grant once more, inside the task that performs the effect.
+///
+/// The engine asked it immediately before calling this runner, and the effect still waited for a
+/// blocking thread after that. This is the last thing this host does before the change-set
+/// service's own work, so a revocation or an expiry that completed during that wait stops the
+/// effect here. What it cannot reach is the change-set service's own lock and preparation, which
+/// come after it: that service takes no admission into its own transaction.
+fn still_authorised(
+    authority: &dyn AuthoritySource,
+    definition: &WorkflowDefinition,
+    node: &WorkflowNode,
+    environment_id: EnvironmentId,
+) -> kr_automation::Result<()> {
+    let grant = authority.grant(definition.grant_reference, kr_ipc::now_ms().get())?;
+    kr_automation::authority::check_node(&grant, definition, node, environment_id)
+}
+
+/// Refuses a materialisation of a version the workflow's scope does not reach.
+///
+/// A materialisation names a version, and the version names the environment and the workspace it
+/// was captured from. A definition scoped to one workspace may not read another's work through a
+/// version identifier, and a version from another environment is not this host's to write out.
+fn version_in_scope(
+    changesets: &ChangeSetService,
+    definition: &WorkflowDefinition,
+    asked: &ChangesetMaterializeParams,
+    environment_id: EnvironmentId,
+) -> kr_automation::Result<()> {
+    // A version this service does not hold is the materialisation's own refusal to make.
+    let Ok(version) = changesets.record(asked.change_set_id, Some(asked.version)) else {
+        return Ok(());
+    };
+    if version.environment_id != environment_id {
+        return Err(kr_automation::AutomationError::PermissionDenied(format!(
+            "change set {} version {} was captured in environment {}, and this host acts in {}",
+            asked.change_set_id, asked.version, version.environment_id, environment_id
+        )));
+    }
+    if let Some(declared) = definition.resource_scope.workspace_id.0
+        && version.workspace_id != declared
+    {
+        return Err(kr_automation::AutomationError::PermissionDenied(format!(
+            "change set {} version {} was captured from workspace {}, and workflow {} is scoped \
+             to workspace {declared}",
+            asked.change_set_id, asked.version, version.workspace_id, definition.workflow_id
+        )));
+    }
+    Ok(())
 }
 
 /// Captures one version of a workspace, recorded as this run's work.
@@ -247,31 +358,43 @@ pub struct AutomationModule {
 impl AutomationModule {
     /// Opens the environment's automation service on its own journal.
     ///
+    /// `policy` is the daemon's own host policy, shared rather than copied, so a grant is decided
+    /// under the policy as it stands when each node is dispatched.
+    ///
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the journal cannot be opened.
     pub async fn open(
         paths: &kr_ipc::paths::EnvironmentPaths,
+        environment_id: EnvironmentId,
         sharing: Arc<SharingService>,
+        policy: Arc<std::sync::Mutex<HostPolicy>>,
         changesets: Arc<ChangeSetService>,
     ) -> Result<Self> {
         // The state directory, not the runtime one: a causal budget has to survive a reboot, and
         // a runtime directory is cleared by one.
         let state_dir = paths.state_dir().to_path_buf();
-        let service = tokio::task::spawn_blocking(move || {
-            AutomationService::open(
-                &state_dir,
-                Arc::new(HostActions::new(changesets)),
-                Arc::new(HostGrants::new(sharing)),
-            )
-        })
-        .await
-        .map_err(|_| ControllerError::RegistryUnavailable {
-            detail: "the automation journal could not be opened".to_owned(),
-        })?
-        .map_err(|error| ControllerError::RegistryUnavailable {
-            detail: kr_project::git::redact(&error.to_string()),
-        })?;
+        let grants: Arc<dyn AuthoritySource> =
+            Arc::new(HostGrants::new(sharing, policy, environment_id));
+        let host = Host {
+            environment_id,
+            runner: Arc::new(HostActions::new(
+                changesets,
+                Arc::clone(&grants),
+                environment_id,
+            )),
+            authority: grants,
+            clock: Arc::new(SystemClock),
+        };
+        let service =
+            tokio::task::spawn_blocking(move || AutomationService::open(&state_dir, host))
+                .await
+                .map_err(|_| ControllerError::RegistryUnavailable {
+                    detail: "the automation journal could not be opened".to_owned(),
+                })?
+                .map_err(|error| ControllerError::RegistryUnavailable {
+                    detail: kr_project::git::redact(&error.to_string()),
+                })?;
         Ok(Self {
             service: Arc::new(service),
         })

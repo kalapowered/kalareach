@@ -16,13 +16,13 @@ use std::sync::Arc;
 use kr_protocol::automation::{
     EdgeCondition, NodeStatus, WorkflowDefinition, WorkflowNode, WorkflowRunStatus,
 };
-use kr_protocol::ids::{ActionId, WorkflowRunId};
+use kr_protocol::ids::{ActionId, EnvironmentId, WorkflowRunId};
 
 use crate::authority::{self, AuthoritySource};
 use crate::causal::CausalContext;
 use crate::error::Result;
 use crate::store::WorkflowStore;
-use crate::{HostClock, SystemClock};
+use crate::{Host, HostClock};
 
 /// Node execution outcome from an action executor.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,6 +68,12 @@ pub struct Dispatch<'a> {
 }
 
 /// Trait implemented by action node runners (e.g., shell commands, test runners, reviews).
+///
+/// A runner that asks the grant again before its effect, as the host's own does, answers
+/// [`crate::AutomationError::PermissionDenied`] or [`crate::AutomationError::AuthorityUnavailable`]
+/// only when it refused the effect before starting it. The engine treats that exactly as it treats
+/// a refusal it decided itself: the node and its run pause, and nothing is claimed about an effect
+/// that never began.
 pub trait ActionRunner: Send + Sync {
     /// Executes one action node.
     fn execute(
@@ -123,32 +129,19 @@ pub struct WorkflowEngine {
     runner: Arc<dyn ActionRunner>,
     authority: Arc<dyn AuthoritySource>,
     clock: Arc<dyn HostClock>,
+    environment_id: EnvironmentId,
 }
 
 impl WorkflowEngine {
-    /// Creates a workflow execution engine reading the host's wall clock.
+    /// Creates a workflow execution engine over `store`, for the host `host` describes.
     #[must_use]
-    pub fn new(
-        store: Arc<WorkflowStore>,
-        runner: Arc<dyn ActionRunner>,
-        authority: Arc<dyn AuthoritySource>,
-    ) -> Self {
-        Self::with_clock(store, runner, authority, Arc::new(SystemClock))
-    }
-
-    /// Creates a workflow execution engine reading the clock it is given.
-    #[must_use]
-    pub fn with_clock(
-        store: Arc<WorkflowStore>,
-        runner: Arc<dyn ActionRunner>,
-        authority: Arc<dyn AuthoritySource>,
-        clock: Arc<dyn HostClock>,
-    ) -> Self {
+    pub fn new(store: Arc<WorkflowStore>, host: Host) -> Self {
         Self {
             store,
-            runner,
-            authority,
-            clock,
+            runner: host.runner,
+            authority: host.authority,
+            clock: host.clock,
+            environment_id: host.environment_id,
         }
     }
 
@@ -271,8 +264,9 @@ impl WorkflowEngine {
                     match self
                         .authority
                         .grant(definition.grant_reference, authority_time_ms)
-                        .and_then(|grant| authority::check_node(&grant, definition, node))
-                    {
+                        .and_then(|grant| {
+                            authority::check_node(&grant, definition, node, self.environment_id)
+                        }) {
                         Ok(()) => {}
                         Err(error) => {
                             return self.pause_on_refusal(
@@ -349,7 +343,9 @@ impl WorkflowEngine {
                     if let Err(error) = self
                         .authority
                         .grant(definition.grant_reference, final_check_ms)
-                        .and_then(|grant| authority::check_node(&grant, definition, node))
+                        .and_then(|grant| {
+                            authority::check_node(&grant, definition, node, self.environment_id)
+                        })
                     {
                         return self.pause_on_refusal(run_id, &node.node_id, error, final_check_ms);
                     }
@@ -363,6 +359,22 @@ impl WorkflowEngine {
                         now_ms: dispatch_time_ms,
                     };
                     let outcome_res = self.runner.execute(&dispatch).await;
+
+                    // A runner that asked the grant once more and was refused never began the
+                    // effect, so this is a refusal and not an outcome: the node pauses as it would
+                    // have if the engine's own check had refused it a moment earlier.
+                    if let Err(
+                        refusal @ (crate::error::AutomationError::PermissionDenied(_)
+                        | crate::error::AutomationError::AuthorityUnavailable(_)),
+                    ) = outcome_res
+                    {
+                        return self.pause_on_refusal(
+                            run_id,
+                            &node.node_id,
+                            refusal,
+                            self.clock.now_ms(),
+                        );
+                    }
 
                     // What the action came to, and what the run owes because of it. The action
                     // was dispatched, so whether it did anything is not this host's to say
@@ -501,11 +513,13 @@ mod tests {
     async fn dependency_executes_only_after_predecessor_success() {
         let store = Arc::new(WorkflowStore::in_memory().unwrap());
         let runner = Arc::new(MockActionRunner::new());
-        let engine = WorkflowEngine::with_clock(
+        let engine = WorkflowEngine::new(
             Arc::clone(&store),
-            runner,
-            crate::authority::every_right(test_grant_id(1)),
-            Arc::new(crate::ManualClock::new(1000)),
+            crate::test_host(
+                runner,
+                crate::authority::every_right(test_grant_id(1)),
+                Arc::new(crate::ManualClock::new(1000)),
+            ),
         );
 
         let wf_id = test_wf_id(1);
@@ -559,11 +573,13 @@ mod tests {
             },
         );
 
-        let engine = WorkflowEngine::with_clock(
+        let engine = WorkflowEngine::new(
             Arc::clone(&store),
-            runner,
-            crate::authority::every_right(test_grant_id(2)),
-            Arc::new(crate::ManualClock::new(1000)),
+            crate::test_host(
+                runner,
+                crate::authority::every_right(test_grant_id(2)),
+                Arc::new(crate::ManualClock::new(1000)),
+            ),
         );
 
         let wf_id = test_wf_id(2);
