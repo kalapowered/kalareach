@@ -432,6 +432,40 @@ impl Store {
         }
     }
 
+    /// Returns the files a package activated here consists of, read from its own manifest.
+    ///
+    /// `None` is a package that is not here, or whose manifest is not the one its hash names or does
+    /// not read: nothing about what it consists of can be said from it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when the manifest is there and cannot be read.
+    pub(crate) fn package_payloads(
+        &self,
+        manifest_digest: PayloadDigest,
+    ) -> CatalogueResult<Option<Vec<PayloadDigest>>> {
+        let path = self
+            .package_dir(manifest_digest)
+            .join(kr_plugin_sdk::package::MANIFEST_FILE);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(CatalogueError::storage(&path, &source)),
+        };
+        if PayloadDigest::of(&bytes) != manifest_digest {
+            return Ok(None);
+        }
+        Ok(serde_json::from_slice::<PluginManifest>(&bytes)
+            .ok()
+            .map(|manifest| {
+                manifest
+                    .payloads
+                    .iter()
+                    .map(|payload| payload.digest)
+                    .collect()
+            }))
+    }
+
     /// Checks an activated package against the manifest its digest names, file by file.
     ///
     /// The directory alone says a package was activated here once. The package hash *is* the

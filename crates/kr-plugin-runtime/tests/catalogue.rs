@@ -3979,6 +3979,41 @@ async fn a_generation_pinned_while_a_sync_ran_keeps_every_payload_it_pins() {
     );
 }
 
+/// An installation keeps its payloads when room is made, whether or not it is pinned or enabled.
+///
+/// Evicting an installed package's files would leave it installed with nothing to run, so every
+/// installation is protected, and a sync that could make room only by evicting one refuses.
+#[tokio::test]
+async fn an_installation_keeps_its_payloads_when_room_is_made() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let (mut catalogue, _generation, installed) = mirrored_at_its_limit(home.path()).await;
+    let installation = catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &version(),
+            catalogue.index(&repository()).expect("an index").entries[0].manifest_digest,
+            InstallationGrant::none(),
+        )
+        .await
+        .expect("installable from the mirror");
+    assert!(!installation.pinned && !installation.enabled);
+
+    let outcome = catalogue.sync(&repository()).await;
+    assert!(
+        matches!(outcome, Err(CatalogueError::ResourceLimit(_))),
+        "making room would take an installation's payloads: {outcome:?}"
+    );
+    let store = catalogue.store(&repository()).expect("enrolled");
+    for (digest, size) in &installed {
+        assert!(
+            store.holds_payload(*digest, *size).expect("readable"),
+            "{digest} belongs to an installation"
+        );
+    }
+}
+
 /// An installation another catalogue pins while a sync runs keeps its payloads.
 #[tokio::test]
 async fn an_installation_pinned_while_a_sync_ran_keeps_its_payloads() {

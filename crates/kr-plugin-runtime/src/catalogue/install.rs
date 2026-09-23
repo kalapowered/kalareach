@@ -419,45 +419,68 @@ impl Bindings {
     }
 }
 
-/// Returns every content hash a live binding or a pinned installation still needs.
+/// Returns every payload a reclaim must keep.
 ///
-/// These are the payloads a sync never evicts to finish: the manifest a binding is pinned to and
-/// every file that package consists of. `live` is what the broker says a live binding holds, which
-/// is expanded through what the installations and this host's own bindings record about it.
-#[must_use]
+/// That is every installed package, enabled or disabled, pinned or not, every package a local
+/// binding or the broker says is live, and every file each of them consists of: a package's hash
+/// names its manifest, and protecting only that would leave the component and the assets a
+/// binding runs on evictable. What a package consists of is read from the installation or the
+/// binding that holds it, or else from its own manifest where it is activated here, through
+/// `manifest`. A live package this host cannot expand is not protected by guesswork: the answer is
+/// a refusal, and nothing is reclaimed.
+///
+/// # Errors
+///
+/// Returns [`CatalogueError::StorageUnavailable`] when a live package's files cannot be named, and
+/// whatever `manifest` returns.
 pub fn protected_payloads(
     installations: &[Installation],
     bindings: &Bindings,
     live: &[PayloadDigest],
-) -> Vec<PayloadDigest> {
-    let mut protected: Vec<PayloadDigest> = Vec::new();
+    manifest: impl Fn(PayloadDigest) -> CatalogueResult<Option<Vec<PayloadDigest>>>,
+) -> CatalogueResult<Vec<PayloadDigest>> {
     let mut packages: Vec<PayloadDigest> = live.to_vec();
-    for installation in installations
-        .iter()
-        .filter(|installation| installation.pinned)
-    {
-        packages.push(installation.package_digest);
-    }
-    for binding in bindings.all() {
-        packages.push(binding.package_digest);
-        protected.extend(binding.payloads.iter().copied());
-    }
+    packages.extend(
+        installations
+            .iter()
+            .map(|installation| installation.package_digest),
+    );
+    packages.extend(bindings.all().iter().map(|binding| binding.package_digest));
+    packages.sort_unstable();
+    packages.dedup();
+    let mut protected: Vec<PayloadDigest> = Vec::new();
     for package in packages {
         protected.push(package);
-        for installation in installations {
-            if installation.package_digest == package {
-                protected.extend(installation.payloads.iter().copied());
-            }
+        let mut named = false;
+        for installation in installations
+            .iter()
+            .filter(|installation| installation.package_digest == package)
+        {
+            protected.extend(installation.payloads.iter().copied());
+            named = true;
         }
-        for binding in bindings.all() {
-            if binding.package_digest == package {
-                protected.extend(binding.payloads.iter().copied());
-            }
+        for binding in bindings
+            .all()
+            .iter()
+            .filter(|binding| binding.package_digest == package)
+        {
+            protected.extend(binding.payloads.iter().copied());
+            named = true;
+        }
+        if !named {
+            let payloads =
+                manifest(package)?.ok_or_else(|| CatalogueError::StorageUnavailable {
+                    detail: format!(
+                        "{package} is live and this host cannot name the files it consists of; \
+                     nothing is reclaimed without knowing what a live package needs"
+                    ),
+                })?;
+            protected.extend(payloads);
         }
     }
     protected.sort_unstable();
     protected.dedup();
-    protected
+    Ok(protected)
 }
 
 #[cfg(test)]
@@ -599,27 +622,47 @@ mod tests {
     }
 
     #[test]
-    fn a_live_bound_or_pinned_package_is_protected() {
+    fn every_installed_bound_or_live_package_is_protected_with_all_its_files() {
         let entry = entry("0.1.0");
-        let mut installed = installation(&entry, true);
-        let mut bindings = Bindings::new();
-        assert!(protected_payloads(std::slice::from_ref(&installed), &bindings, &[]).is_empty());
-        let binding = bindings
-            .bind(&installed, &entry, "/usr/local/bin/example-agent")
-            .expect("enabled");
-        let protected = protected_payloads(std::slice::from_ref(&installed), &bindings, &[]);
+        let installed = installation(&entry, false);
+        let bindings = Bindings::new();
+        let nothing =
+            |_: PayloadDigest| -> CatalogueResult<Option<Vec<PayloadDigest>>> { Ok(None) };
+
+        // An installation is protected whether or not it is enabled, pinned or bound.
+        let protected =
+            protected_payloads(std::slice::from_ref(&installed), &bindings, &[], nothing)
+                .expect("named");
         assert!(protected.contains(&entry.manifest_digest));
         for payload in &installed.payloads {
-            assert!(protected.contains(payload), "every file of a live package");
+            assert!(
+                protected.contains(payload),
+                "every file of an installed package"
+            );
         }
 
-        bindings.unbind(binding.binding_id);
-        assert!(protected_payloads(std::slice::from_ref(&installed), &bindings, &[]).is_empty());
-        installed.pinned = true;
-        assert!(
-            protected_payloads(std::slice::from_ref(&installed), &bindings, &[])
-                .contains(&entry.manifest_digest)
-        );
+        // A package the broker says is live, which no installation holds any more, is expanded
+        // from its own manifest where it is activated here.
+        let upgraded_from = PayloadDigest::of(b"the release an upgrade replaced");
+        let its_file = PayloadDigest::of(b"a file of that release");
+        let protected = protected_payloads(
+            std::slice::from_ref(&installed),
+            &bindings,
+            &[upgraded_from],
+            |package| Ok((package == upgraded_from).then(|| vec![its_file])),
+        )
+        .expect("named from its manifest");
+        assert!(protected.contains(&upgraded_from) && protected.contains(&its_file));
+
+        // And one nothing can name stops the reclaim instead of being guessed at.
+        let refusal = protected_payloads(
+            std::slice::from_ref(&installed),
+            &bindings,
+            &[upgraded_from],
+            nothing,
+        )
+        .expect_err("a live package whose files nothing names");
+        assert!(matches!(refusal, CatalogueError::StorageUnavailable { .. }));
     }
 
     #[test]

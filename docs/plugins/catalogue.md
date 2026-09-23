@@ -154,10 +154,13 @@ the second check, and one that declares a gigabyte never reaches it.
 Exceeding a budget names the exact allowance that ran out, because "out of space" sends a person to
 the wrong setting. The last generation stays usable either way.
 
-Reclaiming space never takes a payload a live binding or a pinned generation still needs. That is
-every file such a package consists of, not only the manifest its hash names: a component nobody can
-read is a binding that does not work. When the only thing left to evict is one of those, the sync
-reports the limit instead.
+Reclaiming space never takes a payload an installed package, a live binding or a pinned generation
+still needs. That is every file such a package consists of, not only the manifest its hash names: a
+component nobody can read is a binding that does not work, and an installed package with its files
+evicted is one that cannot run. What a live package consists of is read from the installation or
+the binding that holds it, or from its own manifest where it is activated here; one whose files
+this host cannot name stops the reclaim rather than being guessed at. When the only thing left to
+evict is one of those, the sync reports the limit instead.
 
 ## Matching, enabling and binding
 

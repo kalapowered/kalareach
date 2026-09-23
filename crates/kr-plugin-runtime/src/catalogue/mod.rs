@@ -2086,7 +2086,8 @@ fn reclaim(
             &records.installations()?,
             bindings,
             &broker.live_packages(),
-        )
+            |package| store.package_payloads(package),
+        )?
         .into_iter()
         .collect();
         protected.extend(also_protected.iter().copied());
