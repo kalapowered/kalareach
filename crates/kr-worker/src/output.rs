@@ -262,6 +262,12 @@ pub struct OutputHub {
     /// How the session closed, once it has. A hub that holds it has told every subscriber, and
     /// keeps none: all there is left to say to an attachment is this.
     closure: Option<Arc<ClosureRecord>>,
+    /// The attachments that had no subscription when the session closed.
+    ///
+    /// Each is owed the closure all the same: it was admitted, its client may be about to
+    /// subscribe, and a worker that stopped counting it would exit under it. It is owed until it
+    /// subscribes, which puts the notice on its stream, or until it leaves.
+    awaiting: BTreeMap<AttachmentId, Owed>,
     /// The closure notices handed out and not yet delivered.
     deliveries: Arc<ClosureDeliveries>,
 }
@@ -294,6 +300,9 @@ impl OutputHub {
                 record,
                 &self.deliveries,
             )));
+            // What it was owed from the moment the session closed is on its stream now, and the
+            // notice there is what is owed from here.
+            self.awaiting.remove(&attachment_id);
             return OutputStream { receiver, queued };
         }
         self.subscribers.insert(
@@ -358,23 +367,39 @@ impl OutputHub {
     }
 
     /// Removes a subscription.
+    ///
+    /// An attachment that leaves after its session closed is owed nothing more.
     pub fn unsubscribe(&mut self, attachment_id: AttachmentId) {
         self.subscribers.remove(&attachment_id);
+        self.awaiting.remove(&attachment_id);
     }
 
-    /// Tells every subscriber how the session closed, then removes them all.
+    /// Tells every attachment how the session closed, and removes every subscription.
     ///
-    /// The record goes through each subscriber's own queue, so it arrives after everything that
-    /// subscriber was sent before it. It is not charged against the queue's bound, and a subscriber
-    /// that is resynchronising is told as well: falling behind loses output, not the news of how
-    /// the session ended. A subscriber that has already gone is owed nothing. The session has one
-    /// closure, so a second call changes nothing.
-    pub fn close(&mut self, record: &ClosureRecord) {
+    /// `attachments` is every attachment the session holds. One with a subscription is sent the
+    /// record through its own queue, so it arrives after everything that subscriber was sent
+    /// before it. It is not charged against the queue's bound, and a subscriber that is
+    /// resynchronising is told as well: falling behind loses output, not the news of how the
+    /// session ended. One without a subscription is owed the record until it subscribes or leaves,
+    /// because it may be about to subscribe. A subscriber that has already gone is owed nothing.
+    /// The session has one closure, so a second call changes nothing.
+    pub fn close(
+        &mut self,
+        record: &ClosureRecord,
+        attachments: impl IntoIterator<Item = AttachmentId>,
+    ) {
         if self.closure.is_some() {
             return;
         }
         let record = Arc::new(record.clone());
-        for subscriber in std::mem::take(&mut self.subscribers).into_values() {
+        let subscribers = std::mem::take(&mut self.subscribers);
+        for attachment_id in attachments {
+            if !subscribers.contains_key(&attachment_id) {
+                self.awaiting
+                    .insert(attachment_id, Owed::new(&self.deliveries));
+            }
+        }
+        for subscriber in subscribers.into_values() {
             let _ = subscriber
                 .sender
                 .send(OutputDelivery::Closed(ClosureNotice::new(
@@ -751,7 +776,7 @@ mod tests {
         let mut first = hub.subscribe(identifier(1), 1024, Presentation::Direct);
         let mut second = hub.subscribe(identifier(2), 1024, Presentation::Direct);
         hub.publish_direct(0, &Arc::new(b"last words".to_vec()), 0);
-        hub.close(&closure(7));
+        hub.close(&closure(7), [identifier(1), identifier(2)]);
         assert!(hub.is_empty(), "a closed hub keeps no subscriber");
         let deliveries = hub.closure_deliveries();
         assert_eq!(deliveries.outstanding(), 2, "each subscriber is owed one");
@@ -783,7 +808,7 @@ mod tests {
         assert!(hub.is_resynchronising(identifier(1)));
         let gone = hub.subscribe(identifier(2), 1024, Presentation::Direct);
         drop(gone);
-        hub.close(&closure(0));
+        hub.close(&closure(0), [identifier(1), identifier(2)]);
         let deliveries = hub.closure_deliveries();
         assert_eq!(
             deliveries.outstanding(),
@@ -809,7 +834,7 @@ mod tests {
     async fn a_notice_still_queued_is_owed_until_its_attachment_takes_it_or_goes() {
         let mut hub = OutputHub::new();
         let stream = hub.subscribe(identifier(1), 1024, Presentation::Direct);
-        hub.close(&closure(0));
+        hub.close(&closure(0), [identifier(1)]);
         let deliveries = hub.closure_deliveries();
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(20), deliveries.settled())
@@ -827,8 +852,8 @@ mod tests {
     #[tokio::test]
     async fn an_attachment_that_subscribes_after_the_closure_is_told_at_once() {
         let mut hub = OutputHub::new();
-        hub.close(&closure(3));
-        hub.close(&closure(4));
+        hub.close(&closure(3), [identifier(1)]);
+        hub.close(&closure(4), [identifier(1)]);
         let mut late = hub.subscribe(identifier(1), 1024, Presentation::Direct);
         assert!(hub.is_empty(), "it is not kept as a subscriber");
         let deliveries = hub.closure_deliveries();
@@ -845,6 +870,35 @@ mod tests {
         }
         assert!(late.recv().await.is_none(), "and then ends");
         assert!(settles(&deliveries).await);
+    }
+
+    #[tokio::test]
+    async fn an_attachment_without_a_subscription_is_owed_until_it_subscribes_or_leaves() {
+        let mut hub = OutputHub::new();
+        let watching = hub.subscribe(identifier(1), 1024, Presentation::Direct);
+        drop(watching);
+        // Two attachments were admitted and had not subscribed when the session closed.
+        hub.close(&closure(0), [identifier(1), identifier(2), identifier(3)]);
+        let deliveries = hub.closure_deliveries();
+        assert_eq!(
+            deliveries.outstanding(),
+            2,
+            "each admitted attachment without a live subscription is owed the closure"
+        );
+        // One subscribes: its notice goes on its stream, and that is what is owed now.
+        let mut subscribing = hub.subscribe(identifier(2), 1024, Presentation::Direct);
+        assert_eq!(deliveries.outstanding(), 2);
+        assert!(matches!(
+            subscribing.recv().await,
+            Some(OutputDelivery::Closed(_))
+        ));
+        assert_eq!(deliveries.outstanding(), 1, "delivered, and owed no more");
+        // The other leaves without subscribing, and is owed nothing more.
+        hub.detached(identifier(3));
+        assert!(
+            settles(&deliveries).await,
+            "nothing is owed once one has its notice and the other has gone"
+        );
     }
 
     #[tokio::test]

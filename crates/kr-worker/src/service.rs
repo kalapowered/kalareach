@@ -1039,18 +1039,33 @@ impl WorkerService {
                                 // The session has closed. How it ended is the last thing its
                                 // attachment is sent, after every byte it was owed, so the client
                                 // ends knowing why rather than finding a connection that stopped.
-                                // The notice is released once it is written or cannot be, and that
-                                // is what the worker waits for before it exits.
+                                // The notice is released once the connection has it or never
+                                // will, and that is what the worker waits for before it exits.
                                 if let Some(notification) = notification(
                                     &stream_id,
                                     sequence,
                                     kr_protocol::session::SESSION_CLOSED_EVENT,
                                     notice.record(),
-                                ) {
+                                ) && write_frame(
+                                    &delivery_writable,
+                                    &sender,
+                                    &notification,
+                                    &delivery_withdrawn,
+                                    true,
+                                )
+                                .await
+                                {
+                                    // A frame written is not always a frame the connection has
+                                    // taken. A pipe finishes a write in the background, a process
+                                    // that exits first loses it, and the pipe takes no further
+                                    // frame until it has finished. So a keepalive, which every
+                                    // client already ignores, follows the notice, and its being
+                                    // taken is what shows the notice was. A socket takes a write
+                                    // when it is made, and there this costs one small frame.
                                     let _ = write_frame(
                                         &delivery_writable,
                                         &sender,
-                                        &notification,
+                                        &ControlFrame::Event(ControlEvent::Keepalive),
                                         &delivery_withdrawn,
                                         true,
                                     )

@@ -3811,9 +3811,16 @@ impl Session {
         self.state = SessionState::Closed;
         self.application_state = None;
         self.closure = Some(record.clone());
-        // Every attachment is told, behind whatever output it was still owed. This is the only place
-        // a session becomes closed, so every closure reaches every attachment through here.
-        self.hub.close(&record);
+        // Every attachment is told, behind whatever output it was still owed, and one that has not
+        // subscribed yet is owed it until it does or leaves. This is the only place a session
+        // becomes closed, so every closure reaches every attachment through here; and nothing is
+        // admitted to a closed session, so no attachment arrives after it.
+        let attachments: Vec<AttachmentId> = self
+            .attachments
+            .iter()
+            .map(|attachment| attachment.id)
+            .collect();
+        self.hub.close(&record, attachments);
         record
     }
 

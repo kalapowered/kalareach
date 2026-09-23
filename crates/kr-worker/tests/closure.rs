@@ -222,6 +222,19 @@ async fn watching(host: &Host) -> LocalClient {
     client
 }
 
+/// Polls until `condition` holds, and fails with how long it waited when it never does.
+async fn until(what: &str, mut condition: impl FnMut() -> bool) {
+    let started = tokio::time::Instant::now();
+    while !condition() {
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "waited {:?} for {what}",
+            started.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Waits for the session's own closure record.
 async fn closed(host: &Host) -> ClosureRecord {
     tokio::time::timeout(LIVENESS_DEADLINE, host.runtime.wait_closed())
@@ -326,10 +339,18 @@ async fn a_client_that_has_gone_holds_nothing_up() {
 /// the bound the caller gives rather than when the client comes back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_client_that_stopped_reading_holds_the_worker_only_until_the_bound() {
-    // Far more output than a socket holds, sent to a client that never reads any of it, so the
-    // closure waits behind output the client is not taking.
-    let host = host("read -r _; head -c 2000000 /dev/zero | tr '\\0' x; exit 0").await;
+    // More output than this client's queue holds, sent to a client that never reads any of it.
+    let host = host("read -r _; head -c 2000000 /dev/zero | tr '\\0' x; read -r _; exit 0").await;
     let (stalled, mut keys) = attached_holding_the_keys(&host).await;
+    keys.release(&host.runtime);
+    // The session says when this client has fallen a whole queue behind: output it was owed has
+    // not been taken off the connection, so nothing behind that output can be either. That is the
+    // moment the closure is let happen, rather than a guess at how much a socket holds.
+    until(
+        "the client that stopped reading to fall a whole queue behind",
+        || host.runtime.session().is_resynchronising(keys.attachment()),
+    )
+    .await;
     keys.release(&host.runtime);
     closed(&host).await;
     assert!(
@@ -343,5 +364,32 @@ async fn a_client_that_stopped_reading_holds_the_worker_only_until_the_bound() {
     assert!(
         host.runtime.closure_delivered(CLOSURE_NOTICE_TIMEOUT).await,
         "and once that client has gone it is owed nothing"
+    );
+}
+
+/// An attachment the session admitted that had not subscribed when the session closed is owed the
+/// closure all the same, and is sent it when it subscribes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attachment_that_subscribes_after_the_closure_is_sent_it_all_the_same() {
+    let host = host("read -r _; exit 0").await;
+    let (mut typing, mut keys) = attached_holding_the_keys(&host).await;
+    let (mut late, late_attachment) = attach(&host).await;
+    keys.release(&host.runtime);
+    let record = closed(&host).await;
+    let (_, sent) = until_the_closure(&mut typing).await;
+    assert_eq!(sent, record);
+    assert!(
+        !host
+            .runtime
+            .closure_delivered(Duration::from_millis(500))
+            .await,
+        "the attachment that has not subscribed is still owed the closure"
+    );
+    subscribe(&mut late, &host, late_attachment).await;
+    let (_, sent) = until_the_closure(&mut late).await;
+    assert_eq!(sent, record, "it is sent the session's own record");
+    assert!(
+        host.runtime.closure_delivered(CLOSURE_NOTICE_TIMEOUT).await,
+        "and the worker is owed nothing once it has been"
     );
 }

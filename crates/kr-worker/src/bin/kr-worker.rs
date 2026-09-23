@@ -340,17 +340,22 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Ends the work of a worker whose session has closed.
 ///
-/// Nothing new is accepted from here, and the root integration's endpoint goes with its shell. Each
-/// attachment is then sent how the session closed, behind the output it was still owed, and the
-/// process ends only once every one has been, or once a client that has stopped reading has had
-/// [`CLOSURE_NOTICE_TIMEOUT`]. A client that has gone holds nothing up. Ending first would take the
-/// connections with it, and every attachment would learn only that its connection had stopped.
+/// The root integration's endpoint goes with its shell. Each attachment is sent how the session
+/// closed, behind the output it was still owed, and one the session admitted that has not
+/// subscribed yet is owed it until it does or leaves. The process ends only once every one has it,
+/// or once [`CLOSURE_NOTICE_TIMEOUT`] has passed for a client that has stopped reading. A client
+/// that has gone holds nothing up. Ending first would take the connections with it, and every
+/// attachment would learn only that its connection had stopped.
+///
+/// The endpoint goes on answering while this waits, so a client that asks how the session ended is
+/// told by the worker that ended it. Nothing it accepts can add to what is owed: a closed session
+/// admits no attachment, and every one it had was counted when it closed. The accept loop stops
+/// once nothing is owed, and is awaited, so no connection is taken after that.
 async fn finish(
     runtime: &Arc<kr_worker::runtime::SessionRuntime>,
     serving: tokio::task::JoinHandle<kr_worker::Result<()>>,
     bridge_server: Option<tokio::task::JoinHandle<()>>,
 ) {
-    serving.abort();
     if let Some(server) = bridge_server {
         server.abort();
     }
@@ -361,6 +366,8 @@ async fn finish(
             CLOSURE_NOTICE_TIMEOUT.as_secs()
         );
     }
+    serving.abort();
+    let _ = serving.await;
 }
 
 /// How long a managed session waits for the user's startup files to finish.
