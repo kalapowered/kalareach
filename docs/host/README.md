@@ -2074,6 +2074,12 @@ unless explicitly cleared and excluded from later sync while privacy mode is on.
 claimed a functioning durable control system wrote no state at all would be claiming something
 untrue.
 
+The text the environment's attention inbox shows is fenced at the control daemon rather than in a
+queue of the session's own. A session serves no text from before a transition, and text it answered
+with before privacy mode was enabled cannot leave the daemon once the new generation is committed,
+whether or not the daemon answered in time. The attention section sets out how, under *Privacy mode
+and the text an item carries*.
+
 Backup production is fenced where it is accounted for, and the fence writes down everything it
 implies in the same breath as raising itself.
 
@@ -2568,34 +2574,44 @@ kernel. A reading the host could not take reports `unavailable` rather than a sy
 with no stated error, because not knowing is its own state.
 ## Attention, review and what changed since a visit
 
-The attention engine runs on the host, from typed events. It holds an inbox, a quiet-hours window,
-each actor's acknowledgements and the cursors it has consumed, and it reads no clock of its own:
-every decision that depends on time takes a reading of the host time contract from its caller.
+The environment has one attention store, and the control daemon holds it. It keeps one inbox for
+every session the environment runs, each actor's acknowledgements, review state, visits and the
+one quiet-hours window, beside the daemon's other state as `attention.sqlite3`. It lives with the
+daemon because it has to outlive every session: review work a session produced stays after the
+session has ended, and a paired device reads one inbox rather than one per session. What a session
+records stays in the session's own journal. The store keeps none of a session's text, only where
+to read it from, and it reads no clock of its own: every decision that depends on time takes a
+reading of the host time contract from the daemon.
 
 ### Where its events come from
 
-The host's own maintenance reads the retained sources and gives the engine what it has not seen,
-keyed by each source's own cursor. Two sources reach it: the question ledger, whose events carry
-the moment a request became pending, and the journal's host events, which are the terminal side
-effects that had no attachment to go to. A record that no rule covers moves the cursor and raises
-nothing, so a later record is not read as a range retention took. A pass reads bounded pages until
-it has caught up, and only then decides any timer: deciding against a half-read history would raise
-a reminder for a request whose answer is in the next page. A page announces nothing by itself for
-the same reason - a question raised and answered inside a backlog is not a notification to send
-now - and the timer pass that follows a completed catch-up is what decides what is still owed.
+Two sources in each session's journal reach it: the question ledger, whose events carry the moment
+a request became pending, and the journal's host events, which are the terminal side effects that
+had no attachment to go to. For each live session the daemon opens a connection of its own to the
+session's worker, verified and bound to the daemon's generation like every other, and declared for
+attention: it carries the daemon's requests for these records and nothing else, and a newer one
+replaces the one before it. The daemon keeps one request for records past the store's cursors
+waiting on it. The worker answers that request as soon as it commits a question transition, a host
+event or a privacy transition, and after at most thirty seconds otherwise, so a question asked in a
+session is in the inbox within moments rather than at some later pass.
 
-A pass that cannot finish decides nothing. A source it could not read, a page it could not write
-down and a backlog longer than one pass reads all leave the timers where they were, and maintenance
-comes back for the rest a couple of seconds later rather than treating the still-due deadline as an
-instruction to try again immediately.
+A page is read in a fixed order: the moment, then each source's newest record and the records after
+the cursor up to it, then the session's privacy record. A page that reaches the newest record of
+both sources certifies everything the session committed before the moment it was read, and a timer
+of that session is decided only up to its latest certified moment. That is what keeps an answer the
+store has not read yet from turning into a reminder. A page that stops short is followed by the
+next one at once. A link that stalls or fails certifies nothing more, and that session's timers
+wait for it. They are late then, never early. A record that no rule covers moves the cursor and
+raises nothing, so a later record is not read as a range retention took.
 
-Maintenance otherwise wakes at the earlier of its own cadence and the moment the engine says a
-timer is due, so a five-minute reminder is five minutes rather than five minutes rounded up to the
-next time the host happened to look. What it counts from is where the host read the record, not
-where the request started waiting, because the sources this build reads record when something
-happened and not where that moment sat on the clock intervals are measured on. The reminder is late
-by however long a record waited to be read; the next paragraph is why that is the direction to err
-in.
+A page announces nothing by itself, since a question raised and answered inside a backlog is not a
+notification to send now; the timer pass that follows a certified page decides what is still owed.
+A timer is otherwise decided when it falls due, so a five-minute reminder is five minutes rather
+than five minutes rounded up to the next time the host happened to look. What it counts from is
+where the host read the record, not where the request started waiting, because the sources this
+build reads record when something happened and not where that moment sat on the clock intervals
+are measured on. The reminder is late by however long a record waited to be read; the next
+paragraph is why that is the direction to err in.
 
 One clock measures every interval, and it is not the wall clock. A wall clock can be set, and a
 host that trusts one still trusts it after somebody moves it forward an hour, so two readings it
@@ -2605,13 +2621,36 @@ asleep. It means nothing outside its own boot, so every interval the host writes
 continuous reading it starts from *and* the boot that reading was taken in, and one whose boot has
 ended starts again rather than being worked out across the gap - once, because opening the store is
 what restarts it and opening the store writes the new start down, so the next open finds an
-interval this boot can measure. An event brings an anchor
-of its own when its producer read that clock, separately for each moment it carries, because a
-request can become pending long before the record of it is written. Every one of those answers is
-nought or less than the true wait, never more: a reminder that comes late is still a reminder, and
-one raised seconds after a request because somebody corrected a clock is an interruption nobody
-earned. The wall clock keeps the two jobs it can do - deciding quiet hours, and saying when
-something happened for a person reading the record.
+interval this boot can measure. An event brings an anchor of its own when its producer read that
+clock, separately for each moment it carries, because a request can become pending long before the
+record of it is written. Every one of those answers is nought or less than the true wait, never
+more: a reminder that comes late is still a reminder, and one raised seconds after a request because
+somebody corrected a clock is an interruption nobody earned. The wall clock keeps the two jobs it
+can do: deciding quiet hours, and saying when something happened for a person reading the record.
+The store keeps the host time contract's own record beside it, so a daemon that restarts still
+knows whether the wall clock was ever rolled back.
+
+### A session that ends
+
+The store ends a session's live conditions only on a closure this daemon recorded and could account
+for: the worker's own handover, or a closure after a death the host confirmed. It then reads what
+is left of both sources from the session's journal, with the same reads a live worker answers
+with, and finishes the session in one write. A pending approval, a pending request and its idle
+reminder leave the inbox as ended with the session, never as answered, approved or completed.
+Review work stays, and so do failed commands, notices and gaps. Finishing a session twice changes
+nothing, and a page that arrives for a finished session is not taken.
+
+A closure written over a worker the host could not confirm had ended opens nothing. Its sources
+become gaps with no known end, its items stay and are marked uncertain, and its timers are never
+decided, because the worker may still be running and writing records nobody will read. A journal
+that cannot be read is a gap with no known end too, and then the session is finished. A closure the
+store could not write down is kept and tried again every few seconds rather than dropped.
+
+A daemon that restarts opens the store again, finds each session it was reading, and reads it from
+its worker or finishes it from its journal. Nothing it rebuilds is announced: an event from an hour
+ago is history rather than a notification to send now, so the replay restores each item with the
+age it had, where the anchor that age is measured from belongs to this boot, and starts the age
+here where it does not. Its timers wait for the first page each session answers with.
 
 ### The rule set
 
@@ -2633,12 +2672,19 @@ session printing continuously while a question waits still owes the reminder, an
 with nothing pending does not. A repeat of the same condition inside sixty seconds is counted on
 the item rather than announced again.
 
+An approval is one item per session and request: the same upstream identifier in two sessions is
+two approvals, because each session's agent is waiting on its own.
+
 An application notice is the one untrusted rule. Any process writing to the terminal can emit one,
 so the item says so and the rule cannot raise any other kind of item; nothing a notice says makes
 it a pending approval. A notice the host recorded as a side effect is one that had no attachment to
 go to: section 8 sends a notification to the attachment holding the input lease, and a record
 exists because nobody held it. With no lease holder there is nobody to send it to, so it goes
-through the owner's configured notification policy, and it is retained in Attention.
+through the owner's configured notification policy, and it is retained in Attention. Two notices
+that say the same thing are one condition. The store knows what a notice says by a keyed digest the
+worker makes under a key the store gives it for that session, sent whether or not the notice's text
+is, so the item is the same with privacy mode on or off and nobody without the key can test a guess
+at withheld text against it.
 
 ### Quiet hours
 
@@ -2649,8 +2695,8 @@ is the condition it was about ending, which is a cancellation rather than a loss
 waiting on the person any more.
 
 Setting or clearing the window records it and announces nothing by itself. What the change lets
-through is released by the next timer pass, and the change wakes maintenance rather than waiting
-for its next tick, so the release follows the setting rather than the minute. That is what keeps a
+through is released by the next timer pass, and the change wakes that pass rather than waiting for
+its next tick, so the release follows the setting rather than the minute. That is what keeps a
 release a decision about the present: announcing inside the setter would decide against whatever
 history the host had read at the moment somebody happened to change a setting.
 
@@ -2660,8 +2706,24 @@ converted from, which the host stores and gives back and never interprets. A hos
 what its wall clock reads is never inside a window: quiet hours are a time of day, and a
 suppression decided on an unprovable clock would withhold a notification at an hour nobody chose.
 
-Setting the window is host management rather than session view authority, because one window
-suppresses the owner's delivery rather than one actor's.
+There is one window for the environment. Setting it is host management rather than session view
+authority, because one window suppresses the owner's delivery rather than one actor's.
+
+### Acknowledgement
+
+An acknowledgement is one actor's, and it names each item by its key and the revision it was
+read at. An item's revision moves when the item is raised and at each new occurrence of its
+condition, so an acknowledgement covers what the actor saw and no more: a later occurrence is
+outstanding for that actor again. A key whose item has gone, moved past the named revision or is
+outside what the actor may see records nothing and is answered as stale; a revision beyond the
+item's own refuses the whole request with nothing written. Each actor has one revision for the
+environment, advanced by its acknowledgements of attention, review and visits.
+
+Every change the group makes is the daemon's own action: its record is committed in the same
+transaction as its effect, the admission it carries is checked again inside that transaction
+before anything is written, an exact repeat is answered from the record, and the same action with
+another payload is a conflict. A record is kept for thirty days, and one is only let go of on a
+wall clock the host can prove, so a rollback cannot make a live record look expired.
 
 ### Review, and what it does not do
 
@@ -2680,21 +2742,23 @@ performs one, so that holds by construction rather than by policy.
 An acknowledgement binds the version it was made against. When a later version arrives the subject
 is outstanding again, because a new change is new review work and an acknowledgement of an earlier
 version does not cover it. Acknowledging a subject the host holds no version of is refused, and so
-is a version beyond the one it holds.
+is a version beyond the one it holds, and so is a subject of another session than the one the
+request names.
 
 An acknowledgement affects only the actor that made it. It does not stop the host reminding
 anybody: the ladder and the repeats belong to the condition, and they end when the condition does.
 
-A refusal the host can decide is decided before anything is dispatched. A subject this session
-never held, a version nobody produced, a counter the store could not write down as it was given, a
+A refusal the host can decide is decided before anything is dispatched. A subject the store never
+held, a version nobody produced, a counter the store could not write down as it was given, a
 quiet-hours bound that is not a minute of the day, a log view past its own bounds and one more
 actor than the store admits are all rejections, not outcomes nobody can establish.
 
 ### Changed since a visit
 
-A visit records how far one actor has read, and never moves backwards. The view compares that
-cursor with the semantic events the host retains and answers with three separate things: the
-authoritative changes, the ranges that are missing, and a model summary when one covers the
+A visit records how far one actor has read in one session, and never moves backwards. Each session
+has a change log of its own, of the last thousand changes and up to sixty-four ranges it has let
+go of. The view compares the visit's cursor with that log and answers with three separate things:
+the authoritative changes, the ranges that are missing, and a model summary when one covers the
 interval. The three never merge. A summary names the interval it was written from and cannot stand
 in for an event; a gap is not an absence of changes but a statement that the host cannot say what
 was there.
@@ -2702,58 +2766,59 @@ was there.
 A log view's source offset and its filter travel with the visit. They come back after a reconnect,
 each view keeps its own position when a client switches between two, and a view whose range
 retention has taken is served from the oldest byte that still exists with the range between stated
-as an explicit history gap.
+as an explicit history gap. A live session's oldest byte comes with each page its worker answers
+with, and a finished session's is read from its spool, since retention goes on after the session
+has ended.
 
 ### The feature store, and what a gap means
 
-The state lives beside the receipts, in the session's own private journal, under its own table
-names and its own schema version. What it decided is a projection of the journal's events, so that
-half can be rebuilt from them: replaying a record the engine has already consumed changes nothing,
-which is what makes a rebuild safe to run twice. What people and clients put there is not, and no
-replay restores it: the acknowledgements, the per-actor revisions, the visits and their log views,
-the quiet-hours window and the identities already given to announcements are records in their own
-right, and the store is where they live.
+What the store decided is a projection of the sessions' records, so that half can be rebuilt from
+them: replaying a record the engine has already consumed changes nothing, which is what makes a
+rebuild safe to run twice. What people and clients put there is not, and no replay restores it:
+the acknowledgements, the per-actor revisions, the visits and their log views, the quiet-hours
+window and the identities already given to announcements are records in their own right, and the
+store is where they live. It keeps a cursor for each session's two sources, and a write changes
+the rows a decision changed rather than the whole store.
 
-One session's worker is the one owner of its own attention store, for as long as it is running.
-Every write replaces the whole state and is made from the copy its owner is holding, so two owners
-would each replace the other's work with a picture of the world that predates it. The claim is a
-row inside the store: opening it reads that row first of all, and writes its own under the same
-transaction, so whatever name reached the database reaches the one claim, and an opener that may
-not have it is told who holds it before a row of the state has been read. Every write reads the
-claim again, inside the transaction it writes in, so an owner whose store was taken while it was
-away replaces nothing: it is told the store is no longer its to write, and whoever opens the store
-next reads it fresh.
+The daemon is the one owner of the store, for as long as it is running, and the environment's
+singleton lock is what makes it one daemon. The store also keeps its own claim, for a second
+process that reaches the file some other way. The claim is a row inside the store: opening it
+reads that row first of all, and writes its own under the same transaction, so whatever name
+reached the database reaches the one claim, and an opener that may not have it is told who holds
+it before a row of the state has been read. Every write reads the claim again, inside the
+transaction it writes in, so an owner whose store was taken while it was away replaces nothing: it
+is told the store is no longer its to write, and whoever opens the store next reads it fresh.
 
 Letting the store go removes that one claim and nothing else - not the state, and not a claim
 somebody else now holds - so the next opener does not have to work out that nobody is holding it.
-That removal is the best this worker can do rather than a promise: a file that has gone, or another
+That removal is the best the daemon can do rather than a promise: a file that has gone, or another
 holder of it that keeps the write waiting, leaves the claim where it is. An owner that ends without
 letting go, one that was killed or a machine that stopped, leaves its claim behind too, and the
-next opener is what clears it. A claim from a boot that has ended is not standing, because that boot's processes
-are gone with it. A claim from this boot is weighed on the process it names: the worker records the
-pair the kernel describes, its number and the start value that tells it apart from whoever holds
-that number next, so a claim whose process has gone is taken the moment the next worker asks. Where
-the platform will not answer, the claim's own lease decides instead, and it stands for ten minutes
-unrefreshed against an owner that refreshes it on every write and a maintenance loop that writes at
-least once a minute. A process the kernel says is running keeps its store however long it has been
-idle.
+next opener is what clears it. A claim from a boot that has ended is not standing, because that
+boot's processes are gone with it. A claim from this boot is weighed on the process it names: the
+owner records the pair the kernel describes, its number and the start value that tells it apart
+from whoever holds that number next, so a claim whose process has gone is taken the moment the
+next daemon asks. Where the platform will not answer, the claim's own lease decides instead, and
+it stands for ten minutes unrefreshed against an owner that refreshes it on every write and a
+maintenance loop that writes at least once a minute. A process the kernel says is running keeps
+its store however long it has been idle.
 
 A database is journalled under the name it was opened by, so one file that two names reach can be
 journalled twice over by two processes that never see each other's work. The store refuses such a
 file outright and says how many names reach it. The count is of the file the store has open rather
 than of whatever a name reaches now: on Windows it comes from the store's own handle on the file,
 and on the Unix family, where nothing safe describes an open file, the name is described without
-opening it - a second descriptor there would drop every lock this process holds on the file,
-including the receipt journal's - and the store then asks its own database whether the file it has
-open is still the one that name reaches. Those are two answers rather than one, so a name swapped
-between them is not ruled out; what is ruled out is every ordinary second name. A host that cannot
-answer at all is refused rather than admitted.
+opening it - a second descriptor there would drop every lock this process holds on the file - and
+the store then asks its own database whether the file it has open is still the one that name
+reaches. Those are two answers rather than one, so a name swapped between them is not ruled out;
+what is ruled out is every ordinary second name. A host that cannot answer at all is refused rather
+than admitted.
 
 Every mutating call writes the new state before it publishes the decision. A write that fails
 leaves the engine where it was, so the same event can be offered again and produces the same
 answer. The exception is the store being taken: that value holds a state that is no longer the
-store's, so it answers nothing more and the session's worker opens the store again rather than
-retrying against it.
+store's, so it answers nothing more and the daemon opens the store again rather than retrying
+against it.
 
 A decided announcement stays written down until a delivery consumer says it has taken durable
 responsibility for it. Taking one is two steps for that reason: the host offers what is outstanding
@@ -2763,7 +2828,9 @@ own that only goes forward, so it outlives the item it was given for: a conditio
 returns is a new item, and an identity a consumer already recorded can never settle a decision made
 after the condition came back. A host that died at any point before the settlement offers the
 announcement again. What becomes of it afterwards - the destinations, the attempts, the receipts -
-belongs to the delivery journal.
+belongs to the delivery journal. An announcement names its item's text by where to read it, and a
+consumer that sends the text reads it under the same release as a reader does (see *Privacy mode
+and the text an item carries* below).
 
 An item holds one outstanding decision at a time. A later announcement about the same condition
 replaces the identity waiting to be taken, and the condition ending takes it away, because an
@@ -2771,16 +2838,11 @@ announcement about something that is no longer true is not one anybody wants. So
 what is waiting rather than a queue of everything that was ever decided.
 
 A jump in a source's sequence means the records between were evicted. The engine records the range,
-marks every unresolved item from that same source uncertain, and leaves it in the inbox. A gap is
-never an approval and never a completion: an approval whose answer may have been in the missing
-range stays pending and says the host cannot tell. A host that starts the engine partway through a
-session's life says where it is starting rather than leaving the first record to look like an
-eviction.
-
-A rebuild announces nothing. An event from an hour ago is history rather than a notification to
-send now, so the replay restores each item with the age it had, where the anchor that age is
-measured from belongs to this boot, and starts the age here where it does not. Either way the first
-timer pass after the rebuild decides what still needs saying.
+names the session it belongs to, marks every unresolved item of that session and source uncertain,
+and leaves it in the inbox; an item of another session is not touched by it. A gap is never an
+approval and never a completion: an approval whose answer may have been in the missing range stays
+pending and says the host cannot tell. A gap with no known end says that nothing after its start
+can be read at all. The store keeps the last sixty-four gaps.
 
 The inbox is a working set rather than a record: the receipts, the question ledger and the retained
 output are where the history lives. Past five hundred items the host lets go of its least urgent
@@ -2795,10 +2857,11 @@ unanswered approval, an unanswered request, an adapter still down, a host still 
 a decision about one that is still in flight: one no consumer has settled, one quiet hours are
 holding, one nobody has made yet, and one whose sixty-second window is still running, because the
 item is the whole of what the host remembers that window by and letting go of it would announce the
-same condition twice inside it. When the whole inbox is those, it goes over its bound rather than answering that nothing
-is waiting or losing an announcement nothing will offer again, and it comes back inside its bound
-on the next timer pass, against what that pass decided and what a consumer settled meanwhile. A
-host whose notifications nobody is taking therefore keeps them rather than quietly dropping them.
+same condition twice inside it. When the whole inbox is those, it goes over its bound rather than
+answering that nothing is waiting or losing an announcement nothing will offer again, and it comes
+back inside its bound on the next timer pass, against what that pass decided and what a consumer
+settled meanwhile. A host whose notifications nobody is taking therefore keeps them rather than
+quietly dropping them.
 
 Review state has no retention at all. A subject nobody has acknowledged is outstanding review work,
 and deleting it would answer that there is none; a subject somebody has acknowledged is that
@@ -2806,7 +2869,7 @@ actor's own record of what they read, and nothing can rebuild it from the events
 cursor that consumed them has already moved. What is bounded is the answer: a review read returns
 at most two hundred subjects and continues after the last one it gave, in the order the host first
 heard of each subject, so a new version of one already served does not move it under a page that is
-continuing. A subject the session does not hold is refused as a continuation rather than silently
+continuing. A subject the caller may not see is refused as a continuation rather than silently
 restarting the list.
 
 A feature store admits two hundred and fifty-six actors; past that a new actor's acknowledgement is
@@ -2814,19 +2877,93 @@ refused, before anything is dispatched, rather than an existing actor's being de
 
 ### What a caller is served
 
+The owner at this machine sees the whole store. A paired device sees what its grant admits: a
+session's items, review state and visits when the grant's selectors admit that session and it
+carries `session.view`, and the environment's own items when it carries `host.manage`. The same
+scope bounds a read's items, the gaps it reports and where it may continue from. `attention.read`
+and `attention.acknowledge` are reads of the caller's current view rather than rights of their
+own, so a device holding only `host.manage` reads the environment's items and none of any session.
+A read may name one session to narrow the inbox to it.
+
 An item's text and a change's text come from retained content: a question's wording, a command
-line, what an application printed. Section 10 narrows retained content to the grant that asked for
-it, and this host cannot narrow a moment in time to an item's text, which is why it refuses a
-retained history page to a paired device outright. An attention item is not a history page, so it
-is narrowed rather than refused: a caller that did not arrive over the local socket is served the
-host's own record of a condition - which rule, at what level, how often, when - with the text left
-out and said to be left out, and no model summary either.
+line, what an application printed. The store keeps none of it. When the owner reads the inbox, the
+daemon asks each session for the text of the items it is about to serve, all at once: the live
+worker over its attention connection, or a finished session's journal. A session that does not
+answer within three seconds, one closed over a worker the host could not account for, or a record
+that is gone serves no text. A question's wording is served only from the
+record that created the question: every later transition of the question carries it again, and
+serving it from one of those would serve text written before a privacy transition under the one
+after it.
+
+Section 10 narrows retained content to the grant that asked for it, and this host cannot narrow a
+moment in time to an item's text, which is why it refuses a retained history page to a paired
+device outright. An attention item is not a history page, so it is narrowed rather than refused: a
+caller that did not arrive over the local socket is served the host's own record of a condition -
+which rule, at what level, how often, when - with the text left out and said to be left out, and no
+model summary either.
 
 An item's key carries none of that text either. A key has to be derived rather than allocated, so
 that rebuilding the inbox from the retained events lands on the items it had before, and it travels
 to every caller that may read the inbox at all. So it carries a digest of the subject rather than
 the subject: a command line or a notification body cannot reach a caller inside the key of the item
 whose text was withheld.
+
+### Privacy mode and the text an item carries
+
+A session serves a record's text only while privacy mode is off, and only for a record written
+after the last privacy transition: the transition writes down where each source stood, in the same
+transaction, and nothing at or before that point is served again, live or from the session's
+journal once it has closed. So text from before privacy mode was enabled, and text written while it
+was on, never comes back. A journal with no privacy record serves no text at all.
+
+That covers what a session answers with from now on. Section 24 also asks that no late
+old-generation result is published: text a session answered with before privacy mode was enabled
+may be in the daemon's hands when the new generation is committed, in a read that has not been
+written to its reader yet or in a delivery that has not been sent, and it must not leave the daemon
+after the commit. Two things see to that.
+
+Before the worker commits a generation that enables privacy mode, it raises a transition and tells
+the daemon so, in a statement on its attention connection. From then on its own answers carry no
+text. The daemon applies the statement under the same lock every release of that text takes, held
+exclusively, and acknowledges it once applied; from then on it releases none of the session's text
+until a later statement settles the transition. Statements carry one order the worker keeps for its
+whole life, and the daemon applies one only from the connection that speaks for the session now and
+only when it comes after the last it applied from there, so a statement that arrives late cannot
+undo a later one. Every new attention connection starts with a statement of where the worker
+stands, so a daemon that restarted, or a connection that replaced a lost one, knows about a
+transition before it serves anything that connection carries. A statement the worker cannot write
+within two seconds ends the connection, and the next one starts with the worker's state as it is
+then.
+
+A daemon that does not answer in time cannot be relied on to have stopped anything, so the worker
+does not rely on it. Every answer that carries text also carries a lease: the moment, on the
+machine's continuous clock, after which the daemon releases none of that text. It is five seconds
+from when the worker decided the answer. Without an acknowledgement the worker commits only once
+every lease it has issued has ended, and with one, once every lease it issued to any other daemon
+has ended, since the acknowledging daemon's barrier holds back only what that daemon holds itself.
+No lease is issued after the raise, so enabling privacy mode never waits more than one lease, five
+seconds, however the daemon behaves.
+
+The daemon checks the release before every write to a transport, not once per answer. An answer to
+the owner goes to its connection one non-blocking write at a time, each made under the shared lock
+right after the check, and the wait for room happens with the lock let go. When the check fails, an
+answer none of which has gone is taken back and the same answer goes without its text; one the
+reader already has part of is not finished, and the connection ends, so the reader asks again. A
+read with text from several sessions is stopped by a transition in any of them, and a read that
+outlasts the lease of the text it carries is cut the same way. The margin the check keeps before
+a lease ends, one second, is the time it allows between reading the clock and the write it admits;
+a daemon thread held off the processor for longer than that between the two, or a machine
+suspended in that instant, is the one case a lease cannot order. A delivery consumer releases the
+same way: each transport write of session text is made through the daemon's release, which refuses
+it once the check fails, and a consumer whose transport would send held bytes later on its own
+cannot carry session text. Text read from a finished session's journal needs no lease, because no
+transition can follow a closure.
+
+Privacy mode reports complete only once the daemon has recorded the new generation, which a request
+on the current attention connection says when it names that generation. Until then the worker's
+attention subsystem reports one piece of cleanup outstanding, and with no daemon it stays that way.
+One transition is raised at a time: a second waits until the first is settled, and one its caller
+abandons is settled when it is dropped.
 
 ## Notification delivery
 
