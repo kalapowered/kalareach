@@ -50,12 +50,16 @@ Android's microphone foreground service:
 - **iOS**: `UIBackgroundModes` declares `audio`. An explicitly started call maintains its audio session
   across screen locks. If capture is interrupted by an incoming phone call or system audio grab, an
   `AVAudioSession.interruptionNotification` is received and capture state transitions to `interrupted`.
-- **Android**: `VoiceMicrophoneService` runs with `foregroundServiceType="microphone"`, holding a
+- **Android**: `VoiceCallService` runs with `foregroundServiceType="microphone"`, holding a
   persistent user-visible notification while a call is active. When the screen locks, the foreground
-  service preserves the microphone and speaker channels.
-- **Unattended activation forbidden**: Capture is started only upon explicit user gesture (pressing
-  "Start voice session"). When a call ends or is revoked, capture stops immediately and background
-  audio services are deactivated. The client never activates the microphone unattended.
+  service preserves the microphone and speaker channels. Every action on the notification names the
+  call it was shown for, so one that arrives late reaches that call or nothing.
+- **Unattended activation forbidden**: building a call makes its offer with the microphone track
+  off, and opens no audio session and no foreground service. The microphone opens only when the
+  host's answer to a start permits the call. That answer names the voice session and the moment the
+  service closes it; each client's capture gate holds the deadline on the device's monotonic clock
+  and ends capture there without waiting for any event. A stopped call never reopens, and a second
+  permit for the same call is refused.
 
 ## Capture states and unheard speech
 
@@ -68,6 +72,11 @@ and enforces the requirement that **unheard speech never authorises an action** 
 - `route_changing`: Switching between speaker, receiver, or Bluetooth.
 - `suspended_by_system`: The OS suspended capture.
 - `unavailable`: No microphone hardware or permission is available.
+- `idle`: No call has been permitted, the call has ended, or its deadline has passed.
+
+What the screen shows and whether the microphone carries speech come from the same gate, so the two
+cannot disagree. The gate keeps the recent intervals in which capture was on, and an instant older
+than the oldest one it kept is treated as unheard.
 
 Whenever capture is in any state other than `capturing`, the UI displays:
 > "Nothing spoken while the microphone was not carrying your voice can authorise an action."
