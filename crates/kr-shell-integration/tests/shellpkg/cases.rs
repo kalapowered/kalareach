@@ -585,7 +585,10 @@ pub fn an_unattributable_gesture_is_consumed_with_one_hint_per_prompt(kind: Shel
     );
     let after_first = session.terminal_output().matches(DETACH_HINT).count();
     if kind == ShellKind::Fish {
-        let hint_pos = session.terminal_output().rfind(DETACH_HINT).unwrap();
+        // Counted in the terminal's own bytes, which is what the wait below counts in.
+        let hint_pos = session
+            .last_shown(DETACH_HINT)
+            .expect("the hint the check above saw drawn");
         let prompt = session.prompt.clone();
         assert!(
             session.wait_for_output_after(hint_pos, &prompt, REPLY),

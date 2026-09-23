@@ -1896,6 +1896,24 @@ impl Session {
         self.output.lock().expect("the output lock").len()
     }
 
+    /// Where the last copy of `needle` the terminal has shown starts, as an offset a later wait
+    /// counts from.
+    ///
+    /// The offset is into the terminal's own bytes, which is what the waits here count in. One
+    /// taken from a text copy of them would move wherever a byte was not valid text, and a wait
+    /// counting from it would start in the wrong place.
+    #[must_use]
+    pub fn last_shown(&self, needle: &str) -> Option<usize> {
+        let output = self.output.lock().expect("the output lock");
+        let needle = needle.as_bytes();
+        if needle.is_empty() || needle.len() > output.len() {
+            return None;
+        }
+        (0..=output.len() - needle.len())
+            .rev()
+            .find(|&at| output[at..].starts_with(needle))
+    }
+
     /// Waits for `needle` in what the terminal showed after `start`.
     ///
     /// This and the call below it are the mechanism the checked command API and the display
