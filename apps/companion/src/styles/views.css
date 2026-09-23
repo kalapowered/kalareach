@@ -460,6 +460,20 @@
   transition: none;
 }
 
+/*
+ * The bundled terminal stylesheet fades the scrollbar in over 100 ms and out over 800 ms. Here it
+ * shows and hides at once, with reduced motion or without, like the rest of the terminal. Each rule
+ * repeats one of that stylesheet's selectors exactly, so it reaches every element the fade does,
+ * and it is important because that stylesheet may come later in the bundle than this one.
+ */
+.xterm .xterm-scrollable-element > .visible {
+  transition: none !important;
+}
+
+.xterm .xterm-scrollable-element > .invisible.fade {
+  transition: none !important;
+}
+
 .terminal-footer {
   padding: 12px 16px;
   border-top: 1px solid var(--line);
