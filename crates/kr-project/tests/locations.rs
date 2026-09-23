@@ -38,9 +38,9 @@ use kr_protocol::project::{
     LocationAuthorisation, LocationPurpose, LocationState, OperationState, ProjectAdoptParams,
     ProjectCloneParams, ProjectCloneResult, ProjectLocationAttachParams,
     ProjectLocationAttachResult, ProjectLocationAuthoriseParams, ProjectLocationListParams,
-    ProjectLocationWithdrawParams, RemoteSpecification, RemoteTransport, RetentionPolicy,
-    WorkspaceCreateParams, WorkspaceCreateResult, WorkspaceKind, WorkspaceListParams,
-    WorkspaceRemoveParams, WorkspaceState,
+    ProjectLocationWithdrawParams, ProjectOperationCancelParams, RemoteSpecification,
+    RemoteTransport, RetentionPolicy, WorkspaceCreateParams, WorkspaceCreateResult, WorkspaceKind,
+    WorkspaceListParams, WorkspaceRemoveParams, WorkspaceState,
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Nullable, Uuid};
@@ -1677,6 +1677,7 @@ fn an_owner_clone_and_materialisation_succeed_through_a_location() {
             &WorkspaceRemoveParams {
                 workspace_id: made.workspace_id,
                 retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable(None),
             },
             Some(&action("workspace.remove", 107)),
         )
@@ -1800,6 +1801,232 @@ fn an_owner_operation_after_withdrawal_does_not_begin() {
         126,
     )
     .expect("an active location still reaches");
+}
+
+#[test]
+fn withdrawal_survives_a_restart_and_owner_cleanup_works() {
+    // A workspace and an operation are left behind by locations the owner withdrew. The withdrawal
+    // outlives a restart, and nothing is reached through a withdrawn location or by a recorded
+    // path. The owner authorises new locations over the same directories and names them: the
+    // workspace is removed through one, its tree's recorded identity still proving it is the one
+    // this host made, and so is the staging directory it recorded; the operation's staging
+    // directory goes through the other, and its outcome stays. A caller bounded by a grant that
+    // names a location is refused, so a withdrawal stays withdrawn for every device.
+    let mut fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let sources = fixture.work().join("sources");
+    let projects = fixture.work().join("projects");
+    let workspaces = fixture.work().join("workspaces");
+    let source = owner_location(&fixture, &owner, &sources, LocationPurpose::Source, 60);
+    let into = owner_location(
+        &fixture,
+        &owner,
+        &projects,
+        LocationPurpose::Destination,
+        61,
+    );
+    let made_in = owner_location(
+        &fixture,
+        &owner,
+        &workspaces,
+        LocationPurpose::Destination,
+        62,
+    );
+    let project = adopt(&fixture, &sources, "repo", 63);
+    attach(fixture.service(), &owner, project, source, 64).expect("the repository is bound");
+    ordinary_repository(&sources, "upstream");
+    let made = workspace_through(
+        fixture.service(),
+        project,
+        through(environment, made_in, "feature"),
+        false,
+        65,
+    )
+    .expect("the workspace is made through a location")
+    .workspace
+    .0
+    .expect("a workspace, not a preview");
+    // The workspace recorded a staging directory its materialisation could not take away.
+    let leftover = workspaces.join(".kr-project-leftover");
+    support::staging_directory(&leftover);
+    let identity = std::fs::metadata(&leftover).expect("its metadata");
+    journal(&fixture)
+        .execute(
+            "UPDATE workspaces SET staging_name = ?2, staging_device = ?3, staging_file_id = ?4
+              WHERE workspace_id = ?1",
+            rusqlite::params![
+                bytes(made.workspace_id.get()),
+                ".kr-project-leftover",
+                std::os::unix::fs::MetadataExt::dev(&identity) as i64,
+                std::os::unix::fs::MetadataExt::ino(&identity) as i64,
+            ],
+        )
+        .expect("the staging directory is recorded with its identity");
+    // An operation whose destination goes while its clone runs keeps its staging directory.
+    withdrawing_during(&mut fixture, "git clone", into, 66, |fixture| {
+        clone_into(
+            fixture.service(),
+            through(environment, into, "interrupted"),
+            beneath(source, "upstream"),
+            67,
+        )
+    })
+    .expect_err("the operation stops at the withdrawal");
+    let kept = names_in(&projects);
+    assert_eq!(kept.len(), 1, "the staging directory is kept: {kept:?}");
+    withdraw(fixture.service(), made_in, 68);
+
+    // Neither withdrawn location reaches anything, before a restart or after one.
+    let remove = |through: Option<ProjectLocationId>| WorkspaceRemoveParams {
+        workspace_id: made.workspace_id,
+        retention: RetentionPolicy::RemoveRetained,
+        through_location_id: Nullable(through),
+    };
+    let refusal = fixture
+        .service()
+        .workspace_remove(&remove(None), Some(&action("workspace.remove", 69)))
+        .expect_err("the withdrawn location reaches nothing");
+    assert!(
+        refusal
+            .to_string()
+            .contains(&format!("location {made_in} is not active")),
+        "{refusal}"
+    );
+    let replacement = fixture.reopen();
+    replacement.recover().expect("recovery runs");
+    let listed = replacement
+        .project_location_list(&ProjectLocationListParams {
+            environment_id: environment,
+            grant_id: Nullable(None),
+        })
+        .expect("the locations list");
+    for (location, state) in [
+        (made_in, LocationState::Withdrawn),
+        (into, LocationState::Withdrawn),
+        (source, LocationState::Dormant),
+    ] {
+        let row = listed
+            .locations
+            .iter()
+            .find(|row| row.location_id == location)
+            .expect("the location is listed");
+        assert_eq!(row.state, state, "{location}");
+    }
+    replacement
+        .workspace_remove(&remove(None), Some(&action("workspace.remove", 70)))
+        .expect_err("still withdrawn after the restart");
+    assert!(workspaces.join("feature/src/lib.rs").is_file());
+    assert!(leftover.join("tree").is_dir());
+
+    // The owner authorises the two directories again, as new locations.
+    let again_workspaces = support::authorise_location(
+        &replacement,
+        &owner,
+        &workspaces,
+        LocationPurpose::Destination,
+        71,
+    );
+    let again_projects = support::authorise_location(
+        &replacement,
+        &owner,
+        &projects,
+        LocationPurpose::Destination,
+        72,
+    );
+    // A caller bounded by a grant names no location, whatever it is.
+    let grant = GrantId::new(Uuid::from_bytes([0x51; 16]));
+    let bounded = action("workspace.remove", 73);
+    let refusal = replacement
+        .workspace_remove(
+            &remove(Some(again_workspaces)),
+            kr_project::store::Performed::from(Some(&bounded)).bounded_by(grant),
+        )
+        .expect_err("only the owner names a location");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    assert!(
+        refusal.to_string().contains("bounded by grant"),
+        "{refusal}"
+    );
+    // A location that does not contain the tree reaches nothing, and neither does a withdrawn one.
+    for (location, seed, why) in [
+        (again_projects, 74, "is not beneath the location"),
+        (made_in, 75, "is not active"),
+    ] {
+        let refusal = replacement
+            .workspace_remove(
+                &remove(Some(location)),
+                Some(&action("workspace.remove", seed)),
+            )
+            .expect_err("nothing is reached through it");
+        assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+        assert!(refusal.to_string().contains(why), "{refusal}");
+    }
+    assert!(workspaces.join("feature/src/lib.rs").is_file());
+
+    // Named by the owner, the new location reaches the workspace and its staging directory.
+    let removed = replacement
+        .workspace_remove(
+            &remove(Some(again_workspaces)),
+            Some(&action("workspace.remove", 76)),
+        )
+        .expect("the workspace is removed through the location the owner named");
+    assert!(removed.working_files_removed);
+    assert!(
+        removed
+            .workspace
+            .detail
+            .0
+            .as_deref()
+            .is_none_or(|detail| !detail.contains(".kr-project-leftover")),
+        "the staging directory is no longer named: {:?}",
+        removed.workspace.detail
+    );
+    support::assert_absent(&workspaces.join("feature"), "the removed workspace");
+    support::assert_absent(&leftover, "the workspace's staging directory");
+
+    // And the operation's staging directory goes through the other; its outcome stays.
+    let operation = ActionId::new(action("project.clone", 67).action_id);
+    let reconcile = |through: ProjectLocationId| ProjectOperationCancelParams {
+        operation_action_id: operation,
+        through_location_id: Nullable(Some(through)),
+    };
+    let refusal = replacement
+        .project_operation_cancel(
+            &actor(),
+            &reconcile(again_workspaces),
+            kr_project::store::Performed::default(),
+        )
+        .expect_err("that location does not contain the staging directory");
+    assert!(
+        refusal.to_string().contains("is not beneath the location"),
+        "{refusal}"
+    );
+    let refusal = replacement
+        .project_operation_cancel(
+            &actor(),
+            &reconcile(again_projects),
+            kr_project::store::Performed::from(Some(&action("project.operation.cancel", 77)))
+                .bounded_by(grant),
+        )
+        .expect_err("only the owner names a location");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    assert_eq!(names_in(&projects), kept);
+    let reconciled = replacement
+        .project_operation_cancel(
+            &actor(),
+            &reconcile(again_projects),
+            kr_project::store::Performed::default(),
+        )
+        .expect("the owner reconciles the operation through the location");
+    assert_eq!(reconciled.operation.state, OperationState::Failed);
+    assert!(
+        reconciled.operation.retained_staging_paths.is_empty(),
+        "{:?}",
+        reconciled.operation.retained_staging_paths
+    );
+    assert_eq!(reconciled.operation.removed_staging_paths.len(), 1);
+    assert!(names_in(&projects).is_empty(), "{:?}", names_in(&projects));
 }
 
 #[test]
@@ -3204,6 +3431,7 @@ fn recursive_removal_refuses_a_grafted_mount() {
                 &WorkspaceRemoveParams {
                     workspace_id: made.workspace_id,
                     retention: RetentionPolicy::RemoveRetained,
+                    through_location_id: Nullable(None),
                 },
                 Some(&action("workspace.remove", 235)),
             )

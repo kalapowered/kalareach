@@ -25,9 +25,10 @@ use kr_project::operation::STAGING_PREFIX;
 use kr_project::store::Performed;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::project::{
-    AdoptionFlow, CloneSource, DestinationState, OperationState, ProjectAdoptParams,
-    ProjectCloneParams, ProjectInitParams, ProjectListParams, ProjectOperationCancelParams,
-    ProjectOrigin, ProjectReadParams, ProjectState, RemoteSpecification, RemoteTransport,
+    AdoptionFlow, CloneSource, DestinationState, LocationPurpose, OperationState,
+    ProjectAdoptParams, ProjectCloneParams, ProjectInitParams, ProjectListParams,
+    ProjectOperationCancelParams, ProjectOrigin, ProjectReadParams, ProjectState,
+    RemoteSpecification, RemoteTransport,
 };
 use kr_protocol::scalars::Nullable;
 
@@ -1081,7 +1082,9 @@ fn a_cancellation_reaches_only_authorised_owned_work() {
             &stranger,
             &ProjectOperationCancelParams {
                 operation_action_id: created.operation.action_id,
+                through_location_id: Nullable(None),
             },
+            Performed::default(),
         )
         .expect_err("a cancellation reaches only authorised owned work");
     assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
@@ -1093,7 +1096,9 @@ fn a_cancellation_reaches_only_authorised_owned_work() {
             &actor(),
             &ProjectOperationCancelParams {
                 operation_action_id: created.operation.action_id,
+                through_location_id: Nullable(None),
             },
+            Performed::default(),
         )
         .expect("the owner's cancellation is answered from the record");
     assert_eq!(answered.operation.state, OperationState::Completed);
@@ -1109,7 +1114,9 @@ fn a_cancellation_reaches_only_authorised_owned_work() {
                 operation_action_id: kr_protocol::ids::ActionId::new(
                     kr_protocol::scalars::Uuid::from_bytes([200; 16]),
                 ),
+                through_location_id: Nullable(None),
             },
+            Performed::default(),
         )
         .expect_err("there is no such operation");
     assert_eq!(refusal.code(), ErrorCode::ResourceUnavailable);
@@ -2112,4 +2119,223 @@ fn a_publication_that_meets_a_taken_name_fails_and_takes_its_staging_away() {
     // And a replacement daemon finds nothing left to settle.
     let recovery = fixture.reopen().recover().expect("recovery runs");
     assert_eq!(recovery.unresolved, 0);
+}
+
+/// Clones `source` to `name` in the fixture's directory as the owner, and returns the operation.
+fn cloned(fixture: &Fixture, source: &Path, name: &str, seed: u8) -> ProjectCloneParams {
+    let params = ProjectCloneParams {
+        destination: destination(fixture.environment_id(), fixture.work(), name),
+        label: name.to_owned(),
+        source: CloneSource::Remote {
+            remote: RemoteSpecification {
+                remote_name: "origin".to_owned(),
+                transport: RemoteTransport::LocalPath,
+                url: source.display().to_string(),
+                provider: String::new(),
+                credential_broker: String::new(),
+            },
+        },
+    };
+    fixture
+        .service()
+        .project_clone(&actor(), &params, Some(&action("project.clone", seed)))
+        .expect("the clone completes");
+    params
+}
+
+/// The identity columns of one directory, as the journal holds them.
+fn identity_of(path: &Path) -> (i64, i64) {
+    let metadata = std::fs::metadata(path).expect("its metadata");
+    (
+        std::os::unix::fs::MetadataExt::dev(&metadata) as i64,
+        std::os::unix::fs::MetadataExt::ino(&metadata) as i64,
+    )
+}
+
+#[test]
+fn the_owner_reconciles_a_legacy_and_an_unknown_operation() {
+    // Three operations a recovery settled without reaching anything: one an earlier build wrote
+    // for another actor and no location, one whose publication was settled as unknown, and one
+    // whose staging directory's identity was never recorded. Each left its staging directory,
+    // and none is reached by a recorded path. The owner authorises a location over the directory
+    // they are in and names it: a staging directory this host can prove it made goes through the
+    // location's handle, one it cannot prove is kept and named, and no outcome changes.
+    let fixture = Fixture::create();
+    let owner = support::TestOwner::default();
+    let source = ordinary_repository(fixture.work(), "source");
+    cloned(&fixture, &source, "legacy", 80);
+    let published = cloned(&fixture, &source, "published", 81);
+    cloned(&fixture, &source, "unproven", 82);
+    let legacy = kr_protocol::ids::ActionId::new(action("project.clone", 80).action_id);
+    let unknown = kr_protocol::ids::ActionId::new(action("project.clone", 81).action_id);
+    let unproven = kr_protocol::ids::ActionId::new(action("project.clone", 82).action_id);
+    let journal = rusqlite::Connection::open(
+        kr_project::ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    let staging = |name: &str| fixture.work().join(format!("{STAGING_PREFIX}{name}"));
+    // An earlier build's row for another actor, which named no location, and the staging
+    // directory it made, with that directory's identity.
+    support::staging_directory(&staging("legacy"));
+    let (device, file) = identity_of(&staging("legacy"));
+    journal
+        .execute(
+            "UPDATE operations SET state = 'staging', ended_at_ms = NULL, staged_device = NULL,
+                    staged_file_id = NULL, staged_created_at_ms = NULL, staging_name = ?2,
+                    staging_device = ?3, staging_file_id = ?4, actor_id = 'local:earlier-build'
+              WHERE action_id = ?1",
+            rusqlite::params![
+                legacy.get().as_bytes().to_vec(),
+                format!("{STAGING_PREFIX}legacy"),
+                device,
+                file,
+            ],
+        )
+        .expect("the row is put back as an earlier build left it");
+    // A publication that landed while its daemon died, whose staging directory is still there.
+    let tree = OpenedRepository::open(
+        fixture.service().profile(),
+        fixture.environment_id(),
+        &fixture.work().join("published"),
+    )
+    .expect("the published repository opens")
+    .identity()
+    .work_tree;
+    support::staging_directory(&staging("published"));
+    let (device, file) = identity_of(&staging("published"));
+    journal
+        .execute(
+            "UPDATE operations SET state = 'publishing', ended_at_ms = NULL, staged_device = ?2,
+                    staged_file_id = ?3, staging_name = ?4, staging_device = ?5,
+                    staging_file_id = ?6
+              WHERE action_id = ?1",
+            rusqlite::params![
+                unknown.get().as_bytes().to_vec(),
+                tree.device as i64,
+                tree.file_id as i64,
+                format!("{STAGING_PREFIX}published"),
+                device,
+                file,
+            ],
+        )
+        .expect("the row is put back in publishing");
+    // A staging directory whose identity was never recorded.
+    support::staging_directory(&staging("unproven"));
+    journal
+        .execute(
+            "UPDATE operations SET state = 'staging', ended_at_ms = NULL, staged_device = NULL,
+                    staged_file_id = NULL, staged_created_at_ms = NULL, staging_name = ?2,
+                    staging_device = NULL, staging_file_id = NULL
+              WHERE action_id = ?1",
+            rusqlite::params![
+                unproven.get().as_bytes().to_vec(),
+                format!("{STAGING_PREFIX}unproven")
+            ],
+        )
+        .expect("the row names a staging directory and no identity");
+    for (id, actor_id) in [
+        (legacy, "local:earlier-build"),
+        (unknown, "local:test"),
+        (unproven, "local:test"),
+    ] {
+        journal
+            .execute(
+                "UPDATE actions SET result = NULL, error_code = NULL, error_detail = NULL,
+                        actor_id = ?2
+                  WHERE action_id = ?1",
+                rusqlite::params![id.get().as_bytes().to_vec(), actor_id],
+            )
+            .expect("the claim is open again");
+    }
+    drop(journal);
+
+    let replacement = fixture.reopen();
+    let recovery = replacement.recover().expect("recovery runs");
+    assert_eq!(recovery.unresolved, 3);
+    for name in ["legacy", "published", "unproven"] {
+        assert!(
+            staging(name).join("tree").is_dir(),
+            "recovery reached no staging directory"
+        );
+    }
+    let location = support::authorise_location(
+        &replacement,
+        &owner,
+        fixture.work(),
+        LocationPurpose::Destination,
+        83,
+    );
+    let reconcile = |operation, through| ProjectOperationCancelParams {
+        operation_action_id: operation,
+        through_location_id: Nullable(through),
+    };
+
+    // Another actor's operation is the owner's to reconcile only through a location it names, and
+    // a caller bounded by a grant names none.
+    let refusal = replacement
+        .project_operation_cancel(&actor(), &reconcile(legacy, None), Performed::default())
+        .expect_err("another actor's work is not stopped by name alone");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    let grant = kr_protocol::ids::GrantId::new(kr_protocol::scalars::Uuid::from_bytes([0x52; 16]));
+    let refusal = replacement
+        .project_operation_cancel(
+            &actor(),
+            &reconcile(legacy, Some(location)),
+            Performed::from(Some(&action("project.operation.cancel", 84))).bounded_by(grant),
+        )
+        .expect_err("only the owner names a location");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    assert!(staging("legacy").join("tree").is_dir());
+
+    // Through the location, each directory this host can prove it made goes, and the outcome each
+    // operation has stays: failed for the one that never published, unknown for the other.
+    for (operation, name, state) in [
+        (legacy, "legacy", OperationState::Failed),
+        (unknown, "published", OperationState::Unknown),
+    ] {
+        let reconciled = replacement
+            .project_operation_cancel(
+                &actor(),
+                &reconcile(operation, Some(location)),
+                Performed::default(),
+            )
+            .unwrap_or_else(|error| panic!("{name} is reconciled: {error}"));
+        assert_eq!(reconciled.operation.state, state, "{name}");
+        assert!(
+            reconciled
+                .operation
+                .removed_staging_paths
+                .iter()
+                .any(|path| path.ends_with(&format!("{STAGING_PREFIX}{name}"))),
+            "{name}: {:?}",
+            reconciled.operation.removed_staging_paths
+        );
+        assert!(
+            reconciled.operation.retained_staging_paths.is_empty(),
+            "{name}: {:?}",
+            reconciled.operation.retained_staging_paths
+        );
+        support::assert_absent(&staging(name), "a staging directory this host made");
+    }
+    // A reconciliation never implies that an ambiguous publication did not happen: what was
+    // published is untouched, and the action is still answered as an unknown outcome.
+    assert!(fixture.work().join("published/.git").is_dir());
+    let repeated = replacement
+        .project_clone(&actor(), &published, Some(&action("project.clone", 81)))
+        .expect_err("the repeat is answered from the unknown outcome");
+    assert_eq!(repeated.code(), ErrorCode::OutcomeUnknown);
+
+    // A directory whose identity was never recorded is not this host's to remove on its name.
+    let reconciled = replacement
+        .project_operation_cancel(
+            &actor(),
+            &reconcile(unproven, Some(location)),
+            Performed::default(),
+        )
+        .expect("the reconciliation answers");
+    assert_eq!(reconciled.operation.state, OperationState::Failed);
+    assert!(staging("unproven").join("tree").is_dir());
+    let detail = reconciled.operation.detail.0.expect("the record says why");
+    assert!(detail.contains("recorded no identity"), "{detail}");
 }

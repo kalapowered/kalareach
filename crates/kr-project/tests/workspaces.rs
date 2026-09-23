@@ -458,6 +458,7 @@ fn a_removal_is_refused_while_a_bound_session_is_live() {
             &WorkspaceRemoveParams {
                 workspace_id,
                 retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable(None),
             },
             Some(&action("workspace.remove", 10)),
         )
@@ -483,6 +484,7 @@ fn a_removal_is_refused_while_a_bound_session_is_live() {
             &WorkspaceRemoveParams {
                 workspace_id,
                 retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable(None),
             },
             Some(&action("workspace.remove", 11)),
         )
@@ -554,6 +556,7 @@ fn a_removal_keeps_dirty_content_a_pin_and_review_evidence_until_the_user_approv
             &WorkspaceRemoveParams {
                 workspace_id,
                 retention: RetentionPolicy::KeepEverything,
+                through_location_id: Nullable(None),
             },
             Some(&action("workspace.remove", 14)),
         )
@@ -574,6 +577,7 @@ fn a_removal_keeps_dirty_content_a_pin_and_review_evidence_until_the_user_approv
             &WorkspaceRemoveParams {
                 workspace_id,
                 retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable(None),
             },
             Some(&action("workspace.remove", 16)),
         )
@@ -619,6 +623,7 @@ fn a_shared_workspaces_removal_never_touches_the_users_tree() {
             &WorkspaceRemoveParams {
                 workspace_id,
                 retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable(None),
             },
             Some(&action("workspace.remove", 18)),
         )
@@ -823,6 +828,7 @@ fn a_workspace_record_its_pins_and_its_partial_progress_survive_the_daemons_deat
             &WorkspaceRemoveParams {
                 workspace_id: workspace.workspace_id,
                 retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable(None),
             },
             Some(&action("workspace.remove", 22)),
         )
@@ -836,6 +842,7 @@ fn a_workspace_record_its_pins_and_its_partial_progress_survive_the_daemons_deat
             &WorkspaceRemoveParams {
                 workspace_id: workspace.workspace_id,
                 retention: RetentionPolicy::KeepEverything,
+                through_location_id: Nullable(None),
             },
             Some(&action("workspace.remove", 23)),
         )
@@ -1259,6 +1266,7 @@ fn a_live_automation_run_refuses_a_removal_as_a_live_session_does() {
             &WorkspaceRemoveParams {
                 workspace_id,
                 retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable(None),
             },
             Some(&action("workspace.remove", 39)),
         )
@@ -1287,6 +1295,7 @@ fn a_live_automation_run_refuses_a_removal_as_a_live_session_does() {
             &WorkspaceRemoveParams {
                 workspace_id,
                 retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable(None),
             },
             Some(&action("workspace.remove", 40)),
         )
@@ -1343,6 +1352,7 @@ fn work_added_after_a_workspace_was_created_still_keeps_it() {
             &WorkspaceRemoveParams {
                 workspace_id,
                 retention: RetentionPolicy::KeepEverything,
+                through_location_id: Nullable(None),
             },
             Some(&action("workspace.remove", 42)),
         )
@@ -1396,6 +1406,7 @@ fn nothing_new_may_hold_a_workspace_once_its_removal_has_begun() {
             &WorkspaceRemoveParams {
                 workspace_id,
                 retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable(None),
             },
             Some(&action("workspace.remove", 44)),
         )
@@ -1477,6 +1488,7 @@ fn a_removal_this_host_cannot_prove_it_owns_is_refused() {
             &WorkspaceRemoveParams {
                 workspace_id,
                 retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable(None),
             },
             Some(&action("workspace.remove", 48)),
         )
@@ -1620,6 +1632,7 @@ fn a_workspace_this_host_cannot_inspect_is_kept_rather_than_removed() {
             &WorkspaceRemoveParams {
                 workspace_id,
                 retention: RetentionPolicy::KeepEverything,
+                through_location_id: Nullable(None),
             },
             Some(&action("workspace.remove", 53)),
         )
@@ -1683,6 +1696,7 @@ fn nothing_new_is_recorded_against_a_workspace_once_its_removal_has_begun() {
             &WorkspaceRemoveParams {
                 workspace_id,
                 retention: RetentionPolicy::KeepEverything,
+                through_location_id: Nullable(None),
             },
             Some(&action("workspace.remove", 56)),
         )
@@ -1817,6 +1831,7 @@ fn a_workspace_holding_a_populated_submodule_is_kept_rather_than_removed() {
     let params = WorkspaceRemoveParams {
         workspace_id,
         retention: RetentionPolicy::KeepEverything,
+        through_location_id: Nullable(None),
     };
     let answer = fixture
         .service()
@@ -2261,6 +2276,7 @@ fn a_removal_answer_rebuilt_by_recovery_comes_from_the_journal() {
     let params = WorkspaceRemoveParams {
         workspace_id,
         retention: RetentionPolicy::RemoveRetained,
+        through_location_id: Nullable(None),
     };
     let removed = fixture
         .service()
@@ -2571,6 +2587,7 @@ fn a_successful_answer_an_earlier_build_recorded_is_protected_before_a_repeat_re
     let params = WorkspaceRemoveParams {
         workspace_id,
         retention: RetentionPolicy::KeepEverything,
+        through_location_id: Nullable(None),
     };
     let answer = fixture
         .service()
@@ -2860,6 +2877,7 @@ fn a_grant_withdrawn_before_a_removal_reserves_leaves_the_workspace_and_its_tree
             &WorkspaceRemoveParams {
                 workspace_id,
                 retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable(None),
             },
             Performed::from(Some(&claimed)).admitted(&expired),
         )
@@ -2886,6 +2904,7 @@ fn a_grant_withdrawn_before_a_removal_reserves_leaves_the_workspace_and_its_tree
             &WorkspaceRemoveParams {
                 workspace_id,
                 retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable(None),
             },
             Some(&action("workspace.remove", 66)),
         )
@@ -2934,6 +2953,7 @@ fn source_permission_does_not_delete_an_outside_workspace() {
             &WorkspaceRemoveParams {
                 workspace_id: made.workspace_id,
                 retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable(None),
             },
             Performed::from(Some(&bounded)).bounded_by(grant),
         )
@@ -2960,6 +2980,7 @@ fn source_permission_does_not_delete_an_outside_workspace() {
             &WorkspaceRemoveParams {
                 workspace_id: made.workspace_id,
                 retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable(None),
             },
             Some(&action("workspace.remove", 42)),
         )

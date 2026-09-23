@@ -466,6 +466,7 @@ async fn every_project_and_workspace_method_runs_end_to_end_through_the_daemon()
                 &WorkspaceRemoveParams {
                     workspace_id: workspace.workspace_id,
                     retention: RetentionPolicy::RemoveRetained,
+                    through_location_id: Nullable(None),
                 },
             )
             .await
@@ -483,6 +484,7 @@ async fn every_project_and_workspace_method_runs_end_to_end_through_the_daemon()
                 ActionTarget::environment(host.environment_id),
                 &ProjectOperationCancelParams {
                     operation_action_id: cloned.operation.action_id,
+                    through_location_id: Nullable(None),
                 },
             )
             .await
@@ -770,6 +772,7 @@ async fn a_workspace_and_its_pins_survive_a_replacement_daemon() {
                 &WorkspaceRemoveParams {
                     workspace_id: workspace.workspace_id,
                     retention: RetentionPolicy::KeepEverything,
+                    through_location_id: Nullable(None),
                 },
             )
             .await
@@ -1056,6 +1059,7 @@ async fn a_daemon_killed_mid_clone_is_replaced_and_the_destination_is_untouched(
                 ActionTarget::environment(environment_id),
                 &ProjectOperationCancelParams {
                     operation_action_id: action,
+                    through_location_id: Nullable(None),
                 },
             )
             .await

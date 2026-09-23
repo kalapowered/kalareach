@@ -18315,10 +18315,22 @@
         "operation_action_id": {
           "$ref": "#/$defs/ActionId",
           "description": "The action that started the operation to cancel."
+        },
+        "through_location_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProjectLocationId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The location the owner reconciles the operation through, or null.\n\nOnly a caller on the host's own socket names one, and naming one reaches any operation in\nthe environment, whoever started it. It is an active destination location of the owner's\nthat contains the staging directory the operation recorded: that directory is taken away\nthrough the location's handle, and only while the object there is the one the host\nrecorded creating. It is how an operation that no handle reaches any more, because its\nlocation was withdrawn or it named none, is cleaned up. It changes no outcome the\noperation already has."
         }
       },
       "required": [
-        "operation_action_id"
+        "operation_action_id",
+        "through_location_id"
       ],
       "type": "object"
     },
@@ -28937,6 +28949,17 @@
           "$ref": "#/$defs/RetentionPolicy",
           "description": "What the removal does with what the workspace holds."
         },
+        "through_location_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProjectLocationId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The location the owner removes the workspace through, or null for the one it was made\nthrough.\n\nOnly a caller on the host's own socket names one: an active destination location of the\nowner's that contains the workspace's working tree. The tree is found beneath its handle\nand removed only while it is the object the host recorded creating, under the same\nretention rules, and so is the staging directory the workspace recorded. It is how a\nworkspace whose location was withdrawn, or that named none, is removed."
+        },
         "workspace_id": {
           "$ref": "#/$defs/WorkspaceId",
           "description": "The workspace to remove."
@@ -28944,7 +28967,8 @@
       },
       "required": [
         "workspace_id",
-        "retention"
+        "retention",
+        "through_location_id"
       ],
       "type": "object"
     },

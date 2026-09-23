@@ -1066,6 +1066,85 @@ pub fn submission(method: &str, seed: u8, proven: bool) -> kr_project::store::Ac
     }
 }
 
+/// Authorises one directory as the owner's location for one purpose, end to end: the first
+/// submission is answered with a challenge, and the same action carrying the owner's proof
+/// authorises it.
+///
+/// # Panics
+///
+/// Panics when the directory cannot be made or either submission is not answered as expected.
+pub fn authorise_location(
+    service: &ProjectService,
+    owner: &TestOwner,
+    root: &Path,
+    purpose: kr_protocol::project::LocationPurpose,
+    seed: u8,
+) -> kr_protocol::ids::ProjectLocationId {
+    use kr_protocol::project::{LocationAuthorisation, ProjectLocationAuthoriseParams};
+    use kr_protocol::scalars::Nullable;
+
+    std::fs::create_dir_all(root).expect("a directory to authorise");
+    let params = ProjectLocationAuthoriseParams {
+        location_id: Nullable(None),
+        environment_id: service.environment_id(),
+        grant_id: Nullable(None),
+        purpose,
+        label: "a place the owner chose".to_owned(),
+        path: root.display().to_string(),
+        owner_confirmation: Nullable(None),
+    };
+    let first = service
+        .project_location_authorise(
+            &actor(),
+            &params,
+            Some(&submission("project.location.authorise", seed, false)),
+            Some(owner),
+        )
+        .expect("the first submission is answered");
+    let LocationAuthorisation::ConfirmationRequired { request } = first.outcome else {
+        panic!("a first submission with no proof authorises nothing");
+    };
+    let proven = ProjectLocationAuthoriseParams {
+        owner_confirmation: Nullable(Some(sign(&request))),
+        ..params
+    };
+    match service
+        .project_location_authorise(
+            &actor(),
+            &proven,
+            Some(&submission("project.location.authorise", seed, true)),
+            Some(owner),
+        )
+        .expect("the confirmed authorisation succeeds")
+        .outcome
+    {
+        LocationAuthorisation::Authorised { location } => location.location_id,
+        LocationAuthorisation::ConfirmationRequired { .. } => {
+            panic!("a submission carrying a proof is not answered with another challenge")
+        }
+    }
+}
+
+/// Withdraws one location as the owner.
+///
+/// # Panics
+///
+/// Panics when the withdrawal is refused.
+pub fn withdraw_location(
+    service: &ProjectService,
+    location: kr_protocol::ids::ProjectLocationId,
+    seed: u8,
+) {
+    service
+        .project_location_withdraw(
+            &kr_protocol::project::ProjectLocationWithdrawParams {
+                location_id: location,
+            },
+            Some(&action("project.location.withdraw", seed)),
+        )
+        .expect("the owner withdraws the location");
+}
+
 /// Returns the kinds of every event the outbox of one environment's journal holds, in order.
 ///
 /// Read from the file rather than through the service, because what is being established is what

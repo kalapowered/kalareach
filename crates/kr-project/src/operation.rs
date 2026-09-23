@@ -497,38 +497,7 @@ impl StagingSibling {
     pub fn remove(self, destination: &Destination, expected: ObjectIdentity) -> Result<()> {
         // A removal beneath a location is an effect through it, asked for once, before anything.
         let parent = destination.reach()?;
-        let path = crate::git::redact(&self.path.display().to_string());
-        if self.directory.identity() != expected {
-            return Err(ProjectError::IdentityChanged {
-                detail: format!(
-                    "this operation staged its content in {expected} and {path} now holds {}; \
-                     nothing is removed",
-                    self.directory.identity()
-                )
-                .into(),
-            });
-        }
-        self.directory
-            .check_privacy(Privacy::Exclusive)
-            .map_err(|refusal| ProjectError::Destination {
-                detail: format!(
-                    "{path} is not a directory only this account can change, so this host cannot \
-                     show that what is in it is only what it staged; nothing is removed: {}",
-                    crate::git::redact(&refusal.to_string())
-                )
-                .into(),
-            })?;
-        parent
-            .remove_tree(&self.name, self.directory)
-            .map_err(|refusal| ProjectError::Destination {
-                detail: format!(
-                    "{path} was not removed: {}",
-                    crate::git::redact(&refusal.to_string())
-                )
-                .into(),
-            })?;
-        parent.sync()?;
-        Ok(())
+        remove_staging_directory(parent, &self.name, self.directory, expected, &self.path)
     }
 
     /// Removes the sibling as [`Self::remove`] does, and says what that left.
@@ -547,6 +516,64 @@ impl StagingSibling {
             Err(refusal) => Cleanup::Kept(refusal.to_string()),
         }
     }
+}
+
+/// Removes one staging directory and everything in it through its parent's handle, when it is the
+/// directory this host recorded and still one only this account can change.
+///
+/// `directory` is the handle opened at `name` beneath `parent`, and the caller has been admitted to
+/// `parent` for this one removal. A recorded name is not authority to remove whatever holds it
+/// now, so the handle has to be the object whose identity was recorded; the rest is asked of that
+/// same handle: this account owns the directory, its mode admits nobody else, and on Apple
+/// platforms it carries no access-control list. The contents go through handles the removal holds
+/// rather than a path, and the directory's own name goes last, only while it still holds this
+/// directory and only once it is empty.
+///
+/// # Errors
+///
+/// Returns [`ProjectError::IdentityChanged`] when the directory is not the recorded object, or
+/// [`ProjectError::Destination`] when it is not a directory only this account can change or the
+/// removal stopped. A removal that stopped names where, and what it removed before then stays
+/// removed.
+pub(crate) fn remove_staging_directory(
+    parent: &AuthorisedDirectory,
+    name: &RelativeName,
+    directory: AuthorisedDirectory,
+    expected: ObjectIdentity,
+    shown: &Path,
+) -> Result<()> {
+    let path = crate::git::redact(&shown.display().to_string());
+    if directory.identity() != expected {
+        return Err(ProjectError::IdentityChanged {
+            detail: format!(
+                "this operation staged its content in {expected} and {path} now holds {}; nothing \
+                 is removed",
+                directory.identity()
+            )
+            .into(),
+        });
+    }
+    directory
+        .check_privacy(Privacy::Exclusive)
+        .map_err(|refusal| ProjectError::Destination {
+            detail: format!(
+                "{path} is not a directory only this account can change, so this host cannot show \
+                 that what is in it is only what it staged; nothing is removed: {}",
+                crate::git::redact(&refusal.to_string())
+            )
+            .into(),
+        })?;
+    parent
+        .remove_tree(name, directory)
+        .map_err(|refusal| ProjectError::Destination {
+            detail: format!(
+                "{path} was not removed: {}",
+                crate::git::redact(&refusal.to_string())
+            )
+            .into(),
+        })?;
+    parent.sync()?;
+    Ok(())
 }
 
 /// What the cleanup of one staging directory left.

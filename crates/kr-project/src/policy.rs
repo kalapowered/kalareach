@@ -990,18 +990,22 @@ fn location_rights() -> CanonicalSet<ActionRight> {
     LOCATION_RIGHTS.into_iter().collect()
 }
 
-/// Returns the name a recorded working tree has beneath a location's recorded path.
+/// Returns the name a recorded path has beneath a location's recorded path.
 ///
 /// Both are the paths this host recorded, and the comparison is of their components, which is all
 /// a name needs: the name is then resolved from the held handle, one component at a time, and the
-/// object that descent produces is what decides. A working tree that is not beneath the location,
-/// or that is the location itself, has no such name.
-fn relative_beneath(location: &str, recorded: &str) -> Result<RelativeName> {
+/// object that descent produces is what decides. A path that is not beneath the location, or that
+/// is the location itself, has no such name. `subject` says what the path is, for the refusal.
+pub(crate) fn relative_beneath(
+    location: &str,
+    recorded: &str,
+    subject: &str,
+) -> Result<RelativeName> {
     let beneath = Path::new(recorded)
         .strip_prefix(Path::new(location))
         .map_err(|_| ProjectError::PermissionDenied {
             detail: format!(
-                "the repository at {} is not beneath the location at {}",
+                "{subject} at {} is not beneath the location at {}",
                 crate::git::redact(recorded),
                 crate::git::redact(location)
             )
@@ -1012,16 +1016,16 @@ fn relative_beneath(location: &str, recorded: &str) -> Result<RelativeName> {
         match component {
             Component::Normal(name) => components.push(name.to_str().ok_or_else(|| {
                 ProjectError::PermissionDenied {
-                    detail: "the repository's recorded path is not text this host can name"
-                        .to_owned()
-                        .into(),
+                    detail: format!(
+                        "the recorded path of {subject} is not text this host can name"
+                    )
+                    .into(),
                 }
             })?),
             _ => {
                 return Err(ProjectError::PermissionDenied {
                     detail: format!(
-                        "the repository at {} is not named beneath the location by ordinary \
-                         names",
+                        "{subject} at {} is not named beneath the location by ordinary names",
                         crate::git::redact(recorded)
                     )
                     .into(),
@@ -1031,10 +1035,11 @@ fn relative_beneath(location: &str, recorded: &str) -> Result<RelativeName> {
     }
     if components.is_empty() {
         return Err(ProjectError::PermissionDenied {
-            detail: "the location is the repository's own working tree; a source location is \
-                     authorised over the directory the repository is in"
-                .to_owned()
-                .into(),
+            detail: format!(
+                "the location is {subject} itself; a location is authorised over the directory \
+                 {subject} is in"
+            )
+            .into(),
         });
     }
     Ok(RelativeName::parse(&components.join("/"))?)
@@ -1554,7 +1559,7 @@ impl ProjectService {
                 admitting: Admitting::OwnerDecision,
             },
         )?;
-        let relative = relative_beneath(&held.row.path, &project.display_path)?;
+        let relative = relative_beneath(&held.row.path, &project.display_path, "the repository")?;
         let tree = held.handle.subdirectory(&relative)?;
         if tree.identity() != project.identity.work_tree {
             return Err(ProjectError::IdentityChanged {
@@ -1746,9 +1751,11 @@ mod tests {
 
     #[test]
     fn a_working_tree_is_named_beneath_a_location_by_its_components_alone() {
-        let name = relative_beneath("/srv/projects", "/srv/projects/team/repo").expect("beneath");
+        let name = relative_beneath("/srv/projects", "/srv/projects/team/repo", "the repository")
+            .expect("beneath");
         assert_eq!(name.as_str(), "team/repo");
-        let name = relative_beneath("/srv/projects/", "/srv/projects/repo").expect("beneath");
+        let name = relative_beneath("/srv/projects/", "/srv/projects/repo", "the repository")
+            .expect("beneath");
         assert_eq!(name.as_str(), "repo");
         for (location, recorded) in [
             ("/srv/projects", "/srv/other/repo"),
@@ -1758,7 +1765,7 @@ mod tests {
             ("/srv/projects", "relative/repo"),
         ] {
             assert!(
-                relative_beneath(location, recorded).is_err(),
+                relative_beneath(location, recorded, "the repository").is_err(),
                 "{recorded} is not named beneath {location}"
             );
         }

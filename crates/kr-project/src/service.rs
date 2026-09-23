@@ -47,8 +47,8 @@ use crate::git::ReadAdmission;
 use crate::git::{Cancellation, GitRequest, RestrictedProfile};
 use crate::identity::{OpenedRepository, wire_identity};
 use crate::operation::{
-    Cleanup, Destination, Reconciliation, STAGED_TREE, StagedWitness, StagingSibling, publish,
-    reconcile, stage_clone, stage_init,
+    Cleanup, Destination, Reconciliation, STAGED_TREE, STAGING_PREFIX, StagedWitness,
+    StagingSibling, publish, reconcile, remove_staging_directory, stage_clone, stage_init,
 };
 use crate::policy::{Admitting, HeldLocation, LocationUse};
 use crate::store::{
@@ -1824,17 +1824,42 @@ impl ProjectService {
         })
     }
 
-    /// Serves `project.operation.cancel`: stops owned subprocesses and reports the staging paths.
+    /// Serves `project.operation.cancel`: stops owned subprocesses and reports the staging paths,
+    /// and is the owner's route to reconciling an operation no handle reaches any more.
+    ///
+    /// Its actor rule has two halves. Without a location, a cancellation reaches only the caller's
+    /// own operations, whoever the caller is. A location may be named only by a caller that holds
+    /// no grant, which is the owner on this machine's own socket; naming one reaches any operation
+    /// in this environment, whoever started it, because it is how the owner reaches an operation a
+    /// device or an earlier build left. The operation is cancelled if it is still running, and once
+    /// it has ended the staging directory it recorded is taken away through the location's handle
+    /// when the object there is the one this host recorded creating, or kept and named with the
+    /// reason. What the operation's outcome was, and what its action was answered with, stay.
     ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::UnknownOperation`] when there is no such operation, or
-    /// [`ProjectError::PermissionDenied`] when it belongs to another actor.
-    pub fn project_operation_cancel(
+    /// Returns [`ProjectError::UnknownOperation`] when there is no such operation,
+    /// [`ProjectError::PermissionDenied`] when it belongs to another actor and no location is
+    /// named, when a caller bounded by a grant names one, or when the location does not admit the
+    /// owner's reconciliation or does not contain the operation's staging directory, and
+    /// [`ProjectError::WrongState`] when a named location meets an operation that has not ended.
+    pub fn project_operation_cancel<'a>(
         &self,
         actor: &ActorId,
         params: &ProjectOperationCancelParams,
+        performed: impl Into<Performed<'a>>,
     ) -> Result<ProjectOperationCancelResult> {
+        let performed = performed.into();
+        let through = params.through_location_id.0;
+        if let (Some(grant), Some(_)) = (performed.grant(), through) {
+            return Err(ProjectError::PermissionDenied {
+                detail: format!(
+                    "a caller bounded by grant {grant} names no location to reconcile an operation \
+                     through; only the owner reconciles through one"
+                )
+                .into(),
+            });
+        }
         let row = self
             .locked()?
             .operation(params.operation_action_id)?
@@ -1842,8 +1867,9 @@ impl ProjectService {
                 operation: params.operation_action_id.to_string().into(),
             })?;
         // Section 23 puts this method under the resource owner's authority, and the resource is
-        // the operation. An operation another actor started is not this caller's to stop.
-        if &row.actor_id != actor {
+        // the operation. An operation another actor started is not this caller's to stop, unless
+        // the caller is the owner naming a location to reconcile it through.
+        if through.is_none() && &row.actor_id != actor {
             return Err(ProjectError::PermissionDenied {
                 detail: format!(
                     "operation {} belongs to another actor, and a cancellation reaches only \
@@ -1852,6 +1878,16 @@ impl ProjectService {
                 )
                 .into(),
             });
+        }
+        // A named location is admitted, and has to contain the directory the operation worked in,
+        // before anything is done: one that cannot serve the reconciliation refuses the whole
+        // request with no effect.
+        if let Some(location_id) = through {
+            self.recorded_reach(
+                location_id,
+                &Path::new(&row.parent_path).join(&row.destination_name),
+                "the operation's destination",
+            )?;
         }
         let flag = self
             .running
@@ -1862,37 +1898,181 @@ impl ProjectService {
             flag.request();
         }
         // A cancellation of work that is not running is the record's own answer: a completed
-        // operation is not undone, and a failed one is not reopened.
-        if !matches!(
+        // operation is not undone, and a failed one is not reopened. For work that is running,
+        // the thread performing it observes the flag, ends the child it started and records the
+        // failure. Waiting for it here is what makes the reported staging paths the ones that are
+        // really there.
+        if matches!(
             row.state,
             OperationState::Staging | OperationState::Publishing
         ) {
-            return Ok(ProjectOperationCancelResult {
-                operation: self.read_operation(row.action_id)?,
-                stopped_processes: U64::new(0),
-            });
-        }
-        // The thread performing the operation observes the flag, ends the child it started and
-        // records the failure. Waiting for it here is what makes the reported staging paths the
-        // ones that are really there.
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            let current = self.locked()?.operation(row.action_id)?;
-            let settled = current.is_some_and(|current| {
-                !matches!(
-                    current.state,
-                    OperationState::Staging | OperationState::Publishing
-                )
-            });
-            if settled || std::time::Instant::now() >= deadline {
-                break;
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let current = self.locked()?.operation(row.action_id)?;
+                let settled = current.is_some_and(|current| {
+                    !matches!(
+                        current.state,
+                        OperationState::Staging | OperationState::Publishing
+                    )
+                });
+                if settled || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
             }
-            std::thread::sleep(Duration::from_millis(10));
+        }
+        if let Some(location_id) = through {
+            let current = self.locked()?.operation(row.action_id)?.ok_or_else(|| {
+                ProjectError::UnknownOperation {
+                    operation: row.action_id.to_string().into(),
+                }
+            })?;
+            self.reconcile_staging(&current, location_id)?;
         }
         Ok(ProjectOperationCancelResult {
             operation: self.read_operation(row.action_id)?,
             stopped_processes: U64::new(flag.map_or(0, |flag| flag.stopped())),
         })
+    }
+
+    /// Takes away, through a location the owner named, the staging directory an ended operation
+    /// recorded, and records what that left.
+    ///
+    /// Only what the row's recorded identity proves this host created goes: a directory whose
+    /// identity is not the recorded one, or one that recorded none, is kept and named with the
+    /// reason, and so is one a removal could not finish. A directory a cleanup already recorded as
+    /// removed is not looked for again. Nothing about the operation's outcome changes.
+    fn reconcile_staging(&self, row: &OperationRow, location_id: ProjectLocationId) -> Result<()> {
+        if matches!(
+            row.state,
+            OperationState::Staging | OperationState::Publishing
+        ) {
+            return Err(ProjectError::WrongState {
+                detail: format!(
+                    "operation {} has not ended, so the staging directory it recorded may still be \
+                     in use and is not reconciled; ask again once it has ended",
+                    row.action_id
+                )
+                .into(),
+            });
+        }
+        let Some(name) = row.staging_name.as_deref() else {
+            return Ok(());
+        };
+        let shown = Path::new(&row.parent_path).join(name);
+        let path = shown.display().to_string();
+        let removed = self
+            .locked()?
+            .staging_paths(row.action_id)?
+            .into_iter()
+            .any(|recorded| recorded.path == path && recorded.removed);
+        if removed {
+            return Ok(());
+        }
+        let reach = self.recorded_reach(location_id, &shown, "the staging directory")?;
+        let cleanup = self.remove_recorded_staging(&reach, row.staging_identity, &shown);
+        self.writable()?
+            .record_staging_path(row.action_id, &path, cleanup.gone(), cleanup.why())
+    }
+
+    /// Admits a location for the owner's reconciliation: an active destination of the owner's in
+    /// this environment.
+    fn owner_destination(
+        &self,
+        location_id: ProjectLocationId,
+    ) -> Result<(Arc<HeldLocation>, LocationUse)> {
+        let wanted = LocationUse {
+            purpose: LocationPurpose::Destination,
+            environment_id: self.environment_id,
+            admitting: Admitting::Caller(None),
+        };
+        Ok((self.locations().admit(location_id, &wanted)?, wanted))
+    }
+
+    /// Reaches a path an earlier operation or workspace recorded, through a location the owner
+    /// names that contains it.
+    ///
+    /// The path's name beneath the location is taken from the two recorded paths, and it is
+    /// resolved from the held handle, with the location asked first, before every read and every
+    /// effect: what decides is the object that descent reaches and the identity the row recorded
+    /// for it, never the path.
+    fn recorded_reach(
+        &self,
+        location_id: ProjectLocationId,
+        recorded: &Path,
+        subject: &str,
+    ) -> Result<TreeReach> {
+        let (held, wanted) = self.owner_destination(location_id)?;
+        let relative = crate::policy::relative_beneath(
+            &held.row().path,
+            &recorded.display().to_string(),
+            subject,
+        )?;
+        let admission = self
+            .locations()
+            .read_admission(vec![(Arc::clone(&held), wanted)]);
+        Ok(TreeReach {
+            through: Some((held, relative)),
+            admission,
+        })
+    }
+
+    /// Removes a staging directory an earlier operation or workspace recorded, through the
+    /// location that reaches it, and says what that left.
+    ///
+    /// One effect through the location, asked for once before it starts. The directory has to be
+    /// one this host names its staging directories by, it has to be the object whose identity the
+    /// row recorded, and it has to be one only this account can change; anything else is kept and
+    /// named with the reason. A name nothing holds is gone, whoever freed it.
+    fn remove_recorded_staging(
+        &self,
+        reach: &TreeReach,
+        expected: Option<ObjectIdentity>,
+        shown: &Path,
+    ) -> Cleanup {
+        let Some((held, relative)) = &reach.through else {
+            return Cleanup::Kept(unreachable_reason(None));
+        };
+        if let Some(admission) = &reach.admission
+            && let Err(refusal) = admission.admit()
+        {
+            return Cleanup::Kept(format!("{refusal}; nothing is removed through it"));
+        }
+        let (above, leaf) = match split_last(relative) {
+            Ok(split) => split,
+            Err(refusal) => return Cleanup::Kept(refusal.to_string()),
+        };
+        if !leaf.as_str().starts_with(STAGING_PREFIX) {
+            return Cleanup::Kept(format!(
+                "{} is not a name this host gives a staging directory, so it is not removed",
+                crate::git::redact(leaf.as_str())
+            ));
+        }
+        let parent = match above {
+            None => held.handle().try_clone(),
+            Some(above) => held.handle().subdirectory(&above),
+        };
+        let parent = match parent {
+            Ok(parent) => parent,
+            Err(kr_transfer::Escape::NotFound { .. }) => return Cleanup::Absent,
+            Err(refusal) => return Cleanup::Kept(ProjectError::from(refusal).to_string()),
+        };
+        let directory = match parent.subdirectory(&leaf) {
+            Ok(directory) => directory,
+            Err(kr_transfer::Escape::NotFound { .. }) => return Cleanup::Absent,
+            Err(refusal) => return Cleanup::Kept(ProjectError::from(refusal).to_string()),
+        };
+        let Some(expected) = expected else {
+            return Cleanup::Kept(
+                "this host recorded no identity for it, so nothing proves it is the directory this \
+                 host created, and it is not removed"
+                    .to_owned(),
+            );
+        };
+        match remove_staging_directory(&parent, &leaf, directory, expected, shown) {
+            Ok(()) => Cleanup::Removed,
+            Err(refusal) => Cleanup::Kept(refusal.to_string()),
+        }
     }
 
     // ----- workspaces -----------------------------------------------------------------------
@@ -2449,29 +2629,56 @@ impl ProjectService {
         {
             return Ok(answered);
         }
-        // A workspace created through a location is reached through that location, admitted for
-        // this caller, and through nothing else; a location that is dormant or withdrawn refuses
-        // the removal here, before anything is reserved.
-        let recorded = self.locked()?.workspace(params.workspace_id)?;
-        // A workspace made through no location is reached through none, whatever authority a
-        // caller holds over the repository it is a copy of: only the owner reaches it, by the path
-        // it was made at.
-        if let Some(grant) = performed.grant()
-            && recorded.as_ref().is_some_and(|row| row.located.is_none())
-        {
+        // Naming a location to remove a workspace through is the owner's route, and only the owner
+        // takes it: withdrawal stays withdrawn for every device.
+        if let (Some(grant), Some(_)) = (performed.grant(), params.through_location_id.0) {
             return Err(ProjectError::PermissionDenied {
                 detail: format!(
-                    "workspace {} was made through no location, so a caller bounded by grant \
-                     {grant} reaches it through none",
-                    params.workspace_id
+                    "a caller bounded by grant {grant} names no location to remove a workspace \
+                     through; only the owner removes one through a location it names"
                 )
                 .into(),
             });
         }
-        let reach = self.tree_reach(
-            recorded.as_ref().and_then(|row| row.located.as_ref()),
-            Admitting::Caller(performed.grant()),
-        )?;
+        let recorded = self.locked()?.workspace(params.workspace_id)?;
+        let reach = match params.through_location_id.0 {
+            // The owner's route to a workspace whose location was withdrawn, or that recorded
+            // none: a location of the owner's that contains the tree, admitted before anything is
+            // reserved. The tree is found beneath it by name and removed only while it is the
+            // object this host recorded creating.
+            Some(location_id) => {
+                let row = recorded
+                    .as_ref()
+                    .ok_or_else(|| ProjectError::UnknownWorkspace {
+                        workspace: params.workspace_id.to_string().into(),
+                    })?;
+                self.recorded_reach(location_id, Path::new(&row.display_path), "the workspace")?
+            }
+            None => {
+                // A workspace made through no location is reached through none, whatever
+                // authority a caller holds over the repository it is a copy of: only the owner
+                // reaches it, by the path it was made at.
+                if let Some(grant) = performed.grant()
+                    && recorded.as_ref().is_some_and(|row| row.located.is_none())
+                {
+                    return Err(ProjectError::PermissionDenied {
+                        detail: format!(
+                            "workspace {} was made through no location, so a caller bounded by \
+                             grant {grant} reaches it through none",
+                            params.workspace_id
+                        )
+                        .into(),
+                    });
+                }
+                // A workspace created through a location is reached through that location,
+                // admitted for this caller, and through nothing else; a location that is dormant
+                // or withdrawn refuses the removal here, before anything is reserved.
+                self.tree_reach(
+                    recorded.as_ref().and_then(|row| row.located.as_ref()),
+                    Admitting::Caller(performed.grant()),
+                )?
+            }
+        };
         // The claim, the holder count and the reservation are one transaction, and they come
         // first. From this moment nothing new may hold the workspace and nothing new may be
         // recorded against it, so the measurement below and the decision after it see a workspace
@@ -2679,12 +2886,42 @@ impl ProjectService {
             // the approval is a second request carrying the other policy.
             return Ok(self.tree_gone(row, reach));
         }
+        // A staging directory the workspace recorded is this host's own and beside the tree. A
+        // removal that reaches the tree through a location takes it away through the same
+        // handle when its recorded identity proves it, or keeps it and says why.
+        if row.staging_name.is_some() && reach.through.is_some() {
+            self.remove_workspace_staging(row, reach);
+        }
         self.remove_working_tree(row, reach)?;
         self.writable()?
             .finish_removal(row.workspace_id, retention, self.clock.now_ms())?;
         // What the result says is what is true of the tree now, whether this call removed it or
         // found it already gone.
         Ok(self.tree_gone(row, reach))
+    }
+
+    /// Takes away the staging directory a workspace recorded, beside its tree, through the
+    /// location the removal reaches the tree through, and records what that left: the name
+    /// forgotten once the directory is gone, or kept with the reason.
+    ///
+    /// Recording the note is cleanup too, so a journal that refuses it changes nothing else.
+    fn remove_workspace_staging(&self, row: &WorkspaceRow, reach: &TreeReach) {
+        let Some(name) = row.staging_name.as_deref() else {
+            return;
+        };
+        let shown = PathBuf::from(workspace_staging_path(row));
+        let cleanup = match reach.beside(name) {
+            Ok(beside) => self.remove_recorded_staging(&beside, row.staging_identity, &shown),
+            Err(refusal) => Cleanup::Kept(refusal.to_string()),
+        };
+        let _ = match cleanup.why() {
+            None => self
+                .writable()
+                .and_then(|mut store| store.clear_workspace_staging(row.workspace_id)),
+            Some(why) => self
+                .writable()
+                .and_then(|mut store| store.keep_workspace_staging(row.workspace_id, why)),
+        };
     }
 
     /// Returns how a removal reaches a workspace's tree.
@@ -2820,12 +3057,24 @@ impl ProjectService {
             });
         };
         let (parent, name) = match &reach.through {
-            // Through the location, and asked for immediately before it starts.
-            Some((held, name)) => {
+            // Through the location, and asked for immediately before it starts. The tree's name
+            // beneath the location can have several components, and a removal takes one entry
+            // out of the directory that holds it, so that directory is found first.
+            Some((held, relative)) => {
                 if let Some(admission) = &reach.admission {
                     admission.admit()?;
                 }
-                (held.handle().try_clone()?, name.clone())
+                let (above, leaf) = split_last(relative)?;
+                let parent = match above {
+                    None => held.handle().try_clone()?,
+                    Some(above) => match held.handle().subdirectory(&above) {
+                        Ok(parent) => parent,
+                        // The directory the tree was in is not there, so neither is the tree.
+                        Err(kr_transfer::Escape::NotFound { .. }) => return Ok(()),
+                        Err(refusal) => return Err(refusal.into()),
+                    },
+                };
+                (parent, leaf)
             }
             None => (
                 kr_transfer::AuthorisedDirectory::open_root(self.environment_id, parent)?,
@@ -3334,11 +3583,52 @@ fn workspace_staging_path(row: &WorkspaceRow) -> String {
 
 /// How a removal reaches a workspace's tree.
 struct TreeReach {
-    /// The location the workspace was created through, admitted, and the tree's name beneath it.
-    /// None for a workspace that recorded no location.
+    /// The location the tree is reached through, admitted, and the tree's name beneath it: the
+    /// location the workspace was created through, or one the owner named that contains it. None
+    /// for a workspace that recorded no location and was named no location.
     through: Option<(Arc<HeldLocation>, RelativeName)>,
     /// What every read of the removal asks before it starts, when there is a location.
     admission: Option<ReadAdmission>,
+}
+
+impl TreeReach {
+    /// Returns the reach of another entry of the directory the tree is in, through the same
+    /// location and asking the same question.
+    fn beside(&self, name: &str) -> Result<Self> {
+        let Some((held, tree)) = &self.through else {
+            return Ok(Self {
+                through: None,
+                admission: None,
+            });
+        };
+        let relative = match split_last(tree)?.0 {
+            None => RelativeName::parse(name)?,
+            Some(above) => RelativeName::parse(&format!("{}/{name}", above.as_str()))?,
+        };
+        Ok(Self {
+            through: Some((Arc::clone(held), relative)),
+            admission: self.admission.clone(),
+        })
+    }
+}
+
+/// Splits a relative name into the name of the directory above its last component, when it has
+/// one, and that last component.
+fn split_last(name: &RelativeName) -> Result<(Option<RelativeName>, RelativeName)> {
+    let components = name.components();
+    let Some((last, above)) = components.split_last() else {
+        return Err(ProjectError::InvalidArgument(
+            "a relative name has at least one component"
+                .to_owned()
+                .into(),
+        ));
+    };
+    let above = if above.is_empty() {
+        None
+    } else {
+        Some(RelativeName::parse(&above.join("/"))?)
+    };
+    Ok((above, RelativeName::parse(last)?))
 }
 
 /// What one step of recovery did.

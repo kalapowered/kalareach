@@ -539,9 +539,11 @@ impl ProjectModule {
                     Method::ProjectAdopt => {
                         encode(&service.project_adopt(&actor, &typed(&params)?, performed)?)
                     }
-                    Method::ProjectOperationCancel => {
-                        encode(&service.project_operation_cancel(&actor, &typed(&params)?)?)
-                    }
+                    Method::ProjectOperationCancel => encode(&service.project_operation_cancel(
+                        &actor,
+                        &typed(&params)?,
+                        performed,
+                    )?),
                     Method::WorkspaceCreate => {
                         encode(&service.workspace_create(&actor, &typed(&params)?, performed)?)
                     }

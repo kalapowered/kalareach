@@ -374,6 +374,7 @@ async fn every_project_method_a_device_may_reach_answers_it_and_the_owner_alike(
         Method::ProjectOperationCancel,
         &ProjectOperationCancelParams {
             operation_action_id: cloned.operation.action_id,
+            through_location_id: Nullable(None),
         },
     )
     .await
@@ -386,6 +387,7 @@ async fn every_project_method_a_device_may_reach_answers_it_and_the_owner_alike(
             Method::ProjectOperationCancel,
             &ProjectOperationCancelParams {
                 operation_action_id: cloned.operation.action_id,
+                through_location_id: Nullable(None),
             },
         )
         .await
@@ -402,6 +404,7 @@ async fn every_project_method_a_device_may_reach_answers_it_and_the_owner_alike(
             &WorkspaceRemoveParams {
                 workspace_id: workspace.workspace_id,
                 retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable(None),
             },
         )
         .await
@@ -505,6 +508,7 @@ async fn an_unbounded_grant_is_refused_by_the_same_rule_and_the_owner_is_unaffec
             ParamsValue::from_typed(&WorkspaceRemoveParams {
                 workspace_id: workspace.workspace_id,
                 retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable(None),
             })
             .expect("encodes"),
         ),
@@ -557,6 +561,7 @@ async fn an_unbounded_grant_is_refused_by_the_same_rule_and_the_owner_is_unaffec
             &WorkspaceRemoveParams {
                 workspace_id: workspace.workspace_id,
                 retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable(None),
             },
         )
         .await
@@ -687,6 +692,7 @@ async fn a_device_is_refused_all_five_repository_methods() {
             ParamsValue::from_typed(&WorkspaceRemoveParams {
                 workspace_id: workspace,
                 retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable(None),
             })
             .expect("encodes"),
         ),
@@ -1223,6 +1229,7 @@ async fn a_device_reaches_only_the_project_methods_its_grant_carries() {
             ParamsValue::from_typed(&WorkspaceRemoveParams {
                 workspace_id: workspace.workspace_id,
                 retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable(None),
             })
             .expect("encodes"),
         ),
@@ -1415,6 +1422,7 @@ async fn a_repeated_project_mutation_from_a_device_is_answered_rather_than_perfo
     let operation_id = ActionId::new(kr_ipc::new_uuid());
     let params = ProjectOperationCancelParams {
         operation_action_id: operation_id,
+        through_location_id: Nullable(None),
     };
     let action_id = ActionId::new(kr_ipc::new_uuid());
     let target = ActionTarget::environment(host.environment_id);
@@ -1487,6 +1495,7 @@ async fn a_repeated_project_mutation_from_a_device_is_answered_rather_than_perfo
             target,
             &ProjectOperationCancelParams {
                 operation_action_id: ActionId::new(kr_ipc::new_uuid()),
+                through_location_id: Nullable(None),
             },
         )
         .await
@@ -1525,6 +1534,7 @@ async fn a_device_without_session_view_still_recovers_its_own_project_outcome() 
     let operation_id = ActionId::new(kr_ipc::new_uuid());
     let params = ProjectOperationCancelParams {
         operation_action_id: operation_id,
+        through_location_id: Nullable(None),
     };
     let action_id = ActionId::new(kr_ipc::new_uuid());
     let target = ActionTarget::environment(host.environment_id);
@@ -1570,6 +1580,53 @@ async fn a_device_without_session_view_still_recovers_its_own_project_outcome() 
     host.stop().await;
 }
 
+/// KR-REQ-23.42: a device names no location to reconcile an operation through.
+///
+/// Naming one is the owner's route to an operation no handle reaches any more, and it reaches any
+/// operation in the environment. The network door tells the project service which grant the
+/// device holds, so the request is refused as a bounded caller's before the operation it names is
+/// even looked for; a door that told the service nothing would have it answer that no such
+/// operation exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_is_refused_the_owners_reconciliation_route() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = net_support::Device::create().await;
+    let record = net_support::pair_with(
+        &host,
+        &device,
+        &owner,
+        net_support::proposal(PROJECT_RIGHTS),
+    )
+    .await;
+    let raw = net_support::RawDevice::connect(&host, &device, &record).await;
+    raw.claim();
+
+    let refusal = raw
+        .mutate(
+            Method::ProjectOperationCancel,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &ProjectOperationCancelParams {
+                operation_action_id: ActionId::new(kr_ipc::new_uuid()),
+                through_location_id: Nullable(Some(kr_protocol::ids::ProjectLocationId::new(
+                    kr_ipc::new_uuid(),
+                ))),
+            },
+        )
+        .await
+        .expect_err("a device names no location");
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+    assert!(
+        refusal.message.contains("bounded by grant"),
+        "the refusal is the one a bounded caller is given: {}",
+        refusal.message
+    );
+
+    raw.close();
+    host.stop().await;
+}
+
 /// KR-REQ-23.42: what `action.read` says about an action that belongs to this host.
 ///
 /// A receipt lives in the journal of the session an action was performed on, and a repository
@@ -1601,6 +1658,7 @@ async fn action_read_says_how_to_obtain_an_outcome_this_host_owns() {
             ActionTarget::environment(host.environment_id),
             &ProjectOperationCancelParams {
                 operation_action_id: ActionId::new(kr_ipc::new_uuid()),
+                through_location_id: Nullable(None),
             },
         )
         .await

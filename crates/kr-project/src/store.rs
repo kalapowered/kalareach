@@ -202,7 +202,8 @@ pub struct WorkspaceRow {
 pub struct OperationRow {
     /// The action that started it, which is the create token.
     pub action_id: ActionId,
-    /// The actor that submitted it. Only that actor may cancel it.
+    /// The actor that submitted it. Only that actor cancels it by naming it; the owner reaches
+    /// it otherwise only by naming a location to reconcile it through.
     pub actor_id: ActorId,
     /// The environment that owns it.
     pub environment_id: EnvironmentId,

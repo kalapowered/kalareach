@@ -13768,6 +13768,18 @@ export interface ProjectOperationCancelParams {
    * One submitted intent and its receipt, generated as a UUIDv4.
    */
   operation_action_id: string
+  /**
+   * The location the owner reconciles the operation through, or null.
+   *
+   * Only a caller on the host's own socket names one, and naming one reaches any operation in
+   * the environment, whoever started it. It is an active destination location of the owner's
+   * that contains the staging directory the operation recorded: that directory is taken away
+   * through the location's handle, and only while the object there is the one the host
+   * recorded creating. It is how an operation that no handle reaches any more, because its
+   * location was withdrawn or it named none, is cleaned up. It changes no outcome the
+   * operation already has.
+   */
+  through_location_id: ProjectLocationId | null
 }
 /**
  * Result of `project.operation.cancel`.
@@ -21896,6 +21908,17 @@ export interface WorkspaceRemoveParams {
    * What the removal does with what the workspace holds.
    */
   retention: 'keep_everything' | 'remove_retained'
+  /**
+   * The location the owner removes the workspace through, or null for the one it was made
+   * through.
+   *
+   * Only a caller on the host's own socket names one: an active destination location of the
+   * owner's that contains the workspace's working tree. The tree is found beneath its handle
+   * and removed only while it is the object the host recorded creating, under the same
+   * retention rules, and so is the staging directory the workspace recorded. It is how a
+   * workspace whose location was withdrawn, or that named none, is removed.
+   */
+  through_location_id: ProjectLocationId | null
   /**
    * One selected working copy and its policy.
    */
