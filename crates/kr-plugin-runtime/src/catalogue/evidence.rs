@@ -128,6 +128,22 @@ pub fn from_qualification(
             ),
         });
     }
+    // The hash is the installed one, and so must the names be. A later entry that calls the same
+    // hash something else would label this installation's evidence as another package's.
+    if entry.plugin_id != installation.plugin_id || entry.publisher_id != installation.publisher_id
+    {
+        return Err(CatalogueError::UnsafePackage {
+            detail: format!(
+                "{} is installed as {} from {}, and an entry names the same hash {} from {}; \
+                 evidence is recorded under the name the package was installed as",
+                installation.package_digest,
+                installation.plugin_id,
+                installation.publisher_id,
+                entry.plugin_id,
+                entry.publisher_id
+            ),
+        });
+    }
 
     let evidence = CapabilityEvidence {
         capability_id: qualification.capability_id.clone(),
@@ -141,9 +157,9 @@ pub fn from_qualification(
         identity: SubjectIdentity {
             binary_digest: Nullable(None),
             schema_version: Nullable(None),
-            plugin_id: Nullable(Some(entry.plugin_id.clone())),
+            plugin_id: Nullable(Some(installation.plugin_id.clone())),
             package_digest: Nullable(Some(entry.manifest_digest)),
-            publisher_id: Nullable(Some(entry.publisher_id.clone())),
+            publisher_id: Nullable(Some(installation.publisher_id.clone())),
             profile_digest: Nullable(Some(qualification.profile_digest)),
             binding_revision: Nullable(None),
         },
@@ -449,6 +465,46 @@ mod tests {
                 .to_string()
                 .contains("cannot create a primitive effect"),
             "{refusal}"
+        );
+    }
+
+    /// A later entry that names the installed hash as another package does not label the
+    /// installation's evidence.
+    #[test]
+    fn a_qualification_under_another_name_for_the_installed_hash_is_refused() {
+        let installed = installation(&entry());
+        let mut renamed = entry();
+        renamed.plugin_id =
+            kr_plugin_sdk::ids::PluginId::new("someone-else/example").expect("a valid identifier");
+        let requested = installed.requested[0].capability;
+        let refusal = from_qualification(
+            &renamed,
+            &installed,
+            &qualification(requested, CapabilityState::VersionQualified),
+            CapabilityRevision::new(1),
+            now(),
+        )
+        .expect_err("the hash is installed under another name");
+        assert!(
+            refusal.to_string().contains("recorded under the name"),
+            "{refusal}"
+        );
+
+        let record = from_qualification(
+            &entry(),
+            &installed,
+            &qualification(requested, CapabilityState::VersionQualified),
+            CapabilityRevision::new(1),
+            now(),
+        )
+        .expect("the installed name");
+        assert_eq!(
+            record.identity.plugin_id.0,
+            Some(installed.plugin_id.clone())
+        );
+        assert_eq!(
+            record.identity.publisher_id.0,
+            Some(installed.publisher_id.clone())
         );
     }
 
