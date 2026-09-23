@@ -446,10 +446,11 @@ impl<K: Kinds> Facts<K> {
         self.out = true;
     }
 
-    /// Facts the load check refused, replaced by this device being out of the collection with a
-    /// join awaiting the owner (row 3). The records go, since nothing about them can be trusted;
-    /// what is kept is the collection, the outcomes, and the epochs of the keys the store may
-    /// still hold, so the steps that follow can forget them.
+    /// Facts the load check refused, read as this device being out of the collection with a join
+    /// awaiting the owner (row 3). The records go, and so does any candidate, dispatched or not,
+    /// since nothing in such a file can be trusted; a rejoin reads the chain again from the
+    /// service. What is kept is the collection, the outcomes, and the epochs of the keys the store
+    /// may still hold, so the steps that follow can forget them.
     pub(crate) fn refused(mut self) -> Self {
         self.leave();
         self.join = 1;
@@ -491,6 +492,16 @@ impl<K: Kinds> Facts<K> {
                 if self.opener(K::epoch(record)).is_none() {
                     return Err(Inconsistent("an epoch with no record that opened it"));
                 }
+            }
+            // The installed record, and before an installation the join record, is one this
+            // device accepted or was confirmed into, so it lists this device.
+            if !self.out
+                && self
+                    .records
+                    .first()
+                    .is_some_and(|record| !K::lists(record, me))
+            {
+                return Err(Inconsistent("a held record that does not list this device"));
             }
         }
         if self.removals.contains(me) || self.addition.as_ref() == Some(me) {
@@ -545,7 +556,8 @@ pub(crate) struct Desired<M> {
     pub epoch: u64,
     /// Its members.
     pub members: BTreeSet<M>,
-    /// True when it keeps the installed record's epoch and key.
+    /// True when it keeps the installed record's epoch and key, which only a weakened rule of the
+    /// exhaustive test does.
     pub same_epoch: bool,
 }
 
@@ -664,17 +676,22 @@ impl<K: Kinds> View<'_, K> {
         done
     }
 
-    /// The candidate row 8 builds now.
-    pub(crate) fn desired(&self) -> Desired<K::Member> {
+    /// The candidate row 8 builds now, or nothing when the head is at the last epoch or revision a
+    /// counter can hold, which has no successor.
+    ///
+    /// Every candidate takes the head's epoch plus one and a freshly drawn key, wrapped only for
+    /// its members: this device wraps the key in use only for the devices its installed record
+    /// lists, so a candidate that is sent and never applied exposes no key anybody writes with.
+    pub(crate) fn desired(&self) -> Option<Desired<K::Member>> {
         let (Some(installed), Some(head)) =
             (self.facts.installed_record(), self.facts.head_record())
         else {
-            return Desired {
+            return Some(Desired {
                 base: 0,
                 epoch: 0,
                 members: BTreeSet::from([self.me]),
                 same_epoch: false,
-            };
+            });
         };
         let start = if weakened(Rule::BuildFromHead) {
             K::members(head)
@@ -691,18 +708,20 @@ impl<K: Kinds> View<'_, K> {
             members.insert(addition);
         }
         let head_members: BTreeSet<K::Member> = K::members(head).into_iter().collect();
-        let same_epoch =
-            self.facts.head == self.facts.installed && members.is_superset(&head_members);
-        Desired {
+        let same_epoch = weakened(Rule::SameEpochCandidate)
+            && self.facts.head == self.facts.installed
+            && members.is_superset(&head_members);
+        self.facts.head.checked_add(1)?;
+        Some(Desired {
             base: self.facts.head,
             epoch: if same_epoch {
                 K::epoch(head)
             } else {
-                K::epoch(head) + 1
+                K::epoch(head).checked_add(1)?
             },
             members,
             same_epoch,
-        }
+        })
     }
 
     /// A pending change the installed record and the head do not yet carry out. One they carry
@@ -752,9 +771,11 @@ impl<K: Kinds> View<'_, K> {
         if !self.needs_candidate() {
             return false;
         }
-        let desired = self.desired();
+        let Some(desired) = self.desired() else {
+            return false;
+        };
         let members: BTreeSet<K::Member> = K::members(&candidate.record).into_iter().collect();
-        K::revision(&candidate.record) == desired.base + 1
+        Some(K::revision(&candidate.record)) == desired.base.checked_add(1)
             && desired.base == self.facts.head
             && K::epoch(&candidate.record) == desired.epoch
             && members == desired.members
@@ -809,6 +830,9 @@ pub(crate) enum Rule {
     BuildWhileWaiting,
     /// Make the record read after a candidate's base the head without the host answers.
     ReadSkipsAnswers,
+    /// Keep the installed record's epoch and key for a candidate that adds a device, so a sent
+    /// candidate that never applies has wrapped the key in use for a device no record lists.
+    SameEpochCandidate,
 }
 
 #[cfg(test)]

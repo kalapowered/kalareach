@@ -59,16 +59,22 @@ pub(crate) struct FileLock {
 
 impl MembershipFile {
     /// Opens or creates the directory, owner-only, and sweeps away any file a process that died
-    /// while writing left behind.
+    /// while writing left behind. When another handle is in the middle of an operation the sweep
+    /// is left to the next opening: a partial file is never read as the file.
     pub(crate) fn open(directory: impl Into<PathBuf>) -> Result<Self, MembershipError> {
         let directory = directory.into();
         private_directory(&directory).map_err(|source| storage(&directory, source))?;
         flush_path_names(&directory).map_err(|source| storage(&directory, source))?;
         let file = Self { directory };
-        let guard = file.lock()?;
-        let swept = file.sweep_partials();
-        drop(guard);
-        swept?;
+        match file.lock() {
+            Ok(guard) => {
+                let swept = file.sweep_partials();
+                drop(guard);
+                swept?;
+            }
+            Err(MembershipError::Busy) => {}
+            Err(error) => return Err(error),
+        }
         Ok(file)
     }
 
@@ -78,13 +84,23 @@ impl MembershipFile {
     }
 
     /// Takes the lock for one operation.
+    ///
+    /// It never waits. An operation holds the lock across the service calls it makes, and a caller
+    /// that blocked a thread waiting for it could stop the executor the holder needs to finish on,
+    /// so a lock another handle holds is answered at once with [`MembershipError::Busy`].
     pub(crate) fn lock(&self) -> Result<FileLock, MembershipError> {
         let path = self.directory.join(LOCK_NAME);
-        let lock = Lock::take(&path).map_err(|error| MembershipError::Storage {
-            path,
-            source: std::io::Error::other(error.to_string()),
-        })?;
-        Ok(FileLock { _lock: lock })
+        match Lock::try_take(&path) {
+            Ok(Some(lock)) => Ok(FileLock { _lock: lock }),
+            Ok(None) => Err(MembershipError::Busy),
+            Err(crate::sync::SyncError::Storage { path, source }) => {
+                Err(MembershipError::Storage { path, source })
+            }
+            Err(error) => Err(MembershipError::Storage {
+                path,
+                source: std::io::Error::other(error.to_string()),
+            }),
+        }
     }
 
     /// Reads the facts, or nothing when there is no file.

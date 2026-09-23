@@ -54,11 +54,11 @@ use kr_protocol::scalars::{TimestampMs, Uuid};
 use serde::{Deserialize, Serialize};
 
 use super::environment::Environment;
-use super::facts::{Change, Ended, Facts, Kinds, Opened, Opener, Outcome, Rule, weaken};
+use super::facts::{Change, Ended, Facts, Kinds, Opened, Opener, Outcome, Rule, View, weaken};
 use super::reconciler::Reconciler;
 use super::{
     CollectionRef, KeyRecords, MembershipError, RecordAt, RekeyAnswer, RekeyFence, RekeyStatus,
-    Step,
+    Settlement, Step,
 };
 use crate::error::ClientError;
 use crate::services::ServiceFuture;
@@ -265,6 +265,13 @@ struct World {
     seen: u64,
     /// History: the chain's length when each pending change was recorded.
     recorded_at: BTreeSet<(Change<Dev>, u64)>,
+    /// History: the pending changes recorded since the head was last fetched, kept apart from
+    /// D's own record of them so the two can be compared.
+    fetch_waits: BTreeSet<Change<Dev>>,
+    /// History: every candidate D sent, by epoch and key, with the devices it wrapped that key
+    /// for. A service may pass a device its wrap whether or not the candidate ever applies, so
+    /// each of them counts as holding that key.
+    sent: BTreeMap<(u64, KeyLabel), u8>,
     next_request: u64,
     budget: [u8; 9],
 }
@@ -342,11 +349,23 @@ impl Environment for ModelEnv {
         record.revision == 1
     }
 
+    fn valid(&self, _collection: &CollectionRef, _record: &ModelRecord) -> bool {
+        true
+    }
+
     fn mark_of(&self, record: &ModelRecord) -> Option<KeyLabel> {
         ModelKinds::lists(record, &D).then_some(record.key)
     }
 
-    fn open_key(&self, record: &ModelRecord) -> Result<KeyLabel, MembershipError> {
+    fn open_key(
+        &self,
+        record: &ModelRecord,
+        answers: &ModelAnswers,
+    ) -> Result<KeyLabel, MembershipError> {
+        // The sender must pass the recorded answers, as a device's own environment requires.
+        if record.issuer != D && !ModelKinds::passes(answers, &record.issuer) {
+            return Err(MembershipError::NotCommitted);
+        }
         self.mark_of(record).ok_or(MembershipError::NotListed)
     }
 
@@ -550,8 +569,13 @@ struct Ran<T> {
     writes: u32,
 }
 
-/// Runs one operation of the reconciler against the world.
-fn run<T>(world: &World, operation: impl FnOnce(&mut Reconciler<ModelEnv>) -> T) -> Ran<T> {
+/// Runs one operation of the reconciler against the world. `fetch` says whether the operation is
+/// a fetch of the head, which a refresh and a join are.
+fn run<T>(
+    world: &World,
+    fetch: bool,
+    operation: impl FnOnce(&mut Reconciler<ModelEnv>) -> T,
+) -> Ran<T> {
     let env = ModelEnv {
         file: Mutex::new(world.facts.clone()),
         store: Mutex::new(world.store.clone()),
@@ -586,11 +610,15 @@ fn run<T>(world: &World, operation: impl FnOnce(&mut Reconciler<ModelEnv>) -> T)
     next.sending = sending.map(request_of);
     next.inbox = inbox.map(|(request, answer)| (request_of(request), answer.into()));
     next.volatile_outcomes = volatile_outcomes;
-    history(world, &mut next);
+    let sent = env.sent.into_inner().expect("unpoisoned");
+    if let Some((_, record)) = sent {
+        *next.sent.entry((record.epoch, record.key)).or_default() |= record.members;
+    }
+    history(world, &mut next, fetch);
     Ran {
         value,
         world: next,
-        sent: env.sent.into_inner().expect("unpoisoned"),
+        sent,
         writes: env.writes.into_inner().expect("unpoisoned"),
     }
 }
@@ -608,17 +636,26 @@ fn pending(world: &World) -> BTreeSet<Change<Dev>> {
     changes
 }
 
-/// Records when each pending change was recorded: the chain's length then.
-fn history(before: &World, after: &mut World) {
+/// Records when each pending change was recorded (the chain's length then) and whether the head
+/// was fetched after it: a fetch clears every wait, and a change recorded in the same write as a
+/// fetch does not wait for one.
+fn history(before: &World, after: &mut World, fetch: bool) {
     let was = pending(before);
     let is = pending(after);
+    if fetch {
+        after.fetch_waits.clear();
+    }
     for change in is.difference(&was) {
         after
             .recorded_at
             .insert((*change, after.service.chain.len() as u64));
+        if !fetch {
+            after.fetch_waits.insert(*change);
+        }
     }
     for change in was.difference(&is) {
         after.recorded_at.retain(|(recorded, _)| recorded != change);
+        after.fetch_waits.remove(change);
     }
 }
 
@@ -678,12 +715,18 @@ fn step_of(world: &World, hide_answer: bool) -> Option<Transition> {
     if hide_answer {
         from.inbox = None;
     }
-    let ran = run(&from, |reconciler| block_on(reconciler.step(NOW)));
+    let ran = run(&from, false, |reconciler| block_on(reconciler.step(NOW)));
     let step = ran
         .value
         .unwrap_or_else(|error| panic!("a model step failed: {error}"));
     if matches!(step, Step::Nothing | Step::FetchNeeded) {
         return None;
+    }
+    let mut next = ran.world;
+    // An answer that says D's own record applied tells D that revision exists: from then on it
+    // is a record D knows, and its head may not stay behind it.
+    if let Step::Settled(Settlement::Applied { revision }) = step {
+        next.seen = next.seen.max(revision);
     }
     Some(Transition {
         label: if hide_answer {
@@ -691,14 +734,14 @@ fn step_of(world: &World, hide_answer: bool) -> Option<Transition> {
         } else {
             Label::Step(step)
         },
-        world: ran.world,
+        world: next,
         sent: ran.sent,
         writes: ran.writes,
     })
 }
 
 fn refresh_of(world: &World) -> Option<Transition> {
-    let ran = run(world, |reconciler| block_on(reconciler.refresh()));
+    let ran = run(world, true, |reconciler| block_on(reconciler.refresh()));
     ran.value
         .unwrap_or_else(|error| panic!("a model refresh failed: {error}"));
     (ran.world != *world).then_some(Transition {
@@ -927,7 +970,7 @@ fn transitions(world: &World) -> Vec<Transition> {
             let removals = mask_of(&world.facts.removals);
             let listed = (installed_members | head_members | addition) & !bit(D) & !removals;
             for member in devices_in(listed) {
-                let ran = run(world, |reconciler| reconciler.remove(member));
+                let ran = run(world, false, |reconciler| reconciler.remove(member));
                 ran.value
                     .unwrap_or_else(|error| panic!("a model removal failed: {error}"));
                 let mut next = ran.world;
@@ -939,11 +982,15 @@ fn transitions(world: &World) -> Vec<Transition> {
                     writes: ran.writes,
                 });
             }
+            // The owner's plan names the collection and the epoch installed when it was made.
+            let epoch = installed(world).map_or(0, |record| record.epoch);
             for member in DEVICES {
                 if installed_members & bit(member) != 0 {
                     continue;
                 }
-                let ran = run(world, |reconciler| reconciler.add(member));
+                let ran = run(world, false, |reconciler| {
+                    reconciler.add(member, collection(), epoch)
+                });
                 ran.value
                     .unwrap_or_else(|error| panic!("a model addition failed: {error}"));
                 let mut next = ran.world;
@@ -963,17 +1010,28 @@ fn transitions(world: &World) -> Vec<Transition> {
             .last()
             .is_some_and(|newest| ModelKinds::lists(newest, &D))
     {
-        let ran = run(world, |reconciler| block_on(reconciler.join(collection())));
-        ran.value
-            .unwrap_or_else(|error| panic!("a model join failed: {error}"));
-        let mut next = ran.world;
-        use_budget(&mut next, JOIN);
-        out.push(Transition {
-            label: Label::Join,
-            world: next,
-            sent: None,
-            writes: ran.writes,
+        let ran = run(world, true, |reconciler| {
+            block_on(reconciler.join(collection()))
         });
+        match ran.value {
+            Ok(()) => {
+                let mut next = ran.world;
+                use_budget(&mut next, JOIN);
+                // A join starts a new membership. What D sent in the one it left reaches the
+                // new one only through the records that applied, which count as every record
+                // from before the join does.
+                next.sent.clear();
+                out.push(Transition {
+                    label: Label::Join,
+                    world: next,
+                    sent: None,
+                    writes: ran.writes,
+                });
+            }
+            // The keys of the membership D left go first, a step each; the join waits for them.
+            Err(MembershipError::KeysStillHeld) => {}
+            Err(error) => panic!("a model join failed: {error}"),
+        }
     }
     if has(world, OTHERS) {
         for record in other_records(world) {
@@ -1011,7 +1069,9 @@ fn transitions(world: &World) -> Vec<Transition> {
             let mut revoked = world.clone();
             revoked.revoked |= bit(member);
             revoked.verified |= bit(member);
-            let ran = run(&revoked, |reconciler| reconciler.feed_revocation(member));
+            let ran = run(&revoked, false, |reconciler| {
+                reconciler.feed_revocation(member)
+            });
             ran.value
                 .unwrap_or_else(|error| panic!("a model feed revocation failed: {error}"));
             let mut next = ran.world;
@@ -1042,6 +1102,11 @@ fn canon(mut world: World) -> World {
         if !outcomes.is_empty() {
             *outcomes = vec![WAITING];
         }
+    }
+    // A sent candidate's key matters only while it could be the key in use: at the installed
+    // epoch or a later one. Keys only move forward, and no device reuses one D never committed.
+    if let Some(epoch) = installed(&world).map(|record| record.epoch) {
+        world.sent.retain(|(sent_epoch, _), _| *sent_epoch >= epoch);
     }
     let live = world
         .facts
@@ -1182,6 +1247,19 @@ fn holders(world: &World, upto: u64) -> (u8, u8) {
             }
         }
     }
+    // Every candidate D sent, applied or not: a service may have passed each device its wrap.
+    // D issued them, so it knows them all.
+    for ((epoch, key), members) in &world.sent {
+        if *key != installed.key {
+            continue;
+        }
+        if *epoch == installed.epoch {
+            direct |= members;
+        } else {
+            reuse |= members;
+            seen_by_d = true;
+        }
+    }
     if seen_by_d {
         return (direct | reuse, 0);
     }
@@ -1204,10 +1282,20 @@ fn recorded_when(world: &World, change: Change<Dev>) -> u64 {
         .map_or(0, |(_, length)| *length)
 }
 
-fn visible_outcomes(world: &World) -> Vec<Outcome<Dev>> {
-    let mut outcomes = world.facts.outcomes.clone();
-    outcomes.extend(world.volatile_outcomes.iter().copied());
-    outcomes
+/// The fence as the reconciler itself decides it, from the facts and the keys the store holds.
+fn reconciler_publishes(world: &World) -> bool {
+    let held: BTreeMap<u64, KeyLabel> = world
+        .facts
+        .epochs()
+        .into_iter()
+        .filter_map(|epoch| world.store.get(&epoch).map(|key| (epoch, *key)))
+        .collect();
+    View {
+        facts: &world.facts,
+        me: D,
+        held: &held,
+    }
+    .publishes()
 }
 
 /// Checks one state.
@@ -1220,6 +1308,19 @@ fn check_state(world: &World) -> Result<(), Violation> {
         return violation(format!(
             "a file the load check refuses: {:?}",
             facts.check(&D)
+        ));
+    }
+    if facts.unfetched != world.fetch_waits {
+        return violation(format!(
+            "D records {:?} as waiting for a fetch, where the history has {:?}",
+            facts.unfetched, world.fetch_waits
+        ));
+    }
+    if reconciler_publishes(world) != publishes(world) {
+        return violation(format!(
+            "the reconciler's fence says {}, where the invariant's says {}",
+            reconciler_publishes(world),
+            publishes(world)
         ));
     }
     // D's window holds exactly the service's records.
@@ -1295,15 +1396,16 @@ fn check_step(before: &World, transition: &Transition) -> Result<(), Violation> 
             return violation(format!("request {request} sent while another is live"));
         }
     }
-    // One durable write per step, apart from forgetting the keys of a collection D left.
-    let forgetting = matches!(label, Label::Step(Step::ForgotKeys) | Label::Join);
-    if transition.writes > 1 && !forgetting {
+    // One durable write per step, every step: so every state between two writes is a state the
+    // search visits, and a restart can come back to.
+    if transition.writes > 1 {
         return violation(format!(
             "{label:?} made {} durable writes",
             transition.writes
         ));
     }
-    // I5.
+    // I5: a key reaches the store only through row 4, from the one record it names, which passes
+    // the checks.
     let new_keys: Vec<(u64, KeyLabel)> = after
         .store
         .iter()
@@ -1311,34 +1413,32 @@ fn check_step(before: &World, transition: &Transition) -> Result<(), Violation> 
         .map(|(epoch, key)| (*epoch, *key))
         .collect();
     if !new_keys.is_empty() {
-        if !matches!(
-            label,
-            Label::Step(Step::Stored { .. }) | Label::StepWithoutAnswer(Step::Stored { .. })
-        ) {
+        let (Label::Step(Step::Stored { epoch, revision })
+        | Label::StepWithoutAnswer(Step::Stored { epoch, revision })) = label
+        else {
             return violation(format!("a key stored by {label:?}"));
-        }
-        for (epoch, key) in new_keys {
-            let accepted = before.service.chain.iter().any(|record| {
-                record.epoch == epoch
-                    && record.key == key
-                    && record.revision <= before.facts.head
-                    && acceptable(before, record)
-            });
-            if !accepted {
-                return violation(format!(
-                    "the key {key:?} of epoch {epoch} stored from no record that passes the checks"
-                ));
-            }
+        };
+        let Some(stored) = record(before, revision).copied() else {
+            return violation(format!(
+                "a key stored from revision {revision}, which no record has"
+            ));
+        };
+        if new_keys != [(epoch, stored.key)]
+            || stored.epoch != epoch
+            || revision > before.facts.head
+            || !acceptable(before, &stored)
+        {
+            return violation(format!(
+                "the key {new_keys:?} stored from record {stored:?}, which does not pass the checks"
+            ));
         }
     }
-    // A join forgets the keys of the membership that ended before it records the new one; those
-    // keys left while D was out.
+    // Keys leave the store only after the write that records D out.
     if before
         .store
         .iter()
         .any(|(epoch, key)| after.store.get(epoch) != Some(key))
-        && !before.facts.out
-        && !after.facts.out
+        && !(before.facts.out && after.facts.out)
     {
         return violation("a key left the store while D is a member");
     }
@@ -1381,9 +1481,9 @@ fn check_step(before: &World, transition: &Transition) -> Result<(), Violation> 
         }
     }
     // I2's durable record: exactly the changes this step ended are recorded, in this write, and a
-    // crash loses none.
-    let before_outcomes = visible_outcomes(before);
-    let after_outcomes = visible_outcomes(after);
+    // crash loses none. Only the file counts: an outcome held anywhere else is one a crash loses.
+    let before_outcomes = &before.facts.outcomes;
+    let after_outcomes = &after.facts.outcomes;
     if after_outcomes.len() < before_outcomes.len()
         || after_outcomes[..before_outcomes.len()] != before_outcomes[..]
     {
@@ -1439,6 +1539,7 @@ fn check_step(before: &World, transition: &Transition) -> Result<(), Violation> 
                     || after.facts.installed != after.facts.head
                     || installed_after.is_none_or(|record| ModelKinds::lists(record, member))
                     || after.facts.head < when
+                    || before.fetch_waits.contains(change)
                 {
                     return violation(format!(
                         "the removal of {member} done outside the exact predicate"
@@ -1464,6 +1565,7 @@ fn check_step(before: &World, transition: &Transition) -> Result<(), Violation> 
                     || after.facts.installed != after.facts.head
                     || installed_after.is_none_or(|record| !ModelKinds::lists(record, member))
                     || after.facts.head < recorded_when(before, *change)
+                    || before.fetch_waits.contains(change)
                 {
                     return violation(format!(
                         "the addition of {member} done outside the exact predicate"
@@ -1742,6 +1844,8 @@ fn start(
         verified: 0,
         seen,
         recorded_at: BTreeSet::new(),
+        fetch_waits: BTreeSet::new(),
+        sent: BTreeMap::new(),
         next_request,
         budget,
     }
@@ -1834,7 +1938,7 @@ const CONFIGURATIONS: [&str; 8] = [
 ];
 
 /// Each weakened rule and the configurations most likely to catch it.
-const WEAKENED: [(Rule, &[&str]); 16] = [
+const WEAKENED: [(Rule, &[&str]); 17] = [
     (Rule::NoOpenerCheck, &["steady-others", "genesis"]),
     (Rule::NoFreshKeyCheck, &["genesis", "steady-others"]),
     (Rule::BuildFromHead, &["genesis", "steady-owner"]),
@@ -1866,10 +1970,14 @@ const WEAKENED: [(Rule, &[&str]); 16] = [
         Rule::ReadSkipsAnswers,
         &["genesis", "expiry", "steady-owner"],
     ),
+    (
+        Rule::SameEpochCandidate,
+        &["steady-owner", "expiry", "genesis"],
+    ),
 ];
 
 /// The largest search a configuration gets; one that reaches it fails as incomplete.
-const MAX_STATES: usize = 20_000_000;
+const MAX_STATES: usize = 40_000_000;
 
 /// The largest search a weakened rule gets before it counts as not caught.
 const WEAKENED_MAX_STATES: usize = 3_000_000;
@@ -1984,9 +2092,9 @@ fn every_weakened_rule_makes_the_exhaustive_test_fail() {
     );
 }
 
-/// A file whose facts no sequence of writes produces is refused on load: the device is out of the
-/// collection with a join awaiting the owner, what it writes instead passes the load check, and
-/// the keys the store may still hold are forgotten.
+/// A file whose facts no sequence of writes produces is refused on load: the device reads it as
+/// being out of the collection with a join awaiting the owner, in facts that pass the load check,
+/// and the keys the store may still hold are forgotten, one epoch a step and one write a step.
 #[test]
 fn a_file_no_sequence_of_writes_produces_is_refused_and_a_rejoin_offered() {
     let mut installed_after_the_head = steady([0; 9]);
@@ -1997,15 +2105,69 @@ fn a_file_no_sequence_of_writes_produces_is_refused_and_a_rejoin_offered() {
     }
     for world in [installed_after_the_head, without_an_identity] {
         assert!(world.facts.check(&D).is_err());
-        let ran = run(&world, |reconciler| block_on(reconciler.step(NOW)));
-        ran.value.expect("a step");
-        assert!(ran.world.facts.out, "a join awaits the owner");
-        assert!(ran.world.facts.check(&D).is_ok());
+        let read = run(&world, false, |reconciler| reconciler.read());
+        let (facts, _) = read
+            .value
+            .expect("readable")
+            .expect("a membership, refused");
+        assert!(facts.out, "a join awaits the owner");
+        assert!(facts.check(&D).is_ok());
+        assert_eq!(read.writes, 0, "reading writes nothing");
+
+        let mut current = world;
+        for _ in 0..4 {
+            let ran = run(&current, false, |reconciler| block_on(reconciler.step(NOW)));
+            let step = ran.value.expect("a step");
+            assert!(ran.writes <= 1, "{step:?} made {} writes", ran.writes);
+            current = ran.world;
+            if step == Step::Nothing {
+                break;
+            }
+            assert!(matches!(step, Step::ForgotKeys { .. }), "{step:?}");
+        }
         assert!(
-            ran.world.store.is_empty(),
+            current.store.is_empty(),
             "the collection's keys are forgotten"
         );
-        let again = run(&ran.world, |reconciler| block_on(reconciler.step(NOW)));
-        assert_eq!(again.value.expect("a step"), Step::Nothing);
+    }
+}
+
+/// A device installed at the last epoch, or the last revision, a counter holds, with a removal
+/// pending: no successor exists, so the step says so and draws, records and writes nothing.
+#[test]
+fn the_last_epoch_or_revision_has_no_successor_and_nothing_is_built() {
+    for (revision, epoch) in [(2, u64::MAX), (u64::MAX, 3)] {
+        let mut world = steady([0; 9]);
+        let last = ModelRecord {
+            revision,
+            epoch,
+            members: bit(D) | bit(A) | bit(X),
+            issuer: D,
+            key: first_key(),
+        };
+        world.facts.join = revision.min(world.facts.join);
+        world.facts.installed = revision;
+        world.facts.head = revision;
+        world.facts.records = vec![last];
+        world.facts.openers = vec![Opener { epoch, issuer: D }];
+        world.facts.opened = BTreeSet::from([Opened {
+            revision,
+            epoch,
+            mark: first_key(),
+        }]);
+        world.store = BTreeMap::from([(epoch, first_key())]);
+        world.facts.removals.insert(A);
+        world.facts.unfetched.insert(Change::Removal(A));
+        assert!(world.facts.check(&D).is_ok());
+
+        let ran = run(&world, false, |reconciler| block_on(reconciler.step(NOW)));
+        assert!(
+            matches!(ran.value, Err(MembershipError::Exhausted)),
+            "{:?}",
+            ran.value
+        );
+        assert_eq!(ran.writes, 0);
+        assert!(ran.world.facts.candidate.is_none());
+        assert_eq!(ran.world.next_request, world.next_request, "nothing drawn");
     }
 }

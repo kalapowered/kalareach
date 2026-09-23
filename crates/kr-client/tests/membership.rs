@@ -652,6 +652,11 @@ fn key_in(record: &CollectionKeyRecord, member: &Node) -> SymmetricKey {
     .expect("the member's own wrap opens")
 }
 
+/// The epoch of the key a record carries.
+fn epoch_of(record: &CollectionKeyRecord) -> u64 {
+    record.payload.key_epoch.get()
+}
+
 fn fresh() -> SymmetricKey {
     Secret::random().expect("a key")
 }
@@ -695,19 +700,23 @@ async fn a_production_device_receives_its_key_through_its_own_wrap_and_keeps_it_
     assert!(lists(&newest, &device));
     let from_wrap = key_in(&newest, &device);
     let held = device
-        .held(&collection, 0)
+        .held(&collection, 1)
         .expect("the key in the device's store");
     assert_eq!(held.expose(), from_wrap.expose());
     assert_eq!(
         owner
-            .held(&collection, 0)
+            .held(&collection, 1)
             .expect("the owner's key")
             .expose(),
         held.expose(),
-        "an addition carries the key in use"
+        "the owner holds the key the device received"
+    );
+    assert!(
+        device.held(&collection, 0).is_none(),
+        "nothing from before it joined"
     );
     assert!(device.publishes());
-    assert_eq!(device.installed(), Some((0, 2)));
+    assert_eq!(device.installed(), Some((1, 2)));
 }
 
 /// Nothing is sealed to a device its host has not committed: the keys an addition wraps to come
@@ -778,11 +787,12 @@ async fn a_record_from_an_issuer_any_host_reports_revoked_is_refused() {
     let newest = world.newest(&collection);
     let newcomer = Node::new(&world);
     let key = fresh();
+    let epoch = epoch_of(&newest) + 1;
     let record = issue(
         &other,
         &newest,
         &[owner.device(), other.device(), newcomer.device()],
-        1,
+        epoch,
         &key,
     );
     let revision = record.payload.revision.get();
@@ -793,7 +803,9 @@ async fn a_record_from_an_issuer_any_host_reports_revoked_is_refused() {
     owner.refresh().await;
     let steps = run(&mut owner).await;
     assert!(
-        owner.held(&collection, 1).is_none(),
+        owner
+            .held(&collection, epoch)
+            .is_none_or(|held| held.expose() != key.expose()),
         "its key never reaches the store"
     );
     assert!(
@@ -820,18 +832,25 @@ async fn a_record_from_a_non_owner_issuer_is_refused() {
     world.hosts.commit(other.device(), false);
     let newest = world.newest(&collection);
     let key = fresh();
-    let record = issue(&other, &newest, &[owner.device(), other.device()], 1, &key);
+    let epoch = epoch_of(&newest) + 1;
+    let record = issue(
+        &other,
+        &newest,
+        &[owner.device(), other.device()],
+        epoch,
+        &key,
+    );
     world.append(&collection, record);
 
     owner.refresh().await;
     run(&mut owner).await;
-    assert!(owner.held(&collection, 1).is_none());
-    let final_record = world.newest(&collection);
-    assert_eq!(
-        final_record.payload.key_epoch.get(),
-        2,
-        "rotated away from it"
+    assert!(
+        owner
+            .held(&collection, epoch)
+            .is_none_or(|held| held.expose() != key.expose())
     );
+    let final_record = world.newest(&collection);
+    assert_eq!(epoch_of(&final_record), epoch + 1, "rotated away from it");
     assert!(!lists(&final_record, &other));
 }
 
@@ -866,21 +885,24 @@ async fn a_newer_record_without_a_chain_from_the_held_one_needs_a_confirmed_rejo
     let stranger = Node::new(&world);
     world.hosts.commit(stranger.device(), true);
     let newest = world.newest(&collection);
+    let epoch = epoch_of(&newest) + 1;
     let forged = issue(
         &stranger,
         &newest,
         &[owner.device(), stranger.device()],
-        1,
+        epoch,
         &fresh(),
     );
     world.forge_next(KeyRecords::Records(vec![forged]));
     assert_eq!(owner.refresh().await, Refreshed::BrokenChain);
-    assert!(owner.held(&collection, 1).is_none());
+    assert!(owner.held(&collection, epoch).is_none());
     assert!(!owner.publishes());
-    // Nothing moves until the owner confirms the rejoin on this device.
-    assert_eq!(owner.step().await, Step::ForgotKeys);
+    // Nothing moves until the owner confirms the rejoin on this device: the keys it held go,
+    // one epoch a step.
+    assert_eq!(owner.step().await, Step::ForgotKeys { epoch: 0 });
+    assert_eq!(owner.step().await, Step::ForgotKeys { epoch: 1 });
     assert_eq!(owner.step().await, Step::Nothing);
-    assert!(owner.held(&collection, 0).is_none());
+    assert!(owner.held(&collection, 0).is_none() && owner.held(&collection, 1).is_none());
     let plan = owner
         .membership
         .plan_join(collection, now())
@@ -894,7 +916,7 @@ async fn a_newer_record_without_a_chain_from_the_held_one_needs_a_confirmed_rejo
     assert!(owner.publishes());
     assert_eq!(
         owner.installed(),
-        Some((0, 2)),
+        Some((1, 2)),
         "the honest chain, checked as a new member"
     );
 }
@@ -917,7 +939,8 @@ async fn every_new_epoch_has_a_freshly_drawn_key() {
     owner.membership.remove(&second.auth()).expect("a removal");
     owner.reconcile().await;
 
-    let keys: Vec<SymmetricKey> = (0..3)
+    // Two additions and two removals: four new epochs after the first, each with its own key.
+    let keys: Vec<SymmetricKey> = (0..5)
         .map(|epoch| owner.held(&collection, epoch).expect("every epoch's key"))
         .collect();
     for (index, key) in keys.iter().enumerate() {
@@ -925,12 +948,14 @@ async fn every_new_epoch_has_a_freshly_drawn_key() {
             assert_ne!(key.expose(), other.expose(), "two epochs share a key");
         }
     }
-    assert_eq!(owner.installed(), Some((2, 5)));
+    assert_eq!(owner.installed(), Some((4, 5)));
 }
 
-/// An addition keeps the epoch and wraps the key in use for the new member.
+/// An addition takes the next epoch and a freshly drawn key, wrapped for every member, the new one
+/// included: the key in use is wrapped only for the devices the installed record lists, so an
+/// addition that never applies exposes no key anybody writes with.
 #[tokio::test]
-async fn an_addition_wraps_the_key_in_use() {
+async fn an_addition_wraps_a_fresh_key_at_the_next_epoch() {
     let world = World::default();
     let mut owner = Node::new(&world);
     let collection = collection_of(&world, &mut owner, &mut []).await;
@@ -940,9 +965,17 @@ async fn an_addition_wraps_the_key_in_use() {
     world.hosts.commit(device.device(), true);
     share(&mut owner, &mut device).await;
     let newest = world.newest(&collection);
-    assert_eq!(newest.payload.key_epoch.get(), 0);
-    assert_eq!(key_in(&newest, &device).expose(), before.expose());
-    assert_eq!(key_in(&newest, &owner).expose(), before.expose());
+    assert_eq!(epoch_of(&newest), 1);
+    let added = key_in(&newest, &device);
+    assert_eq!(key_in(&newest, &owner).expose(), added.expose());
+    assert_ne!(added.expose(), before.expose(), "not the key in use");
+    assert_eq!(
+        device
+            .held(&collection, 1)
+            .expect("the new member's key")
+            .expose(),
+        added.expose()
+    );
 }
 
 /// KR-REQ-20.11, the sync-collection half: removing a device gives the others a fresh key at the
@@ -955,7 +988,8 @@ async fn removing_a_device_gives_the_rest_a_key_it_cannot_open() {
     let mut stays = Node::new(&world);
     let mut leaves = Node::new(&world);
     let collection = collection_of(&world, &mut owner, &mut [&mut stays, &mut leaves]).await;
-    let old = leaves.held(&collection, 0).expect("the key it had");
+    let joined = epoch_of(&world.newest(&collection));
+    let old = leaves.held(&collection, joined).expect("the key it had");
 
     owner.membership.remove(&leaves.auth()).expect("a removal");
     owner.reconcile().await;
@@ -963,23 +997,27 @@ async fn removing_a_device_gives_the_rest_a_key_it_cannot_open() {
     leaves.reconcile().await;
 
     let newest = world.newest(&collection);
-    assert_eq!(newest.payload.key_epoch.get(), 1);
+    let epoch = epoch_of(&newest);
+    assert_eq!(epoch, joined + 1);
     assert!(!lists(&newest, &leaves), "no wrap for the removed device");
     let new_key = stays
-        .held(&collection, 1)
+        .held(&collection, epoch)
         .expect("the rest hold the new key");
     assert_eq!(
-        owner.held(&collection, 1).expect("the owner too").expose(),
+        owner
+            .held(&collection, epoch)
+            .expect("the owner too")
+            .expose(),
         new_key.expose()
     );
     assert_ne!(new_key.expose(), old.expose());
-    assert!(leaves.held(&collection, 1).is_none());
+    assert!(leaves.held(&collection, epoch).is_none());
     assert!(leaves.out(), "the removed device is out");
     // What it had is not taken back: the removed device's store forgets it only because it
     // left, and the old key it held was the one it already had.
     assert_eq!(
         old.expose(),
-        owner.held(&collection, 0).expect("kept").expose()
+        owner.held(&collection, joined).expect("kept").expose()
     );
 }
 
@@ -1232,7 +1270,7 @@ async fn a_revoked_winner_that_keeps_this_device_is_rotated_out_and_its_key_neve
         &winner,
         &newest,
         &[owner.device(), winner.device(), third.device()],
-        1,
+        epoch_of(&newest) + 1,
         &winner_key,
     );
     world.append(&collection, record);
@@ -1271,7 +1309,7 @@ async fn a_rotation_away_from_a_refused_record_keeps_nothing_it_added() {
         &revoked,
         &newest,
         &[owner.device(), revoked.device(), added.device()],
-        0,
+        epoch_of(&newest),
         &key,
     );
     world.append(&collection, record);
@@ -1343,20 +1381,40 @@ async fn a_losing_candidate_key_is_never_installed() {
     assert_eq!(owner.step().await, Step::Built { built: true });
     assert_eq!(owner.step().await, Step::Dispatched);
     assert_eq!(owner.step().await, Step::Sent { answered: false });
+    // The key the candidate carries, read from the request in flight before the service takes it.
+    let losing_key = key_in(&world.state().held[0].record, &owner);
+    let never_held = |node: &Node| {
+        (0..=16).all(|epoch| {
+            node.held(&collection, epoch)
+                .is_none_or(|key| key.expose() != losing_key.expose())
+        })
+    };
     // The other member's rotation lands first; the held candidate then loses.
     other.reconcile().await;
     other.membership.remove(&third.auth()).expect("a removal");
     other.reconcile().await;
     world.deliver_held();
-    let losing = world.state().held.len();
-    assert_eq!(losing, 0);
-    run(&mut owner).await;
+    assert!(world.state().held.is_empty());
+    for _ in 0..64 {
+        let step = owner.step().await;
+        assert!(
+            never_held(&owner),
+            "the losing key reached the store after {step:?}"
+        );
+        match step {
+            Step::Nothing => break,
+            Step::FetchNeeded | Step::Settled(Settlement::Refused { .. }) => {
+                owner.refresh().await;
+            }
+            _ => {}
+        }
+    }
     let newest = world.newest(&collection);
     assert!(!lists(&newest, &third));
     let other_key = key_in(&newest, &owner);
     assert_eq!(
         owner
-            .held(&collection, 1)
+            .held(&collection, epoch_of(&newest))
             .expect("the winning key")
             .expose(),
         other_key.expose()
@@ -1453,14 +1511,7 @@ async fn an_undispatched_candidate_is_sent_after_a_restart() {
 async fn an_addition_whose_reply_was_lost_completes_after_a_restart() {
     let world = World::default();
     let mut owner = Node::new(&world);
-    let mut rotating = Node::new(&world);
-    let collection = collection_of(&world, &mut owner, &mut [&mut rotating]).await;
-    // A rotation first, so the added device's record carries a new epoch's key.
-    owner
-        .membership
-        .remove(&rotating.auth())
-        .expect("a removal");
-    owner.reconcile().await;
+    let collection = collection_of(&world, &mut owner, &mut []).await;
 
     let mut device = Node::new(&world);
     world.hosts.commit(device.device(), true);
@@ -1487,11 +1538,17 @@ async fn an_addition_whose_reply_was_lost_completes_after_a_restart() {
         .plan_join(collection, now())
         .expect("a plan");
     device.membership.join(&join, now()).await.expect("a join");
-    assert_eq!(device.step().await, Step::Stored { epoch: 1 });
+    assert_eq!(
+        device.step().await,
+        Step::Stored {
+            epoch: 1,
+            revision: 2
+        }
+    );
     device.restart();
     assert!(device.held(&collection, 1).is_some());
     assert!(!device.publishes());
-    assert_eq!(device.step().await, Step::Installed { revision: 4 });
+    assert_eq!(device.step().await, Step::Installed { revision: 2 });
     assert!(device.publishes());
 }
 
@@ -1519,7 +1576,7 @@ async fn an_addition_survives_a_removal_that_arrives_before_it_is_sent() {
     let newest = world.newest(&collection);
     assert!(lists(&newest, &device));
     assert!(!lists(&newest, &leaves));
-    assert_eq!(newest.payload.key_epoch.get(), 1);
+    assert_eq!(epoch_of(&newest), 2, "one record carries both");
     assert!(owner.publishes());
 }
 
@@ -1536,11 +1593,12 @@ async fn a_refused_issuers_key_wrapped_again_by_a_later_addition_is_never_instal
 
     let newest = world.newest(&collection);
     let refused_key = fresh();
+    let epoch = epoch_of(&newest) + 1;
     let opening = issue(
         &refused,
         &newest,
         &[owner.device(), honest.device(), refused.device()],
-        1,
+        epoch,
         &refused_key,
     );
     world.append(&collection, opening.clone());
@@ -1555,7 +1613,7 @@ async fn a_refused_issuers_key_wrapped_again_by_a_later_addition_is_never_instal
             refused.device(),
             added.device(),
         ],
-        1,
+        epoch,
         &refused_key,
     );
     world.append(&collection, rewrapped);
@@ -1570,7 +1628,7 @@ async fn a_refused_issuers_key_wrapped_again_by_a_later_addition_is_never_instal
             assert_ne!(key.expose(), refused_key.expose());
         }
     }
-    assert!(owner.held(&collection, 1).is_none());
+    assert!(owner.held(&collection, epoch).is_none());
     assert!(!lists(&world.newest(&collection), &refused));
     assert!(owner.publishes());
 }
@@ -1607,7 +1665,10 @@ async fn a_removal_recorded_while_an_addition_of_that_device_is_unsettled_is_car
         owner.step().await,
         Step::Settled(Settlement::Applied { revision })
     );
-    // A crash between the write that cleared the candidate and the one that installs.
+    // A crash between the write that cleared the candidate and the ones that install.
+    owner.restart();
+    assert!(!owner.publishes());
+    assert_eq!(owner.step().await, Step::Stored { epoch: 1, revision });
     owner.restart();
     assert!(!owner.publishes());
     assert_eq!(owner.step().await, Step::Installed { revision });
@@ -1619,7 +1680,7 @@ async fn a_removal_recorded_while_an_addition_of_that_device_is_unsettled_is_car
     run(&mut owner).await;
     let newest = world.newest(&collection);
     assert!(!lists(&newest, &device));
-    assert_eq!(newest.payload.key_epoch.get(), 1);
+    assert_eq!(epoch_of(&newest), 2);
     assert!(owner.publishes());
     assert!(owner.outcomes().contains(&Outcome::Removal {
         device: device.device(),
@@ -1738,7 +1799,13 @@ async fn the_genesis_key_is_installed_only_through_row_4_after_the_claim_applies
     );
     assert!(owner.held(&collection, 0).is_none());
     assert!(!owner.publishes());
-    assert_eq!(owner.step().await, Step::Stored { epoch: 0 });
+    assert_eq!(
+        owner.step().await,
+        Step::Stored {
+            epoch: 0,
+            revision: 1
+        }
+    );
     let stored = owner.held(&collection, 0).expect("the first key");
     assert_eq!(
         stored.expose(),
@@ -1756,9 +1823,10 @@ async fn a_same_epoch_record_wrapping_another_key_is_refused() {
     let mut owner = Node::new(&world);
     let mut other = Node::new(&world);
     let collection = collection_of(&world, &mut owner, &mut [&mut other]).await;
-    let held = owner.held(&collection, 0).expect("the key");
-
     let newest = world.newest(&collection);
+    let epoch = epoch_of(&newest);
+    let held = owner.held(&collection, epoch).expect("the key");
+
     let added = Node::new(&world);
     world.hosts.commit(added.device(), true);
     let another = fresh();
@@ -1766,18 +1834,18 @@ async fn a_same_epoch_record_wrapping_another_key_is_refused() {
         &other,
         &newest,
         &[owner.device(), other.device(), added.device()],
-        0,
+        epoch,
         &another,
     );
     world.append(&collection, record);
     owner.refresh().await;
     run(&mut owner).await;
     assert_eq!(
-        owner.held(&collection, 0).expect("unchanged").expose(),
+        owner.held(&collection, epoch).expect("unchanged").expose(),
         held.expose()
     );
     let final_record = world.newest(&collection);
-    assert_eq!(final_record.payload.key_epoch.get(), 1, "rotated away");
+    assert_eq!(epoch_of(&final_record), epoch + 1, "rotated away");
     assert!(
         !lists(&final_record, &added),
         "nothing the refused record added"
@@ -1810,6 +1878,7 @@ async fn a_removal_is_not_done_while_a_refused_record_left_the_device_the_curren
         .expect("a removal");
     honest.reconcile().await;
     let rotated = world.newest(&collection);
+    let current_epoch = epoch_of(&rotated);
     let current = key_in(&rotated, &honest);
     // The faulty member wraps the current key for the removed device again, then rotates it out
     // itself, and is revoked.
@@ -1822,7 +1891,7 @@ async fn a_removal_is_not_done_while_a_refused_record_left_the_device_the_curren
             faulty.device(),
             removed.device(),
         ],
-        1,
+        current_epoch,
         &current,
     );
     world.append(&collection, readded.clone());
@@ -1830,20 +1899,29 @@ async fn a_removal_is_not_done_while_a_refused_record_left_the_device_the_curren
         &faulty,
         &readded,
         &[owner.device(), honest.device(), faulty.device()],
-        2,
+        current_epoch + 1,
         &fresh(),
     );
     world.append(&collection, dropped);
     world.hosts.revoke(faulty.device());
 
-    let steps = run(&mut owner).await;
-    for (step, _) in &steps {
-        if *step == Step::Done {
-            let installed = owner.installed().expect("installed");
+    // Inspected after every step: the removal ends as done only once a record at an epoch after
+    // the faulty member's is installed, so the key the removed device holds is no longer in use.
+    for _ in 0..64 {
+        let step = owner.step().await;
+        if step == Step::Done {
+            let (epoch, _) = owner.installed().expect("installed");
             assert!(
-                installed.0 >= 3,
-                "done only after a rotation away from the current key"
+                epoch > current_epoch + 1,
+                "done at epoch {epoch}, before a rotation away from the key it holds"
             );
+        }
+        match step {
+            Step::Nothing => break,
+            Step::FetchNeeded | Step::Settled(Settlement::Refused { .. }) => {
+                owner.refresh().await;
+            }
+            _ => {}
         }
     }
     let final_record = world.newest(&collection);
@@ -1917,24 +1995,27 @@ async fn a_new_epoch_reusing_an_earlier_key_is_refused_and_rotated_away() {
     let old = owner.held(&collection, 0).expect("the first key");
 
     let newest = world.newest(&collection);
+    let epoch = epoch_of(&newest) + 1;
     let reusing = issue(
         &faulty,
         &newest,
         &[owner.device(), faulty.device()],
-        1,
+        epoch,
         &old,
     );
     world.append(&collection, reusing);
     owner.refresh().await;
     run(&mut owner).await;
     assert!(
-        owner.held(&collection, 1).is_none(),
-        "epoch 1 is never installed"
+        owner.held(&collection, epoch).is_none(),
+        "the reusing record's epoch is never installed"
     );
-    let fresh_key = owner.held(&collection, 2).expect("rotated to epoch 2");
+    let fresh_key = owner
+        .held(&collection, epoch + 1)
+        .expect("rotated to the epoch after it");
     assert_ne!(fresh_key.expose(), old.expose());
     let final_record = world.newest(&collection);
-    assert_eq!(final_record.payload.key_epoch.get(), 2);
+    assert_eq!(epoch_of(&final_record), epoch + 1);
     assert!(owner.publishes());
 }
 
@@ -2013,16 +2094,17 @@ async fn a_record_that_leaves_this_device_out_ends_its_membership_until_the_owne
 
     // The owner removes the device, reuses that key in a later epoch, and lists it again.
     let newest = world.newest(&collection);
+    let held = epoch_of(&newest);
     let removed_key = fresh();
-    let without = issue(&owner, &newest, &[owner.device()], 1, &removed_key);
+    let without = issue(&owner, &newest, &[owner.device()], held + 1, &removed_key);
     world.append(&collection, without.clone());
-    let reused = issue(&owner, &without, &[owner.device()], 2, &removed_key);
+    let reused = issue(&owner, &without, &[owner.device()], held + 2, &removed_key);
     world.append(&collection, reused.clone());
     let again = issue(
         &owner,
         &reused,
         &[owner.device(), device.device()],
-        2,
+        held + 2,
         &removed_key,
     );
     world.append(&collection, again);
@@ -2031,11 +2113,11 @@ async fn a_record_that_leaves_this_device_out_ends_its_membership_until_the_owne
     assert_eq!(device.step().await, Step::Left);
     assert!(device.out());
     assert!(!device.publishes());
-    assert_eq!(device.step().await, Step::ForgotKeys);
-    assert!(device.held(&collection, 0).is_none());
+    assert_eq!(device.step().await, Step::ForgotKeys { epoch: held });
+    assert!(device.held(&collection, held).is_none());
     assert_eq!(device.step().await, Step::Nothing);
     assert_eq!(device.refresh().await, Refreshed::Out);
-    assert!(device.held(&collection, 2).is_none());
+    assert!(device.held(&collection, held + 2).is_none());
 
     let plan = device
         .membership
@@ -2048,7 +2130,7 @@ async fn a_record_that_leaves_this_device_out_ends_its_membership_until_the_owne
         .expect("confirmed");
     device.reconcile().await;
     assert!(device.publishes());
-    assert_eq!(device.installed(), Some((2, 5)));
+    assert_eq!(device.installed(), Some((held + 2, 5)));
 }
 
 /// A revocation verified from an authority feed fences publication at once, before any host
@@ -2114,7 +2196,7 @@ async fn a_record_read_to_settle_a_candidate_becomes_the_head_with_the_host_answ
         &other,
         &newest,
         &[owner.device(), other.device(), failing.device()],
-        0,
+        epoch_of(&newest),
         &key,
     );
     world.append(&collection, theirs);
@@ -2244,18 +2326,28 @@ async fn a_reused_key_before_the_current_join_is_the_stated_limit_and_a_current_
     let mut owner = Node::new(&world);
     let mut device = Node::new(&world);
     let collection = collection_of(&world, &mut owner, &mut [&mut device]).await;
-    let before_join = owner.held(&collection, 0).expect("the first key");
+    // The key the device held in the membership it is about to leave.
+    let first_epoch = epoch_of(&world.newest(&collection));
+    let before_join = device
+        .held(&collection, first_epoch)
+        .expect("the key of its first membership");
 
     // The device leaves, the owner rotates, and lists it again at a new epoch reusing the key of
-    // an epoch from before the device's new join: the stated limit, accepted.
+    // the device's earlier membership, from before its new join: the stated limit, accepted.
     let newest = world.newest(&collection);
-    let without = issue(&owner, &newest, &[owner.device()], 1, &fresh());
+    let without = issue(
+        &owner,
+        &newest,
+        &[owner.device()],
+        first_epoch + 1,
+        &fresh(),
+    );
     world.append(&collection, without.clone());
     let reusing = issue(
         &owner,
         &without,
         &[owner.device(), device.device()],
-        2,
+        first_epoch + 2,
         &before_join,
     );
     world.append(&collection, reusing.clone());
@@ -2277,7 +2369,10 @@ async fn a_reused_key_before_the_current_join_is_the_stated_limit_and_a_current_
         "a reuse from before the join is not detected"
     );
     assert_eq!(
-        device.held(&collection, 2).expect("installed").expose(),
+        device
+            .held(&collection, first_epoch + 2)
+            .expect("installed")
+            .expose(),
         before_join.expose()
     );
 
@@ -2287,17 +2382,319 @@ async fn a_reused_key_before_the_current_join_is_the_stated_limit_and_a_current_
         &owner,
         &current,
         &[owner.device(), device.device()],
-        3,
+        first_epoch + 3,
         &before_join,
     );
     world.append(&collection, again);
     device.refresh().await;
     run(&mut device).await;
     assert!(
-        device.held(&collection, 3).is_none(),
+        device.held(&collection, first_epoch + 3).is_none(),
         "the reused key is never installed"
     );
     let final_record = world.newest(&collection);
-    assert_eq!(final_record.payload.key_epoch.get(), 4, "rotated away");
+    assert_eq!(epoch_of(&final_record), first_epoch + 4, "rotated away");
     assert!(device.publishes());
+}
+
+/* -------------------------------------------------------------------------- */
+/* The file, the lock and the order of things                                  */
+/* -------------------------------------------------------------------------- */
+
+/// An answer that would end this device's membership waits while a candidate it dispatched
+/// stands: that request is settled first, by its status and its fence, so nothing it sent can
+/// still run once the device has left and joined again.
+#[tokio::test]
+async fn a_dispatched_candidate_is_settled_before_an_answer_that_ends_the_membership() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut first = Node::new(&world);
+    let mut second = Node::new(&world);
+    let collection = collection_of(&world, &mut owner, &mut [&mut first, &mut second]).await;
+    let records_before = world.chain(&collection).len();
+
+    owner.membership.remove(&first.auth()).expect("a removal");
+    world.fate(Fate::Hold);
+    assert_eq!(owner.step().await, Step::Built { built: true });
+    let request = owner.candidate_request().expect("a candidate");
+    assert_eq!(owner.step().await, Step::Dispatched);
+    assert_eq!(owner.step().await, Step::Sent { answered: false });
+
+    // A hostile service answers twice with a chain this device cannot follow.
+    let replayed = world.chain(&collection)[0].clone();
+    world.forge_next(KeyRecords::Records(vec![replayed.clone()]));
+    world.forge_next(KeyRecords::Records(vec![replayed]));
+    assert_eq!(owner.refresh().await, Refreshed::SettleFirst);
+    assert!(!owner.out() && !owner.publishes());
+    assert_eq!(owner.step().await, Step::Settled(Settlement::Fenced));
+    assert!(
+        world.state().held.is_empty(),
+        "the fence stops the request for good"
+    );
+    assert_eq!(owner.refresh().await, Refreshed::BrokenChain);
+    assert!(owner.out());
+
+    owner.restart();
+    while matches!(owner.step().await, Step::ForgotKeys { .. }) {}
+    let plan = owner
+        .membership
+        .plan_join(collection, now())
+        .expect("a plan");
+    owner
+        .membership
+        .join(&plan, now())
+        .await
+        .expect("the rejoin");
+    owner.reconcile().await;
+    assert!(owner.publishes());
+    assert_eq!(world.sends(request), 1);
+    assert_eq!(
+        world.chain(&collection).len(),
+        records_before,
+        "the request that was in flight never ran"
+    );
+    assert!(lists(&world.newest(&collection), &first));
+}
+
+/// A gate a test opens.
+#[derive(Debug, Default)]
+struct Gate {
+    open: Mutex<bool>,
+    waiting: Mutex<Option<std::task::Waker>>,
+}
+
+impl Gate {
+    fn open(&self) {
+        *self.open.lock().expect("an unpoisoned gate") = true;
+        if let Some(waker) = self.waiting.lock().expect("an unpoisoned gate").take() {
+            waker.wake();
+        }
+    }
+
+    async fn wait(&self) {
+        std::future::poll_fn(|context| {
+            if *self.open.lock().expect("an unpoisoned gate") {
+                return std::task::Poll::Ready(());
+            }
+            *self.waiting.lock().expect("an unpoisoned gate") = Some(context.waker().clone());
+            std::task::Poll::Pending
+        })
+        .await;
+    }
+}
+
+/// Hosts whose answer waits until the test opens a gate.
+#[derive(Debug)]
+struct GatedHosts {
+    hosts: Arc<Hosts>,
+    gate: Arc<Gate>,
+}
+
+impl DeviceDirectory for GatedHosts {
+    fn answers(&self) -> ServiceFuture<'_, Option<HostAnswers>> {
+        Box::pin(async move {
+            self.gate.wait().await;
+            Ok(Some(HostAnswers {
+                reports: self.hosts.reports().clone(),
+            }))
+        })
+    }
+}
+
+/// An operation holds the membership across the service calls it waits on, and another handle
+/// is told at once that it is busy rather than blocking a thread the first one needs to finish.
+#[tokio::test(flavor = "current_thread")]
+async fn a_second_handle_is_told_the_membership_is_busy_rather_than_waiting() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    collection_of(&world, &mut owner, &mut []).await;
+
+    let gate = Arc::new(Gate::default());
+    let secrets = StoredCollectionKeys::open(
+        StoreSelection::File,
+        "kalareach-membership-test",
+        &owner.root.path().join("secrets"),
+        SCOPE,
+    )
+    .expect("the file seam");
+    let mut gated = SyncMembership::open(
+        owner.root.path().join("membership"),
+        &owner.keys,
+        secrets,
+        Arc::new(ServiceView {
+            world: world.clone(),
+            caller: owner.auth(),
+        }),
+        Arc::new(GatedHosts {
+            hosts: Arc::clone(&world.hosts),
+            gate: Arc::clone(&gate),
+        }),
+    )
+    .expect("a second handle");
+    let mut refresh = Box::pin(gated.refresh());
+    let waiting = std::future::poll_fn(|context| {
+        std::task::Poll::Ready(refresh.as_mut().poll(context).is_pending())
+    })
+    .await;
+    assert!(
+        waiting,
+        "the refresh waits on its hosts while it holds the membership"
+    );
+    assert!(matches!(
+        owner.membership.members(),
+        Err(MembershipError::Busy)
+    ));
+    assert!(matches!(
+        owner.membership.step(now()).await,
+        Err(MembershipError::Busy)
+    ));
+    gate.open();
+    assert_eq!(refresh.await.expect("the refresh"), Refreshed::Recorded);
+    assert!(owner.membership.members().expect("free again").is_some());
+}
+
+/// A share plan names the collection and the epoch it was made at, and they are checked under
+/// the same hold that records the addition: once the collection has moved on, it is refused.
+#[tokio::test]
+async fn a_share_plan_is_refused_once_the_collection_moved_on() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut other = Node::new(&world);
+    let mut third = Node::new(&world);
+    collection_of(&world, &mut owner, &mut [&mut other, &mut third]).await;
+    let device = Node::new(&world);
+    world.hosts.commit(device.device(), true);
+    owner.refresh().await;
+    let plan = owner
+        .membership
+        .plan_share(&device.auth(), now())
+        .expect("a plan");
+
+    // Before the owner confirms, another member rotates and this device installs it.
+    other.reconcile().await;
+    other.membership.remove(&third.auth()).expect("a removal");
+    other.reconcile().await;
+    owner.reconcile().await;
+    assert!(matches!(
+        owner.membership.authorise(&plan, now()),
+        Err(MembershipError::Plan(PlanRefusal::Stale))
+    ));
+    let status = owner
+        .membership
+        .members()
+        .expect("readable")
+        .expect("a collection");
+    assert!(status.addition.is_none(), "nothing was recorded");
+}
+
+/// Starting a collection after leaving one forgets the keys of the one it left, one epoch a
+/// write, and keeps the outcomes the screen has not shown yet.
+#[tokio::test]
+async fn starting_a_collection_after_leaving_one_keeps_the_outcomes_and_forgets_the_old_keys() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut device = Node::new(&world);
+    let old = collection_of(&world, &mut owner, &mut [&mut device]).await;
+    let old_epoch = epoch_of(&world.newest(&old));
+
+    // The device asks for a removal of its own, and is removed before it builds anything.
+    device.membership.remove(&owner.auth()).expect("a removal");
+    owner.membership.remove(&device.auth()).expect("a removal");
+    owner.reconcile().await;
+    assert_eq!(device.refresh().await, Refreshed::Left);
+    assert!(device.held(&old, old_epoch).is_some(), "not forgotten yet");
+
+    let new = device
+        .membership
+        .start(collection_id(0x77), now())
+        .expect("a new collection");
+    assert_ne!(new, old);
+    assert!(
+        device.held(&old, old_epoch).is_none(),
+        "the old keys went first"
+    );
+    assert!(device.outcomes().contains(&Outcome::Removal {
+        device: owner.device(),
+        ended: Ended::Refused
+    }));
+    device.restart();
+    assert!(device.outcomes().contains(&Outcome::Removal {
+        device: owner.device(),
+        ended: Ended::Refused
+    }));
+    world.hosts.commit(device.device(), true);
+    device.reconcile().await;
+    assert!(device.publishes());
+}
+
+/// A membership file changed behind this device's back is refused on load, even one whose window
+/// is a single record: the device is out and a join awaits the owner.
+#[tokio::test]
+async fn a_membership_file_changed_behind_the_devices_back_is_refused() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let collection = collection_of(&world, &mut owner, &mut []).await;
+    assert!(owner.publishes());
+
+    // Change one byte of the installed record's signature, the only record the file holds.
+    let signature = *world.newest(&collection).signature.as_bytes();
+    let path = owner
+        .root
+        .path()
+        .join("membership")
+        .join("membership.facts");
+    let mut bytes = std::fs::read(&path).expect("the membership file");
+    let at = bytes
+        .windows(signature.len())
+        .position(|window| window == signature)
+        .expect("the record's signature in the file");
+    bytes[at] ^= 0x01;
+    std::fs::write(&path, bytes).expect("written back");
+
+    assert!(owner.out(), "refused, with a join awaiting the owner");
+    assert!(!owner.publishes());
+}
+
+/// A record whose issuer the hosts report with another stored-envelope key than its record names
+/// is never opened for use: check 3 fails, and the device rotates the issuer out.
+#[tokio::test]
+async fn a_record_whose_issuer_the_hosts_report_with_another_key_is_never_opened() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut other = Node::new(&world);
+    let collection = collection_of(&world, &mut owner, &mut [&mut other]).await;
+
+    let newest = world.newest(&collection);
+    let key = fresh();
+    let epoch = epoch_of(&newest) + 1;
+    let record = issue(
+        &other,
+        &newest,
+        &[owner.device(), other.device()],
+        epoch,
+        &key,
+    );
+    world.append(&collection, record);
+    world.hosts.commit(
+        Device {
+            authorisation: other.auth(),
+            stored_envelope: *DeviceKeys::generate()
+                .expect("keys")
+                .stored_envelope
+                .public(),
+        },
+        true,
+    );
+
+    owner.refresh().await;
+    run(&mut owner).await;
+    for held in 0..=epoch + 1 {
+        assert!(
+            owner
+                .held(&collection, held)
+                .is_none_or(|stored| stored.expose() != key.expose())
+        );
+    }
+    assert!(!lists(&world.newest(&collection), &other));
+    assert!(owner.publishes());
 }

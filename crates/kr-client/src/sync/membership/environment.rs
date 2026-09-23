@@ -12,13 +12,14 @@ use kr_crypto::envelope::{
     CollectionRecipient, CollectionRecordDraft, check_genesis, check_successor,
     issue_collection_key_record, open_collection_key, verify_collection_key_record,
 };
-use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
+use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair, key_id};
 use kr_crypto::secret::{Secret, SymmetricKey};
 use kr_protocol::collection_keys::{
     CollectionKeyRecord, CollectionKeyWrapContext, CollectionKeyWrapFormat,
 };
 use kr_protocol::ids::{SyncKeyEpoch, SyncKeyRecordRevision};
-use kr_protocol::scalars::{AuthorisationKey, Digest256, TimestampMs, Uuid};
+use kr_protocol::pairing::KeyPurpose;
+use kr_protocol::scalars::{AuthorisationKey, Digest256, StoredEnvelopeKey, TimestampMs, Uuid};
 
 use super::facts::{Facts, Kinds};
 use super::file::{FileLock, MembershipFile};
@@ -73,16 +74,28 @@ pub(crate) trait Environment: Send + Sync {
     fn follows(&self, previous: &RecordOf<Self>, next: &RecordOf<Self>) -> bool;
     /// The first record's rules, for this collection.
     fn first(&self, collection: &CollectionRef, record: &RecordOf<Self>) -> bool;
-    /// Check 1, the issuer's signature under the key its record names, and this device's own
-    /// wrap opened against the issuer's stored-envelope key: the mark of the key it holds, or
-    /// nothing when the record does not list this device or its wrap does not open.
+    /// One record on its own: well formed, signed by the issuer it names, and of this collection.
+    /// The load check applies it to every record the file holds.
+    fn valid(&self, collection: &CollectionRef, record: &RecordOf<Self>) -> bool;
+    /// The mark of the key a record carries for this device, for comparing keys only: check 1,
+    /// the issuer's signature under the key the record names, and this device's own wrap opened
+    /// against the issuer's stored-envelope key as the record names it. Nothing opened here is
+    /// used or kept; a record whose key is used is opened again by [`Self::open_key`]. Nothing
+    /// comes back when the record does not list this device or its wrap does not open.
     fn mark_of(&self, record: &RecordOf<Self>) -> Option<MarkOf<Self>>;
-    /// Opens this device's own wrap in an accepted record, for row 4 to store.
+    /// Opens this device's own wrap in an accepted record, for row 4 to store: against the
+    /// issuer's stored-envelope key as the recorded host answers report it, never as the record
+    /// names it.
     ///
     /// # Errors
     ///
-    /// When the record does not list this device or its wrap does not open.
-    fn open_key(&self, record: &RecordOf<Self>) -> Result<Self::Key, MembershipError>;
+    /// When the record does not list this device, no recorded host answer reports its issuer
+    /// with a stored-envelope key, or the wrap does not open.
+    fn open_key(
+        &self,
+        record: &RecordOf<Self>,
+        answers: &AnswersOf<Self>,
+    ) -> Result<Self::Key, MembershipError>;
     /// The mark of a key.
     fn mark(&self, key: &Self::Key) -> MarkOf<Self>;
     /// Draws a fresh key for a new epoch.
@@ -284,6 +297,28 @@ impl DeviceEnvironment {
         }
         Some((own, record.issuer()?))
     }
+
+    /// Opens this device's own wrap in a record against one sender key.
+    fn open_from(
+        &self,
+        record: &CollectionKeyRecord,
+        sender: &StoredEnvelopeKey,
+    ) -> Result<SymmetricKey, MembershipError> {
+        let (own, _) = self.entries(record).ok_or(MembershipError::NotListed)?;
+        let context = CollectionKeyWrapContext {
+            format: CollectionKeyWrapFormat::V1,
+            collection_id: record.payload.collection_id,
+            key_epoch: record.payload.key_epoch,
+            sender_key_id: key_id(KeyPurpose::StoredEnvelope, sender.as_bytes()),
+            recipient_key_id: self.envelope.key_id(),
+        };
+        Ok(open_collection_key(
+            &self.envelope,
+            sender,
+            &own.wrap,
+            &context,
+        )?)
+    }
 }
 
 impl Environment for DeviceEnvironment {
@@ -320,31 +355,39 @@ impl Environment for DeviceEnvironment {
             && check_genesis(record).is_ok()
     }
 
+    fn valid(&self, collection: &CollectionRef, record: &CollectionKeyRecord) -> bool {
+        record.payload.home == collection.home
+            && record.payload.collection_id == collection.collection_id
+            && record.issuer().is_some_and(|issuer| {
+                verify_collection_key_record(record, &issuer.authorisation).is_ok()
+            })
+    }
+
     fn mark_of(&self, record: &CollectionKeyRecord) -> Option<Digest256> {
         let (_, issuer) = self.entries(record)?;
         verify_collection_key_record(record, &issuer.authorisation).ok()?;
-        let key = self.open_key(record).ok()?;
+        let key = self.open_from(record, &issuer.stored_envelope).ok()?;
         Some(self.mark(&key))
     }
 
-    fn open_key(&self, record: &CollectionKeyRecord) -> Result<SymmetricKey, MembershipError> {
-        let (own, issuer) = self.entries(record).ok_or(MembershipError::NotListed)?;
-        // The issuer's stored-envelope key is the one its record names. A record reaches this
-        // point only after check 3 found the issuer at a host with that same key, so it is the
-        // key the directory reports, never one taken from a record alone.
-        let context = CollectionKeyWrapContext {
-            format: CollectionKeyWrapFormat::V1,
-            collection_id: record.payload.collection_id,
-            key_epoch: record.payload.key_epoch,
-            sender_key_id: issuer.stored_envelope_key_id(),
-            recipient_key_id: self.envelope.key_id(),
-        };
-        Ok(open_collection_key(
-            &self.envelope,
-            &issuer.stored_envelope,
-            &own.wrap,
-            &context,
-        )?)
+    fn open_key(
+        &self,
+        record: &CollectionKeyRecord,
+        answers: &RecordedAnswers,
+    ) -> Result<SymmetricKey, MembershipError> {
+        let (_, issuer) = self.entries(record).ok_or(MembershipError::NotListed)?;
+        let issuer = Device::of(issuer);
+        // A record this device issued is opened against its own key, which it does not check
+        // against its hosts. Any other issuer's key is one a host reports: paired, able to manage
+        // it and not revoked, with exactly this stored-envelope key. Nothing is opened against a
+        // key only a record names.
+        if issuer == self.me() {
+            return self.open_from(record, self.envelope.public());
+        }
+        if !answers.passes(&issuer) {
+            return Err(MembershipError::NotCommitted);
+        }
+        self.open_from(record, &issuer.stored_envelope)
     }
 
     fn mark(&self, key: &SymmetricKey) -> Digest256 {
@@ -374,7 +417,11 @@ impl Environment for DeviceEnvironment {
     ) -> Result<CollectionKeyRecord, MembershipError> {
         let (revision, previous) = match base {
             Some(base) => (
-                base.payload.revision.get().saturating_add(1),
+                base.payload
+                    .revision
+                    .get()
+                    .checked_add(1)
+                    .ok_or(MembershipError::Exhausted)?,
                 Some(base.digest()?),
             ),
             None => (1, None),

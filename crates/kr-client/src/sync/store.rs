@@ -2455,7 +2455,7 @@ impl Lock {
     }
 
     /// Takes the lock when it is free, and answers rather than waiting when it is not.
-    fn try_take(path: &Path) -> Result<Option<Self>> {
+    pub(super) fn try_take(path: &Path) -> Result<Option<Self>> {
         let file = Self::open(path)?;
         match file.try_lock() {
             Ok(()) => Ok(Some(Self { file })),

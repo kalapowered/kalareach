@@ -35,6 +35,12 @@
 //! a removed device already held stays readable to it: a rotation takes nothing back, and no
 //! retroactive secrecy is claimed.
 //!
+//! Every record this device issues takes the next epoch and a freshly drawn key, an addition
+//! included: it wraps the key in use only for the devices its installed record lists, so a record
+//! that is sent and never applies has exposed no key anybody writes with. A new member reads the
+//! settings once a member seals them again under the new epoch. Records other members issue at an
+//! unchanged epoch, which only add members, are accepted as before.
+//!
 //! # The reconciler
 //!
 //! The membership file holds nine facts: the join record, the installed record, the head, the host
@@ -54,7 +60,7 @@
 //! | 5 | No candidate, the head installed, and a pending change it carries out | Ends the change as done when the head was fetched after it was recorded; otherwise waits for a fetch |
 //! | 6 | An undispatched candidate that row 8 would not build now | Drops it with its key |
 //! | 7 | An undispatched candidate that is valid | Marks it dispatched, then sends it once |
-//! | 8 | A pending change not carried out, or a head refused while it lists this device | Builds a candidate on the head from the installed record's members |
+//! | 8 | A pending change not carried out, or a head refused while it lists this device | Builds a candidate on the head from the installed record's members, at the head's epoch plus one with a freshly drawn key |
 //!
 //! Publication into the collection is open only while no removal is pending, no candidate stands,
 //! no join awaits the owner and the head is installed ([`SyncMembership::publishes`]).
@@ -402,12 +408,17 @@ pub enum Step {
     Settled(Settlement),
     /// Row 2: this device is out of the collection; a join awaits the owner.
     Left,
-    /// This device forgot the keys of a collection it left.
-    ForgotKeys,
+    /// This device forgot one epoch's key of a collection it left.
+    ForgotKeys {
+        /// The epoch.
+        epoch: u64,
+    },
     /// Row 4 stored the key of an accepted record's epoch.
     Stored {
         /// The epoch.
         epoch: u64,
+        /// The record whose key it is.
+        revision: u64,
     },
     /// Row 4 recorded an accepted record as installed.
     Installed {
@@ -446,6 +457,9 @@ pub enum Refreshed {
     Out,
     /// This device holds no collection.
     NoMembership,
+    /// The answer would end this device's membership, but a dispatched candidate stands: the
+    /// next step settles its request first, and a refresh after it records the answer.
+    SettleFirst,
 }
 
 /// Why a membership operation did not complete.
@@ -524,6 +538,17 @@ pub enum MembershipError {
     /// A plan handed back was refused.
     #[error("{0}")]
     Plan(#[from] PlanRefusal),
+    /// Another handle on this membership is in the middle of an operation; try again.
+    #[error("another operation on this device's membership is under way")]
+    Busy,
+    /// The keys of a collection this device left are still being forgotten, a step each; a new
+    /// membership is recorded only after them.
+    #[error("the keys of the collection this device left are not all forgotten yet")]
+    KeysStillHeld,
+    /// The head is at the last epoch or revision a counter holds, which has no successor, so no
+    /// further record can follow it.
+    #[error("this collection's key records are at their last epoch or revision")]
+    Exhausted,
 }
 
 impl From<ClientError> for MembershipError {
@@ -660,6 +685,8 @@ impl SyncMembership {
             home: self.me().installation_id(),
             collection_id,
         };
+        // The keys of a collection this device left go first, one epoch a write.
+        while self.reconciler.forget_left_key()?.is_some() {}
         self.reconciler.start(collection, now)?;
         Ok(collection)
     }
@@ -695,9 +722,14 @@ impl SyncMembership {
             // after a refusal, a newer record may exist.
             let fetch = matches!(
                 step,
-                Step::FetchNeeded | Step::Settled(Settlement::Refused { .. })
+                Step::FetchNeeded | Step::Settled(Settlement::Refused { .. } | Settlement::Fenced)
             );
-            if fetch && self.refresh().await? != Refreshed::Recorded {
+            if fetch
+                && !matches!(
+                    self.refresh().await?,
+                    Refreshed::Recorded | Refreshed::SettleFirst
+                )
+            {
                 break;
             }
         }
@@ -798,15 +830,7 @@ impl SyncMembership {
         else {
             return Err(PlanRefusal::Substituted.into());
         };
-        let (facts, _) = self
-            .reconciler
-            .read()?
-            .ok_or(MembershipError::NoMembership)?;
-        let current = facts.installed_record().map(DeviceKinds::epoch);
-        if facts.collection != collection || current != Some(epoch) {
-            return Err(PlanRefusal::Stale.into());
-        }
-        self.reconciler.add(device)
+        self.reconciler.add(device, collection, epoch)
     }
 
     /// Plans joining a collection another device shares, for the owner to confirm on this device
@@ -835,6 +859,8 @@ impl SyncMembership {
     /// the newest record does not list this device, and [`MembershipError::AlreadyMember`] when
     /// this device holds a collection it has not left.
     pub async fn join(&mut self, plan: &Plan, now: TimestampMs) -> Result<(), MembershipError> {
+        // The keys of a collection this device left go first, one epoch a write.
+        while self.reconciler.forget_left_key()?.is_some() {}
         let plan = self.plans.consume(plan, now)?;
         let PlannedOperation::Join { collection } = plan.operation else {
             return Err(PlanRefusal::Substituted.into());

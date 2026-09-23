@@ -14,8 +14,8 @@ use kr_protocol::scalars::{TimestampMs, Uuid};
 use super::environment::{Environment, MarkOf, MemberOf, RecordOf};
 use super::facts::{Candidate, Change, Ended, Facts, Kinds, Outcome, Rule, View, weakened};
 use super::{
-    CollectionRef, KeyRecords, MembershipError, RecordAt, Refreshed, RekeyAnswer, RekeyFence,
-    RekeyStatus, Settlement, Step,
+    CollectionRef, KeyRecords, MembershipError, PlanRefusal, RecordAt, Refreshed, RekeyAnswer,
+    RekeyFence, RekeyStatus, Settlement, Step,
 };
 
 /// The facts, and the mark of the key the store holds for each epoch it holds one for.
@@ -58,28 +58,27 @@ impl<E: Environment> Reconciler<E> {
         }
     }
 
-    /// Reads the facts and runs the load check. Facts that no sequence of writes produces are
-    /// replaced by this device being out of the collection, with a join awaiting the owner.
+    /// Reads the facts and runs the load check. Facts that no sequence of writes produces are read
+    /// as this device being out of the collection, with a join awaiting the owner; they reach the
+    /// file only with the next write an operation makes anyway, so no operation makes two.
     pub(crate) fn load(&self) -> Result<Option<Facts<E::Kinds>>, MembershipError> {
-        let Some(mut facts) = self.env.load()? else {
+        let Some(facts) = self.env.load()? else {
             return Ok(None);
         };
         let me = self.env.me();
-        let mut consistent = facts.check(&me).is_ok();
-        if consistent && facts.head > 0 {
-            // Check 2 again over the window: a file that was changed behind this device's back
-            // does not become a chain it accepts.
-            let links = facts.records.windows(2);
-            consistent = links.into_iter().all(|pair| match pair {
+        // Every record in the window again, each signed and bound to this collection, and each
+        // link following the record before it: a file changed behind this device's back, one
+        // record long or longer, does not become a chain it accepts.
+        let consistent = facts.check(&me).is_ok()
+            && facts
+                .records
+                .iter()
+                .all(|record| self.env.valid(&facts.collection, record))
+            && facts.records.windows(2).all(|pair| match pair {
                 [previous, next] => self.env.follows(previous, next),
                 _ => true,
             });
-        }
-        if !consistent {
-            facts = facts.refused();
-            self.write(&facts)?;
-        }
-        Ok(Some(facts))
+        Ok(Some(if consistent { facts } else { facts.refused() }))
     }
 
     /// Replaces the file. A weakened rule keeps new outcomes where a crash loses them instead.
@@ -121,19 +120,64 @@ impl<E: Environment> Reconciler<E> {
         now: TimestampMs,
     ) -> Result<(), MembershipError> {
         let _guard = self.env.lock()?;
-        if let Some(facts) = self.load()?
-            && !facts.out
-        {
-            return Err(MembershipError::AlreadyMember);
+        let previous = self.load()?;
+        if let Some(facts) = &previous {
+            self.may_replace(facts)?;
         }
         let me = self.env.me();
         let key = self.env.draw_key(0, 0, &[me])?;
         let record = self.env.issue(&collection, None, 0, &[me], &key, now)?;
         let request = self.env.fresh_request()?;
-        let facts = Facts::genesis(collection, record, request, Default::default());
+        let mut facts = Facts::genesis(collection, record, request, Default::default());
+        if let Some(previous) = previous {
+            // The outcomes wait for the screen, and verified revocations stay verified.
+            facts.outcomes = previous.outcomes;
+            facts.answers = previous.answers;
+        }
         self.sending = None;
         self.inbox = None;
         self.write(&facts)
+    }
+
+    /// Forgets one epoch's key of a collection this device left, when one is still held.
+    ///
+    /// The keys go after the write that recorded leaving, never before it, and one epoch a write.
+    fn forget_one(
+        &self,
+        facts: &Facts<E::Kinds>,
+        held: &BTreeMap<u64, MarkOf<E>>,
+    ) -> Result<Option<u64>, MembershipError> {
+        let Some(epoch) = held.keys().next().copied() else {
+            return Ok(None);
+        };
+        self.env.forget_key(&facts.collection, epoch)?;
+        Ok(Some(epoch))
+    }
+
+    /// Forgets one epoch's key of the collection this device left, as a step while out does,
+    /// and says which, or nothing when none is left or this device has not left.
+    pub(crate) fn forget_left_key(&mut self) -> Result<Option<u64>, MembershipError> {
+        let _guard = self.env.lock()?;
+        let Some(facts) = self.load()? else {
+            return Ok(None);
+        };
+        if !facts.out {
+            return Ok(None);
+        }
+        let held = self.held(&facts)?;
+        self.forget_one(&facts, &held)
+    }
+
+    /// Whether a membership may be replaced by a new one: only one this device has left, and only
+    /// once the steps that follow leaving have forgotten its keys.
+    fn may_replace(&self, facts: &Facts<E::Kinds>) -> Result<(), MembershipError> {
+        if !facts.out {
+            return Err(MembershipError::AlreadyMember);
+        }
+        if !self.held(facts)?.is_empty() {
+            return Err(MembershipError::KeysStillHeld);
+        }
+        Ok(())
     }
 
     /// One step: the first row that applies.
@@ -144,14 +188,10 @@ impl<E: Environment> Reconciler<E> {
         };
         let held = self.held(&facts)?;
         if facts.out {
-            // The collection's keys go after the write that recorded leaving, never before it.
-            if held.is_empty() {
-                return Ok(Step::Nothing);
-            }
-            for epoch in held.keys() {
-                self.env.forget_key(&facts.collection, *epoch)?;
-            }
-            return Ok(Step::ForgotKeys);
+            return Ok(match self.forget_one(&facts, &held)? {
+                Some(epoch) => Step::ForgotKeys { epoch },
+                None => Step::Nothing,
+            });
         }
         // Row 1, and the send that follows a dispatch mark.
         if let Some(candidate) = &facts.candidate
@@ -183,9 +223,9 @@ impl<E: Environment> Reconciler<E> {
             let epoch = <E::Kinds as Kinds>::epoch(record);
             let revision = <E::Kinds as Kinds>::revision(record);
             if !held.contains_key(&epoch) {
-                let key = self.env.open_key(record)?;
+                let key = self.env.open_key(record, &facts.answers)?;
                 self.env.store_key(&facts.collection, epoch, &key)?;
-                return Ok(Step::Stored { epoch });
+                return Ok(Step::Stored { epoch, revision });
             }
             let mut next = facts.clone();
             next.install(revision);
@@ -271,13 +311,16 @@ impl<E: Environment> Reconciler<E> {
         Ok(Step::Nothing)
     }
 
-    /// Row 8's candidate: on the head, from the installed record's members.
+    /// Row 8's candidate: on the head, from the installed record's members, at the head's epoch
+    /// plus one with a freshly drawn key.
     fn build(
         &self,
         view: &View<'_, E::Kinds>,
         now: TimestampMs,
     ) -> Result<Candidate<RecordOf<E>>, MembershipError> {
-        let desired = view.desired();
+        // The last epoch or revision a counter holds has no successor: nothing is drawn or
+        // recorded for a candidate that could never follow it.
+        let desired = view.desired().ok_or(MembershipError::Exhausted)?;
         let members: Vec<MemberOf<E>> = desired.members.iter().copied().collect();
         let key = if desired.same_epoch {
             self.env
@@ -447,7 +490,9 @@ impl<E: Environment> Reconciler<E> {
         if revision <= facts.head {
             return Ok(());
         }
-        if revision != facts.head + 1 || <E::Kinds as Kinds>::revision(record) != revision {
+        if facts.head.checked_add(1) != Some(revision)
+            || <E::Kinds as Kinds>::revision(record) != revision
+        {
             return Err(MembershipError::BrokenChain);
         }
         let mark = self.env.mark_of(record);
@@ -478,36 +523,48 @@ impl<E: Environment> Reconciler<E> {
         };
         let before = facts.outcomes.len();
         let mut next = facts.clone();
-        match self
+        let ended = match self
             .env
             .records_after(&facts.collection, facts.head)
             .await?
         {
             // Before its first record applies, a collection this device starts does not exist
             // at the service yet, which is no answer about this device's membership.
-            KeyRecords::Absent if facts.head == 0 => {}
-            KeyRecords::Absent => {
-                next.leave();
-                self.commit(before, next)?;
-                return Ok(Refreshed::Left);
-            }
+            KeyRecords::Absent if facts.head == 0 => None,
+            KeyRecords::Absent => Some(Refreshed::Left),
             KeyRecords::Records(records) => {
+                let mut broken = None;
                 for record in records {
-                    let expected = next.head + 1;
-                    if <E::Kinds as Kinds>::revision(&record) != expected
-                        || !self.links(&next, &record)
-                    {
+                    let follows = next.head.checked_add(1)
+                        == Some(<E::Kinds as Kinds>::revision(&record))
+                        && self.links(&next, &record);
+                    if !follows {
                         // An answer, not a failed fetch: a chain this device cannot follow from
                         // the revision it holds. It accepts nothing and waits for a rejoin.
-                        let mut left = facts.clone();
-                        left.leave();
-                        self.commit(before, left)?;
-                        return Ok(Refreshed::BrokenChain);
+                        broken = Some(Refreshed::BrokenChain);
+                        break;
                     }
                     let mark = self.env.mark_of(&record);
                     next.push(record, mark);
                 }
+                broken
             }
+        };
+        if let Some(ended) = ended {
+            // A dispatched candidate is settled before anything else, leaving included: row 1
+            // settles its request by status and fence, and the candidate fences publication
+            // meanwhile. The next refresh, with nothing in flight, leaves.
+            if facts
+                .candidate
+                .as_ref()
+                .is_some_and(|candidate| candidate.dispatched.is_some())
+            {
+                return Ok(Refreshed::SettleFirst);
+            }
+            let mut left = facts.clone();
+            left.leave();
+            self.commit(before, left)?;
+            return Ok(ended);
         }
         next.answers = <E::Kinds as Kinds>::refreshed(&next.answers, fresh);
         next.unfetched.clear();
@@ -548,11 +605,24 @@ impl<E: Environment> Reconciler<E> {
         Ok(())
     }
 
-    /// The owner confirmed an addition. An addition of a device whose removal is pending, or
-    /// beside another pending addition, is refused and reported (I3).
-    pub(crate) fn add(&mut self, member: MemberOf<E>) -> Result<Ended, MembershipError> {
+    /// The owner confirmed an addition, planned for this collection at this epoch. An addition of
+    /// a device whose removal is pending, or beside another pending addition, is refused and
+    /// reported (I3).
+    ///
+    /// The plan's collection and epoch are checked under the same hold of the lock that records
+    /// the addition, so no other operation can move the collection on in between.
+    pub(crate) fn add(
+        &mut self,
+        member: MemberOf<E>,
+        collection: CollectionRef,
+        epoch: u64,
+    ) -> Result<Ended, MembershipError> {
         let _guard = self.env.lock()?;
         let facts = self.member_facts()?;
+        let current = facts.installed_record().map(<E::Kinds as Kinds>::epoch);
+        if facts.collection != collection || current != Some(epoch) {
+            return Err(PlanRefusal::Stale.into());
+        }
         if facts
             .installed_record()
             .is_some_and(|record| <E::Kinds as Kinds>::lists(record, &member))
@@ -604,13 +674,9 @@ impl<E: Environment> Reconciler<E> {
         let _guard = self.env.lock()?;
         let previous = self.load()?;
         if let Some(facts) = &previous {
-            if !facts.out {
-                return Err(MembershipError::AlreadyMember);
-            }
-            // The keys of the membership that ended go before the one that starts.
-            for epoch in self.held(facts)?.keys() {
-                self.env.forget_key(&facts.collection, *epoch)?;
-            }
+            // The keys of the membership that ended are forgotten, a step each, before the one
+            // that starts is recorded.
+            self.may_replace(facts)?;
         }
         let fresh = self
             .env
@@ -628,8 +694,8 @@ impl<E: Environment> Reconciler<E> {
         }
         for pair in chain.windows(2) {
             if let [before, after] = pair
-                && (<E::Kinds as Kinds>::revision(after)
-                    != <E::Kinds as Kinds>::revision(before) + 1
+                && (Some(<E::Kinds as Kinds>::revision(after))
+                    != <E::Kinds as Kinds>::revision(before).checked_add(1)
                     || !self.env.follows(before, after))
             {
                 return Err(MembershipError::BrokenChain);
