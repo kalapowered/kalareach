@@ -531,7 +531,11 @@ async fn attend<H: RoomHost>(
         }
         // The socket ended, or never opened. An invitation that ended meanwhile ends the relay
         // now; one still on offer is attached again after the pause.
+        #[cfg(test)]
+        probe::mark(probe::Moment::SocketEnded);
         watch.on_offer().await?;
+        #[cfg(test)]
+        probe::mark(probe::Moment::PauseBegan);
         watch.until(tokio::time::sleep(REATTACH_DELAY)).await?;
     }
 }
@@ -576,8 +580,10 @@ impl<H: RoomHost> Watch<H> {
     async fn until<F: Future>(&mut self, future: F) -> Result<F::Output, Ended> {
         tokio::pin!(future);
         loop {
+            // In this order: an invitation the owner ended takes nothing more from the room, not
+            // even what is already waiting, and a due recheck is asked before anything else.
             tokio::select! {
-                output = &mut future => return Ok(output),
+                biased;
                 changed = self.stop.changed() => {
                     return Err(match changed {
                         Ok(()) => Ended::Finished,
@@ -585,6 +591,7 @@ impl<H: RoomHost> Watch<H> {
                     });
                 }
                 _ = self.recheck.tick() => self.offered().await?,
+                output = &mut future => return Ok(output),
             }
         }
     }
@@ -621,13 +628,14 @@ impl<H: RoomHost> Watch<H> {
     }
 
     /// Runs one room step on a blocking thread: it takes the invitation's lock, which a durable
-    /// write may be holding. The pairing service being gone ends the invitation.
+    /// write may be holding. The pairing service being gone ends the invitation, as
+    /// [`Self::let_go`] says.
     async fn step(
         &self,
         attempt_id: AttemptId,
         message: RendezvousMessage,
     ) -> Result<Vec<ClientFrame>, Ended> {
-        let pairing = self.host.upgrade().ok_or(Ended::Over)?;
+        let pairing = self.host.upgrade().ok_or_else(|| self.let_go())?;
         let invitation_id = self.invitation_id;
         Ok(tokio::task::spawn_blocking(move || {
             pairing.room_step(invitation_id, attempt_id, message)
@@ -637,9 +645,9 @@ impl<H: RoomHost> Watch<H> {
     }
 
     /// Ends one attempt under the invitation's lock. The pairing service being gone ends the
-    /// invitation.
+    /// invitation, as [`Self::let_go`] says.
     async fn abort(&self, attempt_id: AttemptId) -> Result<(), Ended> {
-        let pairing = self.host.upgrade().ok_or(Ended::Over)?;
+        let pairing = self.host.upgrade().ok_or_else(|| self.let_go())?;
         let invitation_id = self.invitation_id;
         let _ = tokio::task::spawn_blocking(move || pairing.room_abort(invitation_id, attempt_id))
             .await;
@@ -716,6 +724,8 @@ async fn last_frames(socket: &mut RoomSocket, replies: Vec<ClientFrame>) {
             _ => None,
         })
         .collect();
+    #[cfg(test)]
+    probe::mark(probe::Moment::AcknowledgementBegan);
     let _ = tokio::time::timeout(CLOSE_ACKNOWLEDGEMENT, async {
         for reply in replies {
             if socket.outgoing.send(reply).await.is_err() {
@@ -753,8 +763,52 @@ async fn release(service: &Arc<dyn Rendezvous>, ticket: &RoomTicket) {
     .await;
 }
 
+/// The moments a relay's tests measure its own bounded waits from, marked by the relay itself on
+/// its own task as each wait begins.
+#[cfg(test)]
+pub(crate) mod probe {
+    use std::sync::{Mutex, PoisonError};
+    use std::time::Instant;
+
+    /// A moment in a relay's life.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Moment {
+        /// A socket ended, or failed to open, and the relay is about to ask the host.
+        SocketEnded,
+        /// The pause before attaching again begins.
+        PauseBegan,
+        /// The bound on an ended invitation's last frames begins.
+        AcknowledgementBegan,
+    }
+
+    static MARKED: Mutex<Vec<(tokio::task::Id, Moment, Instant)>> = Mutex::new(Vec::new());
+
+    /// Marks `moment` for the task running now.
+    pub(crate) fn mark(moment: Moment) {
+        if let Some(task) = tokio::task::try_id() {
+            MARKED.lock().unwrap_or_else(PoisonError::into_inner).push((
+                task,
+                moment,
+                Instant::now(),
+            ));
+        }
+    }
+
+    /// When `task` marked `moment`, each time it did.
+    pub(crate) fn marked(task: tokio::task::Id, moment: Moment) -> Vec<Instant> {
+        MARKED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(by, marked, _)| *by == task && *marked == moment)
+            .map(|(_, _, at)| *at)
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::probe::{Moment, marked};
     use super::*;
     use kr_protocol::scalars::{Nonce256, Uuid};
     use std::time::Instant;
@@ -927,7 +981,7 @@ mod tests {
         replies: Vec<ClientFrame>,
         on_step: OnStep,
         answers: std::sync::Mutex<Vec<(Instant, RoomOffer)>>,
-        gate: Gate,
+        gate: Arc<Gate>,
     }
 
     impl TestHost {
@@ -937,7 +991,7 @@ mod tests {
                 replies,
                 on_step,
                 answers: std::sync::Mutex::new(Vec::new()),
-                gate: Gate::default(),
+                gate: Arc::new(Gate::default()),
             })
         }
 
@@ -958,27 +1012,6 @@ mod tests {
                 .iter()
                 .find(|(at, given)| *given == answer && *at > after)
                 .map(|(at, _)| *at)
-        }
-
-        /// Waits for the host's first answer after `after`, and returns when it was given.
-        async fn next_answer(&self, after: Instant) -> Instant {
-            tokio::time::timeout(WATCHDOG, async {
-                loop {
-                    let first = self
-                        .answers
-                        .lock()
-                        .expect("the answers")
-                        .iter()
-                        .find(|(at, _)| *at > after)
-                        .map(|(at, _)| *at);
-                    if let Some(at) = first {
-                        return at;
-                    }
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-            })
-            .await
-            .expect("the relay asks the host")
         }
     }
 
@@ -1246,16 +1279,21 @@ mod tests {
             let host = TestHost::new(Vec::new(), OnStep::Keeps);
             let service = TestService::new(8);
             let (relay, _stop) = relaying(&host, &service).await;
+            let task = relay.id();
             host.end();
-            let hung_up = Instant::now();
             service.hang_up();
             finished(relay).await;
-            if host.answered(RoomOffer::Lapsed, hung_up).is_none() {
-                // A recheck between the two found the end before the socket ended.
+            // The relay marks the socket's end before it asks the host. A recheck that found the
+            // end first releases without that mark, and proves nothing about the socket's end.
+            let Some(ended) = marked(task, Moment::SocketEnded).first().copied() else {
                 continue;
-            }
+            };
+            assert!(
+                host.answered(RoomOffer::Lapsed, ended).is_some(),
+                "the host was asked as the socket ended"
+            );
             assert_eq!(service.released(), 1);
-            let late = service.released_at().duration_since(hung_up);
+            let late = service.released_at().duration_since(ended);
             assert!(late <= SLACK, "released {late:?} after the socket ended");
             assert_eq!(
                 service.attached().len(),
@@ -1274,10 +1312,8 @@ mod tests {
         let host = TestHost::new(Vec::new(), OnStep::Keeps);
         let service = TestService::new(8);
         let (relay, _stop) = relaying(&host, &service).await;
-        let closed = Instant::now();
+        let task = relay.id();
         service.close_socket().await;
-        // The relay asks the host as the socket ends, and pauses only after the answer.
-        let asked = host.next_answer(closed).await;
         tokio::time::timeout(WATCHDOG, async {
             while service.attached().len() < 2 {
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -1285,7 +1321,10 @@ mod tests {
         })
         .await
         .expect("the relay attaches again");
-        let paused = service.attached()[1].duration_since(asked);
+        let began = *marked(task, Moment::PauseBegan)
+            .first()
+            .expect("the relay paused");
+        let paused = service.attached()[1].duration_since(began);
         assert!(
             paused >= REATTACH_DELAY && paused <= REATTACH_DELAY + SLACK,
             "attached again {paused:?} after the pause began"
@@ -1304,9 +1343,15 @@ mod tests {
         let host = TestHost::new(Vec::new(), OnStep::Keeps);
         let service = TestService::new(8);
         let (relay, stop) = relaying(&host, &service).await;
-        let closed = Instant::now();
+        let task = relay.id();
         service.close_socket().await;
-        host.next_answer(closed).await;
+        tokio::time::timeout(WATCHDOG, async {
+            while marked(task, Moment::PauseBegan).is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the relay pauses");
         let stopped = Instant::now();
         stop.send(true).expect("the relay listens");
         finished(relay).await;
@@ -1345,23 +1390,21 @@ mod tests {
         let host = TestHost::new(closes(8), OnStep::Lapses);
         let service = TestService::new(1);
         let (relay, _stop) = relaying(&host, &service).await;
-        let delivered = Instant::now();
+        let task = relay.id();
         deliver(&service).await;
         finished(relay).await;
         assert_eq!(service.released(), 1);
-        // The host's answer that the step ended the invitation is the last thing before the bound
-        // begins.
-        let answered = host
-            .answered(RoomOffer::Lapsed, delivered)
-            .expect("the host said the step ended it");
-        let held = service.released_at().duration_since(answered);
+        let began = *marked(task, Moment::AcknowledgementBegan)
+            .first()
+            .expect("the relay began its last frames");
+        let held = service.released_at().duration_since(began);
         assert!(
             held >= CLOSE_ACKNOWLEDGEMENT,
             "the room's acknowledgement is awaited for the whole bound, and it was {held:?}"
         );
         assert!(
             held <= CLOSE_ACKNOWLEDGEMENT + SLACK,
-            "released {held:?} after the host said the step ended it"
+            "released {held:?} after the bound began"
         );
     }
 
@@ -1410,6 +1453,38 @@ mod tests {
         finished(relay).await;
         let late = answered.elapsed();
         assert!(late <= SLACK, "ended {late:?} after the host answered");
+        assert_eq!(service.released(), 1, "released once, by the owner");
+    }
+
+    /// An invitation the owner ended, with a candidate's message still waiting on the socket, is
+    /// not released again when the pairing service goes too: the owner's stop is taken before
+    /// anything waiting, and a relay that finds the service gone releases only an invitation the
+    /// owner never ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_invitation_the_owner_ended_is_not_released_again_when_its_host_goes() {
+        let host = TestHost::new(Vec::new(), OnStep::Keeps);
+        let service = TestService::new(8);
+        let (relay, stop) = relaying(&host, &service).await;
+        let gate = Arc::clone(&host.gate);
+        gate.shut();
+        tokio::time::timeout(WATCHDOG, async {
+            while gate.waiting() == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the relay asks the host");
+        // While the relay waits for its answer: a message arrives, the owner ends the invitation
+        // and releases the locator, and the pairing service goes.
+        deliver(&service).await;
+        stop.send(true).expect("the relay listens");
+        let ticket = ticket();
+        service
+            .release_locator(&ticket.origin, &ticket.locator, &ticket.control_token)
+            .expect("released");
+        drop(host);
+        gate.open();
+        finished(relay).await;
         assert_eq!(service.released(), 1, "released once, by the owner");
     }
 

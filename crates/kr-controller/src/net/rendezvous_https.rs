@@ -31,7 +31,11 @@
 //! 5. A success that is not the answer to the operation asked is a configuration error: whatever
 //!    answered does not speak this contract.
 
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -50,7 +54,7 @@ use kr_transport::listener::BoxFuture;
 use rustls_platform_verifier::BuilderVerifierExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
@@ -87,6 +91,11 @@ const ROOM_QUEUE: usize = 16;
 
 /// How long a socket may take to close once its pump is done with it.
 const CLOSE_DEADLINE: Duration = Duration::from_secs(1);
+
+/// The most of a room's answer to the upgrade that is read before its head is complete.
+///
+/// A real answer's head is a few hundred bytes.
+pub const MAX_UPGRADE_ANSWER_BYTES: usize = 16 * 1024;
 
 /// The rendezvous service a deployed host reaches over HTTPS.
 ///
@@ -211,7 +220,7 @@ async fn open_room(
     origin: &RendezvousOrigin,
     locator: &Locator,
     token: &str,
-) -> kr_pairing::Result<WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>> {
+) -> kr_pairing::Result<WebSocketStream<UpgradeGuard<tokio_rustls::client::TlsStream<TcpStream>>>> {
     let authority = origin
         .as_str()
         .strip_prefix("https://")
@@ -245,10 +254,151 @@ async fn open_room(
         .map_err(|_| configuration("the control token header cannot be sent"))?
         .limits(Limits::default().max_payload_len(Some(MAX_FRAME_BYTES)));
     let (socket, _) = builder
-        .connect_on(stream)
+        .connect_on(UpgradeGuard::new(stream))
         .await
         .map_err(|error| unreachable("did not accept the host", &error))?;
     Ok(socket)
+}
+
+/// A room socket's stream, which holds the room's answer to the upgrade back until it is whole and
+/// safe to parse.
+///
+/// The WebSocket library reads an answer's head for as long as it is incomplete, however long it
+/// grows, and decodes `Sec-WebSocket-Accept` into a digest's twenty bytes on the assumption that
+/// the value fits. So the answer is read here first, into a buffer of at most
+/// [`MAX_UPGRADE_ANSWER_BYTES`], and handed on only once its head is complete and every accept
+/// value in it is one SHA-1 digest in base64; anything else is an error of the stream, which ends
+/// the attachment. After the head, reads and writes go straight to the stream.
+pub struct UpgradeGuard<S> {
+    stream: S,
+    answer: Answered,
+}
+
+/// How far the room's answer to the upgrade has come.
+enum Answered {
+    /// Its head is still arriving.
+    Reading(Vec<u8>),
+    /// Its head was whole and acceptable: what was read is being handed on, from `at`.
+    Handing { read: Vec<u8>, at: usize },
+    /// Everything read ahead has been handed on.
+    Through,
+}
+
+impl<S> UpgradeGuard<S> {
+    const fn new(stream: S) -> Self {
+        Self {
+            stream,
+            answer: Answered::Reading(Vec::new()),
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for UpgradeGuard<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        loop {
+            match &mut this.answer {
+                Answered::Through => return Pin::new(&mut this.stream).poll_read(cx, buf),
+                Answered::Handing { read, at } => {
+                    let count = (read.len() - *at).min(buf.remaining());
+                    buf.put_slice(&read[*at..*at + count]);
+                    *at += count;
+                    if *at == read.len() {
+                        this.answer = Answered::Through;
+                    }
+                    return Poll::Ready(Ok(()));
+                }
+                Answered::Reading(head) => {
+                    let mut chunk = [0; 1024];
+                    let room = (MAX_UPGRADE_ANSWER_BYTES - head.len()).min(chunk.len());
+                    let mut into = ReadBuf::new(&mut chunk[..room]);
+                    ready!(Pin::new(&mut this.stream).poll_read(cx, &mut into))?;
+                    if into.filled().is_empty() {
+                        // The room ended the stream part way through its answer, which the
+                        // library reads as the end it is.
+                        return Poll::Ready(Ok(()));
+                    }
+                    head.extend_from_slice(into.filled());
+                    if let Some(end) = head.windows(4).position(|window| window == b"\r\n\r\n") {
+                        check_upgrade_head(&head[..end + 4])?;
+                        let read = std::mem::take(head);
+                        this.answer = Answered::Handing { read, at: 0 };
+                    } else if head.len() >= MAX_UPGRADE_ANSWER_BYTES {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "the room's answer to the upgrade is longer than an answer may be",
+                        )));
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for UpgradeGuard<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+    }
+}
+
+/// Refuses an answer carrying a `Sec-WebSocket-Accept` that is anything but one SHA-1 digest in
+/// padded base64, on whichever line it appears: the value is decoded into twenty bytes, and a
+/// longer one does not fit. A value is measured from after its leading spaces to the end of its
+/// line, so one the library would read shorter is measured at least as long here.
+fn check_upgrade_head(head: &[u8]) -> io::Result<()> {
+    for line in head.split(|byte| *byte == b'\n') {
+        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+            continue;
+        };
+        if !line[..colon]
+            .trim_ascii()
+            .eq_ignore_ascii_case(b"sec-websocket-accept")
+        {
+            continue;
+        }
+        let value = line[colon + 1..].trim_ascii_start();
+        let value = value.strip_suffix(b"\r").unwrap_or(value);
+        let digest = value.len() == 28
+            && value[27] == b'='
+            && value[..27]
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'));
+        if !digest {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the room's answer to the upgrade carries an accept value that is no SHA-1 digest",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Splits an origin's authority into its host, without an IPv6 literal's brackets, and its port.
@@ -285,11 +435,25 @@ where
     RoomSocket { outgoing, incoming }
 }
 
+/// A frame the room sent, and the wait for the relay to have room for it.
+type Delivery = (
+    ServiceFrame,
+    Pin<
+        Box<
+            dyn Future<Output = Result<mpsc::OwnedPermit<ServiceFrame>, mpsc::error::SendError<()>>>
+                + Send,
+        >,
+    >,
+);
+
 /// Carries frames between one room socket and its relay until either lets go.
 ///
-/// The socket is read only while no frame it delivered waits for the relay, and the relay's own
-/// frames are taken whenever it has one, so a relay busy sending is never held up by frames it
-/// has not read yet. A frame of the room's that this host cannot read ends the socket.
+/// Both directions move in the one task, each as far as it can: the room's frames are read and
+/// delivered while the relay's wait to be written, and the relay's are taken and written while
+/// the room's wait for the relay. A frame the room sent waits here until the relay has room for
+/// it, and the socket is read no further meanwhile, which is the room's backpressure; the socket
+/// takes the relay's next frame only when it can accept one, which is the relay's. A frame of the
+/// room's that this host cannot read ends the socket.
 async fn carry<S>(
     mut socket: WebSocketStream<S>,
     to_relay: mpsc::Sender<ServiceFrame>,
@@ -297,42 +461,78 @@ async fn carry<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut waiting = None;
-    loop {
-        tokio::select! {
-            permit = to_relay.reserve(), if waiting.is_some() => {
-                let Ok(permit) = permit else { break };
-                if let Some(frame) = waiting.take() {
-                    permit.send(frame);
+    let relay_gone = to_relay.closed();
+    tokio::pin!(relay_gone);
+    let mut delivering: Option<Delivery> = None;
+    let mut unflushed = false;
+    std::future::poll_fn(|cx| {
+        loop {
+            if relay_gone.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(());
+            }
+            let mut moved = false;
+            if let Some((_, room)) = &mut delivering {
+                match room.as_mut().poll(cx) {
+                    Poll::Ready(Ok(permit)) => {
+                        if let Some((frame, _)) = delivering.take() {
+                            permit.send(frame);
+                        }
+                        moved = true;
+                    }
+                    Poll::Ready(Err(_)) => return Poll::Ready(()),
+                    Poll::Pending => {}
                 }
             }
-            message = socket.next(), if waiting.is_none() => match message {
-                Some(Ok(message)) if message.is_binary() => {
-                    match decode_service_frame(message.as_payload()) {
-                        Ok(frame) => waiting = Some(frame),
-                        Err(_) => break,
+            if delivering.is_none() {
+                match socket.poll_next_unpin(cx) {
+                    Poll::Ready(Some(Ok(message))) if message.is_binary() => {
+                        let Ok(frame) = decode_service_frame(message.as_payload()) else {
+                            return Poll::Ready(());
+                        };
+                        delivering = Some((frame, Box::pin(to_relay.clone().reserve_owned())));
+                        moved = true;
                     }
+                    // The library answers a ping itself.
+                    Poll::Ready(Some(Ok(message))) if message.is_ping() || message.is_pong() => {
+                        moved = true;
+                    }
+                    // Text is no frame of the room's, and a close, an error or the end ends it.
+                    Poll::Ready(_) => return Poll::Ready(()),
+                    Poll::Pending => {}
                 }
-                // The library answers a ping itself.
-                Some(Ok(message)) if message.is_ping() || message.is_pong() => {}
-                // Text is no frame of the room's, and a close, an error or the end ends it.
-                Some(Ok(_) | Err(_)) | None => break,
-            },
-            frame = from_relay.recv() => {
-                let Some(frame) = frame else { break };
-                let Ok(bytes) = encode_frame(&frame) else { break };
-                tokio::select! {
-                    sent = socket.send(Message::binary(bytes)) => {
-                        if sent.is_err() {
-                            break;
+            }
+            match socket.poll_ready_unpin(cx) {
+                Poll::Ready(Ok(())) => match from_relay.poll_recv(cx) {
+                    Poll::Ready(Some(frame)) => {
+                        let Ok(bytes) = encode_frame(&frame) else {
+                            return Poll::Ready(());
+                        };
+                        if socket.start_send_unpin(Message::binary(bytes)).is_err() {
+                            return Poll::Ready(());
                         }
+                        unflushed = true;
+                        moved = true;
                     }
-                    () = to_relay.closed() => break,
+                    Poll::Ready(None) => return Poll::Ready(()),
+                    Poll::Pending => {}
+                },
+                Poll::Ready(Err(_)) => return Poll::Ready(()),
+                Poll::Pending => {}
+            }
+            if unflushed {
+                match socket.poll_flush_unpin(cx) {
+                    Poll::Ready(Ok(())) => unflushed = false,
+                    Poll::Ready(Err(_)) => return Poll::Ready(()),
+                    Poll::Pending => {}
                 }
+            }
+            if !moved {
+                return Poll::Pending;
             }
         }
-    }
-    if let Some(frame) = waiting {
+    })
+    .await;
+    if let Some((frame, _)) = delivering {
         let _ = tokio::time::timeout(CLOSE_DEADLINE, to_relay.send(frame)).await;
     }
     let _ = tokio::time::timeout(CLOSE_DEADLINE, socket.close()).await;
@@ -389,9 +589,15 @@ struct ReleaseRequest<'a> {
 struct ReserveAnswer {
     reserved: bool,
     /// The expiry the service stored, after clamping. The host's own deadline is authoritative,
-    /// so it is read only to check that it is a decimal counter.
-    #[serde(default)]
+    /// so it is read only to check that it is a decimal counter. Absent is not `null`.
+    #[serde(default, deserialize_with = "text")]
     advertised_expires_at_ms: Option<String>,
+}
+
+/// Reads a member that is text when it is present: an explicit `null` is not the member being
+/// absent.
+fn text<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
 }
 
 /// A release's answer.
@@ -561,6 +767,7 @@ fn configuration(reason: impl std::fmt::Display) -> PairingError {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, SocketAddr};
+    use std::time::Instant;
 
     use kr_protocol::ids::AttemptId;
     use kr_protocol::invitation::RendezvousMessage;
@@ -692,6 +899,10 @@ mod tests {
                 r#"{"ok":true,"data":{"reserved":true,"advertised_expires_at_ms":"1","more":1}}"#,
             ),
             (200, r#"{"ok":true,"data":{"released":true}}"#),
+            (
+                200,
+                r#"{"ok":true,"data":{"reserved":false,"advertised_expires_at_ms":null}}"#,
+            ),
             (503, r#"{"ok":true,"data":{"reserved":false}}"#),
         ] {
             assert_eq!(
@@ -1060,6 +1271,127 @@ mod tests {
             attached.expect_err("refused").code(),
             ErrorCode::RendezvousUnavailable
         );
+    }
+
+    /// Takes the next connection's TLS, reads the host's upgrade request, and answers it with
+    /// `answer`, as a room that does not speak the upgrade properly would.
+    async fn answer_upgrade(room: &LoopbackRoom, answer: Vec<u8>) {
+        let (stream, _) = room.listener.accept().await.expect("a connection");
+        let mut stream = room.acceptor.accept(stream).await.expect("TLS");
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(stream.read_u8().await.expect("the request"));
+        }
+        // The host may stop reading part way through, which ends this write.
+        let _ = stream.write_all(&answer).await;
+        let _ = stream.flush().await;
+        // Held open, so the host's side of the answer is decided by what it read.
+        let _ = tokio::time::timeout(WATCHDOG, stream.read_u8()).await;
+    }
+
+    /// An answer to the upgrade whose head never ends is refused once it reaches its bound, well
+    /// before the attachment's deadline, rather than held for as long as it keeps arriving.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_answer_to_the_upgrade_that_never_ends_is_refused_at_its_bound() {
+        let authority = Authority::new("rendezvous test authority");
+        let room = LoopbackRoom::start(&authority).await;
+        let client = authority.trusted_by();
+        let mut answer = b"HTTP/1.1 101 Switching Protocols\r\nX-Padding: ".to_vec();
+        answer.resize(answer.len() + 1024 * 1024, b'a');
+        let attempted = Instant::now();
+        let (attached, ()) = tokio::time::timeout(WATCHDOG, async {
+            tokio::join!(
+                client.attach(&room.origin, &locator(), &SymmetricKey::from_bytes([5; 32])),
+                answer_upgrade(&room, answer)
+            )
+        })
+        .await
+        .expect("the attempt ends");
+        assert_eq!(
+            attached.expect_err("an answer that never ends").code(),
+            ErrorCode::RendezvousUnavailable
+        );
+        let took = attempted.elapsed();
+        assert!(
+            took < ATTACH_DEADLINE / 2,
+            "refused {took:?} after the attempt began, at the bound rather than the deadline"
+        );
+    }
+
+    /// An answer whose accept value is longer than a SHA-1 digest is refused as an error, and the
+    /// relay that asked goes on, rather than the WebSocket library failing on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_accept_value_longer_than_a_digest_is_refused() {
+        let authority = Authority::new("rendezvous test authority");
+        let room = LoopbackRoom::start(&authority).await;
+        let client = authority.trusted_by();
+        let answer = concat!(
+            "HTTP/1.1 101 Switching Protocols\r\n",
+            "Upgrade: websocket\r\n",
+            "Connection: Upgrade\r\n",
+            "Sec-WebSocket-Accept: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n",
+            "\r\n"
+        );
+        let (attached, ()) = tokio::time::timeout(WATCHDOG, async {
+            tokio::join!(
+                client.attach(&room.origin, &locator(), &SymmetricKey::from_bytes([5; 32])),
+                answer_upgrade(&room, answer.as_bytes().to_vec())
+            )
+        })
+        .await
+        .expect("the attempt ends");
+        assert_eq!(
+            attached.expect_err("no digest").code(),
+            ErrorCode::RendezvousUnavailable
+        );
+    }
+
+    /// While the socket can take no more of the relay's frames, the room's frames still reach the
+    /// relay: neither direction waits for the other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_rooms_frames_reach_the_relay_while_the_socket_can_take_no_more() {
+        let authority = Authority::new("rendezvous test authority");
+        let room = LoopbackRoom::start(&authority).await;
+        let client = authority.trusted_by();
+        let (attached, (_, _, mut end)) = tokio::time::timeout(WATCHDOG, async {
+            tokio::join!(
+                client.attach(&room.origin, &locator(), &SymmetricKey::from_bytes([5; 32])),
+                room.attached()
+            )
+        })
+        .await
+        .expect("the host attaches");
+        let mut socket = attached.expect("attached");
+        let attempt_id = AttemptId::new(Uuid::from_bytes([7; 16]));
+
+        // The room reads nothing, and the relay sends until the socket takes no more.
+        let large = ClientFrame::Relay {
+            attempt_id,
+            payload: Bytes::new(vec![0; super::super::rendezvous::MAX_FRAME_PAYLOAD_BYTES]),
+        };
+        tokio::time::timeout(WATCHDOG, async {
+            loop {
+                match socket.outgoing.try_send(large.clone()) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        if socket.outgoing.capacity() == 0 {
+                            return;
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => panic!("the pump ended"),
+                }
+            }
+        })
+        .await
+        .expect("the socket fills");
+
+        let opened = ServiceFrame::AttemptOpened { attempt_id };
+        send(&mut end, &opened).await;
+        let delivered = tokio::time::timeout(Duration::from_secs(5), socket.incoming.recv())
+            .await
+            .expect("delivered while the relay's frames wait");
+        assert_eq!(delivered, Some(opened));
     }
 
     /// A frame of the room's that this host cannot read ends the socket, rather than being passed
