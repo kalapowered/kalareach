@@ -33,6 +33,7 @@ use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::account::{MembershipLease, MembershipLeasePayload, TeamRole};
 use kr_protocol::actor::ActorIngress;
+use kr_protocol::authority::{CapabilityRequirement, EffectClass};
 use kr_protocol::grant::{
     EnvironmentSelector, Grant, GrantExpiry, HistoryScope, OrganisationRequirement, SessionSelector,
 };
@@ -40,7 +41,7 @@ use kr_protocol::ids::{
     AccountId, AuthorityRevision, BuildId, DeviceId, EnvironmentId, GrantId, OrganisationId,
     PolicyKeyRevision, RevocationRequestId, SessionId,
 };
-use kr_protocol::method::Method;
+use kr_protocol::method::{Method, lookup};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Nullable, Signature64, TimestampMs, Uuid};
 use kr_protocol::sharing::{MembershipRefusal, OfflineValidityPolicy};
@@ -612,6 +613,10 @@ fn revoking_a_parent_revokes_every_descendant() {
 // KR-REQ-10.41: the vocabulary, and capabilities never becoming authority
 // ---------------------------------------------------------------------------------------------
 
+/// KR-REQ-06.10: a capability is evidence and never permission. A decision takes no capability at
+/// all: `input.write`, which asks for terminal-input capability evidence, is refused to a grant
+/// without the terminal-input right, and `plugin.capabilities`, a read that asks for package
+/// evidence and names no right, is refused outside the environments the grant's scope admits.
 #[test]
 fn a_method_is_decided_from_the_registry_table_and_never_from_a_capability() {
     // The table is the registry's. Writing input needs terminal input; reading a session does not.
@@ -640,6 +645,39 @@ fn a_method_is_decided_from_the_registry_table_and_never_from_a_capability() {
         Refusal::MissingRight {
             right: ActionRight::TerminalInput
         }
+    );
+
+    // A read that asks for capability evidence is still a scoped read: inside the grant's
+    // environments it is permitted, and outside them it is refused.
+    assert!(matches!(
+        lookup("plugin.capabilities").map(|entry| (entry.effect, entry.capability)),
+        Some((EffectClass::Read, CapabilityRequirement::Required { .. }))
+    ));
+    let inside = AccessRequest {
+        session_id: None,
+        ..request(Method::PluginCapabilities, 5_000)
+    };
+    let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
+    assert!(
+        decide(
+            &viewer,
+            &record(viewer.clone()),
+            &mut policy,
+            inside.clone()
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        decide(
+            &viewer,
+            &record(viewer.clone()),
+            &mut policy,
+            AccessRequest {
+                environment_id: environment_id(0xe1),
+                ..inside
+            },
+        ),
+        Err(Refusal::EnvironmentOutsideGrant)
     );
 
     // Every right in the vocabulary is spelt the way the wire spells it, and resolves back.
