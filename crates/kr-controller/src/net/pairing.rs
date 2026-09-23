@@ -1093,15 +1093,22 @@ impl PairingSurface for PairingHost {
 /// Runs one owner-driven write of an invitation with the mutation's admission asked inside the
 /// write's own transaction, and reports a lapse as the lapse it is.
 ///
-/// A lapse is final: a withdrawn registration is not restored and a passed deadline does not come
-/// back, so asking once more after a refused write says whether the refusal was the lapse.
+/// Only a refusal is reinterpreted. The store refused before writing anything, which is what an
+/// admission that lapsed inside the write looks like, and a lapse is final: a withdrawn
+/// registration is not restored and a passed deadline does not come back, so asking once more
+/// says whether the refusal was the lapse. Every other failure is reported as it happened; a failed
+/// write in particular is a write of unknown outcome, whatever the admission says by now.
 fn admitted<T>(
     slot: &WriteAdmission,
     admission: &Admission,
     call: impl FnOnce() -> kr_pairing::Result<T>,
 ) -> Result<T> {
-    slot.during(admission, call)
-        .map_err(|error| admission().err().unwrap_or_else(|| refusal(error)))
+    slot.during(admission, call).map_err(|error| match error {
+        kr_pairing::PairingError::Refused { .. } => {
+            admission().err().unwrap_or_else(|| refusal(error))
+        }
+        other => refusal(other),
+    })
 }
 
 /// Returns the kr-pairing grant kind a protocol kind names.
@@ -1220,4 +1227,61 @@ pub fn fresh_identities(
         recipient_device_id: DeviceId::new(kr_ipc::new_uuid()),
         authority_revision,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// An admission that holds for its first `holds` askings and has lapsed from then on.
+    fn lapsing_after(holds: usize) -> Admission {
+        let asked = Arc::new(AtomicUsize::new(0));
+        Arc::new(move || {
+            if asked.fetch_add(1, Ordering::SeqCst) < holds {
+                Ok(())
+            } else {
+                Err(ControllerError::WindowExpired {
+                    detail: "the deadline passed".to_owned(),
+                })
+            }
+        })
+    }
+
+    /// KR-REQ-10.05: a write that failed is reported as a failure even when the admission lapses
+    /// before the failure is reported. Its outcome is unknown, and a refusal would say nothing was
+    /// written.
+    #[test]
+    fn a_failed_write_is_not_reported_as_the_admission_lapsing() {
+        let slot = WriteAdmission::default();
+        let admission = lapsing_after(1);
+        let failed = admitted::<()>(&slot, &admission, || {
+            admission().expect("admitted inside the write");
+            Err(kr_pairing::PairingError::Store {
+                reason: "the disk is full".to_owned(),
+            })
+        });
+        let error = failed.expect_err("the write failed");
+        assert_eq!(error.code(), ErrorCode::StorageUnavailable, "{error}");
+    }
+
+    /// KR-REQ-10.05: a refusal the store made inside the write is reported as the admission's own
+    /// lapse, once the admission has lapsed.
+    #[test]
+    fn a_refused_write_is_reported_as_the_lapse_it_was() {
+        let slot = WriteAdmission::default();
+        let admission = lapsing_after(0);
+        let refused = admitted::<()>(&slot, &admission, || {
+            Err(kr_pairing::PairingError::Refused {
+                code: ErrorCode::PermissionDenied,
+                reason: "the deadline passed".to_owned(),
+            })
+        });
+        assert!(
+            matches!(refused, Err(ControllerError::WindowExpired { .. })),
+            "{refused:?}"
+        );
+    }
 }
