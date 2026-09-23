@@ -34,6 +34,12 @@
 //!   subdirectory that comes back, and the file a read returns, which is the handle the bytes come
 //!   from. A caller asks for that rule when what it reads has to be the tree it named and nothing
 //!   grafted into it; an authority that has not asked for it resolves as it always did.
+//! * **A tree is removed the way a name is resolved.** [`AuthorisedDirectory::remove_tree`] goes
+//!   through the handle the caller checked and through handles it opens itself, one directory at
+//!   a time and on the mount it started on. It follows nothing, takes a directory's name only
+//!   while that name still holds the directory it emptied, and a removal that stops says where
+//!   and keeps what it removed rather than pretending otherwise. What it leaves to whoever may
+//!   write in a directory is stated with the method.
 //! * Each step is one directory-relative open: `openat2` with `RESOLVE_BENEATH` on Linux,
 //!   `openat` with `O_NOFOLLOW` on the other Unix systems, a relative `NtCreateFile` on Windows.
 //!   [`cap_std`] owns those three implementations, which is why this module is the policy and not
@@ -70,6 +76,7 @@
 //!   another directory of the same filesystem is a name, not a mount, and nothing about the path
 //!   says it is there.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use cap_fs_ext::{DirExt as _, FollowSymlinks, MetadataExt as _, OpenOptionsFollowExt as _};
@@ -81,6 +88,12 @@ pub const MAX_RELATIVE_NAME_LEN: usize = 4096;
 
 /// Longest accepted component of a relative name, in bytes.
 pub const MAX_COMPONENT_LEN: usize = 255;
+
+/// How many directories deep a recursive removal goes before it refuses.
+///
+/// Every directory on the way down stays open until everything in it is gone, so this is also the
+/// most directory handles one removal holds at once.
+pub const MAX_REMOVAL_DEPTH: usize = 128;
 
 /// Windows device names, which name a device rather than a file whatever directory they appear in.
 const RESERVED_STEMS: &[&str] = &[
@@ -196,6 +209,24 @@ pub enum Escape {
         holder: String,
         /// The environment that tried to use it.
         named: String,
+    },
+    /// A recursive removal stopped before it finished.
+    ///
+    /// What it removed before it stopped stays removed and nothing is put back. What is left
+    /// includes the entry it stopped at, which is named.
+    #[error(
+        "the removal of {name} stopped at {stopped_at} after it had removed {removed} entries, and \
+         what it removed is not put back: {reason}"
+    )]
+    RemovalStopped {
+        /// The entry the removal was asked to take away.
+        name: String,
+        /// Where it stopped, relative to the directory the removal was asked of.
+        stopped_at: String,
+        /// How many entries it removed before it stopped.
+        removed: u64,
+        /// Why it stopped.
+        reason: Box<Self>,
     },
 }
 
@@ -1105,6 +1136,98 @@ impl AuthorisedDirectory {
         }
     }
 
+    /// Removes `name` from this directory, and everything beneath it, through `opened`.
+    ///
+    /// `opened` is the handle this authority gave for `name`, and the caller has checked it: its
+    /// identity, and whatever else the caller's own rule asks of it. The removal goes through that
+    /// handle and through handles it opens itself, never through a path, so what the check
+    /// established is true of the tree that goes.
+    ///
+    /// * **The name has to hold `opened` when the removal starts**, or nothing is removed.
+    /// * **Each directory beneath is entered the way a descent enters one**: opened without
+    ///   following a link, as a directory, against the handle above it, and kept open until
+    ///   everything in it is gone. The removal stays on the mount `opened` is on, whether or not
+    ///   this authority was confined to one, so a directory mounted into the tree is refused before
+    ///   anything in it is reached: a recursive removal that crossed into another filesystem would
+    ///   take away what no name inside the tree named.
+    /// * **Nothing is followed.** On Unix an entry that is not a directory is unlinked by its name
+    ///   in the handle of the directory it is in, which removes a link as a link and cannot remove a
+    ///   directory, so an entry replaced by a directory in the meantime stops the removal rather
+    ///   than being emptied. On Windows a file goes through its own handle instead, so a
+    ///   replacement at its name is never what goes; a link there is removed as a link, by name.
+    /// * **A directory's name goes only once the directory is empty, and only while the name still
+    ///   holds the directory this removal emptied.** A replacement at the old name stops the
+    ///   removal and is never emptied, and an empty-directory removal refuses anything put into the
+    ///   directory after it was emptied.
+    /// * **A refusal is never retried as a removal with fewer checks.** A depth past
+    ///   [`MAX_REMOVAL_DEPTH`], a directory met twice on the way down and every failure each stop
+    ///   the removal.
+    ///
+    /// A removal that stops has removed what it removed. Nothing is put back, and the refusal names
+    /// where it stopped and how many entries went before it did.
+    ///
+    /// What this cannot promise is stated rather than implied: between the moment a name is checked
+    /// and the moment it is removed, whoever may write in the directory that holds it can put
+    /// something else there, which then goes in its place: a file at a file's name, or an empty
+    /// directory at an emptied one's. That is a process running as this same account, or an
+    /// account the directory's mode or access list admits, and each of them could already remove
+    /// what it put there. A caller that needs that to be this account alone asks, through the
+    /// handle, that `opened` is a directory only this account can change
+    /// ([`Privacy::Exclusive`]); nothing beneath such a directory is reachable by anyone else.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first rule `name` breaks, [`Escape::WrongEnvironment`] for a handle of another
+    /// environment, [`Escape::IdentityChanged`] when the name does not hold `opened` and nothing
+    /// was removed, [`Escape::CrossedMount`] or [`Escape::Unopenable`] when the mount rule cannot
+    /// be established and nothing was removed, and [`Escape::RemovalStopped`] naming where the
+    /// removal stopped once it had begun.
+    pub fn remove_tree(&self, name: &RelativeName, opened: Self) -> Result<(), Escape> {
+        // One component, as for every other operation that changes what a directory holds.
+        single_component(name)?;
+        check_component(name.as_str())?;
+        opened.check_environment(self.environment_id)?;
+        let entry = OsStr::new(name.as_str());
+        // The object the caller checked, or nothing: a different object at the name is not what
+        // the caller asked to take away.
+        same_object_at(&self.directory, entry, opened.identity, name.as_str())?;
+        // The mount rule travels with the removal whoever asked for it. An authority that carries
+        // it already compares `opened` with its own mount; one that does not starts the removal on
+        // the mount `opened` itself is on.
+        let opened = self.confine_like_me(opened, name.as_str())?;
+        let opened = if opened.mount.is_some() {
+            opened
+        } else {
+            opened.confined_to_one_mount()?
+        };
+        let mut removal = Removal {
+            name: name.as_str().to_owned(),
+            removed: 0,
+            held: vec![opened.identity],
+        };
+        removal.empty(&opened, name.as_str())?;
+        removal.take_directory(self, entry, opened, name.as_str())
+    }
+
+    /// Opens one entry a listing of this directory returned, as a directory of its own.
+    ///
+    /// The entry is a name the directory holds rather than one a caller supplied, so it is not
+    /// parsed as a relative name: a tree holds names a relative name refuses, such as a Windows
+    /// device name on a Unix host, and every one of them has to be removable. It is opened the way
+    /// each step of a descent is: without following a link, as a directory, and on this
+    /// authority's mount where the authority is confined to one.
+    fn enter(&self, entry: &OsStr, reported: &str) -> Result<Self, Escape> {
+        let opened = self
+            .directory
+            .open_dir_nofollow(entry)
+            .map_err(|error| entry_failure(reported, &error))?;
+        refuse_reparse_point(&opened, reported)?;
+        let mut display = self.display.clone();
+        display.push(entry);
+        let child = Self::from_handle(self.environment_id, opened, display)?;
+        self.confine_like_me(child, reported)
+    }
+
     /// Flushes this directory's own entries to storage.
     ///
     /// A payload file that is created, or renamed into the completed area, is not durable until
@@ -1194,6 +1317,219 @@ impl AuthorisedDirectory {
             })
         }
     }
+}
+
+/// One recursive removal on its way through a tree.
+struct Removal {
+    /// The entry the removal was asked to take away, for the refusal.
+    name: String,
+    /// How many entries have gone so far.
+    removed: u64,
+    /// The identity of every directory held open on the way down, the first one included. A
+    /// directory met again is a loop in the tree, and the removal stops rather than going round it.
+    held: Vec<ObjectIdentity>,
+}
+
+impl Removal {
+    /// Turns a refusal met part way into the removal's own, naming where it stopped.
+    fn stopped(&self, at: &str, reason: Escape) -> Escape {
+        Escape::RemovalStopped {
+            name: self.name.clone(),
+            stopped_at: at.to_owned(),
+            removed: self.removed,
+            reason: Box::new(reason),
+        }
+    }
+
+    /// Removes everything in one directory this removal holds, through that directory's handle.
+    fn empty(&mut self, directory: &AuthorisedDirectory, at: &str) -> Result<(), Escape> {
+        // Every name is read before anything is removed, and the listing is closed by then: one
+        // directory is not listed and changed at once.
+        let entries =
+            entry_names(&directory.directory, at).map_err(|reason| self.stopped(at, reason))?;
+        for entry in entries {
+            let here = format!("{at}/{}", entry.to_string_lossy());
+            // Asked of the name without following it. Only a directory is descended into, and
+            // whether it is one is settled by the open that enters it; everything else is removed
+            // by a call that cannot remove a directory, whatever this said.
+            let kind = match directory.directory.symlink_metadata(&entry) {
+                Ok(metadata) => metadata.file_type(),
+                // Gone since the listing, whoever took it: nothing of it is left to remove.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(self.stopped(&here, entry_failure(&here, &error))),
+            };
+            if kind.is_dir() {
+                self.descend(directory, &entry, &here)?;
+            } else {
+                remove_non_directory(&directory.directory, &entry)
+                    .map_err(|error| self.stopped(&here, entry_failure(&here, &error)))?;
+                self.removed += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Enters one directory, empties it through the handle it entered, and takes its name away.
+    fn descend(
+        &mut self,
+        directory: &AuthorisedDirectory,
+        entry: &OsStr,
+        here: &str,
+    ) -> Result<(), Escape> {
+        if self.held.len() >= MAX_REMOVAL_DEPTH {
+            return Err(self.stopped(
+                here,
+                Escape::TooLong {
+                    detail: format!(
+                        "{here} is more than {MAX_REMOVAL_DEPTH} directories deep, and a removal \
+                         goes no deeper"
+                    ),
+                },
+            ));
+        }
+        let child = directory
+            .enter(entry, here)
+            .map_err(|reason| self.stopped(here, reason))?;
+        if self.held.contains(&child.identity) {
+            return Err(self.stopped(
+                here,
+                Escape::WrongKind {
+                    detail: format!(
+                        "{here} is a directory this removal is already inside, so the tree loops"
+                    ),
+                },
+            ));
+        }
+        self.held.push(child.identity);
+        self.empty(&child, here)?;
+        self.held.pop();
+        self.take_directory(directory, entry, child, here)
+    }
+
+    /// Takes away the name of a directory this removal has emptied.
+    fn take_directory(
+        &mut self,
+        holder: &AuthorisedDirectory,
+        entry: &OsStr,
+        emptied: AuthorisedDirectory,
+        here: &str,
+    ) -> Result<(), Escape> {
+        // Only while the name still holds the directory this removal emptied. A replacement at it
+        // is refused, never emptied: this is the one place a directory goes by name, and it goes
+        // only as the directory that was checked.
+        same_object_at(&holder.directory, entry, emptied.identity, here)
+            .map_err(|reason| self.stopped(here, reason))?;
+        // Windows removes a directory only by its name and only once no handle on it is open,
+        // because the handles this host resolves names through are opened so that nothing can
+        // rename or delete a directory beneath them. Unix does not mind either way.
+        drop(emptied);
+        remove_empty_directory(&holder.directory, entry)
+            .map_err(|error| self.stopped(here, entry_failure(here, &error)))?;
+        self.removed += 1;
+        Ok(())
+    }
+}
+
+/// Reads every name one directory holds, closing the listing before returning.
+fn entry_names(directory: &Dir, at: &str) -> Result<Vec<OsString>, Escape> {
+    let unreadable = |error: std::io::Error| Escape::Unopenable {
+        component: at.to_owned(),
+        detail: error.to_string(),
+    };
+    directory
+        .entries()
+        .map_err(unreadable)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(unreadable)
+}
+
+/// Checks that a name in `directory` holds the directory whose identity is `expected`.
+fn same_object_at(
+    directory: &Dir,
+    entry: &OsStr,
+    expected: ObjectIdentity,
+    reported: &str,
+) -> Result<(), Escape> {
+    match directory.symlink_metadata(entry) {
+        Ok(metadata) => {
+            let found = ObjectIdentity {
+                device: metadata.dev(),
+                file_id: metadata.ino(),
+            };
+            if metadata.is_dir() && found == expected {
+                Ok(())
+            } else {
+                Err(Escape::IdentityChanged {
+                    detail: format!(
+                        "{reported} was the directory {expected}, and its name now holds {found}"
+                    ),
+                })
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(Escape::IdentityChanged {
+                detail: format!("{reported} was the directory {expected}, and its name is empty"),
+            })
+        }
+        Err(error) => Err(entry_failure(reported, &error)),
+    }
+}
+
+/// Reads a failure to reach or remove one entry of a tree as the refusal it is.
+fn entry_failure(reported: &str, error: &std::io::Error) -> Escape {
+    if is_link_errno(error) {
+        return Escape::Link {
+            component: reported.to_owned(),
+        };
+    }
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return Escape::NotFound {
+            component: reported.to_owned(),
+        };
+    }
+    Escape::Unopenable {
+        component: reported.to_owned(),
+        detail: error.to_string(),
+    }
+}
+
+/// Removes one entry that is not a directory, relative to the handle of the directory it is in.
+///
+/// Without the flag that asks for a directory, the call cannot remove one, and it removes a link
+/// rather than what the link names.
+#[cfg(unix)]
+fn remove_non_directory(directory: &Dir, entry: &OsStr) -> std::io::Result<()> {
+    rustix::fs::unlinkat(directory, entry, rustix::fs::AtFlags::empty()).map_err(Into::into)
+}
+
+/// Removes one entry that is not a directory.
+///
+/// A file goes through its own handle, so nothing that happens to its name meanwhile has any
+/// bearing on what goes. A link cannot be opened without being followed, so it is removed as a
+/// link, by its name in the directory this removal holds. A directory refuses the open as a file,
+/// and so stops the removal instead of being emptied.
+#[cfg(windows)]
+fn remove_non_directory(directory: &Dir, entry: &OsStr) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    match directory.open_with(entry, &options) {
+        Ok(file) => crate::windows::dispose_of(&file),
+        Err(error) if is_link_errno(&error) => directory.remove_file_or_symlink(entry),
+        Err(error) => Err(error),
+    }
+}
+
+/// Removes one empty directory, relative to the handle of the directory it is in.
+#[cfg(unix)]
+fn remove_empty_directory(directory: &Dir, entry: &OsStr) -> std::io::Result<()> {
+    rustix::fs::unlinkat(directory, entry, rustix::fs::AtFlags::REMOVEDIR).map_err(Into::into)
+}
+
+/// Removes one empty directory by its name in the directory this removal holds.
+#[cfg(windows)]
+fn remove_empty_directory(directory: &Dir, entry: &OsStr) -> std::io::Result<()> {
+    directory.remove_dir(entry)
 }
 
 /// An opened object beneath an authorised directory.
@@ -1572,6 +1908,17 @@ pub enum Privacy {
     /// hold a protected list, which is what stops the user profile above from propagating an entry
     /// into it.
     Boundary,
+    /// Only this user may reach the directory or change anything in it, and nothing but its mode
+    /// says otherwise.
+    ///
+    /// This is what a removal inside a directory rests on when it has to bound who could have put
+    /// something else at a name there: nobody but a process of this same account. It is
+    /// [`Self::OwnerOnly`], and on Apple platforms the directory carries no access-control list
+    /// either, because a list there can admit an account the mode bits do not mention. A Linux list
+    /// is bounded by the mode's own group bits, which the owner-only mode already requires to be
+    /// clear, so there is nothing more to ask there. On Windows it is the same check as
+    /// [`Self::OwnerOnly`].
+    Exclusive,
 }
 
 fn directory_identity(directory: &Dir, what: &Path) -> Result<ObjectIdentity, Escape> {
@@ -1815,33 +2162,66 @@ fn refuse_reparse_file(_file: &File, _path: &str) -> Result<(), Escape> {
 
 /// Checks that a directory belongs to this user and is owner-only.
 ///
-/// The policy is the same for both strictnesses here: a Unix directory's mode belongs to the
-/// directory, and the one above it cannot widen it.
+/// The owner and the mode are the same for every strictness here: a Unix directory's mode belongs
+/// to the directory, and the one above it cannot widen it. An exclusive directory is asked one
+/// more thing on Apple platforms, which is whether a list beside the mode admits anybody.
 #[cfg(unix)]
-fn owner_only(directory: &Dir, path: &str, _privacy: Privacy) -> Result<(), Escape> {
+fn owner_only(directory: &Dir, path: &str, privacy: Privacy) -> Result<(), Escape> {
     use cap_std::fs::MetadataExt as _;
 
     let metadata = directory
         .dir_metadata()
         .map_err(|error| classify(directory, path, &error))?;
-    let expected = rustix_uid();
-    if metadata.uid() != expected {
+    judge_owner_and_mode(metadata.uid(), rustix_uid(), metadata.mode(), path)?;
+    if matches!(privacy, Privacy::Exclusive) && carries_access_control(directory) {
         return Err(Escape::WrongKind {
             detail: format!(
-                "{path} belongs to user {} and this host runs as {expected}",
-                metadata.uid()
-            ),
-        });
-    }
-    if metadata.mode() & 0o077 != 0 {
-        return Err(Escape::WrongKind {
-            detail: format!(
-                "{path} is mode {:o} and a KalaReach directory is owner-only",
-                metadata.mode() & 0o777
+                "{path} carries an access-control list, which can admit an account its mode does \
+                 not mention"
             ),
         });
     }
     Ok(())
+}
+
+/// Judges a directory's owner and mode: this account's own, and admitting nobody else.
+///
+/// Apart from the call that reads them, so the judgement is proved where no test can reach it
+/// through the filesystem: putting another account's name on a directory is a privileged act.
+#[cfg(unix)]
+fn judge_owner_and_mode(owner: u32, ours: u32, mode: u32, path: &str) -> Result<(), Escape> {
+    if owner != ours {
+        return Err(Escape::WrongKind {
+            detail: format!("{path} belongs to user {owner} and this host runs as {ours}"),
+        });
+    }
+    if mode & 0o077 != 0 {
+        return Err(Escape::WrongKind {
+            detail: format!(
+                "{path} is mode {:o} and a KalaReach directory is owner-only",
+                mode & 0o777
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Whether a directory carries protection beyond its mode bits, asked of its own handle.
+///
+/// A call that fails is read as a list, which is the answer that stops a caller relying on the
+/// mode alone.
+#[cfg(target_os = "macos")]
+fn carries_access_control(directory: &Dir) -> bool {
+    use std::os::fd::AsFd as _;
+
+    crate::apple::carries_access_control(directory.as_fd())
+}
+
+/// A list on this platform is bounded by the mode's own group bits, which the owner-only mode has
+/// already required to be clear, so there is no second question to ask.
+#[cfg(all(unix, not(target_os = "macos")))]
+const fn carries_access_control(_directory: &Dir) -> bool {
+    false
 }
 
 /// Checks the access-control list of a directory on Windows, which is where its access rules live.
@@ -2576,5 +2956,37 @@ mod tests {
             matches!(refusal, Escape::Unopenable { ref detail, .. } if detail.contains("does not report which mount")),
             "the refusal says the host cannot tell: {refusal}"
         );
+    }
+
+    /// A directory another account owns is never one this host may remove anything from, whatever
+    /// its mode says. No test can reach this through the filesystem, because putting another
+    /// account's name on a directory is a privileged act, so the judgement is proved here.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_another_account_owns_is_refused_whatever_its_mode() {
+        for mode in [0o700, 0o755, 0o777] {
+            let refusal = judge_owner_and_mode(0, 501, mode, "staged")
+                .expect_err("another account's directory is not this account's own");
+            assert!(
+                matches!(refusal, Escape::WrongKind { ref detail } if detail.contains("belongs to user 0")),
+                "the refusal names the owner: {refusal}"
+            );
+        }
+        judge_owner_and_mode(501, 501, 0o700, "staged")
+            .expect("this account's own directory, admitting nobody else, is accepted");
+    }
+
+    /// A mode that lets any other account in at all is refused, whoever owns the directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_mode_that_admits_another_account_is_refused() {
+        for mode in [0o750, 0o705, 0o770, 0o777, 0o701, 0o710, 0o740, 0o704] {
+            let refusal = judge_owner_and_mode(501, 501, mode, "staged")
+                .expect_err("a mode that admits somebody else");
+            assert!(
+                matches!(refusal, Escape::WrongKind { ref detail } if detail.contains("owner-only")),
+                "{mode:o}: {refusal}"
+            );
+        }
     }
 }

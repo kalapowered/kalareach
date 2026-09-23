@@ -18,6 +18,10 @@
 //! callback, a conditional or an object entry decides access on terms that are not its kind, its
 //! flags, its mask and its account, and a reading that recorded one without them would compare
 //! equal to a reading of a different list.
+//!
+//! A recursive removal comes here for one more thing: a file in a tree goes through its own
+//! handle, reopened for deletion and marked, rather than by its name. Reopening a handle and
+//! marking an object for deletion are two calls into `kernel32`.
 
 use std::os::windows::io::{AsRawHandle as _, BorrowedHandle};
 
@@ -615,6 +619,79 @@ pub fn account_named(text: &str) -> std::io::Result<Sid> {
         LocalFree(sid.cast());
     }
     copied.ok_or_else(|| std::io::Error::other("the account named could not be read back"))
+}
+
+/// Removes the file an open handle names, whatever its name reaches by now.
+///
+/// The object is opened a second time with the right to delete it, from the handle rather than
+/// by a name, and marked for removal. The name takes no part in either call, so a replacement put
+/// at it in the meantime is never what goes. A file marked read-only goes too: what a tree holds
+/// is removed whole, and Git writes its objects read-only.
+///
+/// Two markings exist and a file takes whichever its volume carries. The first unlinks the name at
+/// once, even while handles are still open. The second, older one takes the name as the last
+/// handle on the object closes, which is before the caller removes the directory the file is in.
+///
+/// # Errors
+///
+/// Returns the reopen or the marking failure. An object another process holds open without
+/// allowing deletion refuses the reopen and stays exactly as it is.
+pub(crate) fn dispose_of(file: &cap_std::fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::{HandleOrInvalid, OwnedHandle};
+
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+        FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo,
+        FileDispositionInfoEx, ReOpenFile, SetFileInformationByHandle,
+    };
+
+    // SAFETY: the original handle is open for the whole call, and what comes back is either a
+    // handle this function owns or the invalid one, which the conversion below refuses.
+    let reopened = unsafe {
+        HandleOrInvalid::from_raw_handle(ReOpenFile(
+            file.as_raw_handle(),
+            DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            0,
+        ))
+    };
+    let deletable = OwnedHandle::try_from(reopened).map_err(|_| std::io::Error::last_os_error())?;
+    let handle: HANDLE = deletable.as_raw_handle();
+    let now = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE
+            | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+            | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+    };
+    // SAFETY: the handle is owned here and open for the whole call, and the buffer is the
+    // structure the information class names, with its own size.
+    let marked = unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfoEx,
+            std::ptr::from_ref(&now).cast(),
+            size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+        )
+    };
+    if marked != 0 {
+        return Ok(());
+    }
+    // A volume that does not carry the immediate marking takes the older one.
+    let at_close = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: as above, for the older information class.
+    let marked = unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfo,
+            std::ptr::from_ref(&at_close).cast(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    if marked == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

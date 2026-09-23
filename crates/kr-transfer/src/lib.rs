@@ -28,7 +28,8 @@
 //!
 //! Two more modules, each private to this crate and each compiled on one platform alone, own what
 //! that platform says about an opened object's access-control list and the account it belongs to.
-//! They are the only code here that leaves safe Rust.
+//! The Windows one also removes a file of a tree through the file's own handle. They are the only
+//! code here that leaves safe Rust.
 //!
 //! ## What a handle is, and is not
 //!
@@ -77,17 +78,18 @@ pub mod store;
 )]
 mod apple;
 
-/// What an open Windows file's access-control list says, and how one is written back.
+/// What an open Windows file's access-control list says, how one is written back, and removal of
+/// a file through its own handle.
 ///
 /// Every file on this platform carries a list, reachable only through the platform's own
-/// interface, which is why this module is allowed to leave safe Rust and nothing else on this
-/// platform is.
+/// interface, and removing a file through its handle is two calls into `kernel32`, which is why
+/// this module is allowed to leave safe Rust and nothing else on this platform is.
 #[cfg(windows)]
 #[expect(
     unsafe_code,
-    reason = "reading and writing an opened object's access-control list are calls into the \
-              platform's own interface, which has no safe binding; the calls are made here and \
-              nowhere else"
+    reason = "reading and writing an opened object's access-control list, and removing a file \
+              through its own handle, are calls into the platform's own interface, which has no \
+              safe binding; the calls are made here and nowhere else"
 )]
 mod windows;
 

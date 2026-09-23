@@ -1752,3 +1752,409 @@ fn a_windows_list_separates_what_an_object_carries_from_what_it_inherits() {
         "a directory handle answers about its own list: {read:?}"
     );
 }
+
+/// A tree goes through the handle that was checked, whatever names it holds, and nothing it links
+/// to goes with it.
+///
+/// The names include ones a relative name refuses, because a tree on this platform can hold them
+/// and a removal that could not take them away would leave the tree behind. A link is removed as
+/// a link, so the directory and the file it names outside the tree are left exactly as they were.
+#[cfg(unix)]
+#[test]
+fn a_tree_goes_through_the_handle_that_was_checked_and_nothing_it_links_to_goes() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().expect("a directory");
+    let outside = tempfile::tempdir().expect("a directory outside the authority");
+    std::fs::create_dir(outside.path().join("kept")).expect("a directory outside");
+    std::fs::write(outside.path().join("kept/notes.txt"), b"outside\n").expect("a file outside");
+    let tree = root.path().join("tree");
+    std::fs::create_dir_all(tree.join("src/deep/deeper")).expect("the tree");
+    std::fs::write(tree.join("src/deep/deeper/leaf.rs"), b"leaf\n").expect("a file");
+    std::fs::write(tree.join("aux.c"), b"a device stem\n").expect("a name Windows reserves");
+    std::fs::write(tree.join("why?"), b"a character Windows refuses\n").expect("another");
+    std::fs::write(tree.join("pack"), b"read-only\n").expect("a file");
+    std::fs::set_permissions(tree.join("pack"), std::fs::Permissions::from_mode(0o444))
+        .expect("made read-only, as Git makes its objects");
+    std::os::unix::fs::symlink(outside.path().join("kept"), tree.join("src/to-a-directory"))
+        .expect("a link to a directory outside");
+    std::os::unix::fs::symlink(
+        outside.path().join("kept/notes.txt"),
+        tree.join("to-a-file"),
+    )
+    .expect("a link to a file outside");
+    fifo(&tree.join("src/pipe")).expect("a named pipe, which is never opened");
+
+    let authority =
+        AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
+    let name = RelativeName::parse("tree").expect("a name");
+    let opened = authority.subdirectory(&name).expect("the tree opens");
+    authority
+        .remove_tree(&name, opened)
+        .expect("the whole tree goes");
+
+    assert!(
+        std::fs::symlink_metadata(&tree)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+        "nothing is left at the tree's name"
+    );
+    assert_eq!(
+        std::fs::read(outside.path().join("kept/notes.txt")).expect("the file outside is there"),
+        b"outside\n",
+        "a link is removed as a link, and what it names is not reached"
+    );
+}
+
+/// KR-REQ-14.05: a removal goes only through the object that was checked, refuses a replacement
+/// rather than emptying it, and a removal that stops says where and keeps what it removed.
+///
+/// Three moments. Before it starts, a different directory at the name means nothing is removed at
+/// all. Part way, an entry it cannot take away stops it, and it reports the entry and how many
+/// went before it rather than putting anything back. And at the end the name has to hold the
+/// directory it emptied: a replacement is left whole.
+#[cfg(unix)]
+#[test]
+fn remove_tree_refuses_a_replacement_and_reports_partial() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let root = tempfile::tempdir().expect("a directory");
+    let authority =
+        AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
+    let name = RelativeName::parse("tree").expect("a name");
+
+    // Before it starts: the name holds another directory.
+    std::fs::create_dir_all(root.path().join("tree/inside")).expect("the tree");
+    std::fs::write(root.path().join("tree/inside/file"), b"checked\n").expect("its file");
+    let opened = authority.subdirectory(&name).expect("the tree opens");
+    std::fs::rename(root.path().join("tree"), root.path().join("moved")).expect("moved aside");
+    std::fs::create_dir(root.path().join("tree")).expect("somebody else's directory");
+    std::fs::write(root.path().join("tree/theirs"), b"theirs\n").expect("their file");
+    let refusal = authority
+        .remove_tree(&name, opened)
+        .expect_err("a different directory at the name is not what was checked");
+    assert!(
+        matches!(refusal, Escape::IdentityChanged { .. }),
+        "the refusal says the name holds something else: {refusal}"
+    );
+    assert!(
+        root.path().join("tree/theirs").is_file(),
+        "the replacement is untouched"
+    );
+    assert!(
+        root.path().join("moved/inside/file").is_file(),
+        "and so is the directory that was checked, because nothing was removed"
+    );
+    std::fs::remove_dir_all(root.path().join("tree")).expect("clears the replacement");
+    std::fs::rename(root.path().join("moved"), root.path().join("tree")).expect("puts it back");
+
+    // Part way: a directory whose entries this account may not remove. A process that ignores
+    // modes has nothing to learn from this half, so it says so rather than passing it.
+    std::fs::create_dir(root.path().join("tree/locked")).expect("a directory");
+    std::fs::write(root.path().join("tree/locked/stuck"), b"stuck\n").expect("its file");
+    for index in 0..8 {
+        std::fs::write(root.path().join(format!("tree/free-{index}")), b"free\n").expect("a file");
+    }
+    std::fs::set_permissions(
+        root.path().join("tree/locked"),
+        std::fs::Permissions::from_mode(0o500),
+    )
+    .expect("its entries cannot be removed");
+    let privileged = std::fs::metadata(root.path()).is_ok_and(|metadata| metadata.uid() == 0);
+    if privileged {
+        println!("not exercised: this process removes entries whatever a directory's mode says");
+    } else {
+        let opened = authority.subdirectory(&name).expect("the tree opens");
+        let refusal = authority
+            .remove_tree(&name, opened)
+            .expect_err("an entry that cannot be removed stops the removal");
+        let Escape::RemovalStopped {
+            stopped_at,
+            removed,
+            reason,
+            ..
+        } = &refusal
+        else {
+            panic!("the refusal is a stopped removal: {refusal}");
+        };
+        assert_eq!(
+            stopped_at, "tree/locked/stuck",
+            "it names the entry it stopped at"
+        );
+        assert!(
+            matches!(**reason, Escape::Unopenable { .. }),
+            "and why: {reason}"
+        );
+        assert!(
+            root.path().join("tree/locked/stuck").is_file(),
+            "that entry is still there"
+        );
+        let gone = (0..8)
+            .filter(|index| !root.path().join(format!("tree/free-{index}")).exists())
+            .count();
+        assert_eq!(
+            *removed,
+            u64::try_from(gone).expect("a count"),
+            "what it says it removed is what is gone, and none of it came back"
+        );
+        assert!(
+            root.path().join("tree").is_dir(),
+            "the tree's own name stays"
+        );
+    }
+    std::fs::set_permissions(
+        root.path().join("tree/locked"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("the directory is writable again");
+
+    // At the end: the directory it emptied is moved away and a replacement holding something is
+    // put at its name. The replacement is built elsewhere and renamed in whole, so whenever the
+    // name is looked at it holds either the checked directory or a directory with something in
+    // it. Whichever moment the swap lands in, the replacement is never emptied.
+    let mut outcomes = std::collections::BTreeMap::<&str, usize>::new();
+    for round in 0..40 {
+        let tree = root.path().join("tree");
+        let _ = std::fs::remove_dir_all(&tree);
+        std::fs::create_dir_all(tree.join("a/b")).expect("the tree");
+        for index in 0..64 {
+            std::fs::write(tree.join(format!("a/b/{index}")), b"staged\n").expect("a file");
+        }
+        let theirs = root.path().join(format!("theirs-{round}"));
+        std::fs::create_dir(&theirs).expect("their directory");
+        std::fs::write(theirs.join("keep"), b"theirs\n").expect("their file");
+        let opened = authority.subdirectory(&name).expect("the tree opens");
+        let moved = root.path().join(format!("moved-{round}"));
+        let outcome = std::thread::scope(|threads| {
+            let swapper = threads.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_micros(50 * (round % 8)));
+                // Either rename can find nothing to move: the removal may have finished first.
+                let _ = std::fs::rename(&tree, &moved);
+                std::fs::rename(&theirs, &tree).expect("their directory takes the name");
+            });
+            let outcome = authority.remove_tree(&name, opened);
+            swapper.join().expect("the swap did not panic");
+            outcome
+        });
+        assert_eq!(
+            std::fs::read(tree.join("keep")).expect("their file is at the name"),
+            b"theirs\n",
+            "round {round}: a replacement at the name is never emptied ({outcome:?})"
+        );
+        let label = match &outcome {
+            Ok(()) => "removed before the swap",
+            Err(Escape::IdentityChanged { .. }) => "refused before anything was removed",
+            Err(Escape::RemovalStopped { .. }) => "stopped at the replacement",
+            Err(other) => panic!("round {round}: an unexpected refusal: {other}"),
+        };
+        if outcome.is_ok() {
+            assert!(
+                !moved.exists(),
+                "round {round}: a completed removal left nothing behind"
+            );
+        }
+        *outcomes.entry(label).or_default() += 1;
+    }
+    println!("{outcomes:?}");
+}
+
+/// A removal goes no deeper than its bound, and stops before removing anything beneath it.
+#[cfg(unix)]
+#[test]
+fn a_removal_deeper_than_its_bound_stops_at_the_bound() {
+    use kr_transfer::authority::MAX_REMOVAL_DEPTH;
+
+    let root = tempfile::tempdir().expect("a directory");
+    let mut deepest = root.path().join("tree");
+    for _ in 0..MAX_REMOVAL_DEPTH {
+        deepest.push("d");
+    }
+    std::fs::create_dir_all(&deepest).expect("a deep tree");
+    std::fs::write(deepest.join("bottom"), b"deep\n").expect("a file at the bottom");
+    let authority =
+        AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
+    let name = RelativeName::parse("tree").expect("a name");
+    let opened = authority.subdirectory(&name).expect("the tree opens");
+    let refusal = authority
+        .remove_tree(&name, opened)
+        .expect_err("a tree deeper than the bound stops the removal");
+    let Escape::RemovalStopped {
+        stopped_at,
+        removed,
+        reason,
+        ..
+    } = &refusal
+    else {
+        panic!("the refusal is a stopped removal: {refusal}");
+    };
+    assert!(
+        matches!(**reason, Escape::TooLong { .. }),
+        "the reason is the depth: {reason}"
+    );
+    assert_eq!(
+        stopped_at.split('/').count(),
+        MAX_REMOVAL_DEPTH + 1,
+        "it stops at the first directory past the bound: {stopped_at}"
+    );
+    assert_eq!(*removed, 0, "nothing on the way down was removed before it");
+    assert!(
+        deepest.join("bottom").is_file(),
+        "and nothing beneath it was reached"
+    );
+}
+
+/// An exclusive directory is one only this account can change: its owner is this account, its
+/// mode admits nobody else, and on Apple platforms nothing beside the mode says otherwise.
+#[cfg(unix)]
+#[test]
+fn an_exclusive_directory_admits_nobody_its_mode_does_not() {
+    use kr_transfer::Privacy;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().expect("a directory");
+    let authority =
+        AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
+    for (name, mode, admitted) in [
+        ("shut", 0o700, true),
+        ("grouped", 0o750, false),
+        ("open", 0o755, false),
+    ] {
+        std::fs::create_dir(root.path().join(name)).expect("a directory");
+        std::fs::set_permissions(
+            root.path().join(name),
+            std::fs::Permissions::from_mode(mode),
+        )
+        .expect("its mode");
+        let held = authority
+            .subdirectory(&RelativeName::parse(name).expect("a name"))
+            .expect("it opens");
+        assert_eq!(
+            held.check_privacy(Privacy::Exclusive).is_ok(),
+            admitted,
+            "{name} is mode {mode:o}"
+        );
+    }
+
+    // A list beside the mode, where the platform's own tool is installed to put one there.
+    std::fs::create_dir(root.path().join("listed")).expect("a directory");
+    std::fs::set_permissions(
+        root.path().join("listed"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("an owner-only mode");
+    let who = std::env::var("USER").unwrap_or_else(|_| "root".to_owned());
+    let given = if cfg!(target_os = "macos") {
+        std::process::Command::new("/bin/chmod")
+            .arg("+a")
+            .arg(format!("{who} allow list"))
+            .arg(root.path().join("listed"))
+            .status()
+    } else {
+        std::process::Command::new("setfacl")
+            .arg("-m")
+            .arg(format!("u:{who}:rx"))
+            .arg(root.path().join("listed"))
+            .status()
+    };
+    match given {
+        Ok(status) if status.success() => {
+            let held = authority
+                .subdirectory(&RelativeName::parse("listed").expect("a name"))
+                .expect("it opens");
+            assert!(
+                held.check_privacy(Privacy::Exclusive).is_err(),
+                "a directory carrying a list is not one only its mode decides"
+            );
+        }
+        _ => println!(
+            "not exercised: this platform's access-control tool did not run, so only the mode \
+             half of this case was checked"
+        ),
+    }
+}
+
+/// KR-REQ-14.05: a recursive removal stops before a directory mounted into the tree, and the tree
+/// mounted there is not reached.
+///
+/// It needs a mount namespace this account owns. Where the host does not allow one, the case says
+/// it was not exercised rather than reporting a result it did not produce.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_removal_stops_before_a_directory_mounted_into_the_tree() {
+    if std::env::var_os("KR_AUTHORITY_REMOVAL_MOUNT").is_some() {
+        removal_mount();
+        return;
+    }
+    let probe = std::process::Command::new("unshare")
+        .args(["-r", "-m", "--", "true"])
+        .status();
+    if !probe.is_ok_and(|status| status.success()) {
+        println!("not exercised: this host does not give this account a mount namespace");
+        return;
+    }
+    let binary = std::env::current_exe().expect("the test binary");
+    let status = std::process::Command::new("unshare")
+        .args(["-r", "-m", "--"])
+        .arg(binary)
+        .args(["--exact", "--nocapture", "--test-threads=1"])
+        .arg("a_removal_stops_before_a_directory_mounted_into_the_tree")
+        .env("KR_AUTHORITY_REMOVAL_MOUNT", "1")
+        .status()
+        .expect("the test binary runs inside a mount namespace");
+    if status.code() == Some(NOT_EXERCISED) {
+        println!("not exercised: this namespace would not place a bind mount");
+        return;
+    }
+    assert!(
+        status.success(),
+        "the removal inside the mount namespace did not hold: {status}"
+    );
+}
+
+/// The half that runs inside the mount namespace.
+#[cfg(target_os = "linux")]
+fn removal_mount() {
+    let root = tempfile::tempdir().expect("a temporary directory");
+    std::fs::create_dir_all(root.path().join("tree/graft")).expect("the tree");
+    std::fs::write(root.path().join("tree/staged"), b"staged\n").expect("the tree's file");
+    std::fs::create_dir(root.path().join("elsewhere")).expect("another tree");
+    std::fs::write(root.path().join("elsewhere/kept"), b"elsewhere\n").expect("its file");
+    if rustix::mount::mount_bind(
+        root.path().join("elsewhere"),
+        root.path().join("tree/graft"),
+    )
+    .is_err()
+    {
+        std::process::exit(NOT_EXERCISED);
+    }
+    let authority =
+        AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
+    let name = RelativeName::parse("tree").expect("a name");
+    let opened = authority.subdirectory(&name).expect("the tree opens");
+    let refusal = authority
+        .remove_tree(&name, opened)
+        .expect_err("a directory mounted into the tree stops the removal");
+    let Escape::RemovalStopped {
+        stopped_at, reason, ..
+    } = &refusal
+    else {
+        panic!("the refusal is a stopped removal: {refusal}");
+    };
+    assert_eq!(
+        stopped_at, "tree/graft",
+        "it stops at the directory mounted there"
+    );
+    assert!(
+        matches!(**reason, Escape::CrossedMount { .. }),
+        "because it is on another mount: {reason}"
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("elsewhere/kept")).expect("the other tree's file"),
+        b"elsewhere\n",
+        "nothing in the mounted tree was reached"
+    );
+    rustix::mount::unmount(
+        root.path().join("tree/graft"),
+        rustix::mount::UnmountFlags::DETACH,
+    )
+    .expect("the mount comes off");
+}
