@@ -24,6 +24,8 @@ use kr_protocol::scalars::{Nullable, U64, Uuid};
 
 mod common;
 
+use common::Submit;
+
 fn test_root_id(v: u8) -> CausalRootId {
     CausalRootId::new(Uuid::from_bytes([v; 16]))
 }
@@ -71,7 +73,7 @@ fn recurring_workflow(id: u8, name: &str, action_kind: &str) -> WorkflowDefiniti
 
 fn install_and_enable(service: &AutomationService, def: &WorkflowDefinition, now_ms: u64) {
     service
-        .install(
+        .submit_install(
             &WorkflowInstallParams {
                 workflow_id: def.workflow_id,
                 revision: def.revision,
@@ -156,7 +158,7 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
         for def in &workflows {
             install_and_enable(&service, def, 1_000);
             service
-                .enable(
+                .submit_enable(
                     &kr_protocol::automation::WorkflowEnableParams {
                         workflow_id: def.workflow_id,
                         revision: def.revision,
@@ -167,7 +169,7 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
         }
 
         let first = service
-            .run(&run_params(&workflows[0], "external-1", None), 1_000)
+            .submit_run(&run_params(&workflows[0], "external-1", None), 1_000)
             .await
             .expect("the external trigger runs");
         assert_eq!(first.depth.get(), 1);
@@ -191,7 +193,7 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
         clock.set(now_ms);
 
         match service
-            .run(
+            .submit_run(
                 &run_params(def, &format!("chain-{steps}"), Some(parent.clone())),
                 now_ms,
             )
@@ -239,7 +241,7 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
     assert!(budget.paused);
 
     let again = service
-        .run(
+        .submit_run(
             &run_params(&workflows[0], "chain-after-exhaustion", Some(parent)),
             2_000_000,
         )
@@ -313,7 +315,7 @@ async fn self_retrigger_is_refused_without_explicit_recurrence() {
     def.explicit_recurrence = false;
     install_and_enable(&service, &def, 1_000);
     service
-        .enable(
+        .submit_enable(
             &kr_protocol::automation::WorkflowEnableParams {
                 workflow_id: def.workflow_id,
                 revision: def.revision,
@@ -323,12 +325,12 @@ async fn self_retrigger_is_refused_without_explicit_recurrence() {
         .unwrap();
 
     let first = service
-        .run(&run_params(&def, "evt-1", None), 1_000)
+        .submit_run(&run_params(&def, "evt-1", None), 1_000)
         .await
         .expect("the first run is admitted");
 
     let error = service
-        .run(
+        .submit_run(
             &run_params(
                 &def,
                 "evt-2",
@@ -355,7 +357,7 @@ async fn a_request_cannot_name_its_own_causal_root() {
     for def in [&first, &second] {
         install_and_enable(&service, def, 1_000);
         service
-            .enable(
+            .submit_enable(
                 &kr_protocol::automation::WorkflowEnableParams {
                     workflow_id: def.workflow_id,
                     revision: def.revision,
@@ -366,13 +368,13 @@ async fn a_request_cannot_name_its_own_causal_root() {
     }
 
     let root_run = service
-        .run(&run_params(&first, "evt-1", None), 1_000)
+        .submit_run(&run_params(&first, "evt-1", None), 1_000)
         .await
         .expect("the first run is admitted");
 
     // A root the parent run does not belong to is refused outright.
     let error = service
-        .run(
+        .submit_run(
             &run_params(
                 &second,
                 "evt-2",
@@ -387,7 +389,7 @@ async fn a_request_cannot_name_its_own_causal_root() {
     // A parent run this host never recorded is refused too, so an invented ancestry cannot
     // start a chain with a depth of its choosing.
     let error = service
-        .run(
+        .submit_run(
             &run_params(
                 &second,
                 "evt-3",
@@ -405,7 +407,7 @@ async fn a_request_cannot_name_its_own_causal_root() {
 
     // A real parent with a lying depth still lands one below its parent.
     let descendant = service
-        .run(
+        .submit_run(
             &run_params(
                 &second,
                 "evt-4",
@@ -435,7 +437,7 @@ async fn created_sessions_are_reserved_against_the_chain() {
     let def = recurring_workflow(6, "session-maker", "create_session");
     install_and_enable(&service, &def, 1_000);
     service
-        .enable(
+        .submit_enable(
             &kr_protocol::automation::WorkflowEnableParams {
                 workflow_id: def.workflow_id,
                 revision: def.revision,
@@ -445,7 +447,7 @@ async fn created_sessions_are_reserved_against_the_chain() {
         .unwrap();
 
     let first = service
-        .run(&run_params(&def, "session-0", None), 1_000)
+        .submit_run(&run_params(&def, "session-0", None), 1_000)
         .await
         .expect("the first session-creating run is admitted");
     let root = first.causal_root_id;
@@ -454,7 +456,7 @@ async fn created_sessions_are_reserved_against_the_chain() {
     // Ten sessions are the whole allowance, and the eleventh is refused.
     for step in 1..DEFAULT_CAUSAL_SESSIONS_LIMIT {
         let result = service
-            .run(
+            .submit_run(
                 &run_params(&def, &format!("session-{step}"), Some(parent.clone())),
                 1_000,
             )
@@ -471,7 +473,7 @@ async fn created_sessions_are_reserved_against_the_chain() {
     assert_eq!(budget.created_sessions, DEFAULT_CAUSAL_SESSIONS_LIMIT);
 
     let error = service
-        .run(&run_params(&def, "session-over", Some(parent)), 1_000)
+        .submit_run(&run_params(&def, "session-over", Some(parent)), 1_000)
         .await
         .expect_err("the eleventh session is refused");
     assert_eq!(
@@ -496,7 +498,7 @@ async fn an_expired_lifetime_stops_further_actions() {
     let def = recurring_workflow(7, "long-chain", "run_tests");
     install_and_enable(&service, &def, 1_000);
     service
-        .enable(
+        .submit_enable(
             &kr_protocol::automation::WorkflowEnableParams {
                 workflow_id: def.workflow_id,
                 revision: def.revision,
@@ -506,7 +508,7 @@ async fn an_expired_lifetime_stops_further_actions() {
         .unwrap();
 
     let first = service
-        .run(&run_params(&def, "evt-1", None), 1_000)
+        .submit_run(&run_params(&def, "evt-1", None), 1_000)
         .await
         .expect("the first run is admitted");
     let parent = parent_ref(first.causal_root_id, first.run_id, 1);
@@ -515,7 +517,7 @@ async fn an_expired_lifetime_stops_further_actions() {
     let expired = 1_000 + 3_600_001;
     clock.set(expired);
     let error = service
-        .run(&run_params(&def, "evt-2", Some(parent)), expired)
+        .submit_run(&run_params(&def, "evt-2", Some(parent)), expired)
         .await
         .expect_err("an expired chain admits nothing further");
     assert!(error.to_string().contains("lifetime"), "{error}");
@@ -537,7 +539,7 @@ async fn rearm_is_authorised_and_refuses_late_descendants() {
     let def = recurring_workflow(8, "rearmed", "run_tests");
     install_and_enable(&service, &def, 1_000);
     service
-        .enable(
+        .submit_enable(
             &kr_protocol::automation::WorkflowEnableParams {
                 workflow_id: def.workflow_id,
                 revision: def.revision,
@@ -547,7 +549,7 @@ async fn rearm_is_authorised_and_refuses_late_descendants() {
         .unwrap();
 
     let first = service
-        .run(&run_params(&def, "evt-1", None), 1_000)
+        .submit_run(&run_params(&def, "evt-1", None), 1_000)
         .await
         .expect("the first run is admitted");
     let root = first.causal_root_id;
@@ -584,7 +586,7 @@ async fn rearm_is_authorised_and_refuses_late_descendants() {
 
     // A descendant of the run from before the rearm belongs to the old generation.
     let late = service
-        .run(&run_params(&def, "evt-late", Some(stale_parent)), 3_000)
+        .submit_run(&run_params(&def, "evt-late", Some(stale_parent)), 3_000)
         .await
         .expect_err("a late descendant cannot spend the new budget");
     assert!(
@@ -594,7 +596,7 @@ async fn rearm_is_authorised_and_refuses_late_descendants() {
 
     // A fresh external trigger under the rearmed root still runs.
     let fresh = service
-        .run(&run_params(&def, "evt-fresh", None), 3_000)
+        .submit_run(&run_params(&def, "evt-fresh", None), 3_000)
         .await
         .expect("a fresh root runs");
     assert_ne!(fresh.causal_root_id, root);
@@ -730,7 +732,7 @@ async fn an_external_callback_is_a_new_external_trigger() {
     let def = recurring_workflow(9, "callback", "run_tests");
     install_and_enable(&service, &def, 1_000);
     service
-        .enable(
+        .submit_enable(
             &kr_protocol::automation::WorkflowEnableParams {
                 workflow_id: def.workflow_id,
                 revision: def.revision,
@@ -740,11 +742,11 @@ async fn an_external_callback_is_a_new_external_trigger() {
         .unwrap();
 
     let first = service
-        .run(&run_params(&def, "callback-1", None), 1_000)
+        .submit_run(&run_params(&def, "callback-1", None), 1_000)
         .await
         .expect("the callback runs");
     let second = service
-        .run(&run_params(&def, "callback-2", None), 1_000)
+        .submit_run(&run_params(&def, "callback-2", None), 1_000)
         .await
         .expect("a second callback runs");
 
@@ -757,7 +759,7 @@ async fn an_external_callback_is_a_new_external_trigger() {
 
     // A repeat of the same event identifier is the same trigger, and runs once.
     let repeat = service
-        .run(&run_params(&def, "callback-1", None), 1_000)
+        .submit_run(&run_params(&def, "callback-1", None), 1_000)
         .await
         .expect_err("a replayed callback is deduplicated");
     assert!(repeat.to_string().contains("duplicate trigger"), "{repeat}");

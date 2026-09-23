@@ -21,6 +21,8 @@ use kr_protocol::scalars::{Nullable, Uuid};
 
 mod common;
 
+use common::Submit;
+
 fn test_wf_id(v: u8) -> WorkflowId {
     WorkflowId::new(Uuid::from_bytes([v; 16]))
 }
@@ -113,10 +115,10 @@ async fn a_withdrawn_grant_admits_no_run() {
         let table = common::standing(grant_id, GrantStanding::Active);
         let service = service(Arc::new(MockActionRunner::new()), Arc::clone(&table));
         service
-            .install(&install_params(&definition), 1_000)
+            .submit_install(&install_params(&definition), 1_000)
             .expect("the definition installs while the grant stands");
         service
-            .enable(
+            .submit_enable(
                 &WorkflowEnableParams {
                     workflow_id: definition.workflow_id,
                     revision: definition.revision,
@@ -127,7 +129,7 @@ async fn a_withdrawn_grant_admits_no_run() {
 
         assert!(table.restand(grant_id, standing));
         let refusal = service
-            .run(&run_params(&definition, "evt-1"), 2_000)
+            .submit_run(&run_params(&definition, "evt-1"), 2_000)
             .await
             .expect_err("a grant in this standing admits nothing");
         assert!(refusal.to_string().contains(word), "{refusal}");
@@ -158,7 +160,7 @@ async fn a_definition_naming_an_unissued_grant_is_refused() {
         Arc::new(GrantTable::new()),
     );
     let refusal = service
-        .install(&install_params(&definition), 1_000)
+        .submit_install(&install_params(&definition), 1_000)
         .expect_err("an unissued grant installs nothing");
     assert!(
         refusal.to_string().contains("not one this host issued"),
@@ -185,7 +187,7 @@ async fn a_view_only_grant_installs_neither_a_shell_node_nor_a_session_node() {
         vec![],
     );
     let refusal = service
-        .install(&install_params(&shell_definition), 1_000)
+        .submit_install(&install_params(&shell_definition), 1_000)
         .expect_err("a view-only grant reaches no terminal");
     assert!(refusal.to_string().contains("terminal input"), "{refusal}");
 
@@ -198,7 +200,7 @@ async fn a_view_only_grant_installs_neither_a_shell_node_nor_a_session_node() {
         vec![],
     );
     let refusal = service
-        .install(&install_params(&session_definition), 1_000)
+        .submit_install(&install_params(&session_definition), 1_000)
         .expect_err("a view-only grant creates no session");
     assert!(refusal.to_string().contains("session.create"), "{refusal}");
 }
@@ -228,10 +230,10 @@ async fn a_revocation_between_two_nodes_stops_the_second() {
     });
     let service = service(runner, Arc::clone(&table));
     service
-        .install(&install_params(&definition), 1_000)
+        .submit_install(&install_params(&definition), 1_000)
         .expect("the definition installs");
     service
-        .enable(
+        .submit_enable(
             &WorkflowEnableParams {
                 workflow_id: definition.workflow_id,
                 revision: definition.revision,
@@ -241,7 +243,7 @@ async fn a_revocation_between_two_nodes_stops_the_second() {
         .expect("the revision enables");
 
     let refusal = service
-        .run(&run_params(&definition, "evt-1"), 1_000)
+        .submit_run(&run_params(&definition, "evt-1"), 1_000)
         .await
         .expect_err("the second node is refused");
     assert!(refusal.to_string().contains("revoked"), "{refusal}");
@@ -349,10 +351,10 @@ async fn a_refusal_after_a_cancellation_leaves_the_cancellation_standing() {
     );
     *runner.store.lock().unwrap() = Some(Arc::clone(service.store()));
     service
-        .install(&install_params(&definition), 1_000)
+        .submit_install(&install_params(&definition), 1_000)
         .expect("the definition installs");
     service
-        .enable(
+        .submit_enable(
             &WorkflowEnableParams {
                 workflow_id: definition.workflow_id,
                 revision: definition.revision,
@@ -361,7 +363,9 @@ async fn a_refusal_after_a_cancellation_leaves_the_cancellation_standing() {
         )
         .expect("the revision enables");
 
-    let _ = service.run(&run_params(&definition, "evt-1"), 1_000).await;
+    let _ = service
+        .submit_run(&run_params(&definition, "evt-1"), 1_000)
+        .await;
 
     let run_id = runner.run_id.lock().unwrap().expect("the run started");
     let receipts = service
@@ -443,7 +447,7 @@ async fn a_capture_node_outside_the_declared_workspace_is_refused() {
         common::holding(grant_id, &[ActionRight::ChangesetCreate]),
     );
     let refusal = service
-        .install(&install_params(&definition), 1_000)
+        .submit_install(&install_params(&definition), 1_000)
         .expect_err("a node outside the declared scope is refused");
     assert!(
         refusal.to_string().contains("scoped to workspace"),

@@ -3609,6 +3609,54 @@ impl Controller {
             .await
     }
 
+    /// Performs one automation mutation under the admission its ingress recorded.
+    ///
+    /// The admission is asked here, under the registry lock, for the reason
+    /// [`Self::check_admission`] states, and then carried into the workflow journal, which asks it
+    /// again inside the transaction that performs the action, immediately before the action's
+    /// first write. Nothing the service does before that write can wait long enough to outlast
+    /// it: the answer and the write are under the journal's one lock, and the journal holds no
+    /// record of an action it has not written. A retry is answered from its record before the
+    /// admission is asked, so a caller whose window has since been replaced still gets its own
+    /// result.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the admission or the automation service decided.
+    pub(crate) async fn automation_mutation(
+        self: &Arc<Self>,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+        carried: crate::authority::AdmittedMutation,
+    ) -> std::result::Result<ParamsValue, ProtocolError> {
+        // A mutation carrying no freshness at all is a retry of an action this host may already
+        // hold, and the journal's record is where such a retry is answered from. What it may not
+        // do is perform the action.
+        if carried.deadline.is_none() {
+            return Err(ControllerError::WindowExpired {
+                detail: "this action carries no freshness, so it may be answered from what this \
+                         host holds and may not be performed"
+                    .to_owned(),
+            }
+            .to_protocol_error());
+        }
+        {
+            let registry = self.registry.lock().await;
+            self.check_admission(&registry, &carried)
+                .map_err(|error| error.to_protocol_error())?;
+        }
+        let controller = Arc::clone(self);
+        let admission: crate::automation::Admission = Arc::new(move || {
+            controller
+                .check_registration(&carried)
+                .map_err(|error| error.to_protocol_error())
+        });
+        self.automation
+            .write(actor_id, mutation, method, admission)
+            .await
+    }
+
     async fn read_method(self: &Arc<Self>, actor_id: &ActorId, request: &Request) -> ControlFrame {
         let Some(method) = request.method.method() else {
             return error_reply(
@@ -3810,31 +3858,24 @@ impl Controller {
             );
         }
         if crate::automation::AutomationModule::serves(method) {
-            // Everything between the envelope check and this point can wait: for this task to be
-            // scheduled and for a blocking thread. An action whose accepted deadline passed while
-            // it queued does not go on to write, and neither does one whose connection lost its
-            // authority in the meantime.
-            if accepted.is_none_or(|accepted| self.clock.now() >= accepted.deadline) {
-                return respond(
-                    mutation.request_id,
-                    Err(ControllerError::WindowExpired {
-                        detail: "the deadline this action was admitted under passed before it \
-                                 could run"
-                            .to_owned(),
-                    }),
-                );
-            }
-            if let Err(error) = self.authorised(connection_id) {
+            let Some(admitted_revision) = admitted else {
                 return error_reply(
                     mutation.request_id,
                     ErrorCode::PermissionDenied,
-                    error.to_string(),
+                    "the authority this connection was admitted under has been withdrawn; open a \
+                     new connection",
                 );
-            }
-            let answered = self
-                .automation
-                .write_frame(actor_id, mutation, method)
-                .await;
+            };
+            let carried = crate::authority::AdmittedMutation {
+                connection_id,
+                admitted_revision,
+                deadline: accepted.map(|accepted| accepted.deadline),
+            };
+            let answered = crate::automation::frame(
+                mutation.request_id,
+                self.automation_mutation(actor_id, mutation, method, carried)
+                    .await,
+            );
             // A run dispatches its nodes and waits for each of them, so the effect and its reply
             // are separated by however long that took, and a revocation can land in the interval.
             // What this host must not do is **disclose** an answer under authority that has since

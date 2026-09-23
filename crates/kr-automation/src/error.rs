@@ -54,6 +54,28 @@ pub enum AutomationError {
         action_id: String,
     },
 
+    /// The admission the action was accepted under no longer stands.
+    ///
+    /// It is asked immediately before the action's first write, and a lapse says nothing about
+    /// the action itself: nothing was written and nothing is recorded, so a submission that is
+    /// still admitted is decided afresh.
+    #[error("{detail}")]
+    Lapsed {
+        /// The code the host's admission refused with.
+        code: ErrorCode,
+        /// What it said.
+        detail: String,
+    },
+
+    /// An earlier submission of this action was refused, and this is that refusal.
+    #[error("{detail}")]
+    Recorded {
+        /// The code the refusal carried.
+        code: ErrorCode,
+        /// What it said.
+        detail: String,
+    },
+
     /// This host carries out no action of that kind.
     ///
     /// Nothing was dispatched, so nothing happened: a node refused this way is a definite failure
@@ -218,11 +240,39 @@ pub enum AutomationError {
     ChangesetError(#[from] kr_changeset::ChangeSetError),
 }
 
+impl AutomationError {
+    /// Whether this is a refusal the host decided about the action itself.
+    ///
+    /// A decided refusal is recorded as what the action came to, so a repeat of the same action
+    /// is refused the same way rather than decided again under whatever holds by then. Everything
+    /// else says nothing about the action: a journal that could not be written, a grant store
+    /// that could not be read, an admission that lapsed before the first write. None of those is
+    /// recorded, because a later submission that meets none of them has not been decided yet.
+    #[must_use]
+    pub const fn is_decided(&self) -> bool {
+        !matches!(
+            self,
+            Self::DatabaseError(_)
+                | Self::JsonError(_)
+                | Self::AuthorityUnavailable(_)
+                | Self::Lapsed { .. }
+                | Self::Recorded { .. }
+                | Self::ActionIdentifierReused { .. }
+        )
+    }
+}
+
 impl From<AutomationError> for ProtocolError {
     fn from(error: AutomationError) -> Self {
+        Self::from(&error)
+    }
+}
+
+impl From<&AutomationError> for ProtocolError {
+    fn from(error: &AutomationError) -> Self {
         match error {
             AutomationError::InvalidArgument(message) => {
-                Self::new(ErrorCode::InvalidArgument, message)
+                Self::new(ErrorCode::InvalidArgument, message.clone())
             }
             AutomationError::CyclicGraph { detail } => Self::new(
                 ErrorCode::InvalidArgument,
@@ -237,7 +287,7 @@ impl From<AutomationError> for ProtocolError {
                 format!("shell command node requires explicit broad shell grant: {detail}"),
             ),
             AutomationError::PermissionDenied(message) => {
-                Self::new(ErrorCode::PermissionDenied, message)
+                Self::new(ErrorCode::PermissionDenied, message.clone())
             }
             AutomationError::AuthorityUnavailable(message) => Self::new(
                 ErrorCode::StorageUnavailable,
@@ -247,6 +297,8 @@ impl From<AutomationError> for ProtocolError {
                 ErrorCode::IdConflict,
                 format!("action {action_id} was submitted before, carrying something else"),
             ),
+            AutomationError::Lapsed { code, detail }
+            | AutomationError::Recorded { code, detail } => Self::new(*code, detail.clone()),
             AutomationError::ActionUnavailable { action_kind } => Self::new(
                 ErrorCode::ResourceUnavailable,
                 format!("this host carries out no action of kind '{action_kind}'"),

@@ -7,6 +7,8 @@ use kr_protocol::scalars::{Nullable, Uuid};
 
 mod common;
 
+use common::Submit;
+
 fn test_wf_id(v: u8) -> WorkflowId {
     WorkflowId::new(Uuid::from_bytes([v; 16]))
 }
@@ -199,7 +201,7 @@ fn read_answers_about_the_revision_it_was_asked_about() {
             vec![],
         );
         service
-            .install(
+            .submit_install(
                 &WorkflowInstallParams {
                     workflow_id,
                     revision: U64::new(revision),

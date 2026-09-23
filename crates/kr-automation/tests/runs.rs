@@ -13,6 +13,8 @@ use kr_protocol::scalars::{Nullable, Uuid};
 
 mod common;
 
+use common::Submit;
+
 fn test_wf_id(v: u8) -> WorkflowId {
     WorkflowId::new(Uuid::from_bytes([v; 16]))
 }
@@ -330,7 +332,7 @@ async fn enable_and_pause_decide_whether_a_revision_runs() {
     )
     .expect("a service");
     service
-        .install(
+        .submit_install(
             &WorkflowInstallParams {
                 workflow_id,
                 revision: definition.revision,
@@ -354,13 +356,13 @@ async fn enable_and_pause_decide_whether_a_revision_runs() {
     // because enabling a revision is its own authorised method.
     assert!(definition.enabled);
     let refused = service
-        .run(&params("evt-1"), 1_000)
+        .submit_run(&params("evt-1"), 1_000)
         .await
         .expect_err("an installed revision does not run until it is enabled");
     assert!(refused.to_string().contains("disabled"), "{refused}");
 
     service
-        .enable(
+        .submit_enable(
             &WorkflowEnableParams {
                 workflow_id,
                 revision: definition.revision,
@@ -369,12 +371,12 @@ async fn enable_and_pause_decide_whether_a_revision_runs() {
         )
         .expect("the revision enables");
     service
-        .run(&params("evt-2"), 1_000)
+        .submit_run(&params("evt-2"), 1_000)
         .await
         .expect("an enabled revision runs");
 
     service
-        .pause(
+        .submit_pause(
             &WorkflowPauseParams {
                 workflow_id,
                 revision: definition.revision,
@@ -384,7 +386,7 @@ async fn enable_and_pause_decide_whether_a_revision_runs() {
         )
         .expect("the revision pauses");
     let paused = service
-        .run(&params("evt-3"), 1_000)
+        .submit_run(&params("evt-3"), 1_000)
         .await
         .expect_err("a paused revision runs nothing");
     assert!(paused.to_string().contains("paused"), "{paused}");
@@ -626,7 +628,7 @@ async fn a_pause_mid_run_stops_the_next_node() {
         .expect("a service"),
     );
     service
-        .install(
+        .submit_install(
             &WorkflowInstallParams {
                 workflow_id,
                 revision: definition.revision,
@@ -637,7 +639,7 @@ async fn a_pause_mid_run_stops_the_next_node() {
         )
         .expect("the definition installs");
     service
-        .enable(
+        .submit_enable(
             &WorkflowEnableParams {
                 workflow_id,
                 revision: definition.revision,
@@ -648,7 +650,7 @@ async fn a_pause_mid_run_stops_the_next_node() {
 
     // The pause lands after the run has been admitted and before its first node dispatches.
     service
-        .pause(
+        .submit_pause(
             &WorkflowPauseParams {
                 workflow_id,
                 revision: definition.revision,
@@ -659,7 +661,7 @@ async fn a_pause_mid_run_stops_the_next_node() {
         .expect("the revision pauses");
 
     let refused = service
-        .run(
+        .submit_run(
             &WorkflowRunParams {
                 workflow_id,
                 revision: definition.revision,

@@ -2395,7 +2395,11 @@ across a restart and a reboot.
 
 The five methods of the automation group arrive through the daemon's ordinary path, and the
 grant each definition names is read from the daemon's own grant store rather than from the
-request. The daemon reads it again before every node a run dispatches, so a revocation or an
+request. The four mutations are actions: each one's effect and the record of what it came to
+commit in one transaction of the workflow journal, and the admission the daemon accepted the
+mutation under is carried into that transaction and asked immediately before the action's first
+write, through the same registration check the project service asks inside its own work. A repeat
+is answered from the record before its freshness is considered. The daemon reads it again before every node a run dispatches, so a revocation or an
 expiry stops the run where it stands, and a node is dispatched only when that grant carries the
 right its effect needs.
 

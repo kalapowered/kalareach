@@ -25,6 +25,34 @@ effect class, the ingress an actor may reach it through, the rights it requires,
 selectors, its freshness and its idempotency. Each method names the exact definition revision it
 acts on, and a request whose revision does not match the document it carries is refused.
 
+## Every mutation is an action
+
+`workflow.install`, `workflow.enable`, `workflow.pause` and `workflow.run` are actions. Each
+carries the caller's action identifier, and the workflow journal records what it came to in the
+same transaction as its effect.
+
+* **One transaction.** The journal first looks for the record an earlier submission of the same
+  action left. If there is one, it is the answer and nothing is written. Otherwise the journal asks
+  the daemon whether the admission the mutation was accepted under still stands (the connection's
+  registration, the authority revision it was admitted under and its accepted deadline),
+  immediately before the action's first write; then it writes the effect and the record together.
+  No effect exists without its record, and there is no record of an action still under way.
+* **A repeat is answered, not performed.** A retry after a lost reply is the original mutation,
+  freshness window and all. It is answered from the record before its window is considered, so a
+  caller whose window has since been replaced still gets its own result. A repeated enable returns
+  the first answer and cannot undo a pause decided after it. A repeated run is told where the run
+  it started stands now, and starts nothing.
+* **A refusal is an answer too.** A refusal the host decided about the action is recorded together
+  with whatever deciding it wrote, such as the pause a breached limit owes, and a repeat is refused
+  the same way. A journal that could not be written, a grant store that could not be read and an
+  admission that lapsed say nothing about the action: they leave no record and write nothing, so a
+  later submission is decided afresh.
+* **A reused identifier is refused.** The same identifier carrying a different method or payload
+  is refused with `ID_CONFLICT`.
+* **A duplicate costs nothing.** A trigger already recorded for the revision is found inside the
+  transaction that would admit it, before any allowance is spent, so two copies of one event that
+  arrive together cannot both reach admission.
+
 ## The grant a workflow acts under
 
 A definition names a grant identifier and nothing more. The host reads that grant from its own

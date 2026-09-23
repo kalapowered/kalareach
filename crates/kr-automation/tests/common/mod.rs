@@ -63,3 +63,123 @@ pub fn standing(grant_id: GrantId, standing: GrantStanding) -> Arc<GrantTable> {
     table.set(grant_of(grant_id, ActionRight::ALL), standing);
     Arc::new(table)
 }
+
+/// A new action of `method`, submitted by the test's own actor.
+#[must_use]
+pub fn fresh_action(method: kr_protocol::method::Method) -> kr_automation::ActionKey {
+    let action_id = uuid::Uuid::new_v4();
+    kr_automation::ActionKey {
+        actor_id: "tester".to_owned(),
+        action_id: action_id.to_string(),
+        method: method.as_str().to_owned(),
+        digest: action_id.as_bytes().to_vec(),
+    }
+}
+
+/// An admission that always stands, for a suite that is not about admission.
+pub fn admitted() -> kr_automation::Result<()> {
+    Ok(())
+}
+
+/// Submits each automation mutation as a new action, under an admission that always stands.
+///
+/// The service performs every mutation as an action and records what it came to. Most suites
+/// are about something else, so each call here is a new action; a suite about repeats builds its
+/// own [`kr_automation::ActionKey`] and submits it twice.
+#[allow(async_fn_in_trait)]
+pub trait Submit {
+    /// `workflow.install`, as a new action.
+    fn submit_install(
+        &self,
+        params: &kr_protocol::automation::WorkflowInstallParams,
+        now_ms: u64,
+    ) -> kr_automation::Result<kr_protocol::automation::WorkflowInstallResult>;
+
+    /// `workflow.enable`, as a new action.
+    fn submit_enable(
+        &self,
+        params: &kr_protocol::automation::WorkflowEnableParams,
+        now_ms: u64,
+    ) -> kr_automation::Result<kr_protocol::automation::WorkflowEnableResult>;
+
+    /// `workflow.pause`, as a new action.
+    fn submit_pause(
+        &self,
+        params: &kr_protocol::automation::WorkflowPauseParams,
+        now_ms: u64,
+    ) -> kr_automation::Result<kr_protocol::automation::WorkflowPauseResult>;
+
+    /// `workflow.run`, as a new action.
+    async fn submit_run(
+        &self,
+        params: &kr_protocol::automation::WorkflowRunParams,
+        now_ms: u64,
+    ) -> kr_automation::Result<kr_protocol::automation::WorkflowRunResult>;
+}
+
+impl Submit for kr_automation::AutomationService {
+    fn submit_install(
+        &self,
+        params: &kr_protocol::automation::WorkflowInstallParams,
+        now_ms: u64,
+    ) -> kr_automation::Result<kr_protocol::automation::WorkflowInstallResult> {
+        let key = fresh_action(kr_protocol::method::Method::WorkflowInstall);
+        self.install(
+            params,
+            &kr_automation::Submitted {
+                key: &key,
+                admission: &admitted,
+            },
+            now_ms,
+        )
+    }
+
+    fn submit_enable(
+        &self,
+        params: &kr_protocol::automation::WorkflowEnableParams,
+        now_ms: u64,
+    ) -> kr_automation::Result<kr_protocol::automation::WorkflowEnableResult> {
+        let key = fresh_action(kr_protocol::method::Method::WorkflowEnable);
+        self.enable(
+            params,
+            &kr_automation::Submitted {
+                key: &key,
+                admission: &admitted,
+            },
+            now_ms,
+        )
+    }
+
+    fn submit_pause(
+        &self,
+        params: &kr_protocol::automation::WorkflowPauseParams,
+        now_ms: u64,
+    ) -> kr_automation::Result<kr_protocol::automation::WorkflowPauseResult> {
+        let key = fresh_action(kr_protocol::method::Method::WorkflowPause);
+        self.pause(
+            params,
+            &kr_automation::Submitted {
+                key: &key,
+                admission: &admitted,
+            },
+            now_ms,
+        )
+    }
+
+    async fn submit_run(
+        &self,
+        params: &kr_protocol::automation::WorkflowRunParams,
+        now_ms: u64,
+    ) -> kr_automation::Result<kr_protocol::automation::WorkflowRunResult> {
+        let key = fresh_action(kr_protocol::method::Method::WorkflowRun);
+        self.run(
+            params,
+            &kr_automation::Submitted {
+                key: &key,
+                admission: &admitted,
+            },
+            now_ms,
+        )
+        .await
+    }
+}

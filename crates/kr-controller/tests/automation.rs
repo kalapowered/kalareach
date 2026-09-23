@@ -777,3 +777,84 @@ async fn a_replayed_mutation_is_answered_from_its_record() {
 
     host.clients.abort();
 }
+
+/// A caller that lost its reply and asks again over a new connection is answered from the record.
+///
+/// The retry is the original mutation, window and all, and the new connection holds a newer
+/// window. The record is read before any freshness is considered, so the caller gets its own
+/// result, and the run is not started a second time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_over_a_new_connection_is_answered_from_its_record() {
+    let host = host().await;
+    let mut control = client(&host).await;
+
+    host.issue(grant_id(5), &[ActionRight::TerminalInput]);
+    let document = definition(
+        workflow_id(5),
+        grant_id(5),
+        "asked twice",
+        WorkflowNode {
+            node_id: "tests".to_owned(),
+            action_kind: "run_tests".to_owned(),
+            action_params: r#"{"suite": "unit"}"#.to_owned(),
+            declared_environment: Nullable::null(),
+        },
+    );
+    install(&mut control, &host, &document).await;
+    enable(&mut control, &host, &document).await;
+
+    let original = control
+        .compose(
+            Method::WorkflowRun,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &WorkflowRunParams {
+                workflow_id: document.workflow_id,
+                revision: document.revision,
+                event_id: "evt-once".to_owned(),
+                event_type: "manual".to_owned(),
+                event_payload: Nullable::null(),
+                causal_parent: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the mutation is composed");
+    let first: WorkflowRunResult = typed(
+        &control
+            .repeat(&original)
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the run is admitted"),
+    );
+    drop(control);
+
+    let mut again = client(&host).await;
+    let answered: WorkflowRunResult = typed(
+        &again
+            .repeat(&original)
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the repeat is answered from its record"),
+    );
+    assert_eq!(answered.run_id, first.run_id, "one action, one run");
+    assert_eq!(answered.status, first.status);
+
+    let read: WorkflowReadResult = typed(
+        &again
+            .request(
+                Method::WorkflowRead,
+                &WorkflowReadParams {
+                    workflow_id: Nullable::some(document.workflow_id),
+                    revision: Nullable::some(document.revision),
+                    run_id: Nullable::null(),
+                    causal_root_id: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("workflow.read succeeds"),
+    );
+    assert_eq!(read.runs.len(), 1, "the repeat started nothing");
+
+    host.clients.abort();
+}

@@ -7,6 +7,10 @@
 //! - `workflow.pause`
 //! - `workflow.run`
 //! - `workflow.read`
+//!
+//! The four mutations are actions. Each one is performed inside one journal transaction together
+//! with the record of what it came to ([`WorkflowStore::act`]), and a repeat of an action is
+//! answered from that record ([`AutomationService::answered`]) rather than performed again.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -19,7 +23,9 @@ use kr_protocol::automation::{
     WorkflowInstallParams, WorkflowInstallResult, WorkflowPauseParams, WorkflowPauseResult,
     WorkflowReadParams, WorkflowReadResult, WorkflowRunParams, WorkflowRunResult,
 };
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{CausalRootId, PluginId, WorkflowId, WorkflowRunId, WorkspaceId};
+use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 
 use crate::admission::AdmissionController;
@@ -29,7 +35,10 @@ use crate::definition::validate_definition;
 use crate::engine::{ActionRunner, WorkflowEngine};
 use crate::error::{AutomationError, Result};
 use crate::source_workflow::{QuiescenceManager, QuiescenceReservation, SourceWorkflowCoordinator};
-use crate::store::{AttentionSubject, InstalledDefinition, WorkflowStore};
+use crate::store::{
+    Acted, ActionKey, ActionRecord, AttentionSubject, InstalledDefinition, Journal, Submitted,
+    WorkflowStore,
+};
 use crate::{HostClock, SystemClock};
 
 /// The identifier an attention record is raised about.
@@ -53,10 +62,32 @@ struct RunPermit<'a> {
 
 impl Drop for RunPermit<'_> {
     fn drop(&mut self) {
-        if let Ok(mut admission) = self.admission.lock() {
-            admission.release_run(self.workflow_id);
-        }
+        self.admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .release_run(self.workflow_id);
     }
+}
+
+/// A run the journal has admitted and recorded, ready for its first node.
+struct AdmittedRun<'a> {
+    run_id: WorkflowRunId,
+    definition: WorkflowDefinition,
+    causal: CausalContext,
+    _permit: RunPermit<'a>,
+}
+
+/// What an earlier submission of an action came to, as its method answers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    /// A `workflow.install` that was performed.
+    Installed(WorkflowInstallResult),
+    /// A `workflow.enable` that was performed.
+    Enabled(WorkflowEnableResult),
+    /// A `workflow.pause` that was performed.
+    Paused(WorkflowPauseResult),
+    /// A `workflow.run` that started a run, as that run stands now.
+    Ran(WorkflowRunResult),
 }
 
 /// The central automation service of an environment.
@@ -87,6 +118,10 @@ impl AutomationService {
     /// `authority` is where the grant a definition names is read from. There is no default here
     /// either: a service that believed whatever grant a request carried would let a caller
     /// describe authority it does not hold.
+    ///
+    /// # Errors
+    ///
+    /// Returns the journal's refusal when it cannot be opened.
     pub fn open(
         state_dir: impl AsRef<Path>,
         runner: Arc<dyn ActionRunner>,
@@ -101,6 +136,10 @@ impl AutomationService {
     }
 
     /// Opens the automation service on the workflow journal in `state_dir`, reading `clock`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the journal's refusal when it cannot be opened.
     pub fn open_with_clock(
         state_dir: impl AsRef<Path>,
         runner: Arc<dyn ActionRunner>,
@@ -116,6 +155,10 @@ impl AutomationService {
     }
 
     /// Creates an automation service whose journal lives only in memory, reading `clock`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the journal's refusal when its schema cannot be created.
     pub fn in_memory_with_clock(
         runner: Arc<dyn ActionRunner>,
         authority: Arc<dyn AuthoritySource>,
@@ -129,6 +172,7 @@ impl AutomationService {
         )
     }
 
+    #[allow(clippy::unnecessary_wraps)]
     fn on_store(
         store: Arc<WorkflowStore>,
         runner: Arc<dyn ActionRunner>,
@@ -158,6 +202,12 @@ impl AutomationService {
         &self.store
     }
 
+    /// Accessor for the engine.
+    #[must_use]
+    pub fn engine(&self) -> &Arc<WorkflowEngine> {
+        &self.engine
+    }
+
     /// Accessor for the source workflow coordinator.
     #[must_use]
     pub fn source_workflow(&self) -> &Arc<SourceWorkflowCoordinator> {
@@ -171,8 +221,30 @@ impl AutomationService {
     /// node's effect, and a shell node has to be covered by a broad shell grant that admits the
     /// environment it declares. A definition nobody could ever run is refused here rather than
     /// half way through its first run.
+    ///
+    /// The installation and the record of the action commit together, and a repeat of the action
+    /// is answered from that record.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the service decided, the one an earlier submission of the same action
+    /// was given, or a lapsed admission.
     pub fn install(
         &self,
+        params: &WorkflowInstallParams,
+        submitted: &Submitted<'_>,
+        now_ms: u64,
+    ) -> Result<WorkflowInstallResult> {
+        let acted = self.store.act(submitted, now_ms, |journal| {
+            let result = self.install_in(journal, params, now_ms)?;
+            Ok((ActionRecord::done(&result)?, result))
+        })?;
+        performed_or_recorded(acted)
+    }
+
+    fn install_in(
+        &self,
+        journal: &Journal<'_>,
         params: &WorkflowInstallParams,
         now_ms: u64,
     ) -> Result<WorkflowInstallResult> {
@@ -205,7 +277,7 @@ impl AutomationService {
 
         // A revision number only ever moves forward, and an installed revision is immutable:
         // the journal refuses a second insert of one that exists.
-        if let Some(existing) = self.store.get_latest_definition(params.workflow_id)?
+        if let Some(existing) = journal.latest_definition(params.workflow_id)?
             && params.revision.get() <= existing.definition.revision.get()
         {
             return Err(AutomationError::RevisionMismatch {
@@ -215,7 +287,7 @@ impl AutomationService {
             });
         }
 
-        self.store.save_definition(&params.definition, now_ms)?;
+        journal.save_definition(&params.definition, now_ms)?;
 
         Ok(WorkflowInstallResult {
             workflow_id: params.workflow_id,
@@ -228,63 +300,115 @@ impl AutomationService {
     ///
     /// Enabling clears a pause, whether the pause came from `workflow.pause` or from a breached
     /// per-workflow limit, so the same authorised method that starts a revision is the one that
-    /// restarts it.
+    /// restarts it. The change and the record of the action commit together, so a replayed
+    /// enable is answered from its record and cannot undo a pause decided after it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the service decided, the one an earlier submission of the same action
+    /// was given, or a lapsed admission.
     pub fn enable(
         &self,
         params: &WorkflowEnableParams,
+        submitted: &Submitted<'_>,
         now_ms: u64,
     ) -> Result<WorkflowEnableResult> {
-        self.installed(params.workflow_id, params.revision)?;
-        self.store
-            .set_enabled(params.workflow_id, params.revision.get(), true)?;
-        self.store
-            .resume_workflow(params.workflow_id, params.revision.get(), now_ms)?;
-
-        Ok(WorkflowEnableResult {
-            workflow_id: params.workflow_id,
-            revision: params.revision,
-            enabled: true,
-        })
+        let acted = self.store.act(submitted, now_ms, |journal| {
+            installed(journal, params.workflow_id, params.revision)?;
+            journal.set_enabled(params.workflow_id, params.revision.get(), true)?;
+            journal.resume_workflow(params.workflow_id, params.revision.get(), now_ms)?;
+            let result = WorkflowEnableResult {
+                workflow_id: params.workflow_id,
+                revision: params.revision,
+                enabled: true,
+            };
+            Ok((ActionRecord::done(&result)?, result))
+        })?;
+        performed_or_recorded(acted)
     }
 
     /// Pauses an installed workflow revision (`workflow.pause`).
-    pub fn pause(&self, params: &WorkflowPauseParams, _now_ms: u64) -> Result<WorkflowPauseResult> {
-        self.installed(params.workflow_id, params.revision)?;
-        self.store
-            .set_paused(params.workflow_id, params.revision.get(), true)?;
-
-        Ok(WorkflowPauseResult {
-            workflow_id: params.workflow_id,
-            revision: params.revision,
-            paused: true,
-        })
-    }
-
-    /// Loads the exact revision a request names, with the journal's state for it.
-    fn installed(&self, workflow_id: WorkflowId, revision: U64) -> Result<InstalledDefinition> {
-        let installed = self
-            .store
-            .get_definition(workflow_id, revision.get())?
-            .ok_or(AutomationError::WorkflowNotFound(workflow_id))?;
-
-        if installed.definition.revision != revision {
-            return Err(AutomationError::RevisionMismatch {
-                workflow_id,
-                expected: revision.get(),
-                found: installed.definition.revision.get(),
-            });
-        }
-        Ok(installed)
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the service decided, the one an earlier submission of the same action
+    /// was given, or a lapsed admission.
+    pub fn pause(
+        &self,
+        params: &WorkflowPauseParams,
+        submitted: &Submitted<'_>,
+        now_ms: u64,
+    ) -> Result<WorkflowPauseResult> {
+        let acted = self.store.act(submitted, now_ms, |journal| {
+            installed(journal, params.workflow_id, params.revision)?;
+            journal.set_paused(params.workflow_id, params.revision.get(), true)?;
+            let result = WorkflowPauseResult {
+                workflow_id: params.workflow_id,
+                revision: params.revision,
+                paused: true,
+            };
+            Ok((ActionRecord::done(&result)?, result))
+        })?;
+        performed_or_recorded(acted)
     }
 
     /// Starts a workflow run (`workflow.run`).
     ///
-    /// Persists the run before dispatching its first node.
-    /// Deduplicates by `(workflow_id, definition_revision, event_id)`.
-    /// Enforces per-workflow concurrency and per-host/grant admission rates.
-    /// Tracks causal root, depth, and parent, preventing retrigger on own descendants.
-    pub async fn run(&self, params: &WorkflowRunParams, now_ms: u64) -> Result<WorkflowRunResult> {
-        let installed = self.installed(params.workflow_id, params.revision)?;
+    /// The run is admitted in one journal transaction: the record of an earlier submission of
+    /// the same action is looked for, the trigger is deduplicated by `(workflow_id,
+    /// definition_revision, event_id)` before anything is spent, per-workflow concurrency and the
+    /// per-grant and host-wide rates are applied, and the trigger, the run, its node receipts,
+    /// the chain's reservation and the record of the action commit together. The run is
+    /// therefore durable before its first node dispatches, and a repeat of the action is
+    /// answered with where that run stands now rather than starting a second one.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the service decided, the one an earlier submission of the same action
+    /// was given, a lapsed admission, or the refusal that stopped the run.
+    pub async fn run(
+        &self,
+        params: &WorkflowRunParams,
+        submitted: &Submitted<'_>,
+        now_ms: u64,
+    ) -> Result<WorkflowRunResult> {
+        let acted = self.store.act(submitted, now_ms, |journal| {
+            let admitted = self.admit_run(journal, params, now_ms)?;
+            Ok((
+                ActionRecord::Started {
+                    run_id: admitted.run_id,
+                },
+                admitted,
+            ))
+        })?;
+        let admitted = match acted {
+            Acted::Performed(admitted) => admitted,
+            Acted::Answered(record) => return self.ran(record),
+        };
+
+        let status = self
+            .engine
+            .execute_run(admitted.run_id, &admitted.definition, &admitted.causal)
+            .await?;
+
+        Ok(WorkflowRunResult {
+            run_id: admitted.run_id,
+            workflow_id: params.workflow_id,
+            revision: params.revision,
+            causal_root_id: admitted.causal.root_id,
+            depth: U64::new(admitted.causal.depth),
+            status,
+        })
+    }
+
+    /// Decides one trigger, inside the journal transaction that records it.
+    fn admit_run<'s>(
+        &'s self,
+        journal: &Journal<'_>,
+        params: &WorkflowRunParams,
+        now_ms: u64,
+    ) -> Result<AdmittedRun<'s>> {
+        let installed = installed(journal, params.workflow_id, params.revision)?;
         if !installed.enabled {
             return Err(AutomationError::WorkflowDisabled(params.workflow_id));
         }
@@ -301,8 +425,8 @@ impl AutomationService {
         authority::check_definition(&grant, &def)?;
 
         // Establish the causal context from the host's own records.
-        let causal_ctx = match params.causal_parent.0.as_ref() {
-            Some(parent_ref) => self.descendant_context(&def, parent_ref)?,
+        let causal = match params.causal_parent.0.as_ref() {
+            Some(parent_ref) => descendant_context(journal, &def, parent_ref)?,
             // No parent means an external trigger, including an unauthenticated callback. The
             // host mints a root for it; nothing in the request can name one, so event content
             // cannot place a trigger inside an existing chain or start a new chain of its own
@@ -311,10 +435,11 @@ impl AutomationService {
         };
 
         // A trigger this journal has already recorded is the same trigger arriving twice. It is
-        // answered before admission, because a redelivery is not new load and must not be able
-        // to spend an allowance or pause the workflow. The transaction below still holds the
-        // line for two copies that arrive at once.
-        if self.store.trigger_is_recorded(
+        // answered inside the transaction and before admission, because a redelivery is not new
+        // load and must not be able to spend an allowance or pause the workflow. Two copies of
+        // one event that arrive at once are serialised by this transaction, so the second always
+        // finds the first's record here.
+        if journal.trigger_is_recorded(
             params.workflow_id,
             params.revision.get(),
             &params.event_id,
@@ -326,30 +451,20 @@ impl AutomationService {
             });
         }
 
+        // The admission this action was accepted under, asked before the first thing the run
+        // spends rather than only before the first thing it writes.
+        journal.admit()?;
+
         // Per-workflow concurrency, the per-grant rate and the host-wide rate, in that order.
         // A breach pauses the revision and records the attention item that pause owes, so the
         // workflow stops rather than being refused one request at a time.
         let admitted = self
             .admission
             .lock()
-            .expect("the admission controller")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .admit_run(params.workflow_id, def.grant_reference, now_ms, None, None);
         if let Err(breach) = admitted {
-            // Two copies of one event can both reach this point. The one that lost is still a
-            // duplicate, not load, so the journal is asked again before the breach is allowed
-            // to pause anything.
-            if self.store.trigger_is_recorded(
-                params.workflow_id,
-                params.revision.get(),
-                &params.event_id,
-            )? {
-                return Err(AutomationError::DuplicateTrigger {
-                    workflow_id: params.workflow_id,
-                    revision: params.revision.get(),
-                    event_id: params.event_id.clone(),
-                });
-            }
-            self.store.pause_workflow_on_breach(
+            journal.pause_workflow_on_breach(
                 params.workflow_id,
                 params.revision.get(),
                 &breach.to_string(),
@@ -357,89 +472,78 @@ impl AutomationService {
             )?;
             return Err(breach);
         }
-        let _permit = RunPermit {
+        let permit = RunPermit {
             admission: &self.admission,
             workflow_id: params.workflow_id,
         };
 
-        // The trigger, the run, its deduplication key and the chain's reservation commit
-        // together, so a run is durable before its first node dispatches and a reservation is
-        // never made for a run that was not recorded.
         let run_id = WorkflowRunId::new(crate::new_uuid());
-        let outcome =
-            self.store
-                .commit_trigger_and_run(run_id, &def, &params.event_id, &causal_ctx, now_ms);
-
-        let status = match outcome {
-            Ok(_) => self.engine.execute_run(run_id, &def, &causal_ctx).await?,
-            Err(error) => return Err(error),
-        };
-
-        Ok(WorkflowRunResult {
+        journal.commit_trigger_and_run(run_id, &def, &params.event_id, &causal, now_ms)?;
+        Ok(AdmittedRun {
             run_id,
-            workflow_id: params.workflow_id,
-            revision: params.revision,
-            causal_root_id: causal_ctx.root_id,
-            depth: U64::new(causal_ctx.depth),
-            status,
+            definition: def,
+            causal,
+            _permit: permit,
         })
     }
 
-    /// Derives a descendant's causal context from the parent run the host has on record.
+    /// Answers a repeat of a `workflow.run` action with where its run stands now.
+    fn ran(&self, record: ActionRecord) -> Result<WorkflowRunResult> {
+        let run_id = match record {
+            ActionRecord::Started { run_id } => run_id,
+            other => return recorded(other),
+        };
+        let run = self.store.run_summary(run_id)?.ok_or_else(|| {
+            AutomationError::InvalidArgument(format!(
+                "the run {run_id} this action started is not in the journal"
+            ))
+        })?;
+        Ok(WorkflowRunResult {
+            run_id: run.run_id,
+            workflow_id: run.workflow_id,
+            revision: run.revision,
+            causal_root_id: run.causal_root_id,
+            depth: run.depth,
+            status: run.status,
+        })
+    }
+
+    /// Answers an action from what an earlier submission of it recorded, when one did.
     ///
-    /// The caller names a parent run and a parent node. Everything else, the root, the depth
-    /// and the budget generation, is read from this host's journal, so a caller cannot mint a
-    /// fresh root by claiming one, reset the depth, or rejoin a rearmed budget with a stale run.
-    fn descendant_context(
-        &self,
-        def: &WorkflowDefinition,
-        parent_ref: &CausalParentRef,
-    ) -> Result<CausalContext> {
-        let parent = self
-            .store
-            .get_run_record(parent_ref.parent_run_id)?
-            .ok_or(AutomationError::ParentRunNotFound(parent_ref.parent_run_id))?;
-
-        if !self
-            .store
-            .node_receipt_exists(parent.run_id, &parent_ref.parent_node_id)?
-        {
-            return Err(AutomationError::ParentNodeNotFound {
-                run_id: parent.run_id,
-                node_id: parent_ref.parent_node_id.clone(),
-            });
-        }
-
-        if parent_ref.causal_root_id != parent.causal_root_id {
-            return Err(AutomationError::CausalRootMismatch {
-                claimed: parent_ref.causal_root_id,
-                actual: parent.causal_root_id,
-            });
-        }
-
-        // A definition does not retrigger on its own descendants. Only a definition that was
-        // reviewed and installed with explicit recurrence may, and even then the root stays the
-        // parent's: recurrence buys another turn in the chain, not a fresh budget.
-        if !def.explicit_recurrence
-            && self
-                .store
-                .list_runs_by_root(parent.causal_root_id)?
-                .iter()
-                .any(|run| run.workflow_id == def.workflow_id)
-        {
-            return Err(AutomationError::SelfRetriggerRejected {
-                workflow_id: def.workflow_id,
-                root: parent.causal_root_id,
-            });
-        }
-
-        Ok(CausalContext::descendant_of(
-            &parent,
-            &parent_ref.parent_node_id,
-        ))
+    /// This is what a repeat is answered from before its freshness is considered: a retry after
+    /// a lost reply carries the window it was first admitted under, and refusing it for that
+    /// would deny a caller its own completed result. Nothing here performs anything, and there is
+    /// no state in which a submission is recorded as still under way: an action either has a
+    /// record, written with its effect, or has not been performed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal an earlier submission was given,
+    /// [`AutomationError::ActionIdentifierReused`] for an identifier spent on another action, and
+    /// a storage error when the record cannot be read.
+    pub fn answered(&self, key: &ActionKey) -> Result<Option<Answer>> {
+        let Some(record) = self.store.recorded_action(key)? else {
+            return Ok(None);
+        };
+        Ok(Some(match Method::from_wire(&key.method) {
+            Some(Method::WorkflowInstall) => Answer::Installed(recorded(record)?),
+            Some(Method::WorkflowEnable) => Answer::Enabled(recorded(record)?),
+            Some(Method::WorkflowPause) => Answer::Paused(recorded(record)?),
+            Some(Method::WorkflowRun) => Answer::Ran(self.ran(record)?),
+            _ => {
+                return Err(AutomationError::InvalidArgument(format!(
+                    "{} is not an automation mutation",
+                    key.method
+                )));
+            }
+        }))
     }
 
     /// Reads definitions, runs, node receipts, and remaining causal budget (`workflow.read`).
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the journal cannot be read.
     pub fn read(&self, params: &WorkflowReadParams, now_ms: u64) -> Result<WorkflowReadResult> {
         let wf_filter = params.workflow_id.0;
         let mut definitions = self.store.list_definitions(wf_filter)?;
@@ -498,6 +602,10 @@ impl AutomationService {
     /// Requires explicit management right (`ActionRight::AutomationManage`). A replayed or late
     /// event reaches [`Self::run`] without this right and cannot rearm anything; a descendant of
     /// a run from the old generation is refused afterwards by the generation check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::PermissionDenied`] without the management right.
     pub fn rearm(
         &self,
         causal_root_id: CausalRootId,
@@ -526,6 +634,10 @@ impl AutomationService {
     /// with another producer, because the sequence numbers here are the journal's row numbers.
     ///
     /// Returns how many items were newly raised.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error, or the attention state's refusal.
     pub fn deliver_attention(
         &self,
         attention: &mut Attention,
@@ -569,7 +681,11 @@ impl AutomationService {
         Ok(raised)
     }
 
-    /// Reserves a workspace for quiesced capture (closing T-029 residual 2).
+    /// Reserves a workspace for quiesced capture.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutomationError::PermissionDenied`] while another reservation holds it.
     pub fn reserve_quiescence(
         &self,
         workspace_id: WorkspaceId,
@@ -586,5 +702,95 @@ impl AutomationService {
         self.source_workflow
             .quiescence()
             .release(workspace_id, reservation_id)
+    }
+}
+
+/// Loads the exact revision a request names, with the journal's state for it.
+fn installed(
+    journal: &Journal<'_>,
+    workflow_id: WorkflowId,
+    revision: U64,
+) -> Result<InstalledDefinition> {
+    let installed = journal
+        .definition(workflow_id, revision.get())?
+        .ok_or(AutomationError::WorkflowNotFound(workflow_id))?;
+    if installed.definition.revision != revision {
+        return Err(AutomationError::RevisionMismatch {
+            workflow_id,
+            expected: revision.get(),
+            found: installed.definition.revision.get(),
+        });
+    }
+    Ok(installed)
+}
+
+/// Derives a descendant's causal context from the parent run the host has on record.
+///
+/// The caller names a parent run and a parent node. Everything else, the root, the depth and the
+/// budget generation, is read from this host's journal, so a caller cannot mint a fresh root by
+/// claiming one, reset the depth, or rejoin a rearmed budget with a stale run.
+fn descendant_context(
+    journal: &Journal<'_>,
+    def: &WorkflowDefinition,
+    parent_ref: &CausalParentRef,
+) -> Result<CausalContext> {
+    let parent = journal
+        .run_record(parent_ref.parent_run_id)?
+        .ok_or(AutomationError::ParentRunNotFound(parent_ref.parent_run_id))?;
+
+    if !journal.node_receipt_exists(parent.run_id, &parent_ref.parent_node_id)? {
+        return Err(AutomationError::ParentNodeNotFound {
+            run_id: parent.run_id,
+            node_id: parent_ref.parent_node_id.clone(),
+        });
+    }
+
+    if parent_ref.causal_root_id != parent.causal_root_id {
+        return Err(AutomationError::CausalRootMismatch {
+            claimed: parent_ref.causal_root_id,
+            actual: parent.causal_root_id,
+        });
+    }
+
+    // A definition does not retrigger on its own descendants. Only a definition that was
+    // reviewed and installed with explicit recurrence may, and even then the root stays the
+    // parent's: recurrence buys another turn in the chain, not a fresh budget.
+    if !def.explicit_recurrence
+        && journal
+            .runs_by_root(parent.causal_root_id)?
+            .iter()
+            .any(|run| run.workflow_id == def.workflow_id)
+    {
+        return Err(AutomationError::SelfRetriggerRejected {
+            workflow_id: def.workflow_id,
+            root: parent.causal_root_id,
+        });
+    }
+
+    Ok(CausalContext::descendant_of(
+        &parent,
+        &parent_ref.parent_node_id,
+    ))
+}
+
+/// What a submission came to, for a method whose record carries its whole result.
+fn performed_or_recorded<T: serde::de::DeserializeOwned>(acted: Acted<T>) -> Result<T> {
+    match acted {
+        Acted::Performed(value) => Ok(value),
+        Acted::Answered(record) => recorded(record),
+    }
+}
+
+/// Reads back what an earlier submission recorded, for a method whose record carries its result.
+fn recorded<T: serde::de::DeserializeOwned>(record: ActionRecord) -> Result<T> {
+    match record {
+        ActionRecord::Done { result } => Ok(serde_json::from_str(&result)?),
+        ActionRecord::Refused { code, detail } => Err(AutomationError::Recorded {
+            code: ErrorCode::from_wire(&code).unwrap_or(ErrorCode::InvalidArgument),
+            detail,
+        }),
+        ActionRecord::Started { run_id } => Err(AutomationError::InvalidArgument(format!(
+            "this action started run {run_id}, which is not what the method it names does"
+        ))),
     }
 }

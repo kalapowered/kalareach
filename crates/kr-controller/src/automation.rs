@@ -26,8 +26,8 @@
 use std::sync::Arc;
 
 use kr_automation::{
-    ActionClaim, ActionOutcome, ActionRecord, ActionRunner, AuthoritySource, AutomationService,
-    Dispatch, WorkflowStore,
+    ActionKey, ActionOutcome, ActionRunner, Answer as Recorded, AuthoritySource, AutomationService,
+    Dispatch, Submitted, WorkflowStore,
 };
 use kr_changeset::ChangeSetService;
 use kr_changeset::materialise;
@@ -359,25 +359,15 @@ impl AutomationModule {
         frame(request.request_id, self.read(request).await)
     }
 
-    /// Serves one automation mutation and returns the frame it answers with.
-    #[must_use]
-    pub async fn write_frame(
-        &self,
-        actor_id: &ActorId,
-        mutation: &MutationRequest,
-        method: Method,
-    ) -> ControlFrame {
-        frame(
-            mutation.request_id,
-            self.write(actor_id, mutation, method).await,
-        )
-    }
-
     /// Answers an action this service has already performed for this caller, if it has.
     ///
     /// This runs **before** the freshness window is considered, because a retry after a lost
     /// reply carries the window the action was first admitted under and this connection holds a
     /// newer one. Refusing it for that would deny a caller its own completed result.
+    ///
+    /// An action either has a record, written in the same transaction as its effect, or has not
+    /// been performed; there is no record of one still under way to be mistaken for either. A
+    /// run that is still dispatching nodes has its record, and a repeat is told where it stands.
     #[must_use]
     pub async fn retained(
         &self,
@@ -385,21 +375,12 @@ impl AutomationModule {
         mutation: &MutationRequest,
         method: Method,
     ) -> Option<ControlFrame> {
-        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).ok()?;
+        let key = action_key(actor_id, mutation, method).ok()?;
         let service = Arc::clone(&self.service);
-        let actor = actor_id.as_str().to_owned();
-        let action_id = mutation.action_id.to_string();
-        let name = method.as_str();
-        let held = blocking(move || {
-            service
-                .store()
-                .retained_action(&actor, &action_id, name, digest.as_bytes())
-        })
-        .await;
-        match held {
+        match blocking(move || service.answered(&key)).await {
+            Ok(None) => None,
+            Ok(Some(answer)) => Some(frame(mutation.request_id, encode_answer(&answer))),
             Err(error) => Some(frame(mutation.request_id, Err(error.into()))),
-            Ok(None | Some(ActionRecord::InFlight)) => None,
-            Ok(Some(record)) => Some(frame(mutation.request_id, answer_from(record))),
         }
     }
 
@@ -434,12 +415,13 @@ impl AutomationModule {
         .await
     }
 
-    /// Serves one automation mutation, answering an exact repeat from its retained record.
+    /// Serves one automation mutation as an action, answering an exact repeat from its record.
     ///
-    /// The claim is taken before the effect. Two copies of one action that both found no record
-    /// would otherwise both install a definition or both start a run, and returning one reply to
-    /// both would not undo the second effect. It is also what stops a replayed enable from
-    /// undoing a pause that was decided after it.
+    /// `admission` is the daemon's answer to whether the admission this mutation was accepted
+    /// under still stands. The journal asks it inside the transaction that performs the action,
+    /// immediately before the action's first write, so an action cannot begin under an admission
+    /// that lapsed while it waited for a blocking thread or for the journal's own lock; and it is
+    /// asked only when there is no record to answer from, so a retry still gets its own result.
     ///
     /// # Errors
     ///
@@ -449,118 +431,59 @@ impl AutomationModule {
         actor_id: &ActorId,
         mutation: &MutationRequest,
         method: Method,
+        admission: Admission,
     ) -> Answer<ParamsValue> {
-        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
-            .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
-        let actor = actor_id.as_str().to_owned();
-        let action_id = mutation.action_id.to_string();
-        let name = method.as_str();
-        let now_ms = kr_ipc::now_ms().get();
-        {
-            let service = Arc::clone(&self.service);
-            let actor = actor.clone();
-            let action_id = action_id.clone();
-            // How long a claim on this method can stand before the attempt that took it has
-            // clearly ended. An install, an enable and a pause are a few statements against this
-            // journal, so a claim older than the longest lifetime a mutation may be admitted for
-            // belongs to nobody. A run dispatches nodes under a deadline of its own, far longer
-            // than that, so its claim is never taken over: this host says it cannot establish the
-            // outcome rather than starting the run a second time.
-            let stale_after_ms = (method != Method::WorkflowRun)
-                .then(|| kr_protocol::limits::MAX_MUTATION_TTL.get());
-            match blocking(move || {
-                service.store().claim_action(
-                    &actor,
-                    &action_id,
-                    name,
-                    digest.as_bytes(),
-                    stale_after_ms,
-                    now_ms,
-                )
-            })
-            .await?
-            {
-                ActionClaim::Held => {}
-                ActionClaim::Answered(record) => return answer_from(record),
-                ActionClaim::InFlight => {
-                    return Err(ProtocolError::new(
-                        ErrorCode::OutcomeUnknown,
-                        "another copy of this action is running and has not said what it came to",
-                    ));
-                }
-            }
-        }
-        let outcome = self.perform(mutation, method, now_ms).await;
-        // Recorded before it is returned, so the reply and the record cannot disagree about what
-        // happened. A journal that will not take the record is not an ordinary failure of the
-        // request: the work was done and no record of it exists, so what the caller is told is
-        // that its outcome is not established.
-        let record = match &outcome {
-            Ok(value) => match kr_cbor::to_canonical_vec(value) {
-                Ok(bytes) => ActionRecord::Done { result: bytes },
-                Err(error) => {
-                    return Err(ProtocolError::new(
-                        ErrorCode::InvalidArgument,
-                        error.to_string(),
-                    ));
-                }
-            },
-            Err(error) => ActionRecord::Refused {
-                code: error.code.as_str().to_owned(),
-                detail: error.message.clone(),
-            },
-        };
-        let service = Arc::clone(&self.service);
-        if blocking(move || {
-            service
-                .store()
-                .settle_action(&actor, &action_id, &record, now_ms)
-        })
-        .await
-        .is_err()
-        {
-            return Err(ProtocolError::new(
-                ErrorCode::OutcomeUnknown,
-                "this action was performed and this host could not record what it came to",
-            ));
-        }
-        outcome
-    }
-
-    /// Performs one automation mutation, with its claim already held.
-    async fn perform(
-        &self,
-        mutation: &MutationRequest,
-        method: Method,
-        now_ms: u64,
-    ) -> Answer<ParamsValue> {
+        let key = action_key(actor_id, mutation, method)?;
         let service = Arc::clone(&self.service);
         let params = mutation.params.clone();
+        let now_ms = kr_ipc::now_ms().get();
+        let still_admitted = move || -> kr_automation::Result<()> {
+            admission().map_err(|refusal| kr_automation::AutomationError::Lapsed {
+                code: refusal.code,
+                detail: refusal.message,
+            })
+        };
         match method {
             // A run dispatches its nodes and waits for each of them, so it stays on this task
             // rather than occupying a blocking thread for as long as the work takes.
             Method::WorkflowRun => {
                 let asked: WorkflowRunParams = typed(&params)?;
-                encode(&service.run(&asked, now_ms).await?)
+                let submitted = Submitted {
+                    key: &key,
+                    admission: &still_admitted,
+                };
+                encode(&service.run(&asked, &submitted, now_ms).await?)
             }
             Method::WorkflowInstall => {
                 blocking(move || {
                     let asked: WorkflowInstallParams = typed(&params)?;
-                    encode(&service.install(&asked, now_ms)?)
+                    let submitted = Submitted {
+                        key: &key,
+                        admission: &still_admitted,
+                    };
+                    encode(&service.install(&asked, &submitted, now_ms)?)
                 })
                 .await
             }
             Method::WorkflowEnable => {
                 blocking(move || {
                     let asked: WorkflowEnableParams = typed(&params)?;
-                    encode(&service.enable(&asked, now_ms)?)
+                    let submitted = Submitted {
+                        key: &key,
+                        admission: &still_admitted,
+                    };
+                    encode(&service.enable(&asked, &submitted, now_ms)?)
                 })
                 .await
             }
             Method::WorkflowPause => {
                 blocking(move || {
                     let asked: WorkflowPauseParams = typed(&params)?;
-                    encode(&service.pause(&asked, now_ms)?)
+                    let submitted = Submitted {
+                        key: &key,
+                        admission: &still_admitted,
+                    };
+                    encode(&service.pause(&asked, &submitted, now_ms)?)
                 })
                 .await
             }
@@ -572,6 +495,33 @@ impl AutomationModule {
                 ),
             )),
         }
+    }
+}
+
+/// The daemon's answer to whether a mutation's admission still stands.
+pub type Admission =
+    Arc<dyn Fn() -> std::result::Result<(), ProtocolError> + Send + Sync + 'static>;
+
+/// The journal's key for one submitted mutation: the verified actor, its action identifier, the
+/// method and the digest of everything the mutation carried.
+fn action_key(actor_id: &ActorId, mutation: &MutationRequest, method: Method) -> Answer<ActionKey> {
+    let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
+        .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))?;
+    Ok(ActionKey {
+        actor_id: actor_id.as_str().to_owned(),
+        action_id: mutation.action_id.to_string(),
+        method: method.as_str().to_owned(),
+        digest: digest.as_bytes().to_vec(),
+    })
+}
+
+/// Encodes what an earlier submission of an action came to.
+fn encode_answer(answer: &Recorded) -> Answer<ParamsValue> {
+    match answer {
+        Recorded::Installed(result) => encode(result),
+        Recorded::Enabled(result) => encode(result),
+        Recorded::Paused(result) => encode(result),
+        Recorded::Ran(result) => encode(result),
     }
 }
 
@@ -589,24 +539,8 @@ where
     }
 }
 
-/// Turns the record of a finished action back into the answer it produced.
-fn answer_from(record: ActionRecord) -> Answer<ParamsValue> {
-    match record {
-        ActionRecord::Done { result } => kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
-            .map(ParamsValue::new)
-            .map_err(|error| ProtocolError::new(ErrorCode::StorageUnavailable, error.to_string())),
-        ActionRecord::Refused { code, detail } => Err(ProtocolError::new(
-            ErrorCode::from_wire(&code).unwrap_or(ErrorCode::InvalidArgument),
-            detail,
-        )),
-        ActionRecord::InFlight => Err(ProtocolError::new(
-            ErrorCode::OutcomeUnknown,
-            "another copy of this action is running and has not said what it came to",
-        )),
-    }
-}
-
-fn frame(request_id: RequestId, outcome: Answer<ParamsValue>) -> ControlFrame {
+/// The response frame one automation answer goes out as.
+pub(crate) fn frame(request_id: RequestId, outcome: Answer<ParamsValue>) -> ControlFrame {
     ControlFrame::Response(Response {
         request_id,
         outcome: match outcome {

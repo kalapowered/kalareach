@@ -65,13 +65,13 @@ pub use crate::definition::{
 };
 pub use crate::engine::{ActionOutcome, ActionRunner, Dispatch, MockActionRunner, WorkflowEngine};
 pub use crate::error::{AutomationError, Result};
-pub use crate::service::AutomationService;
+pub use crate::service::{Answer, AutomationService};
 pub use crate::source_workflow::{
     QuiescenceManager, QuiescenceReservation, SourceWorkflowCoordinator,
 };
 pub use crate::store::{
-    ActionClaim, ActionRecord, AttentionOutboxRecord, AttentionSubject, InstalledDefinition,
-    StoredRunRecord, WorkflowStore,
+    Acted, ActionKey, ActionRecord, AttentionOutboxRecord, AttentionSubject, InstalledDefinition,
+    Journal, StoredRunRecord, Submitted, WorkflowStore,
 };
 
 pub(crate) fn new_uuid() -> kr_protocol::scalars::Uuid {
