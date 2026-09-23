@@ -774,19 +774,22 @@ impl DeliveryModule {
         // there is time for another attempt, when it is due, what the attempt row is stamped
         // with - is decided from this reading.
         let answered_at_ms = clock.now_ms().max(now_ms);
-        let decision = kr_delivery::push::decide(
+        let mut decision = kr_delivery::push::decide(
             &outcome,
             delivery.notification_id,
             attempt,
             answered_at_ms,
             delivery.expires_at_ms,
         );
-        if decision.next == NextAction::RenewThenSend {
-            // The need is recorded now, so the renewal can be under way before the next attempt
-            // is due. What stops the old credential being presented again is not this call but
-            // the action persisted with the record: the next attempt renews first and does not
-            // present anything until a renewal has succeeded.
-            let _ = credentials.renew(push.sender_record_id);
+        // A refused credential is renewed now rather than at the next attempt, so the renewal is
+        // done before that attempt is due. One that happened replaces the refused bearer, and the
+        // next attempt presents the new one without renewing it a second time. One that did not
+        // leaves the renewal owed with the record: the next attempt renews first and presents
+        // nothing until a renewal has succeeded.
+        if decision.next == NextAction::RenewThenSend
+            && credentials.renew(push.sender_record_id).is_ok()
+        {
+            decision.next = NextAction::Send;
         }
         if decision.disable_destination {
             self.disable(record)?;

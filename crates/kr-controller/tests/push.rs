@@ -3890,3 +3890,81 @@ fn configuring_a_destination_this_host_cannot_reach_is_refused_with_the_reason()
         "nothing else was written"
     );
 }
+
+/// Renews every credential it is asked to, into a new bearer, and counts the renewals.
+#[derive(Debug, Default)]
+struct CountingRenewal {
+    renewed: Mutex<u32>,
+}
+
+impl CredentialRenewal for CountingRenewal {
+    fn renew(&self, held: &PushDeliveryCredential) -> Result<PushDeliveryCredential, String> {
+        *self.renewed.lock().expect("the double is not poisoned") += 1;
+        Ok(PushDeliveryCredential {
+            secret: SecretBytes32::from_bytes([0xee; 32]),
+            ..held.clone()
+        })
+    }
+}
+
+/// KR-REQ-16.13: a refused credential is renewed in the pass that was refused, and the attempt
+/// after it presents the renewed bearer without renewing a second time.
+#[test]
+fn a_credential_renewed_after_a_refusal_is_presented_without_a_second_renewal() {
+    let environment = environment();
+    let destination = push_destination(&environment, true);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    take_and_produce(
+        &environment,
+        &notice(1, "an approval is waiting"),
+        std::slice::from_ref(&destination),
+        1,
+    );
+    let gateway = GatewayDouble::answering(vec![SendOutcome::Forbidden {
+        detail: "FORBIDDEN".to_owned(),
+    }]);
+    let credentials = held(NOW + 30 * 24 * 60 * 60 * 1000);
+    let renewal = Arc::new(CountingRenewal::default());
+    credentials.attach_renewal(Arc::clone(&renewal) as Arc<dyn CredentialRenewal>);
+    for at_ms in [NOW, NOW + 10 * 60 * 1000] {
+        environment
+            .module
+            .run_due(
+                &gateway,
+                &gateway,
+                &credentials,
+                &ExternalDouble::answering(Vec::new()),
+                &Granted(BTreeSet::new()),
+                &at(at_ms),
+            )
+            .expect("a pass");
+    }
+    assert_eq!(
+        gateway.sent().len(),
+        2,
+        "refused once, then presented again"
+    );
+    assert_eq!(
+        *renewal.renewed.lock().expect("the double is not poisoned"),
+        1,
+        "the renewal made after the refusal is the one the next attempt uses"
+    );
+    assert_eq!(
+        credentials
+            .current(PushSenderRecordId::new(uuid(3)))
+            .expect("a credential")
+            .secret,
+        SecretBytes32::from_bytes([0xee; 32])
+    );
+    environment
+        .module
+        .with(|producer| {
+            let record = producer.journal().deliveries().expect("a read").remove(0);
+            assert_eq!(record.state, DeliveryState::Accepted);
+            Ok(())
+        })
+        .expect("a read");
+}
