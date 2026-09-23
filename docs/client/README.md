@@ -302,6 +302,75 @@ to section 20's declared size buckets, producing the sealed object the service s
 the key on every call, so a key that has been withdrawn stops working at the next call rather than
 at the next restart.
 
+### Who holds a collection's key
+
+A settings collection two or more devices share lives in the namespace of the device that started
+it, its home. Its members are the devices its signed key record names, each with the epoch's key
+wrapped to its stored-envelope key (`kr_protocol::collection_keys`). `sync::membership` is one
+member's side of that record: `SyncMembership` checks the records the service keeps, stores the
+key it is given, and issues the next record when the owner adds or removes a device or a host
+reports one revoked.
+
+A device gets a collection key only by opening its own wrap in a record it accepted. It accepts a
+record when its own entry names both of its keys; the record follows the one it holds, link by
+link, each signed by an issuer the record before it named; one of its hosts reports the issuer
+paired and able to manage it, with the same stored-envelope key, and nothing it recorded from a
+host or a verified authority feed reports the issuer revoked (the issuer of the record that opened
+the epoch passes the same test); the signature verifies; and the key it opens is the one it
+already holds for that epoch, or, for a new epoch, one that differs from every key it holds and
+every key it opened from an earlier record since it joined.
+
+Adding a device and joining a collection each widen who reads a person's settings, so each is a
+plan (`Plan`) the owner confirms: "share settings with *name*" on a member, with the recipient's
+keys taken from its hosts' reports and nowhere else, and "join settings shared by *name*" on the
+device that joins. A plan is consumed once; one swapped, cancelled, reused or expired is refused.
+Removing a device needs no new confirmation, and neither does removing a device a host reports
+revoked. A member never removes itself.
+
+Removing a device gives the members that stay a freshly drawn key at the next epoch; the removed
+device has no wrap of it. What it held already stays with it: a rotation takes nothing back, and
+no retroactive secrecy is claimed. A record that leaves this device out ends its membership, even
+when a later record lists it again: it forgets the collection's keys and reads the collection
+again only after the owner confirms a join on it.
+
+The membership file keeps nine facts: the join record, the installed record, the head, the host
+answers, the pending removals, at most one pending addition, at most one candidate record with its
+request identity and dispatch mark, whether a join awaits the owner, and the outcomes not yet
+shown. `SyncMembership::step` runs one row of the reconciler at a time and makes at most one
+durable write, so a restart resumes where the file says; the module documentation has the rows.
+Publication into the collection is open only while no removal is pending, no candidate stands, no
+join awaits the owner and the newest record this device has is the one it installed
+(`SyncMembership::publishes`). A candidate is sent once, after its dispatch mark is written; an
+answer that is lost is settled by the request's status and then its fence, and where the service
+no longer holds the receipt, by the record after the candidate's base. A change is reported done
+only at a head fetched after the change was recorded.
+
+The file is replaced whole: written to a temporary name, flushed, renamed over the old one, and on
+Unix the directory entry is flushed too. On Windows nothing flushes the directory entry, so after a
+power loss a Windows device can come back with the file as it stood before its last writes: a
+removal the owner recorded is gone and is shown no longer pending, and a candidate's dispatch mark
+is gone, so the device marks and sends the same record again under the same request identity,
+which the service answers from its receipt. A crash of the process alone loses nothing on either.
+
+Two limits are stated rather than closed:
+
+* A device revoked at a host but not yet removed by a record this device accepted is still a
+  member. A device that has not received a revocation cannot act on it, and a hostile service can
+  hold a removal back; it can deny service, but it cannot keep a key an honest member rotated away
+  from it.
+* A member that passes the host check and reuses key bytes where this device cannot see them, in an
+  epoch it was not a member of or one from before its current join. Such a member could as well
+  hand the key, or the settings themselves, to a removed device.
+
+The reconciler's exhaustive test runs a bounded model of its world over the reconciler itself: every
+reachable
+combination of the file's facts under the owner's changes, other members' records (a faulty one
+among them), host and feed revocations, lost requests and answers, expired receipts and crashes,
+with every state checked against the invariants and every state settling once events stop. Its
+eight configurations run with
+`cargo test --release -p kr-client --lib membership::exhaustive -- --ignored`; the two smallest,
+and one run for each rule the test can weaken, run with the rest of the suite.
+
 ### Privacy mode
 
 The host records a privacy generation and drives every subsystem through the same four steps. This
@@ -762,7 +831,8 @@ not one of them, so an account password reset returns an account and nothing els
 | KR-REQ-24.13 | A draft outlives its attachment, its connection and another device's write, and is never replaced by remote content |
 | KR-REQ-20.13 | Per-object revisions and compare-and-swap writes, a lost comparison kept beside rather than resolved by a clock, the person's choice leaving no copy on the device or the service, the settlement of a write whose answer was lost through the request's own identity, the closed kind set that no restore can reach host authority through, and drafts that stay drafts. The legs in `tests/integration/sync/tests/sync.rs` hold a live deployment to the same rules through `services::sync`, with two client stores under one installation |
 | §24 privacy | The fence, the cancellation, the removal, the pinned-label rule, a publication in flight when privacy mode is enabled, work whose caller walked away staying outstanding, and the settlement of a dispatch whose answer was lost: applied, refused, and a request the service holds no receipt for, which stays counted under the generation in force and is ended at the service once privacy mode has moved past it, keeping the account of what left wherever the service cannot establish that nothing ran. A client fenced by privacy mode sends a live deployment nothing (`kr_req_24_28_a_client_fenced_by_privacy_mode_publishes_nothing_and_keeps_its_pinned_labels`). Turning the generation on is the host's, and this client is one subsystem of it |
-| KR-REQ-18.05 | The encrypted settings sync part only: the service holds ciphertext in a declared size bucket and never a setting, against a live deployment as well as the suite's own service (`kr_req_18_05_a_setting_is_stored_sealed_in_a_declared_bucket`), and the feature names its three parts and which of them are optional. Nothing here performs a history backup or produces recovery material |
+| KR-REQ-18.05 | The encrypted settings sync part only: the service holds ciphertext in a declared size bucket and never a setting, against a live deployment as well as the suite's own service (`kr_req_18_05_a_setting_is_stored_sealed_in_a_declared_bucket`), and the feature names its three parts and which of them are optional. A device receives a collection key only through its own wrap in a record it accepted, and only after its hosts committed its pairing and the owner confirmed the addition and the join (`a_production_device_receives_its_key_through_its_own_wrap_and_keeps_it_in_its_store`, `nothing_is_sealed_to_a_device_its_host_has_not_committed` in `crates/kr-client/tests/membership.rs`, against the suite's own service and hosts). Nothing here performs a history backup or produces recovery material |
+| KR-REQ-20.11 | The sync-collection half: removing a device gives the members that stay a fresh key at the next epoch that the removed device has no wrap of, and publication stays fenced until that record is installed (`removing_a_device_gives_the_rest_a_key_it_cannot_open`, `every_new_epoch_has_a_freshly_drawn_key`, `publication_stays_fenced_from_a_recorded_removal_until_its_record_is_installed` in `crates/kr-client/tests/membership.rs`, and the reconciler's exhaustive test in `crates/kr-client/src/sync/membership/exhaustive.rs`) |
 | KR-REQ-20.14 | `a_kit_round_trips_through_its_printable_and_scanned_forms`, `the_printed_kit_is_the_document_the_fixture_publishes`, `a_mistyped_kit_fails_on_its_checksum_before_anything_is_derived`, `a_kit_read_by_hand_forgives_the_letters_the_alphabet_leaves_out` and `a_kit_value_whose_spacing_would_change_when_read_is_refused` in `crates/kr-client/tests/recovery.rs`, with `fixtures/crypto/kdf.json` and `fixtures/crypto/recovery-kit.json` |
 | KR-REQ-20.15 | `a_writer_is_declared_recovery_enabled_only_after_its_bundle_has_landed`, `a_writer_whose_bundle_did_not_commit_is_not_declared`, `rotating_a_writers_key_replaces_it_in_one_commit` and `a_verified_generation_never_moves_backwards` in `crates/kr-client/tests/recovery.rs`. They establish the ordering and what the bundle holds; nothing here declares a writer to a *service*, because that declaration belongs to the collection's enrolment record |
 | KR-REQ-20.16 | `a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bundles_writers` in `crates/kr-client/tests/recovery.rs`, which drops every producer value before the restore and takes the producer key out of the authenticated bundle |

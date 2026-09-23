@@ -101,6 +101,10 @@ can. The domains this crate and `kr-protocol` define:
 | `kr-recovery-bundle/1` | The retrieval context a recovery bundle's key is derived from |
 | `KRRECOV1` | The `crypto_kdf` context of the recovery seed |
 
+`kr-client` adds two digest domains of its own, neither of them a signature: `kr-collection-key-mark/1`,
+the SHA-256 of a collection key a member compares keys by without keeping them, and
+`kr-sync-membership-plan/1`, the digest that binds an owner's plan to the one operation it confirms.
+
 ## Encrypted objects
 
 A backup object is encrypted under its own random 256-bit key with `secretstream` in 1 MiB records.
@@ -316,7 +320,17 @@ rotation is the epoch, with each member's authorisation key beside it. Adding a 
 epoch; removing members advances it once and returns the same `Revocation` a backup recipient's
 removal does, which claims no retroactive secrecy. `Revocation::describe_settings_sync` is the
 sentence a person reads: the devices that stay get a new key, and the one that left keeps what it
-already had.
+already had. The rotation counter has no successor at its last value, so a removal that would need
+one is refused whole, with `CryptoError::RotationExhausted`, rather than recorded at an epoch the
+removed devices still hold the key of.
+
+A member's side of the record is `kr_client::sync::membership`. Before a member uses a key from a
+record it checks the chain from the record it holds, the issuer against its hosts' reports, the
+signature, and its own wrap, opened against the issuer's stored-envelope key; for a new epoch the
+key must differ from every key it holds and every key it opened from an earlier record since it
+joined. The membership file it keeps holds records, which carry only public keys and wraps, and
+no key: what it compares keys by is each key's mark, the SHA-256 of the key under
+`kr-collection-key-mark/1`, and the key itself goes only to the device's secret store.
 
 ## Authority inside an envelope
 
