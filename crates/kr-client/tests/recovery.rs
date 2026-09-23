@@ -1904,6 +1904,83 @@ async fn a_lost_write_that_landed_is_recognised_by_the_store_opened_after_a_rest
 }
 
 #[tokio::test]
+async fn a_store_opened_after_a_restart_holds_reads_to_the_place_its_lost_write_compared_against() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let second = AuthorisationKeyPair::generate().expect("another writer key");
+    let third = AuthorisationKeyPair::generate().expect("a third writer key");
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    for (enrolled, now) in [(&writer, 1_000), (&second, 2_000)] {
+        store
+            .enable_writer(&seed, &mut bundle, trusted(enrolled), TimestampMs::new(now))
+            .await
+            .expect("the bundle commits");
+    }
+
+    // The third write compares against the second place, applies at the third, and its answer is
+    // lost; then the process ends.
+    service.interrupt_the_next_exchange(Interruption::LoseTheAnswerAfterTheWrite);
+    assert!(matches!(
+        store
+            .enable_writer(&seed, &mut bundle, trusted(&third), TimestampMs::new(3_000))
+            .await,
+        Err(RecoveryError::BundleOutcomeUnknown { .. })
+    ));
+    let mut store = store.restart(Arc::clone(&service) as Arc<_>);
+    assert_eq!(
+        store.position(),
+        None,
+        "a store opened afresh has read nothing"
+    );
+
+    // The bundle had reached the second place when that write went out. A service that answers
+    // with the first place and the first write's own bytes serves something authentic and old: it
+    // has gone back, and the record is how a store that has read nothing knows it.
+    let attempts = service.attempts();
+    let first = attempts
+        .first()
+        .expect("the first write")
+        .ciphertext
+        .clone();
+    let lost = attempts.last().expect("the lost write").ciphertext.clone();
+    service.substitute(LOCATOR, first);
+    service.next_fetch_answers(at(1));
+    assert!(matches!(
+        store.fetch(&seed).await,
+        Err(RecoveryError::BundleWentBack {
+            expected: 2,
+            found: 1
+        })
+    ));
+    assert_eq!(store.position(), None);
+    service.substitute(LOCATOR, lost);
+
+    // The lost write's own bytes at the place it compared against are something no write of it
+    // can be: it lands past that place. The read is refused, and the write stays outstanding.
+    service.next_fetch_answers(at(2));
+    assert!(matches!(
+        store.fetch(&seed).await,
+        Err(RecoveryError::BundleDidNotMoveOn { found }) if found == at(2)
+    ));
+    assert!(matches!(
+        store.lost_write(),
+        Some(LostWrite::Unsettled { .. })
+    ));
+    assert_eq!(
+        store.position(),
+        None,
+        "nothing refused became the baseline"
+    );
+
+    // Where the service holds them, at the place past it, they settle the write.
+    store.fetch(&seed).await.expect("the bundle");
+    assert_eq!(store.lost_write(), Some(LostWrite::Applied));
+    assert_eq!(store.position(), Some(at(3)));
+}
+
+#[tokio::test]
 async fn a_lost_write_still_on_its_way_is_ended_by_the_store_opened_after_a_restart() {
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");

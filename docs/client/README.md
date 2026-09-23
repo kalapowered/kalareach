@@ -630,13 +630,15 @@ the locator, so a lost answer costs a read rather than another write.
 
 **A lost write outlives the process that sent it.** `BundleStore::open` takes the directory where
 the device keeps its recovery state, and each record lives there under a name derived from its
-bundle's location, so one directory serves every bundle the device writes. The record is written and
-flushed before the write leaves, and the write does not leave if that fails. It stays until the next
-write replaces it, and what is learned about the write, an answer or a settlement, is written into
-it as well. A store opened over it after a restart takes the write up. One whose answer never came
-back and which nothing settled starts unsettled, as if the answer had just been lost, and the store
-writes nothing until a read finds the write's bytes or `end_lost_write` fences its identity. The
-record also outlives an answer, because `complete_migration` needs it: a migration whose destination
+bundle's location, so one directory serves every bundle the device writes. The record is written
+and flushed before the write leaves, and the write does not leave if that fails. It stays until the
+next write replaces it, and what is learned about the write, an answer or a settlement, is written
+into it as well. A store opened over it after a restart takes the write up. One whose answer never
+came back and which nothing settled starts unsettled, as if the answer had just been lost, and the
+store writes nothing until a read finds the write's bytes or `end_lost_write` fences its identity.
+Its reads are held to the place the write compared against, because the bundle had reached that
+place before the write went out, and the write's own bytes count only at a place past it. The record
+also outlives an answer, because `complete_migration` needs it: a migration whose destination
 answered is not complete until the bundle has been read back there, and a destination store opened
 after a restart finishes it from the record. A record this build cannot read is refused rather than
 set aside, since it may be the only account of a write that can still land. An open store holds a

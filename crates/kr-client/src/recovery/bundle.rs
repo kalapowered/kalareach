@@ -168,8 +168,9 @@ impl BundleStore {
     /// takes that write up as its own. One whose answer never came back and which nothing settled,
     /// in this process or one that has since ended, starts outstanding: [`Self::lost_write`] says
     /// so, and nothing is written until [`Self::fetch`] recognises the write or
-    /// [`Self::end_lost_write`] ends it. [`Self::complete_migration`] recognises the write by what
-    /// the record keeps.
+    /// [`Self::end_lost_write`] ends it. Reads are held to the place that write compared against,
+    /// because the bundle was already there when it went out, and [`Self::complete_migration`]
+    /// recognises the write by what the record keeps.
     ///
     /// # Errors
     ///
@@ -230,6 +231,17 @@ impl BundleStore {
         self.last_write
             .as_ref()
             .filter(|write| write.known == Known::Unsettled)
+    }
+
+    /// Returns the place this store knows the bundle had reached, which every read is held to.
+    ///
+    /// Where the store has read or written the bundle, that is where. A store opened after a
+    /// restart has done neither yet, and its record says where the bundle was when its last write
+    /// went out: a place in the order only goes forward, so nothing earlier is a place the bundle
+    /// can be at now.
+    fn seen(&self) -> Option<SyncPosition> {
+        self.position()
+            .or_else(|| self.last_write.as_ref().and_then(|write| write.expected.0))
     }
 
     /// Records what became of a write whose answer never arrived.
@@ -471,12 +483,18 @@ impl BundleStore {
     }
 
     /// Reads the bundle, settles a lost write it recognises, and makes it this store's baseline.
+    ///
+    /// The bytes alone do not recognise a write at any place. A write lands past the place it
+    /// compared against, so its bytes read back anywhere else are a service answering with
+    /// something no write of it can be, and that is refused rather than settled.
     async fn adopt(&mut self, seed: &RecoverySeed) -> Result<Baseline> {
         let read = self.read(seed).await?;
-        if self
+        if let Some(expected) = self
             .unsettled()
-            .is_some_and(|record| record.sent == read.sealed)
+            .filter(|record| record.sent == read.sealed)
+            .map(|record| record.expected.0)
         {
+            diagnose_applied(expected, read.position)?;
             self.settle(LostWrite::Applied);
         }
         self.baseline = Some(read.clone());
@@ -498,7 +516,7 @@ impl BundleStore {
     /// compare-and-swap exists to prevent, and the settlement of a lost write already holds a
     /// receipt to the same rule.
     async fn read(&self, seed: &RecoverySeed) -> Result<Baseline> {
-        let read = read_bundle(self.service.as_ref(), &self.context, self.position(), seed).await?;
+        let read = read_bundle(self.service.as_ref(), &self.context, self.seen(), seed).await?;
         if let Some(baseline) = &self.baseline
             && baseline.position == read.position
             && baseline.bundle != read.bundle
@@ -1002,6 +1020,11 @@ impl BundleStore {
             }
         };
         let read = self.read(seed).await?;
+        // The write's own bytes are its own only at a place it can have landed at, past the one it
+        // compared against. Anywhere else they are a service answering the impossible.
+        if read.sealed == record.sent {
+            diagnose_applied(record.expected.0, read.position)?;
+        }
         if let Some(receipt) = receipt {
             // The receipt names the place this write took. A read behind it is a service that has
             // gone back, and that one place holding other bytes is two histories rather than a
