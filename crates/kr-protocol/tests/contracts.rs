@@ -46,6 +46,8 @@ fn receipt(state: ReceiptState, revision: u64) -> Receipt {
 
 #[test]
 fn the_permitted_transitions_are_exactly_the_contract() {
+    // KR-REQ-01.25: the receipt state transitions are a preserved behavioural contract: the
+    // implementation permits exactly the specified edges and no other.
     use ReceiptState::{Accepted, Applied, Dispatching, Received, Refused, Rejected, Unknown};
     let expected: &[(ReceiptState, &[ReceiptState])] = &[
         (Received, &[Accepted, Rejected]),
@@ -618,6 +620,8 @@ fn a_declared_length_is_rejected_before_the_payload_is_allocated() {
 /// KR-REQ-23.11: a frame is its four-byte length prefix followed by exactly one payload.
 #[test]
 fn frames_round_trip_and_report_what_is_missing() {
+    // KR-REQ-04.08: a structured message is length-delimited CBOR: a four-byte length and one
+    // canonical object, decoded one frame at a time from a stream that carries several.
     let codec = FrameCodec::new(StreamKind::Control);
     let payload = kr_cbor::to_canonical_vec(&RequestId::new(41)).expect("encode");
     let framed = codec.encode(&payload).expect("frame");
@@ -865,6 +869,8 @@ fn a_target_states_fields_that_agree_with_each_other() {
 /// KR-REQ-23.13: the negotiated version is the highest one both sides listed.
 #[test]
 fn version_selection_takes_the_highest_version_both_sides_listed() {
+    // KR-REQ-20.24: the protocol version is negotiated: the selection is the highest version both
+    // peers list, whatever else either of them offers.
     let supported = [
         ProtocolVersion::new(1, 1),
         ProtocolVersion::new(1, 2),
@@ -905,6 +911,8 @@ fn version_selection_never_assumes_an_unlisted_version_is_supported() {
 /// KR-REQ-23.13: a major mismatch is UNSUPPORTED_SCHEMA.
 #[test]
 fn a_major_mismatch_is_an_unsupported_schema() {
+    // KR-REQ-20.24: a peer that shares no supported version with this build is refused as
+    // UNSUPPORTED_SCHEMA rather than served under a version it never offered.
     assert_eq!(
         select_version(&[ProtocolVersion::new(2, 0)], &[PROTOCOL_VERSION]),
         Err(ErrorCode::UnsupportedSchema)

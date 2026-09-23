@@ -15,6 +15,8 @@ fn schema_dir() -> PathBuf {
 /// KR-REQ-23.53: the published authority table is generated from the registry and kept current.
 #[test]
 fn the_committed_files_match_the_rust_types() {
+    // KR-REQ-04.08: the published JSON Schema is generated from the Rust serde types, and the
+    // committed document is exactly what they generate.
     for (name, expected) in generated_files() {
         let path = schema_dir().join(name);
         let actual = std::fs::read_to_string(&path)

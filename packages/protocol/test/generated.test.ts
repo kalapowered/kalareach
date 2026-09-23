@@ -9,6 +9,8 @@ const packageRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 
 describe('generated types', () => {
   it('match the committed JSON Schema', () => {
+    // KR-REQ-04.08: the TypeScript types are generated from the JSON Schema the Rust serde types
+    // produce, and the committed types are exactly what that generation writes.
     expect(() =>
       execFileSync(process.execPath, [join(packageRoot, 'scripts', 'generate-types.mjs'), '--check'], {
         cwd: packageRoot,

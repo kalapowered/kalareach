@@ -328,6 +328,8 @@ fn digest_fixtures_match() {
 /// KR-REQ-23.08, KR-REQ-23.06: the Rust half of signing-input parity under its domain.
 #[test]
 fn signing_input_fixtures_match() {
+    // KR-REQ-01.25: signed fields are a preserved contract: every published signing input is
+    // exactly its committed bytes and digest under its domain, and decodes to its committed value.
     let document = load("digests.json");
     for case in cases(&document, "signing_input_cases") {
         let id = case["id"].as_str().expect("case id");

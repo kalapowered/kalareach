@@ -238,6 +238,10 @@ fn mutation_request_matches_fixture() {
 /// KR-REQ-23.11: every published frame is a four-byte length and one canonical object.
 #[test]
 fn every_frame_fixture_round_trips_as_bytes() {
+    // KR-REQ-01.25: canonical bytes are a preserved contract: every published envelope encodes to
+    // exactly its committed bytes and frame, and decodes back to exactly its committed value.
+    // KR-REQ-04.08: every published message travels as a four-byte length followed by one
+    // canonical CBOR object, on the stream kind the fixture names.
     let document = load("frames.json");
     let cases = document["cases"].as_array().expect("cases");
     assert!(cases.len() >= 7, "frames fixture covers the envelope types");
@@ -276,6 +280,8 @@ fn receipt_and_notification_fixtures_decode_into_types() {
     use kr_protocol::frame::StreamHeader;
     use kr_protocol::receipt::{ReceiptResponse, ReceiptState};
 
+    // KR-REQ-01.25: a receipt, an error response, a notification and a stream header decode from
+    // their committed bytes into the typed model and re-encode to exactly those bytes.
     let document = load("frames.json");
 
     let receipt_bytes = hex::decode(
@@ -332,6 +338,8 @@ fn receipt_and_notification_fixtures_decode_into_types() {
 /// both endpoint identities, in the published bytes.
 #[test]
 fn connect_transcript_matches_fixture() {
+    // KR-REQ-01.25: the signed fields of a connection are a preserved contract: the transcript both
+    // proofs sign is exactly the committed bytes and digest, under the committed domain.
     let document = load("transcripts.json");
     let case = case(&document, "connect_transcript");
     assert_eq!(case["domain"].as_str().expect("domain"), CONNECT_DOMAIN);
@@ -374,6 +382,8 @@ fn connect_transcript_matches_fixture() {
 /// KR-REQ-23.07: the mutation digest's signing input, in the published bytes.
 #[test]
 fn mutation_digest_matches_fixture() {
+    // KR-REQ-01.25: the fields a mutation's digest covers are a preserved contract: its signing
+    // input is exactly the committed bytes and digest, under the committed domain.
     let document = load("transcripts.json");
     let case = case(&document, "mutation_digest");
     assert_eq!(case["domain"].as_str().expect("domain"), MUTATION_DOMAIN);

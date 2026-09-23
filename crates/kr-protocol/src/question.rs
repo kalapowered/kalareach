@@ -878,6 +878,120 @@ mod tests {
         }
     }
 
+    /// A pending question of `kind`, carrying the choices the host builds for that kind.
+    fn question(kind: QuestionKind, supplied: &[QuestionChoice]) -> Question {
+        use crate::identity::ProcessStartSource;
+        use crate::scalars::Uuid;
+
+        Question {
+            question_id: QuestionId::new(Uuid::from_bytes([1; 16])),
+            revision: QuestionRevision::new(1),
+            state: QuestionState::Pending,
+            session_id: SessionId::new(Uuid::from_bytes([2; 16])),
+            session_epoch: SessionEpoch::V1,
+            kind,
+            context: String::new(),
+            question: "which one?".to_owned(),
+            choices: build_choices(kind, supplied).expect("a well-formed question"),
+            source: QuestionSource {
+                application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([3; 16])),
+                process: ProcessStartIdentity::new(7, ProcessStartSource::LinuxProcStat, 11),
+                executable: Nullable::null(),
+                agent_label: Nullable::null(),
+                connection_id: ConnectionId::new(Uuid::from_bytes([4; 16])),
+                launch_channel: false,
+                session_member: true,
+                ancestry: true,
+                agent_binding_revision: Nullable::null(),
+            },
+            created_at_ms: TimestampMs::new(0),
+            expires_at_ms: TimestampMs::new(DEFAULT_EXPIRY.get()),
+            answer: Nullable::null(),
+            resolved_at_ms: Nullable::null(),
+        }
+    }
+
+    /// KR-REQ-11.59: a question is `input`, `select` or `confirm`, and no other kind is read.
+    #[test]
+    fn a_question_is_input_select_or_confirm_and_nothing_else() {
+        for (kind, wire) in [
+            (QuestionKind::Input, "input"),
+            (QuestionKind::Select, "select"),
+            (QuestionKind::Confirm, "confirm"),
+        ] {
+            assert_eq!(kind.as_str(), wire);
+            assert_eq!(
+                serde_json::from_value::<QuestionKind>(serde_json::json!(wire)).expect("a kind"),
+                kind
+            );
+        }
+        for unknown in ["multi_select", "approval", "yes_no", ""] {
+            assert!(
+                serde_json::from_value::<QuestionKind>(serde_json::json!(unknown)).is_err(),
+                "{unknown:?} is not a question kind"
+            );
+        }
+    }
+
+    /// KR-REQ-11.59: an answer carries at most 16 KiB of text, whichever text arm it arrives in,
+    /// and the free-text arm is answerable on every `select` and `confirm` and on nothing else.
+    #[test]
+    fn an_answer_is_one_arm_of_the_union_and_at_most_sixteen_kibibytes() {
+        let input = question(QuestionKind::Input, &[]);
+        let select = question(QuestionKind::Select, &[choice("a"), choice("b")]);
+        let confirm = question(QuestionKind::Confirm, &[]);
+        let at_limit = "x".repeat(MAX_ANSWER_BYTES);
+        let over_limit = "x".repeat(MAX_ANSWER_BYTES + 1);
+        assert_eq!(MAX_ANSWER_BYTES, 16 * 1024);
+
+        // The two text arms: exactly the limit is accepted, one byte more is refused.
+        let typed = |text: &str| QuestionAnswer::Input {
+            text: text.to_owned(),
+        };
+        let other = |text: &str| QuestionAnswer::Other {
+            text: text.to_owned(),
+        };
+        assert!(check_answer(&input, &typed(&at_limit)).is_ok());
+        assert!(check_answer(&input, &typed(&over_limit)).is_err());
+        for form in [&select, &confirm] {
+            assert!(
+                check_answer(form, &other(&at_limit)).is_ok(),
+                "{}",
+                form.kind
+            );
+            assert!(
+                check_answer(form, &other(&over_limit)).is_err(),
+                "{}",
+                form.kind
+            );
+        }
+        // The limit is on bytes, not characters: 4,097 four-byte characters are over it.
+        assert!(check_answer(&input, &typed(&"\u{1F600}".repeat(4 * 1024 + 1))).is_err());
+
+        // Each arm answers its own kind. A listed choice is the select's; a decision is the
+        // confirm's; the free-text arm is never folded into a listed choice.
+        let chosen = QuestionAnswer::Choice {
+            choice_id: "a".to_owned(),
+        };
+        let decided = QuestionAnswer::Decision { decided: true };
+        assert!(check_answer(&select, &chosen).is_ok());
+        assert!(check_answer(&confirm, &chosen).is_err());
+        assert!(check_answer(&confirm, &decided).is_ok());
+        assert!(check_answer(&select, &decided).is_err());
+        assert!(check_answer(&input, &other("free text")).is_err());
+        assert!(
+            check_answer(
+                &select,
+                &QuestionAnswer::Choice {
+                    choice_id: SOMETHING_ELSE_CHOICE.to_owned()
+                }
+            )
+            .is_err(),
+            "the free-text option is answered with its own text, not as a listed choice"
+        );
+    }
+
+    /// KR-REQ-11.59: "Something else" is on every `select` and `confirm`, added by the host.
     #[test]
     fn every_select_and_confirm_carries_the_free_text_option() {
         let select = build_choices(QuestionKind::Select, &[choice("a"), choice("b")]).expect("ok");
@@ -891,6 +1005,7 @@ mod tests {
         assert!(input.is_empty());
     }
 
+    /// KR-REQ-11.59: a source cannot supply, and so cannot replace or remove, the free-text option.
     #[test]
     fn a_source_cannot_supply_its_own_free_text_option() {
         let error = build_choices(
@@ -901,6 +1016,7 @@ mod tests {
         assert!(error.message().contains(SOMETHING_ELSE_CHOICE));
     }
 
+    /// KR-REQ-11.59: a select offers two to twelve listed choices.
     #[test]
     fn a_select_offers_between_two_and_twelve_choices() {
         assert!(build_choices(QuestionKind::Select, &[choice("a")]).is_err());
