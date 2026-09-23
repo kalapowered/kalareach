@@ -968,22 +968,33 @@ impl Catalogue {
         let ledger = ledger_of(&store, &enrolled)?;
 
         let transport = Arc::clone(&self.transport);
+        // The client works in a private copy of the accepted trust checkpoint, never in the
+        // checkpoint itself: a load that fails, is interrupted or is refused at its commit leaves
+        // the accepted checkpoint exactly as it was. A reset a kept root advance still owes is
+        // applied to the copy. The copy lives until this sync is over, because the client keeps
+        // its time checkpoint there while it fetches the generation's payloads.
+        let reset = self.db.read(|records| records.trust_reset(&enrolled.key))?;
+        let working = store.working_datastore(reset)?;
         let verified = {
             let db = &mut self.db;
             let key = &enrolled.key;
+            let accepted_root = &enrolled.enrolment.root;
             let rotated = Effect::Root(id.clone());
             trust::verify(
                 &enrolled.enrolment,
-                &store.datastore(),
+                working.path(),
                 &ledger,
                 &transport,
                 &mut |new_root| {
                     // A rotation is kept the moment verification arrives at it, before anything
                     // that follows can fail: a host that went back to the old root could have old
-                    // trust restored by a repository that withheld the new one.
+                    // trust restored by a repository that withheld the new one. Whether it resets
+                    // the timestamp and snapshot floors is kept with it, so the next load applies
+                    // the reset even though it starts from the new root.
+                    let reset = trust::resets_floors(accepted_root, &new_root)?;
                     let pending = db.begin()?;
                     committed(authority, &rotated, move |permit| {
-                        pending.run(permit, |changes| changes.set_root(key, &new_root))
+                        pending.run(permit, |changes| changes.set_root(key, &new_root, reset))
                     })
                 },
             )
@@ -991,19 +1002,28 @@ impl Catalogue {
         };
         authority.check()?;
 
-        // Rollback protection that does not depend on the client's datastore surviving. A document
-        // an interrupted write left unreadable is one the client skips; these numbers are recorded
-        // beside the accepted generation and are compared whatever state that datastore is in.
-        if let Some(active) = enrolled.active
-            && let Some(role) = verified.versions.rollback_from(active.versions)
+        // The metadata verified, so it becomes the accepted checkpoint now, in a commit of its
+        // own: trust progress is kept whatever the generation checks, the mirror or the index
+        // activation that follow decide, and the reset the checkpoint carries is no longer owed.
         {
-            return Err(CatalogueError::Untrusted {
-                detail: format!(
-                    "this generation's {role} metadata is older than the one already accepted; a \
-                     replayed document is a rollback"
-                ),
-            });
+            let key = &enrolled.key;
+            let pending = self.db.begin()?;
+            committed(authority, &Effect::Checkpoint(id.clone()), |permit| {
+                store.publish_checkpoint(permit, &working)?;
+                pending
+                    .run(permit, |changes| changes.clear_trust_reset(key))
+                    .map_err(|error| match error {
+                        uncertain @ CatalogueError::PublicationUncertain { .. } => uncertain,
+                        other => CatalogueError::PublicationUncertain {
+                            detail: format!(
+                                "the trust checkpoint was published and its reset could not be \
+                                 cleared: {other}"
+                            ),
+                        },
+                    })
+            })?;
         }
+
         let index_digest = verified
             .index
             .digest()
@@ -2293,6 +2313,58 @@ mod tests {
         (home, catalogue, id)
     }
 
+    /// A kept root that resets the role floors says so until a verified checkpoint is published,
+    /// and the working copy the next verification starts from leaves those floors out.
+    #[tokio::test]
+    async fn a_reset_kept_with_a_root_is_owed_until_a_checkpoint_is_published() {
+        let (_home, mut catalogue, id) = development();
+        catalogue.sync(&id).await.expect("a generation");
+        let enrolled = catalogue.enrolled(&id).expect("enrolled");
+        let store = catalogue.store(&id).expect("enrolled");
+        let (key, root) = (&enrolled.key, &enrolled.enrolment.root);
+        let owed = |catalogue: &Catalogue| {
+            catalogue
+                .db
+                .read(|records| records.trust_reset(key))
+                .expect("readable")
+        };
+        let set_root = |catalogue: &mut Catalogue, reset: bool| {
+            let pending = catalogue.db.begin().expect("the write lock");
+            committed(&Owner::acting(), &Effect::Records, move |permit| {
+                pending.run(permit, |changes| changes.set_root(key, root, reset))
+            })
+            .expect("recorded");
+        };
+        assert!(!owed(&catalogue));
+        set_root(&mut catalogue, true);
+        assert!(owed(&catalogue));
+        set_root(&mut catalogue, false);
+        assert!(
+            owed(&catalogue),
+            "a later root that changes nothing does not clear it"
+        );
+
+        let floors = |working: &crate::catalogue::store::WorkingDatastore| {
+            ["timestamp.json", "snapshot.json", "targets.json"]
+                .map(|role| working.path().join(role).is_file())
+        };
+        assert_eq!(
+            floors(&store.working_datastore(false).expect("a copy")),
+            [true, true, true]
+        );
+        assert_eq!(
+            floors(&store.working_datastore(true).expect("a copy")),
+            [false, false, true],
+            "the reset leaves the timestamp and snapshot floors out of the copy"
+        );
+
+        catalogue.sync(&id).await.expect("verified again");
+        assert!(
+            !owed(&catalogue),
+            "a published checkpoint settles the reset"
+        );
+    }
+
     fn claim(action: &str) -> ReceiptClaim {
         ReceiptClaim {
             key: ReceiptKey::new("kr:local", action),
@@ -2361,10 +2433,17 @@ mod tests {
         );
         assert_eq!(
             recording.committed(),
-            vec![Committed {
-                effect: Effect::Index(id.clone()),
-                confirmed: false,
-            }]
+            vec![
+                Committed {
+                    effect: Effect::Checkpoint(id.clone()),
+                    confirmed: true,
+                },
+                Committed {
+                    effect: Effect::Index(id.clone()),
+                    confirmed: false,
+                },
+            ],
+            "the verified metadata is accepted before the index is written"
         );
         let sync_failure = recording.failure(&stopped.into());
         assert_eq!(sync_failure.state(), ReceiptState::Unknown);

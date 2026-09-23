@@ -51,9 +51,10 @@ published. That is the thing the metadata exists to replace.
 3. Read the index, inside the metadata budget, and check what each entry declares: safe paths, no
    two names that collide on a case-insensitive filesystem, a manifest that does not declare
    itself, and declared sizes inside one package's limits.
-4. Refuse a generation older than the one already accepted, one whose metadata version went
-   backwards in any role, one that puts different bytes under a generation number this host already
-   accepted, and one that is not the generation the owner pinned.
+4. Refuse a generation older than the one already accepted, one that puts different bytes under a
+   generation number this host already accepted, and one that is not the generation the owner
+   pinned. A role whose metadata version went backwards has already been refused by the client, in
+   step 1.
 5. Fetch the whole generation, where the full offline mirror is on.
 6. Activate the index atomically, and carry the root verification arrived at forward.
 
@@ -63,10 +64,20 @@ forward is the one verification ended on rather than the one it started from: a 
 by the root it replaces, and a host that always restarted from the original could have old trust
 restored by a repository that simply withheld the newer root.
 
-The client keeps its own trusted metadata, and its rollback protection is only as durable as that
-store. The versions each role was accepted at are therefore written beside the activated generation
-as well, and compared on every sync, so an unreadable datastore costs a re-fetch rather than a
-protection.
+The client's rollback protection is the metadata it last verified: each role's new version is
+compared with the one it holds. That store is this host's accepted trust checkpoint, and the client
+never writes into it. Every verification works in a private copy of it, and the copy becomes the
+accepted checkpoint, document by document with each document renamed into place whole, only once
+the metadata has verified and under the same admission as any other change. A sync that fails, is
+interrupted or is refused leaves the checkpoint exactly as it was, so an interruption can no longer
+leave a half-written document the client would skip.
+
+Where a new root changes the keys that sign timestamps or snapshots, those roles may start again
+from lower versions, and the client drops their old versions when it sees the change. A sync that
+keeps such a root and then fails leaves the next sync starting from that root, where the change is
+no longer visible to the client, so the change is recorded with the root and the next sync's copy
+starts without those versions. This host keeps no second floor of its own: one compared whatever
+the keys would refuse exactly those valid lower versions.
 
 Expired metadata stops at step 1, and stops there only. It blocks a **new** generation; it does not
 reach into what is installed. A pinned package stays usable offline under the grants it already

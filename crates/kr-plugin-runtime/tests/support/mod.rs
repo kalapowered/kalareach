@@ -304,6 +304,16 @@ impl Generation {
     /// Rotates the root to version 2 using `new_keys`, cross-signing with the old root key,
     /// writing `2.root.json` and signing metadata at generation 2.
     pub async fn rotate_root_to_v2(&self, new_keys: &KeySet) -> Vec<u8> {
+        self.rotate_root_to_v2_publishing(new_keys, 2).await
+    }
+
+    /// Rotates the root as [`Self::rotate_root_to_v2`] does, with every role's metadata signed at
+    /// version 2 and the index published as `index_generation`.
+    pub async fn rotate_root_to_v2_publishing(
+        &self,
+        new_keys: &KeySet,
+        index_generation: u64,
+    ) -> Vec<u8> {
         let metadata = self.directory.join("metadata");
         let targets = self.directory.join("targets");
         let root_expires: jiff::Timestamp =
@@ -368,7 +378,7 @@ impl Generation {
             IndexEntry::from_manifest(&manifest, manifest_digest, manifest_bytes.len() as u64);
         let index = CatalogueIndex {
             index_version: INDEX_VERSION,
-            generation: RepositoryGeneration::new(2),
+            generation: RepositoryGeneration::new(index_generation),
             produced_at: TimestampMs::new(1_760_000_000_000),
             publishers: vec![PublisherRecord {
                 id: manifest.publisher_id.clone(),

@@ -364,7 +364,8 @@ CREATE TABLE IF NOT EXISTS enrolments (
     budgets            TEXT NOT NULL,
     ceiling            TEXT NOT NULL,
     pinned_generation  INTEGER,
-    active_generation  INTEGER
+    active_generation  INTEGER,
+    trust_reset        INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS accepted_generations (
     enrolment_key  TEXT NOT NULL REFERENCES enrolments(enrolment_key) ON DELETE CASCADE,
@@ -472,6 +473,24 @@ impl Records<'_> {
             .map_err(|source| self.failure(&source))?
             .map(EnrolmentRow::into_enrolled)
             .transpose()
+    }
+
+    /// Returns true when a kept root advance changed the timestamp or snapshot keys and no verified
+    /// checkpoint has been published since.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when the record cannot be read.
+    pub fn trust_reset(&self, key: &EnrolmentKey) -> CatalogueResult<bool> {
+        self.transaction
+            .query_row(
+                "SELECT trust_reset FROM enrolments WHERE enrolment_key = ?1",
+                params![key.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|source| self.failure(&source))
+            .map(|value| value.is_some_and(|reset| reset != 0))
     }
 
     /// Returns one target of one accepted generation, as it was accepted.
@@ -708,13 +727,32 @@ impl Changes<'_> {
     /// An enrolment removed while it synchronised is not recreated: there is then nothing to keep
     /// the root for.
     ///
+    /// `reset` records that the new root signs timestamps or snapshots with other keys than the
+    /// root it replaces, so the next verification starts without the old floors for those roles.
+    /// The record stays until a verified checkpoint is published; a later root that does not
+    /// change those keys does not clear it.
+    ///
     /// # Errors
     ///
     /// Returns [`CatalogueError::StorageUnavailable`] when it cannot be written.
-    pub fn set_root(&self, key: &EnrolmentKey, root: &[u8]) -> CatalogueResult<()> {
+    pub fn set_root(&self, key: &EnrolmentKey, root: &[u8], reset: bool) -> CatalogueResult<()> {
         self.execute(
-            "UPDATE enrolments SET root = ?2 WHERE enrolment_key = ?1",
-            params![key.as_str(), root],
+            "UPDATE enrolments SET root = ?2, trust_reset = MAX(trust_reset, ?3)
+              WHERE enrolment_key = ?1",
+            params![key.as_str(), root, i64::from(reset)],
+        )?;
+        Ok(())
+    }
+
+    /// Records that a verified trust checkpoint was published, so no reset is pending any more.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when it cannot be written.
+    pub fn clear_trust_reset(&self, key: &EnrolmentKey) -> CatalogueResult<()> {
+        self.execute(
+            "UPDATE enrolments SET trust_reset = 0 WHERE enrolment_key = ?1",
+            params![key.as_str()],
         )?;
         Ok(())
     }

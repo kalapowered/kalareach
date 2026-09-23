@@ -117,6 +117,8 @@ pub enum Effect {
     Records,
     /// A repository's newer trust root, kept the moment verification reached it.
     Root(RepositoryId),
+    /// A repository's trust checkpoint, the metadata a verification accepted.
+    Checkpoint(RepositoryId),
     /// A verified generation's index document, written into its repository's store.
     Index(RepositoryId),
     /// A verified payload, written into the cache under its digest.
@@ -137,6 +139,7 @@ impl core::fmt::Display for Effect {
         match self {
             Self::Records => f.write_str("the catalogue's records"),
             Self::Root(id) => write!(f, "a new trust root for {id}"),
+            Self::Checkpoint(id) => write!(f, "the trust checkpoint for {id}"),
             Self::Index(id) => write!(f, "a generation index for {id}"),
             Self::Payload(digest) => write!(f, "the payload {digest}"),
             Self::Package(digest) => write!(f, "the package {digest}"),

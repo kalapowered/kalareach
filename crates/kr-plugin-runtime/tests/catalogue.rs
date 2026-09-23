@@ -2644,6 +2644,160 @@ async fn kr_req_11_09_installed_operations_survive_the_repository_being_removed(
 }
 
 // ---------------------------------------------------------------------------------------------
+// Trust progress: a private copy for every verification, and a checkpoint only a verified load moves
+// ---------------------------------------------------------------------------------------------
+
+/// Every file of the accepted trust checkpoint, with its bytes.
+fn checkpoint(catalogue: &Catalogue) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let directory = catalogue
+        .store(&repository())
+        .expect("enrolled")
+        .datastore();
+    std::fs::read_dir(&directory)
+        .expect("a checkpoint")
+        .flatten()
+        .filter(|entry| entry.path().is_file())
+        .map(|entry| {
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                std::fs::read(entry.path()).expect("readable"),
+            )
+        })
+        .collect()
+}
+
+/// Lower role versions under new keys are accepted after the sync that reached the new root failed
+/// and the host restarted.
+///
+/// A root that changes the timestamp and snapshot keys lets those roles start again from lower
+/// versions. The sync here keeps the new root and then fails at its index, so the next sync starts
+/// from the new root. The floors the old keys set no longer apply: the client applies a stored
+/// floor only where it still verifies under the current root, and the reset recorded with the kept
+/// root drops the floors from the working copy for a key change the client would otherwise not see.
+/// A second floor of this host's own, compared whatever the keys, refuses these versions.
+#[tokio::test]
+async fn lower_role_versions_under_new_keys_are_accepted_after_a_failed_sync_and_a_restart() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(
+        home.path(),
+        GenerationSpec {
+            generation: 5,
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("generation five, every role at version five");
+
+    // New keys for every role, every role's metadata at version two, and a newer generation.
+    let new_root = generation
+        .rotate_root_to_v2_publishing(&KeySet::generate(), 6)
+        .await;
+    let index = generation.targets_dir().join("index.json");
+    let published = std::fs::read(&index).expect("an index");
+    std::fs::remove_file(&index).expect("removable");
+    assert!(
+        catalogue.sync(&repository()).await.is_err(),
+        "the index is missing"
+    );
+    let kept: serde_json::Value = serde_json::from_slice(
+        &catalogue
+            .repository(&repository())
+            .expect("readable")
+            .expect("enrolled")
+            .root,
+    )
+    .expect("json");
+    let rotated: serde_json::Value = serde_json::from_slice(&new_root).expect("json");
+    assert_eq!(kept["signed"]["version"], rotated["signed"]["version"]);
+
+    // A restart in between changes nothing: the reset is kept with the root.
+    drop(catalogue);
+    let mut catalogue = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+    std::fs::write(&index, &published).expect("writable");
+    let outcome = catalogue
+        .sync(&repository())
+        .await
+        .expect("lower versions under the new keys are accepted");
+    assert_eq!(outcome.generation.get(), 6);
+}
+
+/// A verification that fails, is interrupted or is refused at its commit leaves the accepted
+/// trust checkpoint exactly as it was, and one that verifies replaces it.
+///
+/// The client works in a private copy. The accepted checkpoint changes only through its own
+/// commit, under the admission, after the metadata verified.
+#[tokio::test]
+async fn a_verification_that_does_not_finish_leaves_the_accepted_checkpoint_as_it_was() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("a first generation");
+    let accepted = checkpoint(&catalogue);
+    assert!(
+        accepted.contains_key("timestamp.json"),
+        "{:?}",
+        accepted.keys()
+    );
+    generation.rewrite_as(2).await;
+
+    // Refused at its commit: the metadata verified, and none of it was accepted.
+    let withdrawn = WithdrawnAtCommit::default();
+    let refused = catalogue
+        .sync_with(&repository(), &mut Change::new(&withdrawn))
+        .await;
+    assert!(
+        matches!(refused, Err(CatalogueError::PermissionDenied { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(checkpoint(&catalogue), accepted, "refused at the commit");
+
+    // Interrupted part way through the metadata.
+    catalogue.set_transport(Arc::new(Damaging {
+        suffix: "snapshot.json",
+        damage: Damage::DropsPartWay,
+    }));
+    assert!(catalogue.sync(&repository()).await.is_err());
+    assert_eq!(checkpoint(&catalogue), accepted, "interrupted");
+
+    // Verified: the checkpoint is the new metadata, and no working copy is left behind.
+    catalogue.set_transport(Arc::new(tough::FilesystemTransport));
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("the second generation");
+    assert_ne!(checkpoint(&catalogue), accepted);
+    let staging = catalogue
+        .store(&repository())
+        .expect("enrolled")
+        .datastore()
+        .with_file_name("staging");
+    assert_eq!(
+        std::fs::read_dir(&staging).expect("readable").count(),
+        0,
+        "no working copy is left in staging"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // What is installed is the package this host checked, fetched as its accepted generation named it
 // ---------------------------------------------------------------------------------------------
 

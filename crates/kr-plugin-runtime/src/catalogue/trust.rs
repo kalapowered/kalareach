@@ -57,13 +57,13 @@ const GLOB_METACHARACTERS: &str = "*?[]{}!\\,";
 /// level costs a host another signed document to fetch and verify on every sync.
 pub const MAX_DELEGATION_DEPTH: usize = 3;
 
-/// The versions of the roles one load trusted.
+/// The versions of the roles one load trusted, recorded with the generation it accepted.
 ///
-/// The client keeps its own trusted metadata in a datastore and refuses a version lower than the
-/// one it holds. That protection is only as durable as the datastore: a document it cannot parse
-/// after an interrupted write is a document it skips rather than one it refuses on. These are the
-/// same numbers held beside the activated generation, so rollback protection survives a datastore
-/// this host can no longer read.
+/// Rollback protection is the client's: it compares each role against the accepted trust
+/// checkpoint, which only a verified load replaces, and resets the timestamp and snapshot floors
+/// where the root's keys for them change. A second floor kept here would refuse the lower versions
+/// a repository may validly publish after such a change, so these numbers are a record of what was
+/// accepted and not a policy of their own.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MetadataVersions {
     /// The root metadata version.
@@ -76,22 +76,29 @@ pub struct MetadataVersions {
     pub targets: u64,
 }
 
-impl MetadataVersions {
-    /// Returns the role whose version went backwards, where one did.
-    #[must_use]
-    pub fn rollback_from(&self, accepted: Self) -> Option<&'static str> {
-        for (role, mine, theirs) in [
-            ("root", self.root, accepted.root),
-            ("timestamp", self.timestamp, accepted.timestamp),
-            ("snapshot", self.snapshot, accepted.snapshot),
-            ("targets", self.targets, accepted.targets),
-        ] {
-            if mine < theirs {
-                return Some(role);
-            }
-        }
-        None
-    }
+/// Returns true when a new root signs timestamps or snapshots with other keys than the old one.
+///
+/// This is the client's own reset rule: such a change lets those roles start again from lower
+/// versions, so the floors the old keys set no longer apply.
+///
+/// # Errors
+///
+/// Returns [`CatalogueError::Untrusted`] when either root cannot be read.
+pub(crate) fn resets_floors(old: &[u8], new: &[u8]) -> CatalogueResult<bool> {
+    let read = |bytes: &[u8]| {
+        serde_json::from_slice::<tough::schema::Signed<tough::schema::Root>>(bytes).map_err(
+            |source| CatalogueError::Untrusted {
+                detail: format!("a trusted root could not be read: {source}"),
+            },
+        )
+    };
+    let (old, new) = (read(old)?, read(new)?);
+    Ok([
+        tough::schema::RoleType::Timestamp,
+        tough::schema::RoleType::Snapshot,
+    ]
+    .into_iter()
+    .any(|role| old.signed.keys(role).ne(new.signed.keys(role))))
 }
 
 /// One delegated role, as this host understands its scope.
@@ -1069,49 +1076,6 @@ mod tests {
                 .contains("pinned generation stays usable"),
             "{refusal}"
         );
-    }
-
-    #[test]
-    fn a_rollback_is_seen_in_any_role() {
-        let accepted = MetadataVersions {
-            root: 1,
-            timestamp: 7,
-            snapshot: 7,
-            targets: 7,
-        };
-        assert!(accepted.rollback_from(accepted).is_none());
-        for (role, older) in [
-            (
-                "root",
-                MetadataVersions {
-                    root: 0,
-                    ..accepted
-                },
-            ),
-            (
-                "timestamp",
-                MetadataVersions {
-                    timestamp: 6,
-                    ..accepted
-                },
-            ),
-            (
-                "snapshot",
-                MetadataVersions {
-                    snapshot: 6,
-                    ..accepted
-                },
-            ),
-            (
-                "targets",
-                MetadataVersions {
-                    targets: 6,
-                    ..accepted
-                },
-            ),
-        ] {
-            assert_eq!(older.rollback_from(accepted), Some(role));
-        }
     }
 
     #[test]

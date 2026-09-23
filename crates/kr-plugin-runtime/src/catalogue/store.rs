@@ -71,6 +71,62 @@ pub enum PackageCheck {
     },
 }
 
+/// A private copy of a repository's accepted trust checkpoint, which one verification works in.
+///
+/// The client writes into its datastore as it goes: roots one after another, then each role's
+/// metadata, each written in place. None of that reaches the accepted checkpoint until the load
+/// has verified, when [`Store::publish_checkpoint`] moves it there under the admitting
+/// authority's permit. A load that fails or is interrupted leaves only this copy, which is removed
+/// with it.
+#[derive(Debug)]
+pub struct WorkingDatastore {
+    path: PathBuf,
+}
+
+impl WorkingDatastore {
+    /// Returns the directory the client works in.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for WorkingDatastore {
+    /// Removes the working copy once the verification it served is over. A removal that fails
+    /// leaves a directory nothing reads.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Returns every file under `directory`, as paths relative to it, in a stable order.
+fn files_under(directory: &Path) -> CatalogueResult<BTreeSet<PathBuf>> {
+    let mut files = BTreeSet::new();
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        let entries = match std::fs::read_dir(&current) {
+            Ok(entries) => entries,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(CatalogueError::storage(&current, &source)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|source| CatalogueError::storage(&current, &source))?;
+            let path = entry.path();
+            let kind = entry
+                .file_type()
+                .map_err(|source| CatalogueError::storage(&path, &source))?;
+            if kind.is_dir() {
+                pending.push(path);
+            } else if kind.is_file()
+                && let Ok(relative) = path.strip_prefix(directory)
+            {
+                files.insert(relative.to_path_buf());
+            }
+        }
+    }
+    Ok(files)
+}
+
 /// A package every file of which was checked, where it lies, against the manifest its digest names.
 ///
 /// Only [`Store::check_package`] makes one. What an installation records about a package, and what
@@ -171,10 +227,125 @@ impl Store {
         }
     }
 
-    /// Returns the directory the client keeps this repository's trusted metadata in.
+    /// Returns the directory that holds this repository's accepted trust checkpoint.
+    ///
+    /// It holds the metadata the client last verified whole, which is what the next verification
+    /// starts from. The client never writes here: it works in a [`WorkingDatastore`], and what it
+    /// verified is moved here by [`Self::publish_checkpoint`].
     #[must_use]
     pub fn datastore(&self) -> PathBuf {
         self.root.join("datastore")
+    }
+
+    /// Copies the accepted trust checkpoint into a private working copy for one verification.
+    ///
+    /// `reset` drops the timestamp and snapshot documents from the copy. The client drops them
+    /// itself when a load moves to a root whose timestamp or snapshot keys differ from the root it
+    /// started from; a root advance kept by an earlier load that then failed is the root the next
+    /// load starts from, so the next load would not see the change, and the reset is applied here
+    /// instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when the copy cannot be made.
+    pub fn working_datastore(&self, reset: bool) -> CatalogueResult<WorkingDatastore> {
+        let staging = self.root.join("staging");
+        std::fs::create_dir_all(&staging)
+            .map_err(|source| CatalogueError::storage(&staging, &source))?;
+        let mut attempt = 0u32;
+        let path = loop {
+            let candidate = staging.join(format!("datastore-{}-{attempt}", std::process::id()));
+            match std::fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                    attempt = attempt.saturating_add(1);
+                    if attempt > 1024 {
+                        return Err(CatalogueError::storage(&candidate, &source));
+                    }
+                }
+                Err(source) => return Err(CatalogueError::storage(&candidate, &source)),
+            }
+        };
+        let working = WorkingDatastore { path };
+        let accepted = self.datastore();
+        for relative in files_under(&accepted)? {
+            let from = accepted.join(&relative);
+            let to = working.path.join(&relative);
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|source| CatalogueError::storage(parent, &source))?;
+            }
+            std::fs::copy(&from, &to).map_err(|source| CatalogueError::storage(&from, &source))?;
+        }
+        if reset {
+            for role in ["timestamp.json", "snapshot.json"] {
+                let path = working.path.join(role);
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(source) => return Err(CatalogueError::storage(&path, &source)),
+                }
+            }
+        }
+        Ok(working)
+    }
+
+    /// Makes a verified working copy the accepted trust checkpoint, one document at a time.
+    ///
+    /// Each document is written whole beside the accepted one and renamed over it, so a reader, or
+    /// an interruption, finds every document whole: the one that was accepted or the one that
+    /// verified. The working copy is left as it was, because the client goes on reading and
+    /// writing its time checkpoint there while the verified generation's payloads are fetched. A
+    /// document the working copy no longer holds is removed. The client verified each new document as no older
+    /// than the one it replaces, so a checkpoint caught part way between the two is still a set of
+    /// floors the next verification can start from.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when nothing was changed, and
+    /// [`CatalogueError::PublicationUncertain`] when part of the checkpoint was, or when its
+    /// directory did not confirm it.
+    pub(crate) fn publish_checkpoint(
+        &self,
+        _permit: &Permit,
+        working: &WorkingDatastore,
+    ) -> CatalogueResult<()> {
+        let accepted = self.datastore();
+        let verified = files_under(&working.path)?;
+        let held = files_under(&accepted)?;
+        let staging = self.root.join("staging");
+        let mut changed = 0usize;
+        let stopped = |changed: usize, error: CatalogueError| {
+            if changed == 0 {
+                error
+            } else {
+                CatalogueError::PublicationUncertain {
+                    detail: format!(
+                        "{changed} documents of the trust checkpoint were replaced before this \
+                         failed: {error}"
+                    ),
+                }
+            }
+        };
+        for relative in &verified {
+            let from = working.path.join(relative);
+            let bytes = std::fs::read(&from)
+                .map_err(|source| stopped(changed, CatalogueError::storage(&from, &source)))?;
+            rename_into_place(&staging, &accepted.join(relative), &bytes)
+                .map_err(|error| stopped(changed, error))?;
+            changed += 1;
+        }
+        for relative in held.iter().filter(|relative| !verified.contains(*relative)) {
+            let path = accepted.join(relative);
+            match std::fs::remove_file(&path) {
+                Ok(()) => changed += 1,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(stopped(changed, CatalogueError::storage(&path, &source)));
+                }
+            }
+        }
+        flushed_after_publication(&accepted, &accepted)
     }
 
     /// Returns the directory an activated package sits in.
