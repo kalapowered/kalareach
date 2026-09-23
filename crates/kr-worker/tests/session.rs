@@ -224,9 +224,6 @@ async fn a_session_runs_a_shell_and_its_output_reaches_an_attachment() {
     let _ = record.ownership_coverage;
 }
 
-/// KR-REQ-06.12: the session root shell is not a superuser shell: the process a session launches
-/// as its root shell runs with the real and effective user of the host that started it.
-#[cfg(unix)]
 /// KR-REQ-07.52: a session that ends straight after writing still delivers the last of what it
 /// wrote before its closure. The engine holds the last character of a run back in case a combining
 /// mark follows it, and a session whose shell ends at that moment has nothing more to follow it.
@@ -276,6 +273,9 @@ async fn the_last_character_a_session_wrote_reaches_its_attachment_before_the_cl
     let _ = session.force_close();
 }
 
+/// KR-REQ-06.12: the session root shell is not a superuser shell: the process a session launches
+/// as its root shell runs with the real and effective user of the host that started it.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_root_shell_runs_as_the_hosts_own_user() {
     let host = kr_ipc::testing::TempHost::create();
