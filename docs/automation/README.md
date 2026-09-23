@@ -177,8 +177,10 @@ the daemon's registry, because a causal budget has to survive a reboot as well a
   and undelivered attention records are all the journal's and come back as they were left.
 * **Cancellation.** Cancelling a run stops undispatched nodes: the journal, not a snapshot taken
   when the run started, decides whether a node still has anything owed to it, so a cancellation
-  that arrives while an earlier node is running still stops the next one. Nothing is claimed about
-  an external side effect an already dispatched action may have had.
+  that arrives while an earlier node is running still stops the next one. Cancellation is
+  terminal: an action that reports back after its node was cancelled does not settle the node,
+  and a run that was cancelled is never recorded as completed. Nothing is claimed about an
+  external side effect an already dispatched action may have had.
 * **Attention delivery.** Attention records are committed with the pause that caused them and
   settled only after the host's attention state has written its own. Each record carries its own
   journal row number as its delivery cursor, so a redelivery after an interrupted settle replays

@@ -1536,6 +1536,73 @@ impl WorkflowStore {
         Ok(claimed > 0)
     }
 
+    /// Records what a dispatched node came to, if the node is still the dispatch's to settle.
+    ///
+    /// Only a node that is still running is settled. A node cancelled while its action ran keeps
+    /// its cancellation: the host stopped asking, and an answer that arrived afterwards does not
+    /// make the run one that completed. Returns whether the outcome was written.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the row cannot be written.
+    pub fn settle_node(
+        &self,
+        run_id: WorkflowRunId,
+        node_id: &str,
+        status: NodeStatus,
+        output: Option<&str>,
+        error: Option<&str>,
+        ended_at_ms: u64,
+    ) -> Result<bool> {
+        let conn = self.lock();
+        let settled = conn.execute(
+            "UPDATE node_receipts SET status = ?1, output_json = ?2, error_json = ?3,
+                    ended_at_ms = ?4
+             WHERE run_id = ?5 AND node_id = ?6 AND status = ?7",
+            params![
+                status.as_str(),
+                output,
+                error,
+                stored(ended_at_ms),
+                run_id.to_string(),
+                node_id,
+                NodeStatus::Running.as_str(),
+            ],
+        )?;
+        Ok(settled > 0)
+    }
+
+    /// Pauses a node that was never dispatched, for review, if it is still waiting.
+    ///
+    /// Returns whether the node was paused. A node the journal has already moved on, a cancelled
+    /// one among them, is left as it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the row cannot be written.
+    pub fn pause_waiting_node(
+        &self,
+        run_id: WorkflowRunId,
+        node_id: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<bool> {
+        let conn = self.lock();
+        let paused = conn.execute(
+            "UPDATE node_receipts SET status = ?1, error_json = ?2, ended_at_ms = ?3
+             WHERE run_id = ?4 AND node_id = ?5 AND status = ?6",
+            params![
+                NodeStatus::Paused.as_str(),
+                reason,
+                stored(now_ms),
+                run_id.to_string(),
+                node_id,
+                NodeStatus::Pending.as_str(),
+            ],
+        )?;
+        Ok(paused > 0)
+    }
+
     /// Pauses one node and its run because the host refused to dispatch it, in one transaction.
     ///
     /// Cancellation is terminal and a refusal never undoes it. A node that has already settled,
@@ -1579,6 +1646,88 @@ impl WorkflowStore {
             )?;
             Ok(())
         })
+    }
+
+    /// Stops a run: every node still waiting or running is cancelled, and so is the run.
+    ///
+    /// A node that already settled keeps what it settled with, and a run that already finished is
+    /// not reopened as a cancelled one. Nothing here says anything about an external side effect
+    /// an already dispatched action may have had.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the rows cannot be written.
+    pub fn cancel_run(&self, run_id: WorkflowRunId, reason: &str, now_ms: u64) -> Result<()> {
+        self.write(|journal| {
+            journal.conn.execute(
+                "UPDATE node_receipts SET status = ?1, error_json = ?2, ended_at_ms = ?3
+                 WHERE run_id = ?4 AND status IN (?5, ?6)",
+                params![
+                    NodeStatus::Cancelled.as_str(),
+                    reason,
+                    stored(now_ms),
+                    run_id.to_string(),
+                    NodeStatus::Pending.as_str(),
+                    NodeStatus::Running.as_str(),
+                ],
+            )?;
+            journal.conn.execute(
+                "UPDATE workflow_runs SET status = ?1, ended_at_ms = ?2
+                 WHERE run_id = ?3 AND status IN (?4, ?5, ?6)",
+                params![
+                    WorkflowRunStatus::Cancelled.as_str(),
+                    stored(now_ms),
+                    run_id.to_string(),
+                    WorkflowRunStatus::Pending.as_str(),
+                    WorkflowRunStatus::Running.as_str(),
+                    WorkflowRunStatus::Paused.as_str(),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Moves a run from waiting to running, unless something already settled it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the row cannot be written.
+    pub fn start_run(&self, run_id: WorkflowRunId) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE workflow_runs SET status = ?1 WHERE run_id = ?2 AND status = ?3",
+            params![
+                WorkflowRunStatus::Running.as_str(),
+                run_id.to_string(),
+                WorkflowRunStatus::Pending.as_str(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Records where a run ended, unless it was cancelled, which is terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the row cannot be written.
+    pub fn finish_run(
+        &self,
+        run_id: WorkflowRunId,
+        status: WorkflowRunStatus,
+        ended_at_ms: u64,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE workflow_runs SET status = ?1, ended_at_ms = ?2
+             WHERE run_id = ?3 AND status <> ?4",
+            params![
+                status.as_str(),
+                stored(ended_at_ms),
+                run_id.to_string(),
+                WorkflowRunStatus::Cancelled.as_str(),
+            ],
+        )?;
+        Ok(())
     }
 
     /// Reports whether a workflow revision is currently paused.
@@ -1663,7 +1812,11 @@ impl WorkflowStore {
         outcome
     }
 
-    /// Updates a workflow run's status.
+    /// Overwrites a run's status, whatever it was.
+    ///
+    /// A record-keeping operation for a caller that is restoring a known state; the engine itself
+    /// moves a run only through [`Self::start_run`], [`Self::finish_run`],
+    /// [`Self::pause_on_refusal`] and [`Self::cancel_run`], which respect a cancellation.
     ///
     /// # Errors
     ///
@@ -1682,7 +1835,10 @@ impl WorkflowStore {
         Ok(())
     }
 
-    /// Updates an action node's receipt and outcome.
+    /// Overwrites a node's receipt, whatever it held.
+    ///
+    /// A record-keeping operation, as [`Self::update_run_status`]; the engine settles a node
+    /// through [`Self::settle_node`], which respects a cancellation.
     ///
     /// # Errors
     ///

@@ -4,20 +4,21 @@
 //! durable before its first node dispatches. The journal does both in one transaction: an action
 //! either has a record, written with its effect, or has not been performed. These cases are the
 //! ones that would expose a gap between the two: a repeat that arrives while the run it started is
-//! still dispatching, an admission that lapses before the first write, and a refusal repeated after
-//! the world changed.
+//! still dispatching, an admission that lapses before the first write, a refusal repeated after the
+//! world changed, and a cancellation that lands while an action is running.
 //!
 //! Requirement rows: KR-REQ-23.52 (the method group's action idempotency), KR-REQ-25.19 (a run is
-//! persisted before it dispatches, and a trigger is deduplicated before it spends anything).
+//! persisted before it dispatches, and cancellation stops undispatched work without claiming
+//! anything about what already ran).
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use kr_automation::{
     ActionKey, ActionOutcome, ActionRunner, AutomationError, AutomationService, Dispatch,
-    ManualClock, Submitted, create_workflow_definition,
+    ManualClock, Submitted, WorkflowStore, create_workflow_definition,
 };
 use kr_protocol::automation::{
-    WorkflowDefinition, WorkflowEnableParams, WorkflowInstallParams, WorkflowNode,
+    NodeStatus, WorkflowDefinition, WorkflowEnableParams, WorkflowInstallParams, WorkflowNode,
     WorkflowRunParams, WorkflowRunStatus,
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
@@ -313,4 +314,76 @@ fn a_repeated_refusal_is_answered_as_it_was_decided() {
         )
         .expect_err("a reused identifier is refused");
     assert_eq!(ProtocolError::from(reused).code, ErrorCode::IdConflict);
+}
+
+/// A runner that cancels its own run while its action is running, and then reports success.
+#[derive(Default)]
+struct CancelledWhileRunning {
+    store: OnceLock<Arc<WorkflowStore>>,
+}
+
+impl ActionRunner for CancelledWhileRunning {
+    fn execute(
+        &self,
+        dispatch: &Dispatch<'_>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = kr_automation::Result<ActionOutcome>> + Send>,
+    > {
+        let store = Arc::clone(self.store.get().expect("the journal is known"));
+        let run_id = dispatch.run_id;
+        Box::pin(async move {
+            store.cancel_run(run_id, "stopped by the person", 1_500)?;
+            Ok(ActionOutcome::Success {
+                output: "finished after the host stopped asking".to_owned(),
+            })
+        })
+    }
+}
+
+/// A cancellation that lands while a node's action runs keeps the node and the run cancelled.
+/// The action's late success is not read as the run having completed.
+#[tokio::test]
+async fn a_cancellation_during_an_action_is_not_overwritten_by_its_late_success() {
+    let runner = Arc::new(CancelledWhileRunning::default());
+    let service = AutomationService::in_memory_with_clock(
+        Arc::clone(&runner) as Arc<dyn ActionRunner>,
+        common::every_right(&[grant_id(4)]),
+        Arc::new(ManualClock::new(1_000)),
+    )
+    .expect("a service");
+    runner
+        .store
+        .set(Arc::clone(service.store()))
+        .expect("set once");
+    let definition = one_node(workflow_id(4), grant_id(4));
+    service
+        .submit_install(&install_params(&definition), 1_000)
+        .expect("installs");
+    service
+        .submit_enable(
+            &WorkflowEnableParams {
+                workflow_id: definition.workflow_id,
+                revision: definition.revision,
+            },
+            1_000,
+        )
+        .expect("enables");
+
+    let run = service
+        .submit_run(&run_params(&definition, "evt-1"), 1_000)
+        .await
+        .expect("the run is admitted");
+    assert_eq!(run.status, WorkflowRunStatus::Cancelled, "{run:?}");
+
+    let receipts = service.store().list_node_receipts(run.run_id).unwrap();
+    assert_eq!(receipts[0].status, NodeStatus::Cancelled);
+    assert!(
+        receipts[0].output.0.is_none(),
+        "the late answer is not recorded"
+    );
+    let runs = service
+        .store()
+        .list_runs(Some(definition.workflow_id))
+        .unwrap();
+    assert_eq!(runs[0].status, WorkflowRunStatus::Cancelled);
 }

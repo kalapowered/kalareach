@@ -183,9 +183,9 @@ impl WorkflowEngine {
                 .push((edge.from_node.as_str(), edge.condition));
         }
 
-        // Update run status to Running
-        self.store
-            .update_run_status(run_id, WorkflowRunStatus::Running, None)?;
+        // The run is running from here, unless something settled it while it waited: a
+        // cancellation is terminal and is not reopened by the run starting late.
+        self.store.start_run(run_id)?;
 
         let mut progress = true;
         let mut run_status = WorkflowRunStatus::Completed;
@@ -244,15 +244,18 @@ impl WorkflowEngine {
                 }
 
                 if must_pause_for_review {
-                    node_statuses.insert(node.node_id.clone(), NodeStatus::Paused);
-                    self.store.update_node_receipt(
+                    let paused = self.store.pause_waiting_node(
                         run_id,
                         &node.node_id,
-                        NodeStatus::Paused,
-                        None,
-                        Some("paused for review due to unknown predecessor outcome"),
-                        Some(now_ms),
+                        "paused for review due to unknown predecessor outcome",
+                        now_ms,
                     )?;
+                    let recorded = if paused {
+                        NodeStatus::Paused
+                    } else {
+                        self.recorded_status(run_id, &node.node_id)?
+                    };
+                    node_statuses.insert(node.node_id.clone(), recorded);
                     run_status = WorkflowRunStatus::Paused;
                     progress = true;
                     continue;
@@ -361,46 +364,20 @@ impl WorkflowEngine {
                     };
                     let outcome_res = self.runner.execute(&dispatch).await;
 
-                    match outcome_res {
+                    // What the action came to, and what the run owes because of it. The action
+                    // was dispatched, so whether it did anything is not this host's to say
+                    // unless the runner said so: an uncertain answer stays uncertain and its
+                    // dependants pause, and only a definite report of failure is a failure.
+                    let (status, output, detail) = match outcome_res {
                         Ok(ActionOutcome::Success { output }) => {
-                            node_statuses.insert(node.node_id.clone(), NodeStatus::Success);
-                            self.store.update_node_receipt(
-                                run_id,
-                                &node.node_id,
-                                NodeStatus::Success,
-                                Some(&output),
-                                None,
-                                Some(self.clock.now_ms()),
-                            )?;
+                            (NodeStatus::Success, Some(output), None)
                         }
                         Ok(ActionOutcome::Failed { error }) => {
-                            node_statuses.insert(node.node_id.clone(), NodeStatus::Failed);
-                            self.store.update_node_receipt(
-                                run_id,
-                                &node.node_id,
-                                NodeStatus::Failed,
-                                None,
-                                Some(&error),
-                                Some(self.clock.now_ms()),
-                            )?;
-                            run_status = WorkflowRunStatus::Failed;
+                            (NodeStatus::Failed, None, Some(error))
                         }
                         Ok(ActionOutcome::Unknown { detail }) => {
-                            // Node marked Unknown -> dependants will pause
-                            node_statuses.insert(node.node_id.clone(), NodeStatus::Unknown);
-                            self.store.update_node_receipt(
-                                run_id,
-                                &node.node_id,
-                                NodeStatus::Unknown,
-                                None,
-                                Some(&detail),
-                                Some(self.clock.now_ms()),
-                            )?;
-                            run_status = WorkflowRunStatus::Paused;
+                            (NodeStatus::Unknown, None, Some(detail))
                         }
-                        // The action was dispatched, so whether it did anything is not
-                        // this host's to say. An uncertain answer stays uncertain and its
-                        // dependants pause; only a definite report of failure is a failure.
                         Err(error) => {
                             let uncertain = matches!(
                                 error,
@@ -411,21 +388,30 @@ impl WorkflowEngine {
                             } else {
                                 NodeStatus::Failed
                             };
-                            node_statuses.insert(node.node_id.clone(), status);
-                            self.store.update_node_receipt(
-                                run_id,
-                                &node.node_id,
-                                status,
-                                None,
-                                Some(&error.to_string()),
-                                Some(self.clock.now_ms()),
-                            )?;
-                            run_status = if uncertain {
-                                WorkflowRunStatus::Paused
-                            } else {
-                                WorkflowRunStatus::Failed
-                            };
+                            (status, None, Some(error.to_string()))
                         }
+                    };
+                    // Only a node that is still this dispatch's is settled. A node cancelled while
+                    // its action ran keeps its cancellation, and so does its run: an answer that
+                    // arrived after the host stopped asking does not make the run a completed one.
+                    let settled = self.store.settle_node(
+                        run_id,
+                        &node.node_id,
+                        status,
+                        output.as_deref(),
+                        detail.as_deref(),
+                        self.clock.now_ms(),
+                    )?;
+                    let recorded = if settled {
+                        status
+                    } else {
+                        self.recorded_status(run_id, &node.node_id)?
+                    };
+                    node_statuses.insert(node.node_id.clone(), recorded);
+                    match recorded {
+                        NodeStatus::Failed => run_status = WorkflowRunStatus::Failed,
+                        NodeStatus::Unknown => run_status = WorkflowRunStatus::Paused,
+                        _ => {}
                     }
 
                     progress = true;
@@ -449,8 +435,16 @@ impl WorkflowEngine {
         }
 
         self.store
-            .update_run_status(run_id, run_status, Some(self.clock.now_ms()))?;
+            .finish_run(run_id, run_status, self.clock.now_ms())?;
         Ok(run_status)
+    }
+
+    /// Reads a node's status from the journal, for a node this loop no longer owns.
+    fn recorded_status(&self, run_id: WorkflowRunId, node_id: &str) -> Result<NodeStatus> {
+        Ok(self
+            .store
+            .node_status(run_id, node_id)?
+            .unwrap_or(NodeStatus::Cancelled))
     }
 
     /// Records a refused dispatch and pauses the run, keeping the refusal for the caller.
@@ -477,23 +471,13 @@ impl WorkflowEngine {
     ///
     /// Nothing here claims anything about an external side effect an already dispatched action
     /// may have had. A cancelled node says the host stopped asking, not that the world is clean.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the journal cannot be written.
     pub fn cancel_run(&self, run_id: WorkflowRunId, now_ms: u64) -> Result<()> {
-        let receipts = self.store.list_node_receipts(run_id)?;
-        for receipt in receipts {
-            if receipt.status == NodeStatus::Pending || receipt.status == NodeStatus::Running {
-                self.store.update_node_receipt(
-                    run_id,
-                    &receipt.node_id,
-                    NodeStatus::Cancelled,
-                    None,
-                    Some("run cancelled by request"),
-                    Some(now_ms),
-                )?;
-            }
-        }
         self.store
-            .update_run_status(run_id, WorkflowRunStatus::Cancelled, Some(now_ms))?;
-        Ok(())
+            .cancel_run(run_id, "run cancelled by request", now_ms)
     }
 }
 
