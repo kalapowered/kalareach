@@ -28,9 +28,10 @@
 //! and a lost answer is reported as an unknown outcome ([`LostWrite`]). The store keeps a record of
 //! the last write it sent, and the record holds what settling that write takes and nothing more:
 //! the place it compared against, the identity and the instant it went out under, and the digest
-//! of the encrypted bundle it sent. It is on this device's disk before the write leaves, so a
-//! process that ends with the write unanswered leaves it for the next store to take up; it never
-//! holds the bundle, its ciphertext or a key. Two things settle it:
+//! of the encrypted bundle it sent. It is on this device's disk before the write leaves and stays
+//! until the next write replaces it, so a process that ends with the write unanswered leaves it for
+//! the next store to take up; it never holds the bundle, its ciphertext or a key. Two things settle
+//! it:
 //!
 //! * **A read that recognises the write.** When the bytes at the locator are the very bytes this
 //!   device sent, whose digest says so, that write applied and cannot apply again, because a
@@ -60,7 +61,7 @@ use kr_protocol::scalars::{
 use serde::{Deserialize, Serialize};
 
 use crate::error::ClientError;
-use crate::recovery::record::{RecordFile, WriteRecord};
+use crate::recovery::record::{Known, RecordFile, WriteRecord};
 use crate::recovery::{RecoveryError, Result};
 use crate::services::{SyncBackupService, SyncExchanged, SyncPosition, SyncRequestFence};
 
@@ -107,17 +108,6 @@ pub enum LostWrite {
     },
 }
 
-/// The last write this store sent, and what became of it where no answer arrived.
-///
-/// One value for the write and its fate, so the store cannot hold the record of one write and a
-/// settled report about another.
-#[derive(Clone, Debug)]
-struct LastWrite {
-    record: WriteRecord,
-    /// [`None`] when the service answered the write, which leaves no question to settle.
-    lost: Option<LostWrite>,
-}
-
 /// Where this store last saw the bundle, and the bundle it authenticated there.
 ///
 /// The place and the content together or neither. A place without the content read there could
@@ -148,8 +138,11 @@ pub struct BundleStore {
     /// between. The store keeps what it read, so a commit of a bundle that is not what this store
     /// last saw is refused rather than accepted with the token it happens to hold.
     baseline: Option<Baseline>,
-    /// The last write this store sent.
-    last_write: Option<LastWrite>,
+    /// The last write this store sent, and what is known of what became of it.
+    ///
+    /// One value for the write and its fate, so the store cannot hold the record of one write and a
+    /// settled report about another. It is the record kept on the disk as well.
+    last_write: Option<WriteRecord>,
     /// Where the record of that write is kept across a restart.
     file: RecordFile,
 }
@@ -171,10 +164,12 @@ impl BundleStore {
     ///
     /// `directory` is where this device keeps its recovery state, and it has to exist already. One
     /// directory holds the records of every bundle location the device writes: each record is
-    /// named after its location. A record left there by a write whose answer never came back, in
-    /// this process or one that has since ended, is taken up here, and the store starts with that
-    /// write outstanding: [`Self::lost_write`] says so, and nothing is written until
-    /// [`Self::fetch`] recognises the write or [`Self::end_lost_write`] ends it.
+    /// named after its location, and names the last write sent there from this device. The store
+    /// takes that write up as its own. One whose answer never came back and which nothing settled,
+    /// in this process or one that has since ended, starts outstanding: [`Self::lost_write`] says
+    /// so, and nothing is written until [`Self::fetch`] recognises the write or
+    /// [`Self::end_lost_write`] ends it. [`Self::complete_migration`] recognises the write by what
+    /// the record keeps.
     ///
     /// # Errors
     ///
@@ -186,11 +181,7 @@ impl BundleStore {
         context: RecoveryContext,
         directory: &Path,
     ) -> Result<Self> {
-        let (file, record) = RecordFile::open(directory, &context)?;
-        let last_write = record.map(|record| LastWrite {
-            lost: Some(LostWrite::Unsettled { sent: record.sent }),
-            record,
-        });
+        let (file, last_write) = RecordFile::open(directory, &context)?;
         Ok(Self {
             service,
             context,
@@ -218,20 +209,27 @@ impl BundleStore {
     /// Returns what became of the last write whose answer never arrived.
     ///
     /// [`None`] until one is lost. It stays until the next answered commit, because what was
-    /// established about that write stays true. A store opened over the record of a write whose
-    /// answer never came back starts with that write unsettled here, whatever the process that
-    /// sent it had learned before it ended.
+    /// established about that write stays true. A store opened over the record of such a write
+    /// reports what that record says, and it says less than the store knew only where writing it
+    /// down failed, never more.
     #[must_use]
     pub fn lost_write(&self) -> Option<LostWrite> {
-        self.last_write.as_ref().and_then(|write| write.lost)
+        let write = self.last_write.as_ref()?;
+        match write.known {
+            Known::Unsettled => Some(LostWrite::Unsettled { sent: write.sent }),
+            Known::Answered => None,
+            Known::Applied => Some(LostWrite::Applied),
+            Known::Ended { retained } => Some(LostWrite::Ended {
+                retained: retained.0,
+            }),
+        }
     }
 
     /// Returns the record of a write whose answer never arrived and which nothing has ended.
     fn unsettled(&self) -> Option<&WriteRecord> {
         self.last_write
             .as_ref()
-            .filter(|write| matches!(write.lost, Some(LostWrite::Unsettled { .. })))
-            .map(|write| &write.record)
+            .filter(|write| write.known == Known::Unsettled)
     }
 
     /// Records what became of a write whose answer never arrived.
@@ -240,10 +238,31 @@ impl BundleStore {
     /// one keeps the answer it was given, because every way of settling it asks the service or the
     /// locator a question whose answer does not change.
     fn settle(&mut self, outcome: LostWrite) {
+        let known = match outcome {
+            LostWrite::Unsettled { .. } => return,
+            LostWrite::Applied => Known::Applied,
+            LostWrite::Ended { retained } => Known::Ended {
+                retained: Nullable::from(retained),
+            },
+        };
         if let Some(write) = &mut self.last_write
-            && matches!(write.lost, Some(LostWrite::Unsettled { .. }))
+            && write.known == Known::Unsettled
         {
-            write.lost = Some(outcome);
+            write.known = known;
+            self.write_down();
+        }
+    }
+
+    /// Writes down what is now known of the last write, as far as the disk allows.
+    ///
+    /// The record was written before the write went out, and that one had to succeed. This one
+    /// only records more: an answer or a settlement the service or the locator already established.
+    /// Where it fails the record says less than the store knows, and a restart asks the service
+    /// about the write again and is told the same thing, so the failure costs a question and never
+    /// a write. Reporting it instead would report a settled write as a failure.
+    fn write_down(&self) {
+        if let Some(write) = &self.last_write {
+            let _ = self.file.save(write);
         }
     }
 
@@ -561,12 +580,10 @@ impl BundleStore {
             request_id,
             signed_at_ms: now_ms,
             sent,
+            known: Known::Unsettled,
         };
         self.file.save(&record)?;
-        self.last_write = Some(LastWrite {
-            record,
-            lost: Some(LostWrite::Unsettled { sent }),
-        });
+        self.last_write = Some(record);
         match self
             .service
             .compare_exchange(
@@ -611,16 +628,14 @@ impl BundleStore {
 
     /// Records that the service answered the last write, so no question about it is left.
     ///
-    /// The record on the disk goes as well, because a restart has nothing to ask about an answered
-    /// write. Removing it can fail, and the answer stands all the same: the record left behind names
-    /// a write the service has already decided, so a restart that finds it asks about it once and is
-    /// told what this call was told. Reporting the removal instead would report a write that
-    /// applied as one that failed.
+    /// The record itself stays, on the disk as well, because an answer is not the end of what the
+    /// record is for: a migration whose destination answered is complete only once the bundle has
+    /// been read back there, and a store opened after a restart finishes it from this record.
     fn answered(&mut self) {
         if let Some(write) = &mut self.last_write {
-            write.lost = None;
+            write.known = Known::Answered;
         }
-        let _ = self.file.clear();
+        self.write_down();
     }
 
     /// Enables a backup writer, committing the updated bundle *before* declaring it.
@@ -917,8 +932,8 @@ impl BundleStore {
     ///
     /// It can be asked again, and it answers the same way: the fence repeats its answer, the read
     /// finds the same bundle, and nothing is written. The destination store keeps its record of the
-    /// write until it writes again, and keeps it on this device's disk while no answer to that
-    /// write has arrived, so a destination store opened after a restart completes the move too.
+    /// write, in memory and on this device's disk, until it writes again, so a destination store
+    /// opened after a restart completes the move too, whether or not the write was answered.
     ///
     /// # Errors
     ///
@@ -964,7 +979,7 @@ impl BundleStore {
     /// alone says nothing about which write is there, and neither does a bundle equal to the one
     /// the write carried.
     async fn recognise_its_own_write(&mut self, seed: &RecoverySeed) -> Result<Baseline> {
-        let Some(record) = self.last_write.as_ref().map(|write| write.record.clone()) else {
+        let Some(record) = self.last_write.clone() else {
             // This store has sent nothing, so nothing at its location can be its own.
             return Err(self.left_nothing(seed).await);
         };

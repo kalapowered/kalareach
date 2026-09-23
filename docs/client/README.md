@@ -630,15 +630,19 @@ the locator, so a lost answer costs a read rather than another write.
 
 **A lost write outlives the process that sent it.** `BundleStore::open` takes the directory where
 the device keeps its recovery state, and each record lives there under a name derived from its
-bundle's location, so one directory serves every bundle the device writes. The record is written
-and flushed before the write leaves, and it goes when a write is answered. A write whose answer
-never came back keeps its record, and a store opened over that record after a restart starts with
-the write unsettled, as if the answer had just been lost: it writes nothing until a read finds the
-write's bytes or `end_lost_write` fences its identity, and `complete_migration` works from it too.
-A record this build cannot read is refused rather than set aside, since it may be the only account
-of a write that can still land. An open store also holds a lock beside its record, so a second store
-for the same bundle on the device, in this process or another, gets `BundleStoreInUse` instead of
-writing a record over the first one's. A restore opens no store at all, because it only reads.
+bundle's location, so one directory serves every bundle the device writes. The record is written and
+flushed before the write leaves, and the write does not leave if that fails. It stays until the next
+write replaces it, and what is learned about the write, an answer or a settlement, is written into
+it as well. A store opened over it after a restart takes the write up. One whose answer never came
+back and which nothing settled starts unsettled, as if the answer had just been lost, and the store
+writes nothing until a read finds the write's bytes or `end_lost_write` fences its identity. The
+record also outlives an answer, because `complete_migration` needs it: a migration whose destination
+answered is not complete until the bundle has been read back there, and a destination store opened
+after a restart finishes it from the record. A record this build cannot read is refused rather than
+set aside, since it may be the only account of a write that can still land. An open store holds a
+lock beside its record, so a second store for the same bundle on the device, in this process or
+another, gets `BundleStoreInUse` instead of writing a record over the first one's. A restore opens
+no store at all, because it only reads.
 
 **An answer this device cannot read is declined rather than guessed at.** A place in the order
 counts from one and a write that produced content is named by a revision, so a removal's place and

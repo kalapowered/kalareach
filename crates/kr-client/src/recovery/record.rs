@@ -3,24 +3,30 @@
 //! A write whose answer never came back has to be ended before the store writes again, and what
 //! ends it is the identity it went out under, the instant that was signed at, and the bytes it
 //! sent. A store built fresh after a restart would know none of them, so they are written down
-//! before the write leaves and read back when the store is opened. A store opened over a record
-//! starts with that write outstanding, exactly as if its answer had just been lost, and it will not
-//! write until the write is reconciled: by a read that finds the bytes it sent, or by the service
-//! fencing its identity.
+//! before the write leaves and read back when the store is opened. A store opened over the record
+//! of a write nothing has settled starts with that write outstanding, exactly as if its answer had
+//! just been lost, and it will not write until the write is reconciled: by a read that finds the
+//! bytes it sent, or by the service fencing its identity.
+//!
+//! The same record is what recognises the write afterwards. A migration is complete only once its
+//! destination write has been read back and its kit handed over, and a destination store opened
+//! after a restart completes it from this record, whether or not the write was answered first.
 //!
 //! # What the record holds, and never holds
 //!
 //! Where the bundle is, the place the write compared against, the identity and instant it went out
-//! under, and the digest of the encrypted bundle it sent. Never the bundle, its ciphertext or a
-//! key. The bundle is key material, and a digest recognises bytes without being able to give any
-//! back.
+//! under, the digest of the encrypted bundle it sent, and what is known of what became of it.
+//! Never the bundle, its ciphertext or a key. The bundle is key material, and a digest recognises
+//! bytes without being able to give any back.
 //!
-//! # When it is written and removed
+//! # When it is written
 //!
-//! It is written and flushed to the device before the write leaves, replaced by the next write, and
-//! removed once a write is answered, because an answer leaves no question for a restart to ask. A
-//! write whose answer never came back keeps its record after it is settled, until the next write
-//! replaces it. A restart then asks about it again, and the service answers the same way.
+//! It is written and flushed to the device before the write leaves, and the write is not sent if
+//! that fails. It stays until the next write replaces it, as the store's own memory of the write
+//! does. What is known of the write is written again when an answer arrives or the write is
+//! settled. That second writing can fail and leave the record saying less than the store knows,
+//! which is the safe direction: a restart then asks about the write again, and the service answers
+//! the same way.
 //!
 //! # One store per record
 //!
@@ -31,6 +37,7 @@
 use std::path::{Path, PathBuf};
 
 use kr_protocol::archive::RecoveryContext;
+use kr_protocol::ids::SyncConflictId;
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
 use serde::{Deserialize, Serialize};
 
@@ -50,13 +57,14 @@ const PARTIAL_EXTENSION: &str = "bundle-write-partial";
 /// The extension of the lock a store holds while it is open.
 const LOCK_EXTENSION: &str = "bundle-lock";
 
-/// One write a bundle store sent, as the store records it.
+/// The last write a bundle store sent, as the store records it.
 ///
-/// It holds what settling that write takes and nothing else. A read recognises the write by the
-/// digest of the encrypted bundle it sent, the service ends it by the identity it went out under
-/// and the instant that was signed at, and any receipt of it is held against the place it compared
-/// against. Neither the bundle nor its ciphertext is here: a write the service says it applied is
-/// read back from the locator, so nothing that settles a lost write needs the bundle's bytes.
+/// It holds what settling and recognising that write take and nothing else. A read recognises the
+/// write by the digest of the encrypted bundle it sent, the service ends it by the identity it went
+/// out under and the instant that was signed at, and any receipt of it is held against the place it
+/// compared against. Neither the bundle nor its ciphertext is here: a write the service says it
+/// applied is read back from the locator, so nothing that settles a lost write needs the bundle's
+/// bytes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct WriteRecord {
@@ -80,6 +88,26 @@ pub(super) struct WriteRecord {
     /// bundle could not tell them apart; each encryption starts from its own random header, so their
     /// ciphertexts differ.
     pub(super) sent: Digest256,
+    /// What is known of what became of it.
+    pub(super) known: Known,
+}
+
+/// What a store knows of what became of its last write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum Known {
+    /// Nothing: no answer came back and nothing has settled it since. The store writes nothing
+    /// further until something does.
+    Unsettled,
+    /// The service answered it, applied or refused.
+    Answered,
+    /// No answer came back, and a read or the service established afterwards that it applied.
+    Applied,
+    /// No answer came back, and the service ended it without recording that it applied.
+    Ended {
+        /// The copy the service kept of the write, when it refused it and kept one.
+        retained: Nullable<SyncConflictId>,
+    },
 }
 
 /// Where one bundle store keeps its record, and the lock that makes it the only store doing so.
@@ -187,20 +215,6 @@ impl RecordFile {
         }
         sync_directory(&self.directory).map_err(|source| storage(&self.directory, source))
     }
-
-    /// Removes the record, when there is one.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RecoveryError::Storage`] when it cannot be removed.
-    pub(super) fn clear(&self) -> Result<()> {
-        match std::fs::remove_file(&self.path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(source) => return Err(storage(&self.path, source)),
-        }
-        sync_directory(&self.directory).map_err(|source| storage(&self.directory, source))
-    }
 }
 
 fn storage(path: &Path, source: std::io::Error) -> RecoveryError {
@@ -246,7 +260,7 @@ fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     written
 }
 
-/// Flushes a directory entry, so a name that was replaced or removed stays that way after a crash.
+/// Flushes a directory entry, so a name that was replaced stays that way after a crash.
 ///
 /// Unix only. This build flushes no directory on Windows and makes no claim there that a record it
 /// wrote survives losing power; what holds on both is that a record is flushed before it is renamed

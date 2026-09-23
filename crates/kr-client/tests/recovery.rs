@@ -1890,6 +1890,17 @@ async fn a_lost_write_that_landed_is_recognised_by_the_store_opened_after_a_rest
         service.fences().is_empty(),
         "a write recognised by reading needs nothing ended"
     );
+
+    // That write was answered, and a store opened after the next restart knows it: nothing is
+    // outstanding, so it reads and writes without asking the service about anything.
+    let mut store = store.restart(Arc::clone(&service) as Arc<_>);
+    assert_eq!(store.lost_write(), None);
+    let mut again = store.fetch(&seed).await.expect("the bundle");
+    store
+        .enable_writer(&seed, &mut again, trusted(&writer), TimestampMs::new(4_000))
+        .await
+        .expect("the write after the restart lands");
+    assert!(service.fences().is_empty());
 }
 
 #[tokio::test]
@@ -1958,6 +1969,15 @@ async fn a_lost_write_still_on_its_way_is_ended_by_the_store_opened_after_a_rest
     assert_eq!(fences[0].request_id, delayed.request_id);
     assert_eq!(fences[0].first_signed_at_ms, 2_000);
     assert!(service.deliver_the_delayed_attempt(&delayed).is_err());
+
+    // What the fence settled is written down too, so a restart before the next write does not
+    // make the store ask again.
+    let mut store = store.restart(Arc::clone(&service) as Arc<_>);
+    assert_eq!(
+        store.lost_write(),
+        Some(LostWrite::Ended { retained: None })
+    );
+    let mut carried = store.fetch(&seed).await.expect("the bundle");
     store
         .enable_writer(
             &seed,
@@ -1968,6 +1988,7 @@ async fn a_lost_write_still_on_its_way_is_ended_by_the_store_opened_after_a_rest
         .await
         .expect("the write lands on what is there");
     assert_eq!(carried.revision.get(), 2, "one bundle, not two");
+    assert_eq!(service.fences().len(), 1);
 }
 
 #[tokio::test]
@@ -1988,15 +2009,20 @@ async fn the_record_of_a_bundle_write_holds_no_key_material() {
         .await
         .expect("the bundle commits");
 
-    // An answered write leaves nothing on the disk but the lock the open store holds, and the lock
-    // is empty.
+    // An answered write leaves its record, saying it was answered, and the lock the open store
+    // holds, which is empty. Nothing else is on the disk.
     let files = store.stored();
-    assert_eq!(files.len(), 1);
+    assert_eq!(files.len(), 2);
     assert!(files[0].0.ends_with(".bundle-lock"));
     assert!(files[0].1.is_empty());
+    let answered = kr_cbor::decode(&store.record(), &kr_cbor::Limits::DEFAULT).expect("a record");
+    assert_eq!(
+        answered.as_map().and_then(|map| map.get("known")),
+        Some(&kr_cbor::CanonicalValue::text("answered"))
+    );
 
-    // A write whose answer is lost leaves its record, and the bundle it carried holds the writer's
-    // signing key and the producer's stored-envelope key.
+    // A write whose answer is lost replaces it, and the bundle that write carried holds the
+    // writer's signing key and the producer's stored-envelope key.
     service.interrupt_the_next_exchange(Interruption::LoseTheRequest);
     assert!(matches!(
         store
@@ -2019,7 +2045,8 @@ async fn the_record_of_a_bundle_write_holds_no_key_material() {
     let stored = store.record();
 
     // What the record holds is exactly where the bundle is, the place the write compared against,
-    // the identity and instant it went out under, and the digest of the bytes it sent.
+    // the identity and instant it went out under, the digest of the bytes it sent, and what is
+    // known of it.
     let value = kr_cbor::decode(&stored, &kr_cbor::Limits::DEFAULT).expect("a canonical record");
     let map = value.as_map().expect("a map");
     let mut names: Vec<&str> = map
@@ -2030,7 +2057,18 @@ async fn the_record_of_a_bundle_write_holds_no_key_material() {
     names.sort_unstable();
     assert_eq!(
         names,
-        ["context", "expected", "request_id", "sent", "signed_at_ms"]
+        [
+            "context",
+            "expected",
+            "known",
+            "request_id",
+            "sent",
+            "signed_at_ms"
+        ]
+    );
+    assert_eq!(
+        map.get("known"),
+        Some(&kr_cbor::CanonicalValue::text("unsettled"))
     );
     let place = map
         .get("context")
@@ -3242,7 +3280,7 @@ async fn a_migration_whose_answer_was_lost_is_completed_after_a_restart() {
 }
 
 #[tokio::test]
-async fn a_migration_whose_read_back_failed_is_completed_from_its_answered_write() {
+async fn a_migration_whose_read_back_failed_is_completed_after_a_restart_from_its_answered_write() {
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");
     let writer = AuthorisationKeyPair::generate().expect("a writer key");
@@ -3296,9 +3334,16 @@ async fn a_migration_whose_read_back_failed_is_completed_from_its_answered_write
         Err(RecoveryError::DestinationHoldsABundle)
     ));
 
-    // The destination store still has the record of the write it sent, so completion recognises
-    // the bundle there by the receipt of that write and the bytes it sent, reads it back, and
-    // hands back the record and the kit the migration owed.
+    // The process ends before anything else happens. The destination store opened afterwards has
+    // the record of the write it sent, answered, so completion recognises the bundle there by the
+    // receipt of that write and the bytes it sent, reads it back, and hands back the record and
+    // the kit the migration owed.
+    let mut destination = destination.restart(Arc::clone(&destination_service) as Arc<_>);
+    assert_eq!(
+        destination.lost_write(),
+        None,
+        "the answer was written down"
+    );
     let migrated = store
         .complete_migration(
             &seed,
