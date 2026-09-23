@@ -749,6 +749,9 @@ mod tests {
     }
 
     /// KR-REQ-10.01: the WebView reaches only the named commands the native side validates.
+    /// KR-REQ-13.21: the methods the page can reach are the ones the named commands perform, and
+    /// none of the sensitive ones outside that set, such as installing a plugin, revoking a device
+    /// or confirming a pairing, is among them.
     #[test]
     fn no_command_reaches_a_method_outside_the_named_set() {
         // The page cannot name a method, so the reachable set is exactly the methods these
@@ -846,6 +849,96 @@ mod tests {
             decode(serde_json::json!({ "session_id": "the one I was looking at" }));
         let error = refusal.expect_err("that is not a session identifier");
         assert_eq!(error.code, kr_protocol::error::ErrorCode::InvalidArgument);
+    }
+
+    /// KR-REQ-13.21: a command that is handed a path acts only on one the platform gave this
+    /// process: a file dropped on the window, or a destination a save dialog returned. Called the
+    /// way the page calls it, through the invoke path, any other path is refused with
+    /// `PERMISSION_DENIED` before anything is read or written, and a path the platform handed over
+    /// passes that gate once.
+    #[test]
+    fn a_path_the_page_names_is_refused_at_the_command_boundary() {
+        use tauri::Manager as _;
+
+        let app = tauri::test::mock_builder()
+            .manage(AppState::new())
+            .invoke_handler(tauri::generate_handler![
+                attachment_upload,
+                export_semantic_json
+            ])
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("an application");
+        let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .expect("a window");
+        let refusal_code = |command: &str, body: serde_json::Value| -> Option<String> {
+            tauri::test::get_ipc_response(
+                &window,
+                tauri::webview::InvokeRequest {
+                    cmd: command.into(),
+                    callback: tauri::ipc::CallbackFn(0),
+                    error: tauri::ipc::CallbackFn(1),
+                    url: "tauri://localhost".parse().expect("the bundle's address"),
+                    body: tauri::ipc::InvokeBody::Json(body),
+                    headers: Default::default(),
+                    invoke_key: tauri::test::INVOKE_KEY.to_owned(),
+                },
+            )
+            .err()
+            .map(|error| error["code"].as_str().unwrap_or_default().to_owned())
+        };
+        let state = app.state::<AppState>();
+
+        // An upload of a file the page names, which nobody dropped on this window.
+        let upload =
+            |path: &str| serde_json::json!({ "subject": {}, "path": path, "sessionId": null });
+        assert_eq!(
+            refusal_code("attachment_upload", upload("/etc/passwd")).as_deref(),
+            Some("PERMISSION_DENIED"),
+            "a path the page names is not a file this window was given"
+        );
+        // A dropped file passes the gate, and stops only at the next step, which needs a host.
+        state.dropped([std::path::PathBuf::from("/tmp/diagram.png")]);
+        assert_eq!(
+            refusal_code("attachment_upload", upload("/tmp/diagram.png")).as_deref(),
+            Some("HOST_NOT_CONFIGURED"),
+            "a dropped file is the one the gate lets through"
+        );
+        assert_eq!(
+            refusal_code("attachment_upload", upload("/tmp/diagram.png")).as_deref(),
+            Some("PERMISSION_DENIED"),
+            "and it is spent by that one upload"
+        );
+
+        // An export to a destination the page names, which no save dialog returned.
+        let directory = tempfile::tempdir().expect("a directory for the export");
+        let export = |path: &std::path::Path| {
+            serde_json::json!({
+                "path": path.display().to_string(),
+                "sessionId": "44444444-4444-4444-8444-444444444444",
+                "exportedAtMs": 1,
+                "dimensions": { "columns": 80, "rows": 24 },
+                "nodes": [],
+                "omissions": []
+            })
+        };
+        let named = directory.path().join("named-by-the-page.json");
+        assert_eq!(
+            refusal_code("export_semantic_json", export(&named)).as_deref(),
+            Some("PERMISSION_DENIED"),
+            "a destination the page names is not one the person chose"
+        );
+        assert!(!named.exists(), "and nothing is written there");
+        // A destination the dialog returned is written, once.
+        let chosen = directory.path().join("chosen.json");
+        state.allow_export_to(chosen.clone());
+        assert_eq!(refusal_code("export_semantic_json", export(&chosen)), None);
+        assert!(chosen.exists(), "the chosen destination is written");
+        assert_eq!(
+            refusal_code("export_semantic_json", export(&chosen)).as_deref(),
+            Some("PERMISSION_DENIED"),
+            "one dialog is one write"
+        );
     }
 
     /// KR-REQ-10.01: an unknown field from the WebView is refused.

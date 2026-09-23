@@ -282,6 +282,8 @@ mod tests {
         assert!(state.origin().is_default);
     }
 
+    /// KR-REQ-13.21: an export is written only where a save dialog put it; a path the page names
+    /// is refused.
     #[test]
     fn an_export_destination_the_dialog_never_returned_is_refused() {
         let state = AppState::new();
@@ -291,6 +293,7 @@ mod tests {
         assert_eq!(error.code, kr_protocol::error::ErrorCode::PermissionDenied);
     }
 
+    /// KR-REQ-13.21: a destination the dialog returned serves one write and no more.
     #[test]
     fn a_chosen_destination_is_usable_once_and_not_twice() {
         let state = AppState::new();
@@ -303,6 +306,8 @@ mod tests {
         );
     }
 
+    /// KR-REQ-13.21: a file is uploaded only when it was dropped on this window; a path the page
+    /// names is refused.
     #[test]
     fn a_path_this_window_was_never_given_is_not_uploadable() {
         let state = AppState::new();
@@ -312,6 +317,7 @@ mod tests {
         assert_eq!(error.code, kr_protocol::error::ErrorCode::PermissionDenied);
     }
 
+    /// KR-REQ-13.21: a dropped file serves one upload and no more.
     #[test]
     fn a_dropped_file_is_uploadable_once_and_not_twice() {
         let state = AppState::new();

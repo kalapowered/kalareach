@@ -61,6 +61,8 @@ custom-protocol = ["tauri/custom-protocol"]
 
 [dev-dependencies]
 tempfile.workspace = true
+# The mock runtime, so a test can call a command the way the page does: through the invoke path.
+tauri = { workspace = true, features = ["test"] }
 
 # The workspace forbids unsafe code, which the macOS user-verification ceremony cannot honour: it
 # is a call into Apple's LocalAuthentication runtime and there is no safe wrapper for it. This

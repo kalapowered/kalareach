@@ -269,8 +269,6 @@ fn every_command_the_page_can_call_is_one_this_crate_names() {
     }
 }
 
-/// KR-REQ-13.21: no named command runs a shell, takes a path or dispatches a method the page
-/// chooses.
 #[test]
 fn no_command_is_a_shell_a_path_or_a_method_the_page_chooses() {
     for (command, _) in NAMED_COMMANDS {
