@@ -40,7 +40,7 @@ use kr_protocol::envelope::{
     ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::{ActorId, DeviceId, RequestId};
+use kr_protocol::ids::{ActorId, DeviceId, GrantId, RequestId};
 use kr_protocol::method::{Method, MethodGroup};
 use kr_protocol::pairing::{OwnerConfirmationProof, OwnerConfirmationRequest, SensitiveAction};
 use kr_protocol::scalars::{AuthorisationKey, EndpointKey};
@@ -446,6 +446,10 @@ impl ProjectModule {
     /// whether a repeat is the same action or a reused identifier. That is what makes a lost reply
     /// to `project.clone` resolvable without cloning twice.
     ///
+    /// `grant` is the grant the caller holds, which only the door that admitted the caller knows:
+    /// a paired device's, or none for a caller on this machine's own socket. The service reads it
+    /// as the caller's class, so nothing the request carries can make a device the owner.
+    ///
     /// # Errors
     ///
     /// Returns the refusal the service decided, under the service's own code.
@@ -455,6 +459,7 @@ impl ProjectModule {
         mutation: &MutationRequest,
         method: Method,
         admission: A,
+        grant: Option<GrantId>,
     ) -> Answer<ParamsValue>
     where
         A: Fn() -> std::result::Result<(), ProtocolError> + Send + 'static,
@@ -516,6 +521,10 @@ impl ProjectModule {
             // opened and surveyed, the journal's lock taken — and a grant revoked or expired in
             // there has to reach an action that then does not begin.
             let performed = kr_project::store::Performed::from(Some(&claim)).admitted(&admission);
+            let performed = match grant {
+                Some(grant) => performed.bounded_by(grant),
+                None => performed,
+            };
             // Every arm runs inside a closure, so a refusal the service decided reaches the
             // retention below instead of returning from the task. An action whose failure was not
             // retained could be performed again under the same identifier and succeed.

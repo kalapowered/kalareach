@@ -781,8 +781,8 @@ impl RemoteConnection {
         // durable acceptance preserves neither. For a create or a project mutation, which this
         // host performs itself, the admission it carries is asked about again inside the daemon —
         // at the transition that lets a create launch, and in the project service's own work
-        // before the action. The project service's own preparation is still behind that second
-        // answer, which `Controller::project_mutation` records as the gap it is.
+        // before the action and inside the transaction that begins it, which is after the
+        // service's own preparation.
         //
         // What this check does is keep an already-withdrawn connection from getting that far.
         // What this host reports meanwhile is the revocation as pending for a worker until it
@@ -927,13 +927,16 @@ impl RemoteConnection {
                     admitted_revision: validated,
                     deadline: Some(accepted.deadline),
                 };
+                // The service is told this caller is bounded by this device's grant, so nothing
+                // the request carries can make it the owner.
+                let grant = self.device.grant.grant_id;
                 // On a task that outlives this connection, because a clone reaches the network and
                 // a materialisation copies files: dropping that future part way through is a
                 // cancellation, and what it would leave behind is exactly what an action identity
                 // exists to make recoverable.
                 let effect = tokio::spawn(async move {
                     controller
-                        .project_mutation(&actor_id, &mutation, method, carried)
+                        .project_mutation(&actor_id, &mutation, method, carried, Some(grant))
                         .await
                 });
                 match tokio::time::timeout(EFFECT_WAIT, effect).await {

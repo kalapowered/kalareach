@@ -35,7 +35,7 @@ use kr_protocol::hostinfo::{
 use kr_protocol::identity::{BootIdentity, WorkerProfile};
 use kr_protocol::ids::{
     ActorId, AuthorityRevision, BootEpoch, BuildId, CapabilityRevision, ConnectionId,
-    ControllerGeneration, EnvironmentId, RequestId, SessionEpoch, SessionId,
+    ControllerGeneration, EnvironmentId, GrantId, RequestId, SessionEpoch, SessionId,
 };
 use kr_protocol::local::{LocalClientKind, LocalHelloAck, LocalPeer, LocalRole};
 use kr_protocol::method::Method;
@@ -3505,11 +3505,13 @@ impl Controller {
     ///
     /// Everything between the envelope check and this point can wait: for this task to be
     /// scheduled and for the registry's lock. The admission is asked about here, with the registry
-    /// lock held across the answer for the reason [`Self::check_admission`] states, and again
-    /// inside the service's own work through [`Self::check_registration`], which is the last thing
-    /// this daemon does before the action is performed. What neither covers is the service's own
-    /// preparation, which happens after both; the comment on the second answer says what that
-    /// leaves.
+    /// lock held across the answer for the reason [`Self::check_admission`] states, and it travels
+    /// into the service through [`Self::check_registration`], which the service asks twice more:
+    /// immediately before it acts, and inside the transaction that begins the effect, so its own
+    /// preparation is covered as well.
+    ///
+    /// `grant` is the grant a paired device holds, set by the network door, or none for a caller on
+    /// this machine's own socket. It is how the service tells the two apart.
     ///
     /// # Errors
     ///
@@ -3520,6 +3522,7 @@ impl Controller {
         mutation: &MutationRequest,
         method: Method,
         carried: crate::authority::AdmittedMutation,
+        grant: Option<GrantId>,
     ) -> std::result::Result<ParamsValue, ProtocolError> {
         // A mutation carrying no freshness at all is a retry of an action this host may already
         // hold: section 9 keeps its record readable after the window that admitted it is gone, and
@@ -3545,13 +3548,12 @@ impl Controller {
         // retained record and immediately before it performs the action, so a retry still gets its
         // own result while a first admission does not begin under authority that has gone.
         //
-        // What neither answer covers is the service's own preparation: resolving a destination and
-        // taking the store's lock both happen inside the call below, after this. Section 9 asks
-        // for authority and expiry to be revalidated *immediately before* the effect, and says
-        // outright that durable acceptance does not preserve expired authority, so an action that
-        // begins in that window is a gap rather than something the section allows. Closing it
-        // means asking inside the service's own transaction, which the service would have to
-        // offer; `docs/host/README.md` states the gap.
+        // And once more inside the transaction that begins the effect: the one that writes the
+        // operation row, the one that writes the workspace row and the one that reserves a
+        // removal. Resolving a destination, opening and surveying a repository and taking the
+        // journal's lock all happen before it, so a revocation or an expiry that completes during
+        // that preparation reaches an action that then does not begin. That is section 9's
+        // revalidation immediately before the effect.
         let controller = Arc::clone(self);
         let admission = move || {
             controller
@@ -3559,7 +3561,7 @@ impl Controller {
                 .map_err(|error| error.to_protocol_error())
         };
         self.project
-            .write(actor_id, mutation, method, admission)
+            .write(actor_id, mutation, method, admission, grant)
             .await
     }
 
@@ -3755,7 +3757,8 @@ impl Controller {
             };
             return crate::project::frame(
                 mutation.request_id,
-                self.project_mutation(actor_id, mutation, method, carried)
+                // The machine's own socket: the caller holds no grant.
+                self.project_mutation(actor_id, mutation, method, carried, None)
                     .await,
             );
         }
