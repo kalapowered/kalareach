@@ -359,6 +359,18 @@ export type ControlFrame =
   | {
       acceptance_delivered: ActionId
     }
+  | {
+      attention_sources: AttentionSourcesRequest
+    }
+  | {
+      attention_source_page: AttentionSourcePage
+    }
+  | {
+      attention_text: AttentionTextRequest
+    }
+  | {
+      attention_text_answer: AttentionTextAnswer
+    }
 /**
  * A versioned capability name. Capabilities describe feasibility, never authority.
  */
@@ -410,7 +422,7 @@ export type PalettePreset = 'light' | 'dark'
  * It confers nothing on its own. Every one of these connections still proves which generation it
  * speaks for, and only the holder of the environment's signing key can produce that proof.
  */
-export type ControllerConnectionRole = 'authority' | 'proxy'
+export type ControllerConnectionRole = 'authority' | 'proxy' | 'attention'
 /**
  * One permitted action in a grant.
  */
@@ -1479,12 +1491,22 @@ export interface KalaReachProtocol {
   attention_acknowledge_result?: AttentionAcknowledgeResult
   attention_automation_subject?: AttentionAutomationSubject
   attention_gap?: AttentionGap
+  attention_host_record?: AttentionHostRecord
+  attention_host_slice?: AttentionHostSlice
   attention_item?: AttentionItem
   attention_item_revision?: AttentionItemRevision
+  attention_question_record?: AttentionQuestionRecord
+  attention_question_slice?: AttentionQuestionSlice
   attention_quiet_hours_params?: AttentionQuietHoursParams
   attention_quiet_hours_result?: AttentionQuietHoursResult
   attention_read_params?: AttentionReadParams
   attention_read_result?: AttentionReadResult
+  attention_record_ref?: AttentionRecordRef
+  attention_record_text?: AttentionRecordText
+  attention_source_page?: AttentionSourcePage
+  attention_sources_request?: AttentionSourcesRequest
+  attention_text_answer?: AttentionTextAnswer
+  attention_text_request?: AttentionTextRequest
   authority_feed_status?: AuthorityFeedStatus
   authority_revision_ack?: AuthorityRevisionAck
   authority_revision_notice?: AuthorityRevisionNotice
@@ -4332,6 +4354,49 @@ export interface AttentionGap {
   to_sequence: U64 | null
 }
 /**
+ * One terminal side effect that had no attachment to go to, as the attention store reads it.
+ */
+export interface AttentionHostRecord {
+  /**
+   * A keyed digest of what a notification said, under the request's fingerprint key.
+   *
+   * It travels whether or not the text does, so two notifications that say the same thing are
+   * one condition to the store with or without their text, and nobody without the key can test
+   * a guess at withheld text against it. Null for anything but a notification.
+   */
+  fingerprint: Digest256 | null
+  /**
+   * Whether it is an application's notification, the only kind a rule reads.
+   */
+  notification: boolean
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  recorded_at_ms: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  sequence: string
+  /**
+   * What it said, clipped to [`MAX_ATTENTION_SUMMARY_LEN`], when the session serves it now,
+   * and null when it does not.
+   */
+  text: string | null
+}
+/**
+ * One source's part of a page: where the source stands, and its records after the cursor.
+ */
+export interface AttentionHostSlice {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  head: string
+  /**
+   * Its records after the cursor, oldest first, up to the head and the page's bounds.
+   */
+  records: AttentionHostRecord[]
+}
+/**
  * One item in the attention inbox.
  */
 export interface AttentionItem {
@@ -4438,6 +4503,58 @@ export interface AttentionItem {
    * never an inferred approval or completion.
    */
   uncertain: boolean
+}
+/**
+ * One question transition, as the attention store reads it.
+ */
+export interface AttentionQuestionRecord {
+  /**
+   * What happened.
+   */
+  kind: 'created' | 'answered' | 'cancelled' | 'expired'
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  pending_since_ms: string
+  /**
+   * The question.
+   */
+  question_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  recorded_at_ms: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  sequence: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * The question's wording, clipped to [`MAX_ATTENTION_SUMMARY_LEN`], when the session serves
+   * it now, and null when it does not.
+   */
+  text: string | null
+  /**
+   * Whether the worker admitted the source that asked, which is what makes a pending request a
+   * verified one.
+   */
+  verified: boolean
+}
+/**
+ * One source's part of a page: where the source stands, and its records after the cursor.
+ */
+export interface AttentionQuestionSlice {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  head: string
+  /**
+   * Its records after the cursor, oldest first, up to the head and the page's bounds.
+   */
+  records: AttentionQuestionRecord[]
 }
 /**
  * Parameters of `attention.quiet_hours`.
@@ -4551,6 +4668,160 @@ export interface AttentionReadResult {
    * Whether the host is inside its quiet hours now.
    */
   quiet_now: boolean
+}
+/**
+ * One record a text request names.
+ */
+export interface AttentionRecordRef {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  sequence: string
+  /**
+   * Its source: the question ledger or the host events.
+   */
+  source: 'receipts' | 'questions' | 'host_events' | 'semantic' | 'automation'
+}
+/**
+ * One record's text, as the session serves it now.
+ */
+export interface AttentionRecordText {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  sequence: string
+  /**
+   * Its source.
+   */
+  source: 'receipts' | 'questions' | 'host_events' | 'semantic' | 'automation'
+  /**
+   * Its text, clipped to [`MAX_ATTENTION_SUMMARY_LEN`], or null when the session does not serve
+   * it now or no longer holds the record.
+   */
+  text: string | null
+}
+/**
+ * A page of one session's attention source records.
+ *
+ * It is read in order: the moment first, then each source's head and its records after the
+ * cursor, then the session's privacy state, which decides which records carry text. A source
+ * whose last record in the page is its head, or which returned none with the cursor at or past
+ * its head, is complete; a page complete for both sources holds every record the session
+ * committed before `built_at_boot_ms`.
+ */
+export interface AttentionSourcePage {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  built_at_boot_ms: string
+  host_events: AttentionHostSlice1
+  /**
+   * The session's privacy generation the page's text was decided under, or null when the
+   * session holds no privacy record, and then no record carries text.
+   */
+  privacy_generation: U64 | null
+  questions: AttentionQuestionSlice1
+  /**
+   * The request this answers.
+   */
+  request_id: string
+}
+/**
+ * The host events.
+ */
+export interface AttentionHostSlice1 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  head: string
+  /**
+   * Its records after the cursor, oldest first, up to the head and the page's bounds.
+   */
+  records: AttentionHostRecord[]
+}
+/**
+ * The question ledger.
+ */
+export interface AttentionQuestionSlice1 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  head: string
+  /**
+   * Its records after the cursor, oldest first, up to the head and the page's bounds.
+   */
+  records: AttentionQuestionRecord[]
+}
+/**
+ * A request for one session's attention source records past where the store has read.
+ *
+ * The worker answers with an [`AttentionSourcePage`]. While neither source has a record past its
+ * cursor and the session's privacy state has not moved, it may hold the request for up to
+ * `wait_ms`, answering as soon as a question transition, a host event or a privacy transition
+ * is committed.
+ */
+export interface AttentionSourcesRequest {
+  /**
+   * The key this session's notification fingerprints are made under.
+   *
+   * The attention store derives it for this session from its own secret, so a fingerprint is
+   * the same for the same text whenever and wherever it is made: live, after either process
+   * restarts, and from the session's journal once the session has closed. The session keeps no
+   * key of its own for it.
+   */
+  fingerprint_key: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  host_events_after: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  max_records: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  questions_after: string
+  /**
+   * Correlates the page with this request.
+   */
+  request_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  wait_ms: string
+}
+/**
+ * The answer to an [`AttentionTextRequest`]: each record's text under the session's privacy
+ * state read after the records.
+ */
+export interface AttentionTextAnswer {
+  /**
+   * The session's privacy generation the text was decided under, or null when the session
+   * holds no privacy record, and then no record carries text.
+   */
+  privacy_generation: U64 | null
+  /**
+   * The request this answers.
+   */
+  request_id: string
+  /**
+   * One entry per record named, in the order named.
+   */
+  texts: AttentionRecordText[]
+}
+/**
+ * A request for the text of records the store names when it serves them.
+ */
+export interface AttentionTextRequest {
+  /**
+   * The records, bounded by [`MAX_ATTENTION_TEXT_RECORDS`].
+   */
+  records: AttentionRecordRef[]
+  /**
+   * Correlates the answer with this request.
+   */
+  request_id: string
 }
 /**
  * What this host shows about the remote authority feed.

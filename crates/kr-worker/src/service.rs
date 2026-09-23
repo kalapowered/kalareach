@@ -79,6 +79,9 @@ use crate::session::Session;
 pub const WINDOW_RENEWAL: std::time::Duration =
     std::time::Duration::from_millis(MAX_WINDOW_VALIDITY.as_millis() as u64 / 2);
 
+/// What a page of attention records leaves free of its frame for everything but the records.
+const PAGE_FRAME_MARGIN: usize = 4_096;
+
 /// How often a local connection sends a keepalive.
 ///
 /// Section 23 puts it at ten seconds while the connection is active. A Unix socket or a named pipe
@@ -167,6 +170,11 @@ struct Authority {
     bound_connection: Option<ConnectionId>,
     /// The proxy connections of that same generation.
     proxy_connections: std::collections::BTreeSet<ConnectionId>,
+    /// The connection the control daemon reads this session's attention sources over.
+    ///
+    /// There is one: a newer one replaces it, and a replacement generation fences it with the
+    /// rest.
+    attention_connection: Option<ConnectionId>,
     /// The authority revision the controller last announced and this worker acknowledged.
     acknowledged_revision: Option<kr_protocol::ids::AuthorityRevision>,
     /// A revision this worker was told about while it was inside a dispatch transition.
@@ -231,6 +239,16 @@ pub struct WorkerService {
     /// announcement, most of all - would otherwise not be acted on until that wait ended. There is
     /// one waiter, and a signal raised while it is between waits is kept for the next one.
     attention_wake: tokio::sync::Notify,
+    /// The session's journal file, which the attention sources are read from.
+    journal_path: Option<std::path::PathBuf>,
+    /// A reading connection of its own to that file, for the control daemon's attention link.
+    ///
+    /// The link reads beside the session rather than through it, so a page being read or held
+    /// never waits for the session's lock and the session never waits for the link. It is opened
+    /// on first use and again after a read fails.
+    attention_reader: Mutex<Option<crate::journal::Journal>>,
+    /// Woken when the session's journal commits a host event or a privacy transition.
+    journal_changes: Option<Arc<tokio::sync::Notify>>,
     /// The trusted broker: the agent processes, their gateway and the resources it arbitrates.
     broker: Arc<crate::broker::Broker>,
     /// The frozen copies the connections of this worker are reading their recoveries out of.
@@ -357,6 +375,10 @@ impl WorkerService {
         // accepted and the fence the writer applies before it is written have to be reading the
         // same clock for the second to be a continuation of the first.
         let shared_clock = runtime.shared_clock();
+        let journal_changes = runtime
+            .session()
+            .journal()
+            .map(crate::journal::Journal::attention_changes);
         Ok(Self {
             runtime,
             identity,
@@ -374,6 +396,7 @@ impl WorkerService {
                 accepted_generation: Some(binding.controller_generation),
                 bound_connection: None,
                 proxy_connections: std::collections::BTreeSet::new(),
+                attention_connection: None,
                 acknowledged_revision: None,
                 owed_revision: None,
             }),
@@ -382,6 +405,9 @@ impl WorkerService {
             admitted: Mutex::new(std::collections::BTreeMap::new()),
             remote_attachments: Mutex::new(std::collections::BTreeSet::new()),
             questions,
+            journal_path: binding.journal_path,
+            attention_reader: Mutex::new(None),
+            journal_changes,
             broker,
             recoveries: crate::recovery::RecoveryCopies::new(),
             build_id: binding.build_id,
@@ -825,6 +851,33 @@ impl WorkerService {
             // refusal rather than a socket that closed.
             let protected = !withdrawn.is_set();
             let reply = self.handle(&mut state, &peer, message).await;
+            // A page the control daemon asked for is read, and held while there is nothing to
+            // answer with, on its own task too: the same connection carries the text requests the
+            // daemon serves its readers from meanwhile. A newer request replaces a held one: the
+            // one it replaces stops waiting and writes nothing, and one already writing its page
+            // finishes it, because a frame cut part way would end the connection. The daemon tells
+            // the two answers apart by their request identifiers.
+            if let Some(pending) = state.pending_page.take() {
+                drop(state.page_cancel.take());
+                let (cancel, cancelled) = tokio::sync::oneshot::channel();
+                let service = Arc::clone(&self);
+                let sender = Arc::clone(&writer);
+                let answering_writable = writable.clone();
+                let answering_withdrawn = Arc::clone(&withdrawn);
+                state.page_cancel = Some(cancel);
+                state.page_task = Some(tokio::spawn(async move {
+                    if let Some(answer) = service.finish_page(pending, cancelled).await {
+                        write_frame(
+                            &answering_writable,
+                            &sender,
+                            &answer,
+                            &answering_withdrawn,
+                            true,
+                        )
+                        .await;
+                    }
+                }));
+            }
             // A launch the reader is still deciding is answered on its own task, so this loop goes
             // on serving the same client: its next keystroke, its interrupt and its detach do not
             // wait behind a transaction the reader has not finished.
@@ -1183,6 +1236,11 @@ impl WorkerService {
         if let Some(task) = state.delivery.take() {
             task.abort();
         }
+        // And a page it was holding, which nobody is left to read.
+        drop(state.page_cancel.take());
+        if let Some(task) = state.page_task.take() {
+            task.abort();
+        }
         for attachment_id in state.take_attachments() {
             let mut session = self.runtime.session();
             let _ = session.detach(attachment_id);
@@ -1221,6 +1279,24 @@ impl WorkerService {
         peer: &PeerIdentity,
         message: ControlFrame,
     ) -> Option<ControlFrame> {
+        // The attention connection carries the attention requests and nothing else once it speaks
+        // for a generation. It holds no authority to act and forwards no caller, so anything else
+        // on it is refused rather than served.
+        if state.controller_role == ControllerConnectionRole::Attention
+            && state.controller
+            && !matches!(
+                message,
+                ControlFrame::AttentionSources(_) | ControlFrame::AttentionText(_)
+            )
+        {
+            return Some(failure(
+                RequestId::new(0),
+                &ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "the attention connection carries attention requests and nothing else",
+                ),
+            ));
+        }
         match message {
             ControlFrame::Hello(hello) => Some(self.hello(state, peer, &hello)),
             ControlFrame::VerifyChallenge(challenge) => {
@@ -1289,6 +1365,8 @@ impl WorkerService {
                     .then_some(reply)
             }
             ControlFrame::ForwardedRead(forwarded) => Some(self.forwarded_read(state, &forwarded)),
+            ControlFrame::AttentionSources(request) => self.attention_sources(state, request),
+            ControlFrame::AttentionText(request) => Some(self.attention_text(state, &request)),
             _ => Some(failure(
                 RequestId::new(0),
                 &ProtocolError::new(
@@ -1482,6 +1560,140 @@ impl WorkerService {
         }))
     }
 
+    /// Takes the control daemon's request for this session's attention source records.
+    ///
+    /// Only on the daemon's attention connection, bound to the generation this worker accepts.
+    /// The page is read and, when there is nothing to answer with yet, held on a task of its own,
+    /// so the connection goes on serving text requests while it waits.
+    fn attention_sources(
+        &self,
+        state: &mut ConnectionState,
+        request: kr_protocol::attention::AttentionSourcesRequest,
+    ) -> Option<ControlFrame> {
+        if let Err(error) = self.check_attention_link(state) {
+            return Some(failure(request.request_id, &error.to_protocol_error()));
+        }
+        state.pending_page = Some(PendingPage {
+            request,
+            max_bytes: Self::frame_bytes(state).saturating_sub(PAGE_FRAME_MARGIN),
+        });
+        None
+    }
+
+    /// Answers the control daemon's request for the text of records its attention store names.
+    fn attention_text(
+        &self,
+        state: &ConnectionState,
+        request: &kr_protocol::attention::AttentionTextRequest,
+    ) -> ControlFrame {
+        if let Err(error) = self.check_attention_link(state) {
+            return failure(request.request_id, &error.to_protocol_error());
+        }
+        match self.read_attention(|journal| crate::attention_source::texts(journal, request)) {
+            Ok(answer) => ControlFrame::AttentionTextAnswer(Box::new(answer)),
+            Err(error) => failure(request.request_id, &error.to_protocol_error()),
+        }
+    }
+
+    /// Refuses an attention request anywhere but on the daemon's current attention connection.
+    fn check_attention_link(&self, state: &ConnectionState) -> Result<()> {
+        if state.client_kind != LocalClientKind::Controller
+            || state.controller_role != ControllerConnectionRole::Attention
+        {
+            return Err(WorkerError::PermissionDenied {
+                detail: "attention records are read only over the control daemon's attention \
+                         connection"
+                    .to_owned(),
+            });
+        }
+        self.check_authority(state)
+    }
+
+    /// Reads the session's journal through the attention link's own reading connection.
+    ///
+    /// A read that fails drops the connection, so the next request opens it again rather than
+    /// reading through a connection that has gone bad.
+    fn read_attention<T>(
+        &self,
+        read: impl FnOnce(&crate::journal::Journal) -> Result<T>,
+    ) -> Result<T> {
+        let mut reader =
+            self.attention_reader
+                .lock()
+                .map_err(|_| WorkerError::JournalUnavailable {
+                    detail: "the attention reader's lock is poisoned".to_owned(),
+                })?;
+        if reader.is_none() {
+            let Some(path) = self.journal_path.as_ref() else {
+                return Err(WorkerError::JournalUnavailable {
+                    detail: "this session keeps no journal, so it has no attention records to read"
+                        .to_owned(),
+                });
+            };
+            *reader = Some(crate::journal::Journal::open_read_only(path)?);
+        }
+        let journal = reader.as_ref().expect("the reader was opened a moment ago");
+        let answer = read(journal);
+        if answer.is_err() {
+            *reader = None;
+        }
+        answer
+    }
+
+    /// Reads one page, holding the request while there is nothing to answer with.
+    ///
+    /// It answers at once when either source has a record past its cursor, when the session's
+    /// privacy generation has moved since the request arrived, and when the request's bound runs
+    /// out. Both subscriptions are taken before each read, so a commit between the read and the
+    /// wait wakes the wait rather than falling between them. A request a newer one replaced while
+    /// it waited answers nothing.
+    async fn finish_page(
+        &self,
+        pending: PendingPage,
+        mut cancelled: tokio::sync::oneshot::Receiver<()>,
+    ) -> Option<ControlFrame> {
+        let request = pending.request;
+        let bound = request
+            .wait_ms
+            .get()
+            .min(kr_protocol::attention::MAX_ATTENTION_SOURCE_WAIT_MS);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(bound);
+        let mut generation: Option<Option<U64>> = None;
+        loop {
+            let questions_moved = self.questions.subscribe();
+            let journal_moved = self
+                .journal_changes
+                .as_ref()
+                .map(|changes| changes.notified());
+            let built_at = self.shared_clock.boot_elapsed_ms();
+            let page = match self.read_attention(|journal| {
+                crate::attention_source::page(journal, &request, built_at, pending.max_bytes)
+            }) {
+                Ok(page) => page,
+                Err(error) => return Some(failure(request.request_id, &error.to_protocol_error())),
+            };
+            let started = *generation.get_or_insert(page.privacy_generation.0);
+            let answer = !page.questions.records.is_empty()
+                || !page.host_events.records.is_empty()
+                || page.privacy_generation.0 != started
+                || tokio::time::Instant::now() >= deadline;
+            if answer {
+                return Some(ControlFrame::AttentionSourcePage(Box::new(page)));
+            }
+            tokio::select! {
+                _ = &mut cancelled => return None,
+                () = questions_moved => {}
+                () = async {
+                    match journal_moved {
+                        Some(moved) => moved.await,
+                        None => std::future::pending().await,
+                    }
+                } => {}
+                () = tokio::time::sleep_until(deadline) => {}
+            }
+        }
+    }
+
     /// Records what a controller connection is for, before it presents a token.
     ///
     /// It is declared once and only before the token: a connection that could relabel itself
@@ -1558,6 +1770,7 @@ impl WorkerService {
                 if superseded {
                     fenced.extend(authority.bound_connection.take());
                     fenced.extend(std::mem::take(&mut authority.proxy_connections));
+                    fenced.extend(authority.attention_connection.take());
                 }
                 authority.accepted_generation = Some(token.generation);
                 match state.controller_role {
@@ -1577,6 +1790,17 @@ impl WorkerService {
                     // holding the authority.
                     ControllerConnectionRole::Proxy => {
                         authority.proxy_connections.insert(state.connection_id);
+                    }
+                    // The daemon reads this session's attention sources over one connection, so
+                    // a newer one replaces the one before it, whose held request goes with it.
+                    ControllerConnectionRole::Attention => {
+                        if let Some(previous) =
+                            authority.attention_connection.replace(state.connection_id)
+                            && previous != state.connection_id
+                            && !fenced.contains(&previous)
+                        {
+                            fenced.push(previous);
+                        }
                     }
                 }
                 drop(authority);
@@ -2014,6 +2238,9 @@ impl WorkerService {
             authority.bound_connection = None;
         }
         authority.proxy_connections.remove(&connection_id);
+        if authority.attention_connection == Some(connection_id) {
+            authority.attention_connection = None;
+        }
     }
 
     /// Removes a connection that has ended of its own accord.
@@ -2100,6 +2327,9 @@ impl WorkerService {
             }
             ControllerConnectionRole::Proxy => {
                 authority.proxy_connections.contains(&state.connection_id)
+            }
+            ControllerConnectionRole::Attention => {
+                authority.attention_connection == Some(state.connection_id)
             }
         };
         if !bound {
@@ -5373,6 +5603,12 @@ pub struct ConnectionState {
     /// The connection's own loop takes it and hands it to a task of its own, so the read loop goes
     /// on serving this client while its launch is with the reader.
     pub pending_launch: Option<PendingLaunch>,
+    /// A page the control daemon asked for, to be read and answered on its own task.
+    pub pending_page: Option<PendingPage>,
+    /// The task reading or holding that page, while it is.
+    pub page_task: Option<tokio::task::JoinHandle<()>>,
+    /// What tells that task a newer request has replaced it.
+    pub page_cancel: Option<tokio::sync::oneshot::Sender<()>>,
     /// An admitted upstream operation whose transport work has not happened yet.
     ///
     /// The connection's own loop takes it and hands it to a task of its own. Section 12 has this
@@ -5432,6 +5668,9 @@ impl ConnectionState {
             input_sequence: 0,
             close_gate: None,
             pending_launch: None,
+            pending_page: None,
+            page_task: None,
+            page_cancel: None,
             pending_upstream: None,
             pending_delivery: None,
             pending_challenge: None,
@@ -5794,6 +6033,16 @@ fn failure(request_id: RequestId, error: &ProtocolError) -> ControlFrame {
         request_id,
         outcome: Outcome::Error(error.clone()),
     })
+}
+
+/// A page of attention source records the control daemon asked for, read and answered off the
+/// connection's read loop so that holding it holds nothing up.
+#[derive(Debug)]
+pub struct PendingPage {
+    /// The request.
+    pub request: kr_protocol::attention::AttentionSourcesRequest,
+    /// What the page may carry, its text included, to fit one frame to the daemon.
+    pub max_bytes: usize,
 }
 
 /// One launch whose answer the reader has not given yet.

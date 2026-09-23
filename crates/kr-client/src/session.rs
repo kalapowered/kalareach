@@ -878,7 +878,12 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
         // A marked retained answer travels between a host and a worker, never to a client: what a
         // client submitted is answered as its own action, retained or performed.
         | ControlFrame::RetainedResponse(_)
-        | ControlFrame::AcceptanceDelivered(_) => return false,
+        | ControlFrame::AcceptanceDelivered(_)
+        // The control daemon's attention link to a worker, which is a local endpoint's too.
+        | ControlFrame::AttentionSources(_)
+        | ControlFrame::AttentionSourcePage(_)
+        | ControlFrame::AttentionText(_)
+        | ControlFrame::AttentionTextAnswer(_) => return false,
     }
     true
 }

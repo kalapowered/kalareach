@@ -532,7 +532,11 @@ impl RemoteConnection {
             | ControlFrame::Forwarded(_)
             | ControlFrame::ForwardedRead(_)
             | ControlFrame::RetainedResponse(_)
-            | ControlFrame::AcceptanceDelivered(_) => None,
+            | ControlFrame::AcceptanceDelivered(_)
+            | ControlFrame::AttentionSources(_)
+            | ControlFrame::AttentionSourcePage(_)
+            | ControlFrame::AttentionText(_)
+            | ControlFrame::AttentionTextAnswer(_) => None,
         }
     }
 

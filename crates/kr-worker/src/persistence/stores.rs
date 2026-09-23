@@ -317,7 +317,8 @@ pub static STORES: &[StoreDescriptor] = &[
     },
     StoreDescriptor {
         name: "privacy",
-        holds: "the privacy generation in force, and whether privacy mode is on",
+        holds: "the privacy generation in force, whether privacy mode is on, and where each \
+                attention source stood at the last transition",
         durability: Durability::CrashDurable,
         retention: Retention::UntilSubjectGone,
         content: ContentClass::Metadata,

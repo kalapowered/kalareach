@@ -35,9 +35,12 @@ use core::str::FromStr;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::ids::{ActorId, AgentTurnId, CausalRootId, ChangeSetId, SessionId, WorkflowId};
+use crate::ids::{
+    ActorId, AgentTurnId, CausalRootId, ChangeSetId, QuestionId, RequestId, SessionId, WorkflowId,
+};
+use crate::question::QuestionEventKind;
 use crate::recovery::HistoryGap;
-use crate::scalars::{Nullable, TimestampMs, U64};
+use crate::scalars::{Digest256, Nullable, SecretBytes32, TimestampMs, U64};
 
 /// How long one rule suppresses a repeat of the same condition, in milliseconds.
 ///
@@ -862,6 +865,191 @@ pub struct VisitChangedResult {
     pub summary: Nullable<ChangeSummary>,
     /// The log views this actor retained, with any gap retention left in them.
     pub views: Vec<RetainedLogView>,
+}
+
+// ----- The control daemon's attention link to one session's worker ---------------------------
+//
+// The environment's attention store is the control daemon's. A session's question ledger and its
+// host events stay in that session's own journal, so the daemon reads them over a connection of
+// its own to the session's worker, one declared for this purpose
+// ([`crate::local::ControllerConnectionRole::Attention`]). Two requests travel on it: one for the
+// records past where the store has read, which the worker may hold until there is something to
+// read, and one for the text of records the store names when it serves them. The worker keeps no
+// cursor; every request names where to start.
+
+/// The most records one source page carries from each source.
+pub const MAX_ATTENTION_SOURCE_RECORDS: u64 = 256;
+
+/// The longest a worker holds a source request that has nothing to answer with yet.
+pub const MAX_ATTENTION_SOURCE_WAIT_MS: u64 = 30_000;
+
+/// The most records one text request names.
+pub const MAX_ATTENTION_TEXT_RECORDS: u64 = 256;
+
+/// A request for one session's attention source records past where the store has read.
+///
+/// The worker answers with an [`AttentionSourcePage`]. While neither source has a record past its
+/// cursor and the session's privacy state has not moved, it may hold the request for up to
+/// `wait_ms`, answering as soon as a question transition, a host event or a privacy transition
+/// is committed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionSourcesRequest {
+    /// Correlates the page with this request.
+    pub request_id: RequestId,
+    /// The last question transition the store has read, or nought for none.
+    pub questions_after: U64,
+    /// The last host event the store has read, or nought for none.
+    pub host_events_after: U64,
+    /// The most records the page carries from each source, bounded by
+    /// [`MAX_ATTENTION_SOURCE_RECORDS`].
+    pub max_records: U64,
+    /// How long the worker may hold the request while it has nothing to answer with, bounded by
+    /// [`MAX_ATTENTION_SOURCE_WAIT_MS`]. Nought answers at once.
+    pub wait_ms: U64,
+    /// The key this session's notification fingerprints are made under.
+    ///
+    /// The attention store derives it for this session from its own secret, so a fingerprint is
+    /// the same for the same text whenever and wherever it is made: live, after either process
+    /// restarts, and from the session's journal once the session has closed. The session keeps no
+    /// key of its own for it.
+    pub fingerprint_key: SecretBytes32,
+}
+
+/// One question transition, as the attention store reads it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionQuestionRecord {
+    /// Its place in the session's question ledger.
+    pub sequence: U64,
+    /// What happened.
+    pub kind: QuestionEventKind,
+    /// The question.
+    pub question_id: QuestionId,
+    /// The session the question belongs to.
+    pub session_id: SessionId,
+    /// Whether the worker admitted the source that asked, which is what makes a pending request a
+    /// verified one.
+    pub verified: bool,
+    /// When the question first became pending.
+    pub pending_since_ms: TimestampMs,
+    /// When this transition was recorded.
+    pub recorded_at_ms: TimestampMs,
+    /// The question's wording, clipped to [`MAX_ATTENTION_SUMMARY_LEN`], when the session serves
+    /// it now, and null when it does not.
+    pub text: Nullable<String>,
+}
+
+/// One terminal side effect that had no attachment to go to, as the attention store reads it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionHostRecord {
+    /// Its place in the session's host events.
+    pub sequence: U64,
+    /// Whether it is an application's notification, the only kind a rule reads.
+    pub notification: bool,
+    /// When it was recorded.
+    pub recorded_at_ms: TimestampMs,
+    /// What it said, clipped to [`MAX_ATTENTION_SUMMARY_LEN`], when the session serves it now,
+    /// and null when it does not.
+    pub text: Nullable<String>,
+    /// A keyed digest of what a notification said, under the request's fingerprint key.
+    ///
+    /// It travels whether or not the text does, so two notifications that say the same thing are
+    /// one condition to the store with or without their text, and nobody without the key can test
+    /// a guess at withheld text against it. Null for anything but a notification.
+    pub fingerprint: Nullable<Digest256>,
+}
+
+/// One source's part of a page: where the source stands, and its records after the cursor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionQuestionSlice {
+    /// The source's last record when it was read, or nought for none.
+    pub head: U64,
+    /// Its records after the cursor, oldest first, up to the head and the page's bounds.
+    pub records: Vec<AttentionQuestionRecord>,
+}
+
+/// One source's part of a page: where the source stands, and its records after the cursor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionHostSlice {
+    /// The source's last record when it was read, or nought for none.
+    pub head: U64,
+    /// Its records after the cursor, oldest first, up to the head and the page's bounds.
+    pub records: Vec<AttentionHostRecord>,
+}
+
+/// A page of one session's attention source records.
+///
+/// It is read in order: the moment first, then each source's head and its records after the
+/// cursor, then the session's privacy state, which decides which records carry text. A source
+/// whose last record in the page is its head, or which returned none with the cursor at or past
+/// its head, is complete; a page complete for both sources holds every record the session
+/// committed before `built_at_boot_ms`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionSourcePage {
+    /// The request this answers.
+    pub request_id: RequestId,
+    /// When the worker began reading, on the machine's continuous clock since boot, which the
+    /// control daemon reads too.
+    pub built_at_boot_ms: U64,
+    /// The question ledger.
+    pub questions: AttentionQuestionSlice,
+    /// The host events.
+    pub host_events: AttentionHostSlice,
+    /// The session's privacy generation the page's text was decided under, or null when the
+    /// session holds no privacy record, and then no record carries text.
+    pub privacy_generation: Nullable<U64>,
+}
+
+/// One record a text request names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionRecordRef {
+    /// Its source: the question ledger or the host events.
+    pub source: AttentionSource,
+    /// Its place in that source.
+    pub sequence: U64,
+}
+
+/// A request for the text of records the store names when it serves them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionTextRequest {
+    /// Correlates the answer with this request.
+    pub request_id: RequestId,
+    /// The records, bounded by [`MAX_ATTENTION_TEXT_RECORDS`].
+    pub records: Vec<AttentionRecordRef>,
+}
+
+/// One record's text, as the session serves it now.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionRecordText {
+    /// Its source.
+    pub source: AttentionSource,
+    /// Its place in that source.
+    pub sequence: U64,
+    /// Its text, clipped to [`MAX_ATTENTION_SUMMARY_LEN`], or null when the session does not serve
+    /// it now or no longer holds the record.
+    pub text: Nullable<String>,
+}
+
+/// The answer to an [`AttentionTextRequest`]: each record's text under the session's privacy
+/// state read after the records.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionTextAnswer {
+    /// The request this answers.
+    pub request_id: RequestId,
+    /// The session's privacy generation the text was decided under, or null when the session
+    /// holds no privacy record, and then no record carries text.
+    pub privacy_generation: Nullable<U64>,
+    /// One entry per record named, in the order named.
+    pub texts: Vec<AttentionRecordText>,
 }
 
 #[cfg(test)]

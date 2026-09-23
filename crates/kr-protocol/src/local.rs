@@ -195,6 +195,11 @@ pub enum ControllerConnectionRole {
     /// It forwards that caller's admitted reads and mutations and owns their attachment, and it
     /// announces nothing. A replacement generation fences it along with the authority itself.
     Proxy,
+    /// The connection the daemon reads this session's attention sources over.
+    ///
+    /// It carries the attention source and text requests and nothing else. A newer one replaces
+    /// it, and a replacement generation fences it along with the authority itself.
+    Attention,
 }
 
 impl ControllerConnectionRole {
@@ -204,6 +209,7 @@ impl ControllerConnectionRole {
         match self {
             Self::Authority => "authority",
             Self::Proxy => "proxy",
+            Self::Attention => "attention",
         }
     }
 }

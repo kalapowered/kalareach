@@ -520,4 +520,13 @@ pub enum ControlFrame {
     /// the worker learns it has arrived here rather than assuming its own write was the end of the
     /// journey.
     AcceptanceDelivered(ActionId),
+    /// The control daemon's request for a session's attention source records, on its attention
+    /// connection to the session's worker.
+    AttentionSources(crate::attention::AttentionSourcesRequest),
+    /// The worker's page of those records.
+    AttentionSourcePage(Box<crate::attention::AttentionSourcePage>),
+    /// The control daemon's request for the text of records its attention store names.
+    AttentionText(crate::attention::AttentionTextRequest),
+    /// The worker's answer: each record's text as the session serves it now.
+    AttentionTextAnswer(Box<crate::attention::AttentionTextAnswer>),
 }

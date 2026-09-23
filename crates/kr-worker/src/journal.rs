@@ -200,6 +200,30 @@ pub struct Journal {
     /// issues live in its memory and the host has restarted. That is what lets retention treat
     /// this boot's records and an earlier boot's differently.
     boot: Option<Vec<u8>>,
+    /// Woken after this journal commits a host event or a privacy transition.
+    ///
+    /// The control daemon holds a request for this session's attention records until there is
+    /// something to read, and this is what tells it there is. It is shared rather than owned, so
+    /// the one waiting can hold it without holding the journal.
+    attention_changes: std::sync::Arc<tokio::sync::Notify>,
+}
+
+/// The privacy record: the generation in force, whether privacy mode is on, and where each
+/// attention source stood when the last transition was recorded.
+///
+/// A record's text is served only while privacy mode is off and only when the record came after
+/// its source's head here, so what was written before privacy mode was enabled, or while it was
+/// on, is never served again once a transition has been recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrivacyRecord {
+    /// The generation in force.
+    pub generation: u64,
+    /// Whether privacy mode is on.
+    pub enabled: bool,
+    /// The question ledger's last transition when the record was written.
+    pub questions_head: u64,
+    /// The last host event when the record was written.
+    pub host_events_head: u64,
 }
 
 /// The continuous reading below which a record this boot wrote is old enough to collect.
@@ -308,6 +332,7 @@ impl Journal {
             boot: kr_ipc::identity::boot_identity()
                 .ok()
                 .map(|boot| boot.value.as_slice().to_vec()),
+            attention_changes: std::sync::Arc::new(tokio::sync::Notify::new()),
         };
         journal.migrate()?;
         // The mark describes the store rather than this process, so it starts at the highest
@@ -339,6 +364,7 @@ impl Journal {
         match recorded {
             None => {
                 self.create_current_schema()?;
+                self.create_starting_privacy(kr_ipc::now_ms())?;
                 self.connection
                     .execute(
                         "INSERT INTO schema_version (version) VALUES (?1)",
@@ -359,6 +385,7 @@ impl Journal {
                         (2, 3) => self.migrate_2_to_3()?,
                         (3, 4) => self.migrate_3_to_4()?,
                         (4, 5) => self.migrate_4_to_5()?,
+                        (5, 6) => self.migrate_5_to_6()?,
                         _ => {
                             return Err(unavailable_detail_owned(format!(
                                 "no migration is implemented from schema version {} to {}",
@@ -507,14 +534,34 @@ impl Journal {
                      resumed_at      INTEGER NOT NULL
                  );
                  CREATE TABLE IF NOT EXISTS privacy (
-                     id             INTEGER PRIMARY KEY CHECK (id = 1),
-                     generation     INTEGER NOT NULL,
-                     enabled        INTEGER NOT NULL,
-                     recorded_at_ms INTEGER NOT NULL
+                     id               INTEGER PRIMARY KEY CHECK (id = 1),
+                     generation       INTEGER NOT NULL,
+                     enabled          INTEGER NOT NULL,
+                     recorded_at_ms   INTEGER NOT NULL,
+                     questions_head   INTEGER NOT NULL DEFAULT 0,
+                     host_events_head INTEGER NOT NULL DEFAULT 0
                  );",
             )
             .map_err(|error| faulted(&self.health, error))?;
         self.add_delivery_generation()?;
+        Ok(())
+    }
+
+    /// Writes the privacy record a journal starts with: privacy mode off at the first generation,
+    /// with nothing before it.
+    ///
+    /// Only a journal being created, or brought to the version that introduced the record's heads,
+    /// gets it. A journal that later loses its privacy record serves no attention text rather than
+    /// being given a fresh one, which would read as a session that never changed privacy mode.
+    fn create_starting_privacy(&self, now_ms: TimestampMs) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT OR IGNORE INTO privacy
+                     (id, generation, enabled, recorded_at_ms, questions_head, host_events_head)
+                 VALUES (1, 0, 0, ?1, 0, 0)",
+                params![i64::try_from(now_ms.get()).unwrap_or(i64::MAX)],
+            )
+            .map_err(|error| faulted(&self.health, error))?;
         Ok(())
     }
 
@@ -584,6 +631,61 @@ impl Journal {
                 faulted(&self.health, error)
             })?;
         Ok(())
+    }
+
+    /// Records where each attention source stood at the last privacy transition, and gives a
+    /// journal that never changed privacy mode its starting record.
+    ///
+    /// A journal with a privacy record went through a transition this build never saw the heads
+    /// of, so its heads are where the sources stand now: nothing written before this migration is
+    /// served as attention text for that session again. A journal without one never changed privacy
+    /// mode, and gets the starting record, under which everything it holds is served.
+    fn migrate_5_to_6(&self) -> Result<()> {
+        // Either source can be missing from a journal an earlier build wrote: the question ledger
+        // is another service's, and the host events are created with the current schema once the
+        // ladder has run. A source that is not there has recorded nothing.
+        let head = |table: &str| -> Result<String> {
+            Ok(if self.has_table(table)? {
+                format!("(SELECT COALESCE(MAX(sequence), 0) FROM {table})")
+            } else {
+                "0".to_owned()
+            })
+        };
+        let questions = head("question_events")?;
+        let host_events = head("host_events")?;
+        self.connection
+            .execute_batch(&format!(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE privacy ADD COLUMN questions_head INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE privacy ADD COLUMN host_events_head INTEGER NOT NULL DEFAULT 0;
+                 UPDATE privacy SET
+                     questions_head = {questions},
+                     host_events_head = {host_events};
+                 INSERT OR IGNORE INTO privacy
+                     (id, generation, enabled, recorded_at_ms, questions_head, host_events_head)
+                 VALUES (1, 0, 0, {now}, 0, 0);
+                 UPDATE schema_version SET version = 6;
+                 COMMIT;",
+                now = kr_ipc::now_ms().get(),
+            ))
+            .map_err(|error| {
+                let _ = self.connection.execute_batch("ROLLBACK;");
+                faulted(&self.health, error)
+            })?;
+        Ok(())
+    }
+
+    /// Whether this journal's file holds a table.
+    fn has_table(&self, name: &str) -> Result<bool> {
+        let present: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .map_err(|error| faulted(&self.health, error))?;
+        Ok(present > 0)
     }
 
     /// Gives an older delivery record the generation column it does not have.
@@ -803,6 +905,7 @@ impl Journal {
                 ],
             )
             .map_err(|error| faulted(&self.health, error))?;
+        self.attention_changes.notify_waiters();
         Ok(())
     }
 
@@ -833,6 +936,190 @@ impl Journal {
             .map_err(|error| faulted(&self.health, error))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|error| faulted(&self.health, error))
+    }
+
+    /// Returns the signal woken after this journal commits a host event or a privacy transition.
+    #[must_use]
+    pub fn attention_changes(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        std::sync::Arc::clone(&self.attention_changes)
+    }
+
+    /// Returns the last host event's sequence, or nought when there is none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn host_events_head(&self) -> Result<u64> {
+        let head: i64 = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), 0) FROM host_events",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| faulted(&self.health, error))?;
+        Ok(u64::try_from(head).unwrap_or_default())
+    }
+
+    /// Returns the host events after `after`, oldest first, at most `limit` of them, each with its
+    /// sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn host_events_after(&self, after: u64, limit: usize) -> Result<Vec<(u64, HostEvent)>> {
+        self.host_event_rows(
+            "SELECT sequence, kind, detail, output_cursor, recorded_at_ms FROM host_events
+             WHERE sequence > ?1 ORDER BY sequence LIMIT ?2",
+            params![
+                i64::try_from(after).unwrap_or(i64::MAX),
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+        )
+    }
+
+    /// Returns one host event by its sequence, when the journal still holds it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn host_event(&self, sequence: u64) -> Result<Option<HostEvent>> {
+        Ok(self
+            .host_event_rows(
+                "SELECT sequence, kind, detail, output_cursor, recorded_at_ms FROM host_events
+                 WHERE sequence = ?1",
+                params![i64::try_from(sequence).unwrap_or(i64::MAX)],
+            )?
+            .into_iter()
+            .next()
+            .map(|(_, event)| event))
+    }
+
+    fn host_event_rows(
+        &self,
+        query: &str,
+        bound: impl rusqlite::Params,
+    ) -> Result<Vec<(u64, HostEvent)>> {
+        let mut statement = self
+            .connection
+            .prepare(query)
+            .map_err(|error| faulted(&self.health, error))?;
+        let rows = statement
+            .query_map(bound, |row| {
+                Ok((
+                    u64::try_from(row.get::<_, i64>(0)?).unwrap_or_default(),
+                    HostEvent {
+                        kind: row.get::<_, String>(1)?,
+                        detail: row.get::<_, String>(2)?,
+                        output_cursor: u64::try_from(row.get::<_, i64>(3)?).unwrap_or_default(),
+                        recorded_at_ms: TimestampMs::new(
+                            u64::try_from(row.get::<_, i64>(4)?).unwrap_or_default(),
+                        ),
+                    },
+                ))
+            })
+            .map_err(|error| faulted(&self.health, error))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| faulted(&self.health, error))
+    }
+
+    /// Returns the question ledger's last transition, or nought when there is none.
+    ///
+    /// The ledger is the question service's, kept in this same file; a file without it has
+    /// recorded no transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn question_events_head(&self) -> Result<u64> {
+        if !self.has_table("question_events")? {
+            return Ok(0);
+        }
+        let head: i64 = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), 0) FROM question_events",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| faulted(&self.health, error))?;
+        Ok(u64::try_from(head).unwrap_or_default())
+    }
+
+    /// Returns the question transitions after `after`, oldest first, at most `limit` of them,
+    /// each with its sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails or a record cannot be
+    /// decoded.
+    pub fn question_events_after(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, kr_protocol::question::QuestionEvent)>> {
+        if !self.has_table("question_events")? {
+            return Ok(Vec::new());
+        }
+        self.question_event_rows(
+            "SELECT sequence, record FROM question_events
+             WHERE sequence > ?1 ORDER BY sequence LIMIT ?2",
+            params![
+                i64::try_from(after).unwrap_or(i64::MAX),
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+        )
+    }
+
+    /// Returns one question transition by its sequence, when the ledger still holds it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::question_events_after`].
+    pub fn question_event(
+        &self,
+        sequence: u64,
+    ) -> Result<Option<kr_protocol::question::QuestionEvent>> {
+        if !self.has_table("question_events")? {
+            return Ok(None);
+        }
+        Ok(self
+            .question_event_rows(
+                "SELECT sequence, record FROM question_events WHERE sequence = ?1",
+                params![i64::try_from(sequence).unwrap_or(i64::MAX)],
+            )?
+            .into_iter()
+            .next()
+            .map(|(_, event)| event))
+    }
+
+    fn question_event_rows(
+        &self,
+        query: &str,
+        bound: impl rusqlite::Params,
+    ) -> Result<Vec<(u64, kr_protocol::question::QuestionEvent)>> {
+        let mut statement = self
+            .connection
+            .prepare(query)
+            .map_err(|error| faulted(&self.health, error))?;
+        let rows = statement
+            .query_map(bound, |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|error| faulted(&self.health, error))?;
+        let mut events = Vec::new();
+        for row in rows {
+            let (sequence, record) = row.map_err(|error| faulted(&self.health, error))?;
+            let event = kr_cbor::from_canonical_slice(&record, &kr_cbor::Limits::DEFAULT).map_err(
+                |error| {
+                    unavailable_detail_owned(format!(
+                        "a question transition could not be read: {error}"
+                    ))
+                },
+            )?;
+            events.push((u64::try_from(sequence).unwrap_or_default(), event));
+        }
+        Ok(events)
     }
 
     /// Commits an intent, or returns the retained receipt for an exact duplicate.
@@ -2534,6 +2821,7 @@ impl Journal {
             semantic_corruption: std::sync::atomic::AtomicBool::new(false),
             health: crate::persistence::fault::JournalHealth::shared(),
             boot: None,
+            attention_changes: std::sync::Arc::new(tokio::sync::Notify::new()),
         };
         // The same mark the writable opener starts from. A reader that faulted would otherwise
         // report a gap reaching back to the beginning of the session.
@@ -2604,27 +2892,64 @@ impl Journal {
     /// # Errors
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
+    ///
+    /// The same transaction records where each attention source stands, and it holds the write
+    /// lock from before those heads are read until the record is written, so no question
+    /// transition or host event can be committed between the two: every record after a head came
+    /// after the transition.
     pub fn record_privacy(
         &mut self,
         generation: u64,
         enabled: bool,
         now_ms: TimestampMs,
     ) -> Result<()> {
-        self.connection
+        let questions = self.has_table("question_events")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| faulted(&self.health, error))?;
+        let questions_head: i64 = if questions {
+            transaction
+                .query_row(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM question_events",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| faulted(&self.health, error))?
+        } else {
+            0
+        };
+        let host_events_head: i64 = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), 0) FROM host_events",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| faulted(&self.health, error))?;
+        transaction
             .execute(
-                "INSERT INTO privacy (id, generation, enabled, recorded_at_ms)
-                 VALUES (1, ?1, ?2, ?3)
+                "INSERT INTO privacy
+                     (id, generation, enabled, recorded_at_ms, questions_head, host_events_head)
+                 VALUES (1, ?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT (id) DO UPDATE SET
                      generation = excluded.generation,
                      enabled = excluded.enabled,
-                     recorded_at_ms = excluded.recorded_at_ms",
+                     recorded_at_ms = excluded.recorded_at_ms,
+                     questions_head = excluded.questions_head,
+                     host_events_head = excluded.host_events_head",
                 params![
                     i64::try_from(generation).unwrap_or(i64::MAX),
                     i64::from(enabled),
                     i64::try_from(now_ms.get()).unwrap_or(i64::MAX),
+                    questions_head,
+                    host_events_head,
                 ],
             )
             .map_err(|error| faulted(&self.health, error))?;
+        transaction
+            .commit()
+            .map_err(|error| faulted(&self.health, error))?;
+        self.attention_changes.notify_waiters();
         Ok(())
     }
 
@@ -2633,17 +2958,25 @@ impl Journal {
     /// # Errors
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
-    pub fn read_privacy(&self) -> Result<Option<(u64, bool)>> {
-        let row: Option<(i64, i64)> = self
+    pub fn read_privacy(&self) -> Result<Option<PrivacyRecord>> {
+        let row: Option<(i64, i64, i64, i64)> = self
             .connection
             .query_row(
-                "SELECT generation, enabled FROM privacy WHERE id = 1",
+                "SELECT generation, enabled, questions_head, host_events_head
+                 FROM privacy WHERE id = 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(|error| faulted(&self.health, error))?;
-        Ok(row.map(|(generation, enabled)| (u64::try_from(generation).unwrap_or(0), enabled != 0)))
+        Ok(row.map(
+            |(generation, enabled, questions_head, host_events_head)| PrivacyRecord {
+                generation: u64::try_from(generation).unwrap_or(0),
+                enabled: enabled != 0,
+                questions_head: u64::try_from(questions_head).unwrap_or(u64::MAX),
+                host_events_head: u64::try_from(host_events_head).unwrap_or(u64::MAX),
+            },
+        ))
     }
 
     /// Removes the content a settled receipt carries, keeping the metadata.

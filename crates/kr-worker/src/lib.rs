@@ -38,6 +38,7 @@
 pub mod action;
 pub mod attachments;
 pub mod attention;
+pub mod attention_source;
 pub mod broker;
 pub mod config;
 pub mod desktop;

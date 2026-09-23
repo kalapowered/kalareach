@@ -2652,6 +2652,76 @@
       ],
       "type": "object"
     },
+    "AttentionHostRecord": {
+      "additionalProperties": false,
+      "description": "One terminal side effect that had no attachment to go to, as the attention store reads it.",
+      "properties": {
+        "fingerprint": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Digest256"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A keyed digest of what a notification said, under the request's fingerprint key.\n\nIt travels whether or not the text does, so two notifications that say the same thing are\none condition to the store with or without their text, and nobody without the key can test\na guess at withheld text against it. Null for anything but a notification."
+        },
+        "notification": {
+          "description": "Whether it is an application's notification, the only kind a rule reads.",
+          "type": "boolean"
+        },
+        "recorded_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it was recorded."
+        },
+        "sequence": {
+          "$ref": "#/$defs/U64",
+          "description": "Its place in the session's host events."
+        },
+        "text": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What it said, clipped to [`MAX_ATTENTION_SUMMARY_LEN`], when the session serves it now,\nand null when it does not."
+        }
+      },
+      "required": [
+        "sequence",
+        "notification",
+        "recorded_at_ms",
+        "text",
+        "fingerprint"
+      ],
+      "type": "object"
+    },
+    "AttentionHostSlice": {
+      "additionalProperties": false,
+      "description": "One source's part of a page: where the source stands, and its records after the cursor.",
+      "properties": {
+        "head": {
+          "$ref": "#/$defs/U64",
+          "description": "The source's last record when it was read, or nought for none."
+        },
+        "records": {
+          "description": "Its records after the cursor, oldest first, up to the head and the page's bounds.",
+          "items": {
+            "$ref": "#/$defs/AttentionHostRecord"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "head",
+        "records"
+      ],
+      "type": "object"
+    },
     "AttentionItem": {
       "additionalProperties": false,
       "description": "One item in the attention inbox.",
@@ -2812,6 +2882,84 @@
         }
       ]
     },
+    "AttentionQuestionRecord": {
+      "additionalProperties": false,
+      "description": "One question transition, as the attention store reads it.",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/QuestionEventKind",
+          "description": "What happened."
+        },
+        "pending_since_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the question first became pending."
+        },
+        "question_id": {
+          "$ref": "#/$defs/QuestionId",
+          "description": "The question."
+        },
+        "recorded_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When this transition was recorded."
+        },
+        "sequence": {
+          "$ref": "#/$defs/U64",
+          "description": "Its place in the session's question ledger."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session the question belongs to."
+        },
+        "text": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The question's wording, clipped to [`MAX_ATTENTION_SUMMARY_LEN`], when the session serves\nit now, and null when it does not."
+        },
+        "verified": {
+          "description": "Whether the worker admitted the source that asked, which is what makes a pending request a\nverified one.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "sequence",
+        "kind",
+        "question_id",
+        "session_id",
+        "verified",
+        "pending_since_ms",
+        "recorded_at_ms",
+        "text"
+      ],
+      "type": "object"
+    },
+    "AttentionQuestionSlice": {
+      "additionalProperties": false,
+      "description": "One source's part of a page: where the source stands, and its records after the cursor.",
+      "properties": {
+        "head": {
+          "$ref": "#/$defs/U64",
+          "description": "The source's last record when it was read, or nought for none."
+        },
+        "records": {
+          "description": "Its records after the cursor, oldest first, up to the head and the page's bounds.",
+          "items": {
+            "$ref": "#/$defs/AttentionQuestionRecord"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "head",
+        "records"
+      ],
+      "type": "object"
+    },
     "AttentionQuietHoursParams": {
       "additionalProperties": false,
       "description": "Parameters of `attention.quiet_hours`.",
@@ -2964,6 +3112,56 @@
       ],
       "type": "object"
     },
+    "AttentionRecordRef": {
+      "additionalProperties": false,
+      "description": "One record a text request names.",
+      "properties": {
+        "sequence": {
+          "$ref": "#/$defs/U64",
+          "description": "Its place in that source."
+        },
+        "source": {
+          "$ref": "#/$defs/AttentionSource",
+          "description": "Its source: the question ledger or the host events."
+        }
+      },
+      "required": [
+        "source",
+        "sequence"
+      ],
+      "type": "object"
+    },
+    "AttentionRecordText": {
+      "additionalProperties": false,
+      "description": "One record's text, as the session serves it now.",
+      "properties": {
+        "sequence": {
+          "$ref": "#/$defs/U64",
+          "description": "Its place in that source."
+        },
+        "source": {
+          "$ref": "#/$defs/AttentionSource",
+          "description": "Its source."
+        },
+        "text": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Its text, clipped to [`MAX_ATTENTION_SUMMARY_LEN`], or null when the session does not serve\nit now or no longer holds the record."
+        }
+      },
+      "required": [
+        "source",
+        "sequence",
+        "text"
+      ],
+      "type": "object"
+    },
     "AttentionRouting": {
       "description": "Where the host sent an item's notification.\n\nSection 8 gives a terminal side effect one destination, the attachment holding the input\nlease. With no lease holder there is nobody to send it to, so section 25 routes it through\nthe owner's configured notification policy and keeps it in Attention either way.",
       "oneOf": [
@@ -3058,6 +3256,142 @@
           "type": "string"
         }
       ]
+    },
+    "AttentionSourcePage": {
+      "additionalProperties": false,
+      "description": "A page of one session's attention source records.\n\nIt is read in order: the moment first, then each source's head and its records after the\ncursor, then the session's privacy state, which decides which records carry text. A source\nwhose last record in the page is its head, or which returned none with the cursor at or past\nits head, is complete; a page complete for both sources holds every record the session\ncommitted before `built_at_boot_ms`.",
+      "properties": {
+        "built_at_boot_ms": {
+          "$ref": "#/$defs/U64",
+          "description": "When the worker began reading, on the machine's continuous clock since boot, which the\ncontrol daemon reads too."
+        },
+        "host_events": {
+          "$ref": "#/$defs/AttentionHostSlice",
+          "description": "The host events."
+        },
+        "privacy_generation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session's privacy generation the page's text was decided under, or null when the\nsession holds no privacy record, and then no record carries text."
+        },
+        "questions": {
+          "$ref": "#/$defs/AttentionQuestionSlice",
+          "description": "The question ledger."
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId",
+          "description": "The request this answers."
+        }
+      },
+      "required": [
+        "request_id",
+        "built_at_boot_ms",
+        "questions",
+        "host_events",
+        "privacy_generation"
+      ],
+      "type": "object"
+    },
+    "AttentionSourcesRequest": {
+      "additionalProperties": false,
+      "description": "A request for one session's attention source records past where the store has read.\n\nThe worker answers with an [`AttentionSourcePage`]. While neither source has a record past its\ncursor and the session's privacy state has not moved, it may hold the request for up to\n`wait_ms`, answering as soon as a question transition, a host event or a privacy transition\nis committed.",
+      "properties": {
+        "fingerprint_key": {
+          "$ref": "#/$defs/SecretBytes32",
+          "description": "The key this session's notification fingerprints are made under.\n\nThe attention store derives it for this session from its own secret, so a fingerprint is\nthe same for the same text whenever and wherever it is made: live, after either process\nrestarts, and from the session's journal once the session has closed. The session keeps no\nkey of its own for it."
+        },
+        "host_events_after": {
+          "$ref": "#/$defs/U64",
+          "description": "The last host event the store has read, or nought for none."
+        },
+        "max_records": {
+          "$ref": "#/$defs/U64",
+          "description": "The most records the page carries from each source, bounded by\n[`MAX_ATTENTION_SOURCE_RECORDS`]."
+        },
+        "questions_after": {
+          "$ref": "#/$defs/U64",
+          "description": "The last question transition the store has read, or nought for none."
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId",
+          "description": "Correlates the page with this request."
+        },
+        "wait_ms": {
+          "$ref": "#/$defs/U64",
+          "description": "How long the worker may hold the request while it has nothing to answer with, bounded by\n[`MAX_ATTENTION_SOURCE_WAIT_MS`]. Nought answers at once."
+        }
+      },
+      "required": [
+        "request_id",
+        "questions_after",
+        "host_events_after",
+        "max_records",
+        "wait_ms",
+        "fingerprint_key"
+      ],
+      "type": "object"
+    },
+    "AttentionTextAnswer": {
+      "additionalProperties": false,
+      "description": "The answer to an [`AttentionTextRequest`]: each record's text under the session's privacy\nstate read after the records.",
+      "properties": {
+        "privacy_generation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session's privacy generation the text was decided under, or null when the session\nholds no privacy record, and then no record carries text."
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId",
+          "description": "The request this answers."
+        },
+        "texts": {
+          "description": "One entry per record named, in the order named.",
+          "items": {
+            "$ref": "#/$defs/AttentionRecordText"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "request_id",
+        "privacy_generation",
+        "texts"
+      ],
+      "type": "object"
+    },
+    "AttentionTextRequest": {
+      "additionalProperties": false,
+      "description": "A request for the text of records the store names when it serves them.",
+      "properties": {
+        "records": {
+          "description": "The records, bounded by [`MAX_ATTENTION_TEXT_RECORDS`].",
+          "items": {
+            "$ref": "#/$defs/AttentionRecordRef"
+          },
+          "type": "array"
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId",
+          "description": "Correlates the answer with this request."
+        }
+      },
+      "required": [
+        "request_id",
+        "records"
+      ],
+      "type": "object"
     },
     "AuthenticationState": {
       "description": "What is known about the upstream's authentication at launch time.",
@@ -7287,6 +7621,58 @@
             "acceptance_delivered"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The control daemon's request for a session's attention source records, on its attention\nconnection to the session's worker.",
+          "properties": {
+            "attention_sources": {
+              "$ref": "#/$defs/AttentionSourcesRequest"
+            }
+          },
+          "required": [
+            "attention_sources"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The worker's page of those records.",
+          "properties": {
+            "attention_source_page": {
+              "$ref": "#/$defs/AttentionSourcePage"
+            }
+          },
+          "required": [
+            "attention_source_page"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The control daemon's request for the text of records its attention store names.",
+          "properties": {
+            "attention_text": {
+              "$ref": "#/$defs/AttentionTextRequest"
+            }
+          },
+          "required": [
+            "attention_text"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The worker's answer: each record's text as the session serves it now.",
+          "properties": {
+            "attention_text_answer": {
+              "$ref": "#/$defs/AttentionTextAnswer"
+            }
+          },
+          "required": [
+            "attention_text_answer"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -7301,6 +7687,11 @@
         {
           "const": "proxy",
           "description": "A connection the daemon opened on behalf of one caller it authenticated elsewhere.\n\nIt forwards that caller's admitted reads and mutations and owns their attachment, and it\nannounces nothing. A replacement generation fences it along with the authority itself.",
+          "type": "string"
+        },
+        {
+          "const": "attention",
+          "description": "The connection the daemon reads this session's attention sources over.\n\nIt carries the attention source and text requests and nothing else. A newer one replaces\nit, and a replacement generation fences it along with the authority itself.",
           "type": "string"
         }
       ]
@@ -31650,11 +32041,23 @@
     "attention_gap": {
       "$ref": "#/$defs/AttentionGap"
     },
+    "attention_host_record": {
+      "$ref": "#/$defs/AttentionHostRecord"
+    },
+    "attention_host_slice": {
+      "$ref": "#/$defs/AttentionHostSlice"
+    },
     "attention_item": {
       "$ref": "#/$defs/AttentionItem"
     },
     "attention_item_revision": {
       "$ref": "#/$defs/AttentionItemRevision"
+    },
+    "attention_question_record": {
+      "$ref": "#/$defs/AttentionQuestionRecord"
+    },
+    "attention_question_slice": {
+      "$ref": "#/$defs/AttentionQuestionSlice"
     },
     "attention_quiet_hours_params": {
       "$ref": "#/$defs/AttentionQuietHoursParams"
@@ -31667,6 +32070,24 @@
     },
     "attention_read_result": {
       "$ref": "#/$defs/AttentionReadResult"
+    },
+    "attention_record_ref": {
+      "$ref": "#/$defs/AttentionRecordRef"
+    },
+    "attention_record_text": {
+      "$ref": "#/$defs/AttentionRecordText"
+    },
+    "attention_source_page": {
+      "$ref": "#/$defs/AttentionSourcePage"
+    },
+    "attention_sources_request": {
+      "$ref": "#/$defs/AttentionSourcesRequest"
+    },
+    "attention_text_answer": {
+      "$ref": "#/$defs/AttentionTextAnswer"
+    },
+    "attention_text_request": {
+      "$ref": "#/$defs/AttentionTextRequest"
     },
     "authority_feed_status": {
       "$ref": "#/$defs/AuthorityFeedStatus"

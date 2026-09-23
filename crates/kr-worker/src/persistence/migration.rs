@@ -17,7 +17,7 @@
 //!   it, which is what stops a partial restore being mistaken for a complete one.
 
 /// The schema version this build reads after migration.
-pub const CURRENT: i64 = 5;
+pub const CURRENT: i64 = 6;
 
 /// The oldest schema version this build's ladder can bring forward.
 pub const OLDEST_MIGRATABLE: i64 = 1;
@@ -54,6 +54,12 @@ pub static LADDER: &[Migration] = &[
         from: 4,
         to: 5,
         summary: "the privacy generation and whether privacy mode is on",
+    },
+    Migration {
+        from: 5,
+        to: 6,
+        summary: "where the attention sources stood at the last privacy transition, and the starting \
+                  privacy record of a journal that never changed privacy mode",
     },
 ];
 
@@ -260,7 +266,8 @@ mod tests {
     fn each_version_names_the_tables_a_store_of_it_really_had() {
         // Every version's set contains the one before it, because no step of this ladder has ever
         // dropped a table. A version this build does not list answers with the current set, which
-        // is the strictest of them.
+        // is the strictest of them. A step can change tables without adding one: the step to 6
+        // gives the privacy record the heads of the attention sources.
         for step in LADDER {
             let before = tables_at(step.from);
             let after = tables_at(step.to);
@@ -270,7 +277,7 @@ mod tests {
                 step.to,
                 step.from
             );
-            assert!(after.len() > before.len(), "every step adds a table");
+            assert!(after.len() >= before.len(), "no step removes a table");
         }
         assert_eq!(tables_at(1), ["schema_version", "receipts"]);
         assert!(tables_at(CURRENT).contains(&"privacy"));

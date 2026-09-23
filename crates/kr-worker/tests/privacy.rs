@@ -130,7 +130,11 @@ fn enabling_privacy_records_a_generation_durably_before_anything_is_touched() {
         temp.environment().journal_database(session_id),
     )
     .expect("reads the journal");
-    assert_eq!(journal.read_privacy().expect("reads"), Some((1, true)));
+    let recorded = journal
+        .read_privacy()
+        .expect("reads")
+        .expect("the record is there");
+    assert_eq!((recorded.generation, recorded.enabled), (1, true));
 }
 
 #[test]

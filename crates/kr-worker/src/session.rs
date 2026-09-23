@@ -452,17 +452,19 @@ impl Session {
         // difference between them decides what this session does next.
         //
         // * A row says which generation is in force and whether privacy mode is on.
-        // * No row is a host that has never enabled it.
+        // * No row is a host that has never enabled it, as far as this reading goes. A journal
+        //   starts with a row, so the attention sources, which need the row's heads, serve no text
+        //   for a session whose row is missing.
         // * A read that *failed* is a host that does not know, and the safe reading of not
         //   knowing is that privacy mode may be on: retention stays off until something can say
         //   otherwise, because retaining under a privacy mode this host cannot see would be the
         //   one mistake privacy mode exists to prevent.
         let recorded = journal.as_ref().map(|journal| journal.read_privacy());
         let (privacy, unresolved) = match recorded {
-            Some(Ok(Some((generation, enabled)))) => (
+            Some(Ok(Some(recorded))) => (
                 crate::privacy::PrivacyMode::restored(
-                    crate::privacy::PrivacyGeneration::new(generation),
-                    enabled,
+                    crate::privacy::PrivacyGeneration::new(recorded.generation),
+                    recorded.enabled,
                 ),
                 false,
             ),
@@ -3452,15 +3454,13 @@ impl Session {
                 .map(crate::journal::Journal::read_privacy)
             {
                 Some(Ok(recorded)) => {
-                    self.privacy = recorded.map_or_else(
-                        crate::privacy::PrivacyMode::new,
-                        |(generation, enabled)| {
+                    self.privacy =
+                        recorded.map_or_else(crate::privacy::PrivacyMode::new, |recorded| {
                             crate::privacy::PrivacyMode::restored(
-                                crate::privacy::PrivacyGeneration::new(generation),
-                                enabled,
+                                crate::privacy::PrivacyGeneration::new(recorded.generation),
+                                recorded.enabled,
                             )
-                        },
-                    );
+                        });
                     self.privacy_cleanup.unresolved = None;
                 }
                 // Still unreadable, or still no journal to read. Nothing below runs.
