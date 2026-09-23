@@ -456,7 +456,16 @@ pub async fn verify(
     // The index is held whole, because it is parsed and searched offline. Its signed length is
     // checked against the metadata budget before it is read, so what is held is what this host
     // said it was willing to hold.
-    ledger.check_metadata_bytes(index_record.length, Stage::Declared, INDEX_TARGET)?;
+    // The index is held under the same allowance as the metadata that pins it, so the two are
+    // counted together: each can fit on its own and still be more than the allowance together.
+    ledger.check_metadata_bytes(
+        budgeted
+            .spent
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(index_record.length),
+        Stage::Declared,
+        INDEX_TARGET,
+    )?;
     let index_name =
         TargetName::new(INDEX_TARGET).map_err(|source| CatalogueError::InvalidArgument {
             detail: format!("{INDEX_TARGET} is not a target name: {source}"),
@@ -508,7 +517,11 @@ pub async fn verify(
     check_index_against_targets(&index, &targets)?;
 
     let total_spent = budgeted.spent.load(std::sync::atomic::Ordering::Relaxed);
-    ledger.check_metadata_bytes(total_spent, Stage::Actual, "metadata")?;
+    ledger.check_metadata_bytes(
+        total_spent.saturating_add(index_bytes),
+        Stage::Actual,
+        "metadata and index",
+    )?;
 
     Ok(VerifiedGeneration {
         generation: index.generation,

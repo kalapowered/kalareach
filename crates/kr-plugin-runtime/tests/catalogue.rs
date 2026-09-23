@@ -15,7 +15,7 @@ mod support;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use kr_plugin_runtime::catalogue::budget::Stage;
+use kr_plugin_runtime::catalogue::budget::{Resource, Stage};
 use kr_plugin_runtime::catalogue::{
     Authority, BudgetLedger, CapabilityCeiling, Catalogue, CatalogueError, CatalogueResult, Change,
     Claimed, Committed, DisablePolicy, Effect, Enrolment, FetchReason, Installation,
@@ -4012,6 +4012,39 @@ async fn an_installation_keeps_its_payloads_when_room_is_made() {
             "{digest} belongs to an installation"
         );
     }
+}
+
+/// The metadata and the index are held under one allowance, so two that each fit can together be
+/// refused.
+#[tokio::test]
+async fn metadata_and_index_are_counted_against_one_allowance() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let size = |path: std::path::PathBuf| std::fs::metadata(path).expect("a file").len();
+    let metadata: u64 = ["timestamp.json", "snapshot.json", "targets.json"]
+        .into_iter()
+        .map(|name| size(generation.metadata_dir().join(name)))
+        .sum();
+    let index = size(generation.targets_dir().join("index.json"));
+    let mut budgets = RepositoryBudgets::defaults();
+    budgets.metadata_bytes = U64::new(metadata + index - 1);
+    assert!(metadata < budgets.metadata_bytes.get() && index < budgets.metadata_bytes.get());
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        budgets,
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    let refusal = catalogue
+        .sync(&repository())
+        .await
+        .expect_err("together they are past the allowance");
+    assert!(
+        matches!(&refusal, CatalogueError::ResourceLimit(limit) if limit.resource == Resource::MetadataBytes),
+        "{refusal:?}"
+    );
+    assert_eq!(catalogue.active(&repository()).expect("enrolled"), None);
 }
 
 /// An installation another catalogue pins while a sync runs keeps its payloads.

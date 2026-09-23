@@ -48,9 +48,10 @@ published. That is the thing the metadata exists to replace.
    `packages/<publisher>/…` for one publisher and nothing else; a role that claims the index,
    another publisher's prefix, a bare wildcard or a hash-prefix bin is refused, and a delegation
    chain deeper than three roles is refused with it.
-3. Read the index, inside the metadata budget, and check what each entry declares: safe paths, no
-   two names that collide on a case-insensitive filesystem, a manifest that does not declare
-   itself, and declared sizes inside one package's limits.
+3. Read the index, inside the metadata budget together with the metadata that pins it, and check
+   what each entry declares: safe paths, no two names that collide on a case-insensitive
+   filesystem, a manifest that does not declare itself, and declared sizes inside one package's
+   limits.
 4. Refuse a generation older than the one already accepted, one that puts different bytes under a
    generation number this host already accepted, and one that is not the generation the owner
    pinned. A role whose metadata version went backwards has already been refused by the client, in
