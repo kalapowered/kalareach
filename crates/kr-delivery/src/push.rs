@@ -137,6 +137,19 @@ pub trait DeliveryStatus: std::fmt::Debug + Send + Sync {
         credential: &PushDeliveryCredential,
         notification_id: NotificationId,
     ) -> StatusAnswer;
+
+    /// Takes one question from this host's allowance at `now_ms`, and says whether there was one
+    /// to take.
+    ///
+    /// A gateway counts status questions against an hourly allowance, whichever of this host's
+    /// paths asks them: the pass asking about a notification the gateway is still retrying, and
+    /// the sweep over outcomes nobody knows. So both reserve here, from one allowance, before they
+    /// ask, and a question that does not fit is not put: the record it was about keeps its place
+    /// until one does. An implementation that counts nothing grants every question.
+    fn reserve(&self, now_ms: u64) -> bool {
+        let _ = now_ms;
+        true
+    }
 }
 
 /// What a status question returned.

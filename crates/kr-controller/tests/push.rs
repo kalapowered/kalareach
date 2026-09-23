@@ -2850,9 +2850,19 @@ fn dummy_grant(device_id: DeviceId) -> Grant {
 struct DeliveringGateway {
     delivered: Mutex<Vec<NotificationId>>,
     asked: Mutex<Vec<Asked>>,
+    /// What it answers a status question with: no record, unless a test says otherwise.
+    status: Option<PushDeliveryState>,
 }
 
 impl DeliveringGateway {
+    /// A gateway still retrying the provider for every notification it is asked about.
+    fn retrying() -> Self {
+        Self {
+            status: Some(PushDeliveryState::Retrying),
+            ..Self::default()
+        }
+    }
+
     fn delivered(&self) -> Vec<NotificationId> {
         self.delivered
             .lock()
@@ -2866,6 +2876,21 @@ impl DeliveringGateway {
             .expect("the gateway is not poisoned")
             .clone()
     }
+
+    /// The notifications it was asked about, in the order the questions came.
+    fn questions(&self) -> Vec<NotificationId> {
+        self.asked()
+            .into_iter()
+            .filter(|asked| asked.url.ends_with("/api/push/deliver/status"))
+            .map(|asked| question_about(&asked.body))
+            .collect()
+    }
+}
+
+/// The notification a status question asks about.
+fn question_about(body: &[u8]) -> NotificationId {
+    let question: serde_json::Value = serde_json::from_slice(body).expect("a JSON question");
+    serde_json::from_value(question["notification_id"].clone()).expect("an identifier")
 }
 
 impl kr_client::services::ServiceHttp for DeliveringGateway {
@@ -2899,6 +2924,16 @@ impl kr_client::services::ServiceHttp for DeliveringGateway {
                     decided_at_ms: kr_ipc::now_ms(),
                     notification_id: request.notification_id,
                     state: PushDeliveryState::Queued,
+                    suppression: Nullable::null(),
+                },
+            })
+        } else if let Some(state) = self.status {
+            serde_json::json!({
+                "ok": true,
+                "data": PushDeliveryAck {
+                    decided_at_ms: kr_ipc::now_ms(),
+                    notification_id: question_about(body),
+                    state,
                     suppression: Nullable::null(),
                 },
             })
@@ -3132,6 +3167,7 @@ async fn a_runtime_recovers_first_and_then_drives_the_outbox_on_its_own_cadence(
         kr_controller::push::runtime::Cadence {
             pass: std::time::Duration::from_millis(20),
             questions: std::time::Duration::from_secs(60 * 60),
+            ..kr_controller::push::runtime::Cadence::DEFAULT
         },
         tokio::runtime::Handle::current(),
     );
@@ -3651,6 +3687,7 @@ fn a_status_answer_about_another_notification_resolves_nothing() {
             Arc::clone(&transport) as Arc<dyn kr_client::services::ServiceHttp>
         )),
         runtime.handle().clone(),
+        kr_controller::push::status::StatusAllowance::GATEWAY,
     );
     let credentials = held(NOW + 30 * 24 * 60 * 60 * 1000);
 
@@ -4335,6 +4372,7 @@ async fn recovery_finishes_every_page_of_pending_events() {
         kr_controller::push::runtime::Cadence {
             pass: std::time::Duration::from_millis(20),
             questions: std::time::Duration::from_secs(60 * 60),
+            ..kr_controller::push::runtime::Cadence::DEFAULT
         },
         tokio::runtime::Handle::current(),
     );
@@ -4432,6 +4470,7 @@ async fn a_recovery_that_fails_is_tried_again_before_anything_is_delivered() {
         kr_controller::push::runtime::Cadence {
             pass: std::time::Duration::from_millis(20),
             questions: std::time::Duration::from_secs(60 * 60),
+            ..kr_controller::push::runtime::Cadence::DEFAULT
         },
         tokio::runtime::Handle::current(),
     );
@@ -4714,4 +4753,342 @@ async fn a_preview_key_recovery_that_cannot_write_the_directory_says_so_and_can_
         .expect("the record");
     assert_eq!(stored.device_key_revision, DeviceKeyRevision::new(2));
     assert_eq!(stored.notification_preview, Some(*rotated.public()));
+}
+
+fn attempts_of(module: &DeliveryModule, notification_id: NotificationId) -> u64 {
+    module
+        .with(|producer| {
+            Ok(producer
+                .journal()
+                .delivery(notification_id)
+                .expect("a read")
+                .expect("the record")
+                .attempts)
+        })
+        .expect("a read")
+}
+
+/// The gateway's answer that it holds a notification and is retrying the provider for it.
+fn gateway_retrying() -> SendOutcome {
+    SendOutcome::Decided(Box::new(PushDeliveryAck {
+        decided_at_ms: TimestampMs::new(NOW),
+        notification_id: NotificationId::new(uuid(0)),
+        state: PushDeliveryState::Retrying,
+        suppression: Nullable::null(),
+    }))
+}
+
+fn connection_reset() -> SendOutcome {
+    SendOutcome::Unknown {
+        detail: "the connection was reset after the body was written".to_owned(),
+    }
+}
+
+/// KR-REQ-24.12: the pass's status questions and the sweep's come out of one allowance. While the
+/// gateway retries the provider, the pass asks about the notifications it is holding and the
+/// sweep about outcomes nobody knows; together they ask no more than the allowance covers. A
+/// question it cannot cover spends no attempt and keeps the record's turn, and sends go on.
+#[test]
+fn a_pass_and_a_sweep_ask_within_one_allowance_while_the_gateway_retries() {
+    let environment = environment();
+    let destination = push_destination(&environment, true);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    let retrying: Vec<NotificationId> = (1..=3)
+        .map(|number| produce_now(&environment.module, &destination, number, NOW + number))
+        .collect();
+    let unknown: Vec<NotificationId> = (4..=5)
+        .map(|number| produce_now(&environment.module, &destination, number, NOW + 10 + number))
+        .collect();
+    let credentials = held(NOW + 30 * 24 * 60 * 60 * 1000);
+    let external = ExternalDouble::answering(Vec::new());
+    let authority = Granted(BTreeSet::new());
+    environment
+        .module
+        .run_due(
+            &GatewayDouble::answering(vec![
+                gateway_retrying(),
+                gateway_retrying(),
+                gateway_retrying(),
+                connection_reset(),
+                connection_reset(),
+            ]),
+            &SilentStatus,
+            &credentials,
+            &external,
+            &authority,
+            &at(NOW + 100),
+        )
+        .expect("a pass");
+    for held_by_the_gateway in &retrying {
+        assert_eq!(
+            state_of(&environment.module, *held_by_the_gateway),
+            DeliveryState::Retrying
+        );
+    }
+    for nobody_knows in &unknown {
+        assert_eq!(
+            state_of(&environment.module, *nobody_knows),
+            DeliveryState::OutcomeUnknown
+        );
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let gateway = Arc::new(DeliveringGateway::retrying());
+    let status = kr_controller::push::status::GatewayStatus::new(
+        Arc::new(OneTransport(
+            Arc::clone(&gateway) as Arc<dyn kr_client::services::ServiceHttp>
+        )),
+        runtime.handle().clone(),
+        kr_controller::push::status::StatusAllowance {
+            burst: 4,
+            per_hour: 1,
+        },
+    );
+    let sender = GatewayDouble::queued();
+
+    // Every question about a notification the gateway holds is due, and a new one arrives.
+    let first = NOW + 100 + 2 * kr_delivery::push::BASE_BACKOFF_MS;
+    let fresh = produce_now(&environment.module, &destination, 6, first);
+    assert_eq!(
+        environment
+            .module
+            .run_due(
+                &sender,
+                &status,
+                &credentials,
+                &external,
+                &authority,
+                &at(first)
+            )
+            .expect("a pass"),
+        4,
+        "the send and three questions"
+    );
+    let polled: BTreeSet<NotificationId> = gateway.questions().into_iter().collect();
+    assert_eq!(polled, retrying.iter().copied().collect::<BTreeSet<_>>());
+    assert_eq!(
+        environment
+            .module
+            .resolve_unknown(
+                &status,
+                &credentials,
+                &at(first),
+                64,
+                std::time::Duration::from_secs(60),
+            )
+            .expect("a sweep"),
+        0
+    );
+    let questions = gateway.questions();
+    assert_eq!(
+        questions.len(),
+        4,
+        "the sweep had one question left and asked it"
+    );
+    assert_eq!(questions[3], unknown[0]);
+    let unknown_due = |at: u64| -> Vec<NotificationId> {
+        environment
+            .module
+            .with(|producer| {
+                Ok(producer
+                    .journal()
+                    .unknown_due(at, 10)
+                    .expect("a read")
+                    .into_iter()
+                    .map(|record| record.notification_id)
+                    .collect())
+            })
+            .expect("a read")
+    };
+    assert_eq!(
+        unknown_due(first),
+        vec![unknown[1]],
+        "the record it could not ask about keeps its turn"
+    );
+
+    // The gateway is still retrying, and every question falls due again inside the hour. None of
+    // them is asked and none spends an attempt, and a new notification is sent all the same.
+    let second = first + 5 * 60 * 1000;
+    let waiting: Vec<NotificationId> = retrying
+        .iter()
+        .copied()
+        .chain(std::iter::once(unknown[0]))
+        .collect();
+    let attempts_before: Vec<u64> = waiting
+        .iter()
+        .map(|id| attempts_of(&environment.module, *id))
+        .collect();
+    let newer = produce_now(&environment.module, &destination, 7, second);
+    assert_eq!(
+        environment
+            .module
+            .run_due(
+                &sender,
+                &status,
+                &credentials,
+                &external,
+                &authority,
+                &at(second)
+            )
+            .expect("a pass"),
+        1,
+        "only the send"
+    );
+    assert_eq!(gateway.questions().len(), 4);
+    assert_eq!(
+        sender
+            .sent()
+            .iter()
+            .map(|request| request.notification_id)
+            .collect::<Vec<_>>(),
+        vec![fresh, newer]
+    );
+    assert_eq!(
+        waiting
+            .iter()
+            .map(|id| attempts_of(&environment.module, *id))
+            .collect::<Vec<_>>(),
+        attempts_before,
+        "a question not asked spends no attempt"
+    );
+    let still_due: BTreeSet<NotificationId> = environment
+        .module
+        .with(|producer| {
+            Ok(producer
+                .journal()
+                .due(second, 10)
+                .expect("a read")
+                .into_iter()
+                .map(|due| due.notification_id)
+                .collect())
+        })
+        .expect("a read");
+    assert_eq!(
+        still_due,
+        waiting.iter().copied().collect::<BTreeSet<_>>(),
+        "and each keeps its place in the outbox"
+    );
+    for id in &waiting {
+        assert_eq!(state_of(&environment.module, *id), DeliveryState::Retrying);
+    }
+
+    // An hour after the burst the allowance has one question again, and the record the sweep could
+    // not reach is the one it asks about.
+    let later = first + 60 * 60 * 1000;
+    environment
+        .module
+        .resolve_unknown(
+            &status,
+            &credentials,
+            &at(later),
+            64,
+            std::time::Duration::from_secs(60),
+        )
+        .expect("a sweep");
+    let questions = gateway.questions();
+    assert_eq!(questions.len(), 5);
+    assert_eq!(questions[4], unknown[1]);
+}
+
+/// KR-REQ-24.12: in the daemon the pass loop and the question loop run at once, and both find
+/// questions due while the gateway retries the provider. Together they put no more than the
+/// allowance's burst, and a notification produced meanwhile is delivered all the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn both_loops_ask_within_one_allowance_while_the_gateway_retries() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let module = Arc::new(
+        DeliveryModule::open_at(
+            &directory.path().join("delivery.sqlite3"),
+            kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
+            kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+        )
+        .expect("a delivery module"),
+    );
+    let now = kr_ipc::now_ms().get();
+    let earlier = now - 10 * 60 * 1000;
+    let device = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair");
+    let destination = DestinationRecord {
+        configured_at_ms: TimestampMs::new(earlier),
+        destination: Destination::Push(Box::new(PushDestination {
+            installation_id: InstallationId::new(uuid(2)),
+            sender_record_id: PushSenderRecordId::new(uuid(3)),
+            preview_keys: PreviewKeys::only(*device.public(), 1),
+            previews_enabled: true,
+            mailbox_key: None,
+        })),
+        ..webhook(Idempotency::Unsupported)
+    };
+    module.configure(&destination).expect("a destination");
+    // Ten minutes ago the gateway took three that it is still retrying the provider for, and two
+    // more went out on connections that were reset.
+    let candidates: BTreeSet<NotificationId> = (1..=5)
+        .map(|number| produce_now(&module, &destination, number, earlier + number))
+        .collect();
+    let credentials = Arc::new(HeldCredentials::new());
+    credentials.hold(current_credential(now));
+    module
+        .run_due(
+            &GatewayDouble::answering(vec![
+                gateway_retrying(),
+                gateway_retrying(),
+                gateway_retrying(),
+                connection_reset(),
+                connection_reset(),
+            ]),
+            &SilentStatus,
+            credentials.as_ref(),
+            &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
+            &at(earlier + 100),
+        )
+        .expect("a pass");
+
+    let runtime = kr_controller::push::runtime::DeliveryRuntime::new(
+        Arc::clone(&module),
+        credentials,
+        Arc::new(Granted(BTreeSet::new())),
+        Arc::new(kr_controller::push::sender::HostSigner::new(
+            kr_crypto::keys::AuthorisationKeyPair::generate().expect("a key"),
+        )),
+        kr_controller::push::runtime::Cadence {
+            pass: std::time::Duration::from_millis(20),
+            questions: std::time::Duration::from_millis(20),
+            status: kr_controller::push::status::StatusAllowance {
+                burst: 4,
+                per_hour: 1,
+            },
+        },
+        tokio::runtime::Handle::current(),
+    );
+    runtime.start().await;
+    let gateway = Arc::new(DeliveringGateway::retrying());
+    assert!(runtime.attach_transport(Arc::new(OneTransport(
+        Arc::clone(&gateway) as Arc<dyn kr_client::services::ServiceHttp>
+    ))));
+    let fresh = produce_now(&module, &destination, 6, kr_ipc::now_ms().get());
+    until_state(&module, fresh, DeliveryState::Accepted).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while gateway.questions().len() < 4 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the allowance was not used"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    // Dozens more passes and sweeps, each of which finds a question due and may not ask it.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let questions = gateway.questions();
+    assert_eq!(
+        questions.len(),
+        4,
+        "the burst and nothing more inside the hour: {questions:?}"
+    );
+    assert!(questions.iter().all(|id| candidates.contains(id)));
+    assert_eq!(gateway.delivered(), vec![fresh], "the send went ahead");
 }

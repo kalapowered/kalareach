@@ -358,7 +358,9 @@ impl DeliveryModule {
     /// journal offers the records whose turn it is, each record considered and left unresolved has
     /// its next turn pushed back ([`kr_delivery::journal::DeliveryJournal::note_question`]), and
     /// the batch is bounded by count and by time. A backlog of old records the gateway holds
-    /// nothing for therefore cannot keep a newer one from being asked.
+    /// nothing for therefore cannot keep a newer one from being asked. Each question is taken from
+    /// the allowance the pass's own status questions come out of ([`DeliveryStatus::reserve`]),
+    /// and the sweep stops where the allowance does: the records it did not reach keep their turn.
     ///
     /// A record for a destination with no such question - an external service - never reaches
     /// here: its uncertainty is marked at the attempt instead, which is section 25's own rule.
@@ -407,7 +409,12 @@ impl DeliveryModule {
             if fenced {
                 return Ok(resolved);
             }
-            let settled = self.ask_about(&record, generation, status, credentials, clock)?;
+            let settled = match self.ask_about(&record, generation, status, credentials, clock)? {
+                // Nothing more can be asked until the allowance comes back, and this record was
+                // not asked about, so its turn stays where it is.
+                Considered::KeepsItsTurn => break,
+                Considered::HadItsTurn(settled) => settled,
+            };
             // What the journal wrote, not what this host proposed. An answer that leaves the
             // outcome where it was, and an answer that asks for another question later, have both
             // resolved nothing; counting either would report a question as answered while the
@@ -428,7 +435,7 @@ impl DeliveryModule {
         Ok(resolved)
     }
 
-    /// Asks about one unknown outcome, and returns the state the journal wrote for it, if any.
+    /// Asks about one unknown outcome, when it may and the allowance covers the question.
     fn ask_about(
         &self,
         record: &kr_delivery::journal::DeliveryRecord,
@@ -436,9 +443,9 @@ impl DeliveryModule {
         status: &dyn DeliveryStatus,
         credentials: &dyn SenderCredentials,
         clock: &dyn Clock,
-    ) -> Result<Option<DeliveryState>> {
+    ) -> Result<Considered> {
         if record.privacy_generation != generation {
-            return Ok(None);
+            return Ok(Considered::HadItsTurn(None));
         }
         let Some(destination) = self.with(|producer| {
             producer
@@ -447,26 +454,29 @@ impl DeliveryModule {
                 .map_err(unavailable)
         })?
         else {
-            return Ok(None);
+            return Ok(Considered::HadItsTurn(None));
         };
         // The same authorisation this was admitted under, or no question: a destination that
         // is disabled, or one whose configuration is no longer the one this was admitted for,
         // is not one this host may name its own work to.
         if !destination.enabled || destination.binding_digest() != record.destination_digest {
-            return Ok(None);
+            return Ok(Considered::HadItsTurn(None));
         }
         let Some(push) = destination.as_push() else {
-            return Ok(None);
+            return Ok(Considered::HadItsTurn(None));
         };
         let Some(credential) = credentials.current(push.sender_record_id) else {
-            return Ok(None);
+            return Ok(Considered::HadItsTurn(None));
         };
+        if !status.reserve(clock.now_ms()) {
+            return Ok(Considered::KeepsItsTurn);
+        }
         let answer = status.status(&credential, record.notification_id);
         let now_ms = clock.now_ms();
         let StatusAnswer::Recorded(ack) = answer else {
             // Nobody answered, or the gateway holds nothing under that identifier. Neither
             // says what became of the notification, so neither settles it.
-            return Ok(None);
+            return Ok(Considered::HadItsTurn(None));
         };
         let decision = kr_delivery::push::decide(
             &kr_delivery::push::SendOutcome::Decided(ack),
@@ -487,6 +497,7 @@ impl DeliveryModule {
                 .settle_receipt(record.notification_id, &decision, now_ms)
                 .map_err(unavailable)
         })
+        .map(Considered::HadItsTurn)
     }
 
     /// Drives one pass of the outbox.
@@ -538,6 +549,13 @@ impl DeliveryModule {
             // the pass: a pass that blocked on the previous destination for a minute would
             // otherwise claim this one against a time that has gone.
             let now_ms = clock.now_ms();
+            // A status question comes out of the allowance the sweep of unknown outcomes draws on
+            // as well. One the allowance cannot cover yet is left as it is, due, for a later
+            // pass: nothing is claimed, so no attempt is spent. The selection offers sends first,
+            // so a question left here holds no send back.
+            if selection.next == NextAction::Receipt && !status.reserve(now_ms) {
+                continue;
+            }
             let claim = self.with(|producer| {
                 producer
                     .journal_mut()
@@ -894,6 +912,16 @@ impl DeliveryModule {
             Ok(())
         })
     }
+}
+
+/// What the sweep of unknown outcomes did with one record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Considered {
+    /// The record had its turn, and the journal wrote this state for it, if any: a question was
+    /// put, or none was because this host may no longer ask about the record.
+    HadItsTurn(Option<DeliveryState>),
+    /// The allowance had no question left, so nothing was asked and the record keeps its turn.
+    KeepsItsTurn,
 }
 
 /// The preview key a device registered, as its request carries it.

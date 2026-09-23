@@ -533,6 +533,8 @@ pub struct DueDelivery {
     pub expires_at_ms: TimestampMs,
     /// The privacy generation it was admitted under.
     pub privacy_generation: u64,
+    /// What its next attempt is: a send, a renewal and then a send, or a status question.
+    pub next: crate::push::NextAction,
     /// The bytes to send.
     pub content: Vec<u8>,
 }
@@ -1871,6 +1873,11 @@ impl DeliveryJournal {
     /// which carries the notification identifier and nothing else. Anything that would present a
     /// request needs one to present.
     ///
+    /// Records that present a request come before status questions, each in the order they fell
+    /// due. A question is asked only within the gateway's hourly allowance, and a pass leaves one
+    /// that does not fit where it is; ordered by due time alone, a backlog of those would fill
+    /// every selection and hold back sends the allowance has nothing to do with.
+    ///
     /// # Errors
     ///
     /// Returns [`DeliveryError::JournalUnavailable`] when the read fails.
@@ -1881,14 +1888,14 @@ impl DeliveryJournal {
         let generation = self.generation()?;
         let mut statement = self.connection.prepare(
             "SELECT n.notification_id, n.destination_id, n.attempts, n.expires_at_ms,
-                    n.privacy_generation, n.content
+                    n.privacy_generation, n.content, o.next_action
                FROM delivery_outbox o JOIN delivery_notifications n
                  ON n.notification_id = o.notification_id
               WHERE o.due_at_ms <= ?1
                 AND (n.content IS NOT NULL OR o.next_action = 'receipt')
                 AND n.expires_at_ms > ?1
                 AND n.privacy_generation = ?3
-              ORDER BY o.due_at_ms, n.admitted_at_ms
+              ORDER BY o.next_action = 'receipt', o.due_at_ms, n.admitted_at_ms
               LIMIT ?2",
         )?;
         let rows = statement.query_map(
@@ -1901,18 +1908,24 @@ impl DeliveryJournal {
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_default(),
+                    row.get::<_, String>(6)?,
                 ))
             },
         )?;
         let mut due = Vec::new();
         for row in rows {
-            let (identifier, destination, attempts, expires, generation, content) = row?;
+            let (identifier, destination, attempts, expires, generation, content, next) = row?;
             due.push(DueDelivery {
                 notification_id: parse_notification(&identifier)?,
                 destination_id: DestinationId::new(destination)?,
                 attempts: as_u64(attempts),
                 expires_at_ms: TimestampMs::new(as_u64(expires)),
                 privacy_generation: as_u64(generation),
+                next: crate::push::NextAction::from_stored(&next).ok_or(
+                    DeliveryError::JournalUnreadable(
+                        "a stored next action is not one this build writes",
+                    ),
+                )?,
                 content,
             });
         }
@@ -5655,6 +5668,75 @@ mod tests {
         assert_eq!(
             crate::push::question_backoff_ms(u64::MAX),
             crate::push::MAX_QUESTION_BACKOFF_MS
+        );
+    }
+
+    /// A status question waits for the gateway's allowance and a send does not, so the selection
+    /// offers sends first: a question that fell due earlier comes after them, and a backlog of
+    /// questions the allowance cannot cover yet never fills a pass.
+    #[test]
+    fn sends_are_selected_before_status_questions_that_fell_due_earlier() {
+        let mut journal = journal();
+        let phone = phone();
+        journal
+            .configure_destination(&phone)
+            .expect("a destination");
+        for byte in 1..=2 {
+            journal
+                .take_events(
+                    &consumer(),
+                    &[taken(byte, u64::from(byte))],
+                    u64::from(byte),
+                )
+                .expect("a page");
+        }
+        // The gateway is holding the first and retrying the provider; the question about it fell
+        // due at 3,000.
+        journal
+            .admit(&delivery_for(9, event(1), &phone))
+            .expect("admitted");
+        claim(&mut journal, 9, 2_000);
+        journal
+            .record_attempt(&Transition {
+                notification_id: NotificationId::new(uuid(9)),
+                attempt: 1,
+                state: DeliveryState::Retrying,
+                started_at_ms: TimestampMs::new(2_000),
+                settled_at_ms: Some(TimestampMs::new(2_010)),
+                next_attempt_at_ms: Some(TimestampMs::new(3_000)),
+                next: crate::push::NextAction::Receipt,
+                detail: Some("the gateway is retrying the provider".to_owned()),
+                suppression: None,
+                left_this_host: true,
+                reported_by_destination: true,
+            })
+            .expect("a transition");
+        // The second was admitted afterwards and has never been sent.
+        journal
+            .admit(&DeliveryRecord {
+                admitted_at_ms: TimestampMs::new(4_000),
+                ..delivery_for(10, event(2), &phone)
+            })
+            .expect("admitted");
+
+        let one = journal.due(10_000, 1).expect("a read");
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].notification_id, NotificationId::new(uuid(10)));
+        assert_eq!(one[0].next, crate::push::NextAction::Send);
+        let every = journal.due(10_000, 10).expect("a read");
+        assert_eq!(
+            every
+                .iter()
+                .map(|due| (due.notification_id, due.next))
+                .collect::<Vec<_>>(),
+            vec![
+                (NotificationId::new(uuid(10)), crate::push::NextAction::Send),
+                (
+                    NotificationId::new(uuid(9)),
+                    crate::push::NextAction::Receipt
+                ),
+            ],
+            "the question is still offered, after the send"
         );
     }
 }

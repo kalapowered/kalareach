@@ -87,11 +87,19 @@ claims and sends whatever is due.
 
 Every few minutes, on a loop of its own, the daemon renews delivery credentials inside their renewal
 window, so a credential is current before a notification needs it, and asks about outcomes nobody
-knows. The gateway counts those questions against an hourly allowance, so they are rationed: a
-bounded batch at a time, within a time limit, and a question that finds nothing waits longer before
-it is asked again, so an old backlog cannot keep a newer notification from being asked about. An
-old notification is asked about less often, never dropped: the gateway keeps an answer for a time
-that runs from its own decision, which the host cannot see.
+knows. Those questions are rationed: a bounded batch at a time, within a time limit, and a question
+that finds nothing waits longer before it is asked again, so an old backlog cannot keep a newer
+notification from being asked about. An old notification is asked about less often, never dropped:
+the gateway keeps an answer for a time that runs from its own decision, which the host cannot see.
+
+The gateway allows each host 1,200 status questions an hour, and each installation the same, and it
+counts them whichever loop asks: the pass asking about a notification the gateway is still retrying,
+or the sweep over unknown outcomes. Both loops take their questions from one allowance: a burst of
+100, then one every 3.6 seconds, so no hour sees more than 1,100 wherever it starts. Every question
+about an installation is also one of the host's own, so the host's allowance covers both limits. A
+question the allowance cannot cover yet is not put. A pass leaves that notification due and spends no
+attempt on it, and it takes sends before questions, so a backlog of questions never holds a send
+back. A sweep stops, and the records it did not reach keep their turn.
 
 Every exchange goes to an origin the delivery already knows. A notification, a status question and
 a renewal go to the gateway the delivery credential names, which is the gateway that issued it; a

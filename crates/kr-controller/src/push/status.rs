@@ -21,8 +21,16 @@
 //! nobody answered has reconciled nothing: the record keeps its unknown outcome, keeps counting as
 //! outstanding, and stays in the retained artifacts a person is shown. It is never settled by
 //! assuming what the silence meant.
+//!
+//! # How many questions
+//!
+//! A gateway allows each host a number of status questions an hour, and each installation the
+//! same number, and it counts every question whichever of the host's paths put it: a pass asking
+//! about a notification the gateway is still retrying, and the sweep over outcomes nobody knows.
+//! So both paths take their questions from one [`StatusBudget`], held by the one [`GatewayStatus`]
+//! a daemon asks through, and a question the budget cannot cover is not put.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use kr_client::services::ServiceHttpAnswer;
 use kr_delivery::push::{DeliveryStatus, StatusAnswer};
@@ -38,23 +46,114 @@ pub const STATUS_ROUTE: &str = "/api/push/deliver/status";
 /// The most bytes this client reads from an answer.
 pub const MAX_ANSWER_BYTES: usize = 16 * 1024;
 
+/// How many status questions a gateway takes in an hour from one host, and about one
+/// installation's notifications: its `DELIVERY_STATUS_LIMIT`, counted in fixed windows of an hour.
+pub const GATEWAY_STATUS_LIMIT: u64 = 1_200;
+
+const MS_PER_HOUR: u64 = 60 * 60 * 1_000;
+
+/// How many status questions a host allows itself.
+///
+/// One allowance for the host covers both of the gateway's counts. Every question this host puts
+/// about an installation's notifications is also one of the host's own, so the installation's
+/// count from this host can never pass the host's. Another host asking about the same
+/// installation counts there as well, which no host can see; a question the gateway refuses for
+/// that reason resolves nothing, and the record is asked about again later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatusAllowance {
+    /// How many may be asked together after a quiet spell. At least one.
+    pub burst: u64,
+    /// How many more an hour, at an even rate. At least one.
+    pub per_hour: u64,
+}
+
+impl StatusAllowance {
+    /// A burst of 100 and then one question every 3.6 seconds: at most 1,100 in any hour, under
+    /// the gateway's [`GATEWAY_STATUS_LIMIT`]. The margin covers a daemon that starts again inside
+    /// the hour, whose allowance starts with a burst of its own.
+    pub const GATEWAY: Self = Self {
+        burst: 100,
+        per_hour: 1_000,
+    };
+
+    /// The most questions this allowance lets through in any hour, wherever the hour starts.
+    #[must_use]
+    pub const fn most_in_an_hour(self) -> u64 {
+        self.burst.saturating_add(self.per_hour)
+    }
+}
+
+/// The status questions this host may still ask.
+///
+/// A generic cell rate: every question moves a theoretical time on by one interval, and a question
+/// is refused while that time is further ahead of the clock than the burst allows. In any hour it
+/// therefore lets through at most [`StatusAllowance::most_in_an_hour`], wherever the hour starts,
+/// which is what a gateway counting in fixed windows needs. A clock that jumps forward gives back
+/// one burst at most; one that goes back refuses until it has caught up.
+#[derive(Debug)]
+pub struct StatusBudget {
+    interval_ms: u64,
+    tolerance_ms: u64,
+    theoretical_ms: Mutex<u64>,
+}
+
+impl StatusBudget {
+    /// A budget that starts with its whole burst.
+    #[must_use]
+    pub fn new(allowance: StatusAllowance) -> Self {
+        // Rounded up, so the rate is never faster than the allowance says.
+        let interval_ms = MS_PER_HOUR.div_ceil(allowance.per_hour.max(1));
+        Self {
+            interval_ms,
+            tolerance_ms: allowance
+                .burst
+                .max(1)
+                .saturating_sub(1)
+                .saturating_mul(interval_ms),
+            theoretical_ms: Mutex::new(0),
+        }
+    }
+
+    /// Takes one question at `now_ms`, and says whether there was one to take.
+    #[must_use]
+    pub fn take(&self, now_ms: u64) -> bool {
+        let Ok(mut theoretical) = self.theoretical_ms.lock() else {
+            return false;
+        };
+        let from = (*theoretical).max(now_ms);
+        if from - now_ms > self.tolerance_ms {
+            return false;
+        }
+        *theoretical = from.saturating_add(self.interval_ms);
+        true
+    }
+}
+
 /// The gateway this host asks about its own deliveries.
 ///
 /// The HTTP exchange is the embedder's, as it is everywhere else a managed service is reached: the
-/// daemon attaches the managed transport, and a test attaches a recorder.
+/// daemon attaches the managed transport, and a test attaches a recorder. A clone asks within the
+/// same budget.
 #[derive(Clone, Debug)]
 pub struct GatewayStatus {
     transports: Arc<dyn DeliveryTransports>,
     runtime: tokio::runtime::Handle,
+    budget: Arc<StatusBudget>,
 }
 
 impl GatewayStatus {
-    /// Builds a status client over the transports this host reaches its gateways through.
+    /// Builds a status client over the transports this host reaches its gateways through, asking
+    /// within `allowance`.
     #[must_use]
-    pub fn new(transports: Arc<dyn DeliveryTransports>, runtime: tokio::runtime::Handle) -> Self {
+    pub fn new(
+        transports: Arc<dyn DeliveryTransports>,
+        runtime: tokio::runtime::Handle,
+        allowance: StatusAllowance,
+    ) -> Self {
         Self {
             transports,
             runtime,
+            budget: Arc::new(StatusBudget::new(allowance)),
         }
     }
 
@@ -81,6 +180,10 @@ impl GatewayStatus {
 }
 
 impl DeliveryStatus for GatewayStatus {
+    fn reserve(&self, now_ms: u64) -> bool {
+        self.budget.take(now_ms)
+    }
+
     fn status(
         &self,
         credential: &PushDeliveryCredential,
@@ -152,4 +255,76 @@ struct StatusRequest {
 struct Envelope {
     ok: bool,
     data: Option<PushDeliveryAck>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_budget_lets_its_burst_through_and_then_one_question_an_interval() {
+        let budget = StatusBudget::new(StatusAllowance {
+            burst: 3,
+            per_hour: 60,
+        });
+        let now = 1_700_000_000_000;
+        assert!(budget.take(now));
+        assert!(budget.take(now));
+        assert!(budget.take(now));
+        assert!(!budget.take(now), "the burst is spent");
+        assert!(!budget.take(now + 59_999));
+        assert!(budget.take(now + 60_000), "one more a minute");
+        assert!(!budget.take(now + 60_000));
+        assert!(
+            budget.take(now + 10 * 60_000),
+            "and after a quiet spell the burst is back"
+        );
+        assert!(budget.take(now + 10 * 60_000));
+        assert!(budget.take(now + 10 * 60_000));
+        assert!(
+            !budget.take(now + 10 * 60_000),
+            "but never more than the burst"
+        );
+    }
+
+    #[test]
+    fn a_clock_that_goes_back_is_refused_until_it_catches_up() {
+        let budget = StatusBudget::new(StatusAllowance {
+            burst: 1,
+            per_hour: 60,
+        });
+        let now = 1_700_000_000_000;
+        assert!(budget.take(now));
+        assert!(!budget.take(now - 1_000));
+        assert!(budget.take(now + 60_000));
+    }
+
+    /// The gateway counts in fixed windows of an hour that start wherever its first question falls,
+    /// so the allowance has to hold for every hour, not only the hours a clock would name. Asked as
+    /// often as it allows for three hours, no hour sees more than the gateway takes.
+    #[test]
+    fn the_gateway_allowance_stays_under_the_gateway_limit_in_every_hour() {
+        let allowance = StatusAllowance::GATEWAY;
+        assert!(allowance.most_in_an_hour() < GATEWAY_STATUS_LIMIT);
+        let budget = StatusBudget::new(allowance);
+        let start = 1_700_000_000_000;
+        let taken: Vec<u64> = (0..3 * MS_PER_HOUR / 100)
+            .map(|step| start + step * 100)
+            .filter(|&at| budget.take(at))
+            .collect();
+        assert!(taken.len() as u64 > 3 * allowance.per_hour, "it is used");
+        let mut busiest = 0;
+        for (index, &from) in taken.iter().enumerate() {
+            let within = taken[index..].partition_point(|&at| at < from + MS_PER_HOUR);
+            busiest = busiest.max(within as u64);
+        }
+        assert!(
+            busiest <= allowance.most_in_an_hour(),
+            "{busiest} in one hour"
+        );
+        assert!(
+            busiest > allowance.per_hour,
+            "and the busiest hour had its burst"
+        );
+    }
 }

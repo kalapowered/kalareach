@@ -13,9 +13,13 @@
 //! 3. **Questions on their own loop**, every [`Cadence::questions`]: credentials inside their
 //!    renewal window are renewed ahead of need, and a bounded batch of the outcomes nobody knows
 //!    is asked about, within a time budget ([`HeldCredentials::renew_due`] and
-//!    [`DeliveryModule::resolve_unknown`]). The gateway counts status questions against an hourly
-//!    allowance, and a slow answer must not hold a notification back, so the questions are
-//!    rationed and never run on the loop that delivers.
+//!    [`DeliveryModule::resolve_unknown`]). A slow answer must not hold a notification back, so
+//!    these questions never run on the loop that delivers.
+//!
+//! The gateway counts status questions against an hourly allowance whichever loop asks them, so
+//! both loops ask through one [`GatewayStatus`], and every question either loop puts comes out of
+//! its one budget, [`Cadence::status`]. The pass's questions come first in practice: it runs every
+//! second, and the sweep has what they leave.
 //!
 //! A pass blocks: it opens connections and waits for gateways, and the journal is behind a
 //! synchronous lock. So every pass runs on a blocking thread and its loop waits for it, which also
@@ -40,33 +44,35 @@ use super::client::GatewayClient;
 use super::credentials::HeldCredentials;
 use super::external::WebhookSender;
 use super::sender::GatewaySenders;
-use super::status::GatewayStatus;
+use super::status::{GatewayStatus, StatusAllowance};
 use super::transport::DeliveryTransports;
 use super::{Clock, DeliveryModule, SystemClock};
 
-/// How often the runtime works.
+/// How often the runtime works, and how often it may ask a gateway anything.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cadence {
     /// How often the outbox is driven.
     pub pass: Duration,
     /// How often credentials are renewed ahead of need and unknown outcomes are asked about.
     pub questions: Duration,
+    /// The status questions both loops share.
+    pub status: StatusAllowance,
 }
 
 impl Cadence {
     /// A pass every second, because a notification that waits for the next pass waits that long,
-    /// and questions every five minutes.
+    /// questions every five minutes, and the status allowance a gateway grants.
     pub const DEFAULT: Self = Self {
         pass: Duration::from_secs(1),
         questions: Duration::from_secs(5 * 60),
+        status: StatusAllowance::GATEWAY,
     };
 }
 
 /// The most unknown outcomes one sweep asks about.
 ///
-/// Sixty every five minutes is 720 an hour, inside the gateway's allowance of 1,200 status
-/// questions an hour for one host and installation, with room for the questions a pass asks
-/// about notifications the gateway is still retrying.
+/// Sixty every five minutes is at most 720 an hour, which leaves the pass room in the shared
+/// allowance even when the sweep has a backlog. What bounds the two together is the allowance.
 pub const QUESTIONS_PER_SWEEP: usize = 60;
 
 /// The longest one sweep of questions may take.
@@ -144,7 +150,11 @@ impl DeliveryRuntime {
             .adapters
             .set(Adapters {
                 sender: GatewayClient::new(Arc::clone(&transports), self.runtime.clone()),
-                status: GatewayStatus::new(Arc::clone(&transports), self.runtime.clone()),
+                status: GatewayStatus::new(
+                    Arc::clone(&transports),
+                    self.runtime.clone(),
+                    self.cadence.status,
+                ),
                 external: WebhookSender::new(Arc::clone(&transports), self.runtime.clone()),
             })
             .is_ok();
