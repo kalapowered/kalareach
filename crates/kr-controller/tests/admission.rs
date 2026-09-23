@@ -115,6 +115,31 @@ fn the_same_token_from_another_actor_is_a_different_intent() {
     assert_ne!(second.reservation.session_id, first.reservation.session_id);
 }
 
+/// KR-REQ-06.02: every new execution is given a new random session identifier. No create reuses
+/// one, even when the same actor sends the same request again under a new create token.
+#[test]
+fn every_new_execution_is_given_a_new_session_identifier() {
+    let (_host, mut registry) = registry();
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..8 {
+        let admission = registry
+            .reserve(
+                &actor("local:501"),
+                kr_ipc::new_uuid(),
+                digest(7),
+                &intent(),
+                TimestampMs::new(1),
+            )
+            .expect("reserves");
+        assert!(!admission.deduplicated);
+        assert_eq!(admission.reservation.session_id.get().version(), 4);
+        assert!(
+            seen.insert(admission.reservation.session_id),
+            "a new execution reused a session identifier"
+        );
+    }
+}
+
 #[test]
 fn the_limit_refuses_before_anything_is_spawned_and_never_evicts() {
     let (_host, mut registry) = registry();

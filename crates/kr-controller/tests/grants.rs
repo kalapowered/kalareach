@@ -16,6 +16,7 @@
 //! | KR-REQ-17.54 | `an_expired_membership_blocks_organisation_mediated_work_on_a_live_transport`, `personal_access_survives_an_organisation_outage_unless_the_host_is_exclusively_managed` |
 //! | KR-REQ-19.02 | `a_delegation_cannot_grant_a_right_the_delegating_actor_lacks` |
 //! | KR-REQ-23.27 | `a_local_revocation_advances_the_revision_fences_the_leases_and_reports_per_worker`, `a_device_revocation_takes_every_grant_that_device_held` |
+//! | KR-REQ-23.53 | `a_composite_method_needs_every_right_its_entry_lists` |
 //! | KR-REQ-24.15 | `expiry_is_revalidated_after_a_wake_and_a_restored_old_policy_cannot_revive_authority` |
 
 use std::sync::Arc;
@@ -644,6 +645,58 @@ fn a_method_is_decided_from_the_registry_table_and_never_from_a_capability() {
     for right in ActionRight::ALL {
         assert_eq!(ActionRight::from_wire(right.as_str()), Some(*right));
     }
+}
+
+/// KR-REQ-23.53: a composite method needs every right its entry lists. Holding one of two is
+/// refused for the other, whichever one is missing, and only a grant holding both is permitted.
+#[test]
+fn a_composite_method_needs_every_right_its_entry_lists() {
+    let method = Method::AgentDraftAddAttachment;
+    let required = unconditional_rights_for(method);
+    assert!(
+        required.contains(&ActionRight::FilesUpload)
+            && required.contains(&ActionRight::AgentPrompt),
+        "the entry lists both rights: {required:?}"
+    );
+    let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
+    for (held, missing) in [
+        (ActionRight::FilesUpload, ActionRight::AgentPrompt),
+        (ActionRight::AgentPrompt, ActionRight::FilesUpload),
+    ] {
+        let partial = grant(
+            1,
+            None,
+            &[ActionRight::SessionView, held],
+            GrantExpiry::Never,
+        );
+        assert_eq!(
+            decide(
+                &partial,
+                &record(partial.clone()),
+                &mut policy,
+                request(method, 5_000)
+            ),
+            Err(Refusal::MissingRight { right: missing }),
+            "holding {held} alone"
+        );
+    }
+    let both = grant(
+        1,
+        None,
+        &[
+            ActionRight::SessionView,
+            ActionRight::FilesUpload,
+            ActionRight::AgentPrompt,
+        ],
+        GrantExpiry::Never,
+    );
+    decide(
+        &both,
+        &record(both.clone()),
+        &mut policy,
+        request(method, 5_000),
+    )
+    .expect("a grant holding every listed right");
 }
 
 /// A decision that could not answer every requirement says which ones it left.
