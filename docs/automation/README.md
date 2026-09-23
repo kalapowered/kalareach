@@ -260,7 +260,10 @@ no output, no terminal text.
 The contract with every consumer:
 
 * **What a consumer reads.** Events of the types it registered for, in the order of their
-  position in the stream. An event is never rewritten, and its position never changes.
+  position in the stream. An event is never rewritten, and its position never changes. Positions
+  only increase and are not dense: every type shares one stream, so the events other consumers
+  read sit between the ones a consumer registered for. A consumer keeps the last position it read
+  and never takes the next event's position to be one more.
 * **How it records where it is.** A consumer acts on an event and then records its position. A
   consumer whose effects are in the same journal, the trigger dispatcher among them, commits its
   effect and its new position in one transaction; a pass that stops at one event keeps the runs it
@@ -272,7 +275,11 @@ The contract with every consumer:
   removed.
 
 The attention records wait in the stream under that rule. The environment's attention state is the
-consumer they are for; until it registers, nothing removes them. `workflow.read` shows each
+consumer they are for; until it registers, nothing removes them. The attention state treats a jump
+in a source's sequence as records that retention removed, so before each record the attention
+consumer tells it that the source stands just before that record: the positions between are the
+events it read past, not missing history. An attention state that is behind even the last
+position the consumer read has lost records delivered to it, and records that gap itself. `workflow.read` shows each
 revision's pause and lists the alerts no attention state has taken, for the workflows and chains the
 read covers, newest 256 at most.
 

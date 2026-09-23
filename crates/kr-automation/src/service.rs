@@ -1005,6 +1005,13 @@ impl AutomationService {
     /// delivered under its own position in the stream, which never changes, so a redelivery
     /// replays a sequence the attention state has already consumed and changes nothing.
     ///
+    /// The stream's positions only increase; they are not dense. Between two attention records
+    /// sit the events other consumers read, and this consumer reads past them. It keeps the last
+    /// position it read, and before each record it tells the attention state that the source
+    /// stands just before that record, so the rows it read past are not taken for records that
+    /// retention removed. An attention state that is behind even the last position read has lost
+    /// records that were delivered to it, and is left to record that gap itself.
+    ///
     /// `source` is the retained source the host has given this journal. It must not be shared
     /// with another producer, because the sequence numbers here are the journal's positions.
     ///
@@ -1020,10 +1027,15 @@ impl AutomationService {
         reading: HostReading,
         now_ms: u64,
     ) -> Result<usize> {
-        self.store
-            .register_consumer(ATTENTION_CONSUMER, ATTENTION_EVENTS, now_ms)?;
+        let mut last_read =
+            self.store
+                .register_consumer(ATTENTION_CONSUMER, ATTENTION_EVENTS, now_ms)?;
         let mut raised = 0;
         for record in self.store.pending_attention()? {
+            let stands = attention.engine()?.consumed(source).unwrap_or(0);
+            if stands >= last_read && record.sequence > last_read.saturating_add(1) {
+                attention.start_from(source, record.sequence - 1)?;
+            }
             let event = SourceEvent::new(
                 EventCursor::new(source, record.sequence),
                 TimestampMs::new(record.created_at_ms),
@@ -1046,6 +1058,7 @@ impl AutomationService {
                 .count();
             self.store
                 .acknowledge(ATTENTION_CONSUMER, record.sequence)?;
+            last_read = record.sequence;
         }
 
         Ok(raised)

@@ -307,6 +307,87 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
     assert_eq!(attention.engine().expect("the engine").items().count(), 1);
 }
 
+/// The journal's positions are not dense: a run's events sit between two attention records. The
+/// attention consumer reads past them, and the attention state is told so, so it records no
+/// history gap and marks nothing uncertain, whether the records arrive in one delivery or two.
+#[tokio::test]
+async fn run_events_between_attention_records_leave_no_history_gap() {
+    let service = in_memory();
+    let def = recurring_workflow(9, "one-shot", "tests.passed", "run_tests");
+    install_and_enable(&service, &def, 1_000);
+    let journal = tempfile::tempdir().expect("a directory for the attention state");
+    let mut attention = attention_at(&journal.path().join("attention.state"), 1_000);
+
+    // A run commits its events, then its chain runs out of time and owes an attention record.
+    let first = service
+        .submit_run(&run_params(&def, "evt-first"), 1_000)
+        .await
+        .expect("the run completes");
+    assert!(
+        service
+            .store()
+            .reserve_budget_action(first.causal_root_id, 0, 1_000 + 3_600_001)
+            .is_err(),
+        "the chain is out of lifetime"
+    );
+    let first_alert = service.store().pending_attention().expect("the journal")[0].sequence;
+    assert!(first_alert > 1, "the run's own events came first");
+    assert_eq!(
+        service
+            .deliver_attention(
+                &mut attention,
+                AttentionSource::Semantic,
+                reading(3_700_000),
+                3_700_000,
+            )
+            .expect("delivers"),
+        1
+    );
+
+    // Another run's events, then another chain's record.
+    let second = service
+        .submit_run(&run_params(&def, "evt-second"), 3_700_000)
+        .await
+        .expect("the run completes");
+    assert!(
+        service
+            .store()
+            .reserve_budget_action(second.causal_root_id, 0, 3_700_000 + 3_600_001)
+            .is_err(),
+        "the chain is out of lifetime"
+    );
+    let second_alert = service.store().pending_attention().expect("the journal")[0].sequence;
+    assert!(
+        second_alert > first_alert + 1,
+        "a run's events sit between them"
+    );
+    assert_eq!(
+        service
+            .deliver_attention(
+                &mut attention,
+                AttentionSource::Semantic,
+                reading(7_400_000),
+                7_400_000,
+            )
+            .expect("delivers"),
+        1
+    );
+
+    assert!(
+        attention.gaps().expect("the gaps").is_empty(),
+        "{:?}",
+        attention.gaps()
+    );
+    let engine = attention.engine().expect("the engine");
+    assert_eq!(engine.items().count(), 2);
+    assert!(engine.items().all(|item| !item.uncertain));
+    assert_eq!(
+        engine.consumed(AttentionSource::Semantic),
+        Some(second_alert),
+        "the state stands at the last record this consumer read"
+    );
+}
+
 fn clock_now(clock: &ManualClock) -> u64 {
     kr_automation::HostClock::now_ms(clock)
 }
