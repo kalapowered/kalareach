@@ -366,6 +366,44 @@ After a failed handshake the stream is not clean any more: a late reply could st
 a retry needs a fresh terminal and `--no-probe` on the same one is refused rather than treated as a
 purge. Calling it afterwards would not unsend the questions.
 
+### When the session closes
+
+An attachment ends when the person detaches, when another attachment takes the input lease, when the
+session closes, or when the connection to its worker ends. The command prints one line saying which,
+and exits with the status that line implies.
+
+A session closes when its root shell exits, reads the end of its input or crashes, and when somebody
+runs `kr close`. Its worker sends every attachment the session's closure record, after all the
+output that attachment was owed, and only then exits. The attachment ends with the status the record
+implies:
+
+| Status | When |
+| --- | --- |
+| 0 | The shell exited with status 0, or somebody closed the session |
+| 1 | Any other closure: the shell exited with another status, a signal ended it, it never became ready, its desktop login ended or its host shut down. A record the command could not read ends here too. The failure's code is `SESSION_CLOSED` |
+| 3 | The connection ended before any closure arrived, because the worker went without saying how the session ended or the connection was lost |
+
+The line comes from the record:
+
+```text
+the session closed: its shell exited with status 0
+the session closed: its shell exited with status 7
+the session closed: a signal ended its shell (<signal>)
+the session closed: it was closed on request
+the connection to the session ended
+```
+
+The command does not pass the shell's status through. Codes 2 to 8 already mean something here, so
+a shell that exited with 3 would look like a missing host. The status is in the line and in the
+`--json` record instead.
+
+A closing session refuses input from the moment its closure begins. Once the host has refused
+something typed at the attachment, the attachment sends nothing more. It goes on showing what the
+session writes until the closure arrives, and its line ends with `; what was typed while it was
+closing was not delivered`.
+
+`kr new` ends the same way when it attaches this terminal to the session it created.
+
 ### Nesting
 
 `kr attach` inside a KalaReach session works, and the outer session treats the inner command as an
@@ -505,12 +543,16 @@ bound to the session this process is running in. Outside a session every tool an
 | 0 | The command succeeded |
 | 1 | Something else failed |
 | 2 | The arguments are not a valid request |
-| 3 | No host is running for this environment |
+| 3 | No host is running for this environment, or the connection to it ended |
 | 4 | The named session does not exist, or the command needed one and had none |
 | 5 | A display number names sessions in more than one environment |
 | 6 | The command needed a terminal, or the terminal could not be changed |
 | 7 | No terminal application could be opened |
 | 8 | The host refused the request |
+
+`kr attach`, and `kr new` when it attaches, exit 0 when the session closed cleanly, 1 when it closed
+any other way, and 3 when the connection ended before any closure arrived. [When the session
+closes](#when-the-session-closes) says which closure is which.
 
 A `--json` failure carries the same information:
 
@@ -767,6 +809,34 @@ A closed session carries its record instead of a null:
   "closed_at_ms": 1789484611722
 }
 ```
+
+`kr new --json` adds four members to the session object. `presentation` is `attach`, `terminal` or
+`invisible`. `presentation_error` says why the session could not be shown that way, and is null
+when it was. `execution_context_chosen` says whether `--desktop` or `--headless` was given. `outcome`
+is the line the attachment of this terminal ended with, and null when there was no attachment. When
+that attachment ended with the session's closure, `state` is `closed` and `closure` is the record,
+so the document describes the session as the command leaves it.
+
+`kr attach --json` returns how the attachment ended, with the record when the session closed:
+
+```json
+{
+  "ok": true,
+  "session_id": "d6d64b2b-f6f1-4617-a07a-bb89a08cd3fd",
+  "outcome": "the session closed: its shell exited with status 0",
+  "closure": {
+    "reason": "root_exit",
+    "exit_code": 0,
+    "signal": null,
+    "ownership_coverage": "incomplete",
+    "durability": "durable",
+    "closed_at_ms": 1789484611722
+  }
+}
+```
+
+`ok` is false whenever the exit status is not 0. `closure` is null unless the attachment ended with
+a record it could read.
 
 `kr doctor --json` returns
 `{ "host": { ... }, "doctor": { ... }, "environment": { ... } }`, and exits non-zero when a check
