@@ -1163,7 +1163,51 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
     ///
     /// Returns [`PairingError::RendezvousUnavailable`].
     pub fn release(&self, rendezvous: &dyn RendezvousHost) -> Result<()> {
-        rendezvous.release_locator(&self.reservation.locator, &self.reservation.control_token)
+        rendezvous.release_locator(
+            &self.proposal.origin,
+            &self.reservation.locator,
+            &self.reservation.control_token,
+        )
+    }
+
+    /// Returns the reservation this invitation holds: its locator, and the control token the host
+    /// proves possession of to the rendezvous service when it attaches to the locator's room or
+    /// releases it. The token controls the rendezvous record and nothing about the invitation.
+    #[must_use]
+    pub const fn reservation(&self) -> &LocatorReservation {
+        &self.reservation
+    }
+
+    /// Returns the rendezvous origin the locator is reserved at.
+    #[must_use]
+    pub const fn origin(&self) -> &RendezvousOrigin {
+        &self.proposal.origin
+    }
+
+    /// Returns the expiry the rendezvous service advertises, in UTC milliseconds. The host's own
+    /// monotonic deadline is the one that decides.
+    #[must_use]
+    pub const fn advertised_expires_at_ms(&self) -> TimestampMs {
+        self.advertised_expires_at_ms
+    }
+
+    /// Consumes the invitation as expired once its deadline has passed, and does nothing before.
+    ///
+    /// Every step checks the deadline for itself. This is for a host about to offer another
+    /// invitation in this one's place, which has no step of its own to ask with and must not be
+    /// held up by an invitation nobody used before it ran out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PairingError::Store`] when the record cannot be read or written, or when a failed
+    /// write has fenced the invitation.
+    pub fn expire_if_due(&mut self) -> Result<()> {
+        self.require_not_fenced()?;
+        self.reload()?;
+        if self.is_expired() {
+            self.consume(PairingConsumedReason::Expired)?;
+        }
+        Ok(())
     }
 
     /// Decides whether a candidate may read this invitation's status.

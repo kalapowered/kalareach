@@ -124,12 +124,17 @@ pub trait RendezvousHost {
         control_token_hash: Digest256,
     ) -> Result<bool>;
 
-    /// Releases a reservation, proving possession of the control token.
+    /// Releases a reservation at `origin`, proving possession of the control token.
     ///
     /// # Errors
     ///
     /// Returns [`PairingError::RendezvousUnavailable`].
-    fn release_locator(&self, locator: &Locator, control_token: &SymmetricKey) -> Result<()>;
+    fn release_locator(
+        &self,
+        origin: &RendezvousOrigin,
+        locator: &Locator,
+        control_token: &SymmetricKey,
+    ) -> Result<()>;
 }
 
 /// The candidate's side of the rendezvous service.
@@ -1118,7 +1123,12 @@ impl RendezvousHost for TestRendezvousHost {
         Ok(true)
     }
 
-    fn release_locator(&self, locator: &Locator, control_token: &SymmetricKey) -> Result<()> {
+    fn release_locator(
+        &self,
+        _origin: &RendezvousOrigin,
+        locator: &Locator,
+        control_token: &SymmetricKey,
+    ) -> Result<()> {
         self.unreachable()?;
         let mut reserved = self.reserved.lock().expect("a test service");
         let presented = Digest256::from_bytes(kr_cbor::sha256(control_token.expose()));

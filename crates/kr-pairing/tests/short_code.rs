@@ -1842,7 +1842,10 @@ fn the_service_holds_only_the_hash_of_the_control_token_the_host_keeps() {
     let locator = host.code().locator().clone();
     let guessed = kr_crypto::secret::SymmetricKey::random().expect("a key");
     assert!(
-        harness.service.release_locator(&locator, &guessed).is_err(),
+        harness
+            .service
+            .release_locator(host.origin(), &locator, &guessed)
+            .is_err(),
         "a token the hash was not taken of releases nothing"
     );
     assert_eq!(harness.service.reserved().len(), 1);
@@ -2263,4 +2266,26 @@ fn no_bundle_moves_before_both_confirmation_tags_are_verified() {
         ),
         "the candidate trusts nothing from the host before the host's tag verifies"
     );
+}
+
+/// KR-REQ-10.33: an invitation nobody used is consumed as expired once its deadline passes, when
+/// the host asks before offering another, and not a moment before. Its reservation still names the
+/// locator and origin, so the host can release it.
+#[test]
+fn an_unused_code_invitation_is_consumed_as_expired_once_its_deadline_passes() {
+    let harness = Harness::new();
+    let mut host = harness.issue();
+    host.expire_if_due().expect("checked");
+    assert_eq!(host.record().state, InvitationState::Open);
+    harness.clock.advance(INVITATION_LIFETIME_MS);
+    host.expire_if_due().expect("checked");
+    assert_eq!(
+        host.record().state,
+        InvitationState::Consumed {
+            reason: PairingConsumedReason::Expired
+        }
+    );
+    assert_eq!(&host.reservation().locator, host.code().locator());
+    host.release(&harness.service)
+        .expect("the reservation is released at its origin");
 }
