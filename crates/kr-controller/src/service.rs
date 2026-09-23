@@ -8069,6 +8069,7 @@ mod a_create_that_launches_nothing {
     /// Reading the registration waits, and a create that queues behind a revocation taking the
     /// connection table can spend the rest of its accepted lifetime there. A registration that
     /// still stands is not permission to start a shell under a deadline that has since passed.
+    /// KR-REQ-07.10: a create's accepted deadline bounds it, and past it nothing is launched.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_create_whose_deadline_passed_while_it_waited_launches_nothing() {
         let (temp, controller, asked) = daemon().await;

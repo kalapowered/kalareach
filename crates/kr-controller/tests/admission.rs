@@ -617,3 +617,152 @@ fn only_the_reservation_a_failure_report_claimed_is_resolved_by_it() {
         "a fenced reservation is not the report's to resolve"
     );
 }
+
+/// KR-REQ-07.10: a create token stays bound to the session it made after that session has closed.
+/// The closed session's row is its tombstone, so a replay of the same request, however late,
+/// resolves to the session that already ran rather than starting another.
+#[test]
+fn a_token_whose_session_has_closed_still_resolves_to_that_session() {
+    let (_host, mut registry) = registry();
+    let token = kr_ipc::new_uuid();
+    let first = registry
+        .reserve(
+            &actor("local:501"),
+            token,
+            digest(4),
+            &intent(),
+            TimestampMs::new(1),
+        )
+        .expect("reserves")
+        .reservation;
+    registry
+        .set_phase(first.reservation_id, LaunchPhase::Closed)
+        .expect("the session closes");
+
+    let replayed = registry
+        .reserve(
+            &actor("local:501"),
+            token,
+            digest(4),
+            &intent(),
+            TimestampMs::new(1_000_000_000),
+        )
+        .expect("a replay is answered rather than refused");
+    assert!(
+        replayed.deduplicated,
+        "the replay is the request it repeats"
+    );
+    assert_eq!(replayed.reservation.session_id, first.session_id);
+    assert_eq!(replayed.reservation.phase, LaunchPhase::Closed);
+    assert_eq!(
+        registry.occupancy().expect("counts"),
+        0,
+        "and nothing was reserved for it to start"
+    );
+}
+
+/// KR-REQ-24.01: the controller registry keeps, durably, the environment's identity and its
+/// generation, each create reservation with the display number allocated to it, each worker's
+/// record and each closed session's tombstone, and a daemon that opens it again reads every one of
+/// them back.
+#[test]
+fn the_registry_reads_back_every_durable_record_it_keeps() {
+    let (host, mut registry) = registry();
+    let generation = registry.advance_generation().expect("advances");
+
+    // A live session: its reservation, its claim and its worker's record.
+    let live = registry
+        .reserve(
+            &actor("local:501"),
+            kr_ipc::new_uuid(),
+            digest(5),
+            &intent(),
+            TimestampMs::new(1),
+        )
+        .expect("reserves")
+        .reservation;
+    registry
+        .set_phase(live.reservation_id, LaunchPhase::Spawned)
+        .expect("spawned");
+    let key = kr_protocol::scalars::AuthorisationKey::from_bytes([6; 32]);
+    registry
+        .claim_rendezvous(live.reservation_id, key)
+        .expect("claims");
+    let worker = kr_controller::registry::WorkerRecord {
+        session_id: live.session_id,
+        display_number: live.display_number,
+        public_key: key,
+        process_identity: kr_protocol::identity::ProcessStartIdentity::new(
+            4242,
+            kr_protocol::identity::ProcessStartSource::MacosProcBsdInfo,
+            77,
+        ),
+        endpoint: "/tmp/kr-registry-test.sock".to_owned(),
+        profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+        state: kr_protocol::session::SessionState::Live,
+        acknowledged_revision: kr_protocol::ids::AuthorityRevision::new(0),
+    };
+    registry
+        .record_worker(live.reservation_id, &worker)
+        .expect("records the worker");
+
+    // A closed session: its reservation and its tombstone.
+    let closed = registry
+        .reserve(
+            &actor("local:501"),
+            kr_ipc::new_uuid(),
+            digest(6),
+            &intent(),
+            TimestampMs::new(2),
+        )
+        .expect("reserves")
+        .reservation;
+    let tombstone = kr_protocol::session::ClosureRecord {
+        session_id: closed.session_id,
+        session_epoch: kr_protocol::ids::SessionEpoch::V1,
+        reason: kr_protocol::session::ClosureReason::CloseRequested,
+        root_exit_code: kr_protocol::scalars::Nullable::null(),
+        root_signal: kr_protocol::scalars::Nullable::null(),
+        terminated: Vec::new(),
+        surviving: Vec::new(),
+        ownership_coverage: kr_protocol::session::OwnershipCoverage::Incomplete,
+        durability: kr_protocol::session::Durability::Durable,
+        closed_at_ms: TimestampMs::new(3),
+    };
+    registry
+        .record_closure(&tombstone)
+        .expect("records the tombstone");
+    drop(registry);
+
+    let reopened = Registry::open(
+        host.environment().registry_database(),
+        host.environment_id(),
+    )
+    .expect("reopens the registry");
+    assert_eq!(reopened.generation().expect("reads"), generation);
+    let kept = reopened
+        .reservation(live.reservation_id)
+        .expect("reads")
+        .expect("the live reservation");
+    assert_eq!(kept.session_id, live.session_id);
+    assert_eq!(kept.display_number, live.display_number);
+    assert_eq!(kept.claimed_key, Some(key));
+    let workers = reopened.workers().expect("reads the workers");
+    assert_eq!(
+        workers
+            .iter()
+            .find(|record| record.session_id == live.session_id),
+        Some(&worker),
+        "the worker's record comes back as it was written"
+    );
+    assert_eq!(
+        reopened.closure(closed.session_id).expect("reads"),
+        Some(tombstone),
+        "and so does the closed session's tombstone"
+    );
+    let closed_again = reopened
+        .reservation(closed.reservation_id)
+        .expect("reads")
+        .expect("the closed reservation");
+    assert_eq!(closed_again.phase, LaunchPhase::Closed);
+}

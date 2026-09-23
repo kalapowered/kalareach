@@ -1571,6 +1571,7 @@ async fn a_retained_action_is_disclosed_under_current_authority_and_not_under_wi
 
 /// A real mutation through this daemon's own dispatch path, admitted while its lifetime was live
 /// and reaching its transaction after another holder released the lock.
+/// KR-REQ-07.10: a create request expires, and one that has expired starts nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_create_that_queues_past_its_lifetime_is_refused_without_starting_anything() {
     let daemon = daemon_host().await;
