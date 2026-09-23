@@ -143,36 +143,48 @@ impl ArchiveRecipients {
         self.keys.iter()
     }
 
-    /// Removes one recipient from every future key wrap.
+    /// Removes recipients from every future key wrap, in one step.
     ///
-    /// Returns `None` when the set does not name it. What it does *not* do is take anything back:
-    /// see [`still_readable_after_revocation`].
-    pub fn revoke(&mut self, key_id: &KeyId) -> Option<Revocation> {
-        let position = self
-            .keys
-            .iter()
-            .position(|key| &crate::backup::recipient_key_id(key) == key_id)?;
-        self.keys.remove(position);
+    /// Returns `None` when the set names none of them. A mutable shared collection advances its
+    /// rotation once for the whole step, however many recipients leave in it: one new key replaces
+    /// the one they all held. What it does *not* do is take anything back: see
+    /// [`still_readable_after_revocation`].
+    pub fn revoke(&mut self, key_ids: &[KeyId]) -> Option<Revocation> {
+        let mut removed: Vec<KeyId> = Vec::new();
+        self.keys.retain(|key| {
+            let id = crate::backup::recipient_key_id(key);
+            if key_ids.contains(&id) {
+                if !removed.contains(&id) {
+                    removed.push(id);
+                }
+                false
+            } else {
+                true
+            }
+        });
+        if removed.is_empty() {
+            return None;
+        }
         let rotates_object_keys = self.kind == CollectionKind::MutableShared;
         if rotates_object_keys {
             // Advancing the rotation is the rotation. Every object staged before it is refused by
             // `seal_archive` and staged again under a new key when it is resumed, so the removed
-            // recipient's wraps open nothing written after this point.
+            // recipients' wraps open nothing written after this point.
             self.rotation = self.rotation.next();
         }
         Some(Revocation {
-            removed: *key_id,
+            removed,
             rotates_object_keys,
             rotation: self.rotation,
         })
     }
 }
 
-/// What removing one recipient did.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What removing recipients did.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Revocation {
-    /// The recipient that is no longer wrapped for.
-    pub removed: KeyId,
+    /// The recipients that are no longer wrapped for, in the order they were in the set.
+    pub removed: Vec<KeyId>,
     /// Whether the next generation re-keys its objects, which a mutable shared collection does.
     pub rotates_object_keys: bool,
     /// The rotation the collection is at now. Staged ciphertext from before it is refused.
@@ -207,16 +219,49 @@ impl Revocation {
     /// The sentence a person is shown, which says what revocation does and what it does not.
     #[must_use]
     pub fn describe(&self) -> String {
-        let rotation = if self.rotates_object_keys {
-            " Its keys are rotated, so nothing written after this point is under a key that device holds."
+        if self.removed.len() == 1 {
+            let rotation = if self.rotates_object_keys {
+                " Its keys are rotated, so nothing written after this point is under a key that device holds."
+            } else {
+                ""
+            };
+            format!(
+                "That device is removed from every future backup key wrap.{rotation} It keeps whatever \
+                 it already had: earlier backups it holds a key for stay readable to it, and removing \
+                 it does not make them secret again."
+            )
         } else {
-            ""
-        };
-        format!(
-            "That device is removed from every future backup key wrap.{rotation} It keeps whatever \
-             it already had: earlier backups it holds a key for stay readable to it, and removing \
-             it does not make them secret again."
-        )
+            let rotation = if self.rotates_object_keys {
+                " The keys are rotated, so nothing written after this point is under a key those devices hold."
+            } else {
+                ""
+            };
+            format!(
+                "Those devices are removed from every future backup key wrap.{rotation} They keep \
+                 whatever they already had: earlier backups they hold a key for stay readable to them, \
+                 and removing them does not make those backups secret again."
+            )
+        }
+    }
+
+    /// The sentence a person is shown when devices leave a synchronised collection.
+    ///
+    /// A synchronised collection is mutable and shared, so removing a device always gives the
+    /// remaining ones a new key. What the removed device already read stays readable to it, and
+    /// the sentence says so rather than claiming a secrecy nothing can restore.
+    #[must_use]
+    pub fn describe_settings_sync(&self) -> String {
+        if self.removed.len() == 1 {
+            "That device no longer receives settings. Settings written from now on are sealed under \
+             a new key it does not hold. What it already had stays readable to it: removing a device \
+             does not make that secret again."
+                .to_owned()
+        } else {
+            "Those devices no longer receive settings. Settings written from now on are sealed under \
+             a new key they do not hold. What they already had stays readable to them: removing a \
+             device does not make that secret again."
+                .to_owned()
+        }
     }
 }
 

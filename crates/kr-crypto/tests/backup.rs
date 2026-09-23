@@ -1127,9 +1127,9 @@ fn revoking_a_recipient_removes_it_from_every_future_wrap() {
     );
 
     let revocation = recipients
-        .revoke(&leaving.key_id())
+        .revoke(&[leaving.key_id()])
         .expect("the set named it");
-    assert_eq!(revocation.removed, leaving.key_id());
+    assert_eq!(revocation.removed, vec![leaving.key_id()]);
     assert!(!recipients.contains(&leaving.key_id()));
     assert!(recipients.contains(&parties.device.key_id()));
 
@@ -1185,7 +1185,7 @@ fn revoking_a_recipient_removes_it_from_every_future_wrap() {
     assert_eq!(restored.plaintext.expose(), b"one");
 
     // Revoking something that is not in the set changes nothing.
-    assert!(recipients.revoke(&leaving.key_id()).is_none());
+    assert!(recipients.revoke(&[leaving.key_id()]).is_none());
 }
 
 #[test]
@@ -1211,7 +1211,7 @@ fn a_mutable_shared_collection_rotates_its_keys_and_an_owned_one_does_not() {
     .expect("a sealed archive");
     let original = member_key(&parties, &published, staged.object_id());
 
-    let rotated = shared.revoke(&leaving.key_id()).expect("a revocation");
+    let rotated = shared.revoke(&[leaving.key_id()]).expect("a revocation");
     assert!(rotated.rotates_object_keys);
     assert!(
         !rotated.may_reuse_staged_ciphertext(),
@@ -1271,7 +1271,7 @@ fn a_mutable_shared_collection_rotates_its_keys_and_an_owned_one_does_not() {
     assert!(owned.add(*parties.device.public()));
     assert!(owned.add(*leaving.public()));
     let staged = stage_at(1, "a.cbor", b"my content", owned.rotation());
-    let plain = owned.revoke(&leaving.key_id()).expect("a revocation");
+    let plain = owned.revoke(&[leaving.key_id()]).expect("a revocation");
     assert!(!plain.rotates_object_keys);
     assert!(plain.may_reuse_staged_ciphertext());
     assert!(
