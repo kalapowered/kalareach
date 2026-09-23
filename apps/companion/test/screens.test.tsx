@@ -528,14 +528,16 @@ describe('pairing', () => {
     })
   })
 
-  // KR-REQ-10.11: the code field turns off capitalisation, correction and spell checking, so the
-  // case-sensitive code reaches the parser exactly as it was typed.
+  // KR-REQ-10.11: the code field turns off capitalisation, correction and spell checking, and a
+  // mixed-case code stays in it exactly as it was typed, case and separators included.
   it('takes the code exactly as typed, with no capitalisation or correction', async () => {
     start({ view: 'pairing' })
     const input = await screen.findByTestId('code-input')
     expect(input.getAttribute('autocapitalize')).toBe('off')
     expect(input.getAttribute('autocorrect')).toBe('off')
     expect(input.getAttribute('spellcheck')).toBe('false')
+    await userEvent.type(input, 'aB3x-Yz7-9Qw')
+    expect((input as HTMLInputElement).value).toBe('aB3x-Yz7-9Qw')
   })
 
   it('reports which platform ceremony verified the owner', async () => {

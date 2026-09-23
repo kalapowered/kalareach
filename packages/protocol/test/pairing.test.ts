@@ -112,7 +112,8 @@ describe('QR payloads', () => {
     }
   })
 
-// KR-REQ-10.38: a QR parser requires an explicit supported mode.
+// KR-REQ-10.38: the two published payloads name different explicit modes, and a code payload
+// carries four members to a direct payload's eight.
   it('requires an explicit supported mode', () => {
     const direct = decodeCanonical(hexToBytes(document.qr.direct.canonical_hex))
     const code = decodeCanonical(hexToBytes(document.qr.code.canonical_hex))
@@ -136,17 +137,24 @@ describe('QR payloads', () => {
 describe('short-code transcript', () => {
   const document = loadPairingFixture('transcript.json')
 
-// KR-REQ-10.20: an independent build of `C` gives the published bytes.
+// KR-REQ-10.20: `C` built here from its seven published members, in the order section 10 writes
+// them, is byte for byte the published encoding, and its SHA-256 is the published context hash.
   it('builds C as the array section 10 writes', () => {
-    const canonical = hexToBytes(document.context.canonical_hex)
-    expect(sha256(canonical)).toBe(document.context.context_hash_hex)
-    const value = decodeCanonical(canonical)
-    expect(value.kind).toBe('array')
-    if (value.kind !== 'array') throw new Error('unreachable')
-    expect(value.items).toHaveLength(7)
-    expect(value.items[0]).toEqual(krText(document.domain))
-    expect(value.items[1]).toEqual(krText(document.context.rendezvous_origin))
-    expect(value.items[2]).toEqual(krText(document.context.locator))
+    const context = document.context
+    const built = encodeCanonical({
+      kind: 'array',
+      items: [
+        krText(document.domain),
+        krText(context.rendezvous_origin),
+        krText(context.locator),
+        { kind: 'bytes', value: hexToBytes(context.invitation_id_hex) },
+        { kind: 'bytes', value: hexToBytes(context.attempt_id_hex) },
+        { kind: 'bytes', value: hexToBytes(context.host_nonce_hex) },
+        { kind: 'bytes', value: hexToBytes(context.client_nonce_hex) }
+      ]
+    })
+    expect(bytesToHex(built)).toBe(context.canonical_hex)
+    expect(sha256(built)).toBe(context.context_hash_hex)
   })
 
 // KR-REQ-10.20: the host is role A and the client role B, each identified from `CH`.
@@ -268,29 +276,44 @@ describe('short-code transcript', () => {
 describe('direct transcript', () => {
   const document = loadPairingFixture('direct.json')
 
-// KR-REQ-10.36: an independent build of `D` gives the published bytes.
+// KR-REQ-10.36: `D` built here from its members, in the order section 10 writes them, is byte for
+// byte the published encoding. The fixed inputs give each device a complete purpose-key bundle
+// whose transport key is its endpoint and whose other three keys are the next three byte values,
+// and the proposed-grant digest is taken here from the grant the published direct QR carries.
   it('builds D as the array section 10 writes', () => {
-    const canonical = hexToBytes(document.transcript.canonical_hex)
-    expect(sha256(canonical)).toBe(document.transcript.canonical_sha256_hex)
-    const value = decodeCanonical(canonical)
-    if (value.kind !== 'array') throw new Error('unreachable')
-    expect(value.items).toHaveLength(10)
-    expect(value.items[0]).toEqual(krText(document.domain))
-    const hexOf = (index: number): string => {
-      const item = value.items[index]
-      if (item.kind !== 'bytes') throw new Error('unreachable')
-      return bytesToHex(item.value)
+    const transcript = document.transcript
+    const fill = (byte: number): Uint8Array => new Uint8Array(32).fill(byte)
+    const bundle = (endpointHex: string): ReturnType<typeof decodeCanonical> => {
+      const first = hexToBytes(endpointHex)[0]
+      return {
+        kind: 'array',
+        items: [0, 1, 2, 3].map((offset) => ({ kind: 'bytes', value: fill(first + offset) }))
+      }
     }
-    expect(hexOf(1)).toBe(document.transcript.invitation_id_hex)
-    expect(hexOf(2)).toBe(document.transcript.host_endpoint_hex)
-    expect(hexOf(3)).toBe(document.transcript.client_endpoint_hex)
-    expect(hexOf(6)).toBe(document.transcript.proposed_grant_digest_hex)
-    expect(hexOf(7)).toBe(document.transcript.host_nonce_hex)
-    expect(hexOf(8)).toBe(document.transcript.client_nonce_hex)
-    expect(value.items[9]).toEqual({
-      kind: 'int',
-      value: BigInt(document.transcript.expires_at)
+    const qr = decodeCanonical(hexToBytes(loadPairingFixture('codes.json').qr.direct.canonical_hex))
+    if (qr.kind !== 'map') throw new Error('unreachable')
+    const grant = new Map(qr.entries).get('proposed_grant')
+    if (grant === undefined) throw new Error('the direct QR carries a proposed grant')
+    const grantDigest = sha256(encodeCanonical(grant))
+    expect(grantDigest).toBe(transcript.proposed_grant_digest_hex)
+
+    const built = encodeCanonical({
+      kind: 'array',
+      items: [
+        krText(document.domain),
+        { kind: 'bytes', value: hexToBytes(transcript.invitation_id_hex) },
+        { kind: 'bytes', value: hexToBytes(transcript.host_endpoint_hex) },
+        { kind: 'bytes', value: hexToBytes(transcript.client_endpoint_hex) },
+        bundle(transcript.host_endpoint_hex),
+        bundle(transcript.client_endpoint_hex),
+        { kind: 'bytes', value: hexToBytes(grantDigest) },
+        { kind: 'bytes', value: hexToBytes(transcript.host_nonce_hex) },
+        { kind: 'bytes', value: hexToBytes(transcript.client_nonce_hex) },
+        { kind: 'int', value: BigInt(transcript.expires_at) }
+      ]
     })
+    expect(bytesToHex(built)).toBe(transcript.canonical_hex)
+    expect(sha256(built)).toBe(transcript.canonical_sha256_hex)
   })
 
 // KR-REQ-10.36: the redemption proof is HMAC-SHA256 of the invitation secret over `D`.
