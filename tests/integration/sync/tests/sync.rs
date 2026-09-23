@@ -45,7 +45,8 @@ use kr_client::services::relay::{ServiceHttp, ServiceHttpAnswer, ServiceSigner};
 use kr_client::services::signed::SignedService;
 use kr_client::services::sync::{MAX_SYNC_REQUEST_BYTES, ManagedSyncService, SYNC_EXCHANGE_PATH};
 use kr_client::services::{
-    ServiceFuture, SyncBackupService, SyncExchanged, SyncRequestFence, SyncRequestStatus,
+    ServiceFuture, SyncBackupService, SyncExchanged, SyncPosition, SyncRequestFence,
+    SyncRequestStatus, SyncRevision,
 };
 use kr_client::sync::{
     CollectionSealer, MemoryCollectionKeys, Published, Resolutions, SettingValue, SyncBody,
@@ -126,6 +127,9 @@ struct Recording {
     sent: AtomicUsize,
     /// Whether the next answer is to be lost on its way back.
     lose_the_next_answer: AtomicBool,
+    /// The answer that was lost, as the service gave it, so a leg can see what the service did with
+    /// the request before it goes on.
+    lost: Mutex<Option<ServiceHttpAnswer>>,
 }
 
 impl fmt::Debug for Recording {
@@ -154,7 +158,9 @@ impl ServiceHttp for Recording {
             if self.lose_the_next_answer.swap(false, Ordering::SeqCst) {
                 // The service has answered, and the answer goes no further than here: what a
                 // connection that dropped on the way back looks like to the device that sent it.
-                drop(answer);
+                // It is kept for the leg, which holds it to being the answer it means to lose: an
+                // exchange that failed before it arrived would look the same to the device.
+                *self.lost.lock().expect("the lost answer") = answer.ok();
                 return Err(ClientError::Host(ProtocolError::new(
                     ErrorCode::OutcomeUnknown,
                     "the answer never came back",
@@ -195,6 +201,7 @@ impl Run {
             reached: Arc::clone(&reached),
             sent: AtomicUsize::new(0),
             lose_the_next_answer: AtomicBool::new(false),
+            lost: Mutex::new(None),
         });
         let service = Arc::new(ManagedSyncService::new(
             deployment.origin().clone(),
@@ -268,8 +275,13 @@ impl Run {
                     "last_signed_at_ms": last.to_string(),
                 },
             });
-            if let Err(error) = sync_call(&signed, &fence).await {
-                left.push(format!("a request identity could not be ended: {error}"));
+            match sync_call(&signed, &fence).await {
+                Ok(answer) => {
+                    if let Err(what) = ended(&answer, &identity) {
+                        left.push(what);
+                    }
+                }
+                Err(error) => left.push(format!("a request identity could not be ended: {error}")),
             }
         }
         let collections = self
@@ -284,6 +296,25 @@ impl Run {
             }
         }
         left
+    }
+}
+
+/// Holds a fence's answer to having ended the identity it named.
+///
+/// Only three answers end a request: the receipt of one that ran, applied or refused, and the fence
+/// itself. Anything else, including an answer about another identity or one that does not say
+/// whether the request ran, leaves an upload that may still arrive, so a leg that took it for an end
+/// could report a collection empty just before a delayed write filled it again.
+fn ended(answer: &serde_json::Value, identity: &str) -> Result<(), String> {
+    if answer["request_id"] != identity {
+        return Err("a fence was answered about another request identity".to_owned());
+    }
+    if !answer["never_ran"].is_boolean() {
+        return Err("a fence answer did not say whether the request ran".to_owned());
+    }
+    match answer["state"].as_str() {
+        Some("applied" | "refused" | "fenced") => Ok(()),
+        _ => Err("a fence answer did not end the request it named".to_owned()),
     }
 }
 
@@ -844,12 +875,42 @@ async fn kr_req_20_13_an_answer_lost_in_flight_is_settled_from_the_receipt_and_a
             .expect("stored");
 
         // The service applies the write and the answer is lost on its way back.
-        run.transport.lose_the_next_answer.store(true, Ordering::SeqCst);
+        run.transport
+            .lose_the_next_answer
+            .store(true, Ordering::SeqCst);
         client
             .publish(object_id, now())
             .await
             .expect_err("the answer never came back");
         assert_eq!(client.outstanding().expect("a count"), 1);
+
+        // What was lost is the answer this leg means: the service applied the write, at a place
+        // the leg reads from that answer. An exchange that failed before it arrived, or one the
+        // service refused, would look the same to the device and prove nothing below.
+        let lost = run
+            .transport
+            .lost
+            .lock()
+            .expect("the lost answer")
+            .take()
+            .expect("the service answered the write");
+        assert_eq!(lost.status, 200);
+        let lost: serde_json::Value =
+            serde_json::from_slice(&lost.body).expect("the service's envelope");
+        assert_eq!(lost["ok"], true, "the service admitted the write");
+        assert_eq!(lost["data"]["state"], "written", "the service applied it");
+        let applied_at = SyncPosition::at(
+            lost["data"]["current_write_sequence"]
+                .as_str()
+                .and_then(|sequence| sequence.parse().ok())
+                .expect("the place it was applied at"),
+            SyncRevision::new(
+                lost["data"]["current_revision"]
+                    .as_str()
+                    .and_then(|revision| revision.parse().ok())
+                    .expect("the name it was given"),
+            ),
+        );
         let staged = client
             .store()
             .requests()
@@ -875,6 +936,10 @@ async fn kr_req_20_13_an_answer_lost_in_flight_is_settled_from_the_receipt_and_a
         let SyncExchanged::Applied { position } = again else {
             panic!("the write was applied")
         };
+        // The very position the lost answer named. Had the service run the write again, a write
+        // that expected no object would have been refused, because the first one is there now: an
+        // applied answer at the same place is the receipt speaking.
+        assert_eq!(position, applied_at, "answered from the receipt");
         assert_eq!(position.write_sequence, 1);
 
         // The client settles it by asking about the request.
