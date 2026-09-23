@@ -54,6 +54,8 @@ function ed25519PublicKey (raw: Uint8Array) {
   return createPublicKey({ key: Buffer.from(spki), format: 'der', type: 'spki' })
 }
 
+// KR-REQ-23.08: the TypeScript half of signature parity: every published signature verifies and
+// every negative case fails.
 describe('signature vectors', () => {
   const document = loadCryptoFixture('signatures.json')
 

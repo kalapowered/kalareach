@@ -1039,6 +1039,8 @@ mod tests {
         assert_eq!(clock.monotonic_ms(), monotonic);
     }
 
+    /// KR-REQ-10.13, KR-REQ-10.12: the service holds only the hash of the 256-bit record-control
+    /// token.
     #[test]
     fn a_reservation_publishes_only_the_hash_of_its_token() {
         let reservation = LocatorReservation {

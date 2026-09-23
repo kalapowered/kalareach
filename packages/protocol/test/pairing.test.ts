@@ -67,6 +67,7 @@ function parseCode (entered: string): string | undefined {
 describe('short-code entry', () => {
   const document = loadPairingFixture('codes.json')
 
+// KR-REQ-10.11: the code alphabet is Bitcoin Base58.
   it('uses the Bitcoin Base58 alphabet', () => {
     expect(document.alphabet).toBe(BASE58)
     expect(document.display_form).toBe('XXXX-XXX-XXX')
@@ -88,6 +89,7 @@ describe('short-code entry', () => {
     }
   })
 
+// KR-REQ-10.11: parsing preserves case.
   it('preserves case, because folding it would throw away entropy', () => {
     expect(parseCode('aB3x-Yz7-9Qw')).not.toBe(parseCode('Ab3x-Yz7-9Qw'))
   })
@@ -96,6 +98,7 @@ describe('short-code entry', () => {
 describe('QR payloads', () => {
   const document = loadPairingFixture('codes.json')
 
+// KR-REQ-10.38: both QR payloads round trip in their canonical encodings.
   it('round-trips both published encodings', () => {
     for (const mode of ['code', 'direct'] as const) {
       const canonical = hexToBytes(document.qr[mode].canonical_hex)
@@ -109,6 +112,7 @@ describe('QR payloads', () => {
     }
   })
 
+// KR-REQ-10.38: a QR parser requires an explicit supported mode.
   it('requires an explicit supported mode', () => {
     const direct = decodeCanonical(hexToBytes(document.qr.direct.canonical_hex))
     const code = decodeCanonical(hexToBytes(document.qr.code.canonical_hex))
@@ -132,6 +136,7 @@ describe('QR payloads', () => {
 describe('short-code transcript', () => {
   const document = loadPairingFixture('transcript.json')
 
+// KR-REQ-10.20: an independent build of `C` gives the published bytes.
   it('builds C as the array section 10 writes', () => {
     const canonical = hexToBytes(document.context.canonical_hex)
     expect(sha256(canonical)).toBe(document.context.context_hash_hex)
@@ -144,6 +149,7 @@ describe('short-code transcript', () => {
     expect(value.items[2]).toEqual(krText(document.context.locator))
   })
 
+// KR-REQ-10.20: the host is role A and the client role B, each identified from `CH`.
   it('builds the two role identities from CH', () => {
     for (const [side, domainKey] of [
       ['host', 'host_domain'],
@@ -163,6 +169,7 @@ describe('short-code transcript', () => {
     expect(document.identities.host_hex).not.toBe(document.identities.client_hex)
   })
 
+// KR-REQ-10.22: an independent computation of `T` gives the published value.
   it('computes T over the context and both messages in order', () => {
     const transcript = hexToBytes(document.exchange.transcript_hex)
     expect(sha256(transcript)).toBe(document.exchange.transcript_sha256_hex)
@@ -176,6 +183,7 @@ describe('short-code transcript', () => {
     expect(bytesToHex(messageB.value)).toBe(document.exchange.message_b_hex)
   })
 
+// KR-REQ-10.22: Node's own HKDF-SHA256, with `K` and salt `T`, derives the five published keys.
   it('derives the five keys with the five literal information strings', () => {
     const salt = document.exchange.transcript_sha256_hex
     const ikm = document.exchange.shared_key_hex
@@ -193,6 +201,7 @@ describe('short-code transcript', () => {
     expect(new Set(expected.map(([, key]) => key)).size).toBe(expected.length)
   })
 
+// KR-REQ-10.23: both confirmation tags are HMAC-SHA256 over `T` under their own keys.
   it('computes both confirmation tags over T', () => {
     const transcript = hexToBytes(document.exchange.transcript_sha256_hex)
     expect(hmac(document.hkdf.client_confirm_key_hex, transcript)).toBe(
@@ -204,6 +213,7 @@ describe('short-code transcript', () => {
     expect(document.confirmation.client_tag_hex).not.toBe(document.confirmation.host_tag_hex)
   })
 
+// KR-REQ-10.27: the `pair.finish` tag covers both endpoint identities and both bundle hashes.
   it('binds pair.finish to both endpoints and both bundle hashes', () => {
     const message = hexToBytes(document.finish.message_hex)
     expect(hmac(document.hkdf.iroh_bind_key_hex, message)).toBe(document.finish.tag_hex)
@@ -223,6 +233,7 @@ describe('short-code transcript', () => {
     expect(hexOf(7)).toBe(document.finish.client_bundle_hash_hex)
   })
 
+// KR-REQ-10.24: the bundle additional data separates direction, sequence and type.
   it('separates every bundle additional-data case', () => {
     const seen = new Set<string>()
     for (const entry of document.bundle_additional_data) {
@@ -239,6 +250,7 @@ describe('short-code transcript', () => {
     expect(seen.size).toBe(4)
   })
 
+// KR-REQ-10.28: the verification value is the first eight hex characters of its digest.
   it('takes the verification value from the first eight hexadecimal characters', () => {
     const input = encodeCanonical({
       kind: 'array',
@@ -256,6 +268,7 @@ describe('short-code transcript', () => {
 describe('direct transcript', () => {
   const document = loadPairingFixture('direct.json')
 
+// KR-REQ-10.36: an independent build of `D` gives the published bytes.
   it('builds D as the array section 10 writes', () => {
     const canonical = hexToBytes(document.transcript.canonical_hex)
     expect(sha256(canonical)).toBe(document.transcript.canonical_sha256_hex)
@@ -280,12 +293,14 @@ describe('direct transcript', () => {
     })
   })
 
+// KR-REQ-10.36: the redemption proof is HMAC-SHA256 of the invitation secret over `D`.
   it('computes the secret proof over D', () => {
     expect(
       hmac(document.secret_proof.secret_hex, hexToBytes(document.transcript.canonical_hex))
     ).toBe(document.secret_proof.tag_hex)
   })
 
+// KR-REQ-10.37: the direct verification value comes from its own domain over `D`.
   it('takes its verification value from its own domain', () => {
     expect(document.domain).not.toBe('kr-pair/spake2-ed25519/1')
     expect(document.verification_value.domain).toBe('kr-pair/direct-verify/1')

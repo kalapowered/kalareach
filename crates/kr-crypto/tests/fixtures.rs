@@ -78,6 +78,7 @@ fn generation_is_deterministic() {
 
 /// KR-REQ-23.06: the published signatures verify over their exact bytes and domain, and every
 /// altered case fails.
+/// KR-REQ-23.08: the Rust half of signature parity with the TypeScript package.
 #[test]
 fn every_signature_vector_verifies_and_every_negative_case_fails() {
     let document = fixture("signatures.json");

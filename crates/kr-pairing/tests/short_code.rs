@@ -1837,3 +1837,25 @@ fn each_failure_kind_reports_its_own_code_and_authentication_stays_ambiguous() {
         "the two causes are indistinguishable"
     );
 }
+
+/// KR-REQ-10.13: an invitation identity is 128 random bits. Across many invitations no two repeat
+/// and no bit is fixed, so nothing about it is a counter, a clock or a version marker.
+#[test]
+fn an_invitation_identity_is_one_hundred_and_twenty_eight_random_bits() {
+    let harness = Harness::new();
+    let identities: Vec<[u8; 16]> = (0..64)
+        .map(|_| *harness.issue().invitation_id().get().as_bytes())
+        .collect();
+    let distinct: BTreeSet<&[u8; 16]> = identities.iter().collect();
+    assert_eq!(distinct.len(), identities.len(), "no identity repeats");
+    for bit in 0..128 {
+        let set = identities
+            .iter()
+            .filter(|identity| identity[bit / 8] & (1 << (bit % 8)) != 0)
+            .count();
+        assert!(
+            set > 0 && set < identities.len(),
+            "bit {bit} of the identity never varies"
+        );
+    }
+}

@@ -26,6 +26,8 @@ const VALID_FILES = [
   'structures.json'
 ] as const
 
+// KR-REQ-23.08: the TypeScript half of byte parity: every valid fixture encodes to the bytes the
+// Rust crate produces and decodes back.
 describe.each(VALID_FILES)('%s', (name) => {
   const document = loadFixture('cbor', name)
   const cases = document.cases ?? []
@@ -47,6 +49,7 @@ describe.each(VALID_FILES)('%s', (name) => {
   )
 })
 
+// KR-REQ-23.08: every forbidden representation is rejected with the rule the Rust decoder names.
 describe('invalid.json', () => {
   const document = loadFixture('cbor', 'invalid.json')
   const cases = document.cases ?? []
@@ -79,6 +82,7 @@ describe('invalid.json', () => {
   )
 })
 
+// KR-REQ-23.08: map keys order and duplicate keys are refused exactly as in Rust.
 describe('key ordering', () => {
   it('orders by the encoded key, not by the key text', () => {
     expect('aa' < 'z').toBe(true)
@@ -125,6 +129,7 @@ function compareBytes (a: Uint8Array, b: Uint8Array): number {
   return Math.sign(a.length - b.length)
 }
 
+// KR-REQ-23.08: the TypeScript half of digest and signing-input parity.
 describe('digests', () => {
   const document = loadFixture('cbor', 'digests.json')
 
@@ -149,6 +154,7 @@ describe('digests', () => {
   )
 })
 
+// KR-REQ-23.08: absent and null keep their different bytes and digests in TypeScript too.
 describe('absent versus null', () => {
   it('produces different bytes and different digests', async () => {
     const document = loadFixture('cbor', 'null-and-absent.json')
@@ -160,6 +166,7 @@ describe('absent versus null', () => {
   })
 })
 
+// KR-REQ-23.08: non-ASCII text is neither normalised nor case folded in TypeScript either.
 describe('non-ASCII text', () => {
   it('is never normalised or case folded', () => {
     const document = loadFixture('cbor', 'strings.json')

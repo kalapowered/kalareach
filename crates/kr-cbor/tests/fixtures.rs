@@ -158,6 +158,7 @@ fn structure_fixtures_round_trip() {
 }
 
 /// KR-REQ-23.03: null is not omission; the two encode, and hash, differently.
+/// KR-REQ-23.08: the Rust half of the absent and null digest parity.
 #[test]
 fn absent_and_null_have_different_digests() {
     let document = load("null-and-absent.json");
@@ -213,6 +214,7 @@ fn non_ascii_text_is_not_normalised() {
 /// KR-REQ-23.02, KR-REQ-23.04, KR-REQ-09.02: tags, floats, indefinite lengths, other simple values,
 /// duplicate and unsorted keys, invalid UTF-8, non-shortest heads, trailing bytes and every depth,
 /// count and length limit are each refused with the rule they break.
+/// KR-REQ-23.08: the Rust half of the shared rejection fixtures, rule for rule.
 #[test]
 fn invalid_fixtures_are_rejected_with_the_named_rule() {
     let document = load("invalid.json");
@@ -280,6 +282,7 @@ fn every_error_rule_is_covered_by_a_fixture() {
     }
 }
 
+/// KR-REQ-23.08, KR-REQ-23.06: the Rust half of byte and digest parity for a signed object.
 #[test]
 fn digest_fixtures_match() {
     let document = load("digests.json");
@@ -300,6 +303,7 @@ fn digest_fixtures_match() {
     }
 }
 
+/// KR-REQ-23.08, KR-REQ-23.06: the Rust half of signing-input parity under its domain.
 #[test]
 fn signing_input_fixtures_match() {
     let document = load("digests.json");
