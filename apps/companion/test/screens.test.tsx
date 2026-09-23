@@ -149,6 +149,21 @@ describe('the semantic view', () => {
     expect(screen.getByText(/The draft is kept here/)).toBeInTheDocument()
   })
 
+  // KR-REQ-07.51: whether the host can be reached is a field of its own. Losing contact puts up a
+  // notice of its own and leaves the session's lifecycle and application state as the host last
+  // reported them, rather than turning them into a closure or a failure.
+  it('keeps what the session is doing apart from whether its host can be reached', async () => {
+    const { controls } = start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
+    const heading = await screen.findByText('Session 1 · Waiting for you')
+    expect(screen.queryAllByText('Not in contact with this host')).toHaveLength(0)
+
+    controls.setConnected(false)
+
+    expect((await screen.findAllByText('Not in contact with this host')).length).toBeGreaterThan(0)
+    expect(heading).toHaveTextContent('Session 1 · Waiting for you')
+    expect(heading).not.toHaveTextContent(/Closed|Closing|Failed/)
+  })
+
   it('shows a reconnect banner that never implies an action succeeded', async () => {
     const { controls } = start({ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' })
     const conversation = await screen.findByTestId('conversation')
