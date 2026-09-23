@@ -26,7 +26,7 @@
 //! while no consumer is registered, which is the case today. Delivering the event to the owner's
 //! devices is the environment attention store's work; this is the source it reads.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use kr_pairing::platform::{
     BootIdentity, InvitationRecord, InvitationState, InvitationStore, PairingCommitment,
@@ -35,7 +35,6 @@ use kr_pairing::platform::{
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::grant::Grant;
-use kr_protocol::grant::GrantExpiry;
 use kr_protocol::ids::{
     ActionId, ActorId, AttemptId, ConfirmationId, DeviceId, InvitationId, PairingEventSequence,
 };
@@ -51,6 +50,7 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 
 use super::devices::{DeviceDirectory, DeviceRecord, insert_record};
+use super::lifetimes::GrantLifetimes;
 use crate::error::{ControllerError, Result};
 
 /// Creates the pairing tables, and records an owner a host upgraded in place already had.
@@ -133,6 +133,7 @@ pub fn prepare(directory: &DeviceDirectory) -> Result<()> {
                      signer_key_id BLOB NOT NULL,
                      answered_at_ms INTEGER NOT NULL,
                      answered_by TEXT NOT NULL,
+                     proof BLOB NOT NULL,
                      consumed_at_ms INTEGER,
                      consumed_by TEXT
                  );",
@@ -167,20 +168,6 @@ fn holds_owner_device(connection: &Connection) -> Result<bool> {
     }))
 }
 
-/// Returns true when `grant` makes its device an owner device at `now_ms`: it holds host
-/// management and has not run out.
-///
-/// A revoked or expired device record is refused by its own markers; this is the grant's half,
-/// for a grant whose expiry has passed before anything wrote a marker.
-#[must_use]
-pub fn holds_live_owner_grant(grant: &Grant, now_ms: u64) -> bool {
-    grant.permits(ActionRight::HostManage)
-        && match grant.expiry {
-            GrantExpiry::Never => true,
-            GrantExpiry::At { expires_at_ms } => now_ms < expires_at_ms.get(),
-        }
-}
-
 /// How this host has an owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostOwner {
@@ -208,6 +195,11 @@ pub struct Acceptance {
     pub signer_key_id: kr_protocol::scalars::KeyId,
     /// The challenge it answered.
     pub request: OwnerConfirmationRequest,
+    /// The caller that completed it, when a caller did. An effect that consumed a proof nobody
+    /// completed through this host records none.
+    pub answered_by: Option<ActorId>,
+    /// The proof itself, exactly as it was accepted.
+    pub proof: OwnerConfirmationProof,
 }
 
 /// What an invitation was issued as, which the store writes beside kr-pairing's record.
@@ -230,6 +222,54 @@ pub struct IssueTerms {
     pub action: Option<(ActionId, Digest256)>,
     /// When it was issued, in UTC milliseconds.
     pub issued_at_ms: TimestampMs,
+}
+
+/// The check an owner mutation makes immediately before its effect: its connection's registration
+/// under the revision it was admitted at, and the deadline it was accepted with.
+pub type Admission = Arc<dyn Fn() -> Result<()> + Send + Sync>;
+
+/// The admission of the owner mutation an invitation's next write is made for.
+///
+/// Set for the length of one call into kr-pairing and asked inside the transaction that call's
+/// write takes, after every lock and every wait before it: the owner's own confirmation, the
+/// invitation's lock and the database's. A candidate's steps and the restart sweep write with it
+/// empty, because no owner mutation is waiting on them.
+#[derive(Clone, Default)]
+pub struct WriteAdmission(Arc<Mutex<Option<Admission>>>);
+
+impl std::fmt::Debug for WriteAdmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("WriteAdmission")
+            .field(&self.held().is_some())
+            .finish()
+    }
+}
+
+impl WriteAdmission {
+    /// Runs `call` with `admission` asked inside every write it makes, and clears it afterwards,
+    /// however `call` ends.
+    pub fn during<T>(&self, admission: &Admission, call: impl FnOnce() -> T) -> T {
+        struct Clear<'a>(&'a WriteAdmission);
+        impl Drop for Clear<'_> {
+            fn drop(&mut self) {
+                *self.0.held() = None;
+            }
+        }
+        *self.held() = Some(Arc::clone(admission));
+        let _clear = Clear(self);
+        call()
+    }
+
+    /// Asks the admission a write is being made under, when one is.
+    fn check(&self) -> Result<()> {
+        let admission = self.held().clone();
+        admission.map_or(Ok(()), |admission| admission())
+    }
+
+    fn held(&self) -> MutexGuard<'_, Option<Admission>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// One invitation as this host recorded it.
@@ -301,28 +341,40 @@ impl StoredCommitment {
 /// A handle carries the terms of the invitation it is about to issue, when it is about to issue
 /// one: kr-pairing's `create` hands over its own record and the proof, and the host's own terms
 /// travel here so the row is written complete in one statement.
+///
+/// A handle that issues an invitation also carries that invitation's [`WriteAdmission`]: the
+/// admission of the owner mutation its next write is made for, asked inside that write's
+/// transaction.
 #[derive(Clone, Debug)]
 pub struct InvitationRows {
     directory: Arc<DeviceDirectory>,
+    lifetimes: Arc<GrantLifetimes>,
     issue: Option<Arc<IssueTerms>>,
+    admission: WriteAdmission,
 }
 
 impl InvitationRows {
-    /// Opens the records in `directory`'s database. [`prepare`] must have run.
+    /// Opens the records in `directory`'s database, whose devices' grants run out as `lifetimes`
+    /// decides. [`prepare`] must have run.
     #[must_use]
-    pub const fn new(directory: Arc<DeviceDirectory>) -> Self {
+    pub fn new(directory: Arc<DeviceDirectory>, lifetimes: Arc<GrantLifetimes>) -> Self {
         Self {
             directory,
+            lifetimes,
             issue: None,
+            admission: WriteAdmission::default(),
         }
     }
 
-    /// Returns a handle that issues one invitation under these terms.
+    /// Returns a handle that issues one invitation under these terms, with an admission slot of
+    /// its own.
     #[must_use]
     pub fn issuing(&self, terms: IssueTerms) -> Self {
         Self {
             directory: Arc::clone(&self.directory),
+            lifetimes: Arc::clone(&self.lifetimes),
             issue: Some(Arc::new(terms)),
+            admission: WriteAdmission::default(),
         }
     }
 
@@ -330,6 +382,18 @@ impl InvitationRows {
     #[must_use]
     pub const fn directory(&self) -> &Arc<DeviceDirectory> {
         &self.directory
+    }
+
+    /// Returns the grant lifetimes the owner devices behind these records are checked against.
+    #[must_use]
+    pub const fn lifetimes(&self) -> &Arc<GrantLifetimes> {
+        &self.lifetimes
+    }
+
+    /// Returns the admission slot of the invitation this handle issues.
+    #[must_use]
+    pub const fn write_admission(&self) -> &WriteAdmission {
+        &self.admission
     }
 
     /// Returns how this host has an owner, when it has one.
@@ -489,22 +553,24 @@ impl InvitationRows {
             .transpose()
     }
 
-    /// Records the challenge one caller's action asked for.
+    /// Records the challenge one caller's action asked for, under that action's admission.
     ///
     /// # Errors
     ///
-    /// Returns a registry error when the row cannot be written, including when the action already
-    /// has one.
+    /// Returns the admission's refusal, and a registry error when the row cannot be written,
+    /// including when the action already has one.
     pub fn record_requested(
         &self,
         actor: &ActorId,
         action_id: ActionId,
         digest: Digest256,
         request: &OwnerConfirmationRequest,
+        admission: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
         let request = encode(request)?;
-        self.directory.with(|connection| {
-            connection
+        self.directory.transaction(|transaction| {
+            admission()?;
+            transaction
                 .execute(
                     "INSERT INTO owner_confirmation_requests
                          (actor, action_id, mutation_digest, request)
@@ -516,34 +582,41 @@ impl InvitationRows {
                         request,
                     ],
                 )
-                .map(|_| ())
+                .map_err(ControllerError::registry)?;
+            Ok(())
         })
     }
 
-    /// Records that an owner confirmation was answered, before anything spends it.
+    /// Records that an owner confirmation was answered, before anything spends it, under the
+    /// admission of the completion that answered it.
     ///
     /// Section 10 makes user-presence verification part of the host's acceptance record, so the
-    /// answer is on record from the moment the host accepts the proof, whatever happens next.
+    /// answer is on record from the moment the host accepts the proof, whatever happens next. The
+    /// caller that completed it and the proof itself are kept, so a repeat of that completion is
+    /// recognised as the same caller's same proof and nothing else.
     ///
     /// # Errors
     ///
-    /// Returns a registry error when the row cannot be written.
+    /// Returns the admission's refusal, and a registry error when the row cannot be written.
     pub fn record_answered(
         &self,
         proof: &OwnerConfirmationProof,
         answered_by: &ActorId,
         now: TimestampMs,
+        admission: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
         let request = encode(&proof.request)?;
         let action = text_of(&proof.request.action)?;
         let channel = proof.channel.as_str();
-        self.directory.with(|connection| {
-            connection
+        let stored_proof = encode(proof)?;
+        self.directory.transaction(|transaction| {
+            admission()?;
+            transaction
                 .execute(
                     "INSERT INTO owner_confirmations (
                          confirmation_id, action, action_digest, request, channel, signer_key_id,
-                         answered_at_ms, answered_by, consumed_at_ms, consumed_by
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL)
+                         answered_at_ms, answered_by, proof, consumed_at_ms, consumed_by
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL)
                      ON CONFLICT (confirmation_id) DO NOTHING",
                     params![
                         proof.request.confirmation_id.get().as_bytes().as_slice(),
@@ -554,9 +627,11 @@ impl InvitationRows {
                         proof.signer_key_id.as_bytes().as_slice(),
                         to_sql(now.get()),
                         answered_by.as_str(),
+                        stored_proof,
                     ],
                 )
-                .map(|_| ())
+                .map_err(ControllerError::registry)?;
+            Ok(())
         })
     }
 
@@ -575,8 +650,11 @@ impl InvitationRows {
         effect: &str,
         now: TimestampMs,
     ) -> Result<()> {
-        self.directory
-            .transaction(|transaction| consume(transaction, proof, effect, now))
+        let consumed = self
+            .directory
+            .transaction(|transaction| consume(transaction, &self.lifetimes, proof, effect, now));
+        self.lifetimes.settle();
+        consumed
     }
 
     /// Returns when a confirmation was answered and when it was consumed, as recorded.
@@ -588,7 +666,8 @@ impl InvitationRows {
         let row = self.directory.with(|connection| {
             connection
                 .query_row(
-                    "SELECT answered_at_ms, consumed_at_ms, channel, signer_key_id, request
+                    "SELECT answered_at_ms, consumed_at_ms, channel, signer_key_id, request,
+                            answered_by, proof
                      FROM owner_confirmations WHERE confirmation_id = ?1",
                     params![confirmation_id.get().as_bytes().as_slice()],
                     |row| {
@@ -599,13 +678,15 @@ impl InvitationRows {
                             row.get::<_, String>(2)?,
                             row.get::<_, Vec<u8>>(3)?,
                             row.get::<_, Vec<u8>>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, Vec<u8>>(6)?,
                         ))
                     },
                 )
                 .optional()
         })?;
         row.map(
-            |(answered_at_ms, consumed_at_ms, channel, signer, request)| {
+            |(answered_at_ms, consumed_at_ms, channel, signer, request, answered_by, proof)| {
                 Ok(Acceptance {
                     answered_at_ms,
                     consumed_at_ms,
@@ -616,6 +697,12 @@ impl InvitationRows {
                         })?,
                     ),
                     request: decode(&request)?,
+                    answered_by: if answered_by.is_empty() {
+                        None
+                    } else {
+                        Some(ActorId::new(answered_by).map_err(ControllerError::registry)?)
+                    },
+                    proof: decode(&proof)?,
                 })
             },
         )
@@ -637,18 +724,25 @@ impl InvitationStore for InvitationRows {
                     .to_owned(),
             })?;
         let effect = format!("pair.invite {}", record.invitation_id);
-        self.directory
-            .transaction(|transaction| {
-                insert_invitation(transaction, record, terms, issued_under)?;
-                consume(transaction, issued_under, &effect, terms.issued_at_ms)
-            })
-            .map_err(store_failure)
+        let created = self.directory.transaction(|transaction| {
+            self.admission.check()?;
+            insert_invitation(transaction, record, terms, issued_under)?;
+            consume(
+                transaction,
+                &self.lifetimes,
+                issued_under,
+                &effect,
+                terms.issued_at_ms,
+            )
+        });
+        self.lifetimes.settle();
+        created.map_err(store_error)
     }
 
     fn load(&self, invitation_id: InvitationId) -> kr_pairing::Result<Option<InvitationRecord>> {
         self.row(invitation_id)
             .map(|row| row.map(|row| row.record))
-            .map_err(store_failure)
+            .map_err(store_error)
     }
 
     fn transition(
@@ -658,6 +752,7 @@ impl InvitationStore for InvitationRows {
     ) -> kr_pairing::Result<TransitionOutcome> {
         self.directory
             .transaction(|transaction| {
+                self.admission.check()?;
                 let current = read_record(transaction, expected.invitation_id)?
                     .ok_or_else(|| ControllerError::registry("that invitation has no record"))?;
                 if &current != expected {
@@ -666,7 +761,7 @@ impl InvitationStore for InvitationRows {
                 write_record(transaction, next)?;
                 Ok(TransitionOutcome::Written)
             })
-            .map_err(store_failure)
+            .or_else(unwritten)
     }
 
     fn commit(
@@ -675,9 +770,12 @@ impl InvitationStore for InvitationRows {
         next: &InvitationRecord,
         commitment: &PairingCommitment,
     ) -> kr_pairing::Result<TransitionOutcome> {
-        self.directory
-            .transaction(|transaction| commit_pairing(transaction, expected, next, commitment))
-            .map_err(store_failure)
+        let committed = self.directory.transaction(|transaction| {
+            self.admission.check()?;
+            commit_pairing(transaction, &self.lifetimes, expected, next, commitment)
+        });
+        self.lifetimes.settle();
+        committed.or_else(unwritten)
     }
 
     fn commitment(
@@ -701,7 +799,7 @@ impl InvitationStore for InvitationRows {
                     })
                     .transpose()
             })
-            .map_err(store_failure)
+            .map_err(store_error)
     }
 
     fn unfinished(&self) -> kr_pairing::Result<Vec<InvitationRecord>> {
@@ -716,10 +814,10 @@ impl InvitationStore for InvitationRows {
                     .query_map([], |row| row.get::<_, Vec<u8>>(0))?
                     .collect::<rusqlite::Result<Vec<_>>>()
             })
-            .map_err(store_failure)?;
+            .map_err(store_error)?;
         let mut records = Vec::with_capacity(ids.len());
         for bytes in ids {
-            let invitation_id = InvitationId::new(uuid(Some(&bytes)).map_err(store_failure)?);
+            let invitation_id = InvitationId::new(uuid(Some(&bytes)).map_err(store_error)?);
             if let Some(record) = self.load(invitation_id)? {
                 records.push(record);
             }
@@ -731,6 +829,7 @@ impl InvitationStore for InvitationRows {
 /// Commits one pairing: everything section 10 writes together, or nothing.
 fn commit_pairing(
     transaction: &Connection,
+    lifetimes: &GrantLifetimes,
     expected: &InvitationRecord,
     next: &InvitationRecord,
     commitment: &PairingCommitment,
@@ -763,6 +862,16 @@ fn commit_pairing(
         });
     }
 
+    // The confirmation is spent, and its signer's authority read, before the candidate's own row
+    // exists: a candidate presenting the signer's key must not be what makes that signer look like
+    // an owner device.
+    consume(
+        transaction,
+        lifetimes,
+        &commitment.owner_confirmation,
+        &format!("pair.confirm {}", commitment.invitation_id),
+        commitment.committed_at_ms,
+    )?;
     let record = device_record(commitment).map_err(ControllerError::registry)?;
     insert_record(transaction, &record)?;
     transaction
@@ -774,12 +883,6 @@ fn commit_pairing(
             ],
         )
         .map_err(ControllerError::registry)?;
-    consume(
-        transaction,
-        &commitment.owner_confirmation,
-        &format!("pair.confirm {}", commitment.invitation_id),
-        commitment.committed_at_ms,
-    )?;
     if first_owner {
         transaction
             .execute(
@@ -843,19 +946,20 @@ fn commit_pairing(
 /// refused: one ceremony authorises one action.
 fn consume(
     transaction: &Connection,
+    lifetimes: &GrantLifetimes,
     proof: &OwnerConfirmationProof,
     effect: &str,
     now: TimestampMs,
 ) -> Result<()> {
-    signer_still_authorised(transaction, proof, now)?;
+    signer_still_authorised(transaction, lifetimes, proof)?;
     let request = encode(&proof.request)?;
     let action = text_of(&proof.request.action)?;
     let changed = transaction
         .execute(
             "INSERT INTO owner_confirmations (
                  confirmation_id, action, action_digest, request, channel, signer_key_id,
-                 answered_at_ms, answered_by, consumed_at_ms, consumed_by
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '', ?7, ?8)
+                 answered_at_ms, answered_by, proof, consumed_at_ms, consumed_by
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '', ?8, ?7, ?9)
              ON CONFLICT (confirmation_id) DO UPDATE
                  SET consumed_at_ms = excluded.consumed_at_ms,
                      consumed_by = excluded.consumed_by
@@ -868,6 +972,7 @@ fn consume(
                 proof.channel.as_str(),
                 proof.signer_key_id.as_bytes().as_slice(),
                 to_sql(now.get()),
+                encode(proof)?,
                 effect,
             ],
         )
@@ -885,13 +990,15 @@ fn consume(
 ///
 /// An answer is accepted when it arrives and spent later, and authority can change in between: the
 /// owner device that answered can be revoked, or its grant can run out, and the first owner can be
-/// established by another pairing. Revocation and the owner record are written to this same
-/// database, so reading them here, in the transaction that records the effect, is the boundary the
-/// two share: an effect commits only under the authority standing at that moment.
+/// established by another pairing. Revocation, expiry tombstones and the owner record are written
+/// to this same database, so reading them here, in the transaction that records the effect, is the
+/// boundary they share: an effect commits only under the authority standing at that moment. A grant
+/// that expires is judged by the deadline the host time contract anchored for it, against the
+/// continuous clock read now, after every wait before this transaction.
 fn signer_still_authorised(
     transaction: &Connection,
+    lifetimes: &GrantLifetimes,
     proof: &OwnerConfirmationProof,
-    now: TimestampMs,
 ) -> Result<()> {
     let lapsed = |detail: &str| ControllerError::Refused {
         code: ErrorCode::OwnerConfirmationRequired,
@@ -915,22 +1022,32 @@ fn signer_still_authorised(
         ConfirmationChannel::OwnerDevicePresence | ConfirmationChannel::PairedOwnerDevice => {
             let mut statement = transaction
                 .prepare(
-                    "SELECT authorisation_key, grant FROM network_devices
+                    "SELECT device_id, authorisation_key, grant FROM network_devices
                      WHERE revoked_at_ms IS NULL AND expired_at_ms IS NULL",
                 )
                 .map_err(ControllerError::registry)?;
             let rows = statement
                 .query_map([], |row| {
-                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
                 })
                 .map_err(ControllerError::registry)?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(ControllerError::registry)?;
-            let standing = rows.iter().any(|(key, grant)| {
-                <[u8; 32]>::try_from(key.as_slice()).is_ok_and(|key| {
+            let standing = rows.iter().any(|(device_id, key, grant)| {
+                let signed = <[u8; 32]>::try_from(key.as_slice()).is_ok_and(|key| {
                     kr_crypto::keys::key_id(KeyPurpose::Authorisation, &key) == proof.signer_key_id
-                }) && decode::<Grant>(grant)
-                    .is_ok_and(|grant| holds_live_owner_grant(&grant, now.get()))
+                });
+                signed
+                    && uuid(Some(device_id)).is_ok_and(|device_id| {
+                        decode::<Grant>(grant).is_ok_and(|grant| {
+                            grant.permits(ActionRight::HostManage)
+                                && lifetimes.in_force_now(DeviceId::new(device_id), grant.expiry)
+                        })
+                    })
             });
             if !standing {
                 return Err(lapsed(
@@ -1287,16 +1404,49 @@ fn from_sql(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
 }
 
-/// Returns kr-pairing's view of a failed write.
+/// Returns true when a store error is the store's own decision not to write, rather than a
+/// failure.
+///
+/// Every error raised inside a transaction rolls it back, so nothing was written either way. What
+/// differs is what kr-pairing may conclude: a refusal (the mutation's admission lapsed, the
+/// confirmation's signer is no longer an owner device, a host with no owner refusing anything but
+/// its first owner, a confirmation already spent) is a decision, and the invitation serves its
+/// next step; a failure is a write whose outcome nobody knows, and kr-pairing fences the invitation
+/// for it.
+const fn is_refusal(error: &ControllerError) -> bool {
+    matches!(
+        error,
+        ControllerError::PermissionDenied { .. }
+            | ControllerError::WindowExpired { .. }
+            | ControllerError::Refused { .. }
+    )
+}
+
+/// Returns kr-pairing's view of a store error, under the code the host reports it with.
 ///
 /// A confirmation whose authority lapsed before its effect committed is refused as what it is,
 /// so the caller is told to confirm again rather than that storage failed.
-fn store_failure(error: ControllerError) -> kr_pairing::PairingError {
+fn store_error(error: ControllerError) -> kr_pairing::PairingError {
+    if !is_refusal(&error) {
+        return kr_pairing::PairingError::Store {
+            reason: error.to_string(),
+        };
+    }
     if error.code() == ErrorCode::OwnerConfirmationRequired {
         return kr_pairing::PairingError::OwnerConfirmationRequired;
     }
-    kr_pairing::PairingError::Store {
+    kr_pairing::PairingError::Refused {
+        code: error.code(),
         reason: error.to_string(),
+    }
+}
+
+/// Returns what a conditional write that wrote nothing reports: a refusal, or a failure.
+fn unwritten(error: ControllerError) -> kr_pairing::Result<TransitionOutcome> {
+    if is_refusal(&error) {
+        Ok(TransitionOutcome::Refused(store_error(error)))
+    } else {
+        Err(store_error(error))
     }
 }
 
@@ -1329,31 +1479,6 @@ mod tests {
         assert_eq!(
             text_of(&ConfirmationChannel::LocalBootstrapTerminal).expect("a name"),
             ConfirmationChannel::LocalBootstrapTerminal.as_str()
-        );
-    }
-
-    /// KR-REQ-10.05: an owner device is a device whose grant holds host management and has not
-    /// run out. A grant past its expiry makes no owner, whether or not anything has yet written the
-    /// expiry into the device's record.
-    #[test]
-    fn a_grant_that_ran_out_makes_no_owner_device() {
-        let mut grant = kr_pairing::grants::personal_owner_grant().into_grant(
-            kr_protocol::ids::GrantId::new(Uuid::from_bytes([1; 16])),
-            DeviceId::new(Uuid::from_bytes([2; 16])),
-            DeviceId::new(Uuid::from_bytes([3; 16])),
-            kr_protocol::ids::AuthorityRevision::new(1),
-        );
-        assert!(holds_live_owner_grant(&grant, 1_000));
-        grant.expiry = GrantExpiry::At {
-            expires_at_ms: TimestampMs::new(1_000),
-        };
-        assert!(holds_live_owner_grant(&grant, 999));
-        assert!(!holds_live_owner_grant(&grant, 1_000));
-        grant.expiry = GrantExpiry::Never;
-        grant.actions = [ActionRight::SessionView].into_iter().collect();
-        assert!(
-            !holds_live_owner_grant(&grant, 1_000),
-            "no host management, no owner"
         );
     }
 }

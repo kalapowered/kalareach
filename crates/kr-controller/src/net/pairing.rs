@@ -51,7 +51,7 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable};
 use kr_transport::preauth::{ConnectionPeer, PairingMethod, PairingSurface};
 
-use super::invitations::{InvitationRow, InvitationRows, IssueTerms};
+use super::invitations::{Admission, InvitationRow, InvitationRows, IssueTerms, WriteAdmission};
 use super::owner::{Caller, OwnerAuthority, Resolved, refusal};
 use crate::error::{ControllerError, Result};
 
@@ -104,6 +104,8 @@ pub const CLOCK_PURPOSE: &str = "kr-host-clock/1";
 /// The invitation this host is offering, and what it was issued as.
 struct Open {
     mode: OpenMode,
+    /// The admission slot of this invitation's writes, set while an owner mutation drives it.
+    admission: WriteAdmission,
     /// The answer `pair.invite` gave, returned again to a retry of the same action.
     answer: PairInviteResult,
     issued_by: ActorId,
@@ -346,7 +348,7 @@ impl PairingHost {
         params: &OwnerConfirmationCompleteParams,
         admission: &dyn Fn() -> Result<()>,
     ) -> Result<OwnerConfirmationCompleteResult> {
-        if let Some(retained) = self.owner.retained_answer(params) {
+        if let Some(retained) = self.owner.retained_answer(caller, params) {
             return retained;
         }
         self.owner.complete(caller, params, admission)
@@ -368,7 +370,7 @@ impl PairingHost {
         params: &PairInviteParams,
         action: (ActionId, Digest256),
         network_config: NetworkConfig,
-        admission: &dyn Fn() -> Result<()>,
+        admission: &Admission,
     ) -> Result<PairInviteResult> {
         if caller.device.is_some() {
             return Err(ControllerError::PermissionDenied {
@@ -425,27 +427,32 @@ impl PairingHost {
             issued_at_ms: kr_ipc::now_ms(),
         };
         let owner = caller.owner_context();
-        // The last check before anything is spent or written: the caller's registration and the
-        // deadline its mutation was admitted under, which the wait for this thread and for the
-        // invitation's lock may have used up.
+        // Asked before anything is spent: the caller's registration and the deadline its mutation
+        // was admitted under, which the wait for this thread and for the invitation's lock may have
+        // used up. A mutation refused here leaves the owner's answer unspent. It is asked once
+        // more inside the transaction that writes the invitation, after every later wait.
         admission()?;
-        let (mode, answer) = match &params.mode {
+        let (mode, answer, slot) = match &params.mode {
             InviteMode::Direct => {
                 let mut identity = self.identity.clone();
                 identity.network_config = network_config;
+                let rows = self.rows.issuing(terms);
+                let slot = rows.write_admission().clone();
                 let (spendable, mut challenges) = self.owner.spend(&expectation)?;
-                let issued = DirectInvitation::issue(
-                    self.rows.issuing(terms),
-                    self.clock.clone(),
-                    identity,
-                    params.proposed_grant.clone(),
-                    kind,
-                    &spendable.approval(&owner),
-                    challenges.ledger(),
-                );
+                let issued = admitted(&slot, admission, || {
+                    DirectInvitation::issue(
+                        rows,
+                        self.clock.clone(),
+                        identity,
+                        params.proposed_grant.clone(),
+                        kind,
+                        &spendable.approval(&owner),
+                        challenges.ledger(),
+                    )
+                });
                 challenges.forget(spendable.request());
                 drop(challenges);
-                let invitation = issued.map_err(refusal)?;
+                let invitation = issued?;
                 let payload = invitation.qr_payload();
                 let QrPayload::Direct(direct) = &payload else {
                     return Err(ControllerError::registry(
@@ -459,7 +466,7 @@ impl PairingHost {
                         qr_text: qr_text(&payload)?,
                     },
                 };
-                (OpenMode::Direct(Box::new(invitation)), answer)
+                (OpenMode::Direct(Box::new(invitation)), answer, slot)
             }
             InviteMode::Code { .. } => {
                 return Err(ControllerError::Refused {
@@ -471,6 +478,7 @@ impl PairingHost {
         };
         *open = Some(Open {
             mode,
+            admission: slot,
             answer: answer.clone(),
             issued_by: caller.actor_id.clone(),
             action: (action, digest),
@@ -491,7 +499,7 @@ impl PairingHost {
         caller: &Caller,
         params: &PairConfirmParams,
         authority_revision: AuthorityRevision,
-        admission: &dyn Fn() -> Result<()>,
+        admission: &Admission,
     ) -> Result<PairConfirmResult> {
         let mut open = self.open();
         let Some(offered) = open
@@ -524,7 +532,9 @@ impl PairingHost {
         );
         let identities = fresh_identities(self.identity.device_id, authority_revision)?;
         let owner = caller.owner_context();
+        // Asked before the answer is spent, and again inside the commit's own transaction.
         admission()?;
+        let slot = offered.admission.clone();
         let (spendable, mut challenges) = self.owner.spend(&expectation)?;
         let committed = match (&mut offered.mode, params.approval) {
             (
@@ -533,25 +543,27 @@ impl PairingHost {
                     transcript_digest,
                     client_key_digest,
                 },
-            ) => invitation.confirm(
-                &spendable.approval(&owner),
-                challenges.ledger(),
-                &ApprovedRedemption {
-                    transcript_digest,
-                    client_key_digest,
-                },
-                &identities,
-                None,
-            ),
+            ) => admitted(&slot, admission, || {
+                invitation.confirm(
+                    &spendable.approval(&owner),
+                    challenges.ledger(),
+                    &ApprovedRedemption {
+                        transcript_digest,
+                        client_key_digest,
+                    },
+                    &identities,
+                    None,
+                )
+            }),
             (OpenMode::Direct(_), PairingApproval::Code { .. }) => {
-                Err(kr_pairing::PairingError::ContextMismatch {
+                Err(refusal(kr_pairing::PairingError::ContextMismatch {
                     what: "the mode of the approval",
-                })
+                }))
             }
         };
         challenges.forget(spendable.request());
         drop(challenges);
-        let commitment = committed.map_err(refusal)?;
+        let commitment = committed?;
         let event = self
             .rows
             .event_for(commitment.invitation_id)?
@@ -575,7 +587,7 @@ impl PairingHost {
         &self,
         caller: &Caller,
         params: &PairCancelParams,
-        admission: &dyn Fn() -> Result<()>,
+        admission: &Admission,
     ) -> Result<PairStatusResult> {
         let mut open = self.open();
         if let Some(offered) = open
@@ -590,16 +602,16 @@ impl PairingHost {
         {
             let owner = caller.owner_context();
             admission()?;
+            let slot = offered.admission.clone();
             match &mut offered.mode {
-                OpenMode::Direct(invitation) => {
+                OpenMode::Direct(invitation) => admitted(&slot, admission, || {
                     if params.deny {
                         invitation.deny(&owner)
                     } else {
                         invitation.cancel(&owner)
                     }
-                }
-            }
-            .map_err(refusal)?;
+                }),
+            }?;
             // The ended invitation stays: its candidate authenticated itself, and asking what
             // happened is how it learns it was denied or withdrawn. The next invitation replaces
             // it.
@@ -806,7 +818,7 @@ impl PairingHost {
             Method::OwnerConfirmationComplete => {
                 let params: OwnerConfirmationCompleteParams = mutation.params.to_typed().ok()?;
                 self.owner
-                    .retained_answer(&params)
+                    .retained_answer(caller, &params)
                     .map(|retained| retained.and_then(|answer| encode(&answer)))
             }
             Method::PairConfirm => {
@@ -1011,6 +1023,20 @@ impl PairingSurface for PairingHost {
             )),
         }
     }
+}
+
+/// Runs one owner-driven write of an invitation with the mutation's admission asked inside the
+/// write's own transaction, and reports a lapse as the lapse it is.
+///
+/// A lapse is final: a withdrawn registration is not restored and a passed deadline does not come
+/// back, so asking once more after a refused write says whether the refusal was the lapse.
+fn admitted<T>(
+    slot: &WriteAdmission,
+    admission: &Admission,
+    call: impl FnOnce() -> kr_pairing::Result<T>,
+) -> Result<T> {
+    slot.during(admission, call)
+        .map_err(|error| admission().err().unwrap_or_else(|| refusal(error)))
 }
 
 /// Returns the kr-pairing grant kind a protocol kind names.

@@ -46,7 +46,8 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, Digest256, EndpointKey, KeyId};
 
 use super::devices::{DeviceDirectory, DeviceRecord};
-use super::invitations::{InvitationRows, holds_live_owner_grant};
+use super::invitations::InvitationRows;
+use super::lifetimes::GrantLifetimes;
 use super::pairing::HostPairingClock;
 use crate::error::{ControllerError, Result};
 
@@ -91,18 +92,22 @@ impl Caller {
         }
     }
 
-    /// Returns true when this caller holds owner authority on this host at `now_ms`.
+    /// Returns true when this caller holds owner authority on this host now.
     ///
     /// A local caller is the host's own account. A paired device is an owner device while its
-    /// record stands and its grant holds `host.manage` and has not run out.
-    #[must_use]
-    pub fn is_owner(&self, now_ms: u64) -> bool {
+    /// record stands, its grant holds `host.manage`, and that grant is in force under the host
+    /// time contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the grant's lifetime cannot be read or recorded.
+    pub fn is_owner(&self, lifetimes: &GrantLifetimes) -> Result<bool> {
         match (&self.device, self.ingress) {
-            (None, ActorIngress::LocalIpc) => true,
-            (Some(device), ActorIngress::PairedDevice) => {
-                device.is_paired() && holds_live_owner_grant(&device.grant, now_ms)
-            }
-            _ => false,
+            (None, ActorIngress::LocalIpc) => Ok(true),
+            (Some(device), ActorIngress::PairedDevice) => Ok(device.is_paired()
+                && device.grant.permits(ActionRight::HostManage)
+                && lifetimes.in_force(device)?),
+            _ => Ok(false),
         }
     }
 }
@@ -275,7 +280,7 @@ impl OwnerAuthority {
         action: (ActionId, Digest256),
         admission: &dyn Fn() -> Result<()>,
     ) -> Result<OwnerConfirmationRequestResult> {
-        if !caller.is_owner(kr_ipc::now_ms().get()) {
+        if !caller.is_owner(self.rows.lifetimes())? {
             return Err(ControllerError::PermissionDenied {
                 detail: "only this host's owner asks for an owner confirmation".to_owned(),
             });
@@ -286,7 +291,6 @@ impl OwnerAuthority {
         let initial_bootstrap = self.enrolment()? == HostEnrolment::InitialBootstrap;
         let mut state = self.state();
         self.sweep(&mut state);
-        admission()?;
         let request = request_confirmation(
             &self.clock,
             resolved.action,
@@ -297,8 +301,10 @@ impl OwnerAuthority {
             self.host_endpoint_id,
         )
         .map_err(refusal)?;
+        // The admission is asked inside the transaction that records the request, after every wait
+        // before it; nothing is issued unless that record is written.
         self.rows
-            .record_requested(&caller.actor_id, action.0, action.1, &request)?;
+            .record_requested(&caller.actor_id, action.0, action.1, &request, admission)?;
         state.ledger.issue(&request, &self.clock);
         state.issued += 1;
         let order = state.issued;
@@ -349,21 +355,30 @@ impl OwnerAuthority {
         )
     }
 
-    /// Returns the answer a repeated completion is owed, when the same proof already answered.
+    /// Returns the answer a repeated completion is owed, when this caller already completed this
+    /// exact proof.
     ///
     /// The acceptance record is what says so, so this holds after the challenge was spent and
-    /// across a restart.
+    /// across a restart. It answers the caller that completed the proof and nobody else, and only
+    /// for the proof exactly as it was accepted: a repeat with anything changed, the signature
+    /// included, is a new completion and is checked as one.
     #[must_use]
     pub fn retained_answer(
         &self,
+        caller: &Caller,
         params: &OwnerConfirmationCompleteParams,
     ) -> Option<Result<OwnerConfirmationCompleteResult>> {
         let proof = &params.proof;
+        let presented_signer_matches = params
+            .bootstrap_signer
+            .0
+            .as_ref()
+            .is_none_or(|signer| key_id(signer) == proof.signer_key_id);
         match self.rows.acceptance(proof.request.confirmation_id) {
             Ok(Some(acceptance))
-                if acceptance.channel == proof.channel.as_str()
-                    && acceptance.signer_key_id == proof.signer_key_id
-                    && acceptance.request == proof.request =>
+                if acceptance.answered_by.as_ref() == Some(&caller.actor_id)
+                    && &acceptance.proof == proof
+                    && presented_signer_matches =>
             {
                 Some(Ok(OwnerConfirmationCompleteResult {
                     confirmation_id: proof.request.confirmation_id,
@@ -382,7 +397,7 @@ impl OwnerAuthority {
     ///
     /// Returns `PERMISSION_DENIED` for a caller without owner authority.
     pub fn pending(&self, caller: &Caller) -> Result<OwnerConfirmationPendingResult> {
-        if !caller.is_owner(kr_ipc::now_ms().get()) {
+        if !caller.is_owner(self.rows.lifetimes())? {
             return Err(ControllerError::PermissionDenied {
                 detail: "only this host's owner reads its outstanding confirmations".to_owned(),
             });
@@ -451,9 +466,11 @@ impl OwnerAuthority {
                 "that challenge has already been answered with another proof",
             ));
         }
-        admission()?;
         let now = kr_ipc::now_ms();
-        self.rows.record_answered(proof, &caller.actor_id, now)?;
+        // The admission is asked inside the transaction that records the answer, after every wait
+        // before it.
+        self.rows
+            .record_answered(proof, &caller.actor_id, now, admission)?;
         if let Some(entry) = state.entries.get_mut(&key) {
             entry.answer = Some(Answer {
                 proof: proof.clone(),
@@ -637,15 +654,23 @@ impl OwnerAuthority {
         }
     }
 
-    /// Returns the live paired devices whose grant holds host management and has not run out.
+    /// Returns the live paired devices whose grant holds host management and is in force under
+    /// the host time contract.
+    ///
+    /// Asking anchors each such grant's deadline, which is what the check inside the consuming
+    /// transaction compares with the clock read there.
     fn owner_devices(&self) -> Result<Vec<DeviceRecord>> {
-        let now = kr_ipc::now_ms().get();
-        Ok(self
-            .devices()
-            .devices()?
-            .into_iter()
-            .filter(|device| device.is_paired() && holds_live_owner_grant(&device.grant, now))
-            .collect())
+        let lifetimes = self.rows.lifetimes();
+        let mut owners = Vec::new();
+        for device in self.devices().devices()? {
+            if device.is_paired()
+                && device.grant.permits(ActionRight::HostManage)
+                && lifetimes.in_force(&device)?
+            {
+                owners.push(device);
+            }
+        }
+        Ok(owners)
     }
 
     fn devices(&self) -> &DeviceDirectory {

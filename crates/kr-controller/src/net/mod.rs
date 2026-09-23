@@ -44,6 +44,7 @@ pub mod config;
 pub mod devices;
 pub mod dispatch;
 pub mod invitations;
+pub mod lifetimes;
 pub mod methods;
 pub mod owner;
 pub mod pairing;
@@ -337,13 +338,6 @@ impl Network {
     }
 }
 
-/// When one device's grant runs out, and whether it has been found to have run out.
-#[derive(Clone, Copy, Debug)]
-pub struct GrantDeadline {
-    /// The moment on the continuous clock, absent for a grant that does not expire.
-    pub deadline: Option<ContinuousInstant>,
-}
-
 /// What the transport calls back into.
 pub struct NetworkHost {
     /// The daemon this host belongs to.
@@ -355,15 +349,9 @@ pub struct NetworkHost {
     devices: Arc<DeviceDirectory>,
     pairing: Arc<PairingHost>,
     endpoint: kr_transport::config::EndpointConfig,
-    /// The clock every deadline this host decides is measured on.
-    clock: Arc<dyn kr_transport::clock::ContinuousClock>,
-    /// When each device's grant runs out, on the continuous clock.
-    ///
-    /// Anchored the first time a device connects and shared by every connection it makes
-    /// afterwards, so a wall clock stepped backwards between two connections cannot give the same
-    /// grant a longer life the second time. A device whose grant is found to have run out is
-    /// recorded as expired, which is what makes the decision survive a restart as well.
-    grant_deadlines: std::sync::Mutex<std::collections::BTreeMap<DeviceId, GrantDeadline>>,
+    /// When each device's grant runs out, under the host time contract the owner confirmations
+    /// on this host are checked under as well.
+    lifetimes: Arc<lifetimes::GrantLifetimes>,
     /// Every authorised connection this host is serving.
     ///
     /// A revocation needs them: withdrawing a registration stops the next request, and a device
@@ -376,13 +364,6 @@ pub struct NetworkHost {
     live: std::sync::Mutex<std::collections::BTreeMap<ConnectionId, Weak<RemoteConnection>>>,
     /// This host's endpoint identity, which is what a pairing invitation pins.
     endpoint_id: EndpointKey,
-    /// Expiry records this host owes its directory, and has not yet written.
-    pending_expiry: Arc<devices::PendingExpiry>,
-    /// Whether this host may decide a grant's expiry from its own wall clock.
-    ///
-    /// Shared with the task that keeps the record, which observes a rollback between connections
-    /// and retries the write until it lands. Every transition of it takes one boundary.
-    clock_trust: Arc<devices::ClockTrust>,
 }
 
 impl std::fmt::Debug for NetworkHost {
@@ -470,103 +451,6 @@ impl NetworkHost {
         Ok(record)
     }
 
-    /// Returns when this device's grant runs out, anchoring it the first time it is asked.
-    ///
-    /// One anchor per device, shared by every connection it makes, so the answer does not depend
-    /// on what the wall clock said at each connection. Behind that anchor is a deadline on the
-    /// machine's own continuous clock, written down and bound to this boot:
-    ///
-    /// * Within the boot it was derived in, that deadline is the answer. A restart of this daemon
-    ///   does not re-derive it, so a connection that sat idle past its expiry and came back after
-    ///   a restart is refused rather than given a fresh lifetime from a wall clock that has since
-    ///   been stepped backwards.
-    /// * In a new boot there is nothing to reuse, so the lifetime comes from the grant's UTC
-    ///   expiry, decided against a moment that is never earlier than the latest this host has
-    ///   recorded. A wall clock that is *behind* that mark by more than [`CLOCK_TOLERANCE`] is not
-    ///   a clock this host will decide an expiry against, and the connection is refused as such.
-    ///
-    /// Either way the continuous instant is sampled *before* the moment it is measured against:
-    /// sampling the other way round would count the time between the two samples, and a machine
-    /// suspended there would wake with a longer grant than it went to sleep with.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the grant has run out, when the wall clock cannot be trusted to say
-    /// whether it has, or when the deadline or an observed expiry cannot be written down. A grant
-    /// whose end this host cannot record is not served: the alternative is a device that keeps
-    /// reconnecting on a grant this host has already decided is over.
-    fn grant_deadline(&self, record: &DeviceRecord) -> Result<Option<ContinuousInstant>> {
-        let mut held = self
-            .grant_deadlines
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(anchored) = held.get(&record.device_id) {
-            return Ok(anchored.deadline);
-        }
-        let kr_protocol::grant::GrantExpiry::At { expires_at_ms } = record.grant.expiry else {
-            held.insert(record.device_id, GrantDeadline { deadline: None });
-            return Ok(None);
-        };
-        let controller = self.daemon()?;
-        let anchor = self.clock.now();
-        let boot_now = controller.shared_clock.boot_elapsed_ms();
-        let recorded = self
-            .devices
-            .grant_deadline_in(record.device_id, &controller.boot_identity)?;
-        let remaining = match recorded {
-            Some(deadline) => deadline.saturating_sub(boot_now),
-            None => self.derive_lifetime(record, expires_at_ms, boot_now)?,
-        };
-        if remaining == 0 {
-            // Run out. The tombstone is what a later boot reads, where this boot's deadline means
-            // nothing any more, and it is owed to the directory before anything tries to write it:
-            // a write that fails here is retried by the host's own task rather than forgotten.
-            self.pending_expiry.owe(record.device_id, kr_ipc::now_ms());
-            self.pending_expiry.settle(&self.devices);
-            return Err(ControllerError::PermissionDenied {
-                detail: "this device's grant has run out; pair again".to_owned(),
-            });
-        }
-        let deadline = anchor.checked_add(std::time::Duration::from_millis(remaining));
-        held.insert(record.device_id, GrantDeadline { deadline });
-        Ok(deadline)
-    }
-
-    /// Derives how much of one grant's life is left, and writes the deadline down.
-    ///
-    /// Only reached in a boot that has no deadline for this device yet. The wall clock decides,
-    /// against the latest moment this host has recorded, and the answer is written as a moment on
-    /// the machine's continuous clock so nothing has to ask the wall clock again.
-    fn derive_lifetime(
-        &self,
-        record: &DeviceRecord,
-        expires_at_ms: kr_protocol::scalars::TimestampMs,
-        boot_now: u64,
-    ) -> Result<u64> {
-        let controller = self.daemon()?;
-        // One boundary, and one answer from it: the reading and the decision about the reading
-        // are taken together, so a grant's life cannot be measured from a moment the host had
-        // already decided it could not trust. Distrust stands until something authenticates the
-        // clock again; reaching a moment this host had already written down is not that evidence,
-        // and only [`NetworkHost::establish_clock`], which an owner's approval reaches, clears it.
-        let Some(observed) = self.clock_trust.sample(&self.devices)? else {
-            return Err(ControllerError::ClockUntrusted {
-                detail: "this host's clock went backwards and has not been established again, so \
-                         it cannot say whether this device's grant has run out"
-                    .to_owned(),
-            });
-        };
-        let remaining = expires_at_ms.get().saturating_sub(observed.now.get());
-        if remaining > 0 {
-            self.devices.record_grant_deadline(
-                record.device_id,
-                &controller.boot_identity,
-                boot_now.saturating_add(remaining),
-            )?;
-        }
-        Ok(remaining)
-    }
-
     /// Serves one authorised connection until it ends.
     async fn serve_connection(self: Arc<Self>, mut session: AuthorisedSession) {
         let connection_id = session.connection_id;
@@ -587,7 +471,7 @@ impl NetworkHost {
         // Section 9 makes the accepted deadline the earliest of the window's expiry, receipt time
         // plus the requested lifetime and any applicable authority deadline. A grant that runs out
         // is exactly such a deadline, and it is this host's one anchor for that device.
-        let grant_deadline = match self.grant_deadline(&device) {
+        let grant_deadline = match self.lifetimes.deadline(&device) {
             Ok(deadline) => deadline,
             Err(error) => {
                 let _ = session
@@ -709,15 +593,15 @@ impl NetworkHost {
     /// answered, and an error when the record cannot be written.
     async fn establish_clock(&self) -> Result<()> {
         self.pairing.accept_clock()?;
-        self.clock_trust.establish(&self.devices)
+        self.lifetimes.clock_trust().establish(&self.devices)
     }
 
     /// Returns the records a connection reads and writes, each of which outlives it.
     fn records(&self) -> devices::HostRecords {
         devices::HostRecords {
             devices: Arc::clone(&self.devices),
-            pending: Arc::clone(&self.pending_expiry),
-            clock: Arc::clone(&self.clock_trust),
+            pending: Arc::clone(self.lifetimes.pending_expiry()),
+            clock: Arc::clone(self.lifetimes.clock_trust()),
         }
     }
 
@@ -932,15 +816,27 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
         controller.paths().registry_database(),
     )?);
     invitations::prepare(&devices)?;
+    // The daemon's own clock, not a second one. Deadlines from the transport's action windows are
+    // compared with deadlines the daemon decided, and a continuous instant is anchored privately:
+    // two clocks would make those comparisons meaningless rather than merely imprecise.
+    let clock: Arc<dyn kr_transport::clock::ContinuousClock> =
+        Arc::clone(&controller.clock) as Arc<_>;
+    // One record of every grant's lifetime, read by the connections this host admits and by the
+    // owner confirmations it spends.
+    let lifetimes = Arc::new(lifetimes::GrantLifetimes::new(
+        Arc::clone(&devices),
+        Arc::clone(&clock),
+        Arc::clone(&controller.shared_clock),
+        controller.boot_identity.clone(),
+    ));
+    let rows = invitations::InvitationRows::new(Arc::clone(&devices), Arc::clone(&lifetimes));
     // Section 10: a host restart cancels every invitation it left unfinished, because a
     // candidate's attempt lived only in memory and nothing can resume it. What an invitation
     // consumed, and how many failed confirmations it had spent, stays on record. This runs before
     // the listener serves anything, so no candidate can reach an invitation from before the
     // restart.
-    kr_pairing::host::cancel_unfinished_invitations(&invitations::InvitationRows::new(Arc::clone(
-        &devices,
-    )))
-    .map_err(|error| invitations::from_store_failure(&error))?;
+    kr_pairing::host::cancel_unfinished_invitations(&rows)
+        .map_err(|error| invitations::from_store_failure(&error))?;
     // The host's own device identity is derived from its environment, so it is the same identity
     // across restarts without anything else having to be stored beside the keys.
     let device_id = DeviceId::new(environment_id.get());
@@ -963,24 +859,16 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
             network_config: NetworkConfig::empty(),
         },
         HostPairingClock::new(&controller.boot_identity),
-        invitations::InvitationRows::new(Arc::clone(&devices)),
+        rows,
     ));
-    // The daemon's own clock, not a second one. Deadlines from the transport's action windows are
-    // compared with deadlines the daemon decided, and a continuous instant is anchored privately:
-    // two clocks would make those comparisons meaningless rather than merely imprecise.
-    let clock: Arc<dyn kr_transport::clock::ContinuousClock> =
-        Arc::clone(&controller.clock) as Arc<_>;
     let host = Arc::new(NetworkHost {
         controller: Arc::downgrade(controller),
         devices,
         pairing,
         endpoint: setup.settings.endpoint.clone(),
-        clock: Arc::clone(&clock),
-        grant_deadlines: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        lifetimes,
         live: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         endpoint_id,
-        pending_expiry: Arc::new(devices::PendingExpiry::default()),
-        clock_trust: Arc::new(devices::ClockTrust::default()),
     });
     // The record of the wall clock moves while this host runs, whether or not anything asks it a
     // question. A mark that only advanced when a device connected would stand still through a
@@ -989,8 +877,8 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
     // mark evidence of time having passed rather than of connections having arrived.
     let marking = tokio::spawn(keep_the_record(
         Arc::clone(&host.devices),
-        Arc::clone(&host.pending_expiry),
-        Arc::clone(&host.clock_trust),
+        Arc::clone(host.lifetimes.pending_expiry()),
+        Arc::clone(host.lifetimes.clock_trust()),
     ));
     // The guard owns that task from here, so every way out of this function ends it: a duplicate
     // registration, an endpoint that will not bind, or a daemon that is dropped.

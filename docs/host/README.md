@@ -1404,10 +1404,22 @@ the destination keys and the rights itself. `owner.confirmation.pending` lists w
 still answer, with the full grant and, for a device, its keys and verification value, to the local
 owner and to paired devices holding `host.manage`. `owner.confirmation.complete` verifies a proof
 against an enrolled signer (a live paired device holding `host.manage`, on an owner-device channel)
-and records the answer. The sensitive effect then spends the oldest answered challenge whose
-members equal its own expectation, exactly once; no method takes a confirmation reference. Session,
-plugin and contact-tool channels are refused. Confirmations live for two minutes on the monotonic
-clock and end with the daemon.
+and records the answer, with the caller that completed it and the proof itself; a repeat of that
+completion is answered again only for that caller and exactly that proof. The sensitive effect then
+spends the oldest answered challenge whose members equal its own expectation and whose signer is
+still an owner device, exactly once; no method takes a confirmation reference. Session, plugin and
+contact-tool channels are refused. Confirmations live for two minutes on the monotonic clock and
+end with the daemon.
+
+**Authority when an answer is spent.** An owner device's grant is in force under the same time
+contract the network admits devices under: a deadline anchored on the continuous clock, a wall
+clock that is not trusted once it has gone backwards, and an expiry tombstone that keeps a grant
+that ran out from coming back. Revocation, the tombstones and the owner record are read again
+inside the transaction that records the effect, before any candidate row is written, and the
+anchored deadline is compared there with the clock read at that moment. The mutation's own
+admission, its registration and its accepted deadline, is asked in that same transaction, after
+every wait before it; a mutation whose admission lapsed writes nothing, and the owner confirms
+again.
 
 **Records.** The pairing records are tables in the registry database, written through the device
 directory's connection: `pairing_invitations` (never the code or the direct secret),

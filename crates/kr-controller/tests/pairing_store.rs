@@ -6,12 +6,15 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use kr_controller::service::net::devices::DeviceDirectory;
 use kr_controller::service::net::invitations::{
     HostOwner, InvitationRows, IssueTerms, device_record, prepare,
 };
+use kr_controller::service::net::lifetimes::GrantLifetimes;
 use kr_crypto::keys::DeviceKeys;
+use kr_ipc::clock::ManualSharedClock;
 use kr_pairing::PairingError;
 use kr_pairing::client::ClientAttempt;
 use kr_pairing::code::EnteredCode;
@@ -43,6 +46,7 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{
     AuthorisationKey, CanonicalSet, Digest256, Nullable, TimestampMs, Uuid,
 };
+use kr_transport::clock::ManualClock;
 
 fn origin() -> RendezvousOrigin {
     RendezvousOrigin::new("https://reach.kala.to").expect("an origin")
@@ -82,6 +86,11 @@ fn client_bundle(keys: &DeviceKeys) -> ClientBundle {
 /// A database created here belongs to a host that already has an owner device, so the pairings
 /// these tests commit are ordinary ones rather than the first owner's.
 fn open(path: &Path) -> (Arc<DeviceDirectory>, InvitationRows) {
+    open_with(path, &ManualClock::new())
+}
+
+/// Opens the database at `path` with its grant lifetimes measured on `clock`.
+fn open_with(path: &Path, clock: &ManualClock) -> (Arc<DeviceDirectory>, InvitationRows) {
     let fresh = !path.exists();
     let directory = Arc::new(DeviceDirectory::open(path).expect("the registry database opens"));
     if fresh {
@@ -90,7 +99,7 @@ fn open(path: &Path) -> (Arc<DeviceDirectory>, InvitationRows) {
             .expect("the host's owner device");
     }
     prepare(&directory).expect("the pairing tables exist");
-    let rows = InvitationRows::new(Arc::clone(&directory));
+    let rows = InvitationRows::new(Arc::clone(&directory), lifetimes(&directory, clock));
     (directory, rows)
 }
 
@@ -98,8 +107,21 @@ fn open(path: &Path) -> (Arc<DeviceDirectory>, InvitationRows) {
 fn open_unowned(path: &Path) -> (Arc<DeviceDirectory>, InvitationRows) {
     let directory = Arc::new(DeviceDirectory::open(path).expect("the registry database opens"));
     prepare(&directory).expect("the pairing tables exist");
-    let rows = InvitationRows::new(Arc::clone(&directory));
+    let rows = InvitationRows::new(
+        Arc::clone(&directory),
+        lifetimes(&directory, &ManualClock::new()),
+    );
     (directory, rows)
+}
+
+/// The grant lifetimes of `directory`'s devices, measured on `clock` in this boot.
+fn lifetimes(directory: &Arc<DeviceDirectory>, clock: &ManualClock) -> Arc<GrantLifetimes> {
+    Arc::new(GrantLifetimes::new(
+        Arc::clone(directory),
+        Arc::new(clock.clone()),
+        Arc::new(ManualSharedClock::new()),
+        kr_ipc::identity::boot_identity().expect("a boot identity"),
+    ))
 }
 
 /// A device record holding a personal owner grant, as an owner device's row reads.
@@ -107,17 +129,21 @@ fn owner_device() -> kr_controller::service::net::devices::DeviceRecord {
     owner_device_with(
         &DeviceKeys::generate().expect("keys"),
         DeviceId::new(Uuid::from_bytes([0x0c; 16])),
+        GrantExpiry::Never,
     )
 }
 
-/// The row of an owner device holding `keys`, under the identity `device_id`.
+/// The row of an owner device holding `keys`, under the identity `device_id`, whose grant holds
+/// every right until `expiry`.
 fn owner_device_with(
     keys: &DeviceKeys,
     device_id: DeviceId,
+    expiry: GrantExpiry,
 ) -> kr_controller::service::net::devices::DeviceRecord {
     let owner_keys = DeviceKeys::generate().expect("keys");
     let clock = TestClock::new();
-    let grant = kr_pairing::grants::personal_owner_grant();
+    let mut grant = kr_pairing::grants::personal_owner_grant();
+    grant.expiry = expiry;
     let request = request_confirmation(
         &clock,
         SensitiveAction::ConfirmDevice,
@@ -194,7 +220,11 @@ impl Harness {
         harness
             .rows
             .directory()
-            .commit(&owner_device_with(&harness.owner_keys, device_id))
+            .commit(&owner_device_with(
+                &harness.owner_keys,
+                device_id,
+                GrantExpiry::Never,
+            ))
             .expect("the owner's device");
         harness.owner_device_id = Some(device_id);
         harness
@@ -804,7 +834,7 @@ fn a_spent_confirmation_cannot_be_spent_again() {
         None,
     );
     let owner = ActorId::new("local:501").expect("a principal");
-    rows.record_answered(&approval.proof, &owner, TimestampMs::new(10))
+    rows.record_answered(&approval.proof, &owner, TimestampMs::new(10), &|| Ok(()))
         .expect("answered");
     let acceptance = rows
         .acceptance(approval.request.confirmation_id)
@@ -931,7 +961,11 @@ fn an_owner_device_on_record_before_the_owner_record_counts_once() {
                 .expect("revoked");
         }
         prepare(&directory).expect("the tables");
-        let rows = InvitationRows::new(Arc::new(directory));
+        let directory = Arc::new(directory);
+        let rows = InvitationRows::new(
+            Arc::clone(&directory),
+            lifetimes(&directory, &ManualClock::new()),
+        );
         assert_eq!(
             rows.host_owner().expect("readable"),
             enrolled.then_some(HostOwner::Migrated)
@@ -960,10 +994,20 @@ fn a_host_with_no_owner_commits_only_its_first_owner() {
     bind(&viewer_host, &mut invitation);
     let refused = approve(&viewer_host, &mut invitation);
     assert!(
-        matches!(refused, Err(PairingError::Store { .. })),
+        matches!(
+            refused,
+            Err(PairingError::Refused {
+                code: ErrorCode::PermissionDenied,
+                ..
+            })
+        ),
         "{refused:?}"
     );
     assert!(rows.events_after(None, 10).expect("readable").is_empty());
+    // A refusal wrote nothing, so the invitation still serves its owner, who withdraws it.
+    invitation
+        .cancel(&viewer_host.owner)
+        .expect("the owner withdraws it");
     assert_eq!(rows.host_owner().expect("readable"), None);
 
     let mut owner_host = Harness::bootstrap(rows.clone());
@@ -1039,5 +1083,113 @@ fn an_answer_whose_owner_device_was_revoked_commits_nothing() {
             .record_for_device(harness.identities().recipient_device_id)
             .expect("readable")
             .is_none()
+    );
+}
+
+/// KR-REQ-10.05, KR-REQ-10.06: the signer's authority is read before the candidate's own row is
+/// written. A candidate presenting the revoked signer's authorisation key and asking for host
+/// management does not make that signer an owner device again: the commit is refused and writes
+/// nothing.
+#[test]
+fn a_candidate_holding_the_signers_key_does_not_vouch_for_it() {
+    let temp = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.sqlite3");
+    let (directory, rows) = open(&path);
+    let mut harness = Harness::new(rows.clone());
+    harness.grant = kr_pairing::grants::personal_owner_grant();
+    harness.grant_kind = GrantKind::PersonalOwner;
+    harness.client_keys.authorisation = harness.owner_keys.authorisation.clone();
+    let mut host = harness.issue();
+    bind(&harness, &mut host);
+    let invitation_id = host.invitation_id();
+    let before = rows
+        .load(invitation_id)
+        .expect("readable")
+        .expect("a record");
+    directory
+        .revoke(
+            harness.owner_device_id.expect("the owner's device"),
+            TimestampMs::new(harness.clock_wall()),
+        )
+        .expect("revoked");
+
+    let refused = approve(&harness, &mut host);
+    assert!(
+        matches!(refused, Err(PairingError::OwnerConfirmationRequired)),
+        "{refused:?}"
+    );
+    assert_eq!(
+        rows.load(invitation_id)
+            .expect("readable")
+            .expect("a record"),
+        before
+    );
+    assert!(rows.commitment(invitation_id).expect("readable").is_none());
+    assert!(rows.events_after(None, 10).expect("readable").is_empty());
+    assert!(
+        directory
+            .record_for_device(harness.identities().recipient_device_id)
+            .expect("readable")
+            .is_none()
+    );
+}
+
+/// KR-REQ-10.05, KR-REQ-10.06: an owner device's grant is judged inside the transaction that
+/// spends its answer, against the continuous clock read there. A grant that runs out between the
+/// answer and the commit commits nothing, and its expiry goes on record.
+#[test]
+fn an_owner_grant_that_runs_out_before_the_commit_commits_nothing() {
+    let temp = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.sqlite3");
+    let clock = ManualClock::new();
+    let (directory, rows) = open_with(&path, &clock);
+    let mut harness = Harness::answering(
+        rows.clone(),
+        ConfirmationChannel::OwnerDevicePresence,
+        HostEnrolment::Enrolled,
+    );
+    // The owner's device holds host management for one more minute, and the host has anchored
+    // that, as spending an answer does.
+    let device_id = DeviceId::new(kr_ipc::new_uuid());
+    let record = owner_device_with(
+        &harness.owner_keys,
+        device_id,
+        GrantExpiry::At {
+            expires_at_ms: TimestampMs::new(kr_ipc::now_ms().get().saturating_add(60_000)),
+        },
+    );
+    directory.commit(&record).expect("the owner's device");
+    harness.owner_device_id = Some(device_id);
+    assert!(rows.lifetimes().in_force(&record).expect("decided"));
+
+    let mut host = harness.issue();
+    bind(&harness, &mut host);
+    let invitation_id = host.invitation_id();
+    let before = rows
+        .load(invitation_id)
+        .expect("readable")
+        .expect("a record");
+    clock.advance(Duration::from_secs(61));
+
+    let refused = approve(&harness, &mut host);
+    assert!(
+        matches!(refused, Err(PairingError::OwnerConfirmationRequired)),
+        "{refused:?}"
+    );
+    assert_eq!(
+        rows.load(invitation_id)
+            .expect("readable")
+            .expect("a record"),
+        before
+    );
+    assert!(rows.commitment(invitation_id).expect("readable").is_none());
+    assert!(rows.events_after(None, 10).expect("readable").is_empty());
+    let expired = directory
+        .record_for_device(device_id)
+        .expect("readable")
+        .expect("the owner's device");
+    assert!(
+        expired.expired_at_ms.is_some(),
+        "the expiry found inside the transaction is on record"
     );
 }

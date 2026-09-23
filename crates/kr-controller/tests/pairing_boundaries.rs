@@ -5,14 +5,19 @@
 
 mod net_support;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use kr_client::error::ClientError;
 use kr_controller::error::ControllerError;
+use kr_controller::service::net::invitations::Admission;
 use kr_controller::service::net::owner::Caller;
 use kr_controller::service::net::pairing::AUTHENTICATION_FAILED;
 use kr_crypto::keys::DeviceKeys;
 use kr_pairing::direct::redeem_proof;
 use kr_protocol::confirmation::{
-    ConfirmationSubject, OwnerConfirmationRequestParams, OwnerConfirmationRequestResult,
+    ConfirmationSubject, OwnerConfirmationCompleteParams, OwnerConfirmationRequestParams,
+    OwnerConfirmationRequestResult,
 };
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::{ErrorCode, ProtocolError};
@@ -251,11 +256,11 @@ async fn a_mutation_whose_admission_lapses_while_it_waits_changes_nothing() {
     .expect("answered");
 
     let pairing = host.network().pairing();
-    let lapsed = || -> kr_controller::error::Result<()> {
+    let lapsed: Admission = Arc::new(|| {
         Err(ControllerError::WindowExpired {
             detail: "the deadline passed while this waited".to_owned(),
         })
-    };
+    });
     let refused = pairing.invite(
         &Caller::local(ActorId::new("local:test").expect("a principal")),
         &direct(&grant),
@@ -283,6 +288,171 @@ async fn a_mutation_whose_admission_lapses_while_it_waits_changes_nothing() {
     )
     .await
     .expect("the next admitted attempt issues it");
+    host.stop().await;
+}
+
+/// KR-REQ-10.05: the admission is asked once more inside the transaction that writes the effect,
+/// after every wait before it: the owner's confirmation, the invitation's lock and the database. A
+/// mutation whose admission lapses after its answer was taken writes nothing, neither the
+/// invitation nor the answer's consumption. The answer it took goes with it, so the owner confirms
+/// again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_admission_that_lapses_inside_the_write_writes_nothing() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let grant = viewer();
+    let answered = calls::confirm_subject(
+        environment,
+        &mut client,
+        issue(InviteModeKind::Direct, &grant),
+        &owner,
+    )
+    .await
+    .expect("answered");
+
+    // Admitted when the invitation's lock is taken, lapsed by the time the database is.
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&asked);
+    let lapsing: Admission = Arc::new(move || {
+        if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(())
+        } else {
+            Err(ControllerError::WindowExpired {
+                detail: "the deadline passed while this waited for the database".to_owned(),
+            })
+        }
+    });
+    let pairing = host.network().pairing();
+    let actor = ActorId::new("local:test").expect("a principal");
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let refused = pairing.invite(
+        &Caller::local(actor.clone()),
+        &direct(&grant),
+        (action, Digest256::from_bytes([2; 32])),
+        host.network().network_config().expect("a configuration"),
+        &lapsing,
+    );
+    assert!(
+        matches!(refused, Err(ControllerError::WindowExpired { .. })),
+        "{refused:?}"
+    );
+    assert!(
+        asked.load(Ordering::SeqCst) >= 2,
+        "asked again inside the write"
+    );
+    assert!(
+        pairing
+            .rows()
+            .row_for_action(&actor, action)
+            .expect("readable")
+            .is_none(),
+        "no invitation was written"
+    );
+    let acceptance = pairing
+        .rows()
+        .acceptance(answered.confirmation_id)
+        .expect("readable")
+        .expect("the acceptance record");
+    assert!(
+        acceptance.consumed_at_ms.is_none(),
+        "nothing consumed it on record"
+    );
+
+    assert_eq!(
+        code(
+            calls::mutate::<_, PairInviteResult>(
+                environment,
+                &mut client,
+                Method::PairInvite,
+                &direct(&grant)
+            )
+            .await
+        ),
+        ErrorCode::OwnerConfirmationRequired
+    );
+    calls::confirm_subject(
+        environment,
+        &mut client,
+        issue(InviteModeKind::Direct, &grant),
+        &owner,
+    )
+    .await
+    .expect("answered again");
+    let _: PairInviteResult = calls::mutate(
+        environment,
+        &mut client,
+        Method::PairInvite,
+        &direct(&grant),
+    )
+    .await
+    .expect("issued under the new answer");
+    host.stop().await;
+}
+
+/// KR-REQ-10.06: a completion is retained for the caller that completed it and for exactly the
+/// proof it accepted. Another paired device submitting that proof gets no success, whatever it
+/// changes; the caller that completed it gets its own answer again, and not for a proof with its
+/// signature altered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_completion_is_retained_for_its_own_caller_and_proof_only() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let challenge = calls::request(
+        environment,
+        &mut client,
+        issue(InviteModeKind::Direct, &viewer()),
+    )
+    .await
+    .expect("a challenge");
+    let (proof, presented) = calls::sign(&challenge.request, &Signer::OwnerDevice(&owner_keys));
+    let first = calls::complete(environment, &mut client, proof.clone(), presented)
+        .await
+        .expect("answered");
+
+    // The same caller, on a new action, is told what its completion produced.
+    let again = calls::complete(environment, &mut client, proof.clone(), presented)
+        .await
+        .expect("its own answer again");
+    assert_eq!(again, first);
+    let mut altered = proof.clone();
+    let mut signature = *altered.signature.as_bytes();
+    signature[0] ^= 0x01;
+    altered.signature = kr_protocol::scalars::Signature64::from_bytes(signature);
+    assert!(
+        calls::complete(environment, &mut client, altered.clone(), presented)
+            .await
+            .is_err(),
+        "an altered proof is a new completion, and it fails"
+    );
+
+    // Another paired device submits the accepted proof, and then the altered one.
+    let device = Device::create().await;
+    let record = pair_with(&host, &device, &owner_keys, viewer()).await;
+    let session = connect(&host, &device, &record).await;
+    for submitted in [proof, altered] {
+        let refused = session
+            .mutate(
+                Method::OwnerConfirmationComplete,
+                ActionTarget::environment(environment),
+                None,
+                &kr_protocol::envelope::ParamsValue::empty(),
+                &OwnerConfirmationCompleteParams {
+                    proof: submitted,
+                    bootstrap_signer: Nullable::null(),
+                },
+                kr_protocol::scalars::DurationMs::new(120_000),
+            )
+            .await;
+        assert!(
+            refused.is_err(),
+            "another device is not answered: {refused:?}"
+        );
+    }
     host.stop().await;
 }
 

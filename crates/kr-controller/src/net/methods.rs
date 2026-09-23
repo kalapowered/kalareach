@@ -9,8 +9,9 @@
 //! The pairing state machines are synchronous and write their records before they answer, so each
 //! call runs on a blocking thread, and the daemon's own tasks never wait on a disk write. A
 //! mutation carries its admission with it onto that thread: the registration and the deadline it
-//! was admitted under are asked again immediately before the transition, because the wait for the
-//! thread and for the invitation's lock can outlast either.
+//! was admitted under are asked again inside the transaction that writes its effect, because the
+//! wait for the thread, for the invitation's lock, for the owner's confirmation and for the
+//! database can each outlast either.
 
 use std::sync::Arc;
 
@@ -25,6 +26,7 @@ use kr_protocol::preauth::PairStatusParams;
 use kr_protocol::scalars::Digest256;
 use kr_transport::clock::ContinuousInstant;
 
+pub use super::invitations::Admission;
 use super::owner::Caller;
 use super::pairing::PairingHost;
 use crate::authority::AdmittedMutation;
@@ -48,9 +50,6 @@ pub const fn serves(method: Method) -> bool {
             | Method::OwnerConfirmationComplete
     )
 }
-
-/// The check a pairing mutation makes immediately before its transition.
-pub type Admission = Arc<dyn Fn() -> Result<()> + Send + Sync>;
 
 impl Controller {
     /// Returns the admission check of one mutation: its connection's registration under the
@@ -179,7 +178,7 @@ impl Controller {
                     .ok_or_else(not_on_network)?
                     .network_config()?;
                 blocking(move || {
-                    pairing.invite(&caller, &params, action, network_config, admission.as_ref())
+                    pairing.invite(&caller, &params, action, network_config, &admission)
                 })
                 .await
             }
@@ -187,12 +186,11 @@ impl Controller {
                 let params: PairConfirmParams = decode(&mutation.params)?;
                 // The grant is issued at the authority revision in force when it is written.
                 let revision = self.authority_revision().await?;
-                blocking(move || pairing.confirm(&caller, &params, revision, admission.as_ref()))
-                    .await
+                blocking(move || pairing.confirm(&caller, &params, revision, &admission)).await
             }
             Method::PairCancel => {
                 let params: PairCancelParams = decode(&mutation.params)?;
-                blocking(move || pairing.cancel(&caller, &params, admission.as_ref())).await
+                blocking(move || pairing.cancel(&caller, &params, &admission)).await
             }
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a mutation the pairing service serves",
