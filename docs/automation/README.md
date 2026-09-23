@@ -233,12 +233,16 @@ the daemon's registry, because a causal budget has to survive a reboot as well a
   for review. No edge fires from it, not even a failure edge: the host does not know there was a
   failure. A process exit code does not prove downstream success.
 * **Restart safety.** A node's recorded status is what decides whether it runs, so a node that
-  already settled is never dispatched a second time. When the daemon starts, it resumes the runs
-  the journal holds as waiting or running. A node that was running when the host stopped may have
-  been dispatched, so it is settled as unknown and its dependants pause for review; only nodes
-  that were never dispatched go on, each after its grant is read again. Causal budgets, run
-  records, node receipts, pending triggers and the dispatcher's own position are all the
-  journal's and come back as they were left.
+  already settled is never dispatched a second time. When the daemon starts, it recovers the
+  journal before it serves anything: a node that was running when the host stopped may have been
+  dispatched, so it is settled as unknown and its dependants pause for review, and the runs the
+  journal holds as waiting or running are marked to resume. Nothing executes yet. The resumed
+  runs and the pending triggers run only once the daemon's start has passed every gate it has,
+  the configuration it puts into force among them, whose withdrawal of authority may owe a fence
+  that has to be up first; a start that fails executes nothing. Only nodes that were never
+  dispatched go on, each after its grant is read again. Causal budgets, run records, node
+  receipts, pending triggers and the dispatcher's own position are all the journal's and come
+  back as they were left.
 * **Cancellation.** Cancelling a run stops undispatched nodes: the journal, not a snapshot taken
   when the run started, decides whether a node still has anything owed to it, so a cancellation
   that arrives while an earlier node is running still stops the next one. Cancellation is

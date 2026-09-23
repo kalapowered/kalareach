@@ -2393,22 +2393,25 @@ is an environment SQLite store in the environment's state directory that commits
 and budget reservations transactionally before execution dispatches, and that keeps a budget
 across a restart and a reboot.
 
-The five methods of the automation group arrive through the daemon's ordinary path, and the
-grant each definition names is read from the daemon's own grant store rather than from the
-request. The four mutations are actions: each one's effect and the record of what it came to
-commit in one transaction of the workflow journal, and the admission the daemon accepted the
-mutation under is carried into that transaction and asked immediately before the action's first
-write, through the same registration check the project service asks inside its own work. A repeat
-is answered from the record before its freshness is considered. The daemon reads it again before every node a run dispatches, so a revocation or an
-expiry stops the run where it stands, and a node is dispatched only when that grant carries the
-right its effect needs.
+The five methods of the automation group arrive through the daemon's ordinary path, and the grant
+each definition names is read from the daemon's own grant store rather than from the request. The
+four mutations are actions: each one's effect and the record of what it came to commit in one
+transaction of the workflow journal, and the admission the daemon accepted the mutation under is
+carried into that transaction and asked immediately before the action's first write: the
+registration check the project service asks inside its own work, and before it the fence this host
+may owe. A repeat is answered from the record before its freshness is considered. The daemon reads
+the grant again before every node a run dispatches, so a revocation or an expiry stops the run where it
+stands, and a node is dispatched only when that grant carries the right its effect needs.
 
 A run started through `workflow.run` is an external trigger with a causal root the daemon mints.
 The daemon also runs the automation service's trigger dispatcher: when a node succeeds, the event
 its action kind fixes is committed with its outcome, and the dispatcher starts the workflows whose
 trigger names that event, with the causal root, depth and parent taken from the journal's record of
-the node. At startup the dispatcher first resumes the runs a stopped daemon left unfinished: a node
-that was running may have been dispatched, so it is settled as unknown and its dependants pause.
+the node. At startup the daemon recovers the journal before it serves anything: a node that was
+running may have been dispatched, so it is settled as unknown and its dependants pause. The
+dispatcher starts last, once the start has passed every gate it has, the configuration put into
+force among them, and it first resumes the runs a stopped daemon left unfinished. A start that
+fails executes nothing.
 
 Admission limits enforce per-workflow concurrency, host-wide rates, and per-grant quotas.
 Breaching a causal budget pauses the chain with error code `CAUSAL_LIMIT`, rejects further

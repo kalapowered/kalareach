@@ -823,6 +823,12 @@ impl Controller {
                 controller.enrol_project_owner(&network, signer, enrolment)?;
             }
         }
+        // Unattended workflow execution starts last. The journal was recovered when the module
+        // was opened, but nothing it holds runs until every gate above has passed, the
+        // configuration put into force among them: a withdrawal it made may owe a fence that has
+        // to be up before anything is dispatched, and a start that fails anywhere above executes
+        // nothing at all.
+        controller.automation.start();
         Ok(controller)
     }
 
@@ -1962,19 +1968,7 @@ impl Controller {
         registry: &Registry,
         admission: &crate::authority::AdmittedMutation,
     ) -> Result<()> {
-        // A fence this host owes and could not raise stops everything it would have fenced. The
-        // revision did not advance, so the registry still reports every connection as admitted;
-        // refusing here is what keeps work admitted under a withdrawn ceiling from being
-        // dispatched while the withdrawal is still owed.
-        if self
-            .fence_unraised
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(ControllerError::PermissionDenied {
-                detail: "this host's configuration withdrew authority and the fence that                          withdrawal owes could not be raised, so nothing admitted under it is                          dispatched; run kr doctor to see what stopped it"
-                    .to_owned(),
-            });
-        }
+        self.check_fence()?;
         let authority_revision = registry.authority_revision()?;
         let admitted = self.admitted_table();
         let registered = admitted
@@ -2090,6 +2084,53 @@ impl Controller {
                     .to_owned(),
             }),
         }
+    }
+
+    /// Refuses while this host owes a fence it could not raise.
+    ///
+    /// Asked by [`Self::check_admission`] and, inside a store's own transaction, by
+    /// [`Self::check_still_admitted`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::PermissionDenied`] while the fence is owed.
+    fn check_fence(&self) -> Result<()> {
+        // A fence this host owes and could not raise stops everything it would have fenced. The
+        // revision did not advance, so the registry still reports every connection as admitted;
+        // refusing here is what keeps work admitted under a withdrawn ceiling from being
+        // dispatched while the withdrawal is still owed.
+        if self
+            .fence_unraised
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ControllerError::PermissionDenied {
+                detail: "this host's configuration withdrew authority and the fence that \
+                         withdrawal owes could not be raised, so nothing admitted under it is \
+                         dispatched; run kr doctor to see what stopped it"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Checks, inside a store's own transaction, that the admission a mutation was accepted under
+    /// still stands.
+    ///
+    /// Everything [`Self::check_admission`] asks that holds without the registry's lock is asked
+    /// again: a fence this host owes and could not raise, then the connection's registration and
+    /// the mutation's deadline ([`Self::check_registration`]). A withdrawal whose fence failed
+    /// leaves every registration standing, so a check of the registration alone would let a
+    /// mutation admitted just before that failure write after it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal either check gives.
+    pub(crate) fn check_still_admitted(
+        &self,
+        admission: &crate::authority::AdmittedMutation,
+    ) -> Result<()> {
+        self.check_fence()?;
+        self.check_registration(admission)
     }
 
     /// Refuses a mutation whose registration or accepted deadline has lapsed.
@@ -3620,7 +3661,8 @@ impl Controller {
     /// The admission is asked here, under the registry lock, for the reason
     /// [`Self::check_admission`] states, and then carried into the workflow journal, which asks it
     /// again inside the transaction that performs the action, immediately before the action's
-    /// first write. Nothing the service does before that write can wait long enough to outlast
+    /// first write ([`Self::check_still_admitted`]: a fence this host owes, the registration, the
+    /// deadline). Nothing the service does before that write can wait long enough to outlast
     /// it: the answer and the write are under the journal's one lock, and the journal holds no
     /// record of an action it has not written. A retry is answered from its record before the
     /// admission is asked, so a caller whose window has since been replaced still gets its own
@@ -3656,7 +3698,7 @@ impl Controller {
         let controller = Arc::clone(self);
         let admission: crate::automation::Admission = Arc::new(move || {
             controller
-                .check_registration(&carried)
+                .check_still_admitted(&carried)
                 .map_err(|error| error.to_protocol_error())
         });
         self.automation

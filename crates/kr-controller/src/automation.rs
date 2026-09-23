@@ -441,24 +441,31 @@ const DISPATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2)
 
 /// The automation service, as the daemon holds it.
 ///
-/// It also owns the task that starts the runs derived triggers ask for, which lives exactly as
-/// long as the module does.
+/// Opening it recovers the journal and executes nothing. Execution waits for
+/// [`AutomationModule::start`], which the daemon calls once its own start has passed every gate it
+/// has. From then on the module owns the task that starts the runs derived triggers ask for, which
+/// lives exactly as long as the module does.
 #[derive(Debug)]
 pub struct AutomationModule {
     service: Arc<AutomationService>,
-    dispatcher: tokio::task::JoinHandle<()>,
+    /// The runs recovery resumed, held until execution starts.
+    resumed: std::sync::Mutex<Option<Vec<kr_automation::StartedRun>>>,
+    /// The trigger dispatcher, once execution has started.
+    dispatcher: std::sync::OnceLock<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for AutomationModule {
     fn drop(&mut self) {
-        self.dispatcher.abort();
+        if let Some(dispatcher) = self.dispatcher.get() {
+            dispatcher.abort();
+        }
     }
 }
 
 /// Runs the trigger dispatcher for as long as the daemon holds the service.
 ///
-/// It first executes the runs a stopped daemon left unfinished, which the module recovered before
-/// the daemon served anything, and then starts the runs the journal's settled-node events trigger,
+/// It first executes the runs a stopped daemon left unfinished, which the module recovered when it
+/// was opened, and then starts the runs the journal's settled-node events trigger,
 /// whenever a run stops and on a timer for anything that did not wake it. Each run executes on a task of its own, so one long run does not hold the rest
 /// of a chain back. Every decision is the journal's: the dispatcher's own position commits with the
 /// runs it starts, so a daemon that stops in the middle neither loses a trigger nor starts one twice.
@@ -511,7 +518,10 @@ fn execute_apart(service: &Arc<AutomationService>, run: kr_automation::StartedRu
 }
 
 impl AutomationModule {
-    /// Opens the environment's automation service on its own journal.
+    /// Opens the environment's automation service on its own journal, and recovers it.
+    ///
+    /// Recovery settles what a stopped daemon left running and decides which runs resume. It
+    /// executes none of them: nothing runs until [`Self::start`].
     ///
     /// `policy` is the daemon's own host policy, shared rather than copied, so a grant is decided
     /// under the policy as it stands when each node is dispatched.
@@ -566,11 +576,29 @@ impl AutomationModule {
                     ),
                 })?
         };
-        let dispatcher = tokio::spawn(dispatch(Arc::clone(&service), resumed));
         Ok(Self {
             service,
-            dispatcher,
+            resumed: std::sync::Mutex::new(Some(resumed)),
+            dispatcher: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Starts executing: the runs recovery resumed, then the runs derived triggers ask for.
+    ///
+    /// The daemon calls this last in its start, once every gate the start has is behind it: the
+    /// configuration it puts into force first, whose withdrawal of authority may owe a fence that
+    /// has to be up before anything is dispatched. A start that fails before this point has
+    /// executed nothing a stopped daemon left behind. Calling it again starts nothing further.
+    pub fn start(&self) {
+        self.dispatcher.get_or_init(|| {
+            let resumed = self
+                .resumed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .unwrap_or_default();
+            tokio::spawn(dispatch(Arc::clone(&self.service), resumed))
+        });
     }
 
     /// Returns the service itself.

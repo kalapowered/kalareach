@@ -137,8 +137,29 @@ async fn host() -> Host {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
+    let controller = start_daemon(&environment, environment_id)
+        .await
+        .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let listener = Listener::bind(&endpoint).expect("binds the endpoint");
+    let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
+    Host {
+        _temp: temp,
+        controller,
+        environment_id,
+        endpoint,
+        clients,
+        work: tempfile::TempDir::new().expect("a working directory on the internal disk"),
+    }
+}
+
+/// Starts a daemon on an environment, waiting out one that is still letting go of it.
+async fn start_daemon(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    environment_id: EnvironmentId,
+) -> kr_controller::error::Result<Arc<Controller>> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let controller = loop {
+    loop {
         let secrets = environment.secrets_dir();
         let attempt = Controller::start(ControllerSetup {
             paths: environment.clone(),
@@ -162,30 +183,13 @@ async fn host() -> Host {
         })
         .await;
         match attempt {
-            Ok(controller) => break controller,
-            Err(error) if std::time::Instant::now() < deadline => {
-                assert!(
-                    matches!(
-                        error,
-                        kr_controller::error::ControllerError::AlreadyRunning { .. }
-                    ),
-                    "the daemon starts: {error}"
-                );
+            Err(kr_controller::error::ControllerError::AlreadyRunning { .. })
+                if std::time::Instant::now() < deadline =>
+            {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-            Err(error) => panic!("the daemon starts: {error}"),
+            answered => return answered,
         }
-    };
-    let endpoint = environment.controller_endpoint().expect("an endpoint");
-    let listener = Listener::bind(&endpoint).expect("binds the endpoint");
-    let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
-    Host {
-        _temp: temp,
-        controller,
-        environment_id,
-        endpoint,
-        clients,
-        work: tempfile::TempDir::new().expect("a working directory on the internal disk"),
     }
 }
 
@@ -1255,6 +1259,359 @@ async fn a_clock_floor_that_could_not_be_written_down_stays_owed_until_it_is() {
         .expect("reads the policy")
         .expect("the host has a policy");
     assert!(stored.utc_floor_ms.get() > expires, "{stored:?}");
+}
+
+/// An admission that always stands, for work written to a journal outside any daemon.
+fn standing() -> kr_automation::Result<()> {
+    Ok(())
+}
+
+/// Leaves one settled node's event in an environment's workflow journal with nothing dispatched
+/// for it yet, as a daemon that stopped between the two would. Returns the event's position.
+async fn trigger_left_pending(state_dir: &Path, environment_id: EnvironmentId) -> u64 {
+    std::fs::create_dir_all(state_dir).expect("the state directory");
+    let grant = grant_id(17);
+    let device_id = kr_protocol::ids::DeviceId::new(environment_id.get());
+    let table = kr_automation::GrantTable::new();
+    table.insert(Grant {
+        grant_id: grant,
+        parent_grant_id: Nullable::null(),
+        issuer_device_id: device_id,
+        recipient_device_id: device_id,
+        authority_revision: AuthorityRevision::new(1),
+        environment_selector: EnvironmentSelector::Any,
+        session_selector: SessionSelector::Any,
+        actions: ActionRight::ALL.iter().copied().collect(),
+        history: HistoryScope {
+            lower_bound_ms: Nullable::null(),
+            include_live_screen: false,
+            named_questions: CanonicalSet::new(),
+            named_approvals: CanonicalSet::new(),
+        },
+        expiry: GrantExpiry::Never,
+        organisation: Nullable::null(),
+    });
+    let service = kr_automation::AutomationService::open(
+        state_dir,
+        kr_automation::Host {
+            environment_id,
+            runner: Arc::new(kr_automation::MockActionRunner::new()),
+            authority: Arc::new(table),
+            clock: Arc::new(kr_automation::SystemClock),
+        },
+    )
+    .expect("the journal opens");
+    let document = definition(
+        workflow_id(41),
+        grant,
+        "producer",
+        WorkflowNode {
+            node_id: "tests".to_owned(),
+            action_kind: "run_tests".to_owned(),
+            action_params: r#"{"suite": "unit"}"#.to_owned(),
+            declared_environment: Nullable::null(),
+        },
+    );
+    let key = |method: Method| kr_automation::ActionKey {
+        actor_id: "local:test".to_owned(),
+        action_id: kr_ipc::new_uuid().to_string(),
+        method: method.as_str().to_owned(),
+        digest: kr_ipc::new_uuid().as_bytes().to_vec(),
+    };
+    let submitted = |key| kr_automation::Submitted {
+        key,
+        admission: &standing,
+        caller_grant: None,
+    };
+    let now = kr_ipc::now_ms().get();
+    let installing = key(Method::WorkflowInstall);
+    service
+        .install(
+            &WorkflowInstallParams {
+                workflow_id: document.workflow_id,
+                revision: document.revision,
+                definition: document.clone(),
+                grant_reference: grant,
+            },
+            &submitted(&installing),
+            now,
+        )
+        .expect("installs");
+    let enabling = key(Method::WorkflowEnable);
+    service
+        .enable(
+            &WorkflowEnableParams {
+                workflow_id: document.workflow_id,
+                revision: document.revision,
+            },
+            &submitted(&enabling),
+            now,
+        )
+        .expect("enables");
+    let running = key(Method::WorkflowRun);
+    service
+        .run(
+            &WorkflowRunParams {
+                workflow_id: document.workflow_id,
+                revision: document.revision,
+                event_id: "evt-left".to_owned(),
+                event_type: "manual".to_owned(),
+                event_payload: Nullable::null(),
+            },
+            &submitted(&running),
+            now,
+        )
+        .await
+        .expect("the run completes");
+    service
+        .store()
+        .events_after(0, &[kr_automation::store::EVENT_NODE_SETTLED], 16)
+        .expect("the journal's events")
+        .last()
+        .expect("the settled node's event")
+        .sequence
+}
+
+/// Where the trigger dispatcher of an environment's journal has read to.
+fn dispatched_to(journal: &kr_automation::WorkflowStore) -> Option<u64> {
+    journal
+        .consumer_position(kr_automation::TRIGGER_CONSUMER)
+        .expect("the journal reads")
+}
+
+/// Opening the automation module recovers its journal and executes nothing: only starting it
+/// does. A trigger a stopped daemon left pending is dispatched once the module is started, and
+/// not while it is only open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_open_automation_module_dispatches_nothing_until_it_is_started() {
+    let host = host().await;
+    let elsewhere = kr_ipc::testing::TempHost::create();
+    let paths = elsewhere.environment();
+    let pending = trigger_left_pending(paths.state_dir(), host.environment_id).await;
+
+    let module = kr_controller::automation::AutomationModule::open(
+        &paths,
+        host.environment_id,
+        Arc::clone(host.controller.sharing()),
+        Arc::clone(host.controller.devices()),
+        Arc::new(std::sync::Mutex::new(host.controller.policy())),
+        Arc::clone(host.controller.changesets().service()),
+    )
+    .await
+    .expect("the module opens");
+    // Longer than the dispatcher's own interval: a module that dispatched on opening would have
+    // read past the pending event by now.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert_eq!(
+        dispatched_to(module.journal()),
+        None,
+        "an open module dispatches nothing"
+    );
+
+    module.start();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while dispatched_to(module.journal()).is_none_or(|position| position < pending) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a started module dispatches the trigger a stopped daemon left"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    drop(module);
+    host.clients.abort();
+}
+
+/// Writes one configuration document where this host reads it.
+fn write_configuration(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    document: &kr_protocol::hostinfo::configuration::ConfigurationDocument,
+) {
+    let path = kr_worker::config::document_path(environment);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("the state directory");
+    }
+    kr_ipc::paths::write_owner_only_file(
+        &path,
+        kr_protocol::hostinfo::configuration::contents(document).as_bytes(),
+    )
+    .expect("the document");
+}
+
+/// A configuration document that narrows the rights a grant may carry to `rights`, which withdraws
+/// authority and owes a fence.
+fn narrowing_document(
+    rights: &[ActionRight],
+) -> kr_protocol::hostinfo::configuration::ConfigurationDocument {
+    let mut narrowed = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
+    narrowed.revision = 1;
+    narrowed.ceilings.grant_rights = Nullable::some(
+        rights
+            .iter()
+            .map(|right| right.as_str().to_owned())
+            .collect(),
+    );
+    narrowed
+}
+
+/// Makes this environment's registry refuse the revision advance a fence needs, as a full disk or
+/// a damaged file would, until the returned connection drops the trigger.
+fn refuse_fences(environment: &kr_ipc::paths::EnvironmentPaths) -> rusqlite::Connection {
+    let registry =
+        rusqlite::Connection::open(environment.registry_database()).expect("opens the registry");
+    registry
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    registry
+        .execute_batch(
+            "CREATE TRIGGER refuse_fence BEFORE UPDATE OF authority_revision ON environment
+             BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("the fault is in place");
+    registry
+}
+
+/// A start that does not pass its configuration gate executes nothing a stopped daemon left
+/// behind. The document it has to put into force withdraws authority and owes a fence, the
+/// registry cannot raise it, and the start fails; the trigger left pending in the journal is
+/// still pending afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_that_fails_at_its_configuration_gate_dispatches_nothing() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    // A first start makes the registry and the journal; then the daemon stops.
+    drop(
+        start_daemon(&environment, environment_id)
+            .await
+            .unwrap_or_else(|error| panic!("the first start: {error}")),
+    );
+    let pending = trigger_left_pending(environment.state_dir(), environment_id).await;
+    let registry = refuse_fences(&environment);
+    write_configuration(
+        &environment,
+        &narrowing_document(&[ActionRight::SessionView]),
+    );
+
+    let Err(refused) = start_daemon(&environment, environment_id).await else {
+        panic!("the start does not pass its configuration gate");
+    };
+    assert!(
+        refused.to_string().contains("could not be put into force"),
+        "{refused}"
+    );
+    // The dispatcher of a daemon that had started executing would have read the pending event
+    // by now; give a dispatcher left behind the time it would need.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    // The first start's dispatcher registered and read nothing; the event left since is where it
+    // was left.
+    let journal =
+        kr_automation::WorkflowStore::open(environment.state_dir()).expect("the journal opens");
+    let position = dispatched_to(&journal);
+    assert!(
+        position.is_none_or(|position| position < pending),
+        "nothing was dispatched, so the event at {pending} is still pending: {position:?}"
+    );
+    registry
+        .execute_batch("DROP TRIGGER refuse_fence;")
+        .expect("the fault is cleared");
+}
+
+/// A withdrawal whose fence could not be raised stops a workflow mutation that was admitted just
+/// before it. The install passes the daemon's first check, waits for the journal, and meanwhile
+/// the registry refuses the fence a narrowed configuration owes; asked again inside the journal's
+/// transaction, the admission refuses, and nothing is installed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_owed_after_admission_stops_the_workflow_write() {
+    let host = host().await;
+    let environment = host._temp.environment();
+    // Everything the workflow needs, and everything the narrowed configuration below still allows,
+    // so the fence is the only thing that can refuse it.
+    let needed = [ActionRight::AutomationManage, ActionRight::TerminalInput];
+    let grant = host.issue(grant_id(18), &needed);
+    let document = definition(
+        workflow_id(42),
+        grant.grant_id,
+        "admitted before the fence",
+        WorkflowNode {
+            node_id: "tests".to_owned(),
+            action_kind: "run_tests".to_owned(),
+            action_params: r#"{"suite": "unit"}"#.to_owned(),
+            declared_environment: Nullable::null(),
+        },
+    );
+    let mut control = client(&host).await;
+
+    // Another writer holds the workflow journal's write lock. Reads go on, so the install is
+    // answered no retained record, passes the daemon's first check, and waits for the journal's
+    // transaction.
+    let journal = rusqlite::Connection::open(
+        environment
+            .state_dir()
+            .join(kr_automation::store::WORKFLOW_DB_NAME),
+    )
+    .expect("opens the journal");
+    journal
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("another writer holds the journal");
+    let installing = document.clone();
+    let environment_id = host.environment_id;
+    let pending = tokio::spawn(async move {
+        control
+            .mutate(
+                Method::WorkflowInstall,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(environment_id),
+                &WorkflowInstallParams {
+                    workflow_id: installing.workflow_id,
+                    revision: installing.revision,
+                    definition: installing.clone(),
+                    grant_reference: installing.grant_reference,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+    });
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    // The configuration narrows the grants' rights, and the fence that owes cannot be raised.
+    let registry = refuse_fences(&environment);
+    write_configuration(&environment, &narrowing_document(&needed));
+    let effective = host.controller.effective_configuration().await;
+    assert!(
+        effective
+            .not_in_force
+            .as_ref()
+            .is_some_and(|problem| problem.as_str().contains("dispatch could not be fenced")),
+        "{:?}",
+        effective.not_in_force
+    );
+
+    journal
+        .execute_batch("COMMIT")
+        .expect("the other writer finishes");
+    let refusal = pending
+        .await
+        .expect("the install answers")
+        .expect_err("the fence stops the install");
+    assert_eq!(refusal.code, ErrorCode::PermissionDenied, "{refusal:?}");
+    assert!(
+        refusal.message.contains("could not be raised"),
+        "{refusal:?}"
+    );
+    assert!(
+        host.controller
+            .automation()
+            .service()
+            .store()
+            .list_definitions(None)
+            .expect("the journal reads")
+            .is_empty(),
+        "nothing was installed"
+    );
+    registry
+        .execute_batch("DROP TRIGGER refuse_fence;")
+        .expect("the fault is cleared");
+    host.clients.abort();
 }
 
 mod net_support;

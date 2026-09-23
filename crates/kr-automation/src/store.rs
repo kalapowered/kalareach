@@ -2683,6 +2683,15 @@ impl WorkflowStore {
         })
     }
 
+    /// Returns where a consumer has read to, or `None` for one that never registered.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the row cannot be read.
+    pub fn consumer_position(&self, consumer: &str) -> Result<Option<u64>> {
+        self.read(|journal| journal.consumer_position(consumer))
+    }
+
     /// Registers a consumer of the event types it reads, if it is not registered already.
     ///
     /// # Errors
