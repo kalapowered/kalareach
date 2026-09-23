@@ -1549,6 +1549,51 @@ mod tests {
         assert!(matches!(error, IpcError::SocketPathTooLong { .. }));
     }
 
+    /// KR-REQ-03.08: an environment identity binds one installation and one operating-system
+    /// user. Each installation's state root holds its own random identity, written once and read
+    /// back unchanged, so two installations on one machine are two environments rather than one
+    /// machine's fingerprint; the identity lives in a file only this user can read, inside a
+    /// directory only this user can enter; and an installation's default state root is inside
+    /// this user's own home.
+    #[test]
+    fn an_environment_identity_is_one_installations_and_one_users() {
+        let root = temporary_root("bound");
+        let first = HostPaths::new(root.join("r1"), root.join("s1")).expect("roots");
+        let second = HostPaths::new(root.join("r2"), root.join("s2")).expect("roots");
+        let one = first.open_environment_id().expect("allocates");
+        let other = second.open_environment_id().expect("allocates");
+        assert_ne!(one, other, "two installations are two environments");
+        assert_eq!(
+            HostPaths::new(root.join("r1"), root.join("s1"))
+                .expect("roots")
+                .open_environment_id()
+                .expect("reads"),
+            one,
+            "an installation keeps its identity"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let file = std::fs::metadata(first.environment_id_file()).expect("the identity file");
+            assert_eq!(file.mode() & 0o777, OWNER_ONLY_FILE_MODE);
+            assert_eq!(file.uid(), current_uid());
+            let directory = std::fs::metadata(first.state_root()).expect("the state root");
+            assert_eq!(directory.mode() & 0o777, OWNER_ONLY_DIRECTORY_MODE);
+            assert_eq!(directory.uid(), current_uid());
+        }
+        #[cfg(unix)]
+        if cfg!(target_os = "macos") || std::env::var_os("XDG_STATE_HOME").is_none() {
+            assert!(
+                default_state_root()
+                    .expect("a default state root")
+                    .starts_with(home_directory().expect("a home directory")),
+                "an installation's own state is kept in its user's home"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn an_environment_identity_is_allocated_once_and_then_read() {
         let root = temporary_root("identity");
