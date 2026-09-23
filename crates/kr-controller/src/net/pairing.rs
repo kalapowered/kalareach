@@ -149,6 +149,7 @@ impl CodeOffer {
             origin: self.invitation.origin().clone(),
             locator: reservation.locator.clone(),
             control_token: reservation.control_token.clone(),
+            lifetime: std::time::Duration::ZERO,
         }
     }
 }
@@ -655,6 +656,12 @@ impl PairingHost {
                     origin,
                     locator: reservation.locator.clone(),
                     control_token: reservation.control_token.clone(),
+                    lifetime: std::time::Duration::from_millis(
+                        invitation
+                            .record()
+                            .deadline_monotonic_ms
+                            .saturating_sub(self.clock.monotonic_ms()),
+                    ),
                 };
                 // The relay waits for this lock before it decides anything, so the room serves
                 // the invitation only once it is on offer below.
@@ -1382,18 +1389,28 @@ impl PairingHost {
     }
 
     /// Returns true while the code invitation `invitation_id` is on offer, open or locked.
+    ///
+    /// Asked under the invitation's lock, and an invitation whose deadline has passed is consumed
+    /// as expired first: the answer is the host's own clock's, not what the record said when it
+    /// was last written.
     #[must_use]
     pub fn room_is_open(&self, invitation_id: InvitationId) -> bool {
-        self.open()
-            .as_ref()
+        let mut open = self.open();
+        let Some(offered) = open
+            .as_mut()
             .filter(|offered| offered.invitation_id() == invitation_id)
-            .is_some_and(|offered| {
-                matches!(offered.mode, OpenMode::Code(_))
-                    && matches!(
-                        offered.state(),
-                        InvitationState::Open | InvitationState::Locked { .. }
-                    )
-            })
+        else {
+            return false;
+        };
+        let Some(offer) = offered.code_mut() else {
+            return false;
+        };
+        // An invitation whose state cannot be read or written serves nobody.
+        offer.invitation.expire_if_due().is_ok()
+            && matches!(
+                offer.invitation.record().state,
+                InvitationState::Open | InvitationState::Locked { .. }
+            )
     }
 
     /// Releases an ended invitation's locator, so its code stops reaching this host at once.

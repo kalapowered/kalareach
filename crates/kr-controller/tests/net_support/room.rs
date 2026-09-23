@@ -47,9 +47,20 @@ const DEPTH: usize = 64;
 const FRAME_WAIT: Duration = Duration::from_secs(10);
 
 /// An in-process rendezvous service with one room per reserved locator.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct TestRoom {
     rooms: Arc<Mutex<Rooms>>,
+    /// True while the room holds back what hosts send, as a slow service does.
+    held: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl Default for TestRoom {
+    fn default() -> Self {
+        Self {
+            rooms: Arc::default(),
+            held: Arc::new(tokio::sync::watch::channel(false).0),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -77,6 +88,14 @@ impl TestRoom {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Holds back, or lets through, every frame hosts send, in the order they were sent.
+    ///
+    /// A control request is not held, which is how a release could overtake frames a host sent
+    /// before it if the host did not wait for the room to acknowledge them.
+    pub fn hold_hosts(&self, held: bool) {
+        self.held.send_replace(held);
     }
 
     /// Makes every control request fail, as an unreachable service does.
@@ -178,7 +197,11 @@ impl TestRoom {
     }
 
     async fn carry_host(&self, locator: &str, from_host: &mut mpsc::Receiver<ClientFrame>) {
+        let mut held = self.held.subscribe();
         while let Some(frame) = from_host.recv().await {
+            if held.wait_for(|held| !*held).await.is_err() {
+                return;
+            }
             match on_the_wire(&frame) {
                 ClientFrame::Relay {
                     attempt_id,
@@ -195,12 +218,26 @@ impl TestRoom {
                     }
                 }
                 ClientFrame::CloseAttempt { attempt_id } => {
-                    let candidate = self
-                        .rooms()
-                        .records
-                        .get_mut(locator)
-                        .and_then(|record| record.attempts.remove(&attempt_id));
+                    // The service's closing sequence: the host is told the attempt closed, and
+                    // the candidate is sent its last frame.
+                    let (candidate, host) = {
+                        let mut rooms = self.rooms();
+                        let record = rooms.records.get_mut(locator);
+                        let host = record.as_ref().and_then(|record| record.host.clone());
+                        (
+                            record.and_then(|record| record.attempts.remove(&attempt_id)),
+                            host,
+                        )
+                    };
                     if let Some(candidate) = candidate {
+                        if let Some(host) = host {
+                            let _ = host
+                                .send(ServiceFrame::AttemptClosed {
+                                    attempt_id,
+                                    reason: CloseReason::Cancelled,
+                                })
+                                .await;
+                        }
                         let _ = candidate
                             .send(ServiceFrame::Closed {
                                 reason: CloseReason::Cancelled,
@@ -382,15 +419,22 @@ impl RendezvousHost for TestRoom {
             .remove(locator.as_str())
             .expect("the record was just read");
         rooms.released.push(locator.as_str().to_owned());
-        // Every socket attached to the record ends with it.
+        // Every socket attached to the record ends with it: each candidate's, which the host is
+        // told about, and then the host's own.
         let closed = ServiceFrame::Closed {
             reason: CloseReason::Cancelled,
         };
-        if let Some(host) = record.host {
-            let _ = host.try_send(closed.clone());
-        }
-        for candidate in record.attempts.into_values() {
+        for (attempt_id, candidate) in record.attempts {
+            if let Some(host) = &record.host {
+                let _ = host.try_send(ServiceFrame::AttemptClosed {
+                    attempt_id,
+                    reason: CloseReason::Cancelled,
+                });
+            }
             let _ = candidate.try_send(closed.clone());
+        }
+        if let Some(host) = record.host {
+            let _ = host.try_send(closed);
         }
         Ok(())
     }
@@ -642,6 +686,19 @@ impl<'a> CodeCandidate<'a> {
         self.client
             .verification_value()
             .expect("both bundles were exchanged")
+    }
+
+    /// Sends a relay payload that is not a pairing message, as a broken or hostile candidate
+    /// might.
+    pub async fn send_malformed(&self) {
+        self.socket
+            .outgoing
+            .send(ClientFrame::Relay {
+                attempt_id: self.attempt_id,
+                payload: Bytes::new(vec![0xff, 0x00, 0x13]),
+            })
+            .await
+            .expect("the room takes the frame");
     }
 
     async fn send(&self, message: &RendezvousMessage) {

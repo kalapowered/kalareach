@@ -1433,10 +1433,13 @@ cross, the candidate's confirmation tag is verified in the serial path (a match 
 and closes every competing attempt; a mismatch spends one of five guesses, on disk before the host
 answers), the two sealed bundles cross, and the host acknowledges the candidate's bundle. Only then
 does the candidate reach the host over iroh, at the endpoint its authenticated bundle pinned, and
-bind the transcript with `pair.finish`. The room reads none of what it relays. The host releases the
-locator when the invitation ends, whether the owner confirmed, denied or withdrew it or its guesses
-ran out. A host with no rendezvous service answers a code invitation with `RENDEZVOUS_CONFIG_ERROR`,
-and a service it cannot reach with `RENDEZVOUS_UNAVAILABLE`.
+bind the transcript with `pair.finish`. The room reads none of what it relays, and a payload that
+is not a pairing message ends its attempt on the host before anything behind it is read. The host
+releases the locator when the invitation ends, whether the owner confirmed, denied or withdrew it,
+its guesses ran out or its deadline passed on the host's own clock; when it ended by itself, the
+release waits until the room confirms it closed the last attempts, so the answer a candidate is
+owed reaches it first. A host with no rendezvous service answers a code invitation with
+`RENDEZVOUS_CONFIG_ERROR`, and a service it cannot reach with `RENDEZVOUS_UNAVAILABLE`.
 
 **Records.** The pairing records are tables in the registry database, written through the device
 directory's connection: `pairing_invitations` (never the code or the direct secret),

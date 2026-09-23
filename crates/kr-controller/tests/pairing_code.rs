@@ -8,7 +8,7 @@
 
 mod net_support;
 
-use kr_controller::service::net::rendezvous::{ClientFrame, decode_message};
+use kr_controller::service::net::rendezvous::{ClientFrame, CloseReason, decode_message};
 use kr_crypto::keys::DeviceKeys;
 use kr_ipc::client::LocalClient;
 use kr_protocol::confirmation::ConfirmationSubject;
@@ -211,9 +211,7 @@ async fn the_first_candidate_to_prove_the_code_closes_the_others() {
     winner.confirm().await.expect("the first to prove the code");
     assert_eq!(
         loser.confirm().await,
-        Err(Stopped::Closed(
-            kr_controller::service::net::rendezvous::CloseReason::Cancelled
-        ))
+        Err(Stopped::Closed(CloseReason::Cancelled))
     );
 
     let status = calls::owner_status(&mut client, invited.invitation_id)
@@ -324,6 +322,114 @@ async fn five_wrong_codes_through_the_room_consume_the_invitation() {
     .await;
     assert!(released.is_ok(), "the locator is released");
     assert_eq!(host.room.released(), vec![code[..4].to_owned()]);
+    host.stop().await;
+}
+
+/// KR-REQ-10.30, KR-REQ-10.31: a payload that is not a pairing message ends its attempt on the
+/// host before anything queued behind it is read. The right confirmation tag, sent straight after
+/// it, neither locks the invitation nor spends a guess: the attempt is already gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_malformed_payload_ends_its_attempt_before_anything_behind_it() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let invited = invite_code(
+        environment,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &viewer(),
+        &Signer::OwnerDevice(&owner_keys),
+    )
+    .await;
+    let (origin, code) = code_of(&invited);
+    let device = Device::create().await;
+    let mut candidate = CodeCandidate::start(&host.room, device.candidate(), &origin, &code)
+        .await
+        .expect("admitted");
+
+    candidate.send_malformed().await;
+    assert_eq!(
+        candidate.confirm().await,
+        Err(Stopped::Closed(CloseReason::Cancelled))
+    );
+    let status = calls::owner_status(&mut client, invited.invitation_id)
+        .await
+        .expect("the owner's view");
+    assert!(
+        matches!(status.status, PairStatus::Open { .. }),
+        "nothing locked it: {:?}",
+        status.status
+    );
+    assert_eq!(
+        status.owner.0.expect("a view").remaining_confirmations,
+        5,
+        "and nothing spent a guess"
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-10.30, KR-REQ-10.19: the candidate whose guess spent the last one is told so before
+/// the locator is released. The room holds the host's frames back for a while, as a slow service
+/// can; the release waits for the room to confirm it closed that attempt, which it does only after
+/// the answer before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_last_answer_reaches_its_candidate_before_the_locator_is_released() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let invited = invite_code(
+        environment,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &viewer(),
+        &Signer::OwnerDevice(&owner_keys),
+    )
+    .await;
+    let (origin, code) = code_of(&invited);
+    let guessing = Device::create().await;
+    for _ in 0..4 {
+        let mut candidate =
+            CodeCandidate::start(&host.room, guessing.candidate(), &origin, &wrong(&code))
+                .await
+                .expect("admitted");
+        assert!(matches!(
+            candidate.confirm().await,
+            Err(Stopped::Refused {
+                code: ErrorCode::PairingAuthFailed,
+                ..
+            })
+        ));
+    }
+    let mut last = CodeCandidate::start(&host.room, guessing.candidate(), &origin, &wrong(&code))
+        .await
+        .expect("admitted");
+
+    host.room.hold_hosts(true);
+    let room = host.room.clone();
+    let (answer, ()) = tokio::join!(last.confirm(), async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            room.released().is_empty(),
+            "the release waits for the room to confirm the last attempt closed"
+        );
+        room.hold_hosts(false);
+    });
+    assert_eq!(
+        answer,
+        Err(Stopped::Refused {
+            code: ErrorCode::PairingAttemptsExhausted,
+            remaining: Some(0),
+        })
+    );
+    let released = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while host.room.released().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(released.is_ok(), "and then the locator is released");
     host.stop().await;
 }
 
