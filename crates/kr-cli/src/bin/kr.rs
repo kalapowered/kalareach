@@ -325,6 +325,20 @@ async fn run(cli: Cli) -> Result<Completion> {
             Ok(Completion::Done)
         }
         Command::Close(arguments) => {
+            // A close asked from inside the session it closes is one of the processes that session
+            // stops, and the graceful stop begins as soon as the close is accepted: a termination
+            // signal to the root shell's process group and a hangup to everything the session
+            // owns. Holding both off for the life of this command is what lets it report what it
+            // was told; the session's forced stop still ends it if it is somehow still running
+            // after the grace.
+            #[cfg(unix)]
+            let _held = {
+                use tokio::signal::unix::{SignalKind, signal};
+                (
+                    signal(SignalKind::hangup()).ok(),
+                    signal(SignalKind::terminate()).ok(),
+                )
+            };
             let selector = session_selector(arguments.session.as_deref())?;
             let wanted = parse_environment(arguments.environment.as_deref())?;
             let environment = kr_cli::resolve::select(&paths, arguments.environment.as_deref())?;

@@ -488,8 +488,9 @@ async fn a_root_shell_that_exits_closes_the_session_and_nothing_restarts_it() {
     assert!(runtime.session().root_identity().is_some());
 }
 
-/// KR-REQ-07.55: the close that begins a closure is answered before anything is stopped, a second
-/// close while it runs joins it, and one after it has finished is answered with the final record.
+/// KR-REQ-07.55: a duplicate close returns the existing state: one asked while the closure runs
+/// joins it rather than starting another, and one asked after it has finished is answered with the
+/// final record.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_closed_session_refuses_input_and_a_second_close_joins_the_first() {
     let host = kr_ipc::testing::TempHost::create();

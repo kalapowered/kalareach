@@ -2079,3 +2079,37 @@ async fn a_descriptor_its_worker_cannot_answer_for_is_not_attached_through() {
     let _ = shell.kill();
     let _ = shell.wait();
 }
+
+/// KR-REQ-07.55: a `kr close` run inside the session it closes is answered with the acceptance
+/// before the closure stops the processes it runs among, itself included, so the command that
+/// asked reports that the session is closing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_from_inside_the_session_is_answered_before_it_is_stopped() {
+    let gates = std::env::temp_dir().join(format!("kalareach-gates-{}", kr_ipc::new_uuid()));
+    std::fs::create_dir_all(&gates).expect("a directory for this test's gates");
+    let (go, answer) = (gates.join("go"), gates.join("closed.json"));
+    let hosted = hosted(&format!(
+        "while [ ! -e '{}' ]; do sleep 0.1; done; '{}' close --json 1 > '{}' 2>&1; sleep 30",
+        go.display(),
+        kr().display(),
+        answer.display()
+    ))
+    .await;
+    std::fs::write(&go, b"").expect("opens the gate");
+
+    let record = tokio::time::timeout(LIVENESS_DEADLINE, hosted.runtime.wait_closed())
+        .await
+        .expect("the session closes");
+    assert_eq!(
+        record.reason,
+        kr_protocol::session::ClosureReason::CloseRequested
+    );
+    let reported = std::fs::read_to_string(&answer).unwrap_or_default();
+    let reported: serde_json::Value =
+        serde_json::from_str(reported.trim()).unwrap_or_else(|error| {
+            panic!("the command inside the session reported its answer ({error}): {reported:?}")
+        });
+    assert_eq!(reported["ok"], serde_json::json!(true));
+    assert_eq!(reported["state"], serde_json::json!("closing"));
+    let _ = std::fs::remove_dir_all(&gates);
+}
