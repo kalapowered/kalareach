@@ -3043,19 +3043,6 @@ impl ProjectService {
                 .into(),
             });
         };
-        let Some(expected) = row.identity else {
-            // The materialisation never got as far as recording the tree's identity, so this host
-            // cannot prove the directory at that path is one it created. Removing it would be
-            // removing whatever is there, which is exactly what an identity exists to stop.
-            return Err(ProjectError::IdentityChanged {
-                detail: format!(
-                    "this host recorded no filesystem identity for the workspace at {}, so it \
-                     will not remove what is there; the directory is left for a person to look at",
-                    crate::git::redact(&path.display().to_string())
-                )
-                .into(),
-            });
-        };
         let (parent, name) = match &reach.through {
             // Through the location, and asked for immediately before it starts. The tree's name
             // beneath the location can have several components, and a removal takes one entry
@@ -3083,9 +3070,24 @@ impl ProjectService {
         };
         if !parent.occupied(&name)? {
             // Already gone, which is what a second removal under a different retention policy
-            // finds. There is nothing to remove and nothing to refuse.
+            // finds, and so is a tree a materialisation that failed early never made. There is
+            // nothing to remove and nothing to refuse: an identity is what authorises removing an
+            // object, and an absence needs no authority.
             return Ok(());
         }
+        let Some(expected) = row.identity else {
+            // The materialisation never got as far as recording the tree's identity, so this host
+            // cannot prove the directory at that path is one it created. Removing it would be
+            // removing whatever is there, which is exactly what an identity exists to stop.
+            return Err(ProjectError::IdentityChanged {
+                detail: format!(
+                    "this host recorded no filesystem identity for the workspace at {}, so it \
+                     will not remove what is there; the directory is left for a person to look at",
+                    crate::git::redact(&path.display().to_string())
+                )
+                .into(),
+            });
+        };
         // The identity is checked before anything is removed: a record whose object has been
         // replaced does not authorise removing whatever now holds its path.
         let here = parent.subdirectory(&name)?;

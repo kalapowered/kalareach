@@ -2030,6 +2030,88 @@ fn withdrawal_survives_a_restart_and_owner_cleanup_works() {
 }
 
 #[test]
+fn a_workspace_whose_tree_was_never_made_is_removed_through_a_location_the_owner_names() {
+    // The destination is withdrawn as a workspace's clone ends, so its tree is never made and the
+    // staging directory it made is kept. The owner authorises the directory again and removes the
+    // workspace through that location: the staging directory goes, as the directory the row
+    // recorded creating, and a tree that is not there needs no identity to be found absent.
+    let mut fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let environment = fixture.environment_id();
+    let sources = fixture.work().join("sources");
+    let workspaces = fixture.work().join("workspaces");
+    let source = owner_location(&fixture, &owner, &sources, LocationPurpose::Source, 90);
+    let made_in = owner_location(
+        &fixture,
+        &owner,
+        &workspaces,
+        LocationPurpose::Destination,
+        91,
+    );
+    let project = adopt(&fixture, &sources, "repo", 92);
+    attach(fixture.service(), &owner, project, source, 93).expect("the repository is bound");
+    withdrawing_after(
+        &mut fixture,
+        "git clone",
+        |_| {},
+        made_in,
+        94,
+        |fixture| {
+            workspace_through(
+                fixture.service(),
+                project,
+                through(environment, made_in, "ws"),
+                false,
+                95,
+            )
+        },
+    )
+    .expect_err("the withdrawal stops the materialisation");
+    let kept = names_in(&workspaces);
+    assert_eq!(kept.len(), 1, "only the staging directory: {kept:?}");
+    let listed = fixture
+        .service()
+        .workspace_list(&WorkspaceListParams {
+            environment_id: environment,
+            project_repository_id: Nullable(Some(project)),
+        })
+        .expect("the workspaces list");
+    let [workspace] = listed.workspaces.as_slice() else {
+        panic!("one workspace was begun: {:?}", listed.workspaces);
+    };
+    assert!(
+        workspace.filesystem_identity.0.is_none(),
+        "no tree was made"
+    );
+
+    let again = support::authorise_location(
+        fixture.service(),
+        &owner,
+        &workspaces,
+        LocationPurpose::Destination,
+        96,
+    );
+    let removed = fixture
+        .service()
+        .workspace_remove(
+            &WorkspaceRemoveParams {
+                workspace_id: workspace.workspace_id,
+                retention: RetentionPolicy::RemoveRetained,
+                through_location_id: Nullable(Some(again)),
+            },
+            Some(&action("workspace.remove", 97)),
+        )
+        .expect("the owner removes it through the location it named");
+    assert_eq!(removed.workspace.state, WorkspaceState::Removed);
+    assert!(removed.working_files_removed);
+    assert!(
+        names_in(&workspaces).is_empty(),
+        "{:?}",
+        names_in(&workspaces)
+    );
+}
+
+#[test]
 fn preview_after_withdrawal_does_not_begin() {
     // A preview returns without the transaction that begins an effect, so it is admitted as a
     // read: once a location it reaches through is withdrawn, neither the preview nor the creation
