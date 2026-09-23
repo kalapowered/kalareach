@@ -80,7 +80,7 @@ fn a_manifest_declares_identity_ranges_match_rules_platforms_hashes_and_capabili
             payload.path
         );
         assert_eq!(
-            serde_json::to_value(&payload.size_bytes).expect("a size"),
+            serde_json::to_value(payload.size_bytes).expect("a size"),
             json!(bytes.len().to_string()),
             "{} is declared with its exact size",
             payload.path
