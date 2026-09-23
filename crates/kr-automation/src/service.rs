@@ -23,7 +23,8 @@
 //!   action kind fixes. [`AutomationService::admit_triggers`] reads those events under its own
 //!   cursor and starts a run of every enabled workflow whose trigger names that type. The run's
 //!   root, depth, generation and parent are the journal's record of the node that produced the
-//!   event, and the trigger's identifier is that node's action identifier.
+//!   event, and the trigger's identifier is that node's action identifier in a namespace no
+//!   external trigger may use.
 //! * **Recovery.** [`AutomationService::recover`] picks up the runs a stopped host left unfinished.
 //!   A node that was running when the host stopped may have been dispatched, so its outcome is
 //!   unknown and its dependants pause; only nodes that were never dispatched, and whose grant
@@ -63,6 +64,15 @@ use crate::store::{
 
 /// The name the trigger dispatcher registers under as a consumer of the journal's events.
 pub const TRIGGER_CONSUMER: &str = "workflow.triggers";
+
+/// The prefix every derived trigger's identifier carries, and no external trigger's may.
+///
+/// A derived trigger is named by the action identifier of the node that produced it, and node
+/// receipts show those identifiers before the node settles. Without a namespace of its own, a
+/// caller could submit an external trigger under that identifier first and take the derived
+/// trigger's place in the deduplication record, turning the expected descendant into a run with
+/// a fresh root.
+pub const DERIVED_TRIGGER_PREFIX: &str = "node:";
 
 /// The identifier an attention record is raised about.
 ///
@@ -134,12 +144,20 @@ pub struct TriggerDecision {
 }
 
 /// What one pass of the trigger dispatcher admitted.
+///
+/// A pass that stopped part way still hands back every run it committed before it stopped. Each
+/// event commits on its own, so those runs are in the journal whatever happened to the next one,
+/// and a host that dropped them would leave them waiting until its next restart.
 #[derive(Debug, Default)]
 pub struct AdmittedTriggers {
     /// Every decision the pass took, one per workflow a trigger matched.
     pub decisions: Vec<TriggerDecision>,
     /// The runs it started, for the host to execute.
     pub started: Vec<StartedRun>,
+    /// Why the pass stopped before it reached the end of the stream, when it did: a grant store
+    /// that could not be read or a journal that could not be written. The event it stopped at is
+    /// still unread and is decided again on the next pass.
+    pub stopped: Option<AutomationError>,
 }
 
 /// What an earlier submission of an action came to, as its method answers it.
@@ -453,6 +471,13 @@ impl AutomationService {
         if installed.paused {
             return Err(AutomationError::WorkflowPaused(params.workflow_id));
         }
+        if params.event_id.starts_with(DERIVED_TRIGGER_PREFIX) {
+            return Err(AutomationError::InvalidArgument(format!(
+                "an external trigger cannot use an event identifier beginning with \
+                 {DERIVED_TRIGGER_PREFIX}, which this host keeps for the triggers its own nodes \
+                 produce"
+            )));
+        }
         // An external trigger, including an unauthenticated callback. The host mints its root;
         // nothing in the request can name one, so event content cannot place a trigger inside an
         // existing chain or lift one out of it. Host-wide admission is what bounds it.
@@ -546,31 +571,43 @@ impl AutomationService {
     /// admits a run of every enabled, unpaused workflow whose trigger names that event. Each
     /// descendant's root, depth, generation and parent come from the journal's record of the run
     /// that produced the event, and its trigger's identifier is the producing node's action
-    /// identifier, so a replay of the event is the same trigger and runs once.
+    /// identifier under [`DERIVED_TRIGGER_PREFIX`], a namespace no external trigger may use, so
+    /// a replay of the event is the same trigger and runs once.
     ///
     /// The runs an event starts, the refusals it earned (a self-retrigger, a breached rate and the
     /// pause it owes, an exhausted chain and the one attention item it owes) and the dispatcher's
     /// position all commit in one transaction. A host that stops between two events neither loses
     /// one nor starts one twice. A grant store that cannot be read, or a journal that cannot be
-    /// written, stops the pass where it is, with that event still unread.
-    ///
-    /// # Errors
-    ///
-    /// Returns a storage error, or a grant store that could not be read.
-    pub fn admit_triggers(&self, now_ms: u64) -> Result<AdmittedTriggers> {
-        self.store
-            .register_consumer(TRIGGER_CONSUMER, &[EVENT_NODE_SETTLED], now_ms)?;
+    /// written, stops the pass where it is, with that event still unread; the runs the pass
+    /// committed before it stopped come back all the same, with the reason in
+    /// [`AdmittedTriggers::stopped`].
+    #[must_use]
+    pub fn admit_triggers(&self, now_ms: u64) -> AdmittedTriggers {
         let mut admitted = AdmittedTriggers::default();
-        while let Some((mut decisions, mut started)) =
+        if let Err(error) =
             self.store
+                .register_consumer(TRIGGER_CONSUMER, &[EVENT_NODE_SETTLED], now_ms)
+        {
+            admitted.stopped = Some(error);
+            return admitted;
+        }
+        loop {
+            match self
+                .store
                 .consume(TRIGGER_CONSUMER, &[EVENT_NODE_SETTLED], |journal, event| {
                     self.decide_trigger(journal, event, now_ms)
-                })?
-        {
-            admitted.decisions.append(&mut decisions);
-            admitted.started.append(&mut started);
+                }) {
+                Ok(Some((mut decisions, mut started))) => {
+                    admitted.decisions.append(&mut decisions);
+                    admitted.started.append(&mut started);
+                }
+                Ok(None) => return admitted,
+                Err(error) => {
+                    admitted.stopped = Some(error);
+                    return admitted;
+                }
+            }
         }
-        Ok(admitted)
     }
 
     /// Admits and executes the runs pending triggers have started, one pass.
@@ -580,15 +617,19 @@ impl AutomationService {
     ///
     /// # Errors
     ///
-    /// Returns what [`Self::admit_triggers`] returns.
+    /// Returns the reason the pass stopped part way, after executing every run it committed
+    /// before it stopped.
     pub async fn dispatch_triggers(&self, now_ms: u64) -> Result<Vec<TriggerDecision>> {
-        let admitted = self.admit_triggers(now_ms)?;
+        let admitted = self.admit_triggers(now_ms);
         for started in admitted.started {
-            // A run that stopped on a refusal has recorded its pause; the decision above already
-            // says the run was started.
+            // A run that stopped on a refusal has recorded its pause; the decision already says
+            // the run was started.
             let _ = self.execute(started).await;
         }
-        Ok(admitted.decisions)
+        match admitted.stopped {
+            Some(error) => Err(error),
+            None => Ok(admitted.decisions),
+        }
     }
 
     /// Decides what one settled-node event triggers.
@@ -616,10 +657,9 @@ impl AutomationService {
         let mut started = Vec::new();
         for installed in journal.definitions_triggered_by(produced)? {
             let definition = installed.definition;
-            let outcome =
-                descendant_context(journal, &definition, &parent, node_id).and_then(|causal| {
-                    self.admit(journal, &definition, &action_id.to_string(), causal, now_ms)
-                });
+            let trigger_id = format!("{DERIVED_TRIGGER_PREFIX}{action_id}");
+            let outcome = descendant_context(journal, &definition, &parent, node_id)
+                .and_then(|causal| self.admit(journal, &definition, &trigger_id, causal, now_ms));
             let outcome = match outcome {
                 Ok(run) => {
                     let run_id = run.run_id;

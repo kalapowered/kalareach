@@ -448,7 +448,6 @@ pub fn create_workflow_definition(
         description: kr_protocol::scalars::Nullable::null(),
         trigger: WorkflowTrigger {
             event_type: "manual".to_owned(),
-            criteria: kr_protocol::scalars::Nullable::null(),
         },
         resource_scope: WorkflowResourceScope::default(),
         nodes,

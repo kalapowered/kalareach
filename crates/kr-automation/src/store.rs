@@ -70,6 +70,20 @@ fn parse_stored_uuid(value: &str) -> rusqlite::Result<kr_protocol::scalars::Uuid
     })
 }
 
+/// Splits an outcome into the part a transaction commits and the part that abandons it.
+///
+/// A refusal the host decided commits with whatever deciding it wrote, such as an exhausted budget
+/// and the one attention event it owes, and comes back to the caller after the commit. Anything
+/// else, a journal that could not write that event among them, abandons the transaction, so the
+/// budget is never left marked as having raised an item that was not written.
+fn decided(outcome: Result<()>) -> Result<Result<()>> {
+    match outcome {
+        Ok(()) => Ok(Ok(())),
+        Err(error) if error.is_decided() => Ok(Err(error)),
+        Err(error) => Err(error),
+    }
+}
+
 /// A count or an instant as the journal stores it.
 fn stored(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
@@ -102,6 +116,8 @@ pub const ATTENTION_CAUSAL_LIMIT: &str = "attention.causal_limit";
 pub const ATTENTION_WORKFLOW_PAUSED: &str = "attention.workflow_paused";
 /// The event type that ends the condition [`ATTENTION_WORKFLOW_PAUSED`] raised.
 pub const ATTENTION_WORKFLOW_RESUMED: &str = "attention.workflow_resumed";
+/// The event type of an accepted trigger and the run it started.
+pub const EVENT_RUN_ADMITTED: &str = "workflow.run_admitted";
 /// The event type of a dispatched node's settled outcome.
 pub const EVENT_NODE_SETTLED: &str = "workflow.node_settled";
 /// The event type of a run that stopped: completed, failed, paused or cancelled.
@@ -116,6 +132,46 @@ pub const ATTENTION_EVENTS: &[&str] = &[
 
 /// The name the attention consumer registers under.
 pub const ATTENTION_CONSUMER: &str = "attention";
+
+/// The subsystem every event of this journal's stream comes from.
+pub const EVENT_SOURCE: &str = "automation";
+
+/// The content class of every event of this journal's stream: identifiers and states, never
+/// anything a node, a terminal or a model produced.
+pub const EVENT_CONTENT: &str = "identifiers";
+
+/// The actor an event names when the host's own transition caused it rather than a caller's action.
+pub const HOST_ACTOR: &str = "host";
+
+/// A run's place in its causal chain, as an event carries it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventChain {
+    /// The chain's root.
+    pub causal_root_id: CausalRootId,
+    /// The budget generation the run belongs to.
+    pub generation: u64,
+    /// The run's depth in the chain.
+    pub depth: u64,
+    /// The run whose node triggered this one, when it descends from another.
+    pub parent_run_id: Option<WorkflowRunId>,
+    /// That node.
+    pub parent_node_id: Option<String>,
+}
+
+impl EventChain {
+    /// The chain a recorded run belongs to.
+    #[must_use]
+    pub fn of(run: &StoredRunRecord) -> Self {
+        Self {
+            causal_root_id: run.causal_root_id,
+            generation: run.generation,
+            depth: run.depth,
+            parent_run_id: run.parent_run_id,
+            parent_node_id: run.parent_node_id.clone(),
+        }
+    }
+}
 
 /// What one event in the journal's stream says happened.
 ///
@@ -151,6 +207,20 @@ pub enum JournalEventKind {
         /// The revision that was enabled again.
         revision: u64,
     },
+    /// A trigger was accepted: its run, the run's receipts and the chain's reservation were
+    /// recorded, and the run will dispatch its first node.
+    RunAdmitted {
+        /// The run.
+        run_id: WorkflowRunId,
+        /// The run's workflow.
+        workflow_id: WorkflowId,
+        /// The run's revision.
+        revision: u64,
+        /// The identifier of the trigger that started it.
+        trigger_event_id: String,
+        /// The run's place in its chain.
+        chain: EventChain,
+    },
     /// A dispatched node's outcome became the journal's record.
     NodeSettled {
         /// The run the node belongs to.
@@ -167,12 +237,8 @@ pub enum JournalEventKind {
         status: NodeStatus,
         /// The event a successful node produces, which is what a derived trigger names.
         produced: Option<String>,
-        /// The chain the run belongs to.
-        causal_root_id: CausalRootId,
-        /// The budget generation the run belongs to.
-        generation: u64,
-        /// The run's depth in the chain.
-        depth: u64,
+        /// The run's place in its chain.
+        chain: EventChain,
     },
     /// A run stopped: it completed, failed, paused or was cancelled.
     RunSettled {
@@ -184,8 +250,8 @@ pub enum JournalEventKind {
         revision: u64,
         /// Where it stopped.
         status: WorkflowRunStatus,
-        /// The chain the run belongs to.
-        causal_root_id: CausalRootId,
+        /// The run's place in its chain.
+        chain: EventChain,
     },
 }
 
@@ -197,10 +263,21 @@ impl JournalEventKind {
             Self::CausalLimit { .. } => ATTENTION_CAUSAL_LIMIT,
             Self::WorkflowPaused { .. } => ATTENTION_WORKFLOW_PAUSED,
             Self::WorkflowResumed { .. } => ATTENTION_WORKFLOW_RESUMED,
+            Self::RunAdmitted { .. } => EVENT_RUN_ADMITTED,
             Self::NodeSettled { .. } => EVENT_NODE_SETTLED,
             Self::RunSettled { .. } => EVENT_RUN_SETTLED,
         }
     }
+}
+
+/// An event as the stream stores it: what happened, and the envelope every event carries.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredEvent {
+    source: String,
+    actor: String,
+    content: String,
+    event: JournalEventKind,
 }
 
 /// One event of the journal's stream, as a consumer reads it.
@@ -211,6 +288,13 @@ pub struct JournalEvent {
     pub sequence: u64,
     /// When it was committed.
     pub recorded_at_ms: u64,
+    /// The subsystem it comes from, [`EVENT_SOURCE`].
+    pub source: String,
+    /// The verified actor whose action caused it, or [`HOST_ACTOR`] for the host's own
+    /// transitions.
+    pub actor: String,
+    /// Its content class, [`EVENT_CONTENT`].
+    pub content: String,
     /// What happened.
     pub kind: JournalEventKind,
 }
@@ -413,7 +497,9 @@ impl AttentionOutboxRecord {
                 "the workflow revision was enabled again".to_owned(),
                 true,
             ),
-            JournalEventKind::NodeSettled { .. } | JournalEventKind::RunSettled { .. } => {
+            JournalEventKind::RunAdmitted { .. }
+            | JournalEventKind::NodeSettled { .. }
+            | JournalEventKind::RunSettled { .. } => {
                 return None;
             }
         };
@@ -436,6 +522,7 @@ pub struct Journal<'c> {
     conn: &'c Connection,
     admission: Option<&'c (dyn Fn() -> Result<()> + Send + Sync)>,
     admitted: Cell<bool>,
+    actor: Option<&'c str>,
 }
 
 impl std::fmt::Debug for Journal<'_> {
@@ -453,6 +540,7 @@ impl<'c> Journal<'c> {
             conn,
             admission: None,
             admitted: Cell::new(false),
+            actor: None,
         }
     }
 
@@ -963,6 +1051,26 @@ impl<'c> Journal<'c> {
             )?;
         }
 
+        self.record_event(
+            &JournalEventKind::RunAdmitted {
+                run_id,
+                workflow_id: definition.workflow_id,
+                revision: definition.revision.get(),
+                trigger_event_id: event_id.to_owned(),
+                chain: EventChain {
+                    causal_root_id: causal_ctx.root_id,
+                    generation: causal_ctx.generation,
+                    depth: causal_ctx.depth,
+                    parent_run_id: causal_ctx.parent.as_ref().map(|parent| parent.run_id),
+                    parent_node_id: causal_ctx
+                        .parent
+                        .as_ref()
+                        .map(|parent| parent.node_id.clone()),
+                },
+            },
+            now_ms,
+        )?;
+
         Ok(budget)
     }
 
@@ -1091,12 +1199,18 @@ impl<'c> Journal<'c> {
     ///
     /// Returns a storage error when the row cannot be written.
     pub fn record_event(&self, kind: &JournalEventKind, now_ms: u64) -> Result<u64> {
+        let stored_event = StoredEvent {
+            source: EVENT_SOURCE.to_owned(),
+            actor: self.actor.unwrap_or(HOST_ACTOR).to_owned(),
+            content: EVENT_CONTENT.to_owned(),
+            event: kind.clone(),
+        };
         self.conn.execute(
             "INSERT INTO outbox_events (event_type, payload_json, created_at_ms)
              VALUES (?1, ?2, ?3)",
             params![
                 kind.event_type(),
-                serde_json::to_string(kind)?,
+                serde_json::to_string(&stored_event)?,
                 stored(now_ms)
             ],
         )?;
@@ -1144,7 +1258,7 @@ impl<'c> Journal<'c> {
         let mut events = Vec::new();
         for row in rows {
             let (sequence, payload, recorded_at_ms) = row?;
-            let kind = serde_json::from_str(&payload).map_err(|error| {
+            let stored_event: StoredEvent = serde_json::from_str(&payload).map_err(|error| {
                 AutomationError::InvalidArgument(format!(
                     "event {sequence} of the workflow journal cannot be read: {error}"
                 ))
@@ -1152,7 +1266,10 @@ impl<'c> Journal<'c> {
             events.push(JournalEvent {
                 sequence: sequence as u64,
                 recorded_at_ms: recorded_at_ms as u64,
-                kind,
+                source: stored_event.source,
+                actor: stored_event.actor,
+                content: stored_event.content,
+                kind: stored_event.event,
             });
         }
         Ok(events)
@@ -1269,9 +1386,7 @@ impl<'c> Journal<'c> {
                 action_id: ActionId::new(parse_stored_uuid(&action_id)?),
                 status: settlement.status,
                 produced: settlement.produced.map(str::to_owned),
-                causal_root_id: run.causal_root_id,
-                generation: run.generation,
-                depth: run.depth,
+                chain: EventChain::of(&run),
             },
             settlement.at_ms,
         )?;
@@ -1294,7 +1409,7 @@ impl<'c> Journal<'c> {
                 workflow_id: run.workflow_id,
                 revision: run.revision,
                 status,
-                causal_root_id: run.causal_root_id,
+                chain: EventChain::of(&run),
             },
             now_ms,
         )?;
@@ -1647,17 +1762,25 @@ impl WorkflowStore {
             conn: &tx,
             admission: Some(submitted.admission),
             admitted: Cell::new(false),
+            actor: Some(&submitted.key.actor_id),
         };
         if let Some(record) = journal.action_record(submitted.key)? {
             return Ok(Acted::Answered(record));
         }
         match effect(&journal) {
             Ok((record, value)) => {
+                // The record is a write like any other: an action whose effect wrote nothing is
+                // still refused here when its admission has lapsed, and leaves no record.
+                journal.admit()?;
                 journal.record_action(submitted.key, &record, now_ms)?;
                 tx.commit()?;
                 Ok(Acted::Performed(value))
             }
             Err(error) if error.is_decided() => {
+                // A refusal is recorded only under an admission that still stands. One decided
+                // before the first write, a revision that is not installed among them, would
+                // otherwise be retained for a submission whose admission lapsed while it waited.
+                journal.admit()?;
                 let refusal = ProtocolError::from(&error);
                 journal.record_action(
                     submitted.key,
@@ -1744,7 +1867,7 @@ impl WorkflowStore {
         self.read(|journal| journal.set_paused(workflow_id, revision, paused))
     }
 
-    /// Reads all definitions matching criteria.
+    /// Reads the installed definitions, of one workflow or of all of them.
     ///
     /// # Errors
     ///
@@ -1834,7 +1957,7 @@ impl WorkflowStore {
         now_ms: u64,
     ) -> Result<()> {
         self.write(|journal| {
-            Ok(
+            decided(
                 journal.reserve_in_budget(root_id, generation, now_ms, |budget| {
                     budget.reserve_action(now_ms)
                 }),
@@ -1854,7 +1977,7 @@ impl WorkflowStore {
         now_ms: u64,
     ) -> Result<()> {
         self.write(|journal| {
-            Ok(
+            decided(
                 journal.reserve_in_budget(root_id, generation, now_ms, |budget| {
                     budget.reserve_session(now_ms)
                 }),

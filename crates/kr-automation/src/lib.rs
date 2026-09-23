@@ -68,7 +68,8 @@ pub use crate::definition::{
 pub use crate::engine::{ActionOutcome, ActionRunner, Dispatch, MockActionRunner, WorkflowEngine};
 pub use crate::error::{AutomationError, Result};
 pub use crate::service::{
-    AdmittedTriggers, Answer, AutomationService, StartedRun, TRIGGER_CONSUMER, TriggerDecision,
+    AdmittedTriggers, Answer, AutomationService, DERIVED_TRIGGER_PREFIX, StartedRun,
+    TRIGGER_CONSUMER, TriggerDecision,
 };
 pub use crate::source_workflow::{
     QuiescenceManager, QuiescenceReservation, SourceWorkflowCoordinator,

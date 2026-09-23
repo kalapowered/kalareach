@@ -22013,11 +22013,7 @@ export interface WorkflowResourceScope {
  */
 export interface WorkflowTrigger {
   /**
-   * Optional criteria or filter for the triggering event.
-   */
-  criteria: string | null
-  /**
-   * The event type that triggers the workflow (e.g., "turn_completed", "changeset_captured").
+   * The event type that triggers the workflow, such as `changeset.captured`.
    */
   event_type: string
 }
@@ -22367,14 +22363,14 @@ export interface WorkflowRunResult {
 }
 /**
  * An event trigger definition for a workflow.
+ *
+ * A trigger matches an event by its type and by nothing else. The events a workflow's own nodes
+ * produce have types their action kinds fix, such as `changeset.captured` or `tests.passed`, and a
+ * run started through `workflow.run` is an external trigger whatever type it names.
  */
 export interface WorkflowTrigger1 {
   /**
-   * Optional criteria or filter for the triggering event.
-   */
-  criteria: string | null
-  /**
-   * The event type that triggers the workflow (e.g., "turn_completed", "changeset_captured").
+   * The event type that triggers the workflow, such as `changeset.captured`.
    */
   event_type: string
 }

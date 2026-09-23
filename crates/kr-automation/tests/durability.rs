@@ -479,7 +479,7 @@ async fn an_event_waits_for_every_consumer_registered_for_its_type() {
 
     // The dispatcher reads the node events. Once it has passed them they go; the attention
     // record stays, because no attention consumer has registered to read it.
-    service.admit_triggers(1_200).expect("a pass");
+    assert!(service.admit_triggers(1_200).stopped.is_none(), "a pass");
     assert!(service.store().prune().unwrap() >= 2);
     assert_eq!(settled(&service), 0);
     assert_eq!(service.store().pending_attention().unwrap().len(), 1);

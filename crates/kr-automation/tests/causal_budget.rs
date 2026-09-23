@@ -377,7 +377,11 @@ async fn a_descendant_takes_its_ancestry_from_the_node_that_produced_its_trigger
     assert_eq!(run.parent_node_id.0.as_deref(), Some("step"));
     assert_eq!(
         run.trigger_event_id,
-        producing[0].action_id.to_string(),
+        format!(
+            "{}{}",
+            kr_automation::DERIVED_TRIGGER_PREFIX,
+            producing[0].action_id
+        ),
         "the trigger is named by the producing node's action identifier"
     );
 

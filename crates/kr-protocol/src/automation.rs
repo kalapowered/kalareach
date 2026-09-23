@@ -126,13 +126,15 @@ wire_enum! {
 }
 
 /// An event trigger definition for a workflow.
+///
+/// A trigger matches an event by its type and by nothing else. The events a workflow's own nodes
+/// produce have types their action kinds fix, such as `changeset.captured` or `tests.passed`, and a
+/// run started through `workflow.run` is an external trigger whatever type it names.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowTrigger {
-    /// The event type that triggers the workflow (e.g., "turn_completed", "changeset_captured").
+    /// The event type that triggers the workflow, such as `changeset.captured`.
     pub event_type: String,
-    /// Optional criteria or filter for the triggering event.
-    pub criteria: Nullable<String>,
 }
 
 /// Resource scope binding for a workflow.
@@ -516,6 +518,25 @@ mod tests {
         for status in WorkflowRunStatus::ALL {
             assert_eq!(WorkflowRunStatus::from_wire(status.as_str()), Some(*status));
         }
+    }
+
+    #[test]
+    fn a_trigger_carries_its_event_type_and_nothing_else() {
+        let filtered = serde_json::json!({
+            "event_type": "changeset.captured",
+            "criteria": "only on main",
+        });
+        assert!(
+            serde_json::from_value::<WorkflowTrigger>(filtered).is_err(),
+            "a filter nothing applies is refused rather than ignored"
+        );
+        let plain = serde_json::json!({ "event_type": "changeset.captured" });
+        assert_eq!(
+            serde_json::from_value::<WorkflowTrigger>(plain)
+                .expect("a trigger")
+                .event_type,
+            "changeset.captured"
+        );
     }
 
     #[test]

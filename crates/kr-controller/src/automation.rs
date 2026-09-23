@@ -112,17 +112,23 @@ impl AuthoritySource for HostGrants {
             ActorIngress::PairedDevice
         };
         let rights = {
-            let policy = self
+            let mut policy = self
                 .policy
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            crate::grants::standing_at_dispatch(
+            let decided = crate::grants::standing_at_dispatch(
                 &record,
-                &policy,
+                &mut policy,
                 self.environment_id,
                 ingress,
                 now_ms,
-            )
+            );
+            // The floor the decision raised is written down while the lock is held, as the daemon
+            // writes every other raise of it, so it survives a restart. A failed write leaves the
+            // raised floor in memory, because a floor only moves forward and keeping it is the
+            // stricter answer.
+            let _ = self.sharing.grants().store_policy(&policy.snapshot());
+            decided
         }
         .map_err(|refusal| {
             kr_automation::AutomationError::PermissionDenied(format!(
@@ -248,10 +254,20 @@ fn version_in_scope(
     asked: &ChangesetMaterializeParams,
     environment_id: EnvironmentId,
 ) -> kr_automation::Result<()> {
-    // A version this service does not hold is the materialisation's own refusal to make.
-    let Ok(version) = changesets.record(asked.change_set_id, Some(asked.version)) else {
-        return Ok(());
-    };
+    // A version that cannot be read cannot be checked, and a version that does not exist yet can
+    // be captured before the materialisation reads it. Either way the dispatch is refused: what is
+    // materialised is only ever a version whose scope was checked here.
+    let version = changesets
+        .record(asked.change_set_id, Some(asked.version))
+        .map_err(|error| {
+            kr_automation::AutomationError::PermissionDenied(format!(
+                "change set {} version {} could not be checked against workflow {}'s scope: {}",
+                asked.change_set_id,
+                asked.version,
+                definition.workflow_id,
+                kr_project::git::redact(&error.to_string())
+            ))
+        })?;
     if version.environment_id != environment_id {
         return Err(kr_automation::AutomationError::PermissionDenied(format!(
             "change set {} version {} was captured in environment {}, and this host acts in {}",
@@ -383,23 +399,28 @@ async fn dispatch(service: Arc<AutomationService>, resumed: Vec<kr_automation::S
     loop {
         let admitted = {
             let service = Arc::clone(&service);
-            blocking(move || {
-                let admitted = service.admit_triggers(kr_ipc::now_ms().get())?;
-                // The events every consumer that reads them has passed are no longer owed.
-                service.store().prune()?;
-                Ok::<_, kr_automation::AutomationError>(admitted)
-            })
-            .await
+            blocking(move || service.admit_triggers(kr_ipc::now_ms().get())).await
         };
-        match admitted {
-            Ok(admitted) => {
-                for run in admitted.started {
-                    execute_apart(&service, run);
-                }
-            }
-            Err(error) => eprintln!(
-                "kr-controller: the workflow trigger dispatcher could not read its triggers: {error}"
-            ),
+        // Every run the pass committed is executed, including those committed before a later
+        // event stopped it: each is in the journal already, and nothing else would start it
+        // before the next restart.
+        for run in admitted.started {
+            execute_apart(&service, run);
+        }
+        if let Some(error) = admitted.stopped {
+            eprintln!(
+                "kr-controller: the workflow trigger dispatcher stopped before its last trigger: \
+                 {error}"
+            );
+        }
+        // The events every consumer that reads them has passed are no longer owed. Removing them
+        // is housekeeping: a failure here leaves them in the stream and changes no decision.
+        let pruned = {
+            let service = Arc::clone(&service);
+            blocking(move || service.store().prune()).await
+        };
+        if let Err(error) = pruned {
+            eprintln!("kr-controller: the workflow journal kept events it no longer owes: {error}");
         }
         tokio::select! {
             () = woken.notified() => {}

@@ -29766,27 +29766,15 @@
     },
     "WorkflowTrigger": {
       "additionalProperties": false,
-      "description": "An event trigger definition for a workflow.",
+      "description": "An event trigger definition for a workflow.\n\nA trigger matches an event by its type and by nothing else. The events a workflow's own nodes\nproduce have types their action kinds fix, such as `changeset.captured` or `tests.passed`, and a\nrun started through `workflow.run` is an external trigger whatever type it names.",
       "properties": {
-        "criteria": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Optional criteria or filter for the triggering event."
-        },
         "event_type": {
-          "description": "The event type that triggers the workflow (e.g., \"turn_completed\", \"changeset_captured\").",
+          "description": "The event type that triggers the workflow, such as `changeset.captured`.",
           "type": "string"
         }
       },
       "required": [
-        "event_type",
-        "criteria"
+        "event_type"
       ],
       "type": "object"
     },

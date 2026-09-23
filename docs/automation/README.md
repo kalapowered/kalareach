@@ -62,10 +62,13 @@ it dispatches and once more where the node's effect begins.
 * **Read, never supplied.** Nothing a caller passes in decides what a run may do. A grant this
   host never issued names no workflow it will install.
 * **Decided under the host's policy.** The grant is intersected with the host's policy as it
-  stands: a revoked ancestor, the clock floor (a clock wound back does not revive an expiry the
-  host already refused), redemption, expiry, an authority revision the host never issued, the
-  organisation lease a grant requires and the bounded offline validity for a grant held by a
-  paired device. The rights the policy leaves are the rights the node is checked against.
+  stands: a revoked ancestor, the clock floor, redemption, expiry, an authority revision the host
+  never issued, the organisation lease a grant requires and the bounded offline validity for a
+  grant held by a paired device. The rights the policy leaves are the rights the node is checked
+  against. Each of these decisions raises the clock floor and writes it down, as the host's other
+  decisions do, so a clock wound back between two dispatches of an unattended workflow does not
+  revive an expiry the host already refused. A grant that requires an organisation membership is
+  refused here, because this path resolves no member account for its recipient.
 * **Withdrawn is withdrawn.** A grant that has expired, has been revoked, has a revoked ancestor,
   or has never had its invitation redeemed admits no run. A withdrawal that lands between two
   nodes of a run stops the run where it stands: the node that has not been dispatched is paused,
@@ -87,8 +90,8 @@ it dispatches and once more where the node's effect begins.
   definition scoped to another environment runs nothing here. A definition scoped to a session is
   refused unless the grant covers it, and a shell node's declared execution environment has to be
   one the grant admits. A capture node has to name the workspace the definition is scoped to, and
-  a materialisation is refused where it would begin when the version it names was captured from
-  another workspace or another environment.
+  a materialisation is refused where it would begin unless the version it names can be read and
+  was captured from the definition's workspace, when it names one, and from this environment.
 
 ## What a node actually does
 
@@ -140,10 +143,12 @@ the unit it derives them for. Nothing a caller sends names any of them.
   `request_review` produces `review.completed`, `create_session` produces `session.created`,
   `shell_command` produces `command.completed` and `apply_diff` produces `diff.applied`. The host's
   trigger dispatcher starts a run of every enabled, unpaused workflow whose trigger names that
-  type. The run's root, depth, budget generation and parent come from the journal's record of the
-  run whose node produced the event, and the trigger's identifier is that node's action
-  identifier, so a definition can mint neither an event type nor an event identifier, and a
-  replayed event is the same trigger and runs once.
+  type; a trigger matches on the event type and nothing else. The run's root, depth, budget
+  generation and parent come from the journal's record of the run whose node produced the event,
+  and the trigger's identifier is `node:` followed by that node's action identifier. A definition
+  can mint neither an event type nor an event identifier, a replayed event is the same trigger and
+  runs once, and an external trigger may not use an identifier beginning with `node:`, so a caller
+  cannot take a derived trigger's place.
 * **Descendant isolation.** A workflow cannot retrigger on its own descendants. Only a definition
   installed with explicit recurrence may, and even then the root stays the parent's: recurrence
   buys another turn in the chain, never a fresh budget.
@@ -213,10 +218,13 @@ the daemon's registry, because a causal budget has to survive a reboot as well a
 ## The event stream and its consumers
 
 The journal commits a small event with every transition that matters outside it, in the same
-transaction as the transition: a node's settled outcome, a run's stop (completed, failed, paused
-or cancelled), an exhausted chain, and a workflow paused by one of its own limits or enabled again.
-An event carries the identifiers a consumer needs and the causal chain it belongs to, and nothing a
-node produced: no output, no terminal text.
+transaction as the transition: an accepted trigger and the run it started, a node's settled
+outcome, a run's stop (completed, failed, paused or cancelled), an exhausted chain, and a workflow
+paused by one of its own limits or enabled again. Every event carries an envelope: the subsystem
+it comes from (`automation`), the verified actor whose action caused it or `host` for the host's
+own transitions, and its content class (`identifiers`). Inside, it carries the identifiers a
+consumer needs, the run's causal root, generation, depth and parent, and nothing a node produced:
+no output, no terminal text.
 
 The contract with every consumer:
 
@@ -224,7 +232,8 @@ The contract with every consumer:
   position in the stream. An event is never rewritten, and its position never changes.
 * **How it records where it is.** A consumer acts on an event and then records its position. A
   consumer whose effects are in the same journal, the trigger dispatcher among them, commits its
-  effect and its new position in one transaction. A consumer with a store of its own keeps its own
+  effect and its new position in one transaction; a pass that stops at one event keeps the runs it
+  committed for the events before it, and the event it stopped at is read again. A consumer with a store of its own keeps its own
   cursor there, keyed by the event's position, so a redelivery changes nothing, and acknowledges to
   the journal once its own state is written.
 * **When an event may be removed.** Only once every consumer registered for its type has

@@ -274,7 +274,6 @@ fn definition(
         description: Nullable::null(),
         trigger: WorkflowTrigger {
             event_type: "manual".to_owned(),
-            criteria: Nullable::null(),
         },
         resource_scope: WorkflowResourceScope::default(),
         nodes: vec![node],
@@ -1027,7 +1026,6 @@ async fn a_triggered_workflow_descends_from_the_node_that_triggered_it() {
     );
     tests.trigger = WorkflowTrigger {
         event_type: "changeset.captured".to_owned(),
-        criteria: Nullable::null(),
     };
     for document in [&capturing, &tests] {
         install(&mut control, &host, document).await;
@@ -1054,4 +1052,108 @@ async fn a_triggered_workflow_descends_from_the_node_that_triggered_it() {
     assert_eq!(descendant.parent_node_id.0.as_deref(), Some("capture"));
 
     host.clients.abort();
+}
+
+/// A materialisation is performed only for a version whose scope was checked. One that cannot be
+/// read, a version that does not exist yet among them, is refused where the effect would begin,
+/// because it could be captured from anywhere before the materialisation read it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_materialisation_whose_version_cannot_be_checked_is_refused() {
+    let host = host().await;
+    let mut control = client(&host).await;
+
+    host.issue(grant_id(12), &[ActionRight::WorkspaceManage]);
+    let unchecked = kr_protocol::changeset::ChangesetMaterializeParams {
+        change_set_id: kr_protocol::ids::ChangeSetId::new(Uuid::from_bytes([0x6d; 16])),
+        version: kr_protocol::ids::ChangeSetVersion::new(1),
+        purpose: kr_protocol::changeset::MaterialisationPurpose::Test,
+        label: "a version nobody captured".to_owned(),
+    };
+    let document = definition(
+        workflow_id(12),
+        grant_id(12),
+        "materialise-the-unknown",
+        WorkflowNode {
+            node_id: "materialise".to_owned(),
+            action_kind: "materialize_changeset".to_owned(),
+            action_params: serde_json::to_string(&unchecked).expect("typed parameters"),
+            declared_environment: Nullable::null(),
+        },
+    );
+    install(&mut control, &host, &document).await;
+    enable(&mut control, &host, &document).await;
+    let refused = failure(start(&mut control, &host, &document, "evt-unknown").await);
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(
+        refused.message.contains("could not be checked"),
+        "{refused:?}"
+    );
+
+    host.clients.abort();
+}
+
+/// The clock floor rises with automation's own decisions. A workflow runs unattended, so nothing
+/// else may advance the floor between two of its dispatches, and a clock wound back after a grant
+/// was refused as expired must not make it stand again.
+#[test]
+fn a_clock_wound_back_does_not_revive_a_grant_a_dispatch_refused() {
+    use kr_controller::grants::{HostPolicy, standing_at_dispatch};
+    use kr_protocol::actor::ActorIngress;
+
+    let environment_id = EnvironmentId::new(Uuid::from_bytes([0x3e; 16]));
+    let device_id = kr_protocol::ids::DeviceId::new(Uuid::from_bytes([0x3f; 16]));
+    let record = GrantRecord {
+        grant: Grant {
+            grant_id: grant_id(13),
+            parent_grant_id: Nullable::null(),
+            issuer_device_id: device_id,
+            recipient_device_id: device_id,
+            authority_revision: AuthorityRevision::new(1),
+            environment_selector: EnvironmentSelector::Any,
+            session_selector: SessionSelector::Any,
+            actions: [ActionRight::TerminalInput].into_iter().collect(),
+            history: HistoryScope {
+                lower_bound_ms: Nullable::null(),
+                include_live_screen: false,
+                named_questions: CanonicalSet::new(),
+                named_approvals: CanonicalSet::new(),
+            },
+            expiry: GrantExpiry::At {
+                expires_at_ms: kr_protocol::scalars::TimestampMs::new(200),
+            },
+            organisation: Nullable::null(),
+        },
+        session_id: None,
+        issued_at_ms: 100,
+        activated_at_ms: Some(100),
+        revoked_at_ms: None,
+        revoked_by_parent: None,
+    };
+    let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
+
+    standing_at_dispatch(
+        &record,
+        &mut policy,
+        environment_id,
+        ActorIngress::LocalIpc,
+        150,
+    )
+    .expect("the grant stands before it expires");
+    standing_at_dispatch(
+        &record,
+        &mut policy,
+        environment_id,
+        ActorIngress::LocalIpc,
+        201,
+    )
+    .expect_err("the grant has expired");
+    assert_eq!(policy.utc_floor_ms(), 201, "the refusal raised the floor");
+    standing_at_dispatch(
+        &record,
+        &mut policy,
+        environment_id,
+        ActorIngress::LocalIpc,
+        199,
+    )
+    .expect_err("a clock wound back does not revive it");
 }

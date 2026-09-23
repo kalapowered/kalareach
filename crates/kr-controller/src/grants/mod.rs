@@ -405,8 +405,10 @@ pub fn decide(
 /// revoked ancestor, the clock floor, redemption, expiry, an unissued revision, and the policy
 /// intersection with its membership leases and bounded offline validity.
 ///
-/// `policy` is read and not written. The floor it keeps is raised where requests are decided;
-/// here it only stops a clock wound back from reviving an expiry this host already refused.
+/// The clock floor rises here as it does in [`decide`]: a workflow runs unattended, and a floor
+/// that only requests advanced would let a clock wound back between two dispatches revive an
+/// expiry this host had already refused. The caller writes the policy down afterwards, as every
+/// other raise of the floor is written down.
 ///
 /// This host resolves no account for a grant's recipient here, so a grant that requires an
 /// organisation membership is refused rather than answered by somebody else's lease.
@@ -416,7 +418,7 @@ pub fn decide(
 /// Returns the first rule that refused, as a [`Refusal`].
 pub fn standing_at_dispatch(
     record: &GrantRecord,
-    policy: &HostPolicy,
+    policy: &mut HostPolicy,
     environment_id: EnvironmentId,
     ingress: kr_protocol::actor::ActorIngress,
     now_ms: u64,
@@ -430,6 +432,7 @@ pub fn standing_at_dispatch(
             },
         });
     }
+    policy.observe_utc(now_ms);
     let now_ms = policy.settled_now(now_ms);
     if !record.is_active() {
         return Err(Refusal::NotRedeemed {
