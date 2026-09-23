@@ -77,11 +77,69 @@ fn client_bundle(keys: &DeviceKeys) -> ClientBundle {
 }
 
 /// Opens the registry database at `path` the way a starting daemon does.
+///
+/// A database created here belongs to a host that already has an owner device, so the pairings
+/// these tests commit are ordinary ones rather than the first owner's.
 fn open(path: &Path) -> (Arc<DeviceDirectory>, InvitationRows) {
+    let fresh = !path.exists();
+    let directory = Arc::new(DeviceDirectory::open(path).expect("the registry database opens"));
+    if fresh {
+        directory
+            .commit(&owner_device())
+            .expect("the host's owner device");
+    }
+    prepare(&directory).expect("the pairing tables exist");
+    let rows = InvitationRows::new(Arc::clone(&directory));
+    (directory, rows)
+}
+
+/// Opens a database for a host that has no owner yet.
+fn open_unowned(path: &Path) -> (Arc<DeviceDirectory>, InvitationRows) {
     let directory = Arc::new(DeviceDirectory::open(path).expect("the registry database opens"));
     prepare(&directory).expect("the pairing tables exist");
     let rows = InvitationRows::new(Arc::clone(&directory));
     (directory, rows)
+}
+
+/// A device record holding a personal owner grant, as an owner device's row reads.
+fn owner_device() -> kr_controller::service::net::devices::DeviceRecord {
+    let keys = DeviceKeys::generate().expect("keys");
+    let owner_keys = DeviceKeys::generate().expect("keys");
+    let clock = TestClock::new();
+    let grant = kr_pairing::grants::personal_owner_grant();
+    let request = request_confirmation(
+        &clock,
+        SensitiveAction::ConfirmDevice,
+        Digest256::from_bytes([1; 32]),
+        None,
+        BTreeSet::new(),
+        DeviceId::new(Uuid::from_bytes([1; 16])),
+        *keys.transport.public(),
+    )
+    .expect("a challenge");
+    device_record(&PairingCommitment {
+        invitation_id: InvitationId::new(Uuid::from_bytes([0x0a; 16])),
+        attempt_id: kr_protocol::ids::AttemptId::new(Uuid::from_bytes([0x0b; 16])),
+        device_id: DeviceId::new(Uuid::from_bytes([0x0c; 16])),
+        grant: grant.clone().into_grant(
+            GrantId::new(Uuid::from_bytes([0x0d; 16])),
+            DeviceId::new(Uuid::from_bytes([1; 16])),
+            DeviceId::new(Uuid::from_bytes([0x0c; 16])),
+            AuthorityRevision::new(1),
+        ),
+        client_keys: keys.public_keys(),
+        client_bundle: Some(client_bundle(&keys)),
+        proposed_grant: grant,
+        verification_value: "00000000".to_owned(),
+        owner_confirmation: sign_confirmation(
+            &owner_keys.authorisation,
+            &request,
+            ConfirmationChannel::OwnerDevicePresence,
+        )
+        .expect("a proof"),
+        committed_at_ms: TimestampMs::new(1),
+    })
+    .expect("a record")
 }
 
 struct Approval {
@@ -831,4 +889,45 @@ fn an_owner_device_on_record_before_the_owner_record_counts_once() {
             enrolled.then_some(HostOwner::Migrated)
         );
     }
+}
+
+/// KR-REQ-10.53, KR-REQ-10.04: a host with no owner commits only the pairing that establishes its
+/// first owner. A viewer's commit is refused and writes nothing; a personal owner grant commits,
+/// writes the owner record with it, and its event says it established the first owner.
+#[test]
+fn a_host_with_no_owner_commits_only_its_first_owner() {
+    let temp = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.sqlite3");
+    let (_, rows) = open_unowned(&path);
+    assert_eq!(rows.host_owner().expect("readable"), None);
+
+    let viewer_host = Harness::new(rows.clone());
+    let mut invitation = viewer_host.issue();
+    bind(&viewer_host, &mut invitation);
+    let refused = approve(&viewer_host, &mut invitation);
+    assert!(
+        matches!(refused, Err(PairingError::Store { .. })),
+        "{refused:?}"
+    );
+    assert!(rows.events_after(None, 10).expect("readable").is_empty());
+    assert_eq!(rows.host_owner().expect("readable"), None);
+
+    let mut owner_host = Harness::new(rows.clone());
+    owner_host.grant = kr_pairing::grants::personal_owner_grant();
+    owner_host.grant_kind = GrantKind::PersonalOwner;
+    let mut invitation = owner_host.issue();
+    bind(&owner_host, &mut invitation);
+    let commitment = approve(&owner_host, &mut invitation).expect("the first owner commits");
+    let event = rows
+        .event_for(commitment.invitation_id)
+        .expect("readable")
+        .expect("the event");
+    assert!(event.first_owner);
+    assert_eq!(
+        rows.host_owner().expect("readable"),
+        Some(HostOwner::FirstOwner {
+            device_id: commitment.device_id,
+            invitation_id: commitment.invitation_id,
+        })
+    );
 }

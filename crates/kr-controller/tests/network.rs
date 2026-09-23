@@ -20,6 +20,10 @@
 
 #![cfg(unix)]
 
+#[allow(dead_code)]
+#[path = "net_support/pairing.rs"]
+mod pairing_calls;
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -41,11 +45,7 @@ use kr_crypto::store::{MemoryStore, StoreSelection, open_store_in};
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::ControllerIdentity;
-use kr_pairing::confirm::{HostEnrolment, sign_confirmation};
-use kr_pairing::direct::{CandidateIdentity, redeem_proof};
-use kr_pairing::grants::GrantKind;
-use kr_pairing::host::OwnerContext;
-use kr_protocol::actor::ActorIngress;
+use kr_pairing::direct::CandidateIdentity;
 use kr_protocol::attachment::{
     AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
 };
@@ -59,15 +59,11 @@ use kr_protocol::ids::{
 use kr_protocol::input::{
     InputAcquireParams, InputAcquireResult, InputWriteParams, InputWriteResult,
 };
+use kr_protocol::invitation::InviteGrantKind;
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
-use kr_protocol::pairing::{
-    ConfirmationChannel, DeviceName, DevicePlatform, DirectQrPayload, ProposedGrant, QrPayload,
-    SensitiveAction,
-};
-use kr_protocol::preauth::{
-    PairRedeemParams, PairRedeemResult, PairStatusParams, PairStatusResult,
-};
+use kr_protocol::pairing::{DeviceName, DevicePlatform, ProposedGrant};
+use kr_protocol::preauth::{PairStatusParams, PairStatusResult};
 use kr_protocol::recovery::{EventStream, EventsSubscribeResult, OutputEvent};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, DurationMs, Nullable, U64, Uuid};
@@ -76,7 +72,7 @@ use kr_protocol::session::{
     SessionReadResult, SessionState, ShellMode,
 };
 use kr_transport::config::EndpointConfig;
-use kr_transport::handshake::{self, LocalIdentity};
+use kr_transport::handshake::LocalIdentity;
 use kr_transport::scheduler::SendLimits;
 
 /// How long a test waits for something the machine has to do before it calls it a failure.
@@ -284,6 +280,8 @@ impl Host {
 
     /// Starts the daemon and puts it on the network with the endpoint configuration given.
     async fn start(&self, endpoint: EndpointConfig, owner: &DeviceKeys) -> RunningDaemon {
+        // The owner device dials from an endpoint configured like the host's own.
+        let endpoint_for_owner = endpoint.clone();
         let environment = self.paths();
         let environment_id = self.environment_id;
         let secrets = environment.secrets_dir();
@@ -326,17 +324,17 @@ impl Host {
                     ..kr_controller::service::net::config::NetworkSettings::default()
                 },
                 secrets: Arc::new(MemoryStore::new()),
-                owner_signer: Some(*owner.authorisation.public()),
-                enrolment: HostEnrolment::Enrolled,
             },
         )
         .await
         .expect("the daemon joins the network");
-        RunningDaemon {
+        let daemon = RunningDaemon {
             controller,
             network,
             serving,
-        }
+        };
+        bootstrap_owner(&daemon, &endpoint_for_owner, owner).await;
+        daemon
     }
 
     async fn client(&self) -> LocalClient {
@@ -409,6 +407,26 @@ struct RunningDaemon {
 }
 
 impl RunningDaemon {
+    /// Returns the environment this daemon serves.
+    fn environment_id(&self) -> EnvironmentId {
+        self.controller.paths().environment_id()
+    }
+
+    /// Connects the owner's own client on this daemon's local socket.
+    async fn client(&self) -> LocalClient {
+        LocalClient::connect(
+            &self
+                .controller
+                .paths()
+                .controller_endpoint()
+                .expect("an endpoint"),
+            LocalClientKind::Cli,
+            build(),
+        )
+        .await
+        .expect("connects to the daemon")
+    }
+
     async fn stop(self) {
         for task in &self.serving {
             task.abort();
@@ -577,7 +595,11 @@ struct Device {
 
 impl Device {
     async fn create(config: &EndpointConfig) -> Self {
-        let keys = DeviceKeys::generate().expect("device keys");
+        Self::with_keys(config, DeviceKeys::generate().expect("device keys")).await
+    }
+
+    /// Creates an unpaired device holding `keys`.
+    async fn with_keys(config: &EndpointConfig, keys: DeviceKeys) -> Self {
         let endpoint = kr_transport::endpoint::bind_dialer(config, &keys.transport)
             .await
             .expect("a dialling endpoint");
@@ -596,6 +618,16 @@ impl Device {
             keys,
             endpoint,
             identity,
+        }
+    }
+
+    /// Returns this device as a candidate for an invitation.
+    fn candidate(&self) -> pairing_calls::Candidate<'_> {
+        pairing_calls::Candidate {
+            endpoint: &self.endpoint,
+            identity: &self.identity,
+            keys: &self.keys,
+            declared: self.candidate_identity(),
         }
     }
 
@@ -650,19 +682,40 @@ fn proposal() -> ProposedGrant {
     }
 }
 
-fn owner_context() -> OwnerContext {
-    OwnerContext {
-        actor_id: kr_protocol::ids::ActorId::new("owner:test").expect("a principal"),
-        ingress: ActorIngress::LocalIpc,
-    }
+/// Pairs `owner` as the host's first owner device, through the initial bootstrap.
+///
+/// The owner's own client does it over the host's local socket, as a person's first pairing does;
+/// every later confirmation in these suites is that owner device's.
+async fn bootstrap_owner(daemon: &RunningDaemon, config: &EndpointConfig, owner: &DeviceKeys) {
+    let device = Device::with_keys(config, owner.clone()).await;
+    let ceremony = DeviceKeys::generate().expect("a ceremony key");
+    let signer = pairing_calls::Signer::Bootstrap(&ceremony.authorisation);
+    let mut client = daemon.client().await;
+    let environment = daemon.environment_id();
+    let invited = pairing_calls::invite_direct(
+        environment,
+        &mut client,
+        InviteGrantKind::PersonalOwner,
+        &kr_pairing::grants::personal_owner_grant(),
+        &signer,
+    )
+    .await
+    .expect("the host issues its first owner's invitation");
+    let (connection, _candidate, _value) =
+        pairing_calls::redeem(&device.candidate(), &invited).await;
+    let confirmed =
+        pairing_calls::confirm_candidate(environment, &mut client, invited.invitation_id, &signer)
+            .await
+            .expect("the first owner is confirmed");
+    assert!(confirmed.event.first_owner);
+    connection.close(0u32.into(), b"paired");
 }
 
 /// Runs a complete direct pairing, and returns the record the host committed.
 ///
-/// The owner half is the test's: issuing an invitation and approving a candidate each need a fresh
-/// owner confirmation, and producing one is a user-presence ceremony rather than something a
-/// daemon decides for itself. What the daemon owns is the challenge, the ledger that makes it
-/// single use, and the record the approval commits.
+/// The owner half is the owner device's: issuing an invitation and approving a candidate each
+/// need a fresh owner confirmation, which that device signs after its own ceremony and the owner's
+/// local client relays. The daemon checks each against the paired owner device and spends it once.
 async fn pair(daemon: &RunningDaemon, device: &Device, owner: &DeviceKeys) -> DeviceRecord {
     pair_with(daemon, device, owner, proposal()).await
 }
@@ -674,133 +727,46 @@ async fn pair_with(
     owner: &DeviceKeys,
     proposal: ProposedGrant,
 ) -> DeviceRecord {
-    let pairing = daemon.network.pairing().expect("this host accepts pairing");
-    let owner_context = owner_context();
-    // One proposal, used for the challenge and for the invitation. The owner approves an exact
-    // proposal, digest and all, so a second one built a millisecond later is a different thing.
-    let rights: BTreeSet<ActionRight> = proposal.actions.iter().copied().collect();
-
-    // The owner authorises the invitation, naming the rights it proposes.
-    let request = pairing
-        .request_confirmation(
-            SensitiveAction::IssueInvitation,
-            kr_pairing::confirm::action_digest(&proposal).expect("a digest"),
-            None,
-            rights.clone(),
-        )
-        .expect("a challenge");
-    let proof = sign_confirmation(
-        &owner.authorisation,
-        &request,
-        ConfirmationChannel::OwnerDevicePresence,
+    let signer = pairing_calls::Signer::OwnerDevice(owner);
+    let mut client = daemon.client().await;
+    let environment = daemon.environment_id();
+    let invited = pairing_calls::invite_direct(
+        environment,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &proposal,
+        &signer,
     )
-    .expect("a proof");
-    let payload = pairing
-        .issue_direct(
-            proposal.clone(),
-            GrantKind::SessionInvitation,
-            daemon
-                .network
-                .network_config()
-                .expect("the host's selected configuration"),
-            &pairing.approval(&owner_context, &request, &proof),
-        )
-        .expect("an invitation");
-    let QrPayload::Direct(payload) = payload else {
-        panic!("a direct invitation produces a direct payload");
-    };
-    let payload: DirectQrPayload = *payload;
-
-    // The candidate scans it and redeems it over the pre-authorisation surface, which is the only
-    // thing an unpaired endpoint reaches.
-    let host_addr = host_addr(&payload);
-    let connection = device
-        .endpoint
-        .connect(host_addr, kr_protocol::hello::ALPN)
-        .await
-        .expect("the candidate reaches the host");
-    let mut candidate = handshake::connect_unpaired(&connection, &device.identity)
-        .await
-        .expect("an unpaired connection");
-    let challenge: PairRedeemResult = candidate
-        .call(
-            Method::PairRedeem,
-            &PairRedeemParams::Challenge {
-                invitation_id: payload.invitation_id,
-            },
-        )
-        .await
-        .expect("the host issues a challenge");
-    let PairRedeemResult::Challenge(challenge) = challenge else {
-        panic!("the first redemption step answers with a challenge");
-    };
-    let live_host = HostPeer(*challenge.endpoint_id.as_bytes());
-    let (redeem, _transcript) = redeem_proof(
-        &payload,
-        &challenge,
-        &device.keys.authorisation,
-        &device.candidate_identity(),
-        &live_host,
-    )
-    .expect("a redemption proof");
-    let locked: PairRedeemResult = candidate
-        .call(
-            Method::PairRedeem,
-            &PairRedeemParams::Direct(Box::new(redeem)),
-        )
-        .await
-        .expect("the host accepts the redemption");
-    let PairRedeemResult::Locked {
-        verification_value, ..
-    } = locked
-    else {
-        panic!("a redemption locks the invitation");
-    };
+    .await
+    .expect("an invitation");
+    let (connection, mut candidate, verification_value) =
+        pairing_calls::redeem(&device.candidate(), &invited).await;
     assert_eq!(verification_value.len(), 8);
 
     // The owner approves exactly what both devices displayed.
-    let (approved, client_keys, host_value) = pairing.awaiting_approval().expect("a candidate");
+    let status = pairing_calls::owner_status(&mut client, invited.invitation_id)
+        .await
+        .expect("the owner's view");
+    let shown = status
+        .owner
+        .0
+        .and_then(|view| view.candidate.0)
+        .expect("a candidate the owner is shown");
     assert_eq!(
-        host_value, verification_value,
+        shown.verification_value, verification_value,
         "both devices show one value"
     );
-    let request = pairing
-        .request_confirmation(
-            SensitiveAction::ConfirmDevice,
-            approved.action_digest(),
-            Some(client_keys),
-            rights,
-        )
-        .expect("a challenge");
-    let proof = sign_confirmation(
-        &owner.authorisation,
-        &request,
-        ConfirmationChannel::OwnerDevicePresence,
-    )
-    .expect("a proof");
-    let identities = net::pairing::fresh_identities(
-        pairing.identity().device_id,
-        daemon
-            .controller
-            .authority_revision()
+    let confirmed =
+        pairing_calls::confirm_candidate(environment, &mut client, invited.invitation_id, &signer)
             .await
-            .expect("the revision"),
-    )
-    .expect("fresh identities");
-    let record = pairing
-        .confirm(
-            &pairing.approval(&owner_context, &request, &proof),
-            &approved,
-            &identities,
-        )
-        .expect("the pairing commits");
+            .expect("the pairing commits");
 
     // And the candidate learns it happened through the surface it is already on.
     let status: PairStatusResult = candidate
         .call(
             Method::PairStatus,
             &PairStatusParams {
-                invitation_id: payload.invitation_id,
+                invitation_id: invited.invitation_id,
             },
         )
         .await
@@ -809,71 +775,26 @@ async fn pair_with(
         matches!(
             status.status,
             kr_protocol::pairing::PairStatus::Committed { device_id, .. }
-                if device_id == record.device_id
+                if device_id == confirmed.device_id
         ),
         "the candidate is told which device it became: {:?}",
         status.status
     );
     connection.close(0u32.into(), b"paired");
-    record
-}
-
-/// The host as the candidate sees it: the endpoint identity the invitation pinned.
-#[derive(Debug)]
-struct HostPeer([u8; 32]);
-
-impl kr_pairing::platform::LivePeer for HostPeer {
-    fn live_endpoint(&self) -> kr_pairing::Result<kr_protocol::scalars::EndpointKey> {
-        Ok(kr_protocol::scalars::EndpointKey::from_bytes(self.0))
-    }
-
-    fn arrived_in_early_data(&self) -> bool {
-        false
-    }
-}
-
-/// Returns where a candidate dials the host, from the invitation alone.
-///
-/// A candidate has the QR and nothing else, so this is built from the QR: the endpoint identity it
-/// pins, the relay it names and the address hints it carries. A test that reached into the daemon
-/// for the address instead would be proving that the *test* knows where the host is.
-fn host_addr(payload: &DirectQrPayload) -> EndpointAddr {
-    let endpoint_id = iroh::PublicKey::from_bytes(payload.endpoint_id.as_bytes())
-        .expect("the invitation pins a usable endpoint identity");
-    let mut addr = EndpointAddr::new(endpoint_id);
-    if let Some(relay) = payload
-        .network_config
-        .relay_urls
-        .first()
-        .and_then(|hint| hint.as_str().parse::<iroh::RelayUrl>().ok())
-    {
-        addr = addr.with_relay_url(relay);
-    }
-    for hint in &payload.network_config.direct_addresses {
-        if let Ok(socket) = hint.as_str().parse::<std::net::SocketAddr>() {
-            addr = addr.with_ip_addr(socket);
-        }
-    }
-    addr
+    daemon
+        .network
+        .devices()
+        .record_for_device(confirmed.device_id)
+        .expect("readable")
+        .expect("the device's record")
 }
 
 /// Connects a paired device and starts one session over it.
 async fn connect(daemon: &RunningDaemon, device: &Device, record: &DeviceRecord) -> Session {
     let host_record = PairedPeer {
-        device_id: daemon
-            .network
-            .pairing()
-            .expect("pairing")
-            .identity()
-            .device_id,
+        device_id: daemon.network.pairing().identity().device_id,
         device_key_revision: DeviceKeyRevision::new(1),
-        authorisation: daemon
-            .network
-            .pairing()
-            .expect("pairing")
-            .identity()
-            .keys
-            .authorisation,
+        authorisation: daemon.network.pairing().identity().keys.authorisation,
         endpoint_id: daemon.network.endpoint_id(),
     };
     let mut addr = EndpointAddr::new(
@@ -1377,7 +1298,7 @@ fn host_addr_of(daemon: &RunningDaemon) -> EndpointAddr {
 }
 
 fn host_paired_record(daemon: &RunningDaemon) -> PairedPeer {
-    let pairing = daemon.network.pairing().expect("pairing");
+    let pairing = daemon.network.pairing();
     PairedPeer {
         device_id: pairing.identity().device_id,
         device_key_revision: DeviceKeyRevision::new(1),
@@ -2513,24 +2434,6 @@ fn proposing(actions: &[ActionRight], session_selector: SessionSelector) -> Prop
     }
 }
 
-/// Pairs one more device under an exact proposal, and then closes the invitation it came through,
-/// which a host keeps open after the commit until its owner closes it, so the next can be issued.
-async fn pair_another(
-    daemon: &RunningDaemon,
-    device: &Device,
-    owner: &DeviceKeys,
-    proposal: ProposedGrant,
-) -> DeviceRecord {
-    let record = pair_with(daemon, device, owner, proposal).await;
-    daemon
-        .network
-        .pairing()
-        .expect("this host accepts pairing")
-        .cancel(&owner_context())
-        .expect("the committed invitation closes");
-    record
-}
-
 /// Asks, as the device `session` belongs to, to close the session, and returns why that was
 /// refused.
 async fn refused_close(
@@ -2739,7 +2642,7 @@ async fn a_question_is_answered_only_with_the_respond_right_for_its_session_and_
     // Three devices: one that may view, one that may respond to another session, and one that may
     // respond to this one.
     let viewer = Device::create(&loopback()).await;
-    let viewer_record = pair_another(
+    let viewer_record = pair_with(
         &daemon,
         &viewer,
         &owner,
@@ -2747,7 +2650,7 @@ async fn a_question_is_answered_only_with_the_respond_right_for_its_session_and_
     )
     .await;
     let elsewhere = Device::create(&loopback()).await;
-    let elsewhere_record = pair_another(
+    let elsewhere_record = pair_with(
         &daemon,
         &elsewhere,
         &owner,
@@ -2760,7 +2663,7 @@ async fn a_question_is_answered_only_with_the_respond_right_for_its_session_and_
     )
     .await;
     let responder = Device::create(&loopback()).await;
-    let responder_record = pair_another(
+    let responder_record = pair_with(
         &daemon,
         &responder,
         &owner,
@@ -2773,7 +2676,8 @@ async fn a_question_is_answered_only_with_the_respond_right_for_its_session_and_
     )
     .await;
     let before = authority(&daemon, &mut local).await;
-    assert_eq!(before.0.len(), 3, "each pairing wrote its device and grant");
+    // The owner's own device, paired when the host was set up, is on record beside the three.
+    assert_eq!(before.0.len(), 4, "each pairing wrote its device and grant");
     let responder_grant = before
         .0
         .iter()

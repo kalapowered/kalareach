@@ -44,6 +44,8 @@ pub mod config;
 pub mod devices;
 pub mod dispatch;
 pub mod invitations;
+pub mod methods;
+pub mod owner;
 pub mod pairing;
 pub mod proxy;
 
@@ -52,11 +54,10 @@ use std::sync::{Arc, Weak};
 use kr_crypto::connect::PairedPeer;
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::{SecretStore, StoreSelection};
-use kr_pairing::confirm::HostEnrolment;
 use kr_pairing::host::HostIdentity;
 use kr_protocol::ids::{ActorId, AuthorityRevision, ConnectionId, DeviceId, DeviceKeyRevision};
 use kr_protocol::pairing::NetworkConfig;
-use kr_protocol::scalars::{AuthorisationKey, EndpointKey};
+use kr_protocol::scalars::EndpointKey;
 use kr_transport::clock::ContinuousInstant;
 use kr_transport::handshake::{HostEpochs, LocalIdentity, PairedDirectory};
 use kr_transport::listener::{AuthorisedSession, BoxFuture, HostHandler, ListenerConfig};
@@ -91,22 +92,12 @@ pub fn device_key_scope(environment_id: kr_protocol::ids::EnvironmentId) -> Stri
 /// up a device attaching to a different one.
 pub const ACKNOWLEDGEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The environment variable naming the signer every pairing confirmation must carry.
-pub const OWNER_KEY: &str = "KR_NETWORK_OWNER_KEY";
-
 /// Everything a daemon needs to put itself on the network.
 pub struct NetworkSetup {
     /// The services this environment selected.
     pub settings: NetworkSettings,
     /// Where this host's own network device keys live.
     pub secrets: Arc<dyn SecretStore>,
-    /// The enrolled owner signer a pairing confirmation is checked against.
-    ///
-    /// `None` means no owner is enrolled, and this host accepts no pairing: an unpaired connection
-    /// is refused rather than offered a ceremony nobody could authorise.
-    pub owner_signer: Option<AuthorisationKey>,
-    /// Whether this host has an owner yet, which decides whether the bootstrap exception applies.
-    pub enrolment: HostEnrolment,
 }
 
 impl std::fmt::Debug for NetworkSetup {
@@ -115,7 +106,6 @@ impl std::fmt::Debug for NetworkSetup {
             .debug_struct("NetworkSetup")
             .field("settings", &self.settings)
             .field("secrets", &self.secrets.describe())
-            .field("pairing", &self.owner_signer.is_some())
             .finish()
     }
 }
@@ -163,32 +153,8 @@ impl NetworkSetup {
                     .store,
             ),
         };
-        let owner_signer = match std::env::var(OWNER_KEY) {
-            Ok(text) if !text.trim().is_empty() => Some(owner_key(text.trim())?),
-            Ok(_) | Err(_) => None,
-        };
-        Ok(Some(Self {
-            settings,
-            secrets,
-            owner_signer,
-            enrolment: if owner_signer.is_some() {
-                HostEnrolment::Enrolled
-            } else {
-                HostEnrolment::InitialBootstrap
-            },
-        }))
+        Ok(Some(Self { settings, secrets }))
     }
-}
-
-fn owner_key(text: &str) -> Result<AuthorisationKey> {
-    let bytes = kr_protocol::scalars::from_base64url(text)
-        .map_err(|error| ControllerError::InvalidArgument(format!("{OWNER_KEY}: {error}")))?;
-    let bytes = <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
-        ControllerError::InvalidArgument(format!(
-            "{OWNER_KEY} is a 32-byte authorisation key in base64url"
-        ))
-    })?;
-    Ok(AuthorisationKey::from_bytes(bytes))
 }
 
 /// What a daemon owns while it is on the network.
@@ -212,14 +178,33 @@ pub struct NetworkGuard {
 }
 
 impl NetworkGuard {
-    /// Returns the host's pairing state machine, which is where an owner confirmation is checked.
-    ///
-    /// A daemon reaches its own ceremony through this. `None` means no owner is enrolled, and a
-    /// method that needs the owner's confirmation is refused rather than performed under the
-    /// operating-system identity of whoever called it.
+    /// Returns the host's pairing service.
     #[must_use]
-    pub fn pairing(&self) -> Option<&Arc<PairingHost>> {
-        self.host.pairing.as_ref()
+    pub fn pairing(&self) -> &Arc<PairingHost> {
+        &self.host.pairing
+    }
+
+    /// Returns the configuration a pairing invitation carries, with this endpoint's current hints.
+    ///
+    /// The selected services are this host's own configuration; the direct addresses are hints
+    /// taken as they stand now, because that is all a hint ever is.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a selected service cannot be expressed as a network hint.
+    pub fn network_config(&self) -> Result<NetworkConfig> {
+        let mut config = self
+            .host
+            .endpoint
+            .to_network_config()
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        config.direct_addresses = self
+            .bound_sockets()
+            .into_iter()
+            .filter_map(|socket| kr_protocol::pairing::NetworkHint::new(socket.to_string()).ok())
+            .take(kr_protocol::pairing::MAX_NETWORK_HINTS)
+            .collect();
+        Ok(config)
     }
 
     /// Returns the addresses this endpoint is bound to, which are the hints a peer dials.
@@ -288,20 +273,7 @@ impl Network {
     ///
     /// Returns an error when a selected service cannot be expressed as a network hint.
     pub fn network_config(&self) -> Result<NetworkConfig> {
-        let mut config = self
-            .guard
-            .host
-            .endpoint
-            .to_network_config()
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        config.direct_addresses = self
-            .guard
-            .bound_sockets()
-            .into_iter()
-            .filter_map(|socket| kr_protocol::pairing::NetworkHint::new(socket.to_string()).ok())
-            .take(kr_protocol::pairing::MAX_NETWORK_HINTS)
-            .collect();
-        Ok(config)
+        self.guard.network_config()
     }
 
     /// Returns the addresses this endpoint is bound to, which are the hints a peer dials.
@@ -310,10 +282,10 @@ impl Network {
         self.guard.bound_sockets()
     }
 
-    /// Returns the host's pairing state machine, for the owner operations it serves.
+    /// Returns the host's pairing service.
     #[must_use]
-    pub fn pairing(&self) -> Option<&Arc<PairingHost>> {
-        self.guard.host.pairing.as_ref()
+    pub fn pairing(&self) -> &Arc<PairingHost> {
+        &self.guard.host.pairing
     }
 
     /// Returns the device directory this host authorises connections against.
@@ -344,7 +316,7 @@ impl Network {
         self.guard.host.revoke_device(device_id).await
     }
 
-    /// Establishes this host's clock again, on an approval its owner signed for that.
+    /// Establishes this host's clock again, on an owner confirmation answered for exactly that.
     ///
     /// A host whose wall clock was found to have gone backwards decides no grant's expiry from it
     /// until this is called. Nothing else clears that, because nothing else is evidence about the
@@ -352,13 +324,11 @@ impl Network {
     ///
     /// # Errors
     ///
-    /// Returns an error when this environment has no owner, when the approval is not its owner's,
-    /// or when the record cannot be written.
-    pub async fn establish_clock(
-        &self,
-        approval: &kr_pairing::host::OwnerApproval<'_>,
-    ) -> Result<()> {
-        self.guard.host.establish_clock(approval).await
+    /// Returns `OWNER_CONFIRMATION_REQUIRED` when no owner confirmation naming the clock has been
+    /// answered through the owner-confirmation methods, and an error when the record cannot be
+    /// written.
+    pub async fn establish_clock(&self) -> Result<()> {
+        self.guard.host.establish_clock().await
     }
 
     /// Stops accepting connections and closes the endpoint.
@@ -383,7 +353,7 @@ pub struct NetworkHost {
     /// a connection that cannot be served, which is what the refusal below says.
     controller: Weak<Controller>,
     devices: Arc<DeviceDirectory>,
-    pairing: Option<Arc<PairingHost>>,
+    pairing: Arc<PairingHost>,
     endpoint: kr_transport::config::EndpointConfig,
     /// The clock every deadline this host decides is measured on.
     clock: Arc<dyn kr_transport::clock::ContinuousClock>,
@@ -419,7 +389,6 @@ impl std::fmt::Debug for NetworkHost {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("NetworkHost")
-            .field("pairing", &self.pairing.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -436,9 +405,7 @@ impl HostHandler for NetworkHost {
     }
 
     fn pairing_surface(&self) -> Option<Arc<dyn PairingSurface>> {
-        self.pairing
-            .as_ref()
-            .map(|host| Arc::clone(host) as Arc<dyn PairingSurface>)
+        Some(Arc::clone(&self.pairing) as Arc<dyn PairingSurface>)
     }
 
     fn serve(self: Arc<Self>, session: AuthorisedSession) -> BoxFuture<'static, ()> {
@@ -738,15 +705,10 @@ impl NetworkHost {
     ///
     /// # Errors
     ///
-    /// Returns an error when this environment has no owner to approve it, when the approval is not
-    /// this host's owner's, or when the record cannot be written.
-    async fn establish_clock(&self, approval: &kr_pairing::host::OwnerApproval<'_>) -> Result<()> {
-        let pairing = self.pairing.as_ref().ok_or_else(|| {
-            ControllerError::NotConfigured(
-                "this environment has no owner to establish its clock".to_owned(),
-            )
-        })?;
-        pairing.accept_clock(approval)?;
+    /// Returns `OWNER_CONFIRMATION_REQUIRED` when no owner confirmation naming the clock has been
+    /// answered, and an error when the record cannot be written.
+    async fn establish_clock(&self) -> Result<()> {
+        self.pairing.accept_clock()?;
         self.clock_trust.establish(&self.devices)
     }
 
@@ -990,21 +952,19 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
         keys.authorisation.clone(),
         controller.build_id.clone(),
     ));
-    let pairing = setup.owner_signer.map(|signer| {
-        Arc::new(PairingHost::new(
-            HostIdentity {
-                device_id,
-                endpoint_id,
-                keys: keys.public_keys(),
-                device_key_revision: DeviceKeyRevision::new(1),
-                network_config: NetworkConfig::empty(),
-            },
-            HostPairingClock::new(&controller.boot_identity),
-            signer,
-            setup.enrolment,
-            Arc::clone(&devices),
-        ))
-    });
+    // Every host on the network serves pairing. Whether it has an owner yet is the owner
+    // record's to say, and a host without one serves exactly the first-owner ceremony.
+    let pairing = Arc::new(PairingHost::new(
+        HostIdentity {
+            device_id,
+            endpoint_id,
+            keys: keys.public_keys(),
+            device_key_revision: DeviceKeyRevision::new(1),
+            network_config: NetworkConfig::empty(),
+        },
+        HostPairingClock::new(&controller.boot_identity),
+        invitations::InvitationRows::new(Arc::clone(&devices)),
+    ));
     // The daemon's own clock, not a second one. Deadlines from the transport's action windows are
     // compared with deadlines the daemon decided, and a continuous instant is anchored privately:
     // two clocks would make those comparisons meaningless rather than merely imprecise.

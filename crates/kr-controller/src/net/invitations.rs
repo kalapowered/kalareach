@@ -630,16 +630,23 @@ fn commit_pairing(
         .map(decode_row)
         .transpose()?
         .ok_or_else(|| ControllerError::registry("that invitation has no record"))?;
-    // The first device holding host management that this host commits is its first owner, and
-    // the record of that is written with the device, so the host is never owner-less and paired
-    // to an owner device at once.
-    let first_owner = commitment.grant.permits(ActionRight::HostManage)
-        && transaction
-            .query_row("SELECT COUNT(*) FROM host_owner WHERE id = 0", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .map_err(ControllerError::registry)?
-            == 0;
+    // A host with no owner commits exactly one kind of pairing: the one that establishes its first
+    // owner, a device holding host management. That is what the initial bootstrap is for and all
+    // it is for, and the owner record is written with the device, so the host is never paired to
+    // its first owner device without the record that ends the bootstrap.
+    let first_owner = transaction
+        .query_row("SELECT COUNT(*) FROM host_owner WHERE id = 0", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(ControllerError::registry)?
+        == 0;
+    if first_owner && !commitment.grant.permits(ActionRight::HostManage) {
+        return Err(ControllerError::PermissionDenied {
+            detail:
+                "a host with no owner commits only the pairing that establishes its first owner"
+                    .to_owned(),
+        });
+    }
 
     let record = device_record(commitment).map_err(ControllerError::registry)?;
     insert_record(transaction, &record)?;

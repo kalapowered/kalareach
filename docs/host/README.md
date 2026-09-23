@@ -274,14 +274,15 @@ all of them rather than leaving the sentence above to be read as more than it sa
 | --- | --- | --- |
 | platform locations | `TMPDIR`, `XDG_RUNTIME_DIR`, `XDG_STATE_HOME`, `XDG_CONFIG_HOME`, `HOME`, `LOCALAPPDATA` | the operating system's own conventional directories, which is what the native locations above are derived from |
 | session readings | `PATH`, `DISPLAY`, `XAUTHORITY`, `XDG_SESSION_ID`, `SESSIONNAME` | what the platform says about the login this host is running in and where a capability probe looks for the tools it reports on |
-| network selections | `KR_NETWORK`, `KR_NETWORK_BIND`, `KR_NETWORK_RELAYS`, `KR_NETWORK_PKARR_PUBLISHER`, `KR_NETWORK_PKARR_RESOLVER`, `KR_NETWORK_DNS_ORIGIN`, `KR_NETWORK_RELAY_CA`, `KR_NETWORK_RELAY_ONLY`, `KR_NETWORK_LOCAL_DISCOVERY`, `KR_NETWORK_MAINLINE`, `KR_NETWORK_OWNER_KEY` | whether and how this daemon joins a network |
+| network selections | `KR_NETWORK`, `KR_NETWORK_BIND`, `KR_NETWORK_RELAYS`, `KR_NETWORK_PKARR_PUBLISHER`, `KR_NETWORK_PKARR_RESOLVER`, `KR_NETWORK_DNS_ORIGIN`, `KR_NETWORK_RELAY_CA`, `KR_NETWORK_RELAY_ONLY`, `KR_NETWORK_LOCAL_DISCOVERY`, `KR_NETWORK_MAINLINE` | whether and how this daemon joins a network |
 
-Six of the network selections reach a provider origin, a trust decision or the owner signing key:
-`KR_NETWORK_RELAYS`, `KR_NETWORK_PKARR_PUBLISHER`, `KR_NETWORK_PKARR_RESOLVER`,
-`KR_NETWORK_DNS_ORIGIN`, `KR_NETWORK_RELAY_CA` and `KR_NETWORK_OWNER_KEY`. `kr doctor` warns
-whenever one of those is set on this host and names what it selects, because a provider origin and
-an owner signer belong in this host's configuration and in its pairing record rather than in the
-environment a process happened to inherit.
+Five of the network selections reach a provider origin or a trust decision: `KR_NETWORK_RELAYS`,
+`KR_NETWORK_PKARR_PUBLISHER`, `KR_NETWORK_PKARR_RESOLVER`, `KR_NETWORK_DNS_ORIGIN` and
+`KR_NETWORK_RELAY_CA`. `kr doctor` warns whenever one of those is set on this host and names what
+it selects, because a provider origin belongs in this host's configuration rather than in the
+environment a process happened to inherit. No variable names this host's owner: the owner is
+recorded through local IPC, by the pairing that establishes it (see "Pairing and the host's owner"
+below).
 
 ### Ceilings
 
@@ -1374,10 +1375,52 @@ The daemon joins the network once, at the end of its startup, when its environme
 `KR_NETWORK` turns it on and the variables in `crates/kr-controller/src/net/config.rs` select the
 relay map, the Pkarr publisher, the Pkarr resolver and the DNS origin, each on its own and none
 inherited. `KR_NETWORK_RELAY_ONLY` removes the direct paths altogether, for a deployment where one
-is not available or not wanted. `KR_NETWORK_OWNER_KEY` names the enrolled owner signer; without one the host accepts no
-pairing, because there is nobody who could authorise a confirmation. A daemon that selects no
-network serves its local endpoint alone, which is a supported deployment rather than a degraded
-one.
+is not available or not wanted. A daemon that selects no network serves its local endpoint alone,
+which is a supported deployment rather than a degraded one, and pairs nothing.
+
+### Pairing and the host's owner
+
+A host on the network serves section 23's six pairing methods and the owner-confirmation methods.
+The owner's own client reaches `pair.invite`, `pair.confirm`, `pair.cancel` and the owner's form of
+`pair.status` over the local socket; an unpaired candidate reaches `pair.redeem`, `pair.finish` and
+its own form of `pair.status` on the bounded pre-authorisation surface. An invitation remembers the
+owner context that issued it, and only that context confirms, cancels or reads it; since invitations
+are issued over local IPC, a paired device is never that context.
+
+**The first owner.** A host starts with no owner. The first owner is established through local IPC
+under the logged-in account, by pairing the owner's first device with a personal owner grant: while
+the host has no owner, and only for that pairing, an owner confirmation may arrive on the
+`local_bootstrap_terminal` channel, signed with a key the local caller presents. That key proves
+possession and nothing else. The command line only answers such a challenge at an interactive
+controlling terminal outside a KalaReach session, which protects against an agent starting the
+ceremony by accident; it is not isolation from other code running under the same account. The
+commit that pairs the first owner device writes the owner record in the same transaction, and from
+then on the terminal channel is refused for good, even if every owner device is later revoked:
+revoking authority must never turn into a weaker way to confirm.
+
+**Owner confirmations.** Six actions need a fresh confirmation bound to the exact action. A caller
+asks with `owner.confirmation.request`, naming a subject; the host fills in the action, the digest,
+the destination keys and the rights itself. `owner.confirmation.pending` lists what an owner can
+still answer, with the full grant and, for a device, its keys and verification value, to the local
+owner and to paired devices holding `host.manage`. `owner.confirmation.complete` verifies a proof
+against an enrolled signer (a live paired device holding `host.manage`, on an owner-device channel)
+and records the answer. The sensitive effect then spends the oldest answered challenge whose
+members equal its own expectation, exactly once; no method takes a confirmation reference. Session,
+plugin and contact-tool channels are refused. Confirmations live for two minutes on the monotonic
+clock and end with the daemon.
+
+**Records.** The pairing records are tables in the registry database, written through the device
+directory's connection: `pairing_invitations` (never the code or the direct secret),
+`pairing_commitments`, `pairing_events`, `host_owner` and `owner_confirmations`, the acceptance
+record of each confirmation answered and the effect that consumed it. A completed pairing writes the
+device row, its commitment, its security event and its confirmation's consumption in one
+transaction. A daemon that starts cancels every invitation it left unfinished before it serves
+anything; the consumed state and the failed-confirmation count stay.
+
+**The security outbox.** `pairing_events` holds one immutable row per completed pairing, ordered by
+a stable sequence. A row is removed only after every registered consumer has read past it, and none
+is removed while no consumer is registered. The environment's attention store is the consumer that
+delivers the event to the owner's devices.
 
 Its own network device keys are a separate key set from the environment's controller identity. The
 controller identity signs generation tokens to this host's workers; these are the keys a *device*

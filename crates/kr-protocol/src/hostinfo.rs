@@ -2759,15 +2759,15 @@ pub mod configuration {
     /// locations" means rather than an exception to it. The session variables are how the
     /// platform describes the login this host is running in, which is a reading of the
     /// environment rather than a choice about it. The network selections are the ones that do
-    /// reach a provider origin and, in one case, the owner signer; they belong in the
-    /// configuration document and in the pairing record, and until they are there this host says
-    /// so out loud.
+    /// reach a provider origin; they belong in the configuration document, and until they are
+    /// there this host says so out loud. No variable names this host's owner: the owner is recorded
+    /// through local IPC, by the pairing that establishes it.
     ///
     /// The list names what this build reads that decides something: a location, the login this
     /// host describes, or a network selection. It is not an inventory of every variable a process
     /// in this tree ever looks at, and it does not claim to be one. A name that is in neither this
     /// table nor [`ALLOWLIST`] takes no part in the precedence.
-    pub const UNGOVERNED: [UngovernedVariable; 22] = [
+    pub const UNGOVERNED: [UngovernedVariable; 21] = [
         UngovernedVariable {
             variable: "TMPDIR",
             selects: "the platform's per-user temporary directory, which is the macOS runtime root",
@@ -2872,11 +2872,6 @@ pub mod configuration {
             variable: "KR_NETWORK_MAINLINE",
             selects: "whether this host uses the public distributed hash table for discovery",
             reaches_authority: false,
-        },
-        UngovernedVariable {
-            variable: "KR_NETWORK_OWNER_KEY",
-            selects: "the owner signing key this host pairs under, which is authority itself",
-            reaches_authority: true,
         },
     ];
 
@@ -5373,7 +5368,7 @@ mod tests {
                 entry.variable
             );
         }
-        for reaching in ["KR_NETWORK_OWNER_KEY", "KR_NETWORK_RELAYS"] {
+        for reaching in ["KR_NETWORK_RELAYS", "KR_NETWORK_RELAY_CA"] {
             let entry = configuration::UNGOVERNED
                 .iter()
                 .find(|entry| entry.variable == reaching)
@@ -5383,6 +5378,14 @@ mod tests {
                 "{reaching} reaches authority or a provider origin and says so"
             );
         }
+        // KR-REQ-10.04: a host's owner is recorded through local IPC and nothing names it from
+        // the environment, so no variable that could select one is read or listed.
+        assert!(
+            configuration::UNGOVERNED
+                .iter()
+                .all(|entry| !entry.variable.contains("OWNER")),
+            "no variable names this host's owner"
+        );
     }
 
     /// KR-REQ-26.13: a document declaring a version this build does not know is left alone.

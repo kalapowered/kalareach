@@ -706,6 +706,23 @@ impl RemoteConnection {
                     .read_frame(reach.as_ref(), &caller, &actor_id, request)
                     .await
             }
+            // The pairing and owner-confirmation reads. A device is the issuing owner of nothing,
+            // because invitations are issued over local IPC, so its `pair.status` is refused by the
+            // pairing service; an owner device reads the confirmations it can approve.
+            Method::PairStatus | Method::OwnerConfirmationPending => {
+                let caller = super::owner::Caller::device(self.device.clone());
+                match self
+                    .controller
+                    .pairing_read(caller, entry.method, &request.params)
+                    .await
+                {
+                    Ok(value) => ControlFrame::Response(Response {
+                        request_id: request.request_id,
+                        outcome: Outcome::Ok(value),
+                    }),
+                    Err(error) => failure(request.request_id, error.to_protocol_error()),
+                }
+            }
             _ => failure(
                 request.request_id,
                 ProtocolError::new(
@@ -1076,15 +1093,6 @@ impl RemoteConnection {
                     admitted_revision: validated,
                     deadline: Some(accepted.deadline),
                 };
-                // The owner's own ceremony, reached through the pairing host. `None` is a host
-                // with no enrolled owner signer, and the two confirmed methods are then refused
-                // rather than performed under the identity of whoever asked.
-                let pairing = self
-                    .controller
-                    .network
-                    .get()
-                    .and_then(|guard| guard.pairing())
-                    .map(Arc::clone);
                 let controller = Arc::clone(&self.controller);
                 let admitting = Arc::clone(&self.controller);
                 let mutation = mutation.clone();
@@ -1096,9 +1104,11 @@ impl RemoteConnection {
                 // waits for its own lock, for the repository's and for downloads, and asks about
                 // the registration again where the change becomes durable.
                 let effect = tokio::spawn(async move {
-                    let confirmations = pairing
-                        .as_deref()
-                        .map(|host| host as &dyn crate::sharing::OwnerConfirmations);
+                    // No owner confirmation reaches the catalogue here: this host's owners are its
+                    // paired owner devices, and the catalogue verifies a confirmation under one
+                    // enrolled signer. Its two confirmed methods are refused, rather than taken
+                    // under whoever asked.
+                    let confirmations: Option<&dyn crate::sharing::OwnerConfirmations> = None;
                     let admission: Arc<dyn crate::catalogue::Admission> =
                         Arc::new(crate::catalogue::DaemonAdmission::new(admitting, carried));
                     controller
@@ -1300,6 +1310,38 @@ impl RemoteConnection {
                     // action was committed is the journal's to say: if it was, a repeat is
                     // answered from its record, and if it was not, a repeat performs it.
                     Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
+                }
+            }
+            // The pairing and owner-confirmation mutations. An owner device completes the
+            // confirmations it signed; `pair.confirm` and `pair.cancel` are the issuing owner's,
+            // and a device never issued an invitation, so the pairing service refuses them.
+            _ if super::methods::serves(entry.method) => {
+                // A pairing mutation claims its action identity the way every other mutation does,
+                // with this host named as the owner of what it produces.
+                if let Err(refusal) = self.claim_route(mutation, None) {
+                    return failure(mutation.request_id, refusal.into_error());
+                }
+                if self.controller.clock.now() >= accepted.deadline {
+                    return failure(
+                        mutation.request_id,
+                        ProtocolError::new(
+                            ErrorCode::PermissionDenied,
+                            "the deadline this action was admitted under passed before it could \
+                             run",
+                        ),
+                    );
+                }
+                let caller = super::owner::Caller::device(self.device.clone());
+                match self
+                    .controller
+                    .pairing_write(caller, entry.method, mutation)
+                    .await
+                {
+                    Ok(value) => ControlFrame::Response(Response {
+                        request_id: mutation.request_id,
+                        outcome: Outcome::Ok(value),
+                    }),
+                    Err(error) => failure(mutation.request_id, error.to_protocol_error()),
                 }
             }
             // Everything else belongs to the worker that owns the session.

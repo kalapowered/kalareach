@@ -1477,8 +1477,6 @@ async fn owned_on(
                 ..NetworkSettings::default()
             },
             secrets: Arc::new(kr_crypto::store::MemoryStore::new()),
-            owner_signer: Some(signer),
-            enrolment: kr_pairing::confirm::HostEnrolment::Enrolled,
         },
     )
     .await

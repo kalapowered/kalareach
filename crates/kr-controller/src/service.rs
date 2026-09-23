@@ -824,18 +824,13 @@ impl Controller {
         // recovered its reservations and rebuilt its worker directory, because it would be told
         // that sessions this host is running do not exist.
         //
-        // The owner signer the network enrols is the one the owner's decisions about repository
-        // locations are confirmed under, so it is lent to the project service in the same step. An
-        // environment with no network has no enrolled owner, and its location decisions are
-        // refused rather than taken under whoever happens to call.
+        // No owner is lent to the project service here: this host's owners are its paired owner
+        // devices, and the project service confirms under one enrolled signer. Its location
+        // decisions are refused until one is enrolled, rather than taken under whoever calls.
         if let Some(setup) =
             net::NetworkSetup::from_environment(&controller.paths, controller.secret_store())?
         {
-            let owner = setup.owner_signer.map(|signer| (signer, setup.enrolment));
-            let network = net::register(&controller, setup).await?;
-            if let Some((signer, enrolment)) = owner {
-                controller.enrol_project_owner(&network, signer, enrolment)?;
-            }
+            net::register(&controller, setup).await?;
         }
         // Unattended workflow execution starts last. The journal was recovered when the module
         // was opened, but nothing it holds runs until every gate above has passed, the
@@ -3363,6 +3358,16 @@ impl Controller {
             _ if crate::attention::AttentionModule::serves(method) => {
                 crate::attention::AttentionModule::check_subject(method, mutation)?;
             }
+            // Pairing and owner confirmation act on this host rather than on a session, so the
+            // target names this environment and no session inside it.
+            _ if net::methods::serves(method) => {
+                if mutation.target.session_id.is_present() {
+                    return Err(ControllerError::InvalidArgument(format!(
+                        "{} acts on this host and names no session",
+                        entry.name
+                    )));
+                }
+            }
             _ => {
                 return Err(ControllerError::InvalidArgument(format!(
                     "{} is not a mutation this daemon serves",
@@ -3945,6 +3950,11 @@ impl Controller {
         if crate::automation::AutomationModule::serves(method) {
             return self.automation.read_frame(request, None).await;
         }
+        if net::methods::serves(method) {
+            let caller = net::owner::Caller::local(actor_id.clone());
+            let outcome = self.pairing_read(caller, method, &request.params).await;
+            return respond(request.request_id, outcome);
+        }
         // The diagnostics are two answers, not one. The owner at their own machine is shown the
         // paths this host resolved and the names they chose, because that is a person asking their
         // own host where its files are; everything else that reaches a read arrived over the
@@ -3995,6 +4005,13 @@ impl Controller {
         accepted: Option<AcceptedDeadline>,
         admitted: Option<AuthorityRevision>,
     ) -> ControlFrame {
+        if net::methods::serves(method) {
+            // Pairing and owner confirmation are the network module's, and a local caller reaches
+            // them as the host's own account: the issuing owner of what it invites.
+            let caller = net::owner::Caller::local(actor_id.clone());
+            let outcome = self.pairing_write(caller, method, mutation).await;
+            return respond(mutation.request_id, outcome);
+        }
         if crate::transfer::TransferModule::serves(method) {
             // The stored subject is read first, because reading it waits: for a blocking thread
             // and for the journal's lock. The admission is asked after it, inside the service's
@@ -4144,14 +4161,10 @@ impl Controller {
             let admission: Arc<dyn crate::catalogue::Admission> = Arc::new(
                 crate::catalogue::DaemonAdmission::new(Arc::clone(self), carried),
             );
-            let pairing = self
-                .network
-                .get()
-                .and_then(|guard| guard.pairing())
-                .map(std::sync::Arc::clone);
-            let confirmations = pairing
-                .as_deref()
-                .map(|host| host as &dyn crate::sharing::OwnerConfirmations);
+            // No owner confirmation reaches the catalogue here: this host's owners are its paired
+            // owner devices, and the catalogue verifies a confirmation under one enrolled signer.
+            // Its two confirmed methods are refused, rather than taken under whoever asked.
+            let confirmations: Option<&dyn crate::sharing::OwnerConfirmations> = None;
             return self
                 .catalogue
                 .write_frame(actor_id, mutation, method, confirmations, admission)

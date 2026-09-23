@@ -459,12 +459,28 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
     ///
     /// Returns [`PairingError::NotIssuingOwner`] or [`PairingError::Store`].
     pub fn cancel(&mut self, owner: &OwnerContext) -> Result<()> {
+        self.end(owner, PairingConsumedReason::Cancelled)
+    }
+
+    /// Consumes the invitation because the owner refused the candidate it was shown.
+    ///
+    /// The candidate is told its approval was denied, which is one of the outcomes section 10's
+    /// user interface distinguishes, rather than that the invitation was withdrawn.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PairingError::NotIssuingOwner`] or [`PairingError::Store`].
+    pub fn deny(&mut self, owner: &OwnerContext) -> Result<()> {
+        self.end(owner, PairingConsumedReason::Denied)
+    }
+
+    fn end(&mut self, owner: &OwnerContext, reason: PairingConsumedReason) -> Result<()> {
         if owner != &self.issuing_owner {
             return Err(PairingError::NotIssuingOwner);
         }
         self.require_not_fenced()?;
         self.reload()?;
-        self.consume(PairingConsumedReason::Cancelled)
+        self.consume(reason)
     }
 
     /// Reports the invitation's state.

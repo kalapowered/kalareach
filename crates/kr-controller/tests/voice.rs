@@ -995,7 +995,11 @@ async fn a_paired_device_reaches_voice_over_its_own_connection() {
                 .devices()
                 .expect("the device directory answers")
                 .into_iter()
-                .find(|record| record.is_paired())
+                // The host's own owner device is paired too; this is the device the test paired.
+                .find(|record| {
+                    let owner = host.owner.as_ref().map(|owner| owner.device_id);
+                    record.is_paired() && owner != Some(record.device_id)
+                })
                 .expect("the paired device")
                 .device_id,
             session_ids: [session_id].into_iter().collect(),
