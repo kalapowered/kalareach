@@ -2198,27 +2198,68 @@ async fn the_same_method_answers_both_ingresses_alike_once_the_grant_admits_the_
     daemon.stop().await;
 }
 
-/// Returns a loopback address where a managed service in an outage would be: every connection is
-/// accepted and nothing is ever answered. The count is how many connections the host opened to it,
-/// and the thread holding them ends with the test.
-fn a_service_that_never_answers() -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
-    let address = listener.local_addr().expect("its address");
-    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let counted = Arc::clone(&accepted);
-    std::thread::spawn(move || {
-        let mut held = Vec::new();
-        for connection in listener.incoming() {
-            match connection {
-                Ok(connection) => {
-                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    held.push(connection);
+/// A loopback address where a managed service in an outage would be: every connection is accepted
+/// and nothing is ever answered.
+///
+/// The thread that holds the listener and every connection it accepted is stopped and joined when
+/// this goes out of scope, so the sockets close with the test that opened them.
+struct ServiceInOutage {
+    address: std::net::SocketAddr,
+    accepted: Arc<std::sync::atomic::AtomicUsize>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ServiceInOutage {
+    fn start() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        listener
+            .set_nonblocking(true)
+            .expect("a listener that can be stopped");
+        let address = listener.local_addr().expect("its address");
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread = std::thread::spawn({
+            let accepted = Arc::clone(&accepted);
+            let stop = Arc::clone(&stop);
+            move || {
+                let mut held = Vec::new();
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((connection, _)) => {
+                            accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            held.push(connection);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        Err(_) => break,
+                    }
                 }
-                Err(_) => break,
+                drop(held);
             }
+        });
+        Self {
+            address,
+            accepted,
+            stop,
+            thread: Some(thread),
         }
-    });
-    (address, accepted)
+    }
+
+    /// How many connections the host has opened to this service so far.
+    fn reached(&self) -> usize {
+        self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for ServiceInOutage {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 /// KR-REQ-26.46: a control-plane outage does not stop local terminal use. The host is configured
@@ -2231,7 +2272,8 @@ async fn a_control_plane_outage_leaves_local_terminal_use_working() {
     let Some(host) = Host::create() else {
         return;
     };
-    let (outage, reached) = a_service_that_never_answers();
+    let service = ServiceInOutage::start();
+    let outage = service.address;
     let config = EndpointConfig {
         bind_addr: Some("127.0.0.1:0".parse().expect("a loopback address")),
         relay_urls: vec![format!("https://{outage}").parse().expect("a relay URL")],
@@ -2363,11 +2405,16 @@ async fn a_control_plane_outage_leaves_local_terminal_use_working() {
         }
     }
 
-    // The outage was real: the host did try its control plane, which answered nothing.
-    assert!(
-        reached.load(std::sync::atomic::Ordering::SeqCst) > 0,
-        "the host never tried the relay or the discovery service it was configured with"
-    );
+    // The outage was real: the host did try its control plane, which answered nothing. The host
+    // reaches for it in the background, so this waits for the first attempt rather than racing it.
+    let started = tokio::time::Instant::now();
+    while service.reached() == 0 {
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "the host never tried the relay or the discovery service it was configured with"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     drop(terminal);
     close_session(&mut local, &host, session_id).await;
