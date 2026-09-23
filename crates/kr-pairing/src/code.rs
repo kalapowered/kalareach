@@ -238,6 +238,7 @@ mod tests {
     /// KR-REQ-10.04, KR-REQ-10.11: a code is ten Base58 characters shown as `XXXX-XXX-XXX`.
     #[test]
     fn a_generated_code_is_ten_alphabet_characters() {
+        // KR-REQ-01.16: the short manual pairing code is ten characters.
         let code = generate_code().expect("libsodium is available");
         assert_eq!(code.locator().as_str().chars().count(), LOCATOR_LEN);
         assert!(code.locator().as_str().chars().all(is_base58));

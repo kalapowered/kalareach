@@ -1173,6 +1173,9 @@ async fn close_session(client: &mut LocalClient, host: &Host, session_id: Sessio
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor() {
+    // KR-REQ-01.07: a device pairs with the host and uses a live session over iroh with no
+    // KalaReach account configured, and no relay, discovery or managed service either: both
+    // endpoints are loopback iroh endpoints and nothing else.
     let Some(host) = Host::create() else {
         return;
     };

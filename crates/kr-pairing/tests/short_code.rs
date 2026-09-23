@@ -313,6 +313,8 @@ fn approve(
 /// the device record and the proposed grant together, and a retry finds the commitment.
 #[test]
 fn a_complete_pairing_commits_the_device_and_the_proposed_grant() {
+    // KR-REQ-01.16: a device pairs by the ten-character code a person reads off the host, with no
+    // account anywhere in the exchange.
     let harness = Harness::new();
     let mut host = harness.issue();
     let entered = EnteredCode::parse(&host.code().display_text()).expect("the code");

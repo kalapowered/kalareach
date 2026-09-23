@@ -82,6 +82,8 @@ async fn accept_connection(endpoint: &Endpoint) -> Connection {
 /// carries hello and device authorisation, and hello carries its full contents in both directions.
 #[tokio::test]
 async fn a_paired_pair_completes_the_handshake_over_loopback() {
+    // KR-REQ-04.06: the transport is iroh: two endpoints complete an authenticated, encrypted
+    // connection over a direct path.
     let (host, client) = paired_pair().await;
     let accepting = spawn_accept(&host, one_device(&client), ManualClock::new());
 
@@ -151,6 +153,7 @@ async fn a_paired_pair_completes_the_handshake_over_loopback() {
 /// added trust anchor, dialled by relay alone.
 #[tokio::test]
 async fn a_connection_completes_through_a_relay_in_the_same_process() {
+    // KR-REQ-04.06: iroh's relay transport carries the same authorised connection.
     let relay = support::LocalRelay::spawn().await;
     let config = EndpointConfig {
         relay_urls: vec![relay.url.clone()],

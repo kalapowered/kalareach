@@ -271,6 +271,8 @@ fn run_redemption(
 /// confirmation commits the device and the proposed grant.
 #[test]
 fn a_complete_direct_pairing_commits_the_device_and_the_proposed_grant() {
+    // KR-REQ-01.16: a device pairs by scanning the host's QR invitation, with no account anywhere
+    // in the exchange.
     let harness = Harness::new();
     let issued_at = kr_pairing::platform::PairingClock::wall_clock_ms(&harness.clock);
     let mut invitation = harness.issue();
