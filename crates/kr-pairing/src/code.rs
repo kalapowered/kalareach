@@ -288,6 +288,32 @@ mod tests {
         }
     }
 
+    /// KR-REQ-10.11: generation discards the bytes a bare modulo would fold onto the start of the
+    /// alphabet. Reducing every random byte modulo 58 would give each of the first 24 characters
+    /// 5/256 and each of the other 34 4/256, so those 24 would make up 46.9% of a large sample
+    /// rather than their fair 24/58, 41.4%. Across 30,000 characters the fair share varies by
+    /// about 0.3 percentage points, so the 38.8% and 44% lines each sit more than eight standard
+    /// deviations from the fair share and the 44% line more than ten from the biased one.
+    #[test]
+    fn the_start_of_the_alphabet_gets_its_fair_share_and_no_more() {
+        let favoured: std::collections::BTreeSet<char> = BASE58_ALPHABET.chars().take(24).collect();
+        let (mut hits, mut total) = (0usize, 0usize);
+        for _ in 0..3_000 {
+            let code = generate_code().expect("a code");
+            for character in code.display_text().chars().filter(|c| *c != '-') {
+                total += 1;
+                if favoured.contains(&character) {
+                    hits += 1;
+                }
+            }
+        }
+        assert_eq!(total, 30_000);
+        assert!(
+            hits * 1_000 > total * 388 && hits * 100 < total * 44,
+            "the first 24 characters took {hits} of {total} draws"
+        );
+    }
+
     /// KR-REQ-10.11: the rejection bound keeps the draw unbiased.
     #[test]
     fn the_rejection_bound_is_the_last_whole_multiple_of_the_alphabet() {

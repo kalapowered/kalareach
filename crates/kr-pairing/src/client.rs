@@ -668,7 +668,7 @@ mod tests {
     fn a_device_gets_five_attempts_per_code() {
         let store = TestClientBudgetStore::new().expect("a store");
         let clock = TestClock::new();
-        for expected in (0..MAX_CLIENT_ATTEMPTS).rev() {
+        for expected in [4, 3, 2, 1, 0] {
             assert_eq!(
                 charge(&store, &clock, &code()).expect("an attempt"),
                 expected
@@ -680,7 +680,8 @@ mod tests {
         ));
     }
 
-    /// KR-REQ-10.32: the count survives an application restart.
+    /// KR-REQ-10.32: the count lives in the budget store rather than in an attempt, so a new
+    /// attempt over the same store continues it.
     #[test]
     fn the_counter_survives_a_restart_and_is_not_keyed_by_the_service() {
         let store = TestClientBudgetStore::new().expect("a store");
@@ -798,7 +799,13 @@ mod tests {
             charge(&store, &clock, &code()).expect("an attempt");
         }
         assert!(charge(&store, &clock, &code()).is_err());
-        clock.advance(INVITATION_LIFETIME_MS + CLIENT_TOMBSTONE_MS + 1);
+        let day = 24 * 60 * 60 * 1_000;
+        assert_eq!(CLIENT_TOMBSTONE_MS, day);
+        // The window closes five minutes after first entry, and the tombstone holds for a day
+        // after that: one millisecond short of it the code is still refused.
+        clock.advance(5 * 60 * 1_000 + day - 1);
+        assert!(charge(&store, &clock, &code()).is_err());
+        clock.advance(2);
         // The record is gone, so an entirely new code entry starts fresh. The invitation itself
         // is long expired by then, which is what makes this safe.
         assert!(charge(&store, &clock, &code()).is_ok());

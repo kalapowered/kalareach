@@ -804,6 +804,74 @@ mod tests {
         ));
     }
 
+    /// KR-REQ-10.26: the signature binds every declaration to the authorisation key that made it.
+    /// With the original authorisation key and endpoint kept, a bundle whose stored-envelope or
+    /// notification-preview key was replaced does not verify, and neither does a client bundle
+    /// whose display name or platform was changed, nor a host bundle whose network configuration
+    /// was.
+    #[test]
+    fn a_declaration_changed_under_the_same_authorisation_key_does_not_verify() {
+        let keys = DeviceKeys::generate().expect("keys");
+        let other = DeviceKeys::generate().expect("keys");
+
+        let client = sign_client_bundle(&keys.authorisation, client_bundle(&keys), transcript())
+            .expect("a signed bundle");
+        assert!(verify_client_bundle(&client, transcript()).is_ok());
+        let mut envelope = client.clone();
+        envelope.bundle.keys.stored_envelope = *other.stored_envelope.public();
+        let mut preview = client.clone();
+        preview.bundle.keys.notification_preview = *other.notification_preview.public();
+        let mut renamed = client.clone();
+        renamed.bundle.device_name = DeviceName::new("Another phone").expect("a name");
+        let mut moved = client.clone();
+        moved.bundle.platform = DevicePlatform::Windows;
+        for (what, altered) in [
+            ("the stored-envelope key", envelope),
+            ("the notification-preview key", preview),
+            ("the display name", renamed),
+            ("the platform", moved),
+        ] {
+            assert_eq!(
+                altered.bundle.keys.authorisation,
+                client.bundle.keys.authorisation
+            );
+            assert_eq!(altered.bundle.endpoint_id, client.bundle.endpoint_id);
+            assert!(
+                matches!(
+                    verify_client_bundle(&altered, transcript()),
+                    Err(PairingError::AuthenticationFailed)
+                ),
+                "a client bundle with another {what} verified"
+            );
+        }
+
+        let host = sign_host_bundle(&keys.authorisation, host_bundle(&keys), transcript())
+            .expect("a signed bundle");
+        assert!(verify_host_bundle(&host, transcript()).is_ok());
+        let mut envelope = host.clone();
+        envelope.bundle.keys.stored_envelope = *other.stored_envelope.public();
+        let mut preview = host.clone();
+        preview.bundle.keys.notification_preview = *other.notification_preview.public();
+        let mut rerouted = host.clone();
+        rerouted.bundle.network_config.relay_urls = vec![
+            kr_protocol::pairing::NetworkHint::new("https://relay.elsewhere.example")
+                .expect("a hint"),
+        ];
+        for (what, altered) in [
+            ("the stored-envelope key", envelope),
+            ("the notification-preview key", preview),
+            ("the network configuration", rerouted),
+        ] {
+            assert!(
+                matches!(
+                    verify_host_bundle(&altered, transcript()),
+                    Err(PairingError::AuthenticationFailed)
+                ),
+                "a host bundle with another {what} verified"
+            );
+        }
+    }
+
     /// KR-REQ-10.26: a bundle must declare its own transport key as its endpoint.
     #[test]
     fn a_bundle_must_declare_its_own_transport_key_as_its_endpoint() {
