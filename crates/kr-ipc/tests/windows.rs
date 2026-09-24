@@ -663,6 +663,74 @@ fn two_processes_started_within_one_second_carry_different_start_values() {
     );
 }
 
+/// Leaves the debug privilege disabled in the token of one process, given by its identifier, and
+/// prints `disabled`.
+///
+/// An account that holds that privilege enabled opens any process whatever its list says, so a
+/// case built on a process's list needs a token without it. A process's token is its user's to
+/// adjust, so this needs no privilege of its own, and a token that does not hold the privilege at
+/// all is left as it is.
+const DROP_DEBUG: &str = r#"
+param([int]$Id)
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+public static class KrDebugPrivilege
+{
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+
+    [DllImport("kernel32.dll")]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool LookupPrivilegeValueW(string system, string name, out long luid);
+
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
+    private struct OnePrivilege { public int Count; public long Luid; public int Attributes; }
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool AdjustTokenPrivileges(IntPtr token, bool disableAll,
+        ref OnePrivilege state, int length, IntPtr previous, IntPtr returned);
+
+    private const uint QueryLimited = 0x00001000;
+    private const uint AdjustPrivileges = 0x0020;
+    private const uint Query = 0x0008;
+
+    public static void Disable(int pid)
+    {
+        IntPtr process = OpenProcess(QueryLimited, false, pid);
+        if (process == IntPtr.Zero) throw new Win32Exception();
+        try
+        {
+            IntPtr token;
+            if (!OpenProcessToken(process, AdjustPrivileges | Query, out token))
+                throw new Win32Exception();
+            try
+            {
+                long luid;
+                if (!LookupPrivilegeValueW(null, "SeDebugPrivilege", out luid))
+                    throw new Win32Exception();
+                OnePrivilege state = new OnePrivilege { Count = 1, Luid = luid, Attributes = 0 };
+                if (!AdjustTokenPrivileges(token, false, ref state, 0, IntPtr.Zero, IntPtr.Zero))
+                    throw new Win32Exception();
+            }
+            finally { CloseHandle(token); }
+        }
+        finally { CloseHandle(process); }
+    }
+}
+'@
+[KrDebugPrivilege]::Disable($Id)
+Write-Output 'disabled'
+"#;
+
 /// KR-REQ-11.52: a process whose list grants this account the right to ask when it started, and no
 /// other right, is identified: its start identity is its creation time. Whether it is still running
 /// takes the right to wait on it as well. Without that right the answer is that nothing is
@@ -675,6 +743,13 @@ fn a_process_this_account_may_only_ask_about_is_identified() {
     let host = TempHost::create();
     let grant = script(&host, "grant-only", GRANT_ONLY);
     let created_at = script(&host, "created-at", CREATED_AT);
+    let drop_debug = script(&host, "drop-debug", DROP_DEBUG);
+    // An elevated account holds the debug privilege, and a token with it enabled opens any process
+    // whatever its list says. This test process gives it up first. That only makes a list mean
+    // more, and every other case here asks about processes this account owns, whose lists grant
+    // it every right anyway. The processes started after this inherit the token as it now is.
+    let dropped = output_of(&drop_debug, &[&std::process::id().to_string()]);
+    assert_eq!(dropped.trim(), "disabled");
     let mut child = std::process::Command::new("ping.exe")
         .args(["-n", "60", "127.0.0.1"])
         .stdin(std::process::Stdio::null())
