@@ -10,7 +10,7 @@
 //! | KR-REQ-02.04, KR-REQ-05.02 | A worker's endpoint is a pipe whose protected list names its owner and no account the machine does not already trust; a caller that holds every identity the owner holds but the owner's own is refused when it opens it; and the owner arriving over the network is refused as well |
 //! | KR-REQ-02.07 | The listener names the process at the other end of the pipe as the kernel records it: the process that connected, never the listener |
 //! | KR-REQ-05.03 | A descriptor is published under a list that grants its owner alone, and is replaced whole: a reader holding the old version still reads the old version, and a reader by name reads one version or the other and never part of one |
-//! | KR-REQ-11.52 | A process's start identity is the creation time the operating system records for that process, and two processes started within one second carry two start values |
+//! | KR-REQ-11.52 | A process's start identity is the creation time the operating system records for that process, two processes started within one second carry two start values, and a process this account may only ask when it started is identified without its liveness being guessed |
 //!
 //! The environment identity's list and the profile it is kept in, KR-REQ-03.08, are checked by
 //! this crate's own tests in `src/paths.rs`, which run on this platform too.
@@ -261,6 +261,87 @@ foreach ($id in @($First, $Second)) {
 
 /// Hundreds of nanoseconds in one second, the unit Windows records a creation time in.
 const TICKS_PER_SECOND: u64 = 10_000_000;
+
+/// Replaces one process's access-control list with a protected one that grants this account the
+/// rights given, in hexadecimal, and nobody anything else; then prints whether this account can
+/// still open the process to wait on it.
+///
+/// The owner of a process may always rewrite its list, so this needs no privilege. An account that
+/// opens the process to wait on it without that right holds a privilege that passes over every
+/// list, and a case built on the list proves nothing for it: the line printed says which.
+const GRANT_ONLY: &str = r#"
+param([int]$Id, [string]$Rights)
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+
+public static class KrProcessList
+{
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        string sddl, uint revision, out IntPtr descriptor, IntPtr size);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool GetSecurityDescriptorDacl(
+        IntPtr descriptor, out bool present, out IntPtr dacl, out bool defaulted);
+
+    [DllImport("advapi32.dll")]
+    private static extern uint SetSecurityInfo(IntPtr handle, int type, uint information,
+        IntPtr owner, IntPtr group, IntPtr dacl, IntPtr sacl);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr LocalFree(IntPtr memory);
+
+    private const uint WriteDac = 0x00040000;
+    private const uint Synchronize = 0x00100000;
+    private const int KernelObject = 6;
+    private const uint DaclInformation = 0x00000004;
+    private const uint ProtectedDacl = 0x80000000;
+
+    public static string Grant(int pid, uint rights)
+    {
+        string user = WindowsIdentity.GetCurrent().User.Value;
+        IntPtr process = OpenProcess(WriteDac, false, pid);
+        if (process == IntPtr.Zero) throw new Win32Exception();
+        try
+        {
+            IntPtr descriptor;
+            string sddl = "D:P(A;;0x" + rights.ToString("x") + ";;;" + user + ")";
+            if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, out descriptor,
+                    IntPtr.Zero))
+                throw new Win32Exception();
+            try
+            {
+                bool present;
+                bool defaulted;
+                IntPtr dacl;
+                if (!GetSecurityDescriptorDacl(descriptor, out present, out dacl, out defaulted))
+                    throw new Win32Exception();
+                uint error = SetSecurityInfo(process, KernelObject,
+                    DaclInformation | ProtectedDacl, IntPtr.Zero, IntPtr.Zero, dacl, IntPtr.Zero);
+                if (error != 0) throw new Win32Exception((int)error);
+            }
+            finally { LocalFree(descriptor); }
+        }
+        finally { CloseHandle(process); }
+        IntPtr waiter = OpenProcess(Synchronize, false, pid);
+        if (waiter == IntPtr.Zero) return "wait refused";
+        CloseHandle(waiter);
+        return "wait allowed";
+    }
+}
+'@
+Write-Output ([KrProcessList]::Grant($Id, [Convert]::ToUInt32($Rights, 16)))
+"#;
 
 /// KR-REQ-02.04, KR-REQ-05.02: a worker's private endpoint carries the operating system's access
 /// control. On this platform the endpoint is a named pipe rather than a file in an owner-only
@@ -580,6 +661,70 @@ fn two_processes_started_within_one_second_carry_different_start_values() {
         "no pair of processes was created within one second and apart in {ATTEMPTS} attempts: \
          {passed_over:?}"
     );
+}
+
+/// KR-REQ-11.52: a process whose list grants this account the right to ask when it started, and no
+/// other right, is identified: its start identity is its creation time. Whether it is still running
+/// takes the right to wait on it as well. Without that right the answer is that nothing is
+/// established, never that the process has ended; with it, the process is running.
+#[test]
+fn a_process_this_account_may_only_ask_about_is_identified() {
+    // PROCESS_QUERY_LIMITED_INFORMATION, then that and SYNCHRONIZE.
+    const QUERY: &str = "1000";
+    const QUERY_AND_WAIT: &str = "101000";
+    let host = TempHost::create();
+    let grant = script(&host, "grant-only", GRANT_ONLY);
+    let created_at = script(&host, "created-at", CREATED_AT);
+    let mut child = std::process::Command::new("ping.exe")
+        .args(["-n", "60", "127.0.0.1"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("a process to describe");
+    let pid = child.id();
+    let recorded = output_of(&created_at, &[&pid.to_string()]);
+    let query_only = output_of(&grant, &[&pid.to_string(), QUERY]);
+    let identity = kr_ipc::identity::process_start_identity(pid);
+    let unwaited = identity.as_ref().ok().map(kr_ipc::identity::process_state);
+    let with_wait = output_of(&grant, &[&pid.to_string(), QUERY_AND_WAIT]);
+    let waited = identity.as_ref().ok().map(kr_ipc::identity::process_state);
+    let still_running = child.try_wait().expect("the process's status").is_none();
+    // The handle this test started it with keeps every right, whatever the list says now.
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(
+        query_only.trim(),
+        "wait refused",
+        "this account opened the process to wait on it without the right, so it holds a privilege \
+         that passes over the list, and the case cannot be made here"
+    );
+    assert_eq!(with_wait.trim(), "wait allowed");
+    let recorded: u64 = recorded
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("PowerShell printed a creation time: {recorded:?}"));
+    assert_eq!(
+        identity.expect("a process this account may ask when it started is identified"),
+        ProcessStartIdentity::new(
+            u64::from(pid),
+            ProcessStartSource::WindowsProcessCreationTime,
+            recorded
+        )
+    );
+    assert!(
+        still_running,
+        "the process was still running when it was asked about"
+    );
+    assert!(
+        matches!(
+            unwaited,
+            Some(kr_ipc::identity::ProcessState::Unknown { .. })
+        ),
+        "without the right to wait on it, whether it runs is not established: {unwaited:?}"
+    );
+    assert_eq!(waited, Some(kr_ipc::identity::ProcessState::Running));
 }
 
 /// A descriptor for `session` in `host`'s environment, naming `endpoint`.

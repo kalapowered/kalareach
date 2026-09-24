@@ -920,11 +920,13 @@ mod platform {
     ///
     /// The kernel keeps describing a process that has exited for as long as anything holds it
     /// open, and its identifier stays with it until then, so a reading that matched does not say
-    /// the process is still running. It is opened again, and the one handle answers both halves:
-    /// that it is still the process that was recorded, which a process that ended and was replaced
-    /// between the two openings is not, and whether it has exited.
+    /// the process is still running. It is opened again, this time with the right to wait on it as
+    /// well, and the one handle answers both halves: that it is still the process that was
+    /// recorded, which a process that ended and was replaced between the two openings is not, and
+    /// whether it has exited. A process this account may ask when it started but may not wait on is
+    /// one whose exit nothing here can establish, and the answer says so rather than guessing.
     pub(super) fn liveness(pid: u32, start_value: u64) -> ProcessState {
-        let (reading, process) = look(pid);
+        let (reading, process) = look(pid, process_times::Rights::QueryAndWait);
         match super::windows_answer(pid, reading, process_times::now()) {
             ProcessQuery::Present(current) if current.start_value.get() == start_value => {
                 match process.map(|process| process.has_exited()) {
@@ -947,13 +949,19 @@ mod platform {
     }
 
     pub(super) fn query_process(pid: u32) -> ProcessQuery {
-        let (reading, _) = look(pid);
+        // Asking when a process started takes the right to ask that and nothing more: a process
+        // whose list grants this account that right alone is still one it can identify.
+        let (reading, _) = look(pid, process_times::Rights::Query);
         super::windows_answer(pid, reading, process_times::now())
     }
 
-    /// Opens one process and reads its creation time, keeping the handle for a second question.
-    fn look(pid: u32) -> (WindowsReading, Option<process_times::Process>) {
-        match process_times::open(pid) {
+    /// Opens one process with `rights` and reads its creation time, keeping the handle for a
+    /// second question.
+    fn look(
+        pid: u32,
+        rights: process_times::Rights,
+    ) -> (WindowsReading, Option<process_times::Process>) {
+        match process_times::open(pid, rights) {
             process_times::Opened::Absent => (WindowsReading::Absent, None),
             process_times::Opened::Failed(error) => (WindowsReading::Failed(error), None),
             process_times::Opened::Process(process) => match process.created() {
@@ -992,8 +1000,17 @@ mod process_times {
         WaitForSingleObject,
     };
 
-    /// One process, opened for the two questions asked of it.
+    /// One process, opened for the questions its rights allow.
     pub(super) struct Process(OwnedHandle);
+
+    /// What a process is opened to be asked.
+    #[derive(Clone, Copy)]
+    pub(super) enum Rights {
+        /// When it was created.
+        Query,
+        /// When it was created, and whether it has exited.
+        QueryAndWait,
+    }
 
     /// What opening a process by its identifier produced.
     pub(super) enum Opened {
@@ -1005,22 +1022,26 @@ mod process_times {
         Failed(String),
     }
 
-    /// Opens the process holding `pid`, with the right to ask its times and the right to wait on
-    /// it.
+    /// Opens the process holding `pid` with `rights`.
     ///
     /// Only one refusal says that nothing holds the identifier: the kernel's invalid-parameter
     /// answer, which is what it gives for an identifier no process has. A refusal of access is a
-    /// process that is there, and so is every other failure as far as this can tell.
-    pub(super) fn open(pid: u32) -> Opened {
+    /// process that is there, and so is every other failure as far as this can tell. Identifier
+    /// zero is the one exception to the first rule, so it is never asked: the kernel gives the same
+    /// answer for the system idle process, which holds it and has no start to read.
+    pub(super) fn open(pid: u32, rights: Rights) -> Opened {
+        if pid == 0 {
+            return Opened::Failed(
+                "identifier 0 is the system idle process, which has no start to read".to_owned(),
+            );
+        }
+        let access = match rights {
+            Rights::Query => PROCESS_QUERY_LIMITED_INFORMATION,
+            Rights::QueryAndWait => PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+        };
         // SAFETY: the call takes three plain values and returns either a new handle the caller
         // owns or null; it has no other effect.
-        let handle = unsafe {
-            OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
-                0,
-                pid,
-            )
-        };
+        let handle = unsafe { OpenProcess(access, 0, pid) };
         if handle.is_null() {
             let error = std::io::Error::last_os_error();
             return match error.raw_os_error() {
@@ -1058,9 +1079,13 @@ mod process_times {
         }
 
         /// Returns whether the process has exited, without waiting for it to.
+        ///
+        /// The handle has the right to wait on the process when it was opened with
+        /// [`Rights::QueryAndWait`]; one opened without it is refused here, which the caller
+        /// reports as a question it could not answer.
         pub(super) fn has_exited(&self) -> std::io::Result<bool> {
-            // SAFETY: the handle is open for as long as `self` is, with the right to wait on it,
-            // and a zero timeout returns at once.
+            // SAFETY: the handle is open for as long as `self` is, and a zero timeout returns at
+            // once. A handle without the right to wait makes the call fail, which is reported.
             match unsafe { WaitForSingleObject(self.0.as_raw_handle(), 0) } {
                 WAIT_OBJECT_0 => Ok(true),
                 WAIT_TIMEOUT => Ok(false),
@@ -1314,6 +1339,13 @@ mod tests {
         assert!(
             matches!(query_process(u32::MAX), ProcessQuery::Gone),
             "an identifier nothing holds is gone"
+        );
+        // Windows answers identifier zero, which the system idle process holds, the way it answers
+        // one nothing holds; the reader does not ask, and says it cannot read a start there.
+        #[cfg(windows)]
+        assert!(
+            matches!(query_process(0), ProcessQuery::CannotEstablish(_)),
+            "identifier 0 is held, and has no start to read"
         );
     }
 
