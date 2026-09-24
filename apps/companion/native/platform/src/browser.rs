@@ -110,7 +110,9 @@ pub fn android_availability(facts: &Capabilities) -> Result<Mode, Unavailable> {
 }
 
 /// What one attempt asks the native half to open.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+///
+/// Its rendering leaves out the address, which carries the attempt's state, nonce and challenge.
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRequest {
     /// The attempt, as a decimal string, which every result carries back.
@@ -128,7 +130,9 @@ pub struct SessionRequest {
 }
 
 /// One result, as the native half reported it.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+///
+/// Its rendering leaves out the address, which can carry an authorisation code and a state.
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RawEvent {
     /// The attempt it belongs to.
@@ -146,8 +150,8 @@ pub struct RawEvent {
     pub reason: Option<String>,
 }
 
-/// What one result means.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// What one result means. An answer's address is never rendered.
+#[derive(Clone, PartialEq, Eq)]
 pub enum SessionEvent {
     /// An address came back; the caller checks it.
     Answer(String),
@@ -160,6 +164,44 @@ pub enum SessionEvent {
     CouldNotReturn,
     /// Anything else the platform reported.
     Failed,
+}
+
+impl std::fmt::Debug for SessionRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionRequest")
+            .field("attempt", &self.attempt)
+            .field("mode", &self.mode)
+            .field("https_host", &self.https_host)
+            .field("https_path", &self.https_path)
+            .field("scheme", &self.scheme)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for RawEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RawEvent")
+            .field("attempt", &self.attempt)
+            .field("kind", &self.kind)
+            .field("domain", &self.domain)
+            .field("code", &self.code)
+            .field("reason", &self.reason)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for SessionEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Answer(_) => formatter.debug_tuple("Answer").finish_non_exhaustive(),
+            Self::Cancelled => formatter.write_str("Cancelled"),
+            Self::TabClosed => formatter.write_str("TabClosed"),
+            Self::CouldNotReturn => formatter.write_str("CouldNotReturn"),
+            Self::Failed => formatter.write_str("Failed"),
+        }
+    }
 }
 
 /// The iOS session's error domain.
@@ -272,6 +314,42 @@ impl<R: tauri::Runtime> crate::Platform<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test 12: a request, a result and a meaning render without the address, whose query carries
+    /// the state, the nonce, the challenge or a code.
+    #[test]
+    fn nothing_that_holds_the_address_renders_it() {
+        let secret =
+            "https://reach.kala.to/app/oauth/callback?code=NEVER_RENDERED&state=NEVER_RENDERED";
+        let request = SessionRequest {
+            attempt: "7".to_owned(),
+            url: secret.to_owned(),
+            mode: Mode::AuthTab,
+            https_host: "reach.kala.to".to_owned(),
+            https_path: "/app/oauth/callback".to_owned(),
+            scheme: "to.kala.reach".to_owned(),
+        };
+        let raw = RawEvent {
+            attempt: "7".to_owned(),
+            kind: "link".to_owned(),
+            url: Some(secret.to_owned()),
+            ..RawEvent::default()
+        };
+        let meaning = event(&raw);
+        assert_eq!(meaning, SessionEvent::Answer(secret.to_owned()));
+        for rendering in [
+            format!("{request:?}"),
+            format!("{request:#?}"),
+            format!("{raw:?}"),
+            format!("{raw:#?}"),
+            format!("{meaning:?}"),
+            format!("{meaning:#?}"),
+        ] {
+            assert!(!rendering.contains("NEVER_RENDERED"), "{rendering}");
+            assert!(!rendering.contains("code="), "{rendering}");
+        }
+        assert_eq!(format!("{meaning:?}"), "Answer(..)");
+    }
 
     #[test]
     fn ios_before_17_4_is_answered_on_the_private_scheme() {

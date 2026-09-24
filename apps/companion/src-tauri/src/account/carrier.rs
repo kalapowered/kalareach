@@ -188,8 +188,10 @@ impl Carrier for Loopback {
                     return Ending::PortBusy;
                 }
             };
-            if let Err(error) = self.browser.open(&url) {
-                tracing::warn!(%error, "the browser could not be opened for a sign-in");
+            // The failure is logged by its kind alone: an opener's error can quote the command it
+            // ran, and that holds the address with the attempt's state and nonce.
+            if self.browser.open(&url).is_err() {
+                tracing::warn!("the browser could not be opened for a sign-in");
                 return Ending::BrowserFailed;
             }
             let waiting = async {
@@ -263,8 +265,8 @@ pub async fn converse(
             let raw = match next {
                 Ok(raw) => raw,
                 Err(_) if closed => return Ending::TabClosed,
-                Err(error) => {
-                    tracing::warn!(%error, "the browser session could not be started");
+                Err(_) => {
+                    tracing::warn!("the browser session could not be started");
                     return Ending::BrowserFailed;
                 }
             };
@@ -538,6 +540,63 @@ mod tests {
                 ..
             }
         )
+    }
+
+    /// A browser that records whether the listener was already bound when it was asked to open.
+    struct Checking {
+        bound: Arc<Mutex<Option<std::net::SocketAddr>>>,
+        opened_after_binding: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl Browser for Checking {
+        fn open(&self, _url: &str) -> Result<(), String> {
+            let bound = self
+                .bound
+                .lock()
+                .expect("the address")
+                .is_some_and(|address| std::net::TcpStream::connect(address).is_ok());
+            self.opened_after_binding
+                .lock()
+                .expect("the record")
+                .push(bound);
+            Ok(())
+        }
+    }
+
+    /// Test 11 for the desktop's carrier: the listener is bound before the browser opens, and a
+    /// wait with no answer ends as timed out.
+    #[tokio::test]
+    async fn the_loopback_carrier_listens_before_the_browser_opens_and_times_out() {
+        let bound = Arc::new(Mutex::new(None));
+        let opened_after_binding = Arc::new(Mutex::new(Vec::new()));
+        let carrier = Loopback::with_listener(
+            Arc::new(Checking {
+                bound: Arc::clone(&bound),
+                opened_after_binding: Arc::clone(&opened_after_binding),
+            }),
+            {
+                let bound = Arc::clone(&bound);
+                move || {
+                    let listener = Listener::open_at(
+                        "127.0.0.1:0".parse().expect("an address"),
+                        "127.0.0.1:0",
+                    )?;
+                    *bound.lock().expect("the address") = Some(listener.local_address());
+                    Ok(listener)
+                }
+            },
+            Duration::from_millis(300),
+        );
+        let plan = carrier.plan().await.expect("a desktop can carry a sign-in");
+        let request =
+            AuthorisationRequest::new(Client::Desktop, Redirect::Loopback).expect("a request");
+        let url = request.url();
+        let mut pending = PendingAuthorisation::new(request);
+        let ending = carrier
+            .carry(&plan, url, &mut pending, nobody_cancels())
+            .await;
+        assert!(matches!(ending, Ending::TimedOut), "{ending:?}");
+        assert_eq!(*opened_after_binding.lock().expect("the record"), [true]);
     }
 
     /// The emulator showed this order: Firefox handed the verified link over, the application came

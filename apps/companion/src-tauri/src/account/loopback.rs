@@ -42,12 +42,18 @@ pub struct Listener {
     host: String,
 }
 
-/// One request that is shaped like the answer, with the connection its page goes back on.
-#[derive(Debug)]
+/// One request that is shaped like the answer, with the connection its page goes back on. Its
+/// rendering leaves out the address, which carries the code and the state.
 pub struct Callback {
     /// The answer as the registered redirect's address, which the attempt's checks compare.
     pub url: String,
     stream: TcpStream,
+}
+
+impl std::fmt::Debug for Callback {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Callback").finish_non_exhaustive()
+    }
 }
 
 impl Listener {
@@ -333,12 +339,72 @@ mod tests {
         );
     }
 
-    /// Loopback only: the listener is not reachable on another interface's address.
-    #[test]
-    fn the_listener_binds_loopback_and_nothing_else() {
-        let address: SocketAddr = ADDRESS.parse().expect("an address");
-        assert!(address.ip().is_loopback());
-        assert!(address.is_ipv4());
+    /// This machine's address on the network, where it has one: the source address a datagram to
+    /// a documentation address would leave from. Nothing is sent.
+    fn outward_address() -> Option<std::net::IpAddr> {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        socket.connect("192.0.2.1:9").ok()?;
+        let address = socket.local_addr().ok()?.ip();
+        (!address.is_loopback() && !address.is_unspecified()).then_some(address)
+    }
+
+    /// Test 11: the socket the listener binds is on loopback, so the machine's other address does
+    /// not reach it. The control, one bound to every interface the same way, is reached there, so
+    /// the check can fail.
+    #[tokio::test]
+    async fn the_bound_socket_is_on_loopback_and_one_on_every_interface_would_be_reached() {
+        let registered: SocketAddr = ADDRESS.parse().expect("an address");
+        assert!(registered.ip().is_loopback() && registered.is_ipv4());
+        let listener = Listener::open_at(SocketAddr::new(registered.ip(), 0), "127.0.0.1:0")
+            .expect("a listener");
+        let bound = listener.local_address();
+        assert_eq!(bound.ip(), registered.ip());
+        let Some(outward) = outward_address() else {
+            println!(
+                "this machine has no address outside loopback; the reachability half is skipped"
+            );
+            return;
+        };
+        assert!(
+            TcpStream::connect(SocketAddr::new(outward, bound.port()))
+                .await
+                .is_err(),
+            "the loopback listener answered on {outward}"
+        );
+        let everywhere = Listener::open_at("0.0.0.0:0".parse().expect("an address"), "127.0.0.1:0")
+            .expect("the control's listener");
+        let port = everywhere.local_address().port();
+        assert!(
+            TcpStream::connect(SocketAddr::new(outward, port))
+                .await
+                .is_ok(),
+            "the control on every interface was not reached on {outward}"
+        );
+    }
+
+    /// Test 12: a callback's rendering leaves out its address, which carries the code and state.
+    #[tokio::test]
+    async fn a_callback_renders_without_its_address() {
+        let listener = Listener::open_at("127.0.0.1:0".parse().expect("an address"), "127.0.0.1:0")
+            .expect("a listener");
+        let address = listener.local_address();
+        let host = format!("127.0.0.1:{}", address.port());
+        let asking = tokio::spawn(async move {
+            send(
+                address,
+                &format!(
+                    "GET /oauth/callback?code=NEVER_RENDERED&state=NEVER_RENDERED HTTP/1.1\r\nHost: {host}\r\n\r\n"
+                ),
+            )
+            .await
+        });
+        let callback = listener.next().await;
+        for rendering in [format!("{callback:?}"), format!("{callback:#?}")] {
+            assert!(!rendering.contains("NEVER_RENDERED"), "{rendering}");
+        }
+        assert_eq!(format!("{callback:?}"), "Callback { .. }");
+        callback.set_aside().await;
+        let _ = asking.await;
     }
 
     #[tokio::test]
