@@ -244,6 +244,12 @@ pub trait SessionEvents: Send + Sync {
 /// session any result ends the attempt. A closed Custom Tab waits `grace` for the link that closed
 /// it. The person's cancel and the `wait` end it too. However it ends, the native half is told, so
 /// it holds nothing of the attempt afterwards.
+///
+/// A call to the native half is never left behind. Its answer goes to the future that asked, and
+/// a future dropped while its call is out leaves that answer nowhere to go, which the plugin
+/// bridge does not survive. So a cancel, the long wait and a closed tab's grace each end the
+/// attempt through the native half, which answers the call that is out, and that answer is
+/// awaited before the attempt ends.
 pub async fn converse(
     events: &dyn SessionEvents,
     request: &SessionRequest,
@@ -293,22 +299,49 @@ pub async fn converse(
                 }
             }
             next = if closed {
-                match tokio::time::timeout(grace, events.next(attempt)).await {
+                let asked = events.next(attempt);
+                tokio::pin!(asked);
+                match tokio::time::timeout(grace, &mut asked).await {
                     Ok(next) => next,
-                    Err(_) => return Ending::TabClosed,
+                    Err(_) => {
+                        // Nothing followed the closed tab: the native half ends the attempt and
+                        // answers the call that is out.
+                        events.cancel(attempt).await;
+                        settle(asked).await;
+                        return Ending::TabClosed;
+                    }
                 }
             } else {
                 events.next(attempt).await
             };
         }
     };
+    tokio::pin!(conversation);
     let ending = tokio::select! {
-        ending = conversation => ending,
-        () = cancelled(cancel) => Ending::Cancelled,
-        () = tokio::time::sleep(wait) => Ending::TimedOut,
+        ending = &mut conversation => ending,
+        () = cancelled(cancel) => {
+            events.cancel(attempt).await;
+            settle(&mut conversation).await;
+            Ending::Cancelled
+        }
+        () = tokio::time::sleep(wait) => {
+            events.cancel(attempt).await;
+            settle(&mut conversation).await;
+            Ending::TimedOut
+        }
     };
     events.cancel(attempt).await;
     ending
+}
+
+/// How long a call to the native half has to answer once the attempt has been ended.
+const SETTLE: Duration = Duration::from_secs(10);
+
+/// Waits for the native half to answer a call it has been told to end.
+async fn settle<F: Future>(call: F) {
+    if tokio::time::timeout(SETTLE, call).await.is_err() {
+        tracing::warn!("the native half did not answer a call after its attempt ended");
+    }
 }
 
 /// The phone's carrier: the platform plugin's browser-backed session.
@@ -424,11 +457,30 @@ mod tests {
 
     use super::*;
 
-    /// A session that answers from a script: each step is a result after a pause, and once the
-    /// script is spent it waits for ever.
+    /// A session that answers from a script, the way the native halves do: each step is a
+    /// result after a pause; once the script is spent a call waits until the attempt is ended,
+    /// and then answers that it was cancelled. A call whose waiting future was dropped before it
+    /// answered is counted: the real bridge does not survive answering one.
     struct Script {
         steps: Mutex<VecDeque<(Duration, RawEvent)>>,
         ended: Mutex<Vec<String>>,
+        ending: tokio::sync::Notify,
+        abandoned: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// Counts the call it guards as abandoned unless it answered.
+    struct Out {
+        answered: bool,
+        abandoned: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Drop for Out {
+        fn drop(&mut self) {
+            if !self.answered {
+                self.abandoned
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
     }
 
     impl Script {
@@ -436,37 +488,52 @@ mod tests {
             Self {
                 steps: Mutex::new(steps.into()),
                 ended: Mutex::new(Vec::new()),
+                ending: tokio::sync::Notify::new(),
+                abandoned: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
 
-        fn take(&self) -> Boxed<'_, Result<RawEvent, String>> {
+        fn take<'a>(&'a self, attempt: &'a str) -> Boxed<'a, Result<RawEvent, String>> {
             let step = self.steps.lock().expect("the script").pop_front();
             Box::pin(async move {
-                match step {
+                let mut out = Out {
+                    answered: false,
+                    abandoned: std::sync::Arc::clone(&self.abandoned),
+                };
+                let answer = match step {
                     Some((after, raw)) => {
                         tokio::time::sleep(after).await;
-                        Ok(raw)
+                        raw
                     }
-                    None => std::future::pending().await,
-                }
+                    None => loop {
+                        let told = self.ending.notified();
+                        if self.ended().iter().any(|ended| ended == attempt) {
+                            break report(attempt, "cancelled", None);
+                        }
+                        told.await;
+                    },
+                };
+                out.answered = true;
+                Ok(answer)
             })
         }
 
         fn ended(&self) -> Vec<String> {
             self.ended.lock().expect("the record").clone()
         }
+
+        fn abandoned(&self) -> usize {
+            self.abandoned.load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 
     impl SessionEvents for Script {
-        fn start<'a>(
-            &'a self,
-            _request: &'a SessionRequest,
-        ) -> Boxed<'a, Result<RawEvent, String>> {
-            self.take()
+        fn start<'a>(&'a self, request: &'a SessionRequest) -> Boxed<'a, Result<RawEvent, String>> {
+            self.take(&request.attempt)
         }
 
-        fn next<'a>(&'a self, _attempt: &'a str) -> Boxed<'a, Result<RawEvent, String>> {
-            self.take()
+        fn next<'a>(&'a self, attempt: &'a str) -> Boxed<'a, Result<RawEvent, String>> {
+            self.take(attempt)
         }
 
         fn cancel<'a>(&'a self, attempt: &'a str) -> Boxed<'a, ()> {
@@ -474,6 +541,7 @@ mod tests {
                 .lock()
                 .expect("the record")
                 .push(attempt.to_owned());
+            self.ending.notify_waiters();
             Box::pin(async {})
         }
     }
@@ -626,7 +694,9 @@ mod tests {
             if !expect_granted {
                 assert!(matches!(ending, Ending::TabClosed), "{ending:?}");
             }
-            assert_eq!(script.ended(), std::slice::from_ref(&request.attempt));
+            assert!(script.ended().iter().all(|ended| *ended == request.attempt));
+            assert!(!script.ended().is_empty());
+            assert_eq!(script.abandoned(), 0, "a call was left behind");
         }
     }
 
@@ -648,7 +718,8 @@ mod tests {
         )
         .await;
         assert!(matches!(ending, Ending::TabClosed), "{ending:?}");
-        assert_eq!(script.ended(), std::slice::from_ref(&request.attempt));
+        assert!(script.ended().iter().all(|ended| *ended == request.attempt));
+        assert_eq!(script.abandoned(), 0, "a call was left behind");
     }
 
     /// On a Custom Tab a link with another state is set aside and the wait goes on.
@@ -752,7 +823,8 @@ mod tests {
             press
         );
         assert!(matches!(ending, Ending::Cancelled), "{ending:?}");
-        assert_eq!(script.ended(), std::slice::from_ref(&request.attempt));
+        assert!(script.ended().iter().all(|ended| *ended == request.attempt));
+        assert_eq!(script.abandoned(), 0, "a call was left behind");
 
         let (mut pending, request, _) = attempt(Mode::SessionHttps);
         let script = Script::new(Vec::new());
@@ -766,6 +838,7 @@ mod tests {
         )
         .await;
         assert!(matches!(ending, Ending::TimedOut), "{ending:?}");
-        assert_eq!(script.ended(), std::slice::from_ref(&request.attempt));
+        assert!(script.ended().iter().all(|ended| *ended == request.attempt));
+        assert_eq!(script.abandoned(), 0, "a call was left behind");
     }
 }
