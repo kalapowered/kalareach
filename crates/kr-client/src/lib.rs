@@ -24,6 +24,7 @@
 //! | [`controls`] | What a client shows, and what it lets a person invoke |
 //! | [`drafts`] | Drafts this device owns, and the attachment that only presents one |
 //! | [`ipc`] | The local socket or named pipe, with the host-stamped freshness context |
+//! | [`pairing`] | Pairing from a device's side: the rendezvous room socket |
 //! | [`projection`] | The screen a projected client holds, and the renderer that draws it |
 //! | [`session`] | Requests, receipts, events and the action window |
 //! | [`sync`] | Encrypted settings sync, its compare-and-swap client and its privacy hook |
@@ -49,6 +50,7 @@ pub mod drafts;
 pub mod encoder;
 pub mod error;
 pub mod ipc;
+pub mod pairing;
 /// The projected screen a client paints, and the pinned Unicode width model it measures with.
 ///
 /// Present when the `terminal` feature is on, which is the default. A client on a system with no

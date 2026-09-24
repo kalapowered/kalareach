@@ -55,6 +55,7 @@ use kr_protocol::pairing::{
 use kr_protocol::preauth::{
     PairFinishResult, PairRedeemParams, PairRedeemResult, PairStatusParams, PairStatusResult,
 };
+use kr_protocol::rendezvous::{ClientFrame, encode_message};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Bytes, CanonicalSet, Digest256, Nullable};
 use kr_transport::preauth::{ConnectionPeer, PairingMethod, PairingSurface};
@@ -65,9 +66,7 @@ use super::invitations::{
     WriteAdmission, another_subject,
 };
 use super::owner::{Caller, OwnerAuthority, Resolved, refusal};
-use super::rendezvous::{
-    ClientFrame, Rendezvous, RoomOffer, RoomTicket, encode_message, serve_room,
-};
+use super::rendezvous::{Rendezvous, RoomOffer, RoomTicket, serve_room};
 use crate::error::{ControllerError, Result};
 
 /// The clock every pairing deadline on this host is measured on.

@@ -42,6 +42,7 @@
 //! | [`pairing`] | Pairing contexts, bundles, transcripts, QR payloads and owner confirmation |
 //! | [`preauth`] | What an unpaired connection may send on the bounded pairing surface |
 //! | [`invitation`] | The issuing owner's pairing methods, the rendezvous relay payload and the pairing security event |
+//! | [`rendezvous`] | The rendezvous room's frames, and the codec of the pairing messages it relays |
 //! | [`confirmation`] | Requesting, listing and answering an owner confirmation |
 //! | [`mailbox`] | Stored mailbox envelopes and their size buckets |
 //! | [`service`] | The credential every managed-service method authenticates with |
@@ -150,6 +151,7 @@ pub mod question;
 pub mod receipt;
 pub mod recovery;
 pub mod relay;
+pub mod rendezvous;
 pub mod rights;
 pub mod root;
 pub mod scalars;

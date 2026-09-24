@@ -4263,6 +4263,7 @@ dependencies = [
 name = "kr-client"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "iroh",
  "kr-cbor",
  "kr-crypto",
@@ -4274,6 +4275,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rustls",
+ "rustls-platform-verifier",
  "schemars 1.2.2",
  "serde",
  "serde_json",
@@ -4281,6 +4283,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-rustls",
+ "tokio-websockets",
  "tracing",
  "url",
  "zeroize",
