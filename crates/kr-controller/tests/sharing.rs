@@ -7,11 +7,12 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-18.03 | `an_invitation_is_scoped_to_the_session_it_shares`, `a_delegation_narrows_what_the_issuer_holds`, `transfer_of_control_hands_over_only_what_the_transferring_grant_carries`, `transfer_of_control_issues_one_authority_and_revokes_the_other` |
+//! | KR-REQ-09.18 | `a_refusal_the_clock_decided_is_never_answered_on_a_floor_that_was_not_written`, `a_start_that_cannot_write_its_floor_decides_no_expiry_until_it_can`, `a_delegation_whose_parent_expired_before_it_was_written_is_refused`, `a_redemption_whose_invitation_expired_before_it_was_written_is_refused`, `a_transfer_whose_source_expired_before_it_was_written_is_refused` |
+//! | KR-REQ-18.03 | `an_invitation_is_scoped_to_the_session_it_shares`, `a_delegation_narrows_what_the_issuer_holds`, `transfer_of_control_hands_over_only_what_the_transferring_grant_carries`, `transfer_of_control_issues_one_authority_and_revokes_the_other`, `a_transfer_whose_source_expired_before_it_was_written_is_refused` |
 //! | KR-REQ-19.01 | `a_view_only_invitation_obtains_no_input_through_a_plugin_an_attachment_action_or_a_workflow` |
-//! | KR-REQ-23.49 | `sharing_checks_parent_rights_expiry_and_owner_confirmation`, `revoking_a_shared_grant_completes_through_the_dispatch_barrier` |
+//! | KR-REQ-23.49 | `sharing_checks_parent_rights_expiry_and_owner_confirmation`, `revoking_a_shared_grant_completes_through_the_dispatch_barrier`, `a_delegation_whose_parent_expired_before_it_was_written_is_refused` |
 //! | KR-REQ-25.07 | `each_role_compiles_to_explicit_actions_and_the_host_decides_from_those`, `only_controller_and_owner_answer_questions_without_an_explicit_option` |
-//! | KR-REQ-25.10 | `an_invitation_is_single_use_and_expires`, `the_issuer_sees_what_is_being_shared_and_no_historical_attachment_keys`, `an_invitation_names_nothing_the_issuer_was_not_shown` |
+//! | KR-REQ-25.10 | `an_invitation_is_single_use_and_expires`, `the_issuer_sees_what_is_being_shared_and_no_historical_attachment_keys`, `an_invitation_names_nothing_the_issuer_was_not_shown`, `a_redemption_whose_invitation_expired_before_it_was_written_is_refused` |
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -1715,10 +1716,18 @@ impl WorkerSupervisor for SilentSupervisor {
 
 async fn daemon() -> (kr_ipc::testing::TempHost, Arc<Controller>) {
     let temp = kr_ipc::testing::TempHost::create();
+    let controller = start_daemon(&temp).await.expect("the daemon starts");
+    (temp, controller)
+}
+
+/// Starts a daemon over an environment tree that may already hold another daemon's records.
+async fn start_daemon(
+    temp: &kr_ipc::testing::TempHost,
+) -> kr_controller::error::Result<Arc<Controller>> {
     let environment = temp.environment();
     let environment_id = temp.environment_id();
     let secrets = environment.secrets_dir();
-    let controller = Controller::start(ControllerSetup {
+    Controller::start(ControllerSetup {
         paths: environment.clone(),
         environment_id,
         identity: Box::new(move || {
@@ -1738,8 +1747,446 @@ async fn daemon() -> (kr_ipc::testing::TempHost, Arc<Controller>) {
         terminal: Box::new(kr_controller::supervision::NoTerminal),
     })
     .await
-    .expect("the daemon starts");
-    (temp, controller)
+}
+
+/// Stops a daemon the way its process ending would: nothing it held in memory survives.
+async fn stop_daemon(controller: Arc<Controller>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while Arc::strong_count(&controller) > 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stopped daemon is still held"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(controller);
+}
+
+/// Makes this environment's store refuse every write of the host's policy, and with it the clock
+/// floor, as a full disk would, until the returned connection drops the trigger.
+fn refuse_policy_writes(temp: &kr_ipc::testing::TempHost) -> rusqlite::Connection {
+    let registry = rusqlite::Connection::open(temp.environment().registry_database())
+        .expect("opens the registry");
+    registry
+        .busy_timeout(Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    registry
+        .execute_batch(
+            "CREATE TRIGGER refuse_policy BEFORE INSERT ON host_authority
+             WHEN NEW.key = 'policy'
+             BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("the fault is in place");
+    registry
+}
+
+/// Clears the fault [`refuse_policy_writes`] put in place.
+fn allow_policy_writes(registry: &rusqlite::Connection) {
+    registry
+        .execute_batch("DROP TRIGGER refuse_policy;")
+        .expect("the fault is cleared");
+}
+
+/// Shares one session as its owner with `device` under a one-hour invitation, redeemed, on the
+/// daemon's own clock. Returns the active grant.
+fn shared_and_redeemed(controller: &Controller, byte: u8, device: DeviceId) -> Grant {
+    let environment_id = controller.paths().environment_id();
+    let now_ms = kr_ipc::now_ms().get();
+    let shared = controller
+        .sharing()
+        .share(
+            &ShareRequest {
+                environment_id,
+                issuer_device_id: DeviceId::new(environment_id.get()),
+                recipient_device_id: device,
+                authority_revision: controller.policy().authority_revision(),
+                now_ms,
+                ..share(SessionRole::Owner, byte)
+            },
+            || Ok(()),
+        )
+        .expect("the host shares a session");
+    controller
+        .sharing()
+        .redeem(shared.preview.invitation_id, device, now_ms + 1)
+        .expect("the device redeems it")
+}
+
+/// Transfers `source` from the device holding it to another, with the owner's confirmation.
+async fn transfer_to_another(
+    controller: &Controller,
+    source: &Grant,
+    issuing: GrantId,
+) -> kr_controller::error::Result<()> {
+    let plan = TransferPlan {
+        session_id: session_id(0xa0),
+        from_device_id: source.recipient_device_id,
+        to_device_id: device_id(0xf2),
+        revoking_grant_id: source.grant_id,
+        issuing_grant_id: issuing,
+        actions: transfer::transferable_actions(source),
+    };
+    let owner_key = kr_crypto::keys::AuthorisationKeyPair::generate().expect("an owner key");
+    let confirmed = confirm_transfer_for(
+        &plan,
+        DeviceId::new(controller.paths().environment_id().get()),
+        &owner_key,
+    );
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        controller.transfer_control(&plan, &confirmed),
+    )
+    .await
+    .expect("the transfer is answered promptly")
+    .map(|_| ())
+}
+
+/// KR-REQ-09.18: a refusal the clock decided is never answered on a clock floor this host could
+/// not write down.
+///
+/// The host's store refuses every write of the floor. The wall clock reads an hour and a minute
+/// ahead, once, which raises the floor past a grant's expiry, and then comes back. A transfer of
+/// that grant is decided while the floor is owed its record, so it is refused as a failure to
+/// record rather than as an expiry: this host has decided nothing about the grant. The daemon stops
+/// before any write lands, the store recovers, and a daemon started again finds the older floor and
+/// the wall clock back where it was. The grant is valid by everything it can read, and it is
+/// admitted, which contradicts no answer this host gave.
+#[tokio::test]
+async fn a_refusal_the_clock_decided_is_never_answered_on_a_floor_that_was_not_written() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let controller = start_daemon(&temp).await.expect("the daemon starts");
+    let held = shared_and_redeemed(&controller, 1, device_id(0xf1));
+    let kr_protocol::grant::GrantExpiry::At { expires_at_ms } = held.expiry else {
+        panic!("an invitation expires");
+    };
+
+    let fault = refuse_policy_writes(&temp);
+    // One reading past the grant's expiry, which raises the floor; its write is refused.
+    let ahead = expires_at_ms.get() + 60_000;
+    controller
+        .update_policy(|policy| policy.observe_utc(ahead))
+        .expect_err("the store refuses the policy");
+    let first = transfer_to_another(&controller, &held, grant_id(9)).await;
+
+    // Stopped before any write of the floor lands; the store recovers; started again.
+    stop_daemon(controller).await;
+    allow_policy_writes(&fault);
+    let controller = start_daemon(&temp).await.expect("the daemon starts again");
+    let second = transfer_to_another(&controller, &held, grant_id(10)).await;
+
+    let refused_as_expired = matches!(
+        &first,
+        Err(error) if error.code() == kr_protocol::error::ErrorCode::PermissionDenied
+    );
+    assert!(
+        !(refused_as_expired && second.is_ok()),
+        "a grant this host refused as expired was admitted after a restart: {first:?}, then \
+         {second:?}"
+    );
+    assert_eq!(
+        first.expect_err("the transfer is refused").code(),
+        kr_protocol::error::ErrorCode::StorageUnavailable,
+        "refused as a floor this host could not write down, not decided"
+    );
+    second.expect("nothing this host decided stands against the grant");
+}
+
+/// A delegation of one session under `parent`, from the device holding it to another, for half an
+/// hour, on the daemon's own clock.
+fn delegate(
+    controller: &Controller,
+    parent: &Grant,
+    byte: u8,
+) -> kr_controller::error::Result<kr_protocol::sharing::GrantCreateResult> {
+    controller.sharing().share(
+        &ShareRequest {
+            environment_id: controller.paths().environment_id(),
+            invitation_id: invitation_id(byte),
+            grant_id: grant_id(byte),
+            issuer_device_id: parent.recipient_device_id,
+            recipient_device_id: device_id(0xf4),
+            parent_grant_id: Some(parent.grant_id),
+            authority_revision: controller.policy().authority_revision(),
+            lifetime_ms: Some(30 * 60 * 1000),
+            now_ms: kr_ipc::now_ms().get(),
+            ..share(SessionRole::Viewer, byte)
+        },
+        || Ok(()),
+    )
+}
+
+/// KR-REQ-09.18: a daemon that starts and cannot write its clock floor decides no expiry until it
+/// can. A delegation from a grant that expires is refused as a floor this host could not write
+/// down, a delegation from a grant that never expires is decided as before, and once the store
+/// takes the floor the expiring grant is decided on it again.
+#[tokio::test]
+async fn a_start_that_cannot_write_its_floor_decides_no_expiry_until_it_can() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let controller = start_daemon(&temp).await.expect("the daemon starts");
+    let expiring = shared_and_redeemed(&controller, 1, device_id(0xf1));
+    let lasting = Grant {
+        grant_id: grant_id(3),
+        parent_grant_id: kr_protocol::scalars::Nullable::null(),
+        issuer_device_id: DeviceId::new(controller.paths().environment_id().get()),
+        recipient_device_id: device_id(0xf3),
+        expiry: GrantExpiry::Never,
+        ..expiring.clone()
+    };
+    controller
+        .sharing()
+        .grants()
+        .issue(
+            &GrantRecord {
+                grant: lasting.clone(),
+                session_id: Some(session_id(0xa0)),
+                issued_at_ms: kr_ipc::now_ms().get(),
+                activated_at_ms: Some(kr_ipc::now_ms().get()),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
+            },
+            || Ok(()),
+        )
+        .expect("a grant that never expires");
+
+    let fault = refuse_policy_writes(&temp);
+    stop_daemon(controller).await;
+    let controller = start_daemon(&temp)
+        .await
+        .expect("a daemon whose floor write is refused still starts");
+
+    let refused = delegate(&controller, &expiring, 5)
+        .expect_err("an expiry is not decided while the floor is owed its record");
+    assert_eq!(
+        refused.code(),
+        kr_protocol::error::ErrorCode::StorageUnavailable,
+        "{refused}"
+    );
+    delegate(&controller, &lasting, 6)
+        .expect("a grant that never expires does not stand on the floor");
+
+    allow_policy_writes(&fault);
+    transfer_to_another(&controller, &expiring, grant_id(9))
+        .await
+        .expect("once the floor is written, the expiry is decided on it");
+}
+
+/// An active grant of one session, issued straight into the daemon's store, that expired an hour
+/// ago by the daemon's own clock. Returns it and the moment two hours ago it was issued.
+fn expired_an_hour_ago(controller: &Controller, byte: u8, holder: DeviceId) -> (Grant, u64) {
+    let now_ms = kr_ipc::now_ms().get();
+    let issued_at_ms = now_ms - 2 * 60 * 60 * 1000;
+    let grant = Grant {
+        grant_id: grant_id(byte),
+        parent_grant_id: kr_protocol::scalars::Nullable::null(),
+        issuer_device_id: DeviceId::new(controller.paths().environment_id().get()),
+        recipient_device_id: holder,
+        authority_revision: controller.policy().authority_revision(),
+        environment_selector: kr_protocol::grant::EnvironmentSelector::These {
+            environment_ids: [controller.paths().environment_id()].into_iter().collect(),
+        },
+        session_selector: SessionSelector::These {
+            session_ids: [session_id(0xa0)].into_iter().collect(),
+        },
+        actions: SessionRole::Owner
+            .default_actions()
+            .iter()
+            .copied()
+            .collect(),
+        history: kr_protocol::grant::HistoryScope {
+            lower_bound_ms: kr_protocol::scalars::Nullable::some(
+                kr_protocol::scalars::TimestampMs::new(issued_at_ms),
+            ),
+            include_live_screen: false,
+            named_questions: CanonicalSet::from_iter([]),
+            named_approvals: CanonicalSet::from_iter([]),
+        },
+        expiry: GrantExpiry::At {
+            expires_at_ms: kr_protocol::scalars::TimestampMs::new(now_ms - 60 * 60 * 1000),
+        },
+        organisation: kr_protocol::scalars::Nullable::null(),
+    };
+    controller
+        .sharing()
+        .grants()
+        .issue(
+            &GrantRecord {
+                grant: grant.clone(),
+                session_id: Some(session_id(0xa0)),
+                issued_at_ms,
+                activated_at_ms: Some(issued_at_ms),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
+            },
+            || Ok(()),
+        )
+        .expect("the grant is written");
+    (grant, issued_at_ms)
+}
+
+/// Has the daemon write down its clock floor at the moment it is now, as every one of its own
+/// requests does before it decides anything.
+fn floor_written_now(controller: &Controller) {
+    controller
+        .update_policy(|policy| policy.observe_utc(kr_ipc::now_ms().get()))
+        .expect("the floor is written down");
+}
+
+/// KR-REQ-23.49 and 10.40: a delegation decides its parent's expiry at the moment it is written,
+/// not only at the moment it was asked for. The parent was still valid at the reading the caller
+/// checked it at, and expired before the delegation reached the store: nothing is written.
+#[tokio::test]
+async fn a_delegation_whose_parent_expired_before_it_was_written_is_refused() {
+    let (_temp, controller) = daemon().await;
+    let (parent, checked_at_ms) = expired_an_hour_ago(&controller, 1, device_id(0xf1));
+    floor_written_now(&controller);
+
+    let refused = controller
+        .sharing()
+        .share(
+            &ShareRequest {
+                environment_id: controller.paths().environment_id(),
+                invitation_id: invitation_id(2),
+                grant_id: grant_id(2),
+                issuer_device_id: device_id(0xf1),
+                recipient_device_id: device_id(0xf2),
+                parent_grant_id: Some(parent.grant_id),
+                authority_revision: controller.policy().authority_revision(),
+                lifetime_ms: Some(30 * 60 * 1000),
+                now_ms: checked_at_ms + 1,
+                ..share(SessionRole::Viewer, 2)
+            },
+            || Ok(()),
+        )
+        .expect_err("the parent had expired by the time the delegation was written");
+    assert_eq!(
+        refused.code(),
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "{refused}"
+    );
+    assert!(refused.to_string().contains("expired"), "{refused}");
+    assert!(
+        controller
+            .sharing()
+            .grants()
+            .record(grant_id(2))
+            .expect("readable")
+            .is_none(),
+        "nothing was delegated"
+    );
+}
+
+/// KR-REQ-25.10: a redemption decides its invitation's deadline at the moment it is written, not
+/// only at the moment it was asked for, and marks an invitation that ran out in between expired.
+#[tokio::test]
+async fn a_redemption_whose_invitation_expired_before_it_was_written_is_refused() {
+    let (_temp, controller) = daemon().await;
+    let environment_id = controller.paths().environment_id();
+    // Shared two hours ago under an hour's invitation, by the daemon's own clock.
+    let shared_at_ms = kr_ipc::now_ms().get() - 2 * 60 * 60 * 1000;
+    let shared = controller
+        .sharing()
+        .share(
+            &ShareRequest {
+                environment_id,
+                issuer_device_id: DeviceId::new(environment_id.get()),
+                authority_revision: controller.policy().authority_revision(),
+                now_ms: shared_at_ms,
+                ..share(SessionRole::Viewer, 1)
+            },
+            || Ok(()),
+        )
+        .expect("the host shares a session");
+    floor_written_now(&controller);
+
+    let refused = controller
+        .sharing()
+        .redeem(
+            shared.preview.invitation_id,
+            device_id(0xf1),
+            shared_at_ms + 1,
+        )
+        .expect_err("the invitation had run out by the time the redemption was written");
+    assert!(refused.to_string().contains("expired"), "{refused}");
+    let invitation = controller
+        .sharing()
+        .invitation(shared.preview.invitation_id)
+        .expect("readable")
+        .expect("present");
+    assert_eq!(
+        invitation.state,
+        kr_protocol::sharing::InvitationState::Expired,
+        "the lapse is written down with the invitation"
+    );
+    assert!(
+        !controller
+            .sharing()
+            .grants()
+            .record(shared.grant.grant_id)
+            .expect("readable")
+            .expect("present")
+            .is_active(),
+        "nothing was activated"
+    );
+}
+
+/// KR-REQ-18.03 and 23.49: a transfer decides its source's expiry at the moment it is written, not
+/// only at the moment it was asked for. The source was valid at the reading the caller took and
+/// had expired by the time the transfer reached the store: nothing is issued and nothing revoked.
+#[tokio::test]
+async fn a_transfer_whose_source_expired_before_it_was_written_is_refused() {
+    let (_temp, controller) = daemon().await;
+    let (source, checked_at_ms) = expired_an_hour_ago(&controller, 1, device_id(0xf1));
+    floor_written_now(&controller);
+    let plan = TransferPlan {
+        session_id: session_id(0xa0),
+        from_device_id: device_id(0xf1),
+        to_device_id: device_id(0xf2),
+        revoking_grant_id: source.grant_id,
+        issuing_grant_id: grant_id(9),
+        actions: transfer::transferable_actions(&source),
+    };
+    let owner_key = kr_crypto::keys::AuthorisationKeyPair::generate().expect("an owner key");
+    let confirmed = confirm_transfer_for(
+        &plan,
+        DeviceId::new(controller.paths().environment_id().get()),
+        &owner_key,
+    );
+
+    let refused = controller
+        .sharing()
+        .transfer_control(
+            &plan,
+            &confirmed,
+            &Clock,
+            controller.policy().authority_revision(),
+            checked_at_ms + 1,
+        )
+        .expect_err("the source had expired by the time the transfer was written");
+    assert_eq!(
+        refused.code(),
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "{refused}"
+    );
+    assert!(
+        controller
+            .sharing()
+            .grants()
+            .record(grant_id(9))
+            .expect("readable")
+            .is_none(),
+        "no replacement was issued"
+    );
+    assert!(
+        controller
+            .sharing()
+            .grants()
+            .record(source.grant_id)
+            .expect("readable")
+            .expect("present")
+            .revoked_at_ms
+            .is_none(),
+        "and the source was not revoked by a transfer that did not happen"
+    );
 }
 
 #[tokio::test]
@@ -1747,6 +2194,8 @@ async fn revoking_a_shared_grant_completes_through_the_dispatch_barrier() {
     let (_temp, controller) = daemon().await;
     let environment_id = controller.paths().environment_id();
     let host_device_id = DeviceId::new(environment_id.get());
+    // On the daemon's own clock, which is the one its store decides a redemption's deadline on.
+    let now_ms = kr_ipc::now_ms().get();
 
     let issued = controller
         .sharing()
@@ -1755,6 +2204,7 @@ async fn revoking_a_shared_grant_completes_through_the_dispatch_barrier() {
                 environment_id,
                 issuer_device_id: host_device_id,
                 authority_revision: controller.policy().authority_revision(),
+                now_ms,
                 ..share(SessionRole::Owner, 1)
             },
             || Ok(()),
@@ -1762,7 +2212,7 @@ async fn revoking_a_shared_grant_completes_through_the_dispatch_barrier() {
         .expect("the host shares a session");
     controller
         .sharing()
-        .redeem(issued.preview.invitation_id, device_id(0xf1), NOW + 1)
+        .redeem(issued.preview.invitation_id, device_id(0xf1), now_ms + 1)
         .expect("the recipient redeems it");
 
     // A delegation from it, so the revocation has a descendant to take with it.
@@ -1777,6 +2227,7 @@ async fn revoking_a_shared_grant_completes_through_the_dispatch_barrier() {
                 recipient_device_id: device_id(0xf2),
                 parent_grant_id: Some(issued.grant.grant_id),
                 authority_revision: controller.policy().authority_revision(),
+                now_ms,
                 ..share(SessionRole::Viewer, 2)
             },
             || Ok(()),
@@ -1805,7 +2256,7 @@ async fn revoking_a_shared_grant_completes_through_the_dispatch_barrier() {
 
     let listed = controller
         .sharing()
-        .list_for_issuer(host_device_id, None, false, NOW)
+        .list_for_issuer(host_device_id, None, false, now_ms)
         .expect("a list");
     assert!(
         listed.grants.is_empty(),

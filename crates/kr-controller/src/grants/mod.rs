@@ -158,6 +158,10 @@ pub enum Refusal {
         /// The last successful synchronisation, when there was one.
         last_synchronised_at_ms: Option<u64>,
     },
+    /// The decision reads this host's clock, and the clock floor it would stand on is owed its
+    /// record, so it is not taken until the floor is written down
+    /// ([`policy::UtcFloor::bound`]).
+    FloorUnrecorded,
 }
 
 impl Refusal {
@@ -209,19 +213,31 @@ impl Refusal {
                  not been reached inside it"
                     .to_owned()
             }
+            Self::FloorUnrecorded => FLOOR_UNRECORDED.to_owned(),
         }
     }
 
     /// The protocol error a refusal becomes.
     ///
-    /// Every one of them is `PERMISSION_DENIED`. A caller learns that its authority does not reach
-    /// the request; which of this host's grants exist, and which revisions it has seen, is not a
-    /// question a refused caller gets answered.
+    /// Every one but [`Self::FloorUnrecorded`] is `PERMISSION_DENIED`. A caller learns that its
+    /// authority does not reach the request; which of this host's grants exist, and which
+    /// revisions it has seen, is not a question a refused caller gets answered. The exception says
+    /// nothing about the caller's authority: it is this host's store, and it passes when the store
+    /// takes the write.
     #[must_use]
     pub fn to_protocol_error(&self) -> ProtocolError {
-        ProtocolError::new(ErrorCode::PermissionDenied, self.detail())
+        let code = match self {
+            Self::FloorUnrecorded => ErrorCode::StorageUnavailable,
+            _ => ErrorCode::PermissionDenied,
+        };
+        ProtocolError::new(code, self.detail())
     }
 }
+
+/// What a caller is told when a decision that reads this host's clock is not taken because the
+/// clock floor it would stand on is owed its record.
+pub const FLOOR_UNRECORDED: &str = "this host could not write down the clock reading this \
+                                    decision stands on, so it does not decide it until it can";
 
 /// What a permitted request carries away from the intersection.
 ///
@@ -301,14 +317,21 @@ pub fn decide(
     // says.
     // Raised here rather than by the caller. A floor a caller has to remember to advance is a
     // floor that is not there the one time it matters.
-    policy.observe_utc(request.now_ms);
+    let bound = policy.utc_floor().bound(grant.expiry, request.now_ms);
     let now_ms = policy.settled_now(request.now_ms);
     if !record.is_active() {
         return Err(Refusal::NotRedeemed {
             grant_id: grant.grant_id,
         });
     }
-    if !grant.expiry.is_valid_at(now_ms) {
+    // Nothing that reads the clock is decided while the floor it would stand on is owed its
+    // record: a daemon that stopped before that record landed would start again on an older floor
+    // and could decide the other way. A lapse found here is owed its record by the caller, which
+    // writes the floor it stood on.
+    if bound.owed && policy.stands_on_the_clock(grant, request.ingress) {
+        return Err(Refusal::FloorUnrecorded);
+    }
+    if bound.passed {
         let expired_at_ms = match grant.expiry {
             kr_protocol::grant::GrantExpiry::Never => now_ms,
             kr_protocol::grant::GrantExpiry::At { expires_at_ms } => expires_at_ms.get(),
@@ -434,14 +457,18 @@ pub fn standing_at_dispatch(
             },
         });
     }
-    policy.observe_utc(now_ms);
+    let bound = policy.utc_floor().bound(grant.expiry, now_ms);
     let now_ms = policy.settled_now(now_ms);
     if !record.is_active() {
         return Err(Refusal::NotRedeemed {
             grant_id: grant.grant_id,
         });
     }
-    if !grant.expiry.is_valid_at(now_ms) {
+    // As [`decide`]: nothing that reads the clock is decided while its floor is owed its record.
+    if bound.owed && policy.stands_on_the_clock(grant, ingress) {
+        return Err(Refusal::FloorUnrecorded);
+    }
+    if bound.passed {
         let expired_at_ms = match grant.expiry {
             kr_protocol::grant::GrantExpiry::Never => now_ms,
             kr_protocol::grant::GrantExpiry::At { expires_at_ms } => expires_at_ms.get(),

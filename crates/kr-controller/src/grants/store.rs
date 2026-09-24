@@ -32,7 +32,7 @@ use std::sync::Arc;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use kr_protocol::error::ErrorCode;
-use kr_protocol::grant::Grant;
+use kr_protocol::grant::{Grant, GrantExpiry};
 use kr_protocol::ids::InvitationId;
 use kr_protocol::ids::{ActionId, ActorId, DeviceId, GrantId, SessionId};
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs};
@@ -41,6 +41,7 @@ use kr_protocol::sharing::{GrantState, GrantSummary, InvitationPreview, Invitati
 use crate::sharing::invitation::{InvitationRecord, state_of};
 
 use super::durable::{StoredFeed, StoredPolicy};
+use super::policy::{Bound, UtcFloor};
 
 use crate::error::{ControllerError, Result};
 
@@ -220,6 +221,8 @@ pub struct GrantDirectory {
     connection: std::sync::Mutex<Connection>,
     /// The action claims whose attempts are running in this daemon.
     live: Arc<LiveClaims>,
+    /// This host's clock floor, once the daemon has bound it ([`Self::bind_host_clock`]).
+    host_clock: std::sync::OnceLock<Arc<UtcFloor>>,
 }
 
 impl GrantDirectory {
@@ -306,7 +309,63 @@ impl GrantDirectory {
         Ok(Self {
             connection: std::sync::Mutex::new(connection),
             live: Arc::new(LiveClaims::default()),
+            host_clock: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Whether `expiry` has passed at the effect, for a caller that decided it at `admitted_ms`, or
+    /// the refusal when that cannot be answered now.
+    fn passed_at_effect(&self, expiry: GrantExpiry, admitted_ms: u64) -> Result<bool> {
+        let bound = self.bound_at_effect(expiry, admitted_ms);
+        if bound.answerable() {
+            Ok(bound.passed)
+        } else {
+            Err(self.unanswerable(&bound))
+        }
+    }
+
+    /// The refusal of an effect whose time bound `bound` could not be answered.
+    ///
+    /// A lapse the floor on disk does not cover yet is owed its record from here, so the daemon
+    /// writes the floor it stood on before its next decision, and an effect asked for again once
+    /// that record is down is refused as expired.
+    fn unanswerable(&self, bound: &Bound) -> ControllerError {
+        if let Some(floor) = self.host_clock.get()
+            && !bound.recorded
+        {
+            floor.owe(bound.at_ms);
+        }
+        unrecorded()
+    }
+
+    /// Binds this host's clock floor, so a grant's time bound is decided at the moment of the
+    /// effect that depends on it.
+    ///
+    /// Until then a bound is decided at the reading its caller took, which is what a caller that
+    /// keeps its own time wants: a test, or a tool reading a copy of the store. The daemon binds
+    /// its floor as it starts. From then on a delegation, a redemption and a transfer read this
+    /// host's wall clock inside the transaction that writes them, under that floor: a grant that
+    /// expires while the effect waits for the store's lock is found expired there, and nothing
+    /// that can expire is decided while the floor is owed its record
+    /// ([`UtcFloor::bound`]). A second binding is ignored.
+    pub fn bind_host_clock(&self, floor: Arc<UtcFloor>) {
+        let _ = self.host_clock.set(floor);
+    }
+
+    /// What `expiry` comes to at the effect, for a caller that decided it at `admitted_ms`.
+    ///
+    /// The later of the caller's reading and this host's clock now, under its floor, once the
+    /// daemon has bound it; the caller's reading alone until then.
+    fn bound_at_effect(&self, expiry: GrantExpiry, admitted_ms: u64) -> Bound {
+        match self.host_clock.get() {
+            Some(floor) => floor.bound(expiry, admitted_ms.max(kr_ipc::now_ms().get())),
+            None => Bound {
+                at_ms: admitted_ms,
+                passed: !expiry.is_valid_at(admitted_ms),
+                recorded: true,
+                owed: false,
+            },
+        }
     }
 
     fn with<T>(&self, body: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T> {
@@ -373,7 +432,9 @@ impl GrantDirectory {
         // is asked in the same place, for the same reason: the wait for the store's lock and the
         // parent read can each outlast it.
         self.in_transaction(|connection| {
-            check_parent(connection, record)?;
+            check_parent(connection, record, |expiry, at| {
+                self.passed_at_effect(expiry, at)
+            })?;
             still_admitted()?;
             write_grant(connection, record, &encoded)
         })
@@ -689,7 +750,9 @@ impl GrantDirectory {
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         let recipient = record.grant.recipient_device_id;
         self.in_transaction(|connection| {
-            check_parent(connection, record)?;
+            check_parent(connection, record, |expiry, at| {
+                self.passed_at_effect(expiry, at)
+            })?;
             still_admitted()?;
             write_grant(connection, record, &encoded_grant)?;
             let written = connection
@@ -770,7 +833,23 @@ impl GrantDirectory {
             if invitation.recipient_device_id != device_id {
                 return Ok(Err(refusal("that invitation was issued to another device")));
             }
-            match invitation.state_at(now_ms) {
+            // Both deadlines are decided at the moment of the redemption. A lapse found here is
+            // written down with the invitation, in this commit, so it needs no clock floor to
+            // outlive a restart; anything else that reads the clock waits for the floor's record.
+            let invitation_bound = self.bound_at_effect(
+                GrantExpiry::At {
+                    expires_at_ms: invitation.preview.expires_at_ms,
+                },
+                now_ms,
+            );
+            match invitation.state {
+                InvitationState::Open if invitation_bound.passed => {
+                    settle_invitation(connection, invitation_id, InvitationState::Expired)?;
+                    return Ok(Err(refusal("this invitation has expired")));
+                }
+                InvitationState::Open if invitation_bound.owed => {
+                    return Ok(Err(unrecorded()));
+                }
                 InvitationState::Open => {}
                 InvitationState::Redeemed => {
                     return Ok(Err(refusal("this invitation has already been redeemed")));
@@ -779,7 +858,6 @@ impl GrantDirectory {
                     return Ok(Err(refusal("this invitation was withdrawn")));
                 }
                 InvitationState::Expired => {
-                    settle_invitation(connection, invitation_id, InvitationState::Expired)?;
                     return Ok(Err(refusal("this invitation has expired")));
                 }
             }
@@ -789,9 +867,13 @@ impl GrantDirectory {
             if record.revoked_at_ms.is_some() {
                 return Ok(Err(refusal("that invitation's grant has been revoked")));
             }
-            if !record.grant.expiry.is_valid_at(now_ms) {
+            let grant_bound = self.bound_at_effect(record.grant.expiry, now_ms);
+            if grant_bound.passed {
                 settle_invitation(connection, invitation_id, InvitationState::Expired)?;
                 return Ok(Err(refusal("that invitation has expired")));
+            }
+            if grant_bound.owed {
+                return Ok(Err(unrecorded()));
             }
             let activated = connection
                 .execute(
@@ -892,7 +974,10 @@ impl GrantDirectory {
                     detail: "a grant nobody has redeemed carries no control to transfer".to_owned(),
                 });
             }
-            if source.revoked_at_ms.is_some() || !source.grant.expiry.is_valid_at(now_ms) {
+            // Its expiry at the moment of the transfer, not at the moment it was asked for.
+            if source.revoked_at_ms.is_some()
+                || self.passed_at_effect(source.grant.expiry, now_ms)?
+            {
                 return Err(ControllerError::PermissionDenied {
                     detail: "that grant is no longer valid, so there is no control to transfer"
                         .to_owned(),
@@ -1227,8 +1312,14 @@ type Row = Result<GrantRecord>;
 ///
 /// The parent has to exist, be **active**, be live, and be narrowed by the child. Active matters:
 /// a proposal nobody has redeemed authorises nothing, so delegating from one would turn authority
-/// that does not exist yet into authority that does.
-fn check_parent(connection: &Connection, record: &GrantRecord) -> Result<()> {
+/// that does not exist yet into authority that does. Live is decided at the effect
+/// (`bound_at_effect`), not only at the moment the child was proposed: a parent that expired while
+/// the delegation waited for this transaction delegates nothing.
+fn check_parent(
+    connection: &Connection,
+    record: &GrantRecord,
+    passed_at_effect: impl FnOnce(GrantExpiry, u64) -> Result<bool>,
+) -> Result<()> {
     let Some(parent_grant_id) = record.grant.parent_grant_id.as_ref().copied() else {
         return Ok(());
     };
@@ -1249,7 +1340,7 @@ fn check_parent(connection: &Connection, record: &GrantRecord) -> Result<()> {
             detail: "the grant this one delegates from has been revoked".to_owned(),
         });
     }
-    if !parent.grant.expiry.is_valid_at(record.issued_at_ms) {
+    if passed_at_effect(parent.grant.expiry, record.issued_at_ms)? {
         return Err(ControllerError::PermissionDenied {
             detail: "the grant this one delegates from has expired".to_owned(),
         });
@@ -1421,6 +1512,15 @@ fn migrate_receipts(connection: &Connection) -> Result<()> {
             .map_err(ControllerError::registry)?;
     }
     transaction.commit().map_err(ControllerError::registry)
+}
+
+/// The refusal of an effect whose time bound this host cannot decide now, because the clock floor
+/// it would stand on is owed its record ([`UtcFloor::bound`]). It passes once the floor is written.
+fn unrecorded() -> ControllerError {
+    ControllerError::Refused {
+        code: ErrorCode::StorageUnavailable,
+        detail: super::FLOOR_UNRECORDED.to_owned(),
+    }
 }
 
 /// A refusal a transaction returns as a value, so its own writes still commit.

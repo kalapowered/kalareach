@@ -381,18 +381,6 @@ pub struct Controller {
     /// delivery runtime intersects an external destination's grant with the same policy at every
     /// question, and the automation service decides each node it dispatches under it.
     policy: Arc<std::sync::Mutex<crate::grants::HostPolicy>>,
-    /// The highest clock floor a decision this daemon took on it is owed the record of.
-    ///
-    /// A refusal the clock decided has to outlive this process: a clock wound back before the next
-    /// start would otherwise find the floor as it was last written and allow what was refused. The
-    /// write can fail, so the debt is kept rather than dropped: the record is owed while this is
-    /// above [`Self::floor_written`]. Both only rise, so a decision owes its floor from wherever it
-    /// was taken, a poll that cannot wait for the policy's lock included, and a write can only
-    /// settle the floor it carried. Every later decision on the floor, the relay once a batch is
-    /// refused, and the network's record task write the floor again until a write lands.
-    floor_owed: std::sync::atomic::AtomicU64,
-    /// The highest clock floor this daemon has written down.
-    floor_written: std::sync::atomic::AtomicU64,
     /// Moves whenever something a paired device's authority is decided from changes: this host's
     /// policy, or the rights ceiling in force.
     ///
@@ -408,6 +396,14 @@ pub struct Controller {
     /// lock. This is the same floor the lock guards, not a copy of it: whoever raises it under the
     /// lock, the automation path included, raises what the poll reads, and the reading the poll
     /// takes raises what every later decision stands on.
+    ///
+    /// It also keeps what is owed a record. A refusal the clock decided has to outlive this
+    /// process: a clock wound back before the next start would otherwise find the floor as it was
+    /// last written and allow what was refused. The write can fail, so the debt is kept rather than
+    /// dropped, and while it is owed no decision that reads the clock is taken
+    /// ([`crate::grants::policy::UtcFloor::bound`]). Every later decision on the floor, the relay
+    /// once a batch is refused, and the network's record task write the floor again until a write
+    /// lands.
     utc_floor: Arc<crate::grants::policy::UtcFloor>,
     /// The time the bounded offline validity has spent, kept on the continuous clock
     /// ([`net::OfflineAnchor`]).
@@ -694,9 +690,25 @@ impl Controller {
             Some(stored) => crate::grants::HostPolicy::restore(&stored, authority_revision),
             None => crate::grants::HostPolicy::personal(authority_revision),
         };
-        sharing.grants().store_policy(&policy.snapshot())?;
         let utc_floor = Arc::clone(policy.utc_floor());
-        let floor_written = policy.utc_floor_ms();
+        // The store decides a grant's time bound at the moment of its effect, on this host's own
+        // clock and under the floor every other decision stands on.
+        sharing.grants().bind_host_clock(Arc::clone(&utc_floor));
+        // Written down again with the revision the registry reached. A start that cannot write it
+        // still starts, with its floor owed its record: no decision that reads the clock is taken
+        // until a write lands, and a personal grant that never expires is used as before. Stopping
+        // instead would leave no daemon at all while the store is full.
+        let snapshot = policy.snapshot();
+        match sharing.grants().store_policy(&snapshot) {
+            Ok(()) => utc_floor.wrote(snapshot.utc_floor_ms.get()),
+            Err(error) => {
+                eprintln!(
+                    "kr-controller: could not write this host's policy at start, so no decision \
+                     that reads the clock is taken until it can: {error}"
+                );
+                utc_floor.could_not_write();
+            }
+        }
         let policy = Arc::new(std::sync::Mutex::new(policy));
         let mut feed = match sharing.grants().stored_feed()? {
             Some(stored) => crate::grants::AuthorityFeed::restore(&stored),
@@ -824,8 +836,6 @@ impl Controller {
             delivery_runtime,
             devices,
             policy,
-            floor_owed: std::sync::atomic::AtomicU64::new(0),
-            floor_written: std::sync::atomic::AtomicU64::new(floor_written),
             authority_epoch: std::sync::atomic::AtomicU64::new(0),
             utc_floor,
             offline_anchor: std::sync::Mutex::new(offline_anchor),
@@ -1804,11 +1814,16 @@ impl Controller {
         crate::sharing::ControlTransfer,
         kr_protocol::sharing::RevocationResult,
     )> {
+        // Written down before anything is decided from it. The transfer decides the source's expiry
+        // again at the moment it writes, and a lapse it finds there is owed its record, which is
+        // written before the refusal goes back.
         let now_ms = self.settled_now_ms();
         let revision = self.policy().authority_revision();
         let transfer =
             self.sharing
-                .transfer_control(plan, confirmation, &PairingTime, revision, now_ms)?;
+                .transfer_control(plan, confirmation, &PairingTime, revision, now_ms);
+        self.settle_floor();
+        let transfer = transfer?;
         let completed = self
             .complete_revocation(transfer.revoked.revoked.iter().copied().collect(), now_ms)
             .await?;
@@ -1909,10 +1924,7 @@ impl Controller {
         )?;
         let snapshot = candidate.snapshot();
         self.sharing.grants().store_policy(&snapshot)?;
-        self.floor_written.fetch_max(
-            snapshot.utc_floor_ms.get(),
-            std::sync::atomic::Ordering::SeqCst,
-        );
+        self.utc_floor.wrote(snapshot.utc_floor_ms.get());
         if next != previous
             && let Err(error) = self
                 .devices
@@ -1928,26 +1940,29 @@ impl Controller {
         Ok(value)
     }
 
-    /// The reading this daemon decides expiry from.
+    /// The reading this daemon's own requests start from, written down before it is used.
     ///
     /// The later of this machine's clock and the highest reading this host has already decided
     /// from, and the floor rises with it. A clock wound back past a deadline therefore does not
-    /// revive a grant this host has already refused.
+    /// revive a grant this host has already refused. The floor is written down here, before the
+    /// caller decides anything from it, so a grant found expired at this reading is found expired
+    /// by every later start too.
+    ///
+    /// A write that fails leaves the floor raised in memory, because a floor only moves forward
+    /// and keeping it is the stricter answer, and leaves it owed its record. The reading still
+    /// dates what the caller writes: a revocation takes authority away whatever the clock says.
+    /// What it no longer does is decide a time bound. Every decision that reads the clock goes
+    /// through [`crate::grants::policy::UtcFloor::bound`], which refuses while the floor is owed
+    /// its record, so a store that cannot take the floor stops expiry decisions rather than
+    /// letting them stand on a floor the next start will not find.
     fn settled_now_ms(&self) -> u64 {
         let now_ms = kr_ipc::now_ms().get();
-        // The floor is raised in memory first and kept whether or not the write succeeds. It only
-        // ever moves forward, so publishing it before it is persisted can make this host stricter
-        // and never laxer, and dropping it after a failed write would let the next reading be an
-        // earlier one.
         let mut policy = self
             .policy
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         policy.observe_utc(now_ms);
         let settled = policy.settled_now(now_ms);
-        // Whatever the caller decides from this reading stands on the floor, so the floor is owed
-        // its record. A failure leaves the raised floor in memory, because a floor only moves
-        // forward and keeping it is the stricter answer, and leaves the record owed.
         self.owe_floor(&policy);
         settled
     }
@@ -1958,8 +1973,7 @@ impl Controller {
     /// other write of the policy: two callers cannot reach the store out of order and leave the
     /// older floor on disk.
     pub(crate) fn owe_floor(&self, policy: &std::sync::MutexGuard<'_, crate::grants::HostPolicy>) {
-        self.floor_owed
-            .fetch_max(self.utc_floor.get(), std::sync::atomic::Ordering::SeqCst);
+        self.utc_floor.owe_current();
         self.write_owed_floor(policy);
     }
 
@@ -1972,20 +1986,14 @@ impl Controller {
         &self,
         policy: &std::sync::MutexGuard<'_, crate::grants::HostPolicy>,
     ) {
-        let owed = self.floor_owed.load(std::sync::atomic::Ordering::SeqCst);
-        if owed <= self.floor_written.load(std::sync::atomic::Ordering::SeqCst) {
+        if !self.utc_floor.is_owed() {
             return;
         }
         // The floor as it stands is never below what is owed: the debt was taken from it, and it
         // only rises.
         let snapshot = policy.snapshot();
         match self.sharing.grants().store_policy(&snapshot) {
-            Ok(()) => {
-                self.floor_written.fetch_max(
-                    snapshot.utc_floor_ms.get(),
-                    std::sync::atomic::Ordering::SeqCst,
-                );
-            }
+            Ok(()) => self.utc_floor.wrote(snapshot.utc_floor_ms.get()),
             Err(error) => eprintln!(
                 "kr-controller: could not record the clock floor this host decided from: {error}"
             ),
@@ -2010,8 +2018,7 @@ impl Controller {
     /// owes nothing more.
     pub(crate) fn keep_lapse(&self, at_ms: u64) {
         self.utc_floor.observe(at_ms);
-        self.floor_owed
-            .fetch_max(at_ms, std::sync::atomic::Ordering::SeqCst);
+        self.utc_floor.owe(at_ms);
     }
 
     /// The epoch a paired device's authority is decided at now.
@@ -2106,9 +2113,7 @@ impl Controller {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.write_owed_floor(&policy);
-        if self.floor_written.load(std::sync::atomic::Ordering::SeqCst)
-            < self.floor_owed.load(std::sync::atomic::Ordering::SeqCst)
-        {
+        if self.utc_floor.is_owed() {
             return Err(unwritten());
         }
         let waited = self.clock.now().saturating_duration_since(read_at);
@@ -2158,7 +2163,7 @@ impl Controller {
                 // would otherwise revive, so it is answered only once its floor is on disk.
                 let floor = policy.utc_floor_ms();
                 self.owe_floor(&policy);
-                if self.floor_written.load(std::sync::atomic::Ordering::SeqCst) < floor {
+                if self.utc_floor.written() < floor {
                     return unwritten();
                 }
             }
@@ -5364,6 +5369,13 @@ impl Controller {
             // invitation's lifetime runs from it.
             now_ms: claimed_at_ms,
         };
+        // A delegation decides its parent's expiry at the moment it writes. The floor goes down
+        // first, so a parent that expired before this request is refused as expired rather than
+        // as a reading this host has not written down; a lapse found at the write itself is owed
+        // its record, which is written before the refusal goes back.
+        if request.parent_grant_id.is_some() {
+            self.settled_now_ms();
+        }
         // The admission is checked under the registry lock, and again inside the transaction that
         // writes the grant. Between the two are the preview, the delegation checks and the wait
         // for the grant store's own lock, and a window that was open when this began can be shut
@@ -5372,9 +5384,10 @@ impl Controller {
         self.check_admission(&registry, &carried)?;
         let result = self
             .sharing
-            .share(&request, || self.check_admission(&registry, &carried))?;
+            .share(&request, || self.check_admission(&registry, &carried));
         drop(registry);
-        encode(&result)
+        self.settle_floor();
+        encode(&result?)
     }
 
     /// Revokes a grant, its descendants, and everything they were being used for.

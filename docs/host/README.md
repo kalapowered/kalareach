@@ -1649,9 +1649,14 @@ What the grant decides, for every request:
   and this host's wall clock with the floor under it, which a clock stepped forward or another
   decision can move first. Either way the connection ends with its subscription, and the expiry is
   written to the device's record, so the device cannot connect again. A refusal the wall clock
-  decided also writes that floor down; a write that fails is retried by every later decision and
-  by the network's record task until one lands, so a restart after a rollback finds the floor the
-  refusal stood on.
+  decided also writes that floor down. A write that fails is retried by every later decision and
+  by the network's record task, and until one lands the floor is owed its record: no decision that
+  reads the clock is taken, so a request under a grant that expires, under an organisation's lease
+  or under this host's offline bound is refused as unrecorded, while a grant that never expires is
+  used as before. A daemon that starts and cannot write its floor starts in the same state, and
+  leaves it once a write lands. A daemon that stops before the floor is written starts on the older
+  floor; what keeps the device out then is the expiry on its record, which is retried the same way
+  until it lands.
 * **Selectors.** The environment and the session the request names have to be ones the grant
   admits. A listing names no session, so the *answer* is narrowed instead: a device is told about
   the sessions its grant admits and no others.

@@ -26,11 +26,11 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use kr_protocol::account::{MEMBERSHIP_LEASE_MAX_LIFETIME_MS, MembershipLease};
 use kr_protocol::actor::ActorIngress;
-use kr_protocol::grant::Grant;
+use kr_protocol::grant::{Grant, GrantExpiry};
 use kr_protocol::ids::{AccountId, AuthorityRevision, OrganisationId, PolicyKeyRevision};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::CanonicalSet;
@@ -77,7 +77,8 @@ pub enum LeaseRefused {
     AboveRoleCeiling,
 }
 
-/// The highest UTC reading this host has decided anything from.
+/// The highest UTC reading this host has decided anything from, and whether that reading is on
+/// disk.
 ///
 /// Expiry is decided from the later of this and the clock. Without it, a clock wound back past a
 /// deadline would revive a grant this host has already refused: section 24 asks for expiry to be
@@ -91,14 +92,70 @@ pub enum LeaseRefused {
 /// decision raised a moment ago under the lock; and a reading that reader takes itself raises the
 /// same floor every later decision stands on. A copy kept beside the policy would fall behind
 /// whenever something raised the floor without updating the copy.
+///
+/// # What a decision may stand on
+///
+/// The floor in memory is only as good as its record. A daemon that stops before a raised floor is
+/// written down starts again on the older one, and after a clock wound back it would decide the
+/// other way. So the floor also keeps what is owed a record: the highest floor a decision stood on
+/// that has to outlive this process, beside the highest floor written down. While the first is
+/// ahead of the second, or while a start could not write the floor at all, the floor is **owed its
+/// record**. [`Self::bound`] is the one rule every decision about a time bound is taken through: a
+/// bound that can pass is not decided while the floor is owed its record, and a bound that has
+/// passed says whether the floor on disk already covers the moment it passed. An effect in the
+/// grant store refuses a lapse the floor does not cover yet and owes its record; a decision on a
+/// request answers the lapse and its caller writes the record straight after. A bound that never
+/// passes stands on no floor and is decided as before, so a personal grant that never expires is
+/// untouched by any of this.
 #[derive(Debug, Default)]
-pub struct UtcFloor(AtomicU64);
+pub struct UtcFloor {
+    /// The highest reading decided from.
+    floor: AtomicU64,
+    /// The highest floor a decision stood on that is owed its record.
+    owed: AtomicU64,
+    /// The highest floor written down.
+    written: AtomicU64,
+    /// True while no write of the floor is known to have landed since this daemon started.
+    unwritten: AtomicBool,
+}
+
+/// What one time bound comes to at one reading of this host's clock ([`UtcFloor::bound`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bound {
+    /// The reading it was decided at: the later of the clock and the floor.
+    pub at_ms: u64,
+    /// Whether the bound has passed at that reading.
+    pub passed: bool,
+    /// Whether the floor on disk covers the moment it passed. A bound that has not passed has
+    /// nothing to cover.
+    pub recorded: bool,
+    /// Whether the floor is owed its record, so that no bound which can pass is decided now.
+    /// Never set for a bound that never passes.
+    pub owed: bool,
+}
+
+impl Bound {
+    /// Whether this may be answered as it stands: nothing is owed a record, and a bound that has
+    /// passed did so at a moment the floor on disk covers.
+    ///
+    /// A caller that writes its own durable record of the lapse in the same commit as its answer,
+    /// as a redemption that marks its invitation expired does, may answer a lapse without it.
+    #[must_use]
+    pub const fn answerable(&self) -> bool {
+        !self.owed && self.recorded
+    }
+}
 
 impl UtcFloor {
-    /// A floor at `floor_ms`.
+    /// A floor at `floor_ms`, read back from where it was written down.
     #[must_use]
     pub const fn at(floor_ms: u64) -> Self {
-        Self(AtomicU64::new(floor_ms))
+        Self {
+            floor: AtomicU64::new(floor_ms),
+            owed: AtomicU64::new(0),
+            written: AtomicU64::new(floor_ms),
+            unwritten: AtomicBool::new(false),
+        }
     }
 
     /// Raises the floor to `now_ms` when that is later, and returns the reading this host decides
@@ -108,7 +165,7 @@ impl UtcFloor {
     /// already says what a host does about that; what this guarantees is that it does not become a
     /// second chance for something already expired. It never waits, so a poll may call it.
     pub fn observe(&self, now_ms: u64) -> u64 {
-        self.0.fetch_max(now_ms, Ordering::SeqCst).max(now_ms)
+        self.floor.fetch_max(now_ms, Ordering::SeqCst).max(now_ms)
     }
 
     /// The reading this host decides from at `now_ms`, without raising the floor.
@@ -120,7 +177,69 @@ impl UtcFloor {
     /// The floor.
     #[must_use]
     pub fn get(&self) -> u64 {
-        self.0.load(Ordering::SeqCst)
+        self.floor.load(Ordering::SeqCst)
+    }
+
+    /// Records that a decision stood on the floor at `at_ms` and is owed its record.
+    pub fn owe(&self, at_ms: u64) {
+        self.owed.fetch_max(at_ms, Ordering::SeqCst);
+    }
+
+    /// Records that a decision stood on the floor as it stands and is owed its record.
+    pub fn owe_current(&self) {
+        self.owe(self.get());
+    }
+
+    /// Records that the floor has been written down up to `floor_ms`.
+    pub fn wrote(&self, floor_ms: u64) {
+        self.written.fetch_max(floor_ms, Ordering::SeqCst);
+        self.unwritten.store(false, Ordering::SeqCst);
+    }
+
+    /// Records that a start could not write the floor down, so it is owed its record until a write
+    /// lands.
+    pub fn could_not_write(&self) {
+        self.unwritten.store(true, Ordering::SeqCst);
+    }
+
+    /// The highest floor written down.
+    #[must_use]
+    pub fn written(&self) -> u64 {
+        self.written.load(Ordering::SeqCst)
+    }
+
+    /// Whether the floor is owed its record.
+    #[must_use]
+    pub fn is_owed(&self) -> bool {
+        self.unwritten.load(Ordering::SeqCst)
+            || self.owed.load(Ordering::SeqCst) > self.written.load(Ordering::SeqCst)
+    }
+
+    /// Decides one time bound at `now_ms`, the later of it and the floor, raising the floor.
+    ///
+    /// This is the rule the floor's record imposes, in one place. A bound that never passes stands
+    /// on no floor. One that can pass is not decided while the floor is owed its record: the
+    /// answer says so, and the caller refuses rather than decides. One that has passed at a moment
+    /// the floor on disk does not cover yet is a refusal whose record is still to be written: the
+    /// caller owes the floor at [`Bound::at_ms`], and answers the lapse only once that record is
+    /// written, or answers it and writes it straight after, as a paired device's decision does.
+    pub fn bound(&self, expiry: GrantExpiry, now_ms: u64) -> Bound {
+        let at_ms = self.observe(now_ms);
+        let GrantExpiry::At { expires_at_ms } = expiry else {
+            return Bound {
+                at_ms,
+                passed: false,
+                recorded: true,
+                owed: false,
+            };
+        };
+        let passed = !expiry.is_valid_at(at_ms);
+        Bound {
+            at_ms,
+            passed,
+            recorded: !passed || self.written() >= expires_at_ms.get(),
+            owed: self.is_owed(),
+        }
     }
 }
 
@@ -181,6 +300,22 @@ impl HostPolicy {
     #[must_use]
     pub fn utc_floor_ms(&self) -> u64 {
         self.utc_floor.get()
+    }
+
+    /// Whether deciding `grant` for a caller on `ingress` reads this host's clock.
+    ///
+    /// A grant that expires does, and so does one whose use this policy bounds by time: an
+    /// organisation's grant, which answers to a lease; any personal grant on a host enrolled as
+    /// exclusively organisation-managed, which answers to a lease too; and a personal grant used
+    /// remotely under a bounded offline validity. A personal grant that never expires, used from
+    /// this machine or where the owner chose no offline bound, reads no clock, which is what
+    /// section 9 keeps usable while this host cannot vouch for its clock.
+    #[must_use]
+    pub fn stands_on_the_clock(&self, grant: &Grant, ingress: ActorIngress) -> bool {
+        grant.expiry != GrantExpiry::Never
+            || grant.organisation.as_ref().is_some()
+            || self.exclusively_managed
+            || (ingress != ActorIngress::LocalIpc && self.offline.is_some())
     }
 
     /// The floor itself, for a reader that holds it beside the policy rather than behind its lock.
