@@ -2478,6 +2478,112 @@ async fn a_relay_quota_disconnect_leaves_the_terminal_worker_running() {
     daemon.stop().await;
 }
 
+// Ignored by default like the rest of this suite: the host fixture needs the worker binary that
+// `scripts/end-to-end.sh` builds, and that script runs the suite with `--include-ignored`.
+/// KR-REQ-17.40: an exhausted relay is reported as the reason a new connection fails, and it takes
+/// nothing that does not need it. A host and two paired devices, one with a direct path and one
+/// whose only path is the relay; then the relay's allowance is spent, and the relay closes what it
+/// admitted and turns away whoever comes back. The connection already established on its direct
+/// path carries on, and a new connection made with the direct addresses the invitation carried
+/// succeeds. A new connection that needs the relay fails, and the failure says that the relay's
+/// allowance is spent, rather than looking like a host that went away.
+#[ignore = "starts a control daemon; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exhausted_relay_is_the_reported_reason_a_new_connection_fails() {
+    let Some(host) = Host::create() else {
+        return;
+    };
+    let relay = LocalRelay::spawn().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    // The host has its direct path and the relay.
+    let daemon = host.start(relay.config(), &owner).await;
+    let host_id = iroh::PublicKey::from_bytes(daemon.network.endpoint_id().as_bytes())
+        .expect("a usable endpoint identity");
+
+    // A device with a direct path, paired by an invitation whose direct addresses it keeps, and
+    // connected on its direct path.
+    let direct = Device::create(&relay.config()).await;
+    let proposed = proposal();
+    let mut client = daemon.client().await;
+    let invited = invite(&daemon, &mut client, &owner, &proposed).await;
+    let hints: Vec<std::net::SocketAddr> = pairing_calls::direct_payload(&invited)
+        .network_config
+        .direct_addresses
+        .iter()
+        .map(|hint| hint.as_str().parse().expect("a socket address"))
+        .collect();
+    assert!(!hints.is_empty(), "the invitation carries direct addresses");
+    let direct_record = redeem(&daemon, &mut client, &direct, &owner, &invited).await;
+    let established = connect(&daemon, &direct, &direct_record).await;
+
+    // A device whose only path is the relay, paired over it while the allowance lasts.
+    let relayed = Device::create(&relay.relay_only_config()).await;
+    let relayed_record = pair(&daemon, &relayed, &owner).await;
+
+    // The allowance is spent from here on, and the relay closes what it admitted.
+    relay.allow_only(0);
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    while !relay.refused().contains(&relayed.endpoint.id()) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the relay never turned the relayed device away"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Already-established direct paths are unaffected.
+    let listed: kr_protocol::session::SessionListResult = established
+        .read(
+            Method::SessionList,
+            &kr_protocol::session::SessionListParams {
+                environment_id: Nullable::null(),
+                include_closed: true,
+            },
+        )
+        .await
+        .expect("the established direct connection still answers");
+    assert!(listed.sessions.is_empty());
+
+    // A new connection made with the direct addresses the invitation carried succeeds.
+    let mut by_hints = EndpointAddr::new(host_id);
+    for hint in &hints {
+        by_hints = by_hints.with_ip_addr(*hint);
+    }
+    let again = NetworkTransport::connect(
+        &direct.endpoint,
+        by_hints,
+        &direct.paired_identity(direct_record.device_id),
+        &host_paired_record(&daemon),
+        SendLimits::default(),
+    )
+    .await
+    .expect("a new connection by the invitation's direct addresses");
+    drop(again);
+
+    // A new connection that needs the relay fails, and the failure says why.
+    let refused = NetworkTransport::connect(
+        &relayed.endpoint,
+        EndpointAddr::new(host_id).with_relay_url(relay.url.clone()),
+        &relayed.paired_identity(relayed_record.device_id),
+        &host_paired_record(&daemon),
+        SendLimits::default(),
+    )
+    .await
+    .expect_err("nothing reaches the host through a relay that refuses");
+    let report = refused.to_string().to_lowercase();
+    assert!(
+        report.contains("relay")
+            && ["allowance", "exhaust", "quota", "capacity"]
+                .iter()
+                .any(|word| report.contains(word)),
+        "the failure says the relay's allowance is spent, rather than looking like a host that \
+         went away: {refused}"
+    );
+
+    drop(established);
+    daemon.stop().await;
+}
+
 /// A grant that sees one session and may type in it, and claims nothing else.
 fn viewer_proposal(session_selector: SessionSelector) -> ProposedGrant {
     ProposedGrant {
