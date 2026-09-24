@@ -14,7 +14,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use iroh::endpoint::{
-    Builder, ConnectError, ConnectingError, Connection, ConnectionError, QuicTransportConfig,
+    Builder, ConnectOptions, ConnectingError, Connection, ConnectionError, QuicTransportConfig,
     RelayStatus, presets,
 };
 use iroh::{
@@ -149,9 +149,12 @@ async fn bind(
 /// relay on the route that is not this endpoint's home relay leaves no reason to read, so a failure
 /// through it is reported as any other failure is.
 ///
-/// A refusal explains only a failure in which nothing answered: an attempt that timed out. A peer
-/// that answered and refused, an endpoint that was closing and a request this endpoint could not
-/// make are each their own reason, whatever a relay said at the time.
+/// A refusal is reported only for an attempt that was made and then timed out before any
+/// connection was established. A request this endpoint could not make, a peer that closed, reset
+/// or refused the handshake and an endpoint that was closing are each their own reason, whatever a
+/// relay said at the time. The timeout alone does not prove the refusal caused it: a peer that began
+/// the handshake and fell silent times out the same way. What is reported is that a relay on the
+/// route had turned this endpoint away when the attempt ran out.
 ///
 /// An endpoint with no IP transport of its own has nothing but relays to try, so once every relay
 /// on its route has refused it the attempt ends there rather than at its deadline. An endpoint that
@@ -160,8 +163,8 @@ async fn bind(
 ///
 /// # Errors
 ///
-/// Returns [`TransportError::RelayRefused`] when a relay on the route refused this endpoint and
-/// nothing else reached the peer, and [`TransportError::Connect`] for any other failure.
+/// Returns [`TransportError::RelayRefused`] when a relay on the route had refused this endpoint as
+/// described, and [`TransportError::Connect`] for any other failure.
 pub async fn connect(
     endpoint: &Endpoint,
     peer: impl Into<EndpointAddr>,
@@ -171,8 +174,14 @@ pub async fn connect(
     let peer_id = peer.id;
     let named: BTreeSet<RelayUrl> = peer.relay_urls().cloned().collect();
     let direct = !endpoint.bound_sockets().is_empty();
+    // The request is made first, and a request that cannot be made fails as itself: no relay has
+    // anything to do with an address this endpoint cannot dial or a protocol it cannot name.
+    let connecting = endpoint
+        .connect_with_opts(peer, alpn, ConnectOptions::default())
+        .await
+        .map_err(|error| TransportError::Connect(error.to_string()))?;
     through_relays(
-        endpoint.connect(peer, alpn),
+        connecting,
         HomeRelays(endpoint.home_relay_status()),
         direct,
         || route(endpoint, peer_id, &named),
@@ -180,16 +189,16 @@ pub async fn connect(
     .await
 }
 
-/// Runs one connection attempt while following what this endpoint's relays say, and decides what a
-/// failure of it is.
+/// Runs one attempt that has been made while following what this endpoint's relays say, and
+/// decides what a failure of it is.
 ///
-/// The status holds its latest value and no history of it, so it is read afresh at every point a
-/// decision rests on it: before a relay-only endpoint gives up, after the route is read, because
-/// reading it waits, and when the attempt has failed, because the change that explains the failure
-/// can arrive together with it.
+/// Every value the status delivers is taken in as it is delivered, and the status is read afresh
+/// wherever a decision rests on it: before a relay-only endpoint gives up, after the route is read,
+/// because reading it waits, and when the attempt has failed. When a change and the attempt's end
+/// are ready at once, the change is taken in first.
 async fn through_relays<T, S, F, R>(
-    attempt: impl Future<Output = std::result::Result<T, ConnectError>>,
-    mut statuses: S,
+    attempt: impl Future<Output = std::result::Result<T, ConnectingError>>,
+    statuses: S,
     direct: bool,
     mut route: F,
 ) -> Result<T>
@@ -198,61 +207,56 @@ where
     F: FnMut() -> R,
     R: Future<Output = BTreeSet<RelayUrl>>,
 {
-    let mut refusals = Refusals::default();
+    let mut followed = Followed::new(statuses);
     let mut watching = true;
     tokio::pin!(attempt);
     loop {
-        refusals.observe(statuses.now());
+        followed.refresh();
         if !direct {
             let relays = route().await;
-            refusals.observe(statuses.now());
-            if let Some((relay, reason)) = refusals.throughout(&relays) {
+            followed.refresh();
+            if let Some((relay, reason)) = followed.refusals().throughout(&relays) {
                 return Err(refused(relay, reason, direct));
             }
         }
         tokio::select! {
+            biased;
+            changed = std::future::poll_fn(|context| followed.poll_changed(context)), if watching => {
+                // A status whose endpoint has gone will change no more, and the attempt ends on its
+                // own.
+                if !changed {
+                    watching = false;
+                }
+            }
             outcome = &mut attempt => {
                 let error = match outcome {
                     Ok(connected) => return Ok(connected),
                     Err(error) => error,
                 };
-                if !nothing_answered(&error) {
+                if !timed_out_unconnected(&error) {
                     return Err(TransportError::Connect(error.to_string()));
                 }
                 let relays = route().await;
-                refusals.observe(statuses.now());
-                return Err(match refusals.on(&relays) {
+                followed.refresh();
+                return Err(match followed.refusals().on(&relays) {
                     Some((relay, reason)) => refused(relay, reason, direct),
                     None => TransportError::Connect(error.to_string()),
                 });
-            }
-            changed = std::future::poll_fn(|context| statuses.poll_changed(context)), if watching => {
-                // What changed is read at the top of the loop. A status whose endpoint has gone
-                // will change no more, and the attempt ends on its own.
-                if !changed {
-                    watching = false;
-                }
             }
         }
     }
 }
 
-/// Whether a failed attempt failed for want of any path that answered.
+/// Whether an attempt that was made failed by timing out before any connection was established.
 ///
-/// That is the only failure a relay's refusal can explain. Every other one says something answered
-/// or something here stopped the attempt: a peer that closed or reset it, a handshake that failed,
-/// an endpoint that was closing, a request that could not be made at all.
-fn nothing_answered(error: &ConnectError) -> bool {
+/// That is the only failure a relay's refusal may be reported for. Every other one says something
+/// answered or something here ended the attempt: a peer that closed or reset it, a handshake that
+/// failed, an endpoint that was closing.
+fn timed_out_unconnected(error: &ConnectingError) -> bool {
     matches!(
         error,
-        ConnectError::Connection {
+        ConnectingError::ConnectionError {
             source: ConnectionError::TimedOut,
-            ..
-        } | ConnectError::Connecting {
-            source: ConnectingError::ConnectionError {
-                source: ConnectionError::TimedOut,
-                ..
-            },
             ..
         }
     )
@@ -308,9 +312,9 @@ trait RelayStatuses {
     /// Returns the status as it stands now, which is every relay it reports on.
     fn now(&mut self) -> Vec<RelayObservation>;
 
-    /// Returns whether the status changed since it was last read, and arranges to be woken when it
-    /// does. `Ready(false)` means it never will again.
-    fn poll_changed(&mut self, context: &mut Context<'_>) -> Poll<bool>;
+    /// Returns the value the status took when it last changed since it was last read, and arranges
+    /// to be woken when it changes. `Ready(None)` means it never will again.
+    fn poll_next(&mut self, context: &mut Context<'_>) -> Poll<Option<Vec<RelayObservation>>>;
 }
 
 /// This endpoint's home relays, as iroh reports them.
@@ -321,8 +325,56 @@ impl<W: Watcher<Value = Vec<RelayStatus>>> RelayStatuses for HomeRelays<W> {
         self.0.get().iter().map(RelayObservation::of).collect()
     }
 
+    fn poll_next(&mut self, context: &mut Context<'_>) -> Poll<Option<Vec<RelayObservation>>> {
+        match self.0.poll_updated(context) {
+            Poll::Ready(Ok(())) => Poll::Ready(Some(
+                self.0.peek().iter().map(RelayObservation::of).collect(),
+            )),
+            Poll::Ready(Err(_)) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// The relay status as one attempt follows it.
+///
+/// Reading and taking in are one step here, so no value the status delivers can be decided past
+/// without being taken in: the status is read only through this, and everything read is observed
+/// before it is returned or dropped.
+struct Followed<S> {
+    statuses: S,
+    refusals: Refusals,
+}
+
+impl<S: RelayStatuses> Followed<S> {
+    fn new(statuses: S) -> Self {
+        Self {
+            statuses,
+            refusals: Refusals::default(),
+        }
+    }
+
+    /// Reads the status as it stands now and takes it in.
+    fn refresh(&mut self) {
+        let now = self.statuses.now();
+        self.refusals.observe(now);
+    }
+
+    /// Takes in the next value the status delivers. `Ready(false)` means it never will again.
     fn poll_changed(&mut self, context: &mut Context<'_>) -> Poll<bool> {
-        self.0.poll_updated(context).map(|updated| updated.is_ok())
+        match self.statuses.poll_next(context) {
+            Poll::Ready(Some(value)) => {
+                self.refusals.observe(value);
+                Poll::Ready(true)
+            }
+            Poll::Ready(None) => Poll::Ready(false),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// Returns the refusals taken in so far.
+    fn refusals(&self) -> &Refusals {
+        &self.refusals
     }
 }
 
@@ -720,61 +772,129 @@ mod tests {
         }
     }
 
-    fn timed_out() -> ConnectError {
-        ConnectError::from(ConnectionError::TimedOut)
+    fn timed_out() -> ConnectingError {
+        ConnectingError::from(ConnectionError::TimedOut)
+    }
+
+    fn redialling(name: &str) -> RelayObservation {
+        RelayObservation {
+            relay: relay(name),
+            connected: false,
+            refused: None,
+            failed: false,
+        }
     }
 
     /// A relay status a test changes at the moment it chooses.
+    ///
+    /// Each change is the value the status delivers and the value it stands at afterwards, which
+    /// are the same unless the test makes the status change again the moment it is read. A read of
+    /// the status as it stands passes over every change not yet delivered, as iroh's does.
     #[derive(Clone, Default)]
     struct Scripted(std::sync::Arc<std::sync::Mutex<ScriptedState>>);
 
     #[derive(Default)]
     struct ScriptedState {
-        value: Vec<RelayObservation>,
-        version: u64,
+        current: Vec<RelayObservation>,
+        changes: std::collections::VecDeque<(Vec<RelayObservation>, Vec<RelayObservation>)>,
         waker: Option<std::task::Waker>,
     }
 
     impl Scripted {
         fn set(&self, value: Vec<RelayObservation>) {
+            self.change(value.clone(), value);
+        }
+
+        /// Delivers `delivered` as the next change, after which the status stands at `after`.
+        fn change(&self, delivered: Vec<RelayObservation>, after: Vec<RelayObservation>) {
             let mut state = self.0.lock().expect("the scripted status");
-            state.value = value;
-            state.version += 1;
+            state.changes.push_back((delivered, after));
             if let Some(waker) = state.waker.take() {
                 waker.wake();
             }
         }
 
         fn reader(&self) -> ScriptedReader {
-            ScriptedReader {
-                shared: self.clone(),
-                seen: 0,
-            }
+            ScriptedReader(self.clone())
         }
     }
 
-    /// One reader of a scripted status, which remembers what it has read.
-    struct ScriptedReader {
-        shared: Scripted,
-        seen: u64,
-    }
+    /// The reading end of a scripted status.
+    struct ScriptedReader(Scripted);
 
     impl RelayStatuses for ScriptedReader {
         fn now(&mut self) -> Vec<RelayObservation> {
-            let state = self.shared.0.lock().expect("the scripted status");
-            self.seen = state.version;
-            state.value.clone()
+            let mut state = self.0.0.lock().expect("the scripted status");
+            while let Some((_, after)) = state.changes.pop_front() {
+                state.current = after;
+            }
+            state.current.clone()
         }
 
-        fn poll_changed(&mut self, context: &mut Context<'_>) -> Poll<bool> {
-            let mut state = self.shared.0.lock().expect("the scripted status");
-            if state.version == self.seen {
-                state.waker = Some(context.waker().clone());
-                return Poll::Pending;
+        fn poll_next(&mut self, context: &mut Context<'_>) -> Poll<Option<Vec<RelayObservation>>> {
+            let mut state = self.0.0.lock().expect("the scripted status");
+            match state.changes.pop_front() {
+                Some((delivered, after)) => {
+                    state.current = after;
+                    Poll::Ready(Some(delivered))
+                }
+                None => {
+                    state.waker = Some(context.waker().clone());
+                    Poll::Pending
+                }
             }
-            self.seen = state.version;
-            Poll::Ready(true)
         }
+    }
+
+    /// KR-REQ-17.40: a value the status delivered is taken in, although the status changed again
+    /// before it was next read. A relay that refused, then admitted the endpoint, then was dialled
+    /// again, is not the reason the attempt failed.
+    #[tokio::test]
+    async fn an_admission_the_status_delivered_is_taken_in_before_it_changes_again() {
+        let status = Scripted::default();
+        status.set(vec![refusing("relay-1", "allowance_spent: spent")]);
+        let setter = status.clone();
+        let error = through_relays(
+            async move {
+                setter.change(vec![admitted("relay-1")], vec![redialling("relay-1")]);
+                tokio::task::yield_now().await;
+                Err::<(), _>(timed_out())
+            },
+            status.reader(),
+            true,
+            || async { relays(&["relay-1"]) },
+        )
+        .await
+        .expect_err("the attempt failed");
+        assert!(matches!(error, TransportError::Connect(_)), "{error}");
+    }
+
+    /// KR-REQ-17.40: a refusal the status delivered is taken in, although the status changed again
+    /// before it was next read, and it stands while the relay is dialled again.
+    #[tokio::test]
+    async fn a_refusal_the_status_delivered_is_taken_in_before_it_changes_again() {
+        let status = Scripted::default();
+        let setter = status.clone();
+        let error = through_relays(
+            async move {
+                setter.change(
+                    vec![refusing("relay-1", "allowance_spent: spent")],
+                    vec![redialling("relay-1")],
+                );
+                tokio::task::yield_now().await;
+                Err::<(), _>(timed_out())
+            },
+            status.reader(),
+            true,
+            || async { relays(&["relay-1"]) },
+        )
+        .await
+        .expect_err("the attempt failed");
+        assert!(
+            matches!(&error, TransportError::RelayRefused(refusal)
+                if refusal.relay == relay("relay-1")),
+            "{error}"
+        );
     }
 
     /// KR-REQ-17.40: a refusal the status reports at the moment the attempt fails is still the
@@ -858,7 +978,7 @@ mod tests {
             "stopping: this relay is stopping",
         )]);
         let error = through_relays(
-            std::future::pending::<std::result::Result<(), ConnectError>>(),
+            std::future::pending::<std::result::Result<(), ConnectingError>>(),
             status.reader(),
             false,
             || async { relays(&["relay-1"]) },
@@ -879,7 +999,7 @@ mod tests {
         let status = Scripted::default();
         status.set(vec![refusing("relay-1", "allowance_spent: spent")]);
         let error = through_relays(
-            async { Err::<(), _>(ConnectError::from(ConnectionError::Reset)) },
+            async { Err::<(), _>(ConnectingError::from(ConnectionError::Reset)) },
             status.reader(),
             true,
             || async { relays(&["relay-1"]) },

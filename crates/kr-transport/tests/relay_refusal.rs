@@ -375,6 +375,42 @@ async fn a_peer_that_answered_and_refused_is_not_reported_as_the_relays_refusal(
     host.endpoint.close().await;
 }
 
+/// KR-REQ-17.40: a request the endpoint cannot make fails as itself, even for a device every relay
+/// on its route has refused. Dialling itself and naming no protocol are refused before any path is
+/// tried, so no relay has anything to do with them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_that_cannot_be_made_is_not_reported_as_the_relays_refusal() {
+    const SPENT: &str = "allowance_spent: the reserved bytes for this endpoint are spent";
+    let relay = RefusingRelay::spawn().await;
+    let host = host(&relay_only(&relay, &[&relay])).await;
+    let device = refused_device(&relay_only(&relay, &[&relay]), &relay, SPENT).await;
+    until_refused(&device, &relay.url, SPENT).await;
+
+    let itself = EndpointAddr::new(device.endpoint.id()).with_relay_url(relay.url.clone());
+    let (_, outcome) = dial(&device, itself).await;
+    let error = outcome.expect_err("an endpoint does not dial itself");
+    assert!(
+        matches!(error, TransportError::Connect(_)),
+        "dialling itself fails as itself: {error}"
+    );
+
+    let host_route = EndpointAddr::new(host.endpoint.id()).with_relay_url(relay.url.clone());
+    let outcome = tokio::time::timeout(
+        PATIENCE,
+        kr_transport::endpoint::connect(&device.endpoint, host_route, b""),
+    )
+    .await
+    .expect("the attempt ends by itself");
+    let error = outcome.expect_err("a connection names a protocol");
+    assert!(
+        matches!(error, TransportError::Connect(_)),
+        "naming no protocol fails as itself: {error}"
+    );
+
+    device.endpoint.close().await;
+    host.endpoint.close().await;
+}
+
 /// KR-REQ-17.40: a refusal is the reason for a connection only when the refusing relay is on its
 /// route. A device whose own home relay turns it away dials a host through another relay, which
 /// admits it, and connects: neither at once nor at the end is the home relay's refusal taken for

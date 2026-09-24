@@ -23,7 +23,8 @@ pub enum TransportError {
     /// A connection could not be established.
     #[error("the connection could not be established: {0}")]
     Connect(String),
-    /// A relay on the route turned this endpoint away, and nothing else reached the peer.
+    /// A relay on the route had turned this endpoint away when the attempt to reach the peer timed
+    /// out without a connection, or when it had nothing but refusing relays to try.
     ///
     /// Section 17: an exhausted bootstrap route is reported as what it is, with what may still
     /// work, and never as a peer that went away.
