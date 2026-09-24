@@ -17,7 +17,7 @@ use kr_client::services::{
     SyncRequestFence, SyncRequestStatus, SyncRevision,
 };
 use kr_client::sync::{
-    Claimed, ClientSelection, ConflictCopy, Dispatch, Outcome, PrivacyRecord, Publication,
+    Across, Claimed, ClientSelection, ConflictCopy, Dispatch, Outcome, PrivacyRecord, Publication,
     Published, Reconciled, RequestRecord, RequestRevision, RequestState, Resolutions, Restored,
     SettingValue, Settlement, StorageFeature, SyncBody, SyncCheckpoint, SyncClient, SyncError,
     SyncObject, SyncSettings, SyncStore, fresh_object_id, fresh_revision, sync_collection,
@@ -4928,6 +4928,412 @@ async fn a_refusal_from_a_collection_put_back_empty_frees_the_next_publication()
         }
     );
     assert_eq!(service.exchanges().await.len(), sent_before + 2);
+}
+
+/// Records in the shapes this device stored before a position named its history.
+///
+/// Each is the stored shape as it was, member for member, so writing one of these into a store is
+/// what a device that stored records before looks like to the build that reads them now.
+mod stored_before {
+    use kr_client::services::SyncRevision;
+    use kr_client::sync::{RequestRevision, SyncObject};
+    use kr_protocol::ids::{DraftRevision, SyncConflictId, SyncObjectId, SyncRevisionId};
+    use kr_protocol::scalars::{Bytes, Nullable, TimestampMs, U64, Uuid};
+    use kr_protocol::sync::SyncObjectKind;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Copy, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Position {
+        pub write_sequence: u64,
+        pub revision: Nullable<SyncRevision>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Checkpoint {
+        pub position: Position,
+        pub published_revision: Nullable<SyncRevisionId>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct DraftCheckpoint {
+        pub position: Position,
+        pub published_revision: Nullable<DraftRevision>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case", deny_unknown_fields)]
+    pub enum State {
+        Admitted { ciphertext: Bytes },
+        Dispatched { ciphertext: Bytes },
+        Diverged { position: Position },
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Request {
+        pub work_id: Uuid,
+        pub object_id: SyncObjectId,
+        pub kind: SyncObjectKind,
+        pub revision: RequestRevision,
+        pub expected: Nullable<Position>,
+        pub produced_under: U64,
+        pub first_signed_at_ms: Nullable<TimestampMs>,
+        pub last_signed_at_ms: Nullable<TimestampMs>,
+        pub state: State,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Publication {
+        pub object_id: SyncObjectId,
+        pub kind: SyncObjectKind,
+        pub position: Position,
+        pub published_at_ms: TimestampMs,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Copy {
+        pub conflict_id: SyncConflictId,
+        pub object_id: SyncObjectId,
+        pub offered_revision: SyncRevisionId,
+        pub retained: Nullable<SyncConflictId>,
+        pub expected: Nullable<Position>,
+        pub current: Position,
+        pub other: SyncObject,
+        pub recorded_at_ms: TimestampMs,
+    }
+
+    /// Writes one record where the store keeps it.
+    pub fn write(directory: &std::path::Path, name: String, record: &impl Serialize) {
+        std::fs::write(
+            directory.join(name),
+            kr_cbor::to_canonical_vec(record).expect("canonical bytes"),
+        )
+        .expect("written");
+    }
+
+    /// Reads one stored file strictly as the shape it had then, which only a record of exactly that
+    /// shape passes.
+    pub fn read<T: for<'de> Deserialize<'de> + Serialize>(path: &std::path::Path) -> T {
+        kr_cbor::from_canonical_slice(
+            &std::fs::read(path).expect("a stored record"),
+            &kr_cbor::Limits::DEFAULT,
+        )
+        .expect("a record in the shape it had before a position named its history")
+    }
+}
+
+#[tokio::test]
+async fn records_stored_before_positions_named_their_history_read_as_never_put_back() {
+    use stored_before::{
+        Checkpoint, Copy, DraftCheckpoint, Position, Publication, Request, State, write,
+    };
+
+    let directory = tempfile::tempdir().expect("a directory");
+    let store_path = directory.path().join("one");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let old = |write_sequence: u64| Position {
+        write_sequence,
+        revision: Nullable::some(SyncRevision::new(Uuid::from_bytes(
+            [write_sequence as u8; 16],
+        ))),
+    };
+    let theirs = object(
+        object_id,
+        2,
+        SyncBody::Settings(settings(&[("theme", "light")], &[])),
+        NOW,
+    );
+    let (sent, parked, diverged, copy) = (
+        fresh_request_id(),
+        fresh_request_id(),
+        fresh_request_id(),
+        SyncConflictId::new(fresh_request_id()),
+    );
+    write(
+        &store_path,
+        format!("{object_id}.note"),
+        &Checkpoint {
+            position: old(4),
+            published_revision: Nullable::null(),
+        },
+    );
+    write(
+        &store_path,
+        format!("{object_id}.published"),
+        &Publication {
+            object_id,
+            kind: SyncObjectKind::Settings,
+            position: old(4),
+            published_at_ms: TimestampMs::new(NOW),
+        },
+    );
+    let request = |work_id: Uuid, expected: Nullable<Position>, state: State| Request {
+        work_id,
+        object_id,
+        kind: SyncObjectKind::Settings,
+        revision: RequestRevision::Object(fresh_revision().expect("a revision")),
+        expected,
+        produced_under: U64::new(0),
+        first_signed_at_ms: Nullable::some(TimestampMs::new(NOW)),
+        last_signed_at_ms: Nullable::some(TimestampMs::new(NOW)),
+        state,
+    };
+    write(
+        &store_path,
+        format!("{sent}.request"),
+        &request(
+            sent,
+            Nullable::some(old(4)),
+            State::Dispatched {
+                ciphertext: kr_protocol::scalars::Bytes::new(b"sealed".to_vec()),
+            },
+        ),
+    );
+    // One that names no position anywhere, which lacked the history of its attempts all the same.
+    write(
+        &store_path,
+        format!("{parked}.request"),
+        &Request {
+            first_signed_at_ms: Nullable::null(),
+            last_signed_at_ms: Nullable::null(),
+            ..request(
+                parked,
+                Nullable::null(),
+                State::Admitted {
+                    ciphertext: kr_protocol::scalars::Bytes::new(b"sealed".to_vec()),
+                },
+            )
+        },
+    );
+    write(
+        &store_path,
+        format!("{diverged}.request"),
+        &request(
+            diverged,
+            Nullable::some(old(4)),
+            State::Diverged { position: old(4) },
+        ),
+    );
+    write(
+        &store_path,
+        format!("{}.conflict", copy.get()),
+        &Copy {
+            conflict_id: copy,
+            object_id,
+            offered_revision: fresh_revision().expect("a revision"),
+            retained: Nullable::null(),
+            expected: Nullable::some(old(3)),
+            current: old(4),
+            other: theirs.clone(),
+            recorded_at_ms: TimestampMs::new(NOW),
+        },
+    );
+
+    // Every one of them reads, as a place in a history never put back.
+    let store = client.store();
+    assert_eq!(
+        store
+            .checkpoint(object_id)
+            .expect("a note")
+            .expect("it reads")
+            .position,
+        at(4)
+    );
+    assert_eq!(
+        store.publications().expect("records").items[0].position,
+        at(4)
+    );
+    let requests = store.requests().expect("requests");
+    assert!(requests.unreadable.is_empty(), "{:?}", requests.unreadable);
+    assert_eq!(requests.items.len(), 3);
+    for record in &requests.items {
+        assert_eq!(record.attempted_in, Nullable::null());
+    }
+    assert_eq!(
+        requests
+            .items
+            .iter()
+            .find(|record| record.work_id == sent)
+            .expect("the dispatch")
+            .expected,
+        Nullable::some(at(4))
+    );
+    assert!(
+        requests
+            .items
+            .iter()
+            .any(|record| record.state == RequestState::Diverged { position: at(4) })
+    );
+    let copies = store.conflicts(object_id).expect("copies");
+    assert!(copies.unreadable.is_empty());
+    assert_eq!(copies.items[0].current, at(4));
+    assert_eq!(copies.items[0].expected, Nullable::some(at(3)));
+    assert_eq!(client.outstanding().expect("a count"), 1);
+
+    // And a record written now in a history never put back is the same shape, so the build that
+    // stored those reads what this one stores.
+    assert!(
+        store
+            .record_checkpoint(
+                object_id,
+                SyncCheckpoint {
+                    position: at(5),
+                    published_revision: Nullable::null(),
+                },
+            )
+            .expect("a note")
+    );
+    let _: Checkpoint = stored_before::read(&store_path.join(format!("{object_id}.note")));
+    let dispatch = claim(store, sent);
+    store
+        .settle(
+            &dispatch,
+            requests
+                .items
+                .iter()
+                .find(|record| record.work_id == sent)
+                .expect("the dispatch"),
+            Outcome::Accepted { position: at(6) },
+        )
+        .expect("settled");
+    let _: Publication = stored_before::read(&store_path.join(format!("{object_id}.published")));
+    let _: Request = stored_before::read(&store_path.join(format!("{parked}.request")));
+
+    // A draft's note, which the draft store keeps.
+    let drafts_path = directory.path().join("drafts");
+    let drafts = DraftStore::open(&drafts_path, device(1)).expect("a draft store");
+    let draft = drafts
+        .create(draft_target(), "mine".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+    write(
+        &drafts_path,
+        format!("{}.sync", draft.draft_id),
+        &DraftCheckpoint {
+            position: old(2),
+            published_revision: Nullable::some(DraftRevision::new(1)),
+        },
+    );
+    assert_eq!(
+        drafts
+            .checkpoint(draft.draft_id)
+            .expect("a note")
+            .expect("it reads")
+            .position,
+        at(2)
+    );
+}
+
+#[tokio::test]
+async fn a_late_answer_is_read_against_the_history_its_attempt_was_made_in() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let collection = sync_collection(SyncObjectKind::Settings, object_id);
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+
+    // A publication leaves in a history never put back, and the call that sent it walks away.
+    let staged = client
+        .store()
+        .admit(object_id, |object| {
+            Ok(kr_cbor::to_canonical_vec(object).expect("canonical bytes"))
+        })
+        .expect("admitted");
+    drop(
+        client
+            .store()
+            .begin_dispatch(staged.work_id, object_id, TimestampMs::new(NOW))
+            .expect("dispatched"),
+    );
+
+    // The service is put back twice while the answer is on its way. This device reads the
+    // collection after the second restore, at write five.
+    let (first, second) = (recovery(0xc1), recovery(0xc2));
+    let theirs = object(
+        object_id,
+        2,
+        SyncBody::Settings(settings(&[("theme", "light")], &[])),
+        NOW,
+    );
+    service
+        .put_back(
+            &Export {
+                objects: [(collection.clone(), (at(5), sealed_object(&theirs)))].into(),
+                ..Export::default()
+            },
+            second,
+        )
+        .await;
+    client
+        .fetch(
+            SyncObjectKind::Settings,
+            object_id,
+            TimestampMs::new(NOW + 1),
+        )
+        .await
+        .expect("the collection put back is followed");
+
+    // The answer that arrives late names the first restore, which this device never met. It is
+    // read against the history the attempt was made in, not the one this device reads now, so it
+    // cannot move the device out of the history the service serves: nothing follows from it but
+    // the account of the write.
+    let settled = client
+        .store()
+        .settle(
+            &claim_after_discard(client.store(), staged.work_id),
+            &staged,
+            Outcome::Accepted {
+                position: in_history(at(3), Some(first)),
+            },
+        )
+        .expect("settled");
+    assert_eq!(settled.across, Across::Unfollowed);
+    assert_eq!(client.outstanding().expect("a count"), 0);
+
+    // The collection is still read in the history the second restore began, and within it the
+    // order rules hold: an answer behind the note is a service that went back.
+    assert_eq!(
+        client
+            .store()
+            .checkpoint(object_id)
+            .expect("a note")
+            .expect("one stands")
+            .position,
+        in_history(at(5), Some(second))
+    );
+    service
+        .hold(
+            &collection,
+            in_history(at(3), Some(second)),
+            sealed_object(&theirs),
+        )
+        .await;
+    assert!(matches!(
+        client
+            .fetch(
+                SyncObjectKind::Settings,
+                object_id,
+                TimestampMs::new(NOW + 2)
+            )
+            .await
+            .expect_err("write three is behind write five in the same history"),
+        SyncError::StaleCheckpoint {
+            expected: 5,
+            found: 3,
+            ..
+        }
+    ));
 }
 
 // ---------------------------------------------------------------------------

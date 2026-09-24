@@ -429,6 +429,16 @@ impl std::fmt::Display for SyncRecoveryId {
     }
 }
 
+/// Whether a stored record's recovery names none, in which case the record leaves the member out.
+///
+/// A record stored before the member existed is a record in a history never put back, so leaving
+/// it out for that history is what keeps such a record the shape it always had: the store's reader
+/// re-encodes every record it reads and refuses one that does not come back as the same bytes, and
+/// both an old record and a new one in that history do.
+pub(crate) const fn names_no_recovery(recovery: &Nullable<SyncRecoveryId>) -> bool {
+    !recovery.is_present()
+}
+
 /// Where one object stands on a synchronisation service.
 ///
 /// Two facts, because one of them cannot do both jobs. The revision names the write, so a
@@ -462,12 +472,13 @@ pub struct SyncPosition {
     /// The history this place is in: the recovery the answer named, or null for a service never put
     /// back.
     ///
-    /// A position this device stored before it read the member has none, and reads as null. That
-    /// is how this client read every answer then, so it is a statement of what was recorded rather
-    /// than a reconstruction of what the service said: a service put back before then names its
-    /// identity on its next answer, and that answer reads as a collection put back, which compares
-    /// nothing across the two.
-    #[serde(default = "Nullable::null")]
+    /// Stored only when it names one, so a position in a history never put back keeps the shape it
+    /// had before the member existed, and a position stored then reads as null. That is how this
+    /// client read every answer then, so it is a statement of what was recorded rather than a
+    /// reconstruction of what the service said: a service put back before then names its identity
+    /// on its next answer, and that answer reads as a collection put back, which compares nothing
+    /// across the two.
+    #[serde(default = "Nullable::null", skip_serializing_if = "names_no_recovery")]
     pub recovery: Nullable<SyncRecoveryId>,
 }
 

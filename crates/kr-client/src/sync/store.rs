@@ -86,7 +86,7 @@ use serde::{Deserialize, Serialize};
 use super::SyncObject;
 use crate::drafts::{DraftStore, SyncCheckpoint as DraftCheckpoint};
 use crate::retry::UserAction;
-use crate::services::{SyncPosition, SyncRecoveryId};
+use crate::services::{SyncPosition, SyncRecoveryId, names_no_recovery};
 
 /// The extension of a stored object this device holds.
 const OBJECT_EXTENSION: &str = "object";
@@ -283,15 +283,19 @@ pub struct RequestRecord {
     /// A result carries it back, and the publication is accepted only when it is still the
     /// generation in force. An older one belongs to work privacy mode cancelled.
     pub produced_under: U64,
-    /// The history of the collection this work was admitted in: the recovery this device read the
-    /// collection in, null for one never put back.
+    /// The history of the collection every attempt under this identity was made in: the recovery
+    /// this device read the collection in, null for one never put back.
     ///
-    /// Work admitted in a history the collection has since been put back from is never attempted
-    /// again, and a service that holds no receipt of it in the history it serves now is asked to
-    /// end it at once. A record written before this member existed has none and reads as null,
+    /// Written when the work is admitted and again as its one attempt leaves, for a setting, and
+    /// when a draft publication is admitted, whose later attempts are made only while the
+    /// collection is still read in it. Work whose attempts were made in a history the collection
+    /// has since been put back from is never attempted again, a service that holds no receipt of it
+    /// in the history it serves now is asked to end it at once, and an answer to one of its attempts
+    /// is read against it. Stored only when it names one, so a record in a history never put back
+    /// keeps the shape it had before the member existed, and a record written then reads as null,
     /// which is the history every collection was read in then.
-    #[serde(default = "Nullable::null")]
-    pub admitted_under: Nullable<SyncRecoveryId>,
+    #[serde(default = "Nullable::null", skip_serializing_if = "names_no_recovery")]
+    pub attempted_in: Nullable<SyncRecoveryId>,
     /// The earliest instant any attempt under this identity was signed at.
     ///
     /// Null while the work is admitted and not sent, and written in the same replacement that
@@ -792,12 +796,13 @@ pub enum End {
     Unfollowed,
 }
 
-/// What a status answer that holds no receipt says about the history a request was admitted in.
+/// What a status answer that holds no receipt says about the history a request's attempts were made
+/// in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Crossing {
-    /// Admitted in the history the collection is read in, so the request may still be on its way.
+    /// Attempted in the history the collection is read in, so the request may still be on its way.
     InHistory,
-    /// Admitted in a history the collection has since been put back from. It is never attempted
+    /// Attempted in a history the collection has since been put back from. It is never attempted
     /// again, and it is ended at once.
     Crossed,
     /// The answer was in a history this device does not follow, and it settles nothing.
@@ -1636,7 +1641,7 @@ impl SyncStore {
                 // says nothing is there rather than naming a place nothing occupies.
                 expected: note.map_or(Nullable::null(), |note| Nullable::some(note.position)),
                 produced_under: privacy.generation,
-                admitted_under: history.current,
+                attempted_in: history.current,
                 first_signed_at_ms: Nullable::null(),
                 last_signed_at_ms: Nullable::null(),
                 state: RequestState::Admitted {
@@ -1732,8 +1737,11 @@ impl SyncStore {
             // The state and the instant the content is signed away are one replacement, so a
             // record that says it was sent always says when it was signed. The rule for which
             // instant a further attempt moves lives on the record itself.
+            // The history the one attempt is made in is recorded with it, in the same replacement.
+            let basis = self.read_basis(object_id)?;
             let sent = RequestRecord {
                 state: RequestState::Dispatched { ciphertext },
+                attempted_in: Nullable(basis.0),
                 ..held.attempted_at(signed_at)
             };
             self.write_request(&sent)?;
@@ -1742,7 +1750,7 @@ impl SyncStore {
                 // The state was written two statements above and it is the only one this reaches.
                 unreachable!("the record this call wrote says it was dispatched");
             };
-            Ok((ciphertext, signed_at, self.read_basis(object_id)?))
+            Ok((ciphertext, signed_at, basis))
         })();
         drop(guard);
         let (ciphertext, signed_at, basis) = outcome?;
@@ -1807,29 +1815,32 @@ impl SyncStore {
     /// it. Deciding about it takes the same lock, so a claim here is what a caller holding no
     /// dispatch of its own presents.
     ///
+    /// The answer is read against the history every attempt at the request was made in, and not
+    /// against the one this device reads when the answer arrives: a collection put back while the
+    /// answer was on its way cannot make an older answer look like news.
+    ///
     /// Returns nothing when somebody has a call out for the request.
     ///
     /// # Errors
     ///
-    /// Returns [`SyncError::Storage`] when the lock cannot be taken.
+    /// Returns [`SyncError::Storage`] when the lock or the record cannot be read.
     pub fn claim_request(&self, work_id: Uuid) -> Result<Option<Dispatch>> {
         let Some(owned) = Lock::try_take(&self.named(work_id, CALLOUT_EXTENSION))? else {
             return Ok(None);
         };
-        // The history the answer is read against is the collection's, when the record still says
-        // which collection that is. A record that has gone leaves nothing an answer could write.
+        // A late answer answers an attempt that has already left, so it is read against the history
+        // that attempt was made in, never against the one this device reads now: the collection may
+        // have been put back since, and an answer from a history this device never met, read
+        // against the newer one, would move the device away from the history it serves. A record
+        // that has gone leaves nothing an answer could write.
         let guard = self.lock()?;
-        let basis = self
-            .read_request(&self.named(work_id, REQUEST_EXTENSION))
-            .and_then(|record| match record {
-                Some(record) => self.read_basis(record.object_id),
-                None => Ok(Basis(None)),
-            });
+        let held = self.read_request(&self.named(work_id, REQUEST_EXTENSION));
         drop(guard);
+        let basis = Basis(held?.and_then(|record| record.attempted_in.0));
         Ok(Some(Dispatch {
             directory: self.directory.clone(),
             work_id,
-            basis: basis?,
+            basis,
             _lock: owned,
         }))
     }
@@ -1896,7 +1907,7 @@ impl SyncStore {
                 });
             }
             // The publication already out for this revision, under the generation in force and in the
-            // history of the collection this device reads. A publication admitted in a history the
+            // history of the collection this device reads. A publication attempted in a history the
             // collection has since been put back from is never attempted again: the receipt of an
             // attempt the replaced history ran is not in the history that replaced it, so a later
             // attempt there could run a second time. A record this build cannot read is not one an
@@ -1913,7 +1924,7 @@ impl SyncStore {
                                 && record.object_id == object_id
                                 && record.revision == revision
                                 && record.produced_under == privacy.generation
-                                && record.admitted_under == history.current
+                                && record.attempted_in == history.current
                                 && record.may_attempt_again(signed_at) =>
                         {
                             Some((ciphertext.clone(), record))
@@ -1947,7 +1958,7 @@ impl SyncStore {
                 // No note is no position, which is the comparison a first publication makes.
                 expected: Nullable::from(expected),
                 produced_under: privacy.generation,
-                admitted_under: history.current,
+                attempted_in: history.current,
                 first_signed_at_ms: Nullable::null(),
                 last_signed_at_ms: Nullable::null(),
                 state: RequestState::Dispatched {
@@ -2101,10 +2112,10 @@ impl SyncStore {
     }
 
     /// Reads a status answer that holds no receipt against the history of the collection, and says
-    /// whether the request was admitted in a history the collection has since been put back from.
+    /// whether the request was attempted in a history the collection has since been put back from.
     ///
     /// Such a request is never attempted again, and the history that replaced the one it was
-    /// admitted in holds no receipt of it, so waiting could end only by an attempt still on its way
+    /// attempted in holds no receipt of it, so waiting could end only by an attempt still on its way
     /// landing in the collection as it now stands. A reconciliation ends it at once instead, whatever
     /// privacy generation is in force: the fence stops any attempt still on its way, and its answer
     /// says what is left to account for.
@@ -2127,8 +2138,9 @@ impl SyncStore {
             {
                 return Ok(Crossing::Unfollowed);
             }
-            // The collection is read in the answer's history from here on.
-            Ok(if record.admitted_under.0 == answered {
+            // The collection is read in the answer's history from here on, and the request's
+            // attempts were made in it or in one it was put back from.
+            Ok(if record.attempted_in.0 == answered {
                 Crossing::InHistory
             } else {
                 Crossing::Crossed

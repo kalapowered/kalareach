@@ -1425,9 +1425,9 @@ pub(crate) enum Answer {
 /// also where a fence the service refuses as out of its reach ends up: the work stays counted, and
 /// the same instants are presented again next time.
 ///
-/// A request admitted in a history the collection has since been put back from is the one case
+/// A request attempted in a history the collection has since been put back from is the one case
 /// where no receipt ends the request at once, whatever the generation. It is never attempted again,
-/// and the history that replaced the one it was admitted in holds no receipt of it, so waiting could
+/// and the history that replaced the one it was attempted in holds no receipt of it, so waiting could
 /// end only by an attempt still on its way landing in the collection as it now stands. The fence
 /// stops that attempt, and its answer says what is left to account for: a restored collection
 /// cannot say for a while that nothing ran, so the account stays. A status answer from a history

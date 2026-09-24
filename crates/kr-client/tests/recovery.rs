@@ -1798,6 +1798,88 @@ async fn a_bundle_put_back_under_another_recovery_is_refused_before_anything_is_
 }
 
 #[tokio::test]
+async fn a_write_record_stored_before_positions_named_their_history_still_reads() {
+    /// A place in the order, as a record stored it before a position named its history.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StoredPosition {
+        write_sequence: u64,
+        revision: kr_protocol::scalars::Nullable<SyncRevision>,
+    }
+    /// The record of a bundle write, member for member as it was stored then.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StoredRecord {
+        context: RecoveryContext,
+        expected: kr_protocol::scalars::Nullable<StoredPosition>,
+        request_id: Uuid,
+        signed_at_ms: TimestampMs,
+        sent: Digest256,
+        known: String,
+    }
+
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    for write in 1..=2_u64 {
+        let writer = AuthorisationKeyPair::generate().expect("a writer key");
+        store
+            .enable_writer(
+                &seed,
+                &mut bundle,
+                trusted(&writer),
+                TimestampMs::new(write * 1_000),
+            )
+            .await
+            .expect("the write lands");
+    }
+    // What this build stores for a write that compared against a place in a history never put
+    // back is the shape a record had before a position named its history: it reads, strictly, as
+    // that shape.
+    let record: StoredRecord =
+        kr_cbor::from_canonical_slice(&store.record(), &kr_cbor::Limits::DEFAULT)
+            .expect("a place in a history never put back is stored as it always was");
+    assert_eq!(
+        record
+            .expected
+            .as_ref()
+            .map(|position| position.write_sequence),
+        Some(1)
+    );
+
+    // A record in that shape, of a write whose answer never came back, is what the store opened
+    // over it starts from.
+    let sent = Digest256::from_bytes([0x5e; 32]);
+    let name = store
+        .stored()
+        .into_iter()
+        .find(|(name, _)| name.ends_with(".bundle-write"))
+        .map(|(name, _)| name)
+        .expect("the record");
+    std::fs::write(
+        store.disk.path().join(name),
+        kr_cbor::to_canonical_vec(&StoredRecord {
+            context: context(ORIGIN),
+            expected: kr_protocol::scalars::Nullable::some(StoredPosition {
+                write_sequence: 2,
+                revision: kr_protocol::scalars::Nullable::some(SyncRevision::new(
+                    Uuid::from_bytes([2; 16]),
+                )),
+            }),
+            request_id: Uuid::from_bytes([0x71; 16]),
+            signed_at_ms: TimestampMs::new(3_000),
+            sent,
+            known: "unsettled".to_owned(),
+        })
+        .expect("canonical bytes"),
+    )
+    .expect("written");
+    let store = store.restart(Arc::clone(&service) as Arc<_>);
+    assert_eq!(store.lost_write(), Some(LostWrite::Unsettled { sent }));
+}
+
+#[tokio::test]
 async fn a_second_reading_of_one_place_with_other_content_is_a_fork_rather_than_a_newer_copy() {
     let service = ScriptedService::shared();
     let seed = RecoverySeed::generate().expect("a seed");
