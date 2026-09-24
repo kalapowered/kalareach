@@ -159,6 +159,23 @@ The two are independent, which is what makes an interruption safe in both direct
 interrupted index fetch leaves the previous index usable, and an interrupted payload fetch leaves
 the installed package usable.
 
+## Where the store writes
+
+The catalogue's records live in its own directory, and each enrolment's files in a directory of its
+own under `repositories/`, with five directories inside: the trust checkpoint (`datastore`), the
+index documents (`index`), the payload cache (`payloads`), the extracted packages (`packages`) and
+the work in progress (`staging`). Every one of them, from the catalogue's own directory down, has to
+be a directory and not a link. A link to a directory elsewhere would have what the store writes land
+there, outside every check and budget the store keeps, so it is refused: when the catalogue opens,
+when a repository's directory is opened or locked, and again just before each write, so a link put
+in place while an operation runs is refused at that operation's next write. A directory symbolic
+link and a Windows junction are both links. The directories above the catalogue's own are the
+host's, and are not checked.
+
+One writer is outside that rule: the update client writes its private working copy of the trust
+checkpoint by path while it verifies. A link put in place of `staging` during a verification is
+refused at the next write the store makes, after the client has written its documents through it.
+
 ## A signature is provenance, not safety
 
 Whoever signed a package, its contents are untrusted input. Before anything is activated the host

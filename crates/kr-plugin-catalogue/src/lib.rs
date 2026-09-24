@@ -305,9 +305,12 @@ impl Catalogue {
     /// # Errors
     ///
     /// Returns [`CatalogueError::StorageUnavailable`] when the directory or its database cannot be
-    /// opened.
+    /// opened, or `root` is a link or not a directory.
     pub fn with_broker(root: &Path, broker: Arc<dyn BrokerBridge>) -> CatalogueResult<Self> {
         std::fs::create_dir_all(root).map_err(|source| CatalogueError::storage(root, &source))?;
+        // The records are written here and every repository's files under here, so a directory
+        // that is a link is refused before anything is written through it.
+        store::real_directory(root)?;
         Ok(Self {
             root: root.to_path_buf(),
             db: Db::open(root)?,

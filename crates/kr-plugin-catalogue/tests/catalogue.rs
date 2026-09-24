@@ -5687,3 +5687,295 @@ async fn kr_req_11_09_a_package_without_its_repository_enables_only_when_every_f
 fn url(text: &str) -> url::Url {
     url::Url::parse(text).expect("a parsable location")
 }
+
+// ---------------------------------------------------------------------------------------------
+// The store's own directories
+// ---------------------------------------------------------------------------------------------
+
+/// Puts a directory link at `link` that points at `target`.
+#[cfg(unix)]
+fn link_directory(target: &std::path::Path, link: &std::path::Path) {
+    std::os::unix::fs::symlink(target, link).expect("a directory link");
+}
+
+/// Puts a directory link at `link` that points at `target`: a symbolic link where this account may
+/// make one, and otherwise a junction, which any account may.
+#[cfg(windows)]
+fn link_directory(target: &std::path::Path, link: &std::path::Path) {
+    if std::os::windows::fs::symlink_dir(target, link).is_ok() {
+        return;
+    }
+    let made = std::process::Command::new("cmd")
+        .arg("/C")
+        .arg("mklink")
+        .arg("/J")
+        .arg(link)
+        .arg(target)
+        .output()
+        .expect("mklink runs");
+    assert!(made.status.success(), "a junction: {made:?}");
+}
+
+/// Removes the directory link at `link`, and nothing it points at.
+fn unlink_directory(link: &std::path::Path) {
+    #[cfg(unix)]
+    std::fs::remove_file(link).expect("the link removed");
+    #[cfg(windows)]
+    std::fs::remove_dir(link).expect("the link removed");
+}
+
+/// Moves `directory` aside and puts a link in its place to a directory elsewhere, which holds a
+/// copy of what `directory` held and a file of its own, and returns the directory elsewhere.
+fn replace_with_link(home: &std::path::Path, directory: &std::path::Path) -> std::path::PathBuf {
+    let elsewhere = home.join("elsewhere");
+    support::copy_tree(directory, &elsewhere);
+    std::fs::write(elsewhere.join("unrelated.txt"), b"not the catalogue's").expect("writable");
+    std::fs::rename(directory, home.join("aside")).expect("moved aside");
+    link_directory(&elsewhere, directory);
+    elsewhere
+}
+
+/// Every file and directory under `directory`, following no link, with each file's bytes.
+fn tree_of(
+    directory: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+    let mut tree = std::collections::BTreeMap::new();
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        for entry in std::fs::read_dir(&current).expect("readable") {
+            let entry = entry.expect("readable");
+            let path = entry.path();
+            let relative = path.strip_prefix(directory).expect("inside").to_path_buf();
+            if entry.file_type().expect("readable").is_dir() {
+                pending.push(path);
+                tree.insert(relative, None);
+            } else {
+                tree.insert(relative, Some(std::fs::read(&path).expect("readable")));
+            }
+        }
+    }
+    tree
+}
+
+/// Every directory the store writes through, from the catalogue's own down to each of one
+/// repository's, is refused while it is a link to a directory elsewhere. A sync that would publish
+/// a checkpoint and an install that would activate a package both stop before anything is written
+/// through it, and the directory elsewhere, which holds a copy of what the store's held and a file
+/// of its own, is left exactly as it was. Put back, the directory serves both again.
+#[tokio::test]
+async fn a_store_directory_that_is_a_link_is_refused_before_anything_is_written_through_it() {
+    let mut written_through = Vec::new();
+    for depth in [
+        "catalogue",
+        "repositories",
+        "repository",
+        "datastore",
+        "index",
+        "payloads",
+        "packages",
+        "staging",
+    ] {
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+        let mut catalogue = enrolled(
+            home.path(),
+            &generation,
+            RepositoryBudgets::defaults(),
+            CapabilityCeiling::default_ceiling(),
+        )
+        .await;
+        let digest = generation.manifest_digest();
+        catalogue.sync(&repository()).await.expect("generation 1");
+        // A later generation, so a sync has a checkpoint to publish.
+        generation.rewrite_as(2).await;
+        let root = home.path().join("catalogue");
+        let own = catalogue
+            .store(&repository())
+            .expect("enrolled")
+            .datastore()
+            .parent()
+            .expect("the repository's directory")
+            .to_path_buf();
+        let directory = match depth {
+            "catalogue" => root.clone(),
+            "repositories" => root.join("repositories"),
+            "repository" => own.clone(),
+            area => own.join(area),
+        };
+
+        // The catalogue's own directory holds its records, so the catalogue is closed before the
+        // link replaces it and opened again afterwards, rather than replaced underneath an open
+        // catalogue.
+        let mut open = Some(catalogue);
+        if depth == "catalogue" {
+            open = None;
+        }
+        let elsewhere = replace_with_link(home.path(), &directory);
+        let before = tree_of(&elsewhere);
+
+        let outcomes = match open.as_mut() {
+            None => vec![("open", Catalogue::open(&root).map(drop))],
+            Some(catalogue) => {
+                let synced = catalogue.sync(&repository()).await.map(drop);
+                let installed = install_example(catalogue, digest).await.map(drop);
+                vec![("sync", synced), ("install", installed)]
+            }
+        };
+        for (what, outcome) in outcomes {
+            match outcome {
+                Err(CatalogueError::StorageUnavailable { detail })
+                    if detail.contains("is a link") => {}
+                Ok(()) => written_through.push(format!("{depth}: the {what} went through")),
+                Err(other) => written_through.push(format!(
+                    "{depth}: the {what} was refused for another reason: {other:?}"
+                )),
+            }
+        }
+        if tree_of(&elsewhere) != before {
+            written_through.push(format!("{depth}: the directory elsewhere changed"));
+        }
+
+        unlink_directory(&directory);
+        std::fs::rename(home.path().join("aside"), &directory).expect("put back");
+        let mut catalogue = match open {
+            Some(catalogue) => catalogue,
+            None => Catalogue::open(&root).expect("the catalogue's own directory"),
+        };
+        let synced = catalogue.sync(&repository()).await.expect("generation 2");
+        assert_eq!(synced.generation.get(), 2, "{depth}");
+        install_example(&mut catalogue, digest)
+            .await
+            .expect("installed");
+    }
+    assert!(written_through.is_empty(), "{written_through:#?}");
+}
+
+/// Reads the local repository, and the first time it fetches a location whose path contains `at`,
+/// runs one step of the test's own first: after the operation fetching it took the store, and
+/// before it writes anything the fetch leads to.
+#[derive(Clone)]
+struct Interrupting {
+    at: &'static str,
+    then: Arc<std::sync::Mutex<Option<Step>>>,
+}
+
+/// One step of a test's own, run once.
+type Step = Box<dyn FnOnce() + Send>;
+
+impl std::fmt::Debug for Interrupting {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Interrupting")
+            .field("at", &self.at)
+            .finish_non_exhaustive()
+    }
+}
+
+#[tough::async_trait]
+impl tough::Transport for Interrupting {
+    async fn fetch(&self, url: url::Url) -> Result<tough::TransportStream, tough::TransportError> {
+        if url.path().contains(self.at) {
+            let then = self.then.lock().expect("the step").take();
+            if let Some(then) = then {
+                then();
+            }
+        }
+        tough::FilesystemTransport.fetch(url).await
+    }
+}
+
+/// A store directory replaced by a link while an operation holds the store, after the checks it
+/// made when it took the store and before it writes, is refused at its next write. A checkpoint
+/// publication, a payload kept in the cache, a staged file and a package's activation each check
+/// every directory they write through just before they write, and the directory elsewhere is
+/// left as it was.
+#[tokio::test]
+async fn a_store_directory_linked_while_the_store_is_held_is_refused_at_the_next_write() {
+    let mut written_through = Vec::new();
+    for (operation, depth) in [
+        ("sync", "datastore"),
+        ("sync", "index"),
+        ("sync", "payloads"),
+        ("sync", "packages"),
+        ("install", "datastore"),
+        ("install", "index"),
+        ("install", "payloads"),
+        ("install", "packages"),
+        ("install", "staging"),
+    ] {
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+        let mut catalogue = enrolled(
+            home.path(),
+            &generation,
+            RepositoryBudgets::defaults(),
+            CapabilityCeiling::default_ceiling(),
+        )
+        .await;
+        catalogue.sync(&repository()).await.expect("generation 1");
+        // A later generation, so a sync has a checkpoint to publish.
+        generation.rewrite_as(2).await;
+        let directory = catalogue
+            .store(&repository())
+            .expect("enrolled")
+            .datastore()
+            .parent()
+            .expect("the repository's directory")
+            .join(depth);
+        let before = Arc::new(std::sync::Mutex::new(None));
+        let (step_home, step_before) = (home.path().to_path_buf(), Arc::clone(&before));
+        catalogue.set_transport(Arc::new(Interrupting {
+            at: if operation == "sync" {
+                "/metadata/"
+            } else {
+                "/packages/"
+            },
+            then: Arc::new(std::sync::Mutex::new(Some(Box::new(move || {
+                let elsewhere = replace_with_link(&step_home, &directory);
+                *step_before.lock().expect("the tree") = Some(tree_of(&elsewhere));
+            })))),
+        }));
+
+        let outcome = if operation == "sync" {
+            catalogue.sync(&repository()).await.map(drop)
+        } else {
+            install_example(&mut catalogue, generation.manifest_digest())
+                .await
+                .map(drop)
+        };
+        let Some(before) = before.lock().expect("the tree").take() else {
+            written_through.push(format!("{operation} {depth}: nothing was fetched"));
+            continue;
+        };
+        match outcome {
+            Err(CatalogueError::StorageUnavailable { detail }) if detail.contains("is a link") => {}
+            Ok(()) => written_through.push(format!("{operation} {depth}: it went through")),
+            Err(other) => written_through.push(format!(
+                "{operation} {depth}: refused for another reason: {other:?}"
+            )),
+        }
+        if tree_of(&home.path().join("elsewhere")) != before {
+            written_through.push(format!(
+                "{operation} {depth}: the directory elsewhere changed"
+            ));
+        }
+    }
+    assert!(written_through.is_empty(), "{written_through:#?}");
+}
+
+/// Installs the example package at `digest`, granting nothing.
+async fn install_example(
+    catalogue: &mut Catalogue,
+    digest: PayloadDigest,
+) -> CatalogueResult<Installation> {
+    catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &version(),
+            digest,
+            InstallationGrant::none(),
+        )
+        .await
+}

@@ -94,7 +94,118 @@ fn checkpoint_size(directory: &Path) -> CatalogueResult<u64> {
 /// One repository's directory.
 #[derive(Clone, Debug)]
 pub struct Store {
+    /// The catalogue's own directory, which every repository's directory sits under.
+    catalogue: PathBuf,
     root: PathBuf,
+}
+
+/// One store's directories, each checked to be a directory of its own and not a link, from the
+/// catalogue's own directory down, when [`Store::layout`] took them.
+#[derive(Debug)]
+struct Layout {
+    datastore: PathBuf,
+    index: PathBuf,
+    payloads: PathBuf,
+    packages: PathBuf,
+    staging: PathBuf,
+}
+
+/// Refuses a directory that is a link, or anything but a directory, without following it.
+///
+/// A link to a directory elsewhere would have whatever is written into it land there, outside
+/// every check and budget the store keeps, so it is refused rather than written through.
+///
+/// # Errors
+///
+/// Returns [`CatalogueError::StorageUnavailable`] when `path` is not a directory of its own, or
+/// cannot be read.
+pub(crate) fn real_directory(path: &Path) -> CatalogueResult<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(metadata) => Err(CatalogueError::StorageUnavailable {
+            detail: format!(
+                "{} is {}, and the catalogue writes only into directories of its own",
+                path.display(),
+                if metadata.file_type().is_symlink() {
+                    "a link"
+                } else {
+                    "not a directory"
+                }
+            ),
+        }),
+        Err(source) => Err(CatalogueError::storage(path, &source)),
+    }
+}
+
+/// Makes `path` where it is missing, and refuses it where it is a link or not a directory.
+///
+/// The directory is created rather than created along with its parents, so a link somebody put
+/// in its place, before or while it is made, is refused instead of followed.
+fn ensure_directory(path: &Path) -> CatalogueResult<()> {
+    match std::fs::create_dir(path) {
+        Ok(()) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(source) => return Err(CatalogueError::storage(path, &source)),
+    }
+    real_directory(path)
+}
+
+/// Makes every directory from `area` down to `directory` that is missing, refusing any that is a
+/// link or not a directory, so nothing is written below `area` through a link.
+fn ensure_below(area: &Path, directory: &Path) -> CatalogueResult<()> {
+    let relative =
+        directory
+            .strip_prefix(area)
+            .map_err(|_| CatalogueError::StorageUnavailable {
+                detail: format!("{} is outside {}", directory.display(), area.display()),
+            })?;
+    let mut current = area.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        ensure_directory(&current)?;
+    }
+    Ok(())
+}
+
+/// Returns the name an index document is kept under: its own digest.
+fn index_name(digest: PayloadDigest) -> String {
+    format!("{digest}.json")
+}
+
+/// Removes whatever an operation that stopped left in `staging`, which nothing names and no
+/// budget counts.
+fn clear_staging(staging: &Path) -> CatalogueResult<()> {
+    let entries = match std::fs::read_dir(staging) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(CatalogueError::storage(staging, &source)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|source| CatalogueError::storage(staging, &source))?;
+        let path = entry.path();
+        let kind = entry
+            .file_type()
+            .map_err(|source| CatalogueError::storage(&path, &source))?;
+        let removed = if kind.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match removed {
+            Ok(()) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(CatalogueError::StorageUnavailable {
+                    detail: format!(
+                        "{} was left in staging by an operation that stopped and cannot be \
+                         removed, so the room it takes is not known to be free: {source}",
+                        path.display()
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What an activated package's directory holds, measured against its own manifest.
@@ -239,15 +350,12 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogueError::StorageUnavailable`] when a directory cannot be created.
+    /// Returns [`CatalogueError::StorageUnavailable`] when a directory cannot be created, or one of
+    /// the store's directories is a link or not a directory.
     pub fn open(root: &Path, enrolment: &EnrolmentKey) -> CatalogueResult<Self> {
-        let root = root.join(REPOSITORIES).join(enrolment.as_str());
-        for directory in ["datastore", "index", "payloads", "packages", "staging"] {
-            let path = root.join(directory);
-            std::fs::create_dir_all(&path)
-                .map_err(|source| CatalogueError::storage(&path, &source))?;
-        }
-        Ok(Self { root })
+        let store = Self::at(root, enrolment);
+        store.layout()?;
+        Ok(store)
     }
 
     /// Names one enrolment's directory without creating anything, for a read.
@@ -257,8 +365,34 @@ impl Store {
     #[must_use]
     pub fn at(root: &Path, enrolment: &EnrolmentKey) -> Self {
         Self {
+            catalogue: root.to_path_buf(),
             root: root.join(REPOSITORIES).join(enrolment.as_str()),
         }
+    }
+
+    /// Checks every directory from the catalogue's own down to each of this store's, making the
+    /// store's where they are missing, and returns them.
+    ///
+    /// Whatever the store writes, it writes through these directories, and one that is a link
+    /// would put it somewhere else. So a directory that is a link, or not a directory, is refused,
+    /// and every write takes its directories from here, just before it writes: no write goes
+    /// through a directory this did not check. The directories above the catalogue's own are the
+    /// host's, and are not the store's to judge.
+    fn layout(&self) -> CatalogueResult<Layout> {
+        real_directory(&self.catalogue)?;
+        ensure_directory(&self.catalogue.join(REPOSITORIES))?;
+        ensure_directory(&self.root)?;
+        let area = |name: &str| {
+            let path = self.root.join(name);
+            ensure_directory(&path).map(|()| path)
+        };
+        Ok(Layout {
+            datastore: area("datastore")?,
+            index: area("index")?,
+            payloads: area("payloads")?,
+            packages: area("packages")?,
+            staging: area("staging")?,
+        })
     }
 
     /// Acquires an exclusive cross-process lock on this repository's store.
@@ -271,47 +405,13 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogueError::StorageUnavailable`] when the lock cannot be acquired, or staging
-    /// cannot be cleared.
+    /// Returns [`CatalogueError::StorageUnavailable`] when one of the store's directories is a
+    /// link or not a directory, the lock cannot be acquired, or staging cannot be cleared.
     pub fn lock(&self) -> CatalogueResult<StoreLock> {
+        let layout = self.layout()?;
         let lock = self.acquire()?;
-        self.clear_staging()?;
+        clear_staging(&layout.staging)?;
         Ok(lock)
-    }
-
-    fn clear_staging(&self) -> CatalogueResult<()> {
-        let staging = self.root.join("staging");
-        let entries = match std::fs::read_dir(&staging) {
-            Ok(entries) => entries,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(source) => return Err(CatalogueError::storage(&staging, &source)),
-        };
-        for entry in entries {
-            let entry = entry.map_err(|source| CatalogueError::storage(&staging, &source))?;
-            let path = entry.path();
-            let kind = entry
-                .file_type()
-                .map_err(|source| CatalogueError::storage(&path, &source))?;
-            let removed = if kind.is_dir() {
-                std::fs::remove_dir_all(&path)
-            } else {
-                std::fs::remove_file(&path)
-            };
-            match removed {
-                Ok(()) => {}
-                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-                Err(source) => {
-                    return Err(CatalogueError::StorageUnavailable {
-                        detail: format!(
-                            "{} was left in staging by an operation that stopped and cannot be \
-                             removed, so the room it takes is not known to be free: {source}",
-                            path.display()
-                        ),
-                    });
-                }
-            }
-        }
-        Ok(())
     }
 
     fn acquire(&self) -> CatalogueResult<StoreLock> {
@@ -367,9 +467,8 @@ impl Store {
     ///
     /// Returns [`CatalogueError::StorageUnavailable`] when the copy cannot be made.
     pub fn working_datastore(&self, reset: bool) -> CatalogueResult<WorkingDatastore> {
-        let staging = self.root.join("staging");
-        std::fs::create_dir_all(&staging)
-            .map_err(|source| CatalogueError::storage(&staging, &source))?;
+        let layout = self.layout()?;
+        let staging = layout.staging;
         let mut attempt = 0u32;
         let path = loop {
             let candidate = staging.join(format!("datastore-{}-{attempt}", std::process::id()));
@@ -385,7 +484,7 @@ impl Store {
             }
         };
         let working = WorkingDatastore { path };
-        let accepted = self.datastore();
+        let accepted = layout.datastore;
         for name in CLIENT_READS {
             let from = accepted.join(name);
             match std::fs::copy(&from, working.path.join(name)) {
@@ -435,7 +534,8 @@ impl Store {
         let Ok(seen) = serde_json::from_slice::<jiff::Timestamp>(&bytes) else {
             return Ok(());
         };
-        let to = self.datastore().join(TIME_CHECKPOINT);
+        let layout = self.layout()?;
+        let to = layout.datastore.join(TIME_CHECKPOINT);
         match std::fs::read(&to) {
             Ok(held) => {
                 if serde_json::from_slice::<jiff::Timestamp>(&held).is_ok_and(|kept| kept >= seen) {
@@ -445,7 +545,7 @@ impl Store {
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
             Err(source) => return Err(CatalogueError::storage(&to, &source)),
         }
-        write_atomically(&self.root.join("staging"), &to, &bytes)
+        write_atomically(&layout.staging, &layout.datastore, &to, &bytes)
     }
 
     /// Makes a verified working copy the accepted trust checkpoint, one document at a time.
@@ -469,10 +569,11 @@ impl Store {
         _permit: &Permit,
         working: &WorkingDatastore,
     ) -> CatalogueResult<()> {
-        let accepted = self.datastore();
+        let layout = self.layout()?;
+        let accepted = layout.datastore;
         let verified = files_under(&working.path)?;
         let held = files_under(&accepted)?;
-        let staging = self.root.join("staging");
+        let staging = layout.staging;
         let mut changed = 0usize;
         let stopped = |changed: usize, error: CatalogueError| {
             if changed == 0 {
@@ -514,7 +615,7 @@ impl Store {
             let from = working.path.join(relative);
             let bytes = std::fs::read(&from)
                 .map_err(|source| stopped(changed, CatalogueError::storage(&from, &source)))?;
-            rename_into_place(&staging, &accepted.join(relative), &bytes)
+            rename_into_place(&staging, &accepted, &accepted.join(relative), &bytes)
                 .map_err(|error| stopped(changed, error))?;
             changed += 1;
         }
@@ -610,9 +711,10 @@ impl Store {
         _permit: &Permit,
         digests: &[PayloadDigest],
     ) -> CatalogueResult<()> {
+        let layout = self.layout()?;
         let mut removed = 0usize;
         for digest in digests {
-            let path = self.index_path(*digest);
+            let path = layout.index.join(index_name(*digest));
             match std::fs::remove_file(&path) {
                 Ok(()) => removed += 1,
                 Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
@@ -861,7 +963,7 @@ impl Store {
     /// is a different file and the pointer can never end up naming content it did not verify.
     #[must_use]
     pub fn index_path(&self, digest: PayloadDigest) -> PathBuf {
-        self.root.join("index").join(format!("{digest}.json"))
+        self.root.join("index").join(index_name(digest))
     }
 
     /// Writes one verified generation's index, in its canonical rendering, under its own digest.
@@ -879,9 +981,11 @@ impl Store {
         rendered: &[u8],
     ) -> CatalogueResult<(PayloadDigest, u64)> {
         let digest = PayloadDigest::of(rendered);
+        let layout = self.layout()?;
         write_atomically(
-            &self.root.join("staging"),
-            &self.index_path(digest),
+            &layout.staging,
+            &layout.index,
+            &layout.index.join(index_name(digest)),
             rendered,
         )?;
         Ok((digest, rendered.len() as u64))
@@ -904,9 +1008,11 @@ impl Store {
                 detail: format!("the bytes offered for {digest} are not the bytes it names"),
             });
         }
+        let layout = self.layout()?;
         write_atomically(
-            &self.root.join("staging"),
-            &self.payload_path(digest),
+            &layout.staging,
+            &layout.payloads,
+            &layout.payloads.join(digest.to_string()),
             bytes,
         )
     }
@@ -967,19 +1073,18 @@ impl Store {
         // one would let a second attempt's incomplete contents be renamed into place by the first
         // attempt's activation, and would make an interrupted run's leftovers part of a set
         // nobody verified as a set.
-        let staging = self.root.join("staging");
-        std::fs::create_dir_all(&staging)
-            .map_err(|source| CatalogueError::storage(&staging, &source))?;
+        let layout = self.layout()?;
         let mut attempt = 0u32;
         loop {
-            let path = staging.join(format!(
+            let path = layout.staging.join(format!(
                 "package-{manifest_digest}-{}-{attempt}",
                 std::process::id()
             ));
             match std::fs::create_dir(&path) {
                 Ok(()) => {
                     return Ok(StagedPackage {
-                        destination: self.package_dir(manifest_digest),
+                        store: self.clone(),
+                        destination: layout.packages.join(manifest_digest.to_string()),
                         path,
                         written: BTreeMap::new(),
                     });
@@ -1133,9 +1238,10 @@ impl Store {
                 }
             }
         };
+        let layout = self.layout()?;
         for (digest, _) in &plan.packages {
-            let path = self.package_dir(*digest);
-            let aside = self.root.join("staging").join(format!("removed-{digest}"));
+            let path = layout.packages.join(digest.to_string());
+            let aside = layout.staging.join(format!("removed-{digest}"));
             match std::fs::rename(&path, &aside) {
                 Ok(()) => removed += 1,
                 Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1154,7 +1260,7 @@ impl Store {
             }
         }
         for (digest, _) in &plan.payloads {
-            let path = self.payload_path(*digest);
+            let path = layout.payloads.join(digest.to_string());
             match std::fs::remove_file(&path) {
                 Ok(()) => removed += 1,
                 Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
@@ -1212,6 +1318,8 @@ impl ReclaimPlan {
 /// A package being staged, which becomes visible only when every payload has verified.
 #[derive(Debug)]
 pub struct StagedPackage {
+    /// The store the package is staged in, whose directories are checked again at activation.
+    store: Store,
     path: PathBuf,
     destination: PathBuf,
     written: BTreeMap<String, u64>,
@@ -1223,12 +1331,14 @@ impl StagedPackage {
     /// `relative` is a [`kr_plugin_sdk::paths::PackagePath`], which is the proof that the package
     /// path rules were applied to it: it cannot escape the directory, name a device or spell a
     /// name two filesystems disagree about. The file is created rather than opened, so an existing
-    /// name, including a link somebody put there, fails instead of being followed.
+    /// name, including a link somebody put there, fails instead of being followed. Every directory
+    /// it is written through, the store's and this attempt's own, is checked first.
     ///
     /// # Errors
     ///
     /// Returns [`CatalogueError::UnsafePackage`] when the name is already staged, and
-    /// [`CatalogueError::StorageUnavailable`] when the bytes cannot be written.
+    /// [`CatalogueError::StorageUnavailable`] when a directory it would be written through is a
+    /// link or not a directory, or the bytes cannot be written.
     pub fn write(
         &mut self,
         relative: &kr_plugin_sdk::paths::PackagePath,
@@ -1240,10 +1350,11 @@ impl StagedPackage {
                 detail: format!("{relative} appears twice in the package"),
             });
         }
+        self.store.layout()?;
+        real_directory(&self.path)?;
         let path = self.path.join(relative);
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|source| CatalogueError::storage(parent, &source))?;
+            ensure_below(&self.path, parent)?;
         }
         let mut file = std::fs::File::options()
             .write(true)
@@ -1294,10 +1405,11 @@ impl StagedPackage {
     /// [`CatalogueError::PublicationUncertain`] when part of the package was replaced and the rest
     /// could not be, or when a directory did not confirm a rename.
     pub(crate) fn activate(self, _permit: &Permit) -> CatalogueResult<PathBuf> {
-        if let Some(parent) = self.destination.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|source| CatalogueError::storage(parent, &source))?;
-        }
+        // The staging directory and the packages directory are checked again here, just before
+        // the package moves from one to the other: a check made when staging started says nothing
+        // about a link put in their place since.
+        self.store.layout()?;
+        real_directory(&self.path)?;
         flush_tree(&self.path)?;
         match std::fs::symlink_metadata(&self.destination) {
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
@@ -1375,11 +1487,11 @@ impl StagedPackage {
             if std::fs::read(&target).is_ok_and(|held| held == checked) {
                 continue;
             }
-            let outcome = target
-                .parent()
-                .map_or(Ok(()), std::fs::create_dir_all)
-                .and_then(|()| std::fs::rename(&staged, &target));
-            if let Err(source) = outcome {
+            if let Some(parent) = target.parent() {
+                ensure_below(&self.destination, parent)
+                    .map_err(|error| stopped(&replaced, error))?;
+            }
+            if let Err(source) = std::fs::rename(&staged, &target) {
                 return Err(stopped(
                     &replaced,
                     CatalogueError::storage(&target, &source),
@@ -1434,8 +1546,8 @@ impl Drop for StagedPackage {
 /// A failure before the rename leaves nothing changed. A flush that fails after it is
 /// [`CatalogueError::PublicationUncertain`]: the new document is already what every reader sees,
 /// and only whether its directory entry survives a power loss is in question.
-fn write_atomically(staging: &Path, path: &Path, bytes: &[u8]) -> CatalogueResult<()> {
-    rename_into_place(staging, path, bytes)?;
+fn write_atomically(staging: &Path, area: &Path, path: &Path, bytes: &[u8]) -> CatalogueResult<()> {
+    rename_into_place(staging, area, path, bytes)?;
     if let Some(parent) = path.parent() {
         flushed_after_publication(parent, path)?;
     }
@@ -1457,16 +1569,23 @@ fn flushed_after_publication(directory: &Path, published: &Path) -> CatalogueRes
 }
 
 /// Writes `bytes` into a temporary file and renames it over `path`, without flushing the directory.
-fn rename_into_place(staging: &Path, path: &Path, bytes: &[u8]) -> CatalogueResult<()> {
+///
+/// `path` lies below `area`, one of the store's own checked directories, and `staging` is the
+/// store's checked staging directory. A directory between `area` and `path` that is missing is
+/// made, and one that is a link is refused, so the document lands where it is named.
+fn rename_into_place(
+    staging: &Path,
+    area: &Path,
+    path: &Path,
+    bytes: &[u8],
+) -> CatalogueResult<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|source| CatalogueError::storage(parent, &source))?;
+        ensure_below(area, parent)?;
     }
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("document");
-    std::fs::create_dir_all(staging).map_err(|source| CatalogueError::storage(staging, &source))?;
     // The temporary name is this writer's alone and is created rather than opened, so a name
     // another writer is using, or a link somebody left, fails instead of being written through.
     let mut attempt = 0u32;
