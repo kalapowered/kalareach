@@ -95,6 +95,35 @@ chmod 700 "$run_root/r" "$run_root/s"
 
 started_pids=()
 
+# The launchd jobs this run's daemon defined, by label. On macOS the daemon writes one definition
+# per worker's job into its environment's jobs directory and removes it once the job has gone.
+defined_jobs() {
+  local definition
+  for definition in "$run_root"/s/environments/*/jobs/kr-worker-*.plist; do
+    [ -e "$definition" ] || continue
+    basename "$definition" .plist
+  done
+}
+
+# Each of those jobs launchd still has loaded, as <domain>/<label>, one to a line. A job launchd
+# could not answer about is named with its answer, so a question nobody could read is not taken
+# for a job that has gone. A host with no launchd has no such job.
+jobs_left() {
+  [ "$(uname -s)" = Darwin ] || return 0
+  local uid label domain rc
+  uid="$(id -u)"
+  for label in $(defined_jobs); do
+    for domain in "gui/$uid" "user/$uid"; do
+      /bin/launchctl print "$domain/$label" >/dev/null 2>&1 && rc=0 || rc=$?
+      case $rc in
+        0) echo "$domain/$label" ;;
+        113) ;;
+        *) echo "$domain/$label (launchctl print answered $rc)" ;;
+      esac
+    done
+  done
+}
+
 cleanup() {
   local status=$?
   for session in $("$run_root/bin/kr" list --json 2>/dev/null | /usr/bin/env python3 -c \
@@ -107,11 +136,18 @@ for entry in document.get("sessions", []):
     print(entry["display_number"])' 2>/dev/null); do
     "$run_root/bin/kr" close "$session" >/dev/null 2>&1 || true
   done
+  # A closed session's worker ends, and the daemon then removes the worker's launchd job. The daemon
+  # is left running until that has happened, within a bound, because a job it has not removed by
+  # the time it stops stays loaded.
+  local deadline=$(( $(date +%s) + 90 ))
+  while [ -n "$(jobs_left)" ] && [ "$(date +%s)" -lt "$deadline" ]; do
+    sleep 1
+  done
   for pid in "${started_pids[@]:-}"; do
     [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
   done
   sleep 1
-  local left
+  local left keep=0 target
   left="$(pgrep -u "$(id -u)" -f "$run_root" 2>/dev/null | grep -v "^$$\$" || true)"
   if [ -n "$left" ]; then
     echo "FAILED: these processes outlived the script"
@@ -122,7 +158,28 @@ for entry in document.get("sessions", []):
   else
     echo "no process this run started is still running"
   fi
-  rm -rf "${run_root:?}"
+  left="$(jobs_left)"
+  if [ -n "$left" ]; then
+    echo "FAILED: these launchd jobs this run's daemon defined were still loaded"
+    printf '%s\n' "$left" | sed 's/^/  /'
+    failed=1
+    # Removed all the same, each by the label this run's own daemon gave it, so the run leaves
+    # nothing loaded behind it. launchd ends whatever is still running inside one.
+    while IFS= read -r target; do
+      /bin/launchctl bootout "${target%% *}" >/dev/null 2>&1 || true
+    done <<<"$left"
+    left="$(jobs_left)"
+    if [ -n "$left" ]; then
+      echo "FAILED: these are still loaded after their removal; $run_root is kept"
+      printf '%s\n' "$left" | sed 's/^/  /'
+      keep=1
+    fi
+  elif [ "$(uname -s)" = Darwin ]; then
+    echo "no launchd job this run's daemon defined is still loaded"
+  fi
+  if [ "$keep" -eq 0 ]; then
+    rm -rf "${run_root:?}"
+  fi
   # A run whose processes outlived it did not pass, whatever the last command returned.
   if [ "$failed" -ne 0 ] && [ "$status" -eq 0 ]; then
     status=1
@@ -212,6 +269,10 @@ for binary in kr-controller kr-worker kr kr-attach-guard; do
     exit 1
   fi
   cp "$target_dir/debug/$binary" "$run_root/bin/$binary"
+  # Started once, here, where nothing is timed: the operating system checks a newly written
+  # executable the first time it starts, and on a loaded machine that check alone can outlast a
+  # create's rendezvous.
+  "$run_root/bin/$binary" --version >/dev/null
 done
 export KR_RUNTIME_DIR="$run_root/r"
 export KR_STATE_DIR="$run_root/s"
