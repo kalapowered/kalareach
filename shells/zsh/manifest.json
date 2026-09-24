@@ -51,6 +51,12 @@
       "revision": "1",
       "upstream_revision": "4c89849c98172c951a9def3690e8647dae76308f",
       "purpose": "The published upstream fix for the terminfo capability-name probes, zsh commit 4c89849c98172c951a9def3690e8647dae76308f (workers/52383), which is after the 5.9 release this package pins. Without it a compiler that rejects a discarded qualifier fails the probe, the shell defines its own copy of an array the terminal header already declares, and the termcap module does not compile."
+    },
+    {
+      "name": "exec-command-resolve",
+      "file": "patches/0004-exec-command-resolve.patch",
+      "revision": "1",
+      "purpose": "The executor asks the integration before it forks an external command started in the foreground with no pipe, through a pointer the line editor's bridge sets and clears, and the forked child starts the launcher the answer names in its place, with the backend's variables added; any other answer, and a launcher that cannot be started, leave the command exactly as it was typed."
     }
   ],
   "sources": [

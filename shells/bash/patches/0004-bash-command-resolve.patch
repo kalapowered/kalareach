@@ -1,0 +1,72 @@
+Subject: [PATCH 4/4] bash: ask the integration before starting a command of the accepted line
+
+An opt-in command integration has to establish its backend before the program it serves starts, so
+the question is asked at the one point where the shell knows exactly what it is about to run: the
+executor, after the search has found the file and before the fork. It is asked only for a command
+of the line the person typed that the root shell starts itself, in the foreground and with no pipe;
+the bridge refuses the rest (a function, a sourced or startup file, an eval, a trap, a prompt
+command, a subshell). The answer either leaves the command exactly as it was, or names a launcher
+that the forked child starts in its place with the backend's variables added. A launcher that
+cannot be started leaves the command as it was typed.
+
+Nothing the person sees changes: no key binding, no function, alias or hook of theirs, and no line
+in the history.
+
+This patch is a derivative work of GNU Bash and carries the GNU General Public Licence, version 3
+or later; see shells/bash/LICENSE.
+
+--- a/execute_cmd.c
++++ b/execute_cmd.c
+@@ -100,6 +100,10 @@
+ 
+ #if defined (HISTORY)
+ #  include "bashhist.h"
++#endif
++
++#if defined (READLINE)
++#  include <readline/kr_bridge_rl.h>
+ #endif
+ 
+ #if defined (HAVE_MBSTR_H) && defined (HAVE_MBSCHR)
+@@ -5600,6 +5604,11 @@
+   pid_t pid;
+   SHELL_VAR *hookf;
+   WORD_LIST *wl;
++#if defined (READLINE)
++  char **kr_launch, **kr_launch_env;
++
++  kr_launch = kr_launch_env = (char **)NULL;
++#endif
+ 
+   stdpath = (cmdflags & CMD_STDPATH);	/* use command -p path */
+   nofork = (cmdflags & CMD_NO_FORK);	/* Don't fork, just exec, if no pipes */
+@@ -5643,6 +5652,17 @@
+       put_command_name_into_env (command);
+     }
+ 
++#if defined (READLINE)
++  /* A command the root shell is about to start in the foreground, with no pipe, asks the
++     integration first.  The answer runs it as it was typed, or through the launcher of a backend
++     the worker established for it before anything started. */
++  if (command && nofork == 0 && pipe_in == NO_PIPE && pipe_out == NO_PIPE && async == 0)
++    {
++      kr_bash_resolve (words, command, &kr_launch, &kr_launch_env);
++      QUIT;
++    }
++#endif
++
+   /* We have to make the child before we check for the non-existence
+      of COMMAND, since we want the error messages to be redirected. */
+   /* If we can get away without forking and there are no pipes to deal with,
+@@ -5749,6 +5769,11 @@
+ 	 leave it there, in the same format that the user used to
+ 	 type it in. */
+       args = strvec_from_word_list (words, 0, 0, (int *)NULL);
++#if defined (READLINE)
++      /* Returns only when the launcher could not be started. */
++      if (kr_launch)
++	kr_bash_launch (kr_launch, kr_launch_env, export_env);
++#endif
+       exit (shell_execve (command, args, export_env));
+     }
+   else

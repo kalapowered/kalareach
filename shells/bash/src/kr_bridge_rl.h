@@ -66,6 +66,34 @@ void kr_rl_pending_paste (int active);
 /* The prompt the next primary reader will start at. */
 unsigned long kr_rl_prompt_generation (void);
 
+/*
+ * Non-zero from the moment a line of the shell is accepted until the next primary reader starts:
+ * the commands that run in between are that line's, and nothing else is.
+ */
+int kr_rl_line_running (void);
+
+/* The working directory now and the revision it is at, or NULL when it cannot be read. */
+const char *kr_rl_cwd (unsigned long *revision);
+
+/* The shell's own word list, which only the shell's half of the bridge reads. */
+struct word_list;
+
+/*
+ * The executor's question, before it forks an external command it found on the search path with
+ * no pipe and in the foreground. `command` is what the search found and `words` what will run.
+ *
+ * Returns non-zero when the command is to run through the integration's launcher, and then fills
+ * the launcher's own vector and the variables to add. Both stay the bridge's until the next call.
+ */
+int kr_bash_resolve (struct word_list *words, const char *command, char ***launch,
+		     char ***environment);
+
+/*
+ * In the forked child, in place of the command: starts the launcher with `environment` added to
+ * `base`. Returns only when the launcher could not be started; the command then runs as typed.
+ */
+void kr_bash_launch (char **launch, char **environment, char **base);
+
 /* Counts Readline holds privately, for the fence proof. */
 int _rl_kr_buffered (void);
 int _rl_kr_macro_remaining (void);

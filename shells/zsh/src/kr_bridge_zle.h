@@ -13,6 +13,9 @@
 /* Loads the bridge when the editor module is set up, before the first primary reader. */
 void kr_zle_setup(void);
 
+/* The editor module is going: nothing may ask the bridge anything any more. */
+void kr_zle_finish(void);
+
 /* The reader's own boundaries, called from zleread. */
 void kr_zle_enter(void);
 void kr_zle_leave(int eof_sent);

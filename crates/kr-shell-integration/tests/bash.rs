@@ -122,6 +122,36 @@ fn a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone() {
     shellpkg::a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone(BASH);
 }
 
+/// KR-REQ-12.07, KR-REQ-07.45
+#[test]
+fn an_interactive_command_asks_once_before_it_starts_and_a_bypass_runs_it_as_typed() {
+    shellpkg::an_interactive_command_asks_once_and_runs_as_typed(BASH);
+}
+
+/// KR-REQ-12.07
+#[test]
+fn a_pipeline_subshell_substitution_background_job_sourced_script_or_script_never_asks() {
+    shellpkg::forms_the_root_shell_does_not_start_itself_never_ask(BASH);
+}
+
+/// KR-REQ-12.07
+#[test]
+fn an_absolute_path_invocation_runs_as_typed() {
+    shellpkg::an_absolute_path_invocation_runs_as_typed(BASH);
+}
+
+/// KR-REQ-12.07
+#[test]
+fn a_worker_that_does_not_answer_leaves_the_command_as_typed_after_the_deadline() {
+    shellpkg::an_unanswered_question_runs_the_command_as_typed_after_the_deadline(BASH);
+}
+
+/// KR-REQ-12.07, KR-REQ-07.45
+#[test]
+fn a_backend_runs_the_command_through_the_launcher_it_names() {
+    shellpkg::a_backend_runs_the_command_through_the_launcher_it_names(BASH);
+}
+
 /// KR-REQ-07.85, KR-REQ-26.11
 #[test]
 fn the_package_declares_the_managed_bash_baseline_and_its_reproducible_identity() {

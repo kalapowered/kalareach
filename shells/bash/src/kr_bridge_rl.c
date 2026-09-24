@@ -68,6 +68,9 @@ static int kr_cancel_requested;
 /* A launch this reader installed, so a revocation can take exactly that text back out. */
 static int kr_installed_chars;
 
+/* True from a line's acceptance until the next primary reader: its commands are running. */
+static int kr_line_running;
+
 static unsigned long
 kr_hash_line (void)
 {
@@ -409,7 +412,11 @@ kr_rl_enter (void)
     kr_bridge_editor_leave (KR_LEAVE_READER_TAKEOVER);
   kr_reader_revision++;
   if (kr_context () == KR_CONTEXT_PRIMARY)
-    kr_prompt_generation++;
+    {
+      /* The line before this prompt has run, and nothing after this is one of its commands. */
+      kr_line_running = 0;
+      kr_prompt_generation++;
+    }
   kr_track_cwd ();
   kr_buffer_hash = kr_hash_line ();
   kr_buffer_revision++;
@@ -423,6 +430,13 @@ kr_rl_enter (void)
   kr_last_source = KR_SOURCE_TERMINAL;
   kr_inside_reader = 1;
   kr_bridge_editor_enter ();
+}
+
+/* A line of the shell was accepted: what runs until the next primary reader is its commands. */
+static void
+kr_rl_line_accepted (void)
+{
+  kr_line_running = 1;
 }
 
 void
@@ -439,10 +453,16 @@ kr_rl_leave (int accepted)
   kr_bridge_cancel_settled ();
   if (accepted)
     {
+      int context = kr_context ();
+
       /* The accepted line is reported from the reader, inside the fence, before the leave: a
 	 record sent after it could only ever say that nothing could be established. */
       kr_bridge_command_accepted ();
       kr_bridge_editor_leave (KR_LEAVE_COMMAND_ACCEPTED);
+      /* Input a running command read through the editor is not a line of the shell: the line
+	 that started that command still owns the block and the capability. */
+      if (context != KR_CONTEXT_READ_BUILTIN)
+	kr_rl_line_accepted ();
     }
   else
     kr_bridge_editor_leave (KR_LEAVE_ROOT_EXIT);
@@ -490,6 +510,27 @@ unsigned long
 kr_rl_prompt_generation (void)
 {
   return kr_prompt_generation;
+}
+
+int
+kr_rl_line_running (void)
+{
+  return kr_line_running;
+}
+
+const char *
+kr_rl_cwd (unsigned long *revision)
+{
+  char here[sizeof (kr_cwd_seen)];
+
+  /* A directory that cannot be read now is not named from what was read before. */
+  if (getcwd (here, sizeof (here)) == 0)
+    return 0;
+  kr_track_cwd ();
+  if (strcmp (kr_cwd_seen, here) != 0)
+    return 0;
+  *revision = kr_cwd_revision;
+  return kr_cwd_seen;
 }
 
 int

@@ -194,4 +194,47 @@ void kr_bridge_lost(int loss, const char *detail);
 /* Non-zero while a launch this bridge installed is waiting to be accepted. */
 int kr_bridge_launch_pending(void);
 
+/* ---- the command a line runs ----------------------------------------------------------------- */
+
+/*
+ * The longest a shell waits for the worker to answer a resolve.
+ *
+ * A worker that is there answers in well under a millisecond. One that has stopped answering costs
+ * this once: while an answer is owed nothing else waits, and every command runs as it was typed.
+ */
+#define KR_ANSWER_WAIT_MS 1000
+
+/*
+ * What an invocation runs as, once the worker has answered.
+ *
+ * `launch` is zero for everything but a backend the worker established: the command then runs
+ * exactly as it was typed and nothing else here is set. Otherwise the shell executes `launcher`
+ * with `arguments` (its own argument vector, the launcher first) and `environment` added to that
+ * one child's environment. Both vectors end with a null pointer.
+ */
+typedef struct {
+    int launch;
+    char *launcher;
+    char **arguments;
+    char **environment;
+} kr_resolution;
+
+/* Non-zero in the root shell process that registered, and in no process forked from it. */
+int kr_bridge_root_process(void);
+
+/*
+ * Asks the worker what one invocation resolves to, and waits at most KR_ANSWER_WAIT_MS.
+ *
+ * `argv` is what the shell is about to run and `executable` is the absolute path its own search
+ * found, in `cwd` at `cwd_revision`. Returns `out->launch`. A bypass, a refusal, the deadline, a
+ * lost endpoint and a launcher that is not an absolute path to an executable file all leave it
+ * zero, and the shell runs the command as it was typed.
+ */
+int kr_bridge_resolve(const char *const *argv, size_t argc, const char *executable,
+                      const char *cwd, unsigned long cwd_revision,
+                      unsigned long prompt_generation, kr_resolution *out);
+
+/* Releases what a resolution holds. */
+void kr_bridge_resolution_free(kr_resolution *resolution);
+
 #endif /* KR_BRIDGE_H */

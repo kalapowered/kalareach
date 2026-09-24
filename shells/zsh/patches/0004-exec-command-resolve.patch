@@ -1,0 +1,193 @@
+Subject: [PATCH 4/4] exec: ask the integration before forking a command of the accepted line
+
+An opt-in command integration has to establish its backend before the program it serves starts, so
+the question is asked at the one point where the shell knows exactly what it is about to run: the
+executor, after the search has found the file and before the fork. It is asked only for an external
+command started in the foreground with no pipe, and the line editor's bridge, which answers it,
+refuses the rest: anything but a command of the line the person typed that the root shell starts
+itself at the top level. Words that still hold a filename pattern are expanded only in the child,
+so such a command is not asked about. The answer either leaves the command exactly as it was, or
+names a launcher that the forked child starts in its place with the backend's variables added. A
+launcher that cannot be started leaves the command as it was typed.
+
+The question is a pointer the editor module sets when it loads and clears when it goes, so the
+executor never calls into a module that is not there. Nothing the person sees changes: no key
+binding, no function, alias or hook of theirs, and no line in the history.
+
+This patch is a derivative work of Zsh and carries the Zsh licence; see shells/zsh/LICENSE.
+
+--- a/Src/exec.c
++++ b/Src/exec.c
+@@ -30,6 +30,19 @@
+ #include "zsh.mdh"
+ #include "exec.pro"
+ 
++/*
++ * The command integration's question in front of an external command the root shell is about
++ * to fork.  The line editor's bridge sets it when it loads and clears it when it goes; what it
++ * answers stays the bridge's.
++ */
++
++/**/
++mod_export KrResolveHook kr_resolve_hook;
++
++/* In a forked child, what the command runs as: the integration's launcher and the variables it
++ * adds, or null for the command as it was typed.  Only the child sets them. */
++static char **kr_launch_argv, **kr_launch_env;
++
+ /* Flags for last argument of addvars */
+ 
+ enum {
+@@ -662,6 +675,81 @@
+ 	}
+     }
+     return NULL;
++}
++
++/*
++ * Whether the forked child would still expand one of a command's words as a filename pattern,
++ * which is the one expansion zsh leaves until after the fork.
++ */
++
++static int
++kr_expands_in_child(LinkList args, int cflags)
++{
++    LinkNode node;
++
++    if ((cflags & BINF_NOGLOB) || unset(GLOBOPT))
++	return 0;
++    for (node = firstnode(args); node; incnode(node))
++	if (haswilds((char *) getdata(node)))
++	    return 1;
++    return 0;
++}
++
++/* A command's words as the child will run them: the lexer's tokens turned back into the
++ * characters they stand for, in heap memory. */
++
++static char **
++kr_plain_words(LinkList args)
++{
++    char **words = hlinklist2array(args, 1), **word;
++
++    for (word = words; *word; word++)
++	untokenize(*word);
++    return words;
++}
++
++/* Whether two NAME=value entries name the same variable. */
++
++static int
++kr_same_name(char *a, char *b)
++{
++    while (*a && *a != '=' && *a == *b)
++	a++, b++;
++    return (*a == '=' || !*a) && (*b == '=' || !*b);
++}
++
++/*
++ * In the forked child, in place of the command: start the integration's launcher, with the
++ * variables its backend needs added to the environment the command would have had.  This returns
++ * only when the launcher could not be started, and the command then runs as it was typed, with
++ * nothing the backend named.
++ */
++
++static void
++kr_exec_launcher(char **envp)
++{
++    char **base = envp ? envp : environ, **merged, **pp, **added;
++    int count = 0, extra = 0, used = 0;
++
++    for (pp = base; *pp; pp++)
++	count++;
++    for (pp = kr_launch_env; pp && *pp; pp++)
++	extra++;
++    merged = (char **) zalloc((count + extra + 1) * sizeof(char *));
++    for (pp = base; *pp; pp++) {
++	for (added = kr_launch_env; added && *added; added++)
++	    if (kr_same_name(*pp, *added))
++		break;
++	if (!added || !*added)
++	    merged[used++] = *pp;
++    }
++    for (added = kr_launch_env; added && *added; added++)
++	merged[used++] = *added;
++    merged[used] = NULL;
++    winch_unblock();
++    execve(kr_launch_argv[0], kr_launch_argv, merged);
++    winch_block();
++    zfree(merged, (count + extra + 1) * sizeof(char *));
+ }
+ 
+ /* execute an external command */
+@@ -740,6 +828,8 @@
+ 	zerr("command too long: %s", arg0);
+ 	_exit(1);
+     }
++    if (kr_launch_argv)
++	kr_exec_launcher(newenvp);
+     for (s = arg0; *s; s++)
+ 	if (*s == '/') {
+ 	    int lerrno = zexecve(arg0, argv, newenvp);
+@@ -3572,11 +3662,31 @@
+ 	    (((is_builtin || is_shfunc) && output) ||
+ 	     (!is_cursh && (last1 != 1 || nsigtrapped || havefiles() ||
+ 			    fdtable_flocks)))) {
++	    char **kr_launch = NULL, **kr_env = NULL;
++
++	    /*
++	     * An external command started in the foreground with no pipe asks the integration
++	     * before the fork: its answer runs the command as it was typed, or through the launcher
++	     * of a backend the worker established for it before anything started.  A word that is
++	     * still a filename pattern is expanded only in the child, so such a command is not
++	     * asked about and runs as it was typed.
++	     */
++	    if (!is_cursh && kr_resolve_hook && type == WC_SIMPLE && !input && !output &&
++		!(how & Z_ASYNC) && !(cflags & BINF_DASH) && args && nonempty(args) &&
++		!kr_expands_in_child(args, cflags)) {
++		char **words = kr_plain_words(args);
++		char *found = findcmd(words[0], 1, use_defpath);
++
++		if (found)
++		    kr_resolve_hook(words, found, &kr_launch, &kr_env);
++	    }
+ 	    switch (execcmd_fork(state, how, type, varspc, &filelist,
+ 				 text, oautocont, close_if_forked)) {
+ 	    case -1:
+ 		goto fatal;
+ 	    case 0:
++		kr_launch_argv = kr_launch;
++		kr_launch_env = kr_env;
+ 		break;
+ 	    default:
+ 		return;
+--- a/Src/zsh.h
++++ b/Src/zsh.h
+@@ -3245,7 +3245,15 @@
+ /* ZLE entry point pointer */
+ 
+ typedef char * (*ZleEntryPoint)(int cmd, va_list ap);
++
++/*
++ * The command integration's question before an external command is forked: the command's words
++ * and the file the search found, both metafied.  It answers with the launcher's own vector and the
++ * variables to add, or leaves both null for a command that runs as it was typed.
++ */
+ 
++typedef int (*KrResolveHook) _((char **, char *, char ***, char ***));
++
+ /* Commands to pass to entry point */
+ 
+ enum {
+--- a/Src/Zle/zle_main.c
++++ b/Src/Zle/zle_main.c
+@@ -2405,6 +2405,9 @@
+     zle_entry_ptr = (ZleEntryPoint)0;
+     zle_load_state = 0;
+ 
++    /* The integration's question goes with the editor that answers it. */
++    kr_zle_finish();
++
+     zfree(clwords, clwsize * sizeof(char *));
+     zle_refresh_finish();
+ 

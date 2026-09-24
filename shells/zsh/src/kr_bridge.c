@@ -26,10 +26,12 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <time.h>
@@ -43,6 +45,10 @@
 #define KR_ENDPOINT_VARIABLE "KR_SHELL_BRIDGE"
 #define KR_SECRET_VARIABLE "KR_SHELL_BRIDGE_SECRET"
 #define KR_SESSION_VARIABLE "KR_SESSION"
+/* Where the integration writes what it did, when the session asked for that. */
+#define KR_TRACE_VARIABLE "KR_SHELL_BRIDGE_TRACE"
+/* Detaches submitted and not answered yet. A refusal belongs to a detach only if it answers one. */
+#define KR_DETACH_IDS_MAX 8
 
 #define KR_UUID_LEN 16
 #define KR_SECRET_MAX 64
@@ -139,6 +145,27 @@ static struct {
     } marks[KR_MARKS_MAX];
     size_t mark_count;
     unsigned long long frame_at_ms;
+
+    /* The detaches this bridge submitted that the worker has not answered, oldest first. */
+    unsigned long long detach_ids[KR_DETACH_IDS_MAX];
+    size_t detach_count;
+
+    /*
+     * The event whose answer this bridge stopped waiting for, or 0.
+     *
+     * The worker answers events in the order they arrive, so an answer to this one or to any later
+     * one says it has caught up. Until then nothing waits for it again.
+     */
+    unsigned long long owed;
+
+    /* The resolve last asked, and the encoded answer once it has come. */
+    unsigned long long resolve_id;
+    int resolve_answered;
+    unsigned char *resolve_answer;
+    size_t resolve_answer_len;
+
+    /* Where diagnostics go, when the session asked for them. */
+    char trace[512];
 } kr = {
     /* Not connected. Static storage starts at zero, which is a descriptor. */
     -1
@@ -156,6 +183,98 @@ kr_now_ms(void)
     }
 #endif
     return 0;
+}
+
+/*
+ * One line of diagnostics, when the session asked for them.
+ *
+ * The integration says what it did and why when something asks it to, and nothing at all
+ * otherwise: a managed root shell writes no file of its own unless it was told where to.
+ */
+static void
+kr_trace(const char *format, ...)
+{
+    char line[1024];
+    va_list arguments;
+    int length;
+    int fd;
+
+    if (kr.trace[0] == '\0') {
+        return;
+    }
+    va_start(arguments, format);
+    length = vsnprintf(line, sizeof(line) - 1, format, arguments);
+    va_end(arguments);
+    if (length < 0) {
+        return;
+    }
+    if ((size_t)length > sizeof(line) - 2) {
+        length = (int)(sizeof(line) - 2);
+    }
+    line[length++] = '\n';
+    fd = open(kr.trace, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        return;
+    }
+    if (write(fd, line, (size_t)length) < 0) {
+        /* Diagnostics that cannot be written are not a reason to do anything differently. */
+    }
+    close(fd);
+}
+
+/* Whether `len` bytes at `text` are well-formed UTF-8, which is all a text string on the wire may
+ * hold. */
+static int
+kr_utf8_valid(const unsigned char *text, size_t len)
+{
+    size_t at = 0;
+
+    while (at < len) {
+        unsigned char lead = text[at];
+        size_t follow;
+        unsigned long value;
+        size_t i;
+
+        if (lead < 0x80) {
+            at++;
+            continue;
+        }
+        if (lead >= 0xc2 && lead <= 0xdf) {
+            follow = 1;
+            value = lead & 0x1fu;
+        } else if (lead >= 0xe0 && lead <= 0xef) {
+            follow = 2;
+            value = lead & 0x0fu;
+        } else if (lead >= 0xf0 && lead <= 0xf4) {
+            follow = 3;
+            value = lead & 0x07u;
+        } else {
+            return 0;
+        }
+        if (len - at <= follow) {
+            return 0;
+        }
+        for (i = 1; i <= follow; i++) {
+            if ((text[at + i] & 0xc0u) != 0x80u) {
+                return 0;
+            }
+            value = (value << 6) | (text[at + i] & 0x3fu);
+        }
+        /* The shortest form only, no surrogates and nothing past the last code point. */
+        if ((follow == 2 && value < 0x800) || (follow == 3 && value < 0x10000) ||
+            (value >= 0xd800 && value <= 0xdfff) || value > 0x10ffff) {
+            return 0;
+        }
+        at += follow + 1;
+    }
+    return 1;
+}
+
+/* Whether a C string is well-formed UTF-8. */
+static int
+kr_utf8_text(const char *text)
+{
+    return text != NULL && kr_utf8_valid((const unsigned char *)text, strlen(text));
 }
 
 static int
@@ -273,6 +392,9 @@ kr_disconnect(int loss)
     kr.registered = 0;
     kr.fence_live = 0;
     kr.launch_pending = 0;
+    /* Nothing more will be answered, so nothing is owed and nothing is waited for. */
+    kr.owed = 0;
+    kr.detach_count = 0;
 }
 
 static int
@@ -443,23 +565,44 @@ kr_frame_arrival(size_t length)
     return kr_now_ms();
 }
 
+/*
+ * Takes the frame of `length` bytes that starts `at` bytes into the input buffer out of it.
+ *
+ * The frames around it keep their order and their arrival times: a mark past the frame moves down
+ * with its bytes, and one that ended inside it now ends where the frame began, because the bytes
+ * before that point arrived when it says they did.
+ */
 static void
-kr_drop_frame(size_t length)
+kr_remove_frame_at(size_t at, size_t length)
 {
     size_t total = KR_FRAME_HEADER + length;
     size_t kept = 0;
     size_t i;
 
-    memmove(kr.in, kr.in + total, kr.in_len - total);
+    memmove(kr.in + at, kr.in + at + total, kr.in_len - at - total);
     kr.in_len -= total;
     for (i = 0; i < kr.mark_count; i++) {
-        if (kr.marks[i].ends_at > total) {
-            kr.marks[kept].ends_at = kr.marks[i].ends_at - total;
-            kr.marks[kept].at_ms = kr.marks[i].at_ms;
-            kept++;
+        size_t ends = kr.marks[i].ends_at;
+
+        if (ends > at + total) {
+            ends -= total;
+        } else if (ends > at) {
+            ends = at;
         }
+        if (ends == 0 || (kept > 0 && kr.marks[kept - 1].ends_at >= ends)) {
+            continue;
+        }
+        kr.marks[kept].ends_at = ends;
+        kr.marks[kept].at_ms = kr.marks[i].at_ms;
+        kept++;
     }
     kr.mark_count = kept;
+}
+
+static void
+kr_drop_frame(size_t length)
+{
+    kr_remove_frame_at(0, length);
 }
 
 /* ---- writing the contract's own shapes ------------------------------------------------------- */
@@ -579,8 +722,8 @@ kr_write_gesture(kr_cbor_writer *writer, int disabled, unsigned long byte)
 /* Opens `{"event": {"id": <id>, "event": {"<name>": ` and leaves the payload to the caller.
  *
  * Each side allocates the identifiers it sends, so an answer belongs to its question rather than
- * to whatever is in flight. */
-static void
+ * to whatever is in flight. Returns the identifier, which is what the answer will carry. */
+static unsigned long long
 kr_open_event(kr_cbor_writer *writer, const char *name)
 {
     kr_cbor_writer_init(writer);
@@ -590,6 +733,7 @@ kr_open_event(kr_cbor_writer *writer, const char *name)
     kr_cbor_uint(writer, ++kr.event_counter);
     kr_cbor_key(writer, "event");
     kr_cbor_variant(writer, name);
+    return kr.event_counter;
 }
 
 static void
@@ -858,6 +1002,13 @@ kr_bridge_activate(void)
     strcpy(kr.endpoint, endpoint);
     strcpy(kr.hint, "Use kr detach --attachment <id> to detach.");
     kr.gesture_byte = 4;
+    {
+        /* Diagnostics go only to an absolute path the session named. */
+        const char *trace = getenv(KR_TRACE_VARIABLE);
+        if (trace != NULL && trace[0] == '/' && strlen(trace) < sizeof(kr.trace)) {
+            strcpy(kr.trace, trace);
+        }
+    }
 
     kr_process_identity();
 
@@ -899,6 +1050,7 @@ kr_bridge_activate(void)
     kr_shell_unexport(KR_SECRET_VARIABLE);
     unsetenv(KR_ENDPOINT_VARIABLE);
     unsetenv(KR_SECRET_VARIABLE);
+    kr_trace("registered: root shell %llu", kr.self_pid);
 }
 
 int
@@ -911,6 +1063,14 @@ int
 kr_bridge_managed(void)
 {
     return kr.managed;
+}
+
+int
+kr_bridge_root_process(void)
+{
+    /* A process forked from the root shell inherits this state and the endpoint's descriptor, and
+     * is still not the process the worker registered. */
+    return kr.registered && kr.fd >= 0 && (unsigned long long)getpid() == kr.self_pid;
 }
 
 int
@@ -1230,6 +1390,7 @@ kr_bridge_pre_eof(int key, int source)
 {
     kr_reader_state state;
     kr_cbor_writer writer;
+    unsigned long long detach_id;
 
     if (!kr.managed) {
         return KR_NATIVE;
@@ -1263,7 +1424,7 @@ kr_bridge_pre_eof(int key, int source)
         return kr_consume(state.prompt_generation, "fence_stale");
     }
 
-    kr_open_event(&writer, "eof_detach");
+    detach_id = kr_open_event(&writer, "eof_detach");
     kr_cbor_map(&writer, 4);
     kr_cbor_key(&writer, "fence_id");
     kr_cbor_bstr(&writer, kr.fence_id, KR_UUID_LEN);
@@ -1275,6 +1436,14 @@ kr_bridge_pre_eof(int key, int source)
     kr_cbor_uint(&writer, kr.fence_prompt);
     kr_cbor_map_end(&writer);
     kr_close_event(&writer);
+    /* A refusal is this detach's only when it answers it. The oldest goes when there is no room,
+     * which a person pressing the gesture faster than the worker answers could only reach by
+     * outrunning it several times over. */
+    if (kr.detach_count == KR_DETACH_IDS_MAX) {
+        memmove(kr.detach_ids, kr.detach_ids + 1, (KR_DETACH_IDS_MAX - 1) * sizeof(kr.detach_ids[0]));
+        kr.detach_count--;
+    }
+    kr.detach_ids[kr.detach_count++] = detach_id;
     return KR_CONSUME;
 }
 
@@ -1713,25 +1882,174 @@ kr_take_publication(const kr_cbor_doc *doc, int publication)
     kr.fence_live = 0;
 }
 
+/* Whether `id` is a detach this bridge submitted and has had no answer to, forgetting it if so. */
+static int
+kr_take_detach_id(unsigned long long id)
+{
+    size_t i;
+
+    for (i = 0; i < kr.detach_count; i++) {
+        if (kr.detach_ids[i] == id) {
+            memmove(kr.detach_ids + i, kr.detach_ids + i + 1,
+                    (kr.detach_count - i - 1) * sizeof(kr.detach_ids[0]));
+            kr.detach_count--;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Takes the worker's answer to one of this bridge's events.
+ *
+ * An answer belongs to the event its identifier names, never to whatever is in flight: a refusal
+ * is a detach's only when it answers a detach, and the answers a package waits for before a
+ * command runs are kept for the event that asked.
+ */
 static void
-kr_take_event_result(const kr_cbor_doc *doc, int result)
+kr_take_event_result(const kr_cbor_doc *doc, unsigned long long id, int result)
 {
     const char *name;
     size_t name_len;
+    int payload;
 
-    if (kr_cbor_variant_of(doc, result, &name, &name_len) < 0) {
+    /* The worker answers in the order it was asked, so this answer, or a later one, is the owed
+     * one having come. */
+    if (kr.owed != 0 && id >= kr.owed) {
+        kr.owed = 0;
+    }
+    payload = kr_cbor_variant_of(doc, result, &name, &name_len);
+    if (payload < 0) {
         return;
     }
-    if (name_len == 7 && memcmp(name, "refused", 7) == 0) {
-        /* The one refusal every bridge must handle: the detach the gesture had already left the
-         * reader for. */
-        kr_detach_refused();
+    if (kr_take_detach_id(id)) {
+        if (name_len == 7 && memcmp(name, "refused", 7) == 0) {
+            /* The one refusal every bridge must handle: the detach the gesture had already left
+             * the reader for. */
+            kr_detach_refused();
+        } else if (name_len == 8 && memcmp(name, "detached", 8) == 0) {
+            /* After a successful detach the bridge drops its fence, so a repeated gesture cannot
+             * take on the next attachment's identity. */
+            kr.fence_live = 0;
+        }
         return;
     }
-    if (name_len == 8 && memcmp(name, "detached", 8) == 0) {
-        /* After a successful detach the bridge drops its fence, so a repeated gesture cannot take
-         * on the next attachment's identity. */
-        kr.fence_live = 0;
+    if (id != 0 && id == kr.resolve_id) {
+        kr.resolve_answered = 1;
+        free(kr.resolve_answer);
+        kr.resolve_answer = NULL;
+        kr.resolve_answer_len = 0;
+        /* Anything but a resolution, a refusal included, is no backend: the command runs as it
+         * was typed. */
+        if (name_len == 16 && memcmp(name, "command_resolved", 16) == 0 &&
+            doc->values[payload].encoded_len > 0) {
+            kr.resolve_answer = (unsigned char *)malloc(doc->values[payload].encoded_len);
+            if (kr.resolve_answer != NULL) {
+                memcpy(kr.resolve_answer, doc->values[payload].encoded,
+                       doc->values[payload].encoded_len);
+                kr.resolve_answer_len = doc->values[payload].encoded_len;
+            }
+        }
+    }
+}
+
+/*
+ * Takes the answer a package is waiting for out of what has already arrived.
+ *
+ * Only the answer to the resolve being waited for is taken, wherever it is among the frames
+ * already read. Everything else stays where it is, in order, for the reader to take at its next
+ * boundary: a request for the reader, a publication and a detach's answer all belong to a reader,
+ * and none is running while a command starts.
+ */
+static void
+kr_take_answers(void)
+{
+    size_t at = 0;
+
+    while (kr.registered && kr.in_len - at >= KR_FRAME_HEADER) {
+        unsigned long length = ((unsigned long)kr.in[at] << 24) |
+                               ((unsigned long)kr.in[at + 1] << 16) |
+                               ((unsigned long)kr.in[at + 2] << 8) | (unsigned long)kr.in[at + 3];
+        kr_cbor_doc doc;
+        const char *name;
+        size_t name_len;
+        int root;
+        int payload;
+        int taken = 0;
+
+        if (length == 0 || length > KR_CBOR_MAX_FRAME) {
+            kr_disconnect(KR_LOSS_BRIDGE_DISCONNECTED);
+            return;
+        }
+        if (kr.in_len - at < KR_FRAME_HEADER + length) {
+            return;
+        }
+        root = kr_cbor_parse(&doc, kr.in + at + KR_FRAME_HEADER, (size_t)length);
+        payload = kr_cbor_variant_of(&doc, root, &name, &name_len);
+        if (payload >= 0 && name_len == 12 && memcmp(name, "event_result", 12) == 0) {
+            int id_value = kr_cbor_get(&doc, payload, "id");
+            if (id_value >= 0 && doc.values[id_value].kind == KR_CBOR_UINT) {
+                unsigned long long id = doc.values[id_value].number;
+                if (id == kr.resolve_id && !kr.resolve_answered) {
+                    kr_take_event_result(&doc, id, kr_cbor_get(&doc, payload, "result"));
+                    taken = 1;
+                } else if (kr.owed != 0 && id >= kr.owed) {
+                    kr.owed = 0;
+                }
+            }
+        }
+        kr_cbor_doc_free(&doc);
+        if (taken) {
+            kr_remove_frame_at(at, (size_t)length);
+        } else {
+            at += KR_FRAME_HEADER + length;
+        }
+    }
+}
+
+/*
+ * Waits until `*answered` is set, the deadline passes or the endpoint has gone.
+ *
+ * Nothing but the answer is taken off the endpoint's buffer here. A deadline that passes leaves the
+ * answer owed, and while it is owed nothing waits again.
+ */
+static int
+kr_await(unsigned long long id, const int *answered, unsigned long long deadline)
+{
+    for (;;) {
+        struct pollfd waiting;
+        long long remaining;
+        int ready;
+
+        kr_take_answers();
+        if (*answered) {
+            return 1;
+        }
+        if (!kr.registered || kr.fd < 0) {
+            return 0;
+        }
+        remaining = (long long)deadline - (long long)kr_now_ms();
+        if (remaining <= 0) {
+            kr.owed = id;
+            return 0;
+        }
+        waiting.fd = kr.fd;
+        waiting.events = (short)(POLLIN | (kr.out_len > 0 ? POLLOUT : 0));
+        waiting.revents = 0;
+        ready = poll(&waiting, 1, (int)remaining);
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            kr.owed = id;
+            return 0;
+        }
+        if (kr.out_len > 0 && !kr_flush()) {
+            return 0;
+        }
+        if (ready > 0 && (waiting.revents & (POLLIN | POLLHUP | POLLERR)) != 0 && !kr_fill()) {
+            return 0;
+        }
     }
 }
 
@@ -1867,7 +2185,11 @@ kr_handle_frame(const unsigned char *frame, size_t length)
         return;
     }
     if (name_len == 12 && memcmp(name, "event_result", 12) == 0) {
-        kr_take_event_result(&doc, kr_cbor_get(&doc, payload, "result"));
+        int id_value = kr_cbor_get(&doc, payload, "id");
+        if (id_value >= 0 && doc.values[id_value].kind == KR_CBOR_UINT) {
+            kr_take_event_result(&doc, doc.values[id_value].number,
+                                 kr_cbor_get(&doc, payload, "result"));
+        }
         kr_cbor_doc_free(&doc);
         return;
     }
@@ -1950,4 +2272,253 @@ kr_bridge_service(void)
         }
     }
     kr_flush();
+}
+
+/* ---- the command a line runs ------------------------------------------------------------------ */
+
+/* Frees a vector of strings that ends with a null pointer. */
+static void
+kr_free_vector(char **vector)
+{
+    size_t i;
+
+    if (vector == NULL) {
+        return;
+    }
+    for (i = 0; vector[i] != NULL; i++) {
+        free(vector[i]);
+    }
+    free(vector);
+}
+
+/* A copy of a decoded text value as a C string, or NULL when it is not text or holds a NUL. */
+static char *
+kr_text_copy(const kr_cbor_doc *doc, int index)
+{
+    char *copy;
+
+    if (index < 0 || doc->values[index].kind != KR_CBOR_TSTR ||
+        memchr(doc->values[index].payload, '\0', doc->values[index].payload_len) != NULL) {
+        return NULL;
+    }
+    copy = (char *)malloc(doc->values[index].payload_len + 1);
+    if (copy == NULL) {
+        return NULL;
+    }
+    memcpy(copy, doc->values[index].payload, doc->values[index].payload_len);
+    copy[doc->values[index].payload_len] = '\0';
+    return copy;
+}
+
+void
+kr_bridge_resolution_free(kr_resolution *resolution)
+{
+    if (resolution == NULL) {
+        return;
+    }
+    free(resolution->launcher);
+    kr_free_vector(resolution->arguments);
+    kr_free_vector(resolution->environment);
+    memset(resolution, 0, sizeof(*resolution));
+}
+
+/*
+ * Reads the answer to the resolve last asked into what the shell runs.
+ *
+ * A backend is the only answer that changes anything, and only when the launcher it names is an
+ * absolute path to an executable file and the vector keeps the command name the person typed.
+ * Anything else is run as typed: the launcher is never searched for.
+ */
+static int
+kr_decide_launch(const char *command, const char *executable, kr_resolution *out)
+{
+    kr_cbor_doc doc;
+    int root;
+    int backend;
+    int launcher;
+    int arguments;
+    int environment;
+    int item;
+    size_t count;
+    size_t used;
+    struct stat file;
+
+    if (kr.resolve_answer == NULL) {
+        kr_trace("resolve %llu: refused; runs as typed", kr.resolve_id);
+        return 0;
+    }
+    root = kr_cbor_parse(&doc, kr.resolve_answer, kr.resolve_answer_len);
+    backend = kr_cbor_get(&doc, root, "backend");
+    if (backend < 0 || doc.values[backend].kind != KR_CBOR_MAP) {
+        int bypass = kr_cbor_get(&doc, root, "bypass");
+        if (bypass >= 0 && doc.values[bypass].kind == KR_CBOR_TSTR) {
+            kr_trace("resolve %llu: bypass %.*s; runs as typed", kr.resolve_id,
+                     (int)doc.values[bypass].payload_len, (const char *)doc.values[bypass].payload);
+        } else {
+            kr_trace("resolve %llu: no backend; runs as typed", kr.resolve_id);
+        }
+        kr_cbor_doc_free(&doc);
+        return 0;
+    }
+    launcher = kr_cbor_get(&doc, backend, "launcher");
+    arguments = kr_cbor_get(&doc, root, "arguments");
+    environment = kr_cbor_get(&doc, backend, "environment");
+    out->launcher = kr_text_copy(&doc, launcher);
+    if (out->launcher == NULL || out->launcher[0] != '/' || stat(out->launcher, &file) != 0 ||
+        !S_ISREG(file.st_mode) || access(out->launcher, X_OK) != 0) {
+        kr_trace("resolve %llu: the launcher is not an absolute path to an executable file; "
+                 "runs as typed", kr.resolve_id);
+        kr_cbor_doc_free(&doc);
+        kr_bridge_resolution_free(out);
+        return 0;
+    }
+    if (arguments < 0 || doc.values[arguments].kind != KR_CBOR_ARRAY ||
+        doc.values[arguments].count == 0 || environment < 0 ||
+        doc.values[environment].kind != KR_CBOR_ARRAY) {
+        kr_trace("resolve %llu: the answer names no vector; runs as typed", kr.resolve_id);
+        kr_cbor_doc_free(&doc);
+        kr_bridge_resolution_free(out);
+        return 0;
+    }
+
+    /* The launcher's own vector: `launcher launch -- executable arguments...`. */
+    count = doc.values[arguments].count;
+    out->arguments = (char **)calloc(count + 5, sizeof(char *));
+    if (out->arguments == NULL) {
+        kr_cbor_doc_free(&doc);
+        kr_bridge_resolution_free(out);
+        return 0;
+    }
+    out->arguments[0] = strdup(out->launcher);
+    out->arguments[1] = strdup("launch");
+    out->arguments[2] = strdup("--");
+    out->arguments[3] = strdup(executable);
+    used = 4;
+    for (item = kr_cbor_first(&doc, arguments); item >= 0; item = kr_cbor_next(&doc, item)) {
+        out->arguments[used] = kr_text_copy(&doc, item);
+        if (out->arguments[used] == NULL) {
+            break;
+        }
+        used++;
+    }
+    if (used != count + 4 || out->arguments[0] == NULL || out->arguments[1] == NULL ||
+        out->arguments[2] == NULL || out->arguments[3] == NULL ||
+        strcmp(out->arguments[4], command) != 0) {
+        /* The integration adds flags; it never renames the command the person typed. */
+        kr_trace("resolve %llu: the answer does not keep the command name; runs as typed",
+                 kr.resolve_id);
+        kr_cbor_doc_free(&doc);
+        kr_bridge_resolution_free(out);
+        return 0;
+    }
+
+    /* The variables for this one child, as NAME=value. */
+    count = doc.values[environment].count;
+    out->environment = (char **)calloc(count + 1, sizeof(char *));
+    if (out->environment == NULL) {
+        kr_cbor_doc_free(&doc);
+        kr_bridge_resolution_free(out);
+        return 0;
+    }
+    used = 0;
+    for (item = kr_cbor_first(&doc, environment); item >= 0; item = kr_cbor_next(&doc, item)) {
+        char *name = kr_text_copy(&doc, kr_cbor_get(&doc, item, "name"));
+        char *value = kr_text_copy(&doc, kr_cbor_get(&doc, item, "value"));
+        char *pair = NULL;
+
+        if (name != NULL && value != NULL && name[0] != '\0' && strchr(name, '=') == NULL) {
+            size_t size = strlen(name) + strlen(value) + 2;
+            pair = (char *)malloc(size);
+            if (pair != NULL) {
+                snprintf(pair, size, "%s=%s", name, value);
+            }
+        }
+        free(name);
+        free(value);
+        if (pair == NULL) {
+            break;
+        }
+        out->environment[used++] = pair;
+    }
+    kr_cbor_doc_free(&doc);
+    if (used != count) {
+        kr_trace("resolve %llu: the answer names a variable no environment can hold; runs as typed",
+                 kr.resolve_id);
+        kr_bridge_resolution_free(out);
+        return 0;
+    }
+    out->launch = 1;
+    kr_trace("resolve %llu: backend; runs through %s", kr.resolve_id, out->launcher);
+    return 1;
+}
+
+int
+kr_bridge_resolve(const char *const *argv, size_t argc, const char *executable, const char *cwd,
+                  unsigned long cwd_revision, unsigned long prompt_generation, kr_resolution *out)
+{
+    kr_cbor_writer writer;
+    size_t i;
+
+    memset(out, 0, sizeof(*out));
+    if (!kr_bridge_root_process() || argv == NULL || argc == 0 || executable == NULL ||
+        cwd == NULL) {
+        return 0;
+    }
+    /*
+     * The request is text, and a backend is established for exactly the file and the directory it
+     * names. An executable, a directory or an argument that is not UTF-8 cannot be named exactly,
+     * so the command runs as typed without asking.
+     */
+    if (executable[0] != '/' || cwd[0] != '/' || !kr_utf8_text(executable) ||
+        !kr_utf8_text(cwd)) {
+        kr_trace("resolve: %s was not asked about: its path or directory cannot be named exactly",
+                 argv[0] != NULL ? argv[0] : "");
+        return 0;
+    }
+    for (i = 0; i < argc; i++) {
+        if (argv[i] == NULL || !kr_utf8_text(argv[i])) {
+            kr_trace("resolve: an argument is not UTF-8, so the command was not asked about");
+            return 0;
+        }
+    }
+    kr_take_answers();
+    if (kr.owed != 0) {
+        kr_trace("resolve: %s was not asked about: event %llu is still unanswered", argv[0],
+                 kr.owed);
+        return 0;
+    }
+
+    kr.resolve_id = kr_open_event(&writer, "command_resolve");
+    kr.resolve_answered = 0;
+    free(kr.resolve_answer);
+    kr.resolve_answer = NULL;
+    kr.resolve_answer_len = 0;
+    kr_cbor_map(&writer, 7);
+    kr_cbor_key(&writer, "cwd");
+    kr_cbor_tstr(&writer, cwd);
+    kr_cbor_key(&writer, "argv");
+    kr_cbor_array(&writer, argc);
+    for (i = 0; i < argc; i++) {
+        kr_cbor_tstr(&writer, argv[i]);
+    }
+    kr_cbor_key(&writer, "executable");
+    kr_cbor_tstr(&writer, executable);
+    kr_cbor_key(&writer, "session_id");
+    kr_cbor_bstr(&writer, kr.session, KR_UUID_LEN);
+    kr_cbor_key(&writer, "interactive");
+    kr_cbor_bool(&writer, 1);
+    kr_cbor_key(&writer, "cwd_revision");
+    kr_cbor_uint(&writer, cwd_revision);
+    kr_cbor_key(&writer, "prompt_generation");
+    kr_cbor_uint(&writer, prompt_generation);
+    kr_cbor_map_end(&writer);
+    kr_close_event(&writer);
+    kr_trace("resolve %llu: asked about %s as %s in %s at revision %lu", kr.resolve_id, argv[0],
+             executable, cwd, cwd_revision);
+
+    if (!kr_await(kr.resolve_id, &kr.resolve_answered, kr_now_ms() + KR_ANSWER_WAIT_MS)) {
+        kr_trace("resolve %llu: no answer; runs as typed", kr.resolve_id);
+        return 0;
+    }
+    return kr_decide_launch(argv[0], executable, out);
 }

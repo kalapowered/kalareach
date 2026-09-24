@@ -216,8 +216,9 @@ Every package records, and the worker keeps with the session:
 Everything below comes from the reader itself, at the moment the reader does the thing. This is the
 contract a bridge speaks and the host answers; which of these a given package sends is that
 package's own declaration. The Zsh and Bash packages send every event in this table but
-`command_resolve` and `command_block`, which the host answers and no packaged shell yet sends, so a
-command in one of those shells takes neither the integration's flags nor a command block.
+`command_block`. The fish and PSReadLine packages send neither `command_resolve` nor
+`command_block`, so a command in one of those shells runs as it was typed, and no packaged shell
+reports a command block.
 
 | Event | When | Fields |
 | --- | --- | --- |
@@ -292,10 +293,38 @@ stays in force and a null `detach_token`, and the line that started the command 
 both. A `continuation` acceptance is not this case: it is part of the line being typed, at the same
 prompt, and that line is the one that runs.
 
-The packaged shells do not export it yet, for the same reason they emit no `command_resolve` or
-`command_block`: the hooks that would carry them are the package builder's. Until a package does,
-a bare `kr detach` inside it is answered with the instruction to name the attachment, which is the
-refusal this contract asks for rather than an attachment the host cannot stand behind.
+The packaged shells do not export it, and a bare `kr detach` inside one of them is answered with
+the instruction to name the attachment, which is the refusal this contract asks for rather than
+an attachment the host cannot stand behind.
+
+### The command a line runs
+
+The Zsh and Bash packages ask before each command of an accepted line that the root shell starts
+itself: an external command found on the search path, at the top level of the line, in the
+foreground and with no pipe. The question is `command_resolve`, asked from the shell's executor
+after its own search has found the file and before it forks, so it names the vector the shell is
+about to run, the absolute path it found and the directory it runs in. A command in a pipeline, a
+subshell, a command substitution or the background runs in a process the shell forks, and one that
+a function, a sourced or startup file, an `eval`, a trap or a prompt hook runs is not a command of
+the line: none of these asks, and each runs as it was typed. A script is a process of its own, so
+only the interpreter it is started with is asked about. Zsh expands a filename pattern only in the
+child it forks, so a command whose words still hold one is not asked about either.
+
+The shell waits at most one second for the answer. A bypass, a refusal, the deadline and a lost
+endpoint all run the command exactly as the shell would have run it without asking: the same file,
+the same vector and the same environment. While an answer is owed nothing waits for another one, so
+a worker that has stopped answering costs one wait rather than one per command. When the answer
+carries a backend, the forked child starts the launcher the backend names, as `<launcher> launch --
+<executable> <arguments>`, with the backend's variables added to that one child's environment. The
+launcher is only ever the absolute path the answer gives and is never searched for; one that is not
+an absolute path to an executable file is refused, and the command runs as it was typed.
+
+None of this changes what the person sees: no key binding, function, alias or hook is added or
+replaced, the history holds the line as it was typed, and `type` and `which` report the command as
+they did before.
+
+A session that names an absolute path in `KR_SHELL_BRIDGE_TRACE` gets one line of diagnostics in
+that file for each question and answer. Otherwise the integration writes no file of its own.
 
 ## The reader-thread rules
 

@@ -1180,6 +1180,7 @@ impl Session {
             events: Inbox::default(),
             answers: std::collections::HashMap::new(),
             next_request: 1,
+            commands: Commands::default(),
             output,
             stopped,
             stopped_reading,

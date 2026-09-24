@@ -63,6 +63,12 @@ static int kr_idle_reported;
 /* A launch this reader installed, so a revocation can take exactly that text back out. */
 static int kr_installed_chars;
 
+/* True from a line's acceptance until the next primary reader: its commands are running. */
+static int kr_line_running;
+
+/* What the command being started now runs as, held until the next command asks. */
+static kr_resolution kr_resolution_now;
+
 static unsigned long
 kr_hash_line(void)
 {
@@ -366,12 +372,98 @@ kr_shell_unexport(const char *name)
     unsetparam((char *)name);
 }
 
-/* ---- the reader's boundaries ------------------------------------------------------------------ */
+/* Whether the shell is running a command of the line itself: not one that a function, a sourced
+ * or startup file, an eval, a trap, a hook or a widget runs. */
+static int
+kr_top_level(void)
+{
+    return zsh_eval_context != NULL && zsh_eval_context[0] != NULL &&
+           strcmp(zsh_eval_context[0], "toplevel") == 0 && zsh_eval_context[1] == NULL;
+}
+
+/*
+ * The executor's question in front of an external command it is about to fork: see the
+ * `kr_resolve_hook` it calls. The words and the file are metafied; the answer is the bridge's own
+ * until the next command asks.
+ */
+static int
+kr_zle_resolve(char **argv, char *path, char ***launch, char ***environment)
+{
+    char **words;
+    char *executable;
+    char *cwd;
+    char *found;
+    int argc;
+    int i;
+    int launching;
+    unsigned long revision;
+
+    *launch = *environment = NULL;
+    kr_bridge_resolution_free(&kr_resolution_now);
+    /* A command of the line the person typed, started by the root shell itself at the top level. */
+    if (!kr_line_running || !kr_bridge_root_process() || !kr_top_level() || argv == NULL ||
+        path == NULL || pwd == NULL) {
+        return 0;
+    }
+    for (argc = 0; argv[argc] != NULL; argc++) {
+    }
+    if (argc == 0) {
+        return 0;
+    }
+    kr_track_cwd();
+    revision = kr_cwd_revision;
+
+    pushheap();
+    words = (char **)zhalloc((size_t)(argc + 1) * sizeof(char *));
+    for (i = 0; i < argc; i++) {
+        words[i] = dupstring(argv[i]);
+        unmetafy(words[i], NULL);
+    }
+    words[argc] = NULL;
+    cwd = dupstring(pwd);
+    unmetafy(cwd, NULL);
+    found = dupstring(path);
+    unmetafy(found, NULL);
+    /* The file the search found, named absolutely: a relative directory on the path is the
+     * working directory's. */
+    if (found[0] == '/') {
+        executable = found;
+    } else {
+        executable = (char *)zhalloc(strlen(cwd) + strlen(found) + 2);
+        snprintf(executable, strlen(cwd) + strlen(found) + 2, "%s/%s", cwd, found);
+    }
+    launching = kr_bridge_resolve((const char *const *)words, (size_t)argc, executable, cwd,
+                                  revision, kr_prompt_generation, &kr_resolution_now);
+    popheap();
+    if (launching) {
+        *launch = kr_resolution_now.arguments;
+        *environment = kr_resolution_now.environment;
+    }
+    return launching;
+}
+
+/* A line of the shell was accepted: what runs until the next primary reader is its commands. */
+static void
+kr_line_accepted(void)
+{
+    kr_line_running = 1;
+}
 
 void
 kr_zle_setup(void)
 {
     kr_bridge_activate();
+    /* Only the registered root shell asks; any other shell of this package pays nothing. */
+    if (kr_bridge_registered()) {
+        kr_resolve_hook = kr_zle_resolve;
+    }
+}
+
+void
+kr_zle_finish(void)
+{
+    kr_resolve_hook = NULL;
+    kr_bridge_resolution_free(&kr_resolution_now);
 }
 
 void
@@ -386,6 +478,8 @@ kr_zle_enter(void)
     }
     kr_reader_revision++;
     if (zlecontext == ZLCON_LINE_START) {
+        /* The line before this prompt has run, and nothing after this is one of its commands. */
+        kr_line_running = 0;
         kr_prompt_generation++;
     }
     kr_track_cwd();
@@ -429,6 +523,11 @@ kr_zle_leave(int eof_sent)
         kr_bridge_command_accepted();
     }
     kr_bridge_editor_leave(reason);
+    /* Input a running command read through the editor is not a line of the shell: the line that
+     * started that command still owns the block and the capability. */
+    if (reason == KR_LEAVE_COMMAND_ACCEPTED && kr_reader_context() != KR_CONTEXT_READ_BUILTIN) {
+        kr_line_accepted();
+    }
 }
 
 int

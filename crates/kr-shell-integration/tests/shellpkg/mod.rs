@@ -341,6 +341,106 @@ pub struct Received {
     pub reader_lifetime: u64,
 }
 
+/// How the worker side of a session answers a `command_resolve`.
+#[derive(Clone, Debug)]
+pub enum ResolvePolicy {
+    /// The worker's own decision for the integrations the session was created with. An integrated
+    /// name is answered `backend_unavailable`, because nothing here establishes a backend, which
+    /// is what the worker answers when it cannot.
+    Decide(Vec<kr_protocol::session::CommandIntegration>),
+    /// No answer to a resolve, while every other event is still answered.
+    Silent,
+    /// A backend the worker established: the answer names `launcher`, adds `environment` for the
+    /// one invocation and appends `added` to the vector.
+    Backend {
+        launcher: String,
+        environment: Vec<kr_protocol::session::EnvironmentVariable>,
+        added: Vec<String>,
+    },
+}
+
+impl Default for ResolvePolicy {
+    fn default() -> Self {
+        Self::Decide(Vec::new())
+    }
+}
+
+/// What a session's worker side answers for the commands a line runs, and everything the bridge
+/// reported about them, in the order it arrived.
+///
+/// These are kept apart from the event queue, which waits drop from: a check that counts the
+/// resolves one command asked needs every one of them, whatever a wait took off the queue.
+#[derive(Default)]
+pub struct Commands {
+    /// How a resolve is answered.
+    pub policy: ResolvePolicy,
+    /// Whether an acceptance is answered with no capability, as for a line nothing can be
+    /// attributed to.
+    pub withhold_tokens: bool,
+    /// Whether the worker side has stopped answering anything at all.
+    pub stuck: bool,
+    /// Every resolve the bridge asked.
+    pub resolves: Vec<kr_protocol::root::RootCommandResolveParams>,
+    /// Every command block the bridge reported.
+    pub blocks: Vec<kr_protocol::root::RootCommandBlockParams>,
+    /// The capability each acceptance was answered with.
+    pub tokens: Vec<Option<String>>,
+    /// Every acceptance the bridge reported.
+    pub accepted: Vec<kr_protocol::root::RootCommandAcceptedParams>,
+    /// Every reader entry the bridge reported.
+    pub entries: Vec<RootEditorEnterParams>,
+}
+
+impl Commands {
+    /// The primary reader that accepted the line reported last, as it reported itself on entry.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no line has been accepted, or no primary reader entered at its prompt.
+    #[must_use]
+    pub fn last_line_reader(&self) -> &RootEditorEnterParams {
+        let line = self.accepted.last().expect("a line was accepted");
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.prompt_generation == line.prompt_generation
+                    && entry.reader_context == kr_protocol::root::ReaderContext::Primary
+            })
+            .expect("a primary reader entered at the prompt the line was accepted at")
+    }
+}
+
+/// What the worker decides for one invocation, for the integrations a session was created with.
+///
+/// The decision is the one the worker makes, from the same function. A worker that can establish
+/// no backend answers an integrated name as a bypass, and so does this one.
+#[must_use]
+pub fn worker_decision(
+    integrations: &[kr_protocol::session::CommandIntegration],
+    params: &kr_protocol::root::RootCommandResolveParams,
+) -> kr_protocol::root::RootCommandResolveResult {
+    use kr_shell_integration::host::command::{InvocationContext, Resolution, resolve};
+
+    let resolution = resolve(
+        integrations,
+        InvocationContext {
+            managed_root_shell: true,
+            interactive: params.interactive,
+        },
+        &params.argv,
+    );
+    if resolution.establishes_backend() {
+        return Resolution::Bypassed {
+            command: params.argv.first().cloned().unwrap_or_default(),
+            arguments: params.argv.clone(),
+            reason: kr_protocol::root::CommandBypassReason::BackendUnavailable,
+        }
+        .to_answer(None);
+    }
+    resolution.to_answer(None)
+}
+
 /// One live session: the worker's endpoint, the shell under a pseudo-terminal, and the frames
 /// between them.
 pub struct Session {
@@ -391,6 +491,8 @@ pub struct Session {
     /// deadline accepts an answer that arrived inside its window, however late it notices it.
     answers: HashMap<RequestId, (Instant, BridgeAnswer)>,
     next_request: u64,
+    /// What this session answers for the commands a line runs, and what the bridge reported.
+    pub commands: Commands,
     output: Arc<Mutex<Vec<u8>>>,
     stopped: Arc<AtomicBool>,
     /// The reader thread's report that it has stopped, so a session that is torn down does not
@@ -411,6 +513,17 @@ impl Session {
     /// decision refuses the handshake: each is a failure of the package under test.
     #[must_use]
     pub fn start(package: &Package) -> Self {
+        Self::start_with(package, &[])
+    }
+
+    /// Starts the packaged shell with `environment` added to what it inherits, and completes the
+    /// handshake.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`Session::start`] does.
+    #[must_use]
+    pub fn start_with(package: &Package, environment: &[(String, String)]) -> Self {
         let directory = tempfile::Builder::new()
             .prefix("kr-shell-")
             .tempdir()
@@ -486,6 +599,9 @@ impl Session {
         command.env("XDG_DATA_HOME", home.join(".local").join("share"));
         command.env("TERM", "xterm-256color");
         command.env("LANG", "C");
+        for (name, value) in environment {
+            command.env(name, value);
+        }
         command.env("KR_SESSION", session_id.to_string());
         command.env("KR_SHELL_BRIDGE", &endpoint.path);
         command.env(
@@ -560,6 +676,7 @@ impl Session {
             events: Inbox::default(),
             answers: HashMap::new(),
             next_request: 1,
+            commands: Commands::default(),
             output,
             stopped,
             stopped_reading,
@@ -617,6 +734,16 @@ impl Session {
         session.hello = hello;
         session.accepted = accepted;
         session
+    }
+
+    /// The directory the shell started in, as the kernel names it.
+    ///
+    /// A shell reports the physical path of its working directory, and the platform's temporary
+    /// directory can be reached through a link, so this is the path with every link resolved.
+    #[must_use]
+    pub fn home(&self) -> PathBuf {
+        let home = self._directory.path().join("home");
+        std::fs::canonicalize(&home).unwrap_or(home)
     }
 
     /// The process the shell says it is.
@@ -904,9 +1031,25 @@ impl Session {
     }
 
     /// What the worker answers an event that needs no decision of its own.
-    fn routine_answer(&self, event: &BridgeEvent) -> Option<EventOutcome> {
+    fn routine_answer(&mut self, event: &BridgeEvent) -> Option<EventOutcome> {
+        if self.commands.stuck {
+            // A worker that has stopped answering still received what the bridge sent.
+            match event {
+                BridgeEvent::EditorEnter(params) => self.commands.entries.push(params.clone()),
+                BridgeEvent::CommandAccepted(params) => {
+                    self.commands.accepted.push(params.clone());
+                }
+                BridgeEvent::CommandResolve(params) => {
+                    self.commands.resolves.push(params.clone());
+                }
+                BridgeEvent::CommandBlock(params) => self.commands.blocks.push((**params).clone()),
+                _ => {}
+            }
+            return None;
+        }
         match event {
-            BridgeEvent::EditorEnter(_) => {
+            BridgeEvent::EditorEnter(params) => {
+                self.commands.entries.push(params.clone());
                 Some(EventOutcome::EditorEntered(RootEditorEnterResult {
                     state: FenceState::Unfenced,
                     fence_exchange: Nullable::null(),
@@ -916,28 +1059,54 @@ impl Session {
                 state: FenceState::Outside,
             })),
             BridgeEvent::CommandAccepted(params) => {
+                self.commands.accepted.push(params.clone());
+                // The capability a real worker mints for the line it has just recorded. This
+                // harness stands in for the worker, so it mints one the same way.
+                let token =
+                    (!self.commands.withhold_tokens).then(|| kr_ipc::new_uuid().to_string());
+                self.commands.tokens.push(token.clone());
                 Some(EventOutcome::CommandRecorded(RootCommandAcceptedResult {
                     origin: params.origin.clone(),
-                    // The capability a real worker mints for the line it has just recorded. This
-                    // harness stands in for the worker, so it mints one the same way.
-                    detach_token: Nullable::some(kr_ipc::new_uuid().to_string()),
+                    detach_token: Nullable(token),
                     state: FenceState::Fenced,
                 }))
             }
-            BridgeEvent::CommandResolve(params) => Some(EventOutcome::CommandResolved(Box::new(
-                kr_protocol::root::RootCommandResolveResult {
-                    arguments: params.argv.clone(),
-                    added: Vec::new(),
-                    bypass: Nullable::some(kr_protocol::root::CommandBypassReason::NotIntegrated),
-                    backend: Nullable::null(),
-                },
-            ))),
-            BridgeEvent::CommandBlock(params) => Some(EventOutcome::CommandBlockRecorded(
-                kr_protocol::root::RootCommandBlockResult {
-                    prompt_generation: params.prompt_generation,
-                    retained: kr_protocol::scalars::U64::new(1),
-                },
-            )),
+            BridgeEvent::CommandResolve(params) => {
+                self.commands.resolves.push(params.clone());
+                let answer = match &self.commands.policy {
+                    ResolvePolicy::Decide(integrations) => worker_decision(integrations, params),
+                    ResolvePolicy::Silent => return None,
+                    ResolvePolicy::Backend {
+                        launcher,
+                        environment,
+                        added,
+                    } => {
+                        let mut arguments = params.argv.clone();
+                        arguments.extend(added.iter().cloned());
+                        kr_protocol::root::RootCommandResolveResult {
+                            arguments,
+                            added: added.clone(),
+                            bypass: Nullable::null(),
+                            backend: Nullable::some(kr_protocol::root::CommandBackend {
+                                session_id: params.session_id,
+                                prompt_generation: params.prompt_generation,
+                                environment: environment.clone(),
+                                launcher: launcher.clone(),
+                            }),
+                        }
+                    }
+                };
+                Some(EventOutcome::CommandResolved(Box::new(answer)))
+            }
+            BridgeEvent::CommandBlock(params) => {
+                self.commands.blocks.push((**params).clone());
+                Some(EventOutcome::CommandBlockRecorded(
+                    kr_protocol::root::RootCommandBlockResult {
+                        prompt_generation: params.prompt_generation,
+                        retained: kr_protocol::scalars::U64::new(1),
+                    },
+                ))
+            }
             BridgeEvent::ReaderIdle(_)
             | BridgeEvent::GestureChanged(_)
             | BridgeEvent::PreEofConsumed(_)
@@ -1882,6 +2051,7 @@ fn a_terminal_that_stopped_reading_ends_a_write_at_its_deadline() {
 }
 
 mod cases;
+mod commands;
 mod dialect;
 mod inbox;
 mod stacks;
@@ -1891,6 +2061,8 @@ mod stacks;
 // is still part of the module it shares.
 #[allow(unused_imports)]
 pub use cases::*;
+#[allow(unused_imports)]
+pub use commands::*;
 pub use dialect::*;
 #[allow(unused_imports)]
 pub use inbox::*;

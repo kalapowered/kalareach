@@ -44,6 +44,12 @@
       "file": "patches/0003-bash-bridge-activation.patch",
       "revision": "1",
       "purpose": "The bridge loads before the user's startup files and before the first primary reader, and the `kr-bridge` builtin the guarded startup entry activates the user-facing hooks through."
+    },
+    {
+      "name": "bash-command-resolve",
+      "file": "patches/0004-bash-command-resolve.patch",
+      "revision": "1",
+      "purpose": "The executor asks the integration before it forks a command of the accepted line that the root shell starts itself, in the foreground and with no pipe, and the forked child starts the launcher the answer names in its place, with the backend's variables added; any other answer, and a launcher that cannot be started, leave the command exactly as it was typed."
     }
   ],
   "sources": [

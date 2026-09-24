@@ -1401,139 +1401,493 @@ async fn a_real_qualified_package_registers_and_qualifies_on_this_hosts_endpoint
         );
         return;
     };
-
-    let temp = kr_ipc::testing::TempHost::create();
-    let environment = temp.environment();
-    // The shell's own home, on the internal disk, with the package's guarded entry in the startup
-    // file the person would have. The entry is what activates the integration after the user's own
-    // configuration has run, which is the ordering section 7 requires.
-    let home = tempfile::Builder::new()
-        .prefix("kr-package-home-")
-        .tempdir()
-        .expect("a home directory on the internal disk");
-    let entry = std::fs::read_to_string(package.startup_entry()).expect("the package's own entry");
-    let startup = match package.kind() {
-        ShellKind::Zsh => home.path().join(".zshrc"),
-        _ => home.path().join(".bashrc"),
-    };
-    std::fs::write(
-        &startup,
-        format!("HISTFILE=\nKR_TEST_USER_CONFIGURATION=1\n\n{entry}"),
+    let shell = RealShell::start(
+        &package,
+        kr_protocol::session::LaunchProfile::default(),
+        Vec::new(),
     )
-    .expect("the startup file");
-
-    let session_id = SessionId::new(kr_ipc::new_uuid());
-    let host_endpoint = HostEndpoint::open_for_session(
-        environment.runtime_root(),
-        environment.runtime_dir(),
-        session_id,
-    )
-    .expect("binds the bridge");
-    let address = host_endpoint.address().clone();
-    let bootstrap = host_endpoint.bootstrap();
-
-    let mut config = configuration(&temp, ShellMode::Managed);
-    config.session_id = session_id;
-    config.journal_path = Some(environment.journal_database(session_id));
-    config.spool_directory = Some(environment.session_spool(session_id));
-    let mut variables = vec![
-        ("TERM".to_owned(), "xterm-256color".to_owned()),
-        ("LANG".to_owned(), "C".to_owned()),
-        ("HOME".to_owned(), home.path().display().to_string()),
-        ("ZDOTDIR".to_owned(), home.path().display().to_string()),
-        (
-            kr_worker::environment::SESSION_VARIABLE.to_owned(),
-            session_id.to_string(),
-        ),
-    ];
-    variables.extend(
-        bootstrap
-            .exported_variables()
-            .into_iter()
-            .map(|(name, value)| (name.to_owned(), value)),
-    );
-    config.shell = kr_worker::pty::ShellCommand {
-        program: package.executable().display().to_string(),
-        arguments: package.arguments(kr_shell_integration::host::package::StartupMode::Interactive),
-        cwd: home.path().display().to_string(),
-        environment: variables,
-    };
-
-    let mut session = Session::open(config).expect("opens the session");
-    session.launch().expect("launches the packaged shell");
-    let root_process = session
-        .root_identity()
-        .expect("the launched shell has a process identity");
-    let identity = package.identity();
-    session.install_fence(FenceDriver::new(
-        session_id,
-        LeaseView::unheld(InputLeaseEpoch::new(0)),
-        Arc::new(SystemContinuousClock::new()),
-    ));
-    let runtime = Arc::new(
-        SessionRuntime::start(
-            session,
-            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
-        )
-        .expect("starts the runtime"),
-    );
-    let expectation = WorkerExpectation {
-        session_id,
-        root_process,
-        supported_editor_abis: vec![identity.editor_abi.clone()],
-        supported_integration_versions: vec![identity.integration_version.clone()],
-        launched_package: Some(package.declaration()),
-        already_registered: false,
-        gesture: EofGesture::default(),
-    };
-    let bridge_task = tokio::spawn(
-        kr_worker::fence::bridge::BridgeServer::new(
-            Arc::clone(&runtime),
-            host_endpoint,
-            expectation,
-        )
-        .serve(),
-    );
-
-    // The package connects to the endpoint it was given, proves itself over the bootstrap secret
-    // and is registered; then its own entry reports that the hooks are live after the startup
-    // files, which is what qualifies the session.
-    let qualified = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            {
-                let session = runtime.session();
-                if let Some(driver) = session.fence()
-                    && driver.phase().reports_ready()
-                {
-                    return driver.phase().shell();
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "the {} package at {} did not register and qualify on this host's endpoint at {}",
-            package.kind().as_str(),
-            package.directory.display(),
-            address.path
-        )
-    });
+    .await;
     assert_eq!(
-        qualified,
+        shell.qualified,
         Some(package.kind()),
         "the session's registered root integration is the package this host launched"
     );
     assert_eq!(
-        runtime.session().config().shell.program,
+        shell.runtime.session().config().shell.program,
         package.executable().display().to_string(),
         "and the executable it launched is the package's own binary"
     );
+    shell.close().await;
+}
 
-    runtime.close(ClosureReason::CloseRequested).1.release();
-    let _ = tokio::time::timeout(Duration::from_secs(30), runtime.wait_closed()).await;
-    bridge_task.abort();
+/// A real qualified package launched as this host's root shell, registered and qualified on the
+/// host's own endpoint.
+struct RealShell {
+    _temp: kr_ipc::testing::TempHost,
+    home: tempfile::TempDir,
+    runtime: Arc<SessionRuntime>,
+    bridge_task: tokio::task::JoinHandle<()>,
+    qualified: Option<ShellKind>,
+}
+
+impl RealShell {
+    /// Launches `package` with the package's guarded entry in the startup file the person would
+    /// have, and waits until the entry has reported the hooks live after the startup files, which
+    /// is what qualifies the session.
+    async fn start(
+        package: &kr_shell_integration::host::package::ShellPackage,
+        launch_profile: kr_protocol::session::LaunchProfile,
+        extra: Vec<(String, String)>,
+    ) -> Self {
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = temp.environment();
+        // The shell's own home, on the internal disk, with the package's guarded entry in the
+        // startup file the person would have. The entry is what activates the integration after the
+        // user's own configuration has run, which is the ordering section 7 requires.
+        let home = tempfile::Builder::new()
+            .prefix("kr-package-home-")
+            .tempdir()
+            .expect("a home directory on the internal disk");
+        let entry =
+            std::fs::read_to_string(package.startup_entry()).expect("the package's own entry");
+        let startup = match package.kind() {
+            ShellKind::Zsh => home.path().join(".zshrc"),
+            _ => home.path().join(".bashrc"),
+        };
+        std::fs::write(
+            &startup,
+            format!("HISTFILE=\nKR_TEST_USER_CONFIGURATION=1\n\n{entry}"),
+        )
+        .expect("the startup file");
+
+        let mut config = configuration(&temp, ShellMode::Managed);
+        let session_id = config.session_id;
+        let host_endpoint = HostEndpoint::open_for_session(
+            environment.runtime_root(),
+            environment.runtime_dir(),
+            session_id,
+        )
+        .expect("binds the bridge");
+        let address = host_endpoint.address().clone();
+        let bootstrap = host_endpoint.bootstrap();
+
+        config.journal_path = Some(environment.journal_database(session_id));
+        config.spool_directory = Some(environment.session_spool(session_id));
+        config.launch_profile = launch_profile;
+        let mut variables = vec![
+            ("TERM".to_owned(), "xterm-256color".to_owned()),
+            ("LANG".to_owned(), "C".to_owned()),
+            ("HOME".to_owned(), home.path().display().to_string()),
+            ("ZDOTDIR".to_owned(), home.path().display().to_string()),
+            (
+                kr_worker::environment::SESSION_VARIABLE.to_owned(),
+                session_id.to_string(),
+            ),
+        ];
+        variables.extend(extra);
+        variables.extend(
+            bootstrap
+                .exported_variables()
+                .into_iter()
+                .map(|(name, value)| (name.to_owned(), value)),
+        );
+        config.shell = kr_worker::pty::ShellCommand {
+            program: package.executable().display().to_string(),
+            arguments: package
+                .arguments(kr_shell_integration::host::package::StartupMode::Interactive),
+            cwd: home.path().display().to_string(),
+            environment: variables,
+        };
+
+        let mut session = Session::open(config).expect("opens the session");
+        session.launch().expect("launches the packaged shell");
+        let root_process = session
+            .root_identity()
+            .expect("the launched shell has a process identity");
+        let identity = package.identity();
+        session.install_fence(FenceDriver::new(
+            session_id,
+            LeaseView::unheld(InputLeaseEpoch::new(0)),
+            Arc::new(SystemContinuousClock::new()),
+        ));
+        let runtime = Arc::new(
+            SessionRuntime::start(
+                session,
+                std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+            )
+            .expect("starts the runtime"),
+        );
+        let expectation = WorkerExpectation {
+            session_id,
+            root_process,
+            supported_editor_abis: vec![identity.editor_abi.clone()],
+            supported_integration_versions: vec![identity.integration_version.clone()],
+            launched_package: Some(package.declaration()),
+            already_registered: false,
+            gesture: EofGesture::default(),
+        };
+        let bridge_task = tokio::spawn(
+            kr_worker::fence::bridge::BridgeServer::new(
+                Arc::clone(&runtime),
+                host_endpoint,
+                expectation,
+            )
+            .serve(),
+        );
+
+        // The package connects to the endpoint it was given, proves itself over the bootstrap
+        // secret and is registered; then its own entry reports that the hooks are live after the
+        // startup files, which is what qualifies the session.
+        let qualified = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                {
+                    let session = runtime.session();
+                    if let Some(driver) = session.fence()
+                        && driver.phase().reports_ready()
+                    {
+                        return driver.phase().shell();
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the {} package at {} did not register and qualify on this host's endpoint at {}",
+                package.kind().as_str(),
+                package.directory.display(),
+                address.path
+            )
+        });
+        Self {
+            _temp: temp,
+            home,
+            runtime,
+            bridge_task,
+            qualified,
+        }
+    }
+
+    /// The shell's home, as the kernel names it, which is the directory a shell reports.
+    fn home(&self) -> std::path::PathBuf {
+        std::fs::canonicalize(self.home.path()).expect("the home resolves")
+    }
+
+    /// Attaches a terminal that takes the keys, as a person's terminal does.
+    fn keys(&self) -> RealKeys {
+        let attachment_id = AttachmentId::new(kr_ipc::new_uuid());
+        let params = terminal(self.runtime.session().config().session_id);
+        let epoch = {
+            let mut session = self.runtime.session();
+            session
+                .attach(&params, params.requested.clone(), attachment_id)
+                .expect("attaches");
+            session
+                .acquire_input(attachment_id, ConnectionId::new(kr_ipc::new_uuid()), None)
+                .expect("takes the keys");
+            session.lease().epoch.get()
+        };
+        RealKeys {
+            attachment_id,
+            epoch,
+            sequence: 0,
+        }
+    }
+
+    /// Waits until the session's retained output carries `marker` `count` times.
+    async fn produced(&self, marker: &[u8], count: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let seen = retained(&self.runtime.session());
+            let times = seen
+                .windows(marker.len())
+                .filter(|window| *window == marker)
+                .count();
+            if times >= count {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "waited for {count} of {} in the session's output, which ends {}",
+                String::from_utf8_lossy(marker).escape_debug(),
+                String::from_utf8_lossy(&seen[seen.len().saturating_sub(512)..]).escape_debug()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Closes the session and waits for it, so the reader on the terminal ends with it.
+    async fn close(self) {
+        self.runtime
+            .close(ClosureReason::CloseRequested)
+            .1
+            .release();
+        let _ = tokio::time::timeout(Duration::from_secs(30), self.runtime.wait_closed()).await;
+        self.bridge_task.abort();
+    }
+}
+
+/// The input lease a real shell's terminal holds.
+struct RealKeys {
+    attachment_id: AttachmentId,
+    epoch: u64,
+    sequence: u64,
+}
+
+impl RealKeys {
+    /// Types one line into the shell through the lease, as a person at the terminal does.
+    fn type_line(&mut self, shell: &RealShell, line: &str) {
+        {
+            let mut session = shell.runtime.session();
+            session
+                .write_input(
+                    self.attachment_id,
+                    self.epoch,
+                    self.sequence,
+                    format!("{line}\r").as_bytes(),
+                    None,
+                    std::time::Instant::now(),
+                )
+                .expect("the keystrokes are accepted");
+        }
+        self.sequence += 1;
+        shell.runtime.flush_input();
+    }
+}
+
+/// A recording program on the internal disk, what it recorded, and the integration's diagnostics.
+struct RealProbes {
+    _directory: tempfile::TempDir,
+    root: std::path::PathBuf,
+}
+
+impl RealProbes {
+    fn new() -> Self {
+        let directory = tempfile::Builder::new()
+            .prefix("kr-probes-")
+            .tempdir()
+            .expect("a directory on the internal disk");
+        let root = std::fs::canonicalize(directory.path()).expect("the directory resolves");
+        std::fs::create_dir(root.join("bin")).expect("a directory for the program");
+        let program = root.join("bin").join("kr-probe");
+        // It records its arguments and every reserved variable it was started with, and prints a
+        // word it puts together from two pieces.
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\n\
+                 {{\n\
+                 printf 'run\\n'\n\
+                 for word in \"$@\"; do printf 'arg %s\\n' \"$word\"; done\n\
+                 env | LC_ALL=C sort | while IFS= read -r line; do\n\
+                 case $line in KR_*) printf 'env %s\\n' \"$line\" ;; esac\n\
+                 done\n\
+                 printf 'end\\n'\n\
+                 }} >> '{record}'\n\
+                 printf '%s%s\\n' 'probe-' 'ran'\n",
+                record = root.join("record").display(),
+            ),
+        )
+        .expect("the program");
+        std::fs::set_permissions(
+            &program,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("an executable program");
+        // Some systems check a program the first time anything starts it, and on a busy machine
+        // that check can outlast a wait. It is paid here, before the shell that is timed starts it.
+        let status = std::process::Command::new(&program)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("the program starts");
+        assert!(status.success(), "the program failed its first start");
+        let _ = std::fs::remove_file(root.join("record"));
+        std::fs::write(root.join("script.sh"), "kr-probe from-a-script\n").expect("a script");
+        Self {
+            _directory: directory,
+            root,
+        }
+    }
+
+    /// What the shell is started with: the program on its search path, and the file the
+    /// integration writes its diagnostics to.
+    fn variables(&self) -> Vec<(String, String)> {
+        vec![
+            (
+                "PATH".to_owned(),
+                format!("{}:/usr/bin:/bin", self.root.join("bin").display()),
+            ),
+            (
+                "KR_SHELL_BRIDGE_TRACE".to_owned(),
+                self.root.join("trace").display().to_string(),
+            ),
+        ]
+    }
+
+    fn program(&self) -> std::path::PathBuf {
+        self.root.join("bin").join("kr-probe")
+    }
+
+    fn script(&self) -> std::path::PathBuf {
+        self.root.join("script.sh")
+    }
+
+    /// Every start of the program: its arguments after its own name, and its reserved variables.
+    fn runs(&self) -> Vec<(Vec<String>, std::collections::BTreeMap<String, String>)> {
+        let text = std::fs::read_to_string(self.root.join("record")).unwrap_or_default();
+        let mut runs = Vec::new();
+        let mut current = None;
+        for line in text.lines() {
+            match line {
+                "run" => current = Some((Vec::new(), std::collections::BTreeMap::new())),
+                "end" => runs.extend(current.take()),
+                _ => {
+                    let Some((arguments, environment)) = current.as_mut() else {
+                        continue;
+                    };
+                    if let Some(argument) = line.strip_prefix("arg ") {
+                        arguments.push(argument.to_owned());
+                    } else if let Some((name, value)) = line
+                        .strip_prefix("env ")
+                        .and_then(|pair| pair.split_once('='))
+                    {
+                        environment.insert(name.to_owned(), value.to_owned());
+                    }
+                }
+            }
+        }
+        runs
+    }
+
+    /// The lines of the integration's diagnostics that record a question asked.
+    fn asked(&self) -> Vec<String> {
+        std::fs::read_to_string(self.root.join("trace"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains(": asked about "))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The lines of the integration's diagnostics.
+    fn trace(&self) -> String {
+        std::fs::read_to_string(self.root.join("trace")).unwrap_or_default()
+    }
+}
+
+/// KR-REQ-12.07, KR-REQ-07.45: a real package asks the real worker before each command of a line
+/// and runs a bypassed command exactly as it was typed; forms the root shell does not start
+/// itself ask nothing.
+///
+/// This host establishes no command backend yet, so every answer here is a bypass: `not_integrated`
+/// for a session created with no integration, and `backend_unavailable` for one created with an
+/// integration for the name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_real_package_asks_the_real_worker_before_each_command_and_runs_a_bypass_as_typed() {
+    let Some(root) = std::env::var_os(PACKAGE_ROOT_VARIABLE) else {
+        eprintln!(
+            "skipped: {PACKAGE_ROOT_VARIABLE} names no directory with a qualified package, so \
+             there is no built package to launch"
+        );
+        return;
+    };
+    let set =
+        kr_shell_integration::host::package::PackageSet::discover(std::path::Path::new(&root))
+            .unwrap_or_else(|fault| panic!("{PACKAGE_ROOT_VARIABLE} names {root:?}: {fault}"));
+    for kind in [ShellKind::Zsh, ShellKind::Bash] {
+        let package = set
+            .select(Some(kind.as_str()))
+            .unwrap_or_else(|fault| panic!("{PACKAGE_ROOT_VARIABLE} has no {kind:?}: {fault}"))
+            .clone();
+        asks_the_real_worker_before_each_command(&package).await;
+    }
+}
+
+/// What [`a_real_package_asks_the_real_worker_before_each_command_and_runs_a_bypass_as_typed`]
+/// asks of one package.
+async fn asks_the_real_worker_before_each_command(
+    package: &kr_shell_integration::host::package::ShellPackage,
+) {
+    for (integrations, bypass) in [
+        (Vec::new(), "bypass not_integrated"),
+        (
+            vec![kr_protocol::session::CommandIntegration {
+                command: "kr-probe".to_owned(),
+                flags: vec!["--kr-integrated".to_owned()],
+                enabled: true,
+            }],
+            "bypass backend_unavailable",
+        ),
+    ] {
+        let probes = RealProbes::new();
+        let shell = RealShell::start(
+            package,
+            kr_protocol::session::LaunchProfile {
+                command_integrations: integrations,
+                ..kr_protocol::session::LaunchProfile::default()
+            },
+            probes.variables(),
+        )
+        .await;
+        let mut keys = shell.keys();
+        let mut printed = 0;
+
+        // A pipeline runs in a child the shell forks and asks nothing; what it was started with is
+        // what the shell passes a command it does not ask about.
+        keys.type_line(&shell, "kr-probe control | cat");
+        printed += 1;
+        shell.produced(b"probe-ran", printed).await;
+        assert!(probes.asked().is_empty(), "{}", probes.trace());
+        let control = probes.runs().last().cloned().expect("the control ran");
+
+        // One command of the line asks once, is answered by the worker, and runs as it was typed.
+        keys.type_line(&shell, "kr-probe one 'two words'");
+        printed += 1;
+        shell.produced(b"probe-ran", printed).await;
+        let asked = probes.asked();
+        assert_eq!(asked.len(), 1, "{}", probes.trace());
+        assert!(
+            asked[0].contains(&format!(
+                "asked about kr-probe as {} in {}",
+                probes.program().display(),
+                shell.home().display()
+            )),
+            "{}",
+            probes.trace()
+        );
+        assert!(probes.trace().contains(bypass), "{}", probes.trace());
+        let (arguments, environment) = probes.runs().last().cloned().expect("the command ran");
+        assert_eq!(
+            arguments,
+            ["one", "two words"],
+            "the vector as it was typed"
+        );
+        // Whether a line holds a capability depends on whether the worker could attribute the line;
+        // everything else is the shell's own environment, with nothing added.
+        let names = |environment: &std::collections::BTreeMap<String, String>| {
+            environment
+                .keys()
+                .filter(|name| name.as_str() != "KR_DETACH_TOKEN")
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(&environment),
+            names(&control.1),
+            "nothing was added to the environment"
+        );
+        assert!(!environment.contains_key("KR_REGISTRATION"));
+
+        // A sourced script and a script of its own ask nothing for what they run.
+        keys.type_line(&shell, &format!(". '{}'", probes.script().display()));
+        printed += 1;
+        shell.produced(b"probe-ran", printed).await;
+        assert_eq!(probes.asked().len(), 1, "{}", probes.trace());
+
+        shell.close().await;
+    }
 }
 
 /// Returns the qualified package this run may launch, or nothing.

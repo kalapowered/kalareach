@@ -45,12 +45,14 @@ cleanly.
 
 ## What Zsh changes
 
-Two patches, against `zsh-5.9`.
+Four patches, against `zsh-5.9`.
 
 | Patch | Files | What it adds |
 | --- | --- | --- |
 | `0001-zle-reader-mailbox` | `Src/Zle/zle.mdd`, `Src/Zle/zle_main.c` | The mailbox and everything that hangs off it |
 | `0002-zle-reader-state` | `Src/Zle/zle_misc.c` | Three reader states the detach condition needs |
+| `0003-terminfo-variable-checks` | `configure.ac`, `configure` | The published upstream fix for the terminfo capability-name probes |
+| `0004-exec-command-resolve` | `Src/exec.c`, `Src/zsh.h`, `Src/Zle/zle_main.c` | The question in front of each command a line starts, and the launcher its answer can name |
 
 The first patch does five things, all inside `zle_main.c`:
 
@@ -89,15 +91,26 @@ resolved a complete sequence and nothing has run it yet, so the reader reports t
 input it is holding, and a launch that arrives at that moment is refused with `queued_prior_input`
 rather than installed over it.
 
+The fourth patch is the command integration's one point in the executor. `execcmd_exec` asks,
+immediately before it forks an external command, when the command has no pipe, is not a
+background job and holds no filename pattern still to expand: zsh expands a pattern only in the
+child, so a command with one is not asked about. The question is a pointer, `kr_resolve_hook`,
+that the editor module sets when it loads and clears in its `finish_`, so the executor never calls
+into a module that is not there; the bridge answers it, and refuses everything but a top-level
+command of the accepted line that the root shell starts itself. When the answer names a launcher,
+the forked child's `execute` starts it in the command's place with the backend's variables added,
+and a launcher that cannot be started leaves the child running the command as it was typed.
+
 ## What Bash changes
 
-Three patches, against `bash-5.2.37`, which bundles Readline 8.2.
+Four patches, against `bash-5.2.37`, which bundles Readline 8.2.
 
 | Patch | Files | What it adds |
 | --- | --- | --- |
 | `0001-readline-reader-mailbox` | `lib/readline/{Makefile.in,input.c,macro.c,readline.c}` | The mailbox, the reader's private counts, the cancellation and the pre-EOF decision |
 | `0002-readline-reader-state` | `lib/readline/{text.c,kill.c}` | Two reader states Readline keeps no flag for |
 | `0003-bash-bridge-activation` | `Makefile.in`, `shell.c`, `builtins/{Makefile.in,read.def}` | Loading the bridge, the prompt context and the builtin |
+| `0004-bash-command-resolve` | `execute_cmd.c` | The question in front of each command a line starts, and the launcher its answer can name |
 
 Readline's buffering is why the mailbox is where it is. The reader returns pending and macro input
 without consulting the character callback at all, and `rl_gather_tyi` can call that callback while
@@ -133,6 +146,15 @@ The patch leaves Bash's parser alone on purpose. Bash ships a generated `y.tab.c
 `parse.y` makes the build regenerate it, which needs a Bison newer than several supported hosts
 carry. Calling the two functions Bash already exports costs nothing and keeps the build to a C
 compiler.
+
+The fourth patch is the command integration's one point in the executor. `execute_disk_command`
+asks after `search_for_command` has found the file and before `make_child`, when the command has no
+pipe and is not a background job. `kr_bash_resolve`, in the shell's own half of the bridge, refuses
+everything but a command of the accepted line: never one a function, a sourced or startup file, an
+`eval`, a trap, `PROMPT_COMMAND` or a subshell runs. When the answer names a launcher, the forked
+child starts it in the command's place with the backend's variables added to the environment it
+would have had, and a launcher that cannot be started leaves the child running the command as it
+was typed.
 
 ## What fish changes
 
@@ -222,7 +244,7 @@ adapter for that reader:
 | `kr_bridge_cbor.c`, `kr_bridge_cbor.h` | KR-CBOR-1: canonical encoding with map keys checked into order as they are written, and a bounded decoder |
 | `kr_bridge_crypto.c`, `kr_bridge_crypto.h` | SHA-256, HMAC-SHA-256 and base64url, for the one proof taken at startup |
 | `kr_bridge_zle.c` / `kr_bridge_rl.c` | The reader's own state, read in one operation at one instant, and the shell's own string representation |
-| `kr_bridge_bash.c` (Bash only) | The two things only the shell itself can do: remove a variable from its exported environment, and say which prompt it is at |
+| `kr_bridge_bash.c` (Bash only) | What only the shell itself can do: remove a variable from its exported environment, say which prompt it is at, and decide whether a command is one of the line's own |
 
 The first three files are the same source in both packages, and a test in
 `crates/kr-shell-integration/tests/` asserts they have not drifted. They are duplicated because
