@@ -713,22 +713,25 @@ async fn a_desktop_bound_session_closes_with_desktop_lost_when_its_login_ends() 
 /// again. Nothing belonging to the person at the machine is touched, and the machine is never
 /// logged out: what is demonstrated is the mechanism, and `docs/host/platforms.md` records what a
 /// real logout does with it.
+///
+/// It needs a graphical login: a person logged in at the console, as on a macOS workstation and
+/// the hosted macOS runners. Where there is none it fails and says so.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_graphical_job_torn_down_by_the_service_manager_ends_the_processes_in_it() {
     let host = kr_ipc::testing::TempHost::create();
     let uid = kr_ipc::paths::current_uid();
     let domain = format!("gui/{uid}");
-    if !std::process::Command::new("/bin/launchctl")
-        .args(["print", &domain])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-    {
-        // No graphical domain on this host, so there is no teardown to observe.
-        return;
-    }
+    assert!(
+        std::process::Command::new("/bin/launchctl")
+            .args(["print", &domain])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success()),
+        "this host has no graphical login domain {domain}, so there is no teardown to observe and \
+         this check cannot run here"
+    );
     let label = format!("kr-test-desktop-{}", std::process::id());
     let job = host.root().join(format!("{label}.plist"));
     // The program is the platform's own sleep, which is on the internal disk. A job that reached

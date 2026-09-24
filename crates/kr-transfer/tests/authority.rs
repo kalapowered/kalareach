@@ -4,9 +4,10 @@
 //!
 //! The fixture at `fixtures/transfer/no-escape.json` is the policy in one place: the names the
 //! validator accepts and refuses, the tree a lookup runs against, and what each lookup must do.
-//! The Unix cases run here. The Windows cases are in the same fixture and are built when the
-//! running platform can build them; where it cannot, the case is reported as not exercised rather
-//! than counted as passed, and the Windows qualification pass records the result.
+//! Each platform builds the objects the fixture names for it and runs every lookup against them;
+//! the other platform's cases are named as skipped, so a run shows which ones it left to the other
+//! platform. An object this platform cannot build fails the run, whatever the reason, because a
+//! lookup that did not run would otherwise be counted as one that passed.
 
 mod support;
 
@@ -132,23 +133,13 @@ fn every_lookup_in_the_fixture_resolves_as_the_fixture_says() {
     // skipped by name, which is a stated exclusion rather than a silent one.
     let mut missing = Vec::new();
     let mut skipped_objects = Vec::new();
-    let mut unavailable = Vec::new();
     for entry in &fixture.tree {
         if !applies(&entry.platforms) {
             skipped_objects.push(entry.path.clone());
             continue;
         }
-        match build(&inside, entry) {
-            Ok(()) => {}
-            // A privilege this account does not hold is a prerequisite of the case, stated here
-            // and again at each lookup that needed the object.
-            Err(NotBuilt::Prerequisite(reason)) => {
-                println!("not exercised: {} needs {reason}", entry.path);
-                unavailable.push(entry.path.clone());
-            }
-            Err(NotBuilt::Failed(reason)) => {
-                missing.push(format!("{} ({}): {reason}", entry.path, entry.kind));
-            }
+        if let Err(reason) = build(&inside, entry) {
+            missing.push(format!("{} ({}): {reason}", entry.path, entry.kind));
         }
     }
     assert!(
@@ -162,18 +153,9 @@ fn every_lookup_in_the_fixture_resolves_as_the_fixture_says() {
         AuthorisedDirectory::open_root(environment(), &inside).expect("opens the authority");
     let mut exercised = Vec::new();
     let mut skipped = Vec::new();
-    let mut unexercised = Vec::new();
     for case in &fixture.lookups {
         if !applies(&case.platforms) {
             skipped.push(case.name.clone());
-            continue;
-        }
-        if let Some(object) = unavailable.iter().find(|object| needs(&case.name, object)) {
-            println!(
-                "not exercised: {} needs {object}, which this host did not make",
-                case.name
-            );
-            unexercised.push(case.name.clone());
             continue;
         }
         let outcome = RelativeName::parse(&case.name).and_then(|name| {
@@ -195,19 +177,17 @@ fn every_lookup_in_the_fixture_resolves_as_the_fixture_says() {
         .filter(|case| applies(&case.platforms))
         .count();
     assert_eq!(
-        exercised.len() + unexercised.len(),
+        exercised.len(),
         expected,
-        "every lookup this platform covers has to run, or to say what it needed"
+        "every lookup this platform covers has to run"
     );
     // The other platform's cases are named, so the qualification run there can see which ones it
     // is responsible for rather than inferring them from a quiet pass here.
     println!(
-        "{}: {} lookups skipped {skipped:?}, {} objects skipped {skipped_objects:?}, {} lookups \
-         unexercised {unexercised:?}",
+        "{}: {} lookups skipped {skipped:?}, {} objects skipped {skipped_objects:?}",
         platform(),
         skipped.len(),
-        skipped_objects.len(),
-        unexercised.len()
+        skipped_objects.len()
     );
     // Nothing beneath the authority ever reached the tree outside it.
     assert_eq!(
@@ -412,116 +392,65 @@ fn a_handle_from_one_environment_is_never_accepted_by_another() {
         .expect("its own environment");
 }
 
-/// Why one object the fixture names is not there.
-#[derive(Debug)]
-enum NotBuilt {
-    /// The host makes this object only for an account holding a privilege this one does not, so
-    /// the run says which lookups it therefore did not exercise and goes on with the rest.
-    Prerequisite(String),
-    /// Anything else. The policy has not been exercised and the run must not pass as though it
-    /// had.
-    Failed(String),
-}
-
-impl NotBuilt {
-    /// Names anything the host refused for a reason that is not a privilege.
-    fn failed(error: &impl std::fmt::Display) -> Self {
-        Self::Failed(error.to_string())
-    }
-}
-
 /// Builds one fixture entry, or says why this platform could not.
-fn build(root: &Path, entry: &Entry) -> Result<(), NotBuilt> {
+fn build(root: &Path, entry: &Entry) -> Result<(), String> {
     let path = root.join(&entry.path);
     match entry.kind.as_str() {
-        "directory" => std::fs::create_dir_all(&path).map_err(|error| NotBuilt::failed(&error)),
+        "directory" => std::fs::create_dir_all(&path).map_err(|error| error.to_string()),
         "file" => std::fs::write(
             &path,
             entry.contents.as_deref().unwrap_or_default().as_bytes(),
         )
-        .map_err(|error| NotBuilt::failed(&error)),
+        .map_err(|error| error.to_string()),
         "symlink" => symlink(entry, &path),
         "hard_link" => {
             let target = root.join(entry.target.as_deref().unwrap_or_default());
-            std::fs::hard_link(&target, &path).map_err(|error| NotBuilt::failed(&error))
+            std::fs::hard_link(&target, &path).map_err(|error| error.to_string())
         }
         "fifo" => fifo(&path),
         "reparse_point" | "reparse_point_file" => reparse_point(entry, root, &path),
-        other => Err(NotBuilt::Failed(format!(
-            "{other} is not an object this build creates"
-        ))),
+        other => Err(format!("{other} is not an object this build creates")),
     }
 }
 
-/// Returns true when a lookup's name is one object, or something beneath it.
-fn needs(name: &str, object: &str) -> bool {
-    name == object
-        || name
-            .strip_prefix(object)
-            .is_some_and(|rest| rest.starts_with('/'))
-}
-
 #[cfg(unix)]
-fn symlink(entry: &Entry, path: &Path) -> Result<(), NotBuilt> {
+fn symlink(entry: &Entry, path: &Path) -> Result<(), String> {
     std::os::unix::fs::symlink(entry.target.as_deref().unwrap_or_default(), path)
-        .map_err(|error| NotBuilt::failed(&error))
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(not(unix))]
-fn symlink(_entry: &Entry, _path: &Path) -> Result<(), NotBuilt> {
-    Err(NotBuilt::Failed(
-        "this platform's symbolic links are covered by its reparse-point cases".to_owned(),
-    ))
+fn symlink(_entry: &Entry, _path: &Path) -> Result<(), String> {
+    Err("this platform's symbolic links are covered by its reparse-point cases".to_owned())
 }
 
 #[cfg(unix)]
-fn fifo(path: &Path) -> Result<(), NotBuilt> {
+fn fifo(path: &Path) -> Result<(), String> {
     let status = std::process::Command::new("mkfifo")
         .arg(path)
         .status()
-        .map_err(|error| {
-            // A host without the tool is one this case cannot build its object on, which the run
-            // states rather than reporting a policy it did not exercise.
-            if error.kind() == std::io::ErrorKind::NotFound {
-                NotBuilt::Prerequisite("the mkfifo tool, which this host does not have".to_owned())
-            } else {
-                NotBuilt::failed(&error)
-            }
-        })?;
+        .map_err(|error| format!("the mkfifo tool could not be run: {error}"))?;
     if status.success() {
         Ok(())
     } else {
-        Err(NotBuilt::Failed(format!("mkfifo exited with {status}")))
+        Err(format!("mkfifo exited with {status}"))
     }
 }
 
 #[cfg(not(unix))]
-fn fifo(_path: &Path) -> Result<(), NotBuilt> {
-    Err(NotBuilt::Failed(
-        "this platform has no named pipe in the filesystem namespace".to_owned(),
-    ))
+fn fifo(_path: &Path) -> Result<(), String> {
+    Err("this platform has no named pipe in the filesystem namespace".to_owned())
 }
 
 #[cfg(windows)]
-fn reparse_point(entry: &Entry, root: &Path, path: &Path) -> Result<(), NotBuilt> {
-    /// What the host says when an account may not create a symbolic link.
-    const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
-
+fn reparse_point(entry: &Entry, root: &Path, path: &Path) -> Result<(), String> {
     let target = root.join(entry.target.as_deref().unwrap_or_default());
     if entry.kind == "reparse_point_file" {
-        // A file symbolic link needs a privilege this host never asks for. Where the account does
-        // not hold it, that is a prerequisite the run states and the lookups beneath the link go
-        // unexercised rather than passing unexamined.
-        return std::os::windows::fs::symlink_file(&target, path).map_err(|error| {
-            if error.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) {
-                NotBuilt::Prerequisite(
-                    "creating a symbolic link, which this account is not privileged to do"
-                        .to_owned(),
-                )
-            } else {
-                NotBuilt::failed(&error)
-            }
-        });
+        // A file symbolic link needs a privilege this host never asks for. An account that does
+        // not hold it cannot build this object, and the lookups beneath the link would go
+        // unexercised, so the run fails with what the host said.
+        return std::os::windows::fs::symlink_file(&target, path)
+            .map_err(|error| format!("a file symbolic link could not be made: {error}"));
     }
     // A directory junction needs no privilege, which is why it is the reparse point this fixture
     // relies on.
@@ -534,11 +463,11 @@ fn reparse_point(entry: &Entry, root: &Path, path: &Path) -> Result<(), NotBuilt
             &command_line_path(&target),
         ])
         .status()
-        .map_err(|error| NotBuilt::failed(&error))?;
+        .map_err(|error| format!("mklink could not be run: {error}"))?;
     if status.success() {
         Ok(())
     } else {
-        Err(NotBuilt::Failed(format!("mklink exited with {status}")))
+        Err(format!("mklink exited with {status}"))
     }
 }
 
@@ -552,10 +481,8 @@ fn command_line_path(path: &Path) -> String {
 }
 
 #[cfg(not(windows))]
-fn reparse_point(_entry: &Entry, _root: &Path, _path: &Path) -> Result<(), NotBuilt> {
-    Err(NotBuilt::Failed(
-        "this platform has no reparse points".to_owned(),
-    ))
+fn reparse_point(_entry: &Entry, _root: &Path, _path: &Path) -> Result<(), String> {
+    Err("this platform has no reparse points".to_owned())
 }
 
 /// KR-REQ-14.05: a component replaced with a link *while* lookups are running never resolves
@@ -713,114 +640,112 @@ fn a_file_says_through_its_own_handle_whether_it_carries_an_access_control_list(
     // file's own descriptor, so the case runs on every host this crate supports rather than only
     // on one with the platform's command-line tool installed.
     let second = RelativeName::parse("listed.txt").expect("a name");
-    match give_an_access_control_list(&authority, &second) {
-        Some(acl) => {
-            let file = authority
-                .open_read(&second, ObjectPolicy::ReadableFile)
-                .expect("it opens");
-            assert!(
-                file.carries_access_control(),
-                "a file with a list says so through its own handle"
-            );
-            assert_eq!(
-                file.access_control().expect("reads access control"),
-                acl,
-                "the list read through the handle is the one the file was given"
-            );
-            // The entries themselves, not merely the fact of them: a list that came back with the
-            // right number of entries and none of their rights would pass everything else here.
-            #[cfg(target_os = "macos")]
-            {
-                let kr_transfer::AccessControl::Apple(apple) = &acl else {
-                    panic!("this platform's list is an Apple list");
-                };
-                assert_eq!(apple.entry_count(), 2, "both entries came back");
-                let raw = apple.as_bytes();
-                assert_eq!(
-                    u32::from_ne_bytes(raw[60..64].try_into().expect("four bytes")),
-                    1,
-                    "the first entry still allows"
-                );
-                assert_eq!(
-                    u32::from_ne_bytes(raw[64..68].try_into().expect("four bytes")),
-                    0x0000_0002,
-                    "the right it allows came back"
-                );
-                assert_eq!(
-                    u32::from_ne_bytes(raw[84..88].try_into().expect("four bytes")),
-                    2,
-                    "the second entry still denies"
-                );
-                assert_eq!(
-                    u32::from_ne_bytes(raw[88..92].try_into().expect("four bytes")),
-                    0x0000_0400,
-                    "the right it denies came back"
-                );
-            }
-            drop(file);
-
-            // Restoring the read access-control list onto a second file descriptor sets the same list.
-            let target_name = RelativeName::parse("target.txt").expect("a name");
-            let mut target = authority.create_new(&target_name).expect("a target file");
-            std::io::Write::write_all(target.handle_mut(), b"target\n").expect("content");
-            #[cfg(windows)]
-            target
-                .clear_access_control()
-                .expect("takes the target's own entries off it");
-            assert!(!target.carries_access_control());
-            target
-                .set_access_control(&acl)
-                .expect("restores access-control list");
-
-            // Re-read target and verify it matches the source list.
-            let target_read = authority
-                .open_read(&target_name, ObjectPolicy::ReadableFile)
-                .expect("opens target read");
-            assert!(target_read.carries_access_control());
-            assert_eq!(
-                target_read.access_control().expect("reads target acl"),
-                acl,
-                "restored access-control list matches the source exactly"
-            );
-            drop(target_read);
-
-            // Clearing the access-control list leaves the file with no list.
-            target
-                .clear_access_control()
-                .expect("clears access-control list");
-            drop(target);
-
-            let target_cleared = authority
-                .open_read(&target_name, ObjectPolicy::ReadableFile)
-                .expect("opens target read");
-            assert!(
-                !target_cleared.carries_access_control(),
-                "cleared file carries no access-control list"
-            );
-            #[cfg(not(windows))]
-            assert_eq!(
-                target_cleared.access_control().expect("reads cleared acl"),
-                kr_transfer::AccessControl::None
-            );
-            #[cfg(windows)]
-            assert!(
-                !target_cleared
-                    .access_control()
-                    .expect("reads cleared acl")
-                    .has_entries(),
-                "a cleared file is left with what the directory above it gives and nothing of \
-                 its own"
-            );
-        }
-        None => println!(
-            "not exercised: this platform did not take an access-control list, so only the \
-             no-list half of this case was checked"
-        ),
+    let acl = give_an_access_control_list(&authority, &second).unwrap_or_else(|reason| {
+        panic!(
+            "this host would not put an access-control list on a file, so the half of this check \
+             that needs one cannot run here: {reason}"
+        )
+    });
+    let file = authority
+        .open_read(&second, ObjectPolicy::ReadableFile)
+        .expect("it opens");
+    assert!(
+        file.carries_access_control(),
+        "a file with a list says so through its own handle"
+    );
+    assert_eq!(
+        file.access_control().expect("reads access control"),
+        acl,
+        "the list read through the handle is the one the file was given"
+    );
+    // The entries themselves, not merely the fact of them: a list that came back with the
+    // right number of entries and none of their rights would pass everything else here.
+    #[cfg(target_os = "macos")]
+    {
+        let kr_transfer::AccessControl::Apple(apple) = &acl else {
+            panic!("this platform's list is an Apple list");
+        };
+        assert_eq!(apple.entry_count(), 2, "both entries came back");
+        let raw = apple.as_bytes();
+        assert_eq!(
+            u32::from_ne_bytes(raw[60..64].try_into().expect("four bytes")),
+            1,
+            "the first entry still allows"
+        );
+        assert_eq!(
+            u32::from_ne_bytes(raw[64..68].try_into().expect("four bytes")),
+            0x0000_0002,
+            "the right it allows came back"
+        );
+        assert_eq!(
+            u32::from_ne_bytes(raw[84..88].try_into().expect("four bytes")),
+            2,
+            "the second entry still denies"
+        );
+        assert_eq!(
+            u32::from_ne_bytes(raw[88..92].try_into().expect("four bytes")),
+            0x0000_0400,
+            "the right it denies came back"
+        );
     }
+    drop(file);
+
+    // Restoring the read access-control list onto a second file descriptor sets the same list.
+    let target_name = RelativeName::parse("target.txt").expect("a name");
+    let mut target = authority.create_new(&target_name).expect("a target file");
+    std::io::Write::write_all(target.handle_mut(), b"target\n").expect("content");
+    #[cfg(windows)]
+    target
+        .clear_access_control()
+        .expect("takes the target's own entries off it");
+    assert!(!target.carries_access_control());
+    target
+        .set_access_control(&acl)
+        .expect("restores access-control list");
+
+    // Re-read target and verify it matches the source list.
+    let target_read = authority
+        .open_read(&target_name, ObjectPolicy::ReadableFile)
+        .expect("opens target read");
+    assert!(target_read.carries_access_control());
+    assert_eq!(
+        target_read.access_control().expect("reads target acl"),
+        acl,
+        "restored access-control list matches the source exactly"
+    );
+    drop(target_read);
+
+    // Clearing the access-control list leaves the file with no list.
+    target
+        .clear_access_control()
+        .expect("clears access-control list");
+    drop(target);
+
+    let target_cleared = authority
+        .open_read(&target_name, ObjectPolicy::ReadableFile)
+        .expect("opens target read");
+    assert!(
+        !target_cleared.carries_access_control(),
+        "cleared file carries no access-control list"
+    );
+    #[cfg(not(windows))]
+    assert_eq!(
+        target_cleared.access_control().expect("reads cleared acl"),
+        kr_transfer::AccessControl::None
+    );
+    #[cfg(windows)]
+    assert!(
+        !target_cleared
+            .access_control()
+            .expect("reads cleared acl")
+            .has_entries(),
+        "a cleared file is left with what the directory above it gives and nothing of \
+         its own"
+    );
 }
 
-/// Puts an access-control list on one file through its own descriptor, and returns what the
-/// platform reports afterwards.
+/// Makes one file, puts an access-control list on it through its own descriptor, and returns what
+/// the platform reports afterwards, or why it would not take one.
 ///
 /// The list is built here rather than asked of the platform's command-line tool. That tool is a
 /// package a host need not have, and a case that quietly does nothing where the package is missing
@@ -829,9 +754,12 @@ fn a_file_says_through_its_own_handle_whether_it_carries_an_access_control_list(
 fn give_an_access_control_list(
     authority: &AuthorisedDirectory,
     name: &RelativeName,
-) -> Option<kr_transfer::AccessControl> {
-    let mut file = authority.create_new(name).ok()?;
-    std::io::Write::write_all(file.handle_mut(), b"content\n").ok()?;
+) -> Result<kr_transfer::AccessControl, String> {
+    let mut file = authority
+        .create_new(name)
+        .map_err(|error| format!("{name} could not be made: {error}"))?;
+    std::io::Write::write_all(file.handle_mut(), b"content\n")
+        .map_err(|error| format!("{name} could not be written: {error}"))?;
     #[cfg(target_os = "macos")]
     let wanted = {
         // This platform's external representation: a 44-byte header declaring how many entries
@@ -841,7 +769,9 @@ fn give_an_access_control_list(
         // the second entry denies is deliberately not deletion: this platform checks that right
         // against the file a rename replaces, so denying it would stop the very replacement these
         // cases are about.
-        let owner = file.owner().ok()?;
+        let owner = file
+            .owner()
+            .map_err(|error| format!("{name} has no owner to read: {error}"))?;
         let mut applicable = [
             0xff, 0xff, 0xee, 0xee, 0xdd, 0xdd, 0xcc, 0xcc, 0xbb, 0xbb, 0xaa, 0xaa, 0, 0, 0, 0,
         ];
@@ -858,7 +788,10 @@ fn give_an_access_control_list(
             raw[at + 16..at + 20].copy_from_slice(&kind.to_ne_bytes());
             raw[at + 20..at + 24].copy_from_slice(&rights.to_ne_bytes());
         }
-        kr_transfer::AccessControl::Apple(kr_transfer::AppleAcl::from_bytes(&raw).ok()?)
+        kr_transfer::AccessControl::Apple(
+            kr_transfer::AppleAcl::from_bytes(&raw)
+                .map_err(|error| format!("the list this case builds is not one: {error}"))?,
+        )
     };
     #[cfg(target_os = "linux")]
     let wanted = {
@@ -866,7 +799,9 @@ fn give_an_access_control_list(
         // row, each a tag, the rights it allows and the user or group it names. Naming a user is
         // what makes the list say more than the mode bits do, and a list that names one carries a
         // mask beside it.
-        let owner = file.owner().ok()?;
+        let owner = file
+            .owner()
+            .map_err(|error| format!("{name} has no owner to read: {error}"))?;
         let mut raw = Vec::with_capacity(4 + 5 * 8);
         raw.extend_from_slice(&2_u32.to_le_bytes());
         for (tag, rights, who) in [
@@ -882,11 +817,30 @@ fn give_an_access_control_list(
         }
         kr_transfer::AccessControl::Posix(raw)
     };
-    file.set_access_control(&wanted).ok()?;
+    file.set_access_control(&wanted)
+        .map_err(|error| format!("{name} would not take an access-control list: {error}"))?;
     drop(file);
-    let read = authority.open_read(name, ObjectPolicy::ReadableFile).ok()?;
-    let carried = read.access_control().ok()?;
-    carried.has_entries().then_some(carried)
+    carried_list(authority, name)
+}
+
+/// Reads back what one file carries of its own, and says so when it carries nothing.
+fn carried_list(
+    authority: &AuthorisedDirectory,
+    name: &RelativeName,
+) -> Result<kr_transfer::AccessControl, String> {
+    let read = authority
+        .open_read(name, ObjectPolicy::ReadableFile)
+        .map_err(|error| format!("{name} would not open for reading: {error}"))?;
+    let carried = read
+        .access_control()
+        .map_err(|error| format!("the list on {name} could not be read back: {error}"))?;
+    if carried.has_entries() {
+        Ok(carried)
+    } else {
+        Err(format!(
+            "{name} carries no entry of its own after it was given a list"
+        ))
+    }
 }
 
 /// Puts a discretionary access-control list on one file through the file's own handle.
@@ -899,13 +853,18 @@ fn give_an_access_control_list(
 fn give_an_access_control_list(
     authority: &AuthorisedDirectory,
     name: &RelativeName,
-) -> Option<kr_transfer::AccessControl> {
+) -> Result<kr_transfer::AccessControl, String> {
     /// Reading a file's content, its attributes and its list.
     const FILE_GENERIC_READ: u32 = 0x0012_0089;
 
-    let mut file = authority.create_new(name).ok()?;
-    std::io::Write::write_all(file.handle_mut(), b"content\n").ok()?;
-    let owner = file.owner().ok()?;
+    let mut file = authority
+        .create_new(name)
+        .map_err(|error| format!("{name} could not be made: {error}"))?;
+    std::io::Write::write_all(file.handle_mut(), b"content\n")
+        .map_err(|error| format!("{name} could not be written: {error}"))?;
+    let owner = file
+        .owner()
+        .map_err(|error| format!("{name} has no owner to read: {error}"))?;
     let wanted = kr_transfer::AccessControl::Windows(kr_transfer::WindowsAcl::new(
         true,
         vec![kr_transfer::AclEntry::new(
@@ -916,22 +875,24 @@ fn give_an_access_control_list(
         )],
         Vec::new(),
     ));
-    file.set_access_control(&wanted).ok()?;
+    file.set_access_control(&wanted)
+        .map_err(|error| format!("{name} would not take an access-control list: {error}"))?;
     drop(file);
-    let read = authority.open_read(name, ObjectPolicy::ReadableFile).ok()?;
-    let carried = read.access_control().ok()?;
-    carried.has_entries().then_some(carried)
+    carried_list(authority, name)
 }
 
-/// Returns nothing: this platform keeps its access-control lists where this host cannot write one.
+/// Says why not: this platform keeps its access-control lists where this host cannot write one.
 ///
 /// It stands in on the Unix hosts that are neither Apple's nor Linux.
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 fn give_an_access_control_list(
     _authority: &AuthorisedDirectory,
-    _name: &RelativeName,
-) -> Option<kr_transfer::AccessControl> {
-    None
+    name: &RelativeName,
+) -> Result<kr_transfer::AccessControl, String> {
+    Err(format!(
+        "this platform keeps its access-control lists where this host cannot write one, so {name} \
+         was given none"
+    ))
 }
 
 /// KR-REQ-14.05: a name resolves through directories on this authority's own mount.
@@ -1736,7 +1697,7 @@ fn a_windows_list_separates_what_an_object_carries_from_what_it_inherits() {
     // The same file given a protected list with one entry of its own reports both.
     match give_an_access_control_list(&authority, &RelativeName::parse("own.txt").expect("a name"))
     {
-        Some(kr_transfer::AccessControl::Windows(list)) => {
+        Ok(kr_transfer::AccessControl::Windows(list)) => {
             assert!(list.is_protected(), "the list this host wrote is protected");
             assert_eq!(list.explicit().len(), 1, "one entry of the object's own");
             assert!(
@@ -1863,111 +1824,108 @@ fn remove_tree_refuses_a_replacement_and_reports_partial() {
     std::fs::remove_dir_all(root.path().join("tree")).expect("clears the replacement");
     std::fs::rename(root.path().join("moved"), root.path().join("tree")).expect("puts it back");
 
-    // Part way, twice, each counted against what is gone. A process that ignores modes has nothing
-    // to learn from either, so it says so rather than passing them.
-    let privileged = std::fs::metadata(root.path()).is_ok_and(|metadata| metadata.uid() == 0);
-    if privileged {
-        println!("not exercised: this process removes entries whatever a directory's mode says");
-    } else {
-        // Progress that is certain: everything inside goes, and the tree's own name cannot,
-        // because the directory that holds it lets nothing be removed from it.
-        let holder = root.path().join("holder");
-        std::fs::create_dir_all(holder.join("partial/sub")).expect("a tree");
-        for index in 0..4 {
-            std::fs::write(holder.join(format!("partial/free-{index}")), b"free\n")
-                .expect("a file");
-        }
-        std::fs::write(holder.join("partial/sub/inner"), b"inner\n").expect("a file");
-        let held =
-            AuthorisedDirectory::open_root(environment(), &holder).expect("the holder opens");
-        let partial = RelativeName::parse("partial").expect("a name");
-        let opened = held.subdirectory(&partial).expect("the tree opens");
-        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o500))
-            .expect("nothing can be removed from the holder");
-        let outcome = held.remove_tree(&partial, opened);
-        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o700))
-            .expect("the holder is writable again");
-        let refusal = outcome.expect_err("a name that cannot be removed stops the removal");
-        let Escape::RemovalStopped {
-            stopped_at,
-            removed,
-            ..
-        } = &refusal
-        else {
-            panic!("the refusal is a stopped removal: {refusal}");
-        };
-        assert_eq!(stopped_at, "partial", "it stops at the tree's own name");
-        assert_eq!(
-            *removed, 6,
-            "four files, the directory inside and its file went before it stopped"
-        );
-        assert!(
-            std::fs::read_dir(holder.join("partial"))
-                .expect("the tree is still there")
-                .next()
-                .is_none(),
-            "and nothing it removed came back"
-        );
-
-        // A stop deep inside, counted whatever order the directory lists its entries in.
-        std::fs::create_dir_all(root.path().join("deep/locked")).expect("a directory");
-        std::fs::write(root.path().join("deep/locked/stuck"), b"stuck\n").expect("its file");
-        std::fs::create_dir(root.path().join("deep/dir")).expect("a directory");
-        std::fs::write(root.path().join("deep/dir/file"), b"file\n").expect("its file");
-        for index in 0..8 {
-            std::fs::write(root.path().join(format!("deep/free-{index}")), b"free\n")
-                .expect("a file");
-        }
-        std::fs::set_permissions(
-            root.path().join("deep/locked"),
-            std::fs::Permissions::from_mode(0o500),
-        )
-        .expect("its entries cannot be removed");
-        let deep = RelativeName::parse("deep").expect("a name");
-        let opened = authority.subdirectory(&deep).expect("the tree opens");
-        let outcome = authority.remove_tree(&deep, opened);
-        std::fs::set_permissions(
-            root.path().join("deep/locked"),
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .expect("the directory is writable again");
-        let refusal = outcome.expect_err("an entry that cannot be removed stops the removal");
-        let Escape::RemovalStopped {
-            stopped_at,
-            removed,
-            reason,
-            ..
-        } = &refusal
-        else {
-            panic!("the refusal is a stopped removal: {refusal}");
-        };
-        assert_eq!(
-            stopped_at, "deep/locked/stuck",
-            "it names the entry it stopped at"
-        );
-        assert!(
-            matches!(**reason, Escape::Unopenable { .. }),
-            "and why: {reason}"
-        );
-        assert!(
-            root.path().join("deep/locked/stuck").is_file(),
-            "that entry is still there"
-        );
-        let mut gone = (0..8)
-            .filter(|index| !root.path().join(format!("deep/free-{index}")).exists())
-            .count();
-        gone += usize::from(!root.path().join("deep/dir/file").exists());
-        gone += usize::from(!root.path().join("deep/dir").exists());
-        assert_eq!(
-            *removed,
-            u64::try_from(gone).expect("a count"),
-            "what it says it removed is every entry that is gone, and none of it came back"
-        );
-        assert!(
-            root.path().join("deep").is_dir(),
-            "the tree's own name stays"
-        );
+    // Part way, twice, each counted against what is gone. A process that ignores modes cannot be
+    // stopped part way by one, so it fails here and says so rather than passing either.
+    assert!(
+        std::fs::metadata(root.path()).is_ok_and(|metadata| metadata.uid() != 0),
+        "this process removes entries whatever a directory's mode says, so a removal that stops \
+         part way cannot be arranged here; run it as an account that holds no such privilege"
+    );
+    // Progress that is certain: everything inside goes, and the tree's own name cannot,
+    // because the directory that holds it lets nothing be removed from it.
+    let holder = root.path().join("holder");
+    std::fs::create_dir_all(holder.join("partial/sub")).expect("a tree");
+    for index in 0..4 {
+        std::fs::write(holder.join(format!("partial/free-{index}")), b"free\n").expect("a file");
     }
+    std::fs::write(holder.join("partial/sub/inner"), b"inner\n").expect("a file");
+    let held = AuthorisedDirectory::open_root(environment(), &holder).expect("the holder opens");
+    let partial = RelativeName::parse("partial").expect("a name");
+    let opened = held.subdirectory(&partial).expect("the tree opens");
+    std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o500))
+        .expect("nothing can be removed from the holder");
+    let outcome = held.remove_tree(&partial, opened);
+    std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o700))
+        .expect("the holder is writable again");
+    let refusal = outcome.expect_err("a name that cannot be removed stops the removal");
+    let Escape::RemovalStopped {
+        stopped_at,
+        removed,
+        ..
+    } = &refusal
+    else {
+        panic!("the refusal is a stopped removal: {refusal}");
+    };
+    assert_eq!(stopped_at, "partial", "it stops at the tree's own name");
+    assert_eq!(
+        *removed, 6,
+        "four files, the directory inside and its file went before it stopped"
+    );
+    assert!(
+        std::fs::read_dir(holder.join("partial"))
+            .expect("the tree is still there")
+            .next()
+            .is_none(),
+        "and nothing it removed came back"
+    );
+
+    // A stop deep inside, counted whatever order the directory lists its entries in.
+    std::fs::create_dir_all(root.path().join("deep/locked")).expect("a directory");
+    std::fs::write(root.path().join("deep/locked/stuck"), b"stuck\n").expect("its file");
+    std::fs::create_dir(root.path().join("deep/dir")).expect("a directory");
+    std::fs::write(root.path().join("deep/dir/file"), b"file\n").expect("its file");
+    for index in 0..8 {
+        std::fs::write(root.path().join(format!("deep/free-{index}")), b"free\n").expect("a file");
+    }
+    std::fs::set_permissions(
+        root.path().join("deep/locked"),
+        std::fs::Permissions::from_mode(0o500),
+    )
+    .expect("its entries cannot be removed");
+    let deep = RelativeName::parse("deep").expect("a name");
+    let opened = authority.subdirectory(&deep).expect("the tree opens");
+    let outcome = authority.remove_tree(&deep, opened);
+    std::fs::set_permissions(
+        root.path().join("deep/locked"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("the directory is writable again");
+    let refusal = outcome.expect_err("an entry that cannot be removed stops the removal");
+    let Escape::RemovalStopped {
+        stopped_at,
+        removed,
+        reason,
+        ..
+    } = &refusal
+    else {
+        panic!("the refusal is a stopped removal: {refusal}");
+    };
+    assert_eq!(
+        stopped_at, "deep/locked/stuck",
+        "it names the entry it stopped at"
+    );
+    assert!(
+        matches!(**reason, Escape::Unopenable { .. }),
+        "and why: {reason}"
+    );
+    assert!(
+        root.path().join("deep/locked/stuck").is_file(),
+        "that entry is still there"
+    );
+    let mut gone = (0..8)
+        .filter(|index| !root.path().join(format!("deep/free-{index}")).exists())
+        .count();
+    gone += usize::from(!root.path().join("deep/dir/file").exists());
+    gone += usize::from(!root.path().join("deep/dir").exists());
+    assert_eq!(
+        *removed,
+        u64::try_from(gone).expect("a count"),
+        "what it says it removed is every entry that is gone, and none of it came back"
+    );
+    assert!(
+        root.path().join("deep").is_dir(),
+        "the tree's own name stays"
+    );
 
     // At the end: the directory it emptied is moved away and a replacement holding something is
     // put at its name. The replacement is built elsewhere and renamed in whole, so whenever the
@@ -2096,7 +2054,9 @@ fn an_exclusive_directory_admits_nobody_its_mode_does_not() {
         );
     }
 
-    // A list beside the mode, where the platform's own tool is installed to put one there.
+    // A list beside the mode, put there by the platform's own tool: `chmod` on Apple platforms,
+    // and `setfacl` from the access-control package on Linux. A host without the tool fails here
+    // and says so, rather than passing with only the mode half checked.
     std::fs::create_dir(root.path().join("listed")).expect("a directory");
     std::fs::set_permissions(
         root.path().join("listed"),
@@ -2104,34 +2064,41 @@ fn an_exclusive_directory_admits_nobody_its_mode_does_not() {
     )
     .expect("an owner-only mode");
     let who = std::env::var("USER").unwrap_or_else(|_| "root".to_owned());
-    let given = if cfg!(target_os = "macos") {
-        std::process::Command::new("/bin/chmod")
-            .arg("+a")
-            .arg(format!("{who} allow list"))
-            .arg(root.path().join("listed"))
-            .status()
+    let (tool, given) = if cfg!(target_os = "macos") {
+        (
+            "/bin/chmod",
+            std::process::Command::new("/bin/chmod")
+                .arg("+a")
+                .arg(format!("{who} allow list"))
+                .arg(root.path().join("listed"))
+                .output(),
+        )
     } else {
-        std::process::Command::new("setfacl")
-            .arg("-m")
-            .arg(format!("u:{who}:rx"))
-            .arg(root.path().join("listed"))
-            .status()
+        (
+            "setfacl",
+            std::process::Command::new("setfacl")
+                .arg("-m")
+                .arg(format!("u:{who}:rx"))
+                .arg(root.path().join("listed"))
+                .output(),
+        )
     };
-    match given {
-        Ok(status) if status.success() => {
-            let held = authority
-                .subdirectory(&RelativeName::parse("listed").expect("a name"))
-                .expect("it opens");
-            assert!(
-                held.check_privacy(Privacy::Exclusive).is_err(),
-                "a directory carrying a list is not one only its mode decides"
-            );
-        }
-        _ => println!(
-            "not exercised: this platform's access-control tool did not run, so only the mode \
-             half of this case was checked"
-        ),
-    }
+    let given = given.unwrap_or_else(|error| {
+        panic!("{tool} could not be run, so the list half of this check cannot run here: {error}")
+    });
+    assert!(
+        given.status.success(),
+        "{tool} would not put a list on the directory, so the list half of this check cannot run \
+         here: {}",
+        String::from_utf8_lossy(&given.stderr)
+    );
+    let held = authority
+        .subdirectory(&RelativeName::parse("listed").expect("a name"))
+        .expect("it opens");
+    assert!(
+        held.check_privacy(Privacy::Exclusive).is_err(),
+        "a directory carrying a list is not one only its mode decides"
+    );
 }
 
 /// KR-REQ-14.05: a recursive removal stops before a directory mounted into the tree, and the tree
@@ -2314,20 +2281,11 @@ fn a_removal_stops_before_a_disk_image_attached_inside_the_tree() {
     );
 }
 
-/// A directory made to stage in is made only where nothing was, and one that turns out not to be
-/// this account's alone is taken away again only while nothing has been put inside it.
-///
-/// On macOS a directory made inside one that carries an inheritable access-control list carries
-/// one too, which can admit an account the mode does not mention, so it is not exclusive. Whoever
-/// that list admits may put something inside it the moment it exists; what they put there is
-/// never taken away with it. A Linux list is bounded by the mode's group bits, which a directory
-/// made owner-only has clear, so there a list makes nothing less exclusive and that half is not
-/// exercised.
+/// A directory made to stage in is made only where nothing was, and it is this account's alone.
 #[cfg(unix)]
 #[test]
-fn a_new_directory_is_made_where_nothing_was_and_kept_whenever_anything_was_put_inside() {
+fn a_new_directory_is_made_only_where_nothing_was() {
     use kr_transfer::Privacy;
-    use std::os::unix::fs::PermissionsExt as _;
 
     let root = tempfile::tempdir().expect("a directory");
     let authority =
@@ -2360,11 +2318,26 @@ fn a_new_directory_is_made_where_nothing_was_and_kept_whenever_anything_was_put_
         .expect("a directory is made where nothing was");
     made.check_privacy(Privacy::Exclusive)
         .expect("and nobody but this account can change it");
+}
 
-    if !cfg!(target_os = "macos") {
-        println!("not exercised: a list here is bounded by the mode, so it makes nothing shared");
-        return;
-    }
+/// A directory made to stage in that turns out not to be this account's alone is taken away again
+/// only while nothing has been put inside it.
+///
+/// On macOS a directory made inside one that carries an inheritable access-control list carries
+/// one too, which can admit an account the mode does not mention, so it is not exclusive. Whoever
+/// that list admits may put something inside it the moment it exists; what they put there is
+/// never taken away with it. A Linux list is bounded by the mode's group bits, which a directory
+/// made owner-only has clear, so there a list makes nothing less exclusive and this case has
+/// nothing to show.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_new_directory_that_inherited_a_list_is_kept_whenever_anything_was_put_inside() {
+    use kr_transfer::Privacy;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().expect("a directory");
+    let authority =
+        AuthorisedDirectory::open_root(environment(), root.path()).expect("the authority opens");
     let listed = root.path().join("listed");
     std::fs::create_dir(&listed).expect("a directory");
     std::fs::set_permissions(&listed, std::fs::Permissions::from_mode(0o700)).expect("its mode");
@@ -2375,11 +2348,16 @@ fn a_new_directory_is_made_where_nothing_was_and_kept_whenever_anything_was_put_
             "{who} allow list,add_file,search,add_subdirectory,file_inherit,directory_inherit"
         ))
         .arg(&listed)
-        .status();
-    if !given.is_ok_and(|status| status.success()) {
-        println!("not exercised: this platform's access-control tool did not run");
-        return;
-    }
+        .output()
+        .unwrap_or_else(|error| {
+            panic!("/bin/chmod could not be run, so this check cannot run here: {error}")
+        });
+    assert!(
+        given.status.success(),
+        "/bin/chmod would not put an inheritable list on the directory, so this check cannot run \
+         here: {}",
+        String::from_utf8_lossy(&given.stderr)
+    );
     let parent = authority
         .subdirectory(&RelativeName::parse("listed").expect("a name"))
         .expect("it opens");

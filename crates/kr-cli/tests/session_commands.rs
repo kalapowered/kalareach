@@ -3,9 +3,10 @@
 //!
 //! The daemon and the worker are the `kr-controller` and `kr-worker` executables the workspace
 //! builds beside this test. A workspace build always has them; a build of this crate alone that
-//! has not built them yet prints why and stops rather than testing something else. Each is copied
-//! to the internal disk before it starts, every process's working directory is inside this test's
-//! own temporary host, and the daemon keeps its keys in that host's own secrets directory.
+//! has not built them yet fails and says why, rather than passing without having tested anything.
+//! Each is copied to the internal disk before it starts, every process's working directory is
+//! inside this test's own temporary host, and the daemon keeps its keys in that host's own secrets
+//! directory.
 
 #![cfg(unix)]
 
@@ -64,17 +65,17 @@ impl Drop for Host {
 }
 
 impl Host {
-    /// Starts the daemon on a host of its own, or says why it cannot.
-    async fn start() -> Option<Self> {
+    /// Starts the daemon on a host of its own, or fails and says why it cannot.
+    async fn start() -> Self {
         let (Some(controller), Some(worker)) = (
             beside_this_test("kr-controller"),
             beside_this_test("kr-worker"),
         ) else {
-            eprintln!(
-                "skipped: the kr-controller and kr-worker executables are not built beside this \
-                 test; a workspace test run builds them"
+            panic!(
+                "the kr-controller and kr-worker executables are not built beside this test, so \
+                 this check cannot run; a workspace test run builds them, and so does \
+                 `cargo build -p kr-controller -p kr-worker`"
             );
-            return None;
         };
         let temp = teardown::Tree::create();
         let bin = temp.root().join("bin");
@@ -118,7 +119,7 @@ impl Host {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        Some(host)
+        host
     }
 
     /// Runs `kr` against this host with nothing of this test's own environment.
@@ -369,9 +370,7 @@ fn closed(host: &Host, display: &str) {
 /// starts.
 #[tokio::test(flavor = "multi_thread")]
 async fn new_attach_detach_and_close_work_in_full_and_in_one_letter() {
-    let Some(host) = Host::start().await else {
-        return;
-    };
+    let host = Host::start().await;
     let cwd = host.temp.root().display().to_string();
     for (form, new, attach, detach, close) in [
         ("full", "new", "attach", "detach", "close"),
@@ -481,13 +480,13 @@ async fn a_worker_on_macos_is_a_per_user_launchd_job_in_its_own_directory() {
         .arg(format!("gui/{uid}"))
         .output()
         .is_ok_and(|output| output.status.success());
-    if !graphical {
-        eprintln!("skipped: this user has no graphical login session for launchd to start jobs in");
-        return;
-    }
-    let Some(host) = Host::start().await else {
-        return;
-    };
+    assert!(
+        graphical,
+        "this user has no graphical login session for launchd to start a desktop worker in, so \
+         this check cannot run here; it runs where a person is logged in at the console, as on a \
+         macOS workstation and the hosted macOS runners"
+    );
+    let host = Host::start().await;
     let cwd = host.temp.root().display().to_string();
     let state_root = std::fs::canonicalize(host.temp.paths().state_root()).expect("the state root");
     let worker_program = std::fs::canonicalize(host.temp.root().join("bin/kr-worker"))

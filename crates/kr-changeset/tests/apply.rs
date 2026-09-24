@@ -348,7 +348,11 @@ fn a_versioned_reference_is_compare_and_swap_and_states_what_it_does_not_do() {
 /// KR-REQ-14.28 and 14.29: a direct apply installs the content, preserves the destination's
 /// permissions and the content's line endings, records each path's progress on both sides, and
 /// leaves recoverable versions of the tree before and after.
-#[cfg(not(windows))]
+///
+/// The permission it preserves is the executable bit, which Windows has no counterpart for. What a
+/// Windows destination carries instead is its access-control list, which the Windows cases below
+/// carry across and check.
+#[cfg(unix)]
 #[test]
 fn a_direct_apply_installs_the_content_and_records_what_it_did() {
     let fixture = Fixture::create();
@@ -365,7 +369,6 @@ fn a_direct_apply_installs_the_content_and_records_what_it_did() {
     // The destination is a second checkout of the same commit, with one of the files executable
     // so the apply has a permission to preserve.
     let destination = ordinary_repository(fixture.work(), "destination-tree");
-    #[cfg(unix)]
     support::make_executable(&destination, "README.md");
     let workspace = fixture.workspace("destination-tree");
     let affected = expectations(&destination, &["README.md", "src/deep/new.rs"]);
@@ -400,15 +403,9 @@ fn a_direct_apply_installs_the_content_and_records_what_it_did() {
         b"a file in a new directory\n"
     );
     // The destination's own permission is preserved rather than the version's imposed on it.
-    #[cfg(unix)]
     assert!(
         support::is_executable(&destination, "README.md"),
         "the destination was executable and still is"
-    );
-    #[cfg(not(unix))]
-    println!(
-        "not exercised: the executable bit, which this platform has no counterpart for; what this \
-         platform carries instead is checked by the access-control cases"
     );
     // Every path's progress is recorded on both sides.
     for row in &result.progress {
@@ -465,7 +462,7 @@ fn a_direct_apply_installs_the_content_and_records_what_it_did() {
 }
 
 /// Puts an access-control list on one file through the file's own descriptor, and returns what the
-/// platform reports afterwards.
+/// platform reports afterwards, or why it would not take one.
 ///
 /// The list is built here rather than asked of the platform's command-line tool. That tool is a
 /// package a host need not have, and a case that quietly does nothing where the package is missing
@@ -474,11 +471,11 @@ fn a_direct_apply_installs_the_content_and_records_what_it_did() {
 fn give_an_access_control_list(
     environment: kr_protocol::ids::EnvironmentId,
     path: &Path,
-) -> Option<kr_transfer::AccessControl> {
-    let directory = path.parent()?;
-    let leaf = kr_transfer::RelativeName::parse(path.file_name()?.to_str()?).ok()?;
-    let authority = kr_transfer::AuthorisedDirectory::open_root(environment, directory).ok()?;
-    let file = authority.open_write(&leaf).ok()?;
+) -> Result<kr_transfer::AccessControl, String> {
+    let (authority, leaf) = authority_over(environment, path)?;
+    let file = authority
+        .open_write(&leaf)
+        .map_err(|error| format!("{} would not open for writing: {error}", path.display()))?;
     #[cfg(target_os = "macos")]
     let wanted = {
         // This platform's external representation: a 44-byte header declaring how many entries
@@ -488,7 +485,9 @@ fn give_an_access_control_list(
         // the second entry denies is deliberately not deletion: this platform checks that right
         // against the file a rename replaces, so denying it would stop the very replacement these
         // cases are about.
-        let owner = file.owner().ok()?;
+        let owner = file
+            .owner()
+            .map_err(|error| format!("{} has no owner to read: {error}", path.display()))?;
         let mut applicable = [
             0xff, 0xff, 0xee, 0xee, 0xdd, 0xdd, 0xcc, 0xcc, 0xbb, 0xbb, 0xaa, 0xaa, 0, 0, 0, 0,
         ];
@@ -505,7 +504,10 @@ fn give_an_access_control_list(
             raw[at + 16..at + 20].copy_from_slice(&kind.to_ne_bytes());
             raw[at + 20..at + 24].copy_from_slice(&rights.to_ne_bytes());
         }
-        kr_transfer::AccessControl::Apple(kr_transfer::AppleAcl::from_bytes(&raw).ok()?)
+        kr_transfer::AccessControl::Apple(
+            kr_transfer::AppleAcl::from_bytes(&raw)
+                .map_err(|error| format!("the list this case builds is not one: {error}"))?,
+        )
     };
     #[cfg(target_os = "linux")]
     let wanted = {
@@ -513,7 +515,9 @@ fn give_an_access_control_list(
         // row, each a tag, the rights it allows and the user or group it names. Naming a user is
         // what makes the list say more than the mode bits do, and a list that names one carries a
         // mask beside it.
-        let owner = file.owner().ok()?;
+        let owner = file
+            .owner()
+            .map_err(|error| format!("{} has no owner to read: {error}", path.display()))?;
         let mut raw = Vec::with_capacity(4 + 5 * 8);
         raw.extend_from_slice(&2_u32.to_le_bytes());
         for (tag, rights, who) in [
@@ -529,13 +533,59 @@ fn give_an_access_control_list(
         }
         kr_transfer::AccessControl::Posix(raw)
     };
-    file.set_access_control(&wanted).ok()?;
+    file.set_access_control(&wanted).map_err(|error| {
+        format!(
+            "{} would not take an access-control list: {error}",
+            path.display()
+        )
+    })?;
     drop(file);
+    carried_list(&authority, &leaf, path)
+}
+
+/// Opens the directory one path is in as an authority, and names the path within it.
+fn authority_over(
+    environment: kr_protocol::ids::EnvironmentId,
+    path: &Path,
+) -> Result<(kr_transfer::AuthorisedDirectory, kr_transfer::RelativeName), String> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| format!("{} is in no directory", path.display()))?;
+    let leaf = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("{} has no name this case can spell", path.display()))?;
+    let leaf = kr_transfer::RelativeName::parse(leaf)
+        .map_err(|error| format!("{leaf} is not a name inside one directory: {error}"))?;
+    let authority = kr_transfer::AuthorisedDirectory::open_root(environment, directory)
+        .map_err(|error| format!("{} would not open: {error}", directory.display()))?;
+    Ok((authority, leaf))
+}
+
+/// Reads back what one file carries of its own through the authority's own handle, and says so when
+/// it carries nothing.
+fn carried_list(
+    authority: &kr_transfer::AuthorisedDirectory,
+    leaf: &kr_transfer::RelativeName,
+    path: &Path,
+) -> Result<kr_transfer::AccessControl, String> {
     let read = authority
-        .open_read(&leaf, kr_transfer::ObjectPolicy::ReadableFile)
-        .ok()?;
-    let carried = read.access_control().ok()?;
-    carried.has_entries().then_some(carried)
+        .open_read(leaf, kr_transfer::ObjectPolicy::ReadableFile)
+        .map_err(|error| format!("{} would not open for reading: {error}", path.display()))?;
+    let carried = read.access_control().map_err(|error| {
+        format!(
+            "the list on {} could not be read back: {error}",
+            path.display()
+        )
+    })?;
+    if carried.has_entries() {
+        Ok(carried)
+    } else {
+        Err(format!(
+            "{} carries no entry of its own after it was given a list",
+            path.display()
+        ))
+    }
 }
 
 /// Everything an account may do to a file.
@@ -568,7 +618,7 @@ const OBJECT_INHERIT: u8 = 0x01;
 fn give_an_access_control_list(
     environment: kr_protocol::ids::EnvironmentId,
     path: &Path,
-) -> Option<kr_transfer::AccessControl> {
+) -> Result<kr_transfer::AccessControl, String> {
     let account = account_of(environment, path)?;
     let wanted = kr_transfer::WindowsAcl::new(
         true,
@@ -579,7 +629,8 @@ fn give_an_access_control_list(
         Vec::new(),
     );
     write_a_list(path, Some(&wanted))?;
-    read_the_list(environment, path)
+    let (authority, leaf) = authority_over(environment, path)?;
+    carried_list(&authority, &leaf, path)
 }
 
 /// Returns the account one file belongs to, read through a handle the authority opened.
@@ -587,20 +638,20 @@ fn give_an_access_control_list(
 fn account_of(
     environment: kr_protocol::ids::EnvironmentId,
     path: &Path,
-) -> Option<kr_transfer::Sid> {
-    let directory = path.parent()?;
-    let leaf = kr_transfer::RelativeName::parse(path.file_name()?.to_str()?).ok()?;
-    let authority = kr_transfer::AuthorisedDirectory::open_root(environment, directory).ok()?;
+) -> Result<kr_transfer::Sid, String> {
+    let (authority, leaf) = authority_over(environment, path)?;
     let file = authority
         .open_read(&leaf, kr_transfer::ObjectPolicy::ReadableFile)
-        .ok()?;
-    let owner = file.owner().ok()?;
-    Some(owner.account().clone())
+        .map_err(|error| format!("{} would not open for reading: {error}", path.display()))?;
+    let owner = file
+        .owner()
+        .map_err(|error| format!("{} has no owner to read: {error}", path.display()))?;
+    Ok(owner.account().clone())
 }
 
 /// Writes one list onto the object at a path, through a handle carrying the right to write one.
 #[cfg(windows)]
-fn write_a_list(path: &Path, list: Option<&kr_transfer::WindowsAcl>) -> Option<()> {
+fn write_a_list(path: &Path, list: Option<&kr_transfer::WindowsAcl>) -> Result<(), String> {
     use std::os::windows::fs::OpenOptionsExt as _;
     use std::os::windows::io::AsHandle as _;
 
@@ -611,33 +662,27 @@ fn write_a_list(path: &Path, list: Option<&kr_transfer::WindowsAcl>) -> Option<(
     if path.is_dir() {
         options.custom_flags(BACKUP_SEMANTICS);
     }
-    let handle = options.open(path).ok()?;
-    kr_transfer::set_access_control(handle.as_handle(), list).ok()
+    let handle = options.open(path).map_err(|error| {
+        format!(
+            "{} would not open to have its list written: {error}",
+            path.display()
+        )
+    })?;
+    kr_transfer::set_access_control(handle.as_handle(), list)
+        .map_err(|error| format!("{} would not take the list: {error}", path.display()))
 }
 
-/// Reads back what one file carries of its own, through the authority's own handle.
-#[cfg(windows)]
-fn read_the_list(
-    environment: kr_protocol::ids::EnvironmentId,
-    path: &Path,
-) -> Option<kr_transfer::AccessControl> {
-    let directory = path.parent()?;
-    let leaf = kr_transfer::RelativeName::parse(path.file_name()?.to_str()?).ok()?;
-    let authority = kr_transfer::AuthorisedDirectory::open_root(environment, directory).ok()?;
-    let read = authority
-        .open_read(&leaf, kr_transfer::ObjectPolicy::ReadableFile)
-        .ok()?;
-    let carried = read.access_control().ok()?;
-    carried.has_entries().then_some(carried)
-}
-
-/// Returns nothing: this platform keeps its access-control lists where this host cannot write one.
+/// Says why not: this platform keeps its access-control lists where this host cannot write one.
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn give_an_access_control_list(
     _environment: kr_protocol::ids::EnvironmentId,
-    _path: &Path,
-) -> Option<kr_transfer::AccessControl> {
-    None
+    path: &Path,
+) -> Result<kr_transfer::AccessControl, String> {
+    Err(format!(
+        "this platform keeps its access-control lists where this host cannot write one, so {} \
+         was given none",
+        path.display()
+    ))
 }
 
 /// KR-REQ-14.29: a direct apply preserves an access-control list on the destination.
@@ -656,73 +701,72 @@ fn a_direct_apply_preserves_an_access_control_list_on_the_destination() {
 
     let destination = ordinary_repository(fixture.work(), "destination-tree");
     let readme_path = destination.join("README.md");
-    let given = give_an_access_control_list(fixture.service().environment_id(), &readme_path);
-    match given {
-        Some(_) => {
-            let authority_before = kr_transfer::AuthorisedDirectory::open_root(
-                fixture.service().environment_id(),
-                &destination,
+    give_an_access_control_list(fixture.service().environment_id(), &readme_path).unwrap_or_else(
+        |reason| {
+            panic!(
+                "this host would not put an access-control list on the destination, so this \
+                 check cannot run here: {reason}"
             )
-            .expect("opens authority before");
-            let name = kr_transfer::RelativeName::parse("README.md").expect("valid name");
-            let file_before = authority_before
-                .open_read(&name, kr_transfer::ObjectPolicy::ReadableFile)
-                .expect("opens file before");
-            let initial_acl = file_before
-                .access_control()
-                .expect("reads initial access control");
-            assert!(
-                initial_acl.has_entries(),
-                "the destination initially carries access-control entries"
-            );
-            drop(file_before);
-            drop(authority_before);
+        },
+    );
+    let authority_before = kr_transfer::AuthorisedDirectory::open_root(
+        fixture.service().environment_id(),
+        &destination,
+    )
+    .expect("opens authority before");
+    let name = kr_transfer::RelativeName::parse("README.md").expect("valid name");
+    let file_before = authority_before
+        .open_read(&name, kr_transfer::ObjectPolicy::ReadableFile)
+        .expect("opens file before");
+    let initial_acl = file_before
+        .access_control()
+        .expect("reads initial access control");
+    assert!(
+        initial_acl.has_entries(),
+        "the destination initially carries access-control entries"
+    );
+    drop(file_before);
+    drop(authority_before);
 
-            let workspace = fixture.workspace("destination-tree");
-            let affected = expectations(&destination, &["README.md"]);
-            let limitations = apply::limitations(DestinationClass::SharedExisting);
-            let order = support::apply_order(
-                reference(&record),
-                DestinationClass::SharedExisting,
-                workspace,
-                &affected,
-                &limitations,
-            );
-            let result = apply::apply(fixture.service(), &order).expect("the apply runs");
-            assert_eq!(
-                result.outcome,
-                Nullable(Some(ApplyOutcomeClass::Applied)),
-                "{}: {:?}",
-                result.detail,
-                result.progress
-            );
-            assert_eq!(
-                support::read_bytes(&destination, "README.md"),
-                b"updated content with ACL\n"
-            );
-            let authority = kr_transfer::AuthorisedDirectory::open_root(
-                fixture.service().environment_id(),
-                &destination,
-            )
-            .expect("opens authority");
-            let file = authority
-                .open_read(&name, kr_transfer::ObjectPolicy::ReadableFile)
-                .expect("opens file");
-            assert!(
-                file.carries_access_control(),
-                "the destination still carries its access-control list after apply"
-            );
-            let acl = file.access_control().expect("reads access control");
-            assert_eq!(
-                acl, initial_acl,
-                "the destination's access-control list matches before apply exactly"
-            );
-        }
-        None => println!(
-            "not exercised: this platform did not take an access-control list, so the \
-             preservation of one across an apply was not checked here"
-        ),
-    }
+    let workspace = fixture.workspace("destination-tree");
+    let affected = expectations(&destination, &["README.md"]);
+    let limitations = apply::limitations(DestinationClass::SharedExisting);
+    let order = support::apply_order(
+        reference(&record),
+        DestinationClass::SharedExisting,
+        workspace,
+        &affected,
+        &limitations,
+    );
+    let result = apply::apply(fixture.service(), &order).expect("the apply runs");
+    assert_eq!(
+        result.outcome,
+        Nullable(Some(ApplyOutcomeClass::Applied)),
+        "{}: {:?}",
+        result.detail,
+        result.progress
+    );
+    assert_eq!(
+        support::read_bytes(&destination, "README.md"),
+        b"updated content with ACL\n"
+    );
+    let authority = kr_transfer::AuthorisedDirectory::open_root(
+        fixture.service().environment_id(),
+        &destination,
+    )
+    .expect("opens authority");
+    let file = authority
+        .open_read(&name, kr_transfer::ObjectPolicy::ReadableFile)
+        .expect("opens file");
+    assert!(
+        file.carries_access_control(),
+        "the destination still carries its access-control list after apply"
+    );
+    let acl = file.access_control().expect("reads access control");
+    assert_eq!(
+        acl, initial_acl,
+        "the destination's access-control list matches before apply exactly"
+    );
 }
 
 /// An access-control list altered on the staged copy before rename is caught by read-back
@@ -741,7 +785,9 @@ fn an_apply_detects_an_access_control_list_tampered_during_staging_and_refuses()
     // copy is protection the file being replaced never had.
     let environment = fixture.service().environment_id();
     let racing = destination.clone();
-    let tampered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // What the fault did to the staged copy: nothing yet, a list put on it, or why it put none.
+    let tampered: std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
     let tampered_by_fault = std::sync::Arc::clone(&tampered);
     fixture.service().inject(Some(Fault {
         after_paths: usize::MAX,
@@ -755,8 +801,9 @@ fn an_apply_detects_an_access_control_list_tampered_during_staging_and_refuses()
                     ))
                 );
                 let staged_path = racing.join(temporary).join("content");
-                if give_an_access_control_list(environment, &staged_path).is_some() {
-                    tampered_by_fault.store(true, std::sync::atomic::Ordering::SeqCst);
+                let given = give_an_access_control_list(environment, &staged_path).map(|_| ());
+                if let Ok(mut slot) = tampered_by_fault.lock() {
+                    *slot = Some(given);
                 }
             }
             true
@@ -778,12 +825,13 @@ fn an_apply_detects_an_access_control_list_tampered_during_staging_and_refuses()
         &limitations,
     );
     let result = apply::apply(fixture.service(), &order).expect("the apply runs");
-    if !tampered.load(std::sync::atomic::Ordering::SeqCst) {
-        println!(
-            "not exercised: this platform did not take an access-control list, so the read-back \
-             of an altered one was not checked here"
-        );
-        return;
+    match tampered.lock().expect("what the fault did").take() {
+        Some(Ok(())) => {}
+        Some(Err(reason)) => panic!(
+            "this host would not put an access-control list on the staged copy, so this check \
+             cannot run here: {reason}"
+        ),
+        None => panic!("the apply never reached the moment before it publishes the staged copy"),
     }
     assert_ne!(
         result.outcome,
@@ -1790,24 +1838,30 @@ fn an_apply_finds_the_data_of_a_repository_inside_its_own_data() {
     );
 }
 
-/// Returns a group this host belongs to that is not the one the named file already has.
+/// Returns a group this host belongs to that is not the one the named file already has, or why
+/// there is none.
 ///
 /// A host that belongs to one group only cannot be asked to move a file between two, and the case
-/// that needs one says it did not run rather than passing without having checked anything.
+/// that needs one fails and says so rather than passing without having checked anything.
 #[cfg(unix)]
-fn another_group_of_this_host(path: &Path) -> Option<u32> {
+fn another_group_of_this_host(path: &Path) -> Result<u32, String> {
     use std::os::unix::fs::MetadataExt as _;
 
-    let own = std::fs::metadata(path).ok()?.gid();
-    let listed = std::process::Command::new("id").arg("-G").output().ok()?;
+    let own = std::fs::metadata(path)
+        .map_err(|error| format!("{} could not be described: {error}", path.display()))?
+        .gid();
+    let listed = std::process::Command::new("id")
+        .arg("-G")
+        .output()
+        .map_err(|error| format!("`id -G` could not be run: {error}"))?;
     if !listed.status.success() {
-        return None;
+        return Err(format!("`id -G` answered {}", listed.status));
     }
-    String::from_utf8(listed.stdout)
-        .ok()?
+    String::from_utf8_lossy(&listed.stdout)
         .split_whitespace()
         .filter_map(|group| group.parse::<u32>().ok())
         .find(|group| *group != own)
+        .ok_or_else(|| format!("this account belongs to group {own} and no other"))
 }
 
 /// KR-REQ-14.29: a direct apply carries the group the destination belongs to.
@@ -1832,20 +1886,15 @@ fn a_direct_apply_carries_the_group_the_destination_belongs_to() {
 
     let destination = ordinary_repository(fixture.work(), "group-destination");
     let readme_path = destination.join("README.md");
-    let Some(group) = another_group_of_this_host(&readme_path) else {
-        println!(
-            "not exercised: this host belongs to one group only, so an apply across two was not \
-             checked here"
-        );
-        return;
-    };
-    if std::os::unix::fs::chown(&readme_path, None, Some(group)).is_err() {
-        println!(
-            "not exercised: this host may not move a file between its groups, so an apply across \
-             two was not checked here"
-        );
-        return;
-    }
+    let group = another_group_of_this_host(&readme_path).unwrap_or_else(|reason| {
+        panic!("an apply across two groups needs two, so this check cannot run here: {reason}")
+    });
+    std::os::unix::fs::chown(&readme_path, None, Some(group)).unwrap_or_else(|error| {
+        panic!(
+            "this host may not move a file into its group {group}, so this check cannot run \
+             here: {error}"
+        )
+    });
 
     let workspace = fixture.workspace("group-destination");
     let affected = expectations(&destination, &["README.md"]);
@@ -1880,28 +1929,25 @@ fn a_direct_apply_carries_the_group_the_destination_belongs_to() {
 
 /// Applies one path of a source tree over a destination tree and returns what the apply reported.
 ///
-/// Returns nothing where this host does not run a repository tool at all, which is the case on
-/// Windows today: its application container cannot keep a repository from being executed from, so
-/// the boundary refuses every invocation rather than claiming a guarantee it does not hold. The
-/// cases that call this say so rather than passing without having checked anything.
+/// It fails where this host does not run a repository tool at all, which is the case on Windows
+/// today: its application container cannot keep a repository from being executed from, so the
+/// boundary refuses every invocation rather than claiming a guarantee it does not hold. The cases
+/// that call this are left out of an ordinary run for that reason, rather than passing without
+/// having checked anything.
 #[cfg(windows)]
 fn apply_readme(
     fixture: &Fixture,
     source: &Path,
     destination_name: &str,
-) -> Option<kr_protocol::changeset::DiffApplyResult> {
+) -> kr_protocol::changeset::DiffApplyResult {
     let source_name = source
         .file_name()
         .expect("the source has a name")
         .to_str()
         .expect("its name is text");
-    let source_project = match fixture.try_adopt(source_name) {
-        Ok(project) => project,
-        Err(refusal) => {
-            println!("not exercised: {refusal}");
-            return None;
-        }
-    };
+    let source_project = fixture
+        .try_adopt(source_name)
+        .unwrap_or_else(|refusal| no_repository_tool_here(&refusal));
     let source_workspace = fixture.shared_workspace(source_project, source_name);
     let record = fixture.capture(source_workspace, &include_everything());
     let destination = fixture.work().join(destination_name);
@@ -1918,7 +1964,13 @@ fn apply_readme(
         &affected,
         &limitations,
     );
-    Some(apply::apply(fixture.service(), &order).expect("the apply runs"))
+    apply::apply(fixture.service(), &order).expect("the apply runs")
+}
+
+/// Ends a case that needs a checkout on a host that runs no repository tool, as a failure.
+#[cfg(windows)]
+fn no_repository_tool_here(refusal: &str) -> ! {
+    panic!("this host runs no repository tool, so this check cannot run here: {refusal}")
 }
 
 /// KR-REQ-14.29: a destination whose whole list comes from the directory above it is published
@@ -1929,11 +1981,11 @@ fn apply_readme(
 /// through it. Nothing has to be written, and the read-back has to agree.
 #[cfg(windows)]
 #[test]
+#[ignore = "needs a repository tool, which the repository boundary on Windows refuses to run, so no host runs it yet; run it with --ignored on a Windows host whose boundary runs one"]
 fn a_windows_apply_leaves_an_inherited_list_exactly_as_it_was() {
     let fixture = Fixture::create();
     if let Some(refusal) = fixture.repository_tool_refusal() {
-        println!("not exercised: {refusal}");
-        return;
+        no_repository_tool_here(&refusal);
     }
     let source = ordinary_repository(fixture.work(), "inherit-source");
     write_bytes(&source, "README.md", b"content under an inherited list\n");
@@ -1976,9 +2028,7 @@ fn a_windows_apply_leaves_an_inherited_list_exactly_as_it_was() {
         "what it has comes from the directory above it"
     );
 
-    let Some(result) = apply_readme(&fixture, &source, "inherit-destination") else {
-        return;
-    };
+    let result = apply_readme(&fixture, &source, "inherit-destination");
     assert_eq!(
         result.outcome,
         Nullable(Some(ApplyOutcomeClass::Applied)),
@@ -2011,11 +2061,11 @@ fn a_windows_apply_leaves_an_inherited_list_exactly_as_it_was() {
 /// destination stays protected rather than acquiring the directory's inheritable entries.
 #[cfg(windows)]
 #[test]
+#[ignore = "needs a repository tool, which the repository boundary on Windows refuses to run, so no host runs it yet; run it with --ignored on a Windows host whose boundary runs one"]
 fn a_windows_apply_publishes_the_destination_s_own_list_and_not_the_directory_s() {
     let fixture = Fixture::create();
     if let Some(refusal) = fixture.repository_tool_refusal() {
-        println!("not exercised: {refusal}");
-        return;
+        no_repository_tool_here(&refusal);
     }
     let source = ordinary_repository(fixture.work(), "own-list-source");
     write_bytes(&source, "README.md", b"content under its own list\n");
@@ -2054,9 +2104,7 @@ fn a_windows_apply_publishes_the_destination_s_own_list_and_not_the_directory_s(
         "a protected list takes nothing from the directory above it"
     );
 
-    let Some(result) = apply_readme(&fixture, &source, "own-list-destination") else {
-        return;
-    };
+    let result = apply_readme(&fixture, &source, "own-list-destination");
     assert_eq!(
         result.outcome,
         Nullable(Some(ApplyOutcomeClass::Applied)),
@@ -2090,11 +2138,11 @@ fn a_windows_apply_publishes_the_destination_s_own_list_and_not_the_directory_s(
 /// the destination keeps the bytes it had.
 #[cfg(windows)]
 #[test]
+#[ignore = "needs a repository tool, which the repository boundary on Windows refuses to run, so no host runs it yet; run it with --ignored on a Windows host whose boundary runs one"]
 fn an_apply_to_a_read_only_windows_destination_leaves_it_exactly_as_it_was() {
     let fixture = Fixture::create();
     if let Some(refusal) = fixture.repository_tool_refusal() {
-        println!("not exercised: {refusal}");
-        return;
+        no_repository_tool_here(&refusal);
     }
     let source = ordinary_repository(fixture.work(), "read-only-source");
     write_bytes(&source, "README.md", b"content that is not published\n");
@@ -2108,9 +2156,7 @@ fn an_apply_to_a_read_only_windows_destination_leaves_it_exactly_as_it_was() {
     permissions.set_readonly(true);
     std::fs::set_permissions(&readme, permissions).expect("the destination is made read-only");
 
-    let Some(result) = apply_readme(&fixture, &source, "read-only-destination") else {
-        return;
-    };
+    let result = apply_readme(&fixture, &source, "read-only-destination");
     assert_ne!(
         result.outcome,
         Nullable(Some(ApplyOutcomeClass::Applied)),

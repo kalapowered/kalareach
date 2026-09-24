@@ -501,15 +501,13 @@ fn a_submodule_is_named_rather_than_entered() {
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .output()
         .expect("installed Git runs");
-    if !added.status.success() {
-        // A Git that refuses a local submodule leaves nothing to test here, and saying so is
-        // better than asserting something the fixture did not build.
-        eprintln!(
-            "this Git would not add a local submodule, so the case is not exercised: {}",
-            String::from_utf8_lossy(&added.stderr)
-        );
-        return;
-    }
+    // A Git that refuses a local submodule leaves nothing to test here, and a case that returned
+    // would be counted as one that passed.
+    assert!(
+        added.status.success(),
+        "this Git would not add a local submodule, so this check cannot run here: {}",
+        String::from_utf8_lossy(&added.stderr)
+    );
     git_raw(&outer, ["commit", "-m", "the submodule"]);
     let workspace = fixture.workspace("outer");
     let record = fixture.capture(workspace, &include_everything());
@@ -1617,13 +1615,11 @@ fn a_linked_worktree_holds_neither_of_its_repository_s_directories() {
         .env("HOME", fixture.work())
         .output()
         .expect("git runs");
-    if !added.status.success() {
-        eprintln!(
-            "this Git would not add a linked worktree, so the case is not exercised: {}",
-            String::from_utf8_lossy(&added.stderr)
-        );
-        return;
-    }
+    assert!(
+        added.status.success(),
+        "this Git would not add a linked worktree, so this check cannot run here: {}",
+        String::from_utf8_lossy(&added.stderr)
+    );
     let workspace = fixture.workspace("linked-tree");
     let record = fixture
         .capture_with(
@@ -2808,7 +2804,16 @@ fn a_repository_whose_own_data_names_itself_is_looked_through_once() {
 /// keeps the two apart a directory called `.GIT` is an ordinary directory nothing has accounted
 /// for — and a repository can sit inside it, keeping its own data at an ordinary path of this
 /// tree.
+///
+/// It needs a filesystem that keeps the two names apart. The ones macOS and Windows give a
+/// temporary directory by default fold case, so there it is left out of an ordinary run, and a
+/// Linux run, such as the workspace test in core-ci's `rust` job, runs it. Where the filesystem
+/// folds case it fails and says so.
 #[test]
+#[cfg_attr(
+    any(target_os = "macos", windows),
+    ignore = "needs a filesystem that keeps `.git` and `.GIT` apart, which a default macOS or Windows volume does not; it runs on Linux, where the filesystem does"
+)]
 fn a_directory_whose_name_only_looks_administrative_is_still_looked_through() {
     let fixture = Fixture::create();
     let path = ordinary_repository(fixture.work(), "case-kept-tree");
@@ -2818,9 +2823,11 @@ fn a_directory_whose_name_only_looks_administrative_is_still_looked_through() {
     // A second name beside the repository's own data. Where the filesystem folds case this is
     // that directory and the creation fails, and there is nothing here to stage.
     let upper = nested.join(".GIT");
-    if std::fs::create_dir(&upper).is_err() {
-        println!("not exercised: this filesystem does not keep `.git` and `.GIT` apart");
-        return;
+    if let Err(error) = std::fs::create_dir(&upper) {
+        panic!(
+            "this filesystem does not keep `.git` and `.GIT` apart, so this check cannot run here: \
+             {error}"
+        );
     }
     let child = upper.join("child");
     std::fs::create_dir_all(&child).expect("a repository inside it");
@@ -2995,7 +3002,15 @@ fn two_views_of_one_target() {
 /// that folds case, and it names where another repository keeps its data — a directory of this
 /// tree. So the scan asks the directory whether it holds one rather than comparing the name it
 /// was listed under.
+///
+/// It needs a filesystem that folds case, which is what macOS gives a temporary directory by
+/// default and Linux does not, so a Linux run leaves it out and the macOS workspace run runs it.
+/// Where the filesystem keeps the two names apart it fails and says so.
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "needs a filesystem that folds case, which a Linux filesystem does not; it runs on macOS, whose default volume does"
+)]
 fn a_reference_file_under_a_folded_name_is_still_read() {
     let fixture = Fixture::create();
     let path = ordinary_repository(fixture.work(), "folded-name-tree");
@@ -3003,13 +3018,11 @@ fn a_reference_file_under_a_folded_name_is_still_read() {
     std::fs::create_dir_all(&inside).expect("a tree inside the data");
     std::fs::write(inside.join(".GIT"), b"gitdir: ../../vendor/repo-data\n")
         .expect("the reference under the other spelling");
-    if std::fs::create_dir(inside.join(".git")).is_ok() {
-        println!(
-            "not exercised: this filesystem keeps `.git` and `.GIT` apart, so this file is \
-                  not the entry Git reads"
-        );
-        return;
-    }
+    assert!(
+        std::fs::create_dir(inside.join(".git")).is_err(),
+        "this filesystem keeps `.git` and `.GIT` apart, so the file is not the entry Git reads and \
+         this check cannot run here"
+    );
     write(&path, "vendor/repo-data/HEAD", "ref: refs/heads/main\n");
     write(
         &path,
