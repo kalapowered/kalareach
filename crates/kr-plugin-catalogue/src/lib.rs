@@ -104,6 +104,9 @@ use crate::db::{Changes, Db, Records};
 use crate::store::StoreLock;
 use crate::trust::{PACKAGE_PREFIX, TargetRecord};
 
+/// How many times a read that met a sync is made before its failure is the answer.
+const READ_ATTEMPTS: u32 = 4;
+
 /// Why a payload is being fetched.
 ///
 /// Section 11 names the three reasons that fetch a payload by content hash. They are an
@@ -479,15 +482,46 @@ impl Catalogue {
     /// Returns [`CatalogueError::StorageUnavailable`] when a record or the index cannot be read,
     /// and [`CatalogueError::Integrity`] when the index is not the one its generation names.
     pub fn current_index(&self, id: &RepositoryId) -> CatalogueResult<Option<CatalogueIndex>> {
-        let Some(enrolled) = self.db.read(|records| records.enrolment(id))? else {
-            return Ok(None);
-        };
-        let Some(active) = enrolled.active else {
-            return Ok(None);
-        };
-        Store::at(&self.root, &enrolled.key)
-            .index(&active)
-            .map(Some)
+        self.read_kept(|records| {
+            let Some(enrolled) = records.enrolment(id)? else {
+                return Ok(None);
+            };
+            let Some(active) = enrolled.active else {
+                return Ok(None);
+            };
+            Store::at(&self.root, &enrolled.key)
+                .index(&active)
+                .map(Some)
+        })
+    }
+
+    /// Reads what depends on the index documents repositories keep, and reads again where the read
+    /// failed while a repository stopped keeping a generation.
+    ///
+    /// A sync removes an index document only after the commit that stops naming it, and a read
+    /// takes its records from one moment: records read just before that commit can name a document
+    /// the sync then removes before the read opens it. The records read again name what is kept
+    /// now. A read that fails while nothing it could have named was removed fails as it is, and one
+    /// that keeps meeting syncs gives up after a few attempts rather than chasing them.
+    fn read_kept<T>(
+        &self,
+        read: impl Fn(&Records<'_>) -> CatalogueResult<T>,
+    ) -> CatalogueResult<T> {
+        let mut attempts = 0;
+        loop {
+            let before = self.db.read(|records| records.kept_everywhere())?;
+            match self.db.read(&read) {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    attempts += 1;
+                    if attempts >= READ_ATTEMPTS
+                        || self.db.read(|records| records.kept_everywhere())? == before
+                    {
+                        return Err(error);
+                    }
+                }
+            }
+        }
     }
 
     /// Searches one repository's active index, offline.
@@ -541,7 +575,7 @@ impl Catalogue {
         &self,
         environment_id: EnvironmentId,
     ) -> CatalogueResult<Vec<InstallationView>> {
-        self.db.read(|records| {
+        self.read_kept(|records| {
             records
                 .installations()?
                 .into_iter()
@@ -563,7 +597,7 @@ impl Catalogue {
         environment_id: EnvironmentId,
         plugin_id: &PluginId,
     ) -> CatalogueResult<InstallationView> {
-        self.db.read(|records| {
+        self.read_kept(|records| {
             let installation = records
                 .installation(environment_id, plugin_id)?
                 .ok_or_else(|| not_installed(plugin_id))?;
@@ -1029,6 +1063,30 @@ impl Catalogue {
         };
         authority.check()?;
 
+        // The index is kept in its canonical rendering, named by that rendering's digest, which is
+        // also what one generation number is compared by.
+        let rendered = verified
+            .index
+            .canonical_json()
+            .map_err(|source| CatalogueError::Integrity {
+                detail: format!("the index could not be rendered: {source}"),
+            })?
+            .into_bytes();
+        let index_digest = PayloadDigest::of(&rendered);
+        let arriving = Retained {
+            generation: verified.generation.get(),
+            index_bytes: rendered.len() as u64,
+        };
+
+        // What the repository keeps is decided before anything this sync verified is kept. The
+        // checkpoint it would publish has to fit beside the new generation, which is what stays if
+        // the sync succeeds, and beside the generation in use, which is what stays if it goes no
+        // further; generations it is not on make room for the second first. A sync that cannot
+        // fit either way is refused here, with the accepted checkpoint and the generation in use as
+        // they were.
+        let checkpoint = working.bytes()?;
+        self.retain_before_publication(&store, &enrolled.key, id, checkpoint, arriving, authority)?;
+
         // The metadata verified, so it becomes the accepted checkpoint now, in a commit of its
         // own: trust progress is kept whatever the generation checks, the mirror or the index
         // activation that follow decide, and the reset the checkpoint carries is no longer owed.
@@ -1051,36 +1109,11 @@ impl Catalogue {
             })?;
         }
 
-        // The index is kept in its canonical rendering, named by that rendering's digest, which is
-        // also what one generation number is compared by.
-        let rendered = verified
-            .index
-            .canonical_json()
-            .map_err(|source| CatalogueError::Integrity {
-                detail: format!("the index could not be rendered: {source}"),
-            })?
-            .into_bytes();
-        let index_digest = PayloadDigest::of(&rendered);
         trust::check_generation(
             verified.generation,
             index_digest,
             accepted_of(enrolled.active),
             enrolled.enrolment.pinned_generation,
-        )?;
-        // What the repository keeps once this generation is the one it is on is checked before
-        // anything is fetched or written for it. A generation that cannot be kept beside the trust
-        // checkpoint is refused here, and the one in use stays as it was.
-        let arriving = Retained {
-            generation: verified.generation.get(),
-            index_bytes: rendered.len() as u64,
-        };
-        let kept = self
-            .db
-            .read(|records| records.kept_generations(&enrolled.key))?;
-        BudgetLedger::new(enrolled.enrolment.budgets).plan_retention(
-            store.checkpoint_bytes()?,
-            &retained(&kept),
-            arriving,
         )?;
 
         // A full mirror runs before the index is activated. Section 11 asks for the whole
@@ -1150,10 +1183,10 @@ impl Catalogue {
             let forgotten = BudgetLedger::new(current.enrolment.budgets).plan_retention(
                 checkpoint,
                 &retained(&changes.kept_generations(&key)?),
-                Retained {
+                Some(Retained {
                     generation: active.generation,
                     index_bytes: active.index_bytes,
-                },
+                }),
             )?;
             for generation in forgotten {
                 changes.forget_generation(&key, generation)?;
@@ -1172,6 +1205,67 @@ impl Catalogue {
         })?;
         self.remove_unnamed_indexes(&store, &enrolled.key, id, authority);
         Ok(synced)
+    }
+
+    /// Checks what a repository keeps before a sync publishes the checkpoint it verified, and makes
+    /// room for it beside the generation in use.
+    ///
+    /// Both outcomes are decided from the records as they are under the store's lock: the
+    /// checkpoint beside the new generation, and the checkpoint beside the generation in use, which
+    /// is what stays if the sync goes no further. The generations the second needs gone are
+    /// removed in a commit of their own, decided again inside it, and their index documents after
+    /// it. Nothing is written when nothing has to go.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::ResourceLimit`] naming the retained metadata when either outcome
+    /// is past the budget, and [`CatalogueError::NotFound`] when the repository was removed.
+    fn retain_before_publication(
+        &mut self,
+        store: &Store,
+        key: &EnrolmentKey,
+        id: &RepositoryId,
+        checkpoint: u64,
+        arriving: Retained,
+        authority: &dyn Authority,
+    ) -> CatalogueResult<()> {
+        let removed = || CatalogueError::NotFound {
+            detail: format!("{id} was removed while it synchronised"),
+        };
+        let in_use = |current: &Enrolled| {
+            current.active.map(|active| Retained {
+                generation: active.generation,
+                index_bytes: active.index_bytes,
+            })
+        };
+        let forget = self.db.read(|records| {
+            let current = records.enrolment_by_key(key)?.ok_or_else(removed)?;
+            let kept = retained(&records.kept_generations(key)?);
+            let ledger = BudgetLedger::new(current.enrolment.budgets);
+            ledger.plan_retention(checkpoint, &kept, Some(arriving))?;
+            Ok(ledger.plan_retention(checkpoint, &kept, in_use(&current))?)
+        })?;
+        if forget.is_empty() {
+            return Ok(());
+        }
+        let pending = self.db.begin()?;
+        committed(authority, &Effect::Records, |permit| {
+            pending.run(permit, |changes| {
+                let current = changes.enrolment_by_key(key)?.ok_or_else(removed)?;
+                let kept = retained(&changes.kept_generations(key)?);
+                let forget = BudgetLedger::new(current.enrolment.budgets).plan_retention(
+                    checkpoint,
+                    &kept,
+                    in_use(&current),
+                )?;
+                for generation in forget {
+                    changes.forget_generation(key, generation)?;
+                }
+                Ok(())
+            })
+        })?;
+        self.remove_unnamed_indexes(store, key, id, authority);
+        Ok(())
     }
 
     /// Removes every index document no generation this repository keeps names.
@@ -1509,6 +1603,7 @@ impl Catalogue {
                 store,
                 &format!("{prefix}/{MANIFEST_FILE}"),
                 entry.manifest_digest,
+                entry.manifest_size_bytes.get(),
                 &package,
                 reason,
                 authority,
@@ -1530,6 +1625,7 @@ impl Catalogue {
                     store,
                     &target,
                     payload.digest,
+                    payload.size_bytes.get(),
                     &package,
                     reason,
                     authority,
@@ -1578,15 +1674,17 @@ impl Catalogue {
         store: &Store,
         target: &str,
         digest: PayloadDigest,
+        length: u64,
         package: &BTreeSet<PayloadDigest>,
         reason: FetchReason,
         authority: &dyn Authority,
     ) -> CatalogueResult<Vec<u8>> {
-        // A cached object that is not cached, or whose bytes no longer hash to its name, is
-        // fetched again. A store that cannot be read is neither: it is a failure of this host's
-        // own disk, and reporting it as an absent payload would send a person looking at their
-        // repository instead of their filesystem.
-        match store.read_payload(digest) {
+        // A cached object that is not cached, or is not the length declared for it, or whose bytes
+        // no longer hash to its name, is fetched again, bounded by the declared length. A store
+        // that cannot be read is neither: it is a failure of this host's own disk, and reporting
+        // it as an absent payload would send a person looking at their repository instead of
+        // their filesystem.
+        match store.read_payload(digest, length) {
             Ok(bytes) => return Ok(bytes),
             Err(CatalogueError::UnavailableOffline { .. } | CatalogueError::Integrity { .. }) => {}
             Err(other) => return Err(other),
@@ -2504,17 +2602,26 @@ mod tests {
             "a later root that changes nothing does not clear it"
         );
 
+        // The copy holds what the client reads back: the two floors and the time it last saw. The
+        // documents it writes afresh on every load, the top-level targets among them, are not
+        // carried into it.
         let floors = |working: &crate::store::WorkingDatastore| {
-            ["timestamp.json", "snapshot.json", "targets.json"]
-                .map(|role| working.path().join(role).is_file())
+            [
+                "timestamp.json",
+                "snapshot.json",
+                "latest_known_time.json",
+                "targets.json",
+            ]
+            .map(|role| working.path().join(role).is_file())
         };
+        assert!(store.datastore().join("targets.json").is_file());
         assert_eq!(
             floors(&store.working_datastore(false).expect("a copy")),
-            [true, true, true]
+            [true, true, true, false]
         );
         assert_eq!(
             floors(&store.working_datastore(true).expect("a copy")),
-            [false, false, true],
+            [false, false, true, false],
             "the reset leaves the timestamp and snapshot floors out of the copy"
         );
 
@@ -2522,6 +2629,155 @@ mod tests {
         assert!(
             !owed(&catalogue),
             "a published checkpoint settles the reset"
+        );
+    }
+
+    /// Arranges for a sync to move `id` on to its next generation just before the next index
+    /// document is opened on this thread, keeping only the new generation: the commit that moves
+    /// the repository and stops naming the old generation, then the old document's removal.
+    fn a_sync_moves_on_before_the_next_index_read(catalogue: &Catalogue, id: &RepositoryId) -> u64 {
+        let enrolled = catalogue.enrolled(id).expect("enrolled");
+        let store = catalogue.store(id).expect("enrolled");
+        let first = enrolled.active.expect("a generation");
+        let mut index = store.index(&first).expect("readable");
+        index.generation = RepositoryGeneration::new(first.generation + 1);
+        let rendered = index
+            .canonical_json()
+            .expect("a renderable index")
+            .into_bytes();
+        let (index_digest, index_bytes) =
+            committed(&Owner::acting(), &Effect::Index(id.clone()), |permit| {
+                store.write_index(permit, &rendered)
+            })
+            .expect("written");
+        let next = ActiveGeneration {
+            generation: first.generation + 1,
+            index_digest,
+            index_bytes,
+            entries: first.entries,
+            versions: first.versions,
+        };
+        let root = catalogue.root().to_path_buf();
+        let key = enrolled.key;
+        crate::store::index_pause::once(move || {
+            let mut db = Db::open(&root).expect("a second connection");
+            let pending = db.begin().expect("the write lock");
+            committed(&Owner::acting(), &Effect::Records, |permit| {
+                pending.run(permit, |changes| {
+                    changes.activate(&key, &next, &[])?;
+                    changes.forget_generation(&key, first.generation)
+                })
+            })
+            .expect("moved on");
+            std::fs::remove_file(Store::at(&root, &key).index_path(first.index_digest))
+                .expect("the old document removed");
+        });
+        next.generation
+    }
+
+    /// A reader whose records were read just before a sync stopped keeping the generation they name,
+    /// and removed its index document, reads again and answers from what is kept now.
+    #[tokio::test]
+    async fn a_reader_that_meets_a_sync_reads_what_is_kept_now() {
+        let (_home, mut catalogue, id) = development();
+        catalogue.sync(&id).await.expect("a generation");
+        let environment = EnvironmentId::new(kr_protocol::scalars::Uuid::NIL);
+        let entry = catalogue
+            .index(&id)
+            .expect("an index")
+            .entries
+            .first()
+            .expect("a package")
+            .clone();
+        catalogue
+            .install(
+                &id,
+                environment,
+                &entry.plugin_id,
+                &entry.version,
+                entry.manifest_digest,
+                InstallationGrant::none(),
+            )
+            .await
+            .expect("installed");
+
+        let next = a_sync_moves_on_before_the_next_index_read(&catalogue, &id);
+        let index = catalogue
+            .current_index(&id)
+            .expect("read again")
+            .expect("an index");
+        assert_eq!(index.generation.get(), next);
+
+        // The views of what is installed read the current index for revocations the same way.
+        let next = a_sync_moves_on_before_the_next_index_read(&catalogue, &id);
+        let views = catalogue
+            .installation_views(environment)
+            .expect("read again");
+        assert_eq!(views.len(), 1);
+        a_sync_moves_on_before_the_next_index_read(&catalogue, &id);
+        catalogue
+            .installation_view(environment, &entry.plugin_id)
+            .expect("read again");
+        assert_eq!(
+            catalogue
+                .active(&id)
+                .expect("enrolled")
+                .map(|active| active.generation),
+            Some(next + 1)
+        );
+    }
+
+    /// An enrolment whose budgets lack an allowance this build enforces is a record it cannot read,
+    /// and every answer about that repository says so and names it; there is no other shape of
+    /// the record to read.
+    #[tokio::test]
+    async fn an_enrolment_without_every_budget_is_a_record_this_build_cannot_read() {
+        let (_home, catalogue, id) = development();
+        let connection =
+            rusqlite::Connection::open(catalogue.root().join(crate::db::DATABASE_FILE))
+                .expect("the catalogue's database");
+        let budgets: String = connection
+            .query_row("SELECT budgets FROM enrolments", [], |row| row.get(0))
+            .expect("one enrolment");
+        let mut shape: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&budgets).expect("an object");
+        shape.remove("retained_generations");
+        shape.remove("retained_metadata_bytes");
+        connection
+            .execute(
+                "UPDATE enrolments SET budgets = ?1",
+                [serde_json::Value::Object(shape).to_string()],
+            )
+            .expect("rewritten");
+        drop(connection);
+        let refusal = catalogue
+            .repository(&id)
+            .expect_err("a record this build cannot read");
+        assert!(
+            matches!(&refusal, CatalogueError::StorageUnavailable { detail }
+                if detail.contains("cannot read") && detail.contains("development")
+                    && detail.contains("retained_generations")),
+            "{refusal:?}"
+        );
+    }
+
+    /// A read that fails while no repository stopped keeping anything fails as it is.
+    #[tokio::test]
+    async fn a_reader_whose_index_is_lost_without_a_sync_is_told_so() {
+        let (_home, mut catalogue, id) = development();
+        catalogue.sync(&id).await.expect("a generation");
+        let active = catalogue
+            .active(&id)
+            .expect("enrolled")
+            .expect("a generation");
+        let store = catalogue.store(&id).expect("enrolled");
+        std::fs::remove_file(store.index_path(active.index_digest)).expect("removable");
+        let refusal = catalogue
+            .current_index(&id)
+            .expect_err("the document is gone and nothing moved");
+        assert!(
+            matches!(refusal, CatalogueError::StorageUnavailable { .. }),
+            "{refusal:?}"
         );
     }
 

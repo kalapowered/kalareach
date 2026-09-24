@@ -79,14 +79,18 @@ restored by a repository that simply withheld the newer root.
 The client's rollback protection is the metadata it last verified: each role's new version is
 compared with the one it holds. That store is this host's accepted trust checkpoint, and the client
 never writes into it. Every verification works in a private copy of it, and the copy becomes the
-accepted checkpoint, document by document with each document renamed into place whole, only once
-the metadata has verified and under the same admission as any other change. A verification that
-fails, is interrupted or is refused leaves the checkpoint exactly as it was, and no interruption
-leaves a half-written document the client would skip. Once the metadata has verified, the
-checkpoint is kept whatever happens to the rest of the sync. The latest time the client saw while it
-fetched a full mirror is kept too, in a commit of its own once the mirror has finished or stopped on
-an error, which is what lets it refuse a clock set back behind that time; a sync cancelled during
-the mirror, or refused at that commit, keeps the time the checkpoint already had.
+accepted checkpoint, document by document with each document renamed into place whole, only once the
+metadata has verified and under the same admission as any other change. A verification that fails,
+is interrupted or is refused leaves the checkpoint exactly as it was, and no interruption leaves a
+half-written document the client would skip. The copy starts from the documents the client reads
+back, the timestamp, the snapshot and the latest time it saw, and the client writes the rest afresh,
+so a checkpoint holds one generation's documents and never the delegated documents of the
+generations before it. Once the metadata has verified, the checkpoint is kept whatever happens to
+the rest of the sync, provided it fits the retained metadata budget beside the generation in use and
+beside the new one; one that does not is refused before it is kept. The latest time the client saw
+while it fetched a full mirror is kept too, in a commit of its own once the mirror has finished or
+stopped on an error, which is what lets it refuse a clock set back behind that time; a sync
+cancelled during the mirror, or refused at that commit, keeps the time the checkpoint already had.
 
 Where a new root changes the keys that sign timestamps or snapshots, those roles may start again
 from lower versions, and the client drops their old versions when it sees the change. A sync that
@@ -175,24 +179,34 @@ Everything a repository leaves on disk is inside one of them:
 | The trust checkpoint and every kept generation's index | Retained metadata: 128 MiB |
 | Cached payloads, the packages extracted from them, and a package being staged | Cached payloads: 1 GiB |
 
-A repository keeps the generation it is on and the one before it, so a reader that looked it up a
-moment before a sync moved it on still finds the index it was told about. Accepting a generation
-past the retained-generation budget removes the oldest it is no longer on, index and all, in the
-same commit that moves it on; so does a kept index that would take the kept metadata past its
-budget. A generation that does not fit beside the trust checkpoint on its own is refused before
-anything is fetched or written for it.
+A repository keeps the generation it is on and the one before it. Accepting a generation past the
+retained-generation budget removes the oldest it is no longer on, index and all, in the same commit
+that moves it on; so does a kept index that would take the kept metadata past its budget. The
+record of a generation goes before its index document does, and a reader whose records named a
+document a sync then removed reads its records again and answers from what is kept now.
+
+What stays is decided before a sync keeps anything of what it verified. Its checkpoint has to fit
+beside the new generation, which is what stays if the sync succeeds, and beside the generation in
+use, which is what stays if it goes no further; the generations the repository is not on make room
+for that first. A sync that fits neither way is refused before its checkpoint is kept, and the
+generation in use stays as it was. The time the client last saw is counted at the most its document
+can hold, so what the budget counts does not move with the clock.
 
 An installed package costs its extracted copy as well as its cached payloads. A package is staged
 whole before it is renamed into place, so room for the copy it stages and for every payload it
 still has to fetch is made before anything is fetched: the staging is counted at its largest rather
-than discovered part way. Staging holds only the work of the operation holding the repository's
-lock, and whatever an operation that stopped left there is removed when the lock is next taken.
+than discovered part way. A cached payload is used only at the length declared for it; a cached
+object of any other length is fetched again under the declared length rather than staged on the
+declaration's word. Staging holds only the work of the operation holding the repository's lock, and
+whatever an operation that stopped left there is removed when the lock is next taken; what cannot
+be removed stops the operation, because the room it takes would be outside every budget.
 
 Reclaiming space never takes a payload an installed package, a live binding or a pinned generation
 still needs. That is every file such a package consists of, not only the manifest its hash names: a
 component nobody can read is a binding that does not work, and an installed package with its files
 evicted is one that cannot run. An extracted package nothing holds goes before any cached payload:
-it is a second copy of payloads, and having it again costs only an extraction. What a live package
+it is a second copy of payloads, and having it again costs only an extraction. It leaves in one
+rename, so it is removed whole or not at all. What a live package
 consists of is read from the installation or the binding that holds it, or from its own manifest
 where it is activated here; one whose files this host cannot name stops the reclaim rather than
 being guessed at. When the only thing left to evict is one of those, the sync reports the limit

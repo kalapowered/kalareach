@@ -57,6 +57,40 @@ const REPOSITORIES: &str = "repositories";
 /// The document in which the client keeps the latest time it has known.
 const TIME_CHECKPOINT: &str = "latest_known_time.json";
 
+/// The documents of the accepted trust checkpoint the client reads back: the timestamp and the
+/// snapshot a new one is compared with, and the latest time it has known.
+///
+/// Everything else it writes afresh on every load: the root it ends on, the top-level targets and
+/// each delegated role's document, which under consistent snapshots it names by version. A working
+/// copy holds only these, so a verified load publishes exactly one generation's documents, and one
+/// generation's delegated documents do not pile up behind the next.
+const CLIENT_READS: [&str; 3] = ["timestamp.json", "snapshot.json", TIME_CHECKPOINT];
+
+/// The most the client's time document can hold: one quoted RFC 3339 instant with nanoseconds, and
+/// room to spare.
+///
+/// The client writes the time it last saw on every load, and its length moves with the clock's
+/// fraction of a second. A checkpoint is counted with this document at this size, so what the
+/// retained metadata budget counts is never less than what is held and does not move from one load
+/// to the next.
+const TIME_CHECKPOINT_BOUND: u64 = 64;
+
+/// Returns what a trust checkpoint in `directory` counts against the retained metadata budget:
+/// every document it holds, the time document at [`TIME_CHECKPOINT_BOUND`] whether or not it is
+/// there yet.
+fn checkpoint_size(directory: &Path) -> CatalogueResult<u64> {
+    let time = directory.join(TIME_CHECKPOINT);
+    let held_time = match std::fs::symlink_metadata(&time) {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
+        Ok(_) => 0,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(source) => return Err(CatalogueError::storage(&time, &source)),
+    };
+    Ok(bytes_under(directory)?
+        .saturating_sub(held_time)
+        .saturating_add(TIME_CHECKPOINT_BOUND))
+}
+
 /// One repository's directory.
 #[derive(Clone, Debug)]
 pub struct Store {
@@ -97,6 +131,16 @@ impl WorkingDatastore {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Returns what the copy counts against the retained metadata budget, which is what
+    /// publishing it would make the accepted checkpoint count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when the copy cannot be read.
+    pub fn bytes(&self) -> CatalogueResult<u64> {
+        checkpoint_size(&self.path)
     }
 }
 
@@ -231,30 +275,53 @@ impl Store {
     ///
     /// Staging holds only the work of whoever holds this lock, so whatever is there once it is
     /// taken was left by an operation that stopped before it could remove it. Nothing names it and
-    /// no budget counts it, so it is removed; a removal that fails leaves it for the next holder.
+    /// no budget counts it, so it is removed. Something that cannot be removed stops the operation
+    /// that took the lock: the room it takes would be outside every budget, and the budgets could
+    /// not say what is free.
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogueError::StorageUnavailable`] when the lock cannot be acquired.
+    /// Returns [`CatalogueError::StorageUnavailable`] when the lock cannot be acquired, or staging
+    /// cannot be cleared.
     pub fn lock(&self) -> CatalogueResult<StoreLock> {
         let lock = self.acquire()?;
-        self.clear_staging();
+        self.clear_staging()?;
         Ok(lock)
     }
 
-    fn clear_staging(&self) {
+    fn clear_staging(&self) -> CatalogueResult<()> {
         let staging = self.root.join("staging");
-        let Ok(entries) = std::fs::read_dir(&staging) else {
-            return;
+        let entries = match std::fs::read_dir(&staging) {
+            Ok(entries) => entries,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(CatalogueError::storage(&staging, &source)),
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry.map_err(|source| CatalogueError::storage(&staging, &source))?;
             let path = entry.path();
-            let _ = match entry.file_type() {
-                Ok(kind) if kind.is_dir() => std::fs::remove_dir_all(&path),
-                Ok(_) => std::fs::remove_file(&path),
-                Err(_) => continue,
+            let kind = entry
+                .file_type()
+                .map_err(|source| CatalogueError::storage(&path, &source))?;
+            let removed = if kind.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
             };
+            match removed {
+                Ok(()) => {}
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(CatalogueError::StorageUnavailable {
+                        detail: format!(
+                            "{} was left in staging by an operation that stopped and cannot be \
+                             removed, so the room it takes is not known to be free: {source}",
+                            path.display()
+                        ),
+                    });
+                }
+            }
         }
+        Ok(())
     }
 
     fn acquire(&self) -> CatalogueResult<StoreLock> {
@@ -299,7 +366,8 @@ impl Store {
 
     /// Copies the accepted trust checkpoint into a private working copy for one verification.
     ///
-    /// `reset` drops the timestamp and snapshot documents from the copy. The client drops them
+    /// Only the documents the client reads back are copied ([`CLIENT_READS`]); the rest it writes
+    /// again as it verifies. `reset` drops the timestamp and snapshot documents from the copy. The client drops them
     /// itself when a load moves to a root whose timestamp or snapshot keys differ from the root it
     /// started from; a root advance kept by an earlier load that then failed is the root the next
     /// load starts from, so the next load would not see the change, and the reset is applied here
@@ -328,14 +396,13 @@ impl Store {
         };
         let working = WorkingDatastore { path };
         let accepted = self.datastore();
-        for relative in files_under(&accepted)? {
-            let from = accepted.join(&relative);
-            let to = working.path.join(&relative);
-            if let Some(parent) = to.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|source| CatalogueError::storage(parent, &source))?;
+        for name in CLIENT_READS {
+            let from = accepted.join(name);
+            match std::fs::copy(&from, working.path.join(name)) {
+                Ok(_) => {}
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => return Err(CatalogueError::storage(&from, &source)),
             }
-            std::fs::copy(&from, &to).map_err(|source| CatalogueError::storage(&from, &source))?;
         }
         if reset {
             for role in ["timestamp.json", "snapshot.json"] {
@@ -449,13 +516,15 @@ impl Store {
         flushed_after_publication(&accepted, &accepted)
     }
 
-    /// Returns the bytes this repository's accepted trust checkpoint holds.
+    /// Returns what this repository's accepted trust checkpoint counts against the retained
+    /// metadata budget: every document it holds, with the time the client last saw counted at the
+    /// most that document can hold.
     ///
     /// # Errors
     ///
     /// Returns [`CatalogueError::StorageUnavailable`] when the checkpoint cannot be read.
     pub fn checkpoint_bytes(&self) -> CatalogueResult<u64> {
-        bytes_under(&self.datastore())
+        checkpoint_size(&self.datastore())
     }
 
     /// Returns every index document here, by the digest it is named by, with the bytes it holds.
@@ -732,6 +801,8 @@ impl Store {
     /// Returns [`CatalogueError::StorageUnavailable`] when the document cannot be read, and
     /// [`CatalogueError::Integrity`] when it is not the one the generation was accepted with.
     pub fn index(&self, active: &ActiveGeneration) -> CatalogueResult<CatalogueIndex> {
+        #[cfg(test)]
+        index_pause::run();
         let path = self.index_path(active.index_digest);
         let bytes =
             std::fs::read(&path).map_err(|source| CatalogueError::storage(&path, &source))?;
@@ -805,14 +876,34 @@ impl Store {
         )
     }
 
-    /// Reads one cached payload.
+    /// Reads one cached payload, which has to be the `length` bytes its digest names.
+    ///
+    /// The length is checked before anything is read. A cached object of another length is not
+    /// the payload a declaration of `length` describes, whatever it hashes to, and its bytes are
+    /// not read, or staged, on that declaration's word.
     ///
     /// # Errors
     ///
     /// Returns [`CatalogueError::UnavailableOffline`] when the payload is not cached here, which
-    /// is the answer section 11 asks for rather than a capability that is not really there.
-    pub fn read_payload(&self, digest: PayloadDigest) -> CatalogueResult<Vec<u8>> {
+    /// is the answer section 11 asks for rather than a capability that is not really there, and
+    /// [`CatalogueError::Integrity`] when what is cached is not `length` bytes that hash to
+    /// `digest`.
+    pub fn read_payload(&self, digest: PayloadDigest, length: u64) -> CatalogueResult<Vec<u8>> {
         let path = self.payload_path(digest);
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.len() != length => {
+                return Err(CatalogueError::Integrity {
+                    detail: format!(
+                        "{} is {} bytes and {digest} is declared as {length}",
+                        path.display(),
+                        metadata.len()
+                    ),
+                });
+            }
+            Ok(_) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(CatalogueError::storage(&path, &source)),
+        }
         match std::fs::read(&path) {
             Ok(bytes) if PayloadDigest::of(&bytes) == digest => Ok(bytes),
             Ok(_) => Err(CatalogueError::Integrity {
@@ -978,10 +1069,13 @@ impl Store {
 
     /// Removes the extracted packages and the cached payloads a reclaim plan names.
     ///
-    /// Something somebody else already removed counts as removed. A failure before anything was
-    /// removed leaves the store as it was; one after is [`CatalogueError::PublicationUncertain`],
-    /// because part of the plan has already happened and cannot be reported as nothing. A package
-    /// removed part way is one whose check fails, and the next activation repairs it.
+    /// An extracted package leaves `packages` in one rename, into staging, and is deleted from
+    /// there: a package is therefore either all there or gone, never part of one, and whatever of
+    /// it a deletion leaves in staging is removed when the store's lock is next taken. A cached
+    /// payload is one file, removed in one step. Something somebody else already removed counts as
+    /// removed. A failure before anything was removed leaves the store as it was; one after is
+    /// [`CatalogueError::PublicationUncertain`], because part of the plan has already happened and
+    /// cannot be reported as nothing.
     ///
     /// # Errors
     ///
@@ -989,35 +1083,38 @@ impl Store {
     /// [`CatalogueError::PublicationUncertain`] when a later one does.
     pub(crate) fn remove(&self, _permit: &Permit, plan: &ReclaimPlan) -> CatalogueResult<()> {
         let mut removed = 0usize;
-        let objects = plan
-            .packages
-            .iter()
-            .map(|(digest, _)| (self.package_dir(*digest), true))
-            .chain(
-                plan.payloads
-                    .iter()
-                    .map(|(digest, _)| (self.payload_path(*digest), false)),
-            );
-        for (path, package) in objects {
-            let outcome = if package {
-                std::fs::remove_dir_all(&path)
+        let total = plan.packages.len() + plan.payloads.len();
+        let stopped = |removed: usize, path: &Path, source: &std::io::Error| {
+            if removed == 0 {
+                CatalogueError::storage(path, source)
             } else {
-                std::fs::remove_file(&path)
-            };
-            match outcome {
+                CatalogueError::PublicationUncertain {
+                    detail: format!(
+                        "{removed} of {total} objects were removed to make room and {} could not \
+                         be: {source}",
+                        path.display()
+                    ),
+                }
+            }
+        };
+        for (digest, _) in &plan.packages {
+            let path = self.package_dir(*digest);
+            let aside = self.root.join("staging").join(format!("removed-{digest}"));
+            match std::fs::rename(&path, &aside) {
+                Ok(()) => {
+                    removed += 1;
+                    let _ = std::fs::remove_dir_all(&aside);
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => return Err(stopped(removed, &path, &source)),
+            }
+        }
+        for (digest, _) in &plan.payloads {
+            let path = self.payload_path(*digest);
+            match std::fs::remove_file(&path) {
                 Ok(()) => removed += 1,
                 Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-                Err(source) if removed == 0 => return Err(CatalogueError::storage(&path, &source)),
-                Err(source) => {
-                    return Err(CatalogueError::PublicationUncertain {
-                        detail: format!(
-                            "{removed} of {} objects were removed to make room and {} could not \
-                             be: {source}",
-                            plan.packages.len() + plan.payloads.len(),
-                            path.display()
-                        ),
-                    });
-                }
+                Err(source) => return Err(stopped(removed, &path, &source)),
             }
         }
         Ok(())
@@ -1383,6 +1480,30 @@ fn flush_directory(path: &Path) -> CatalogueResult<()> {
         let _ = path;
     }
     Ok(())
+}
+
+/// What the unit tests run just before an index document is opened, to reach a reader whose records
+/// were read before a sync removed the document they name.
+#[cfg(test)]
+pub(crate) mod index_pause {
+    use std::cell::RefCell;
+
+    type Then = Box<dyn FnOnce()>;
+
+    thread_local! {
+        static BEFORE: RefCell<Option<Then>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `then` once, the next time an index document is about to be opened on this thread.
+    pub(crate) fn once(then: impl FnOnce() + 'static) {
+        BEFORE.with(|before| *before.borrow_mut() = Some(Box::new(then)));
+    }
+
+    pub(crate) fn run() {
+        if let Some(then) = BEFORE.with(|before| before.borrow_mut().take()) {
+            then();
+        }
+    }
 }
 
 /// A directory whose flush the unit tests make fail, to reach what follows a rename that happened.
@@ -2034,13 +2155,20 @@ mod tests {
     fn an_uncached_payload_is_unavailable_offline_and_not_a_pretend_capability() {
         let (_directory, store) = store();
         let digest = PayloadDigest::of(b"component");
-        let refusal = store.read_payload(digest).expect_err("not cached");
+        let refusal = store.read_payload(digest, 9).expect_err("not cached");
         assert_eq!(
             refusal.code(),
             kr_protocol::error::ErrorCode::PackageUnavailableOffline
         );
         owned(|permit| store.cache_payload(permit, digest, b"component")).expect("cacheable");
-        assert_eq!(store.read_payload(digest).expect("cached"), b"component");
+        assert_eq!(store.read_payload(digest, 9).expect("cached"), b"component");
+        // The same bytes asked for at another length are not the payload that length describes.
+        for length in [8, 10] {
+            assert!(matches!(
+                store.read_payload(digest, length),
+                Err(CatalogueError::Integrity { .. })
+            ));
+        }
     }
 
     #[test]
@@ -2196,10 +2324,43 @@ mod tests {
         drop(lock);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn the_checkpoint_counts_every_document_it_holds() {
+    fn staging_that_cannot_be_cleared_stops_the_operation_that_took_the_lock() {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let (_directory, store) = store();
-        assert_eq!(store.checkpoint_bytes().expect("a readable store"), 0);
+        let staged = store
+            .stage_package(PayloadDigest::of(b"left behind"))
+            .expect("staged");
+        let held = staged.path().join("assets");
+        std::mem::forget(staged);
+        std::fs::create_dir_all(&held).expect("a directory");
+        std::fs::write(held.join("icon.bin"), [0u8; 8]).expect("writable");
+        std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o555)).expect("read-only");
+        let refusal = store.lock().expect_err("staging cannot be cleared");
+        std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o755))
+            .expect("writable again");
+        assert!(
+            matches!(&refusal, CatalogueError::StorageUnavailable { detail } if detail.contains("left in staging")),
+            "{refusal:?}"
+        );
+        let _lock = store.lock().expect("staging clears once it can");
+        assert_eq!(
+            std::fs::read_dir(store.root.join("staging"))
+                .expect("readable")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn the_checkpoint_counts_every_document_and_the_time_at_its_most() {
+        let (_directory, store) = store();
+        assert_eq!(
+            store.checkpoint_bytes().expect("a readable store"),
+            TIME_CHECKPOINT_BOUND
+        );
         std::fs::write(store.datastore().join("root.json"), [0u8; 40]).expect("writable");
         std::fs::create_dir_all(store.datastore().join("roles")).expect("a directory");
         std::fs::write(
@@ -2207,7 +2368,21 @@ mod tests {
             [0u8; 2],
         )
         .expect("writable");
-        assert_eq!(store.checkpoint_bytes().expect("a readable store"), 42);
+        assert_eq!(
+            store.checkpoint_bytes().expect("a readable store"),
+            42 + TIME_CHECKPOINT_BOUND
+        );
+        // However long the time the client wrote, it counts the same.
+        for time in [
+            "\"2026-09-24T10:06:12Z\"",
+            "\"2026-09-24T10:06:12.123456789Z\"",
+        ] {
+            std::fs::write(store.datastore().join(TIME_CHECKPOINT), time).expect("writable");
+            assert_eq!(
+                store.checkpoint_bytes().expect("a readable store"),
+                42 + TIME_CHECKPOINT_BOUND
+            );
+        }
     }
 
     #[test]
@@ -2239,6 +2414,55 @@ mod tests {
             matches!(outcome, Err(CatalogueError::StorageUnavailable { .. })),
             "nothing of the plan happened: {outcome:?}"
         );
+    }
+
+    #[test]
+    fn an_extracted_package_is_removed_whole_or_not_at_all() {
+        let (_directory, store) = store();
+        let tree = |name: &[u8]| {
+            let digest = PayloadDigest::of(name);
+            let directory = store.package_dir(digest);
+            std::fs::create_dir_all(directory.join("assets")).expect("a directory");
+            std::fs::write(directory.join("plugin.json"), b"{}").expect("writable");
+            std::fs::write(directory.join("assets").join("icon.bin"), [0u8; 8]).expect("writable");
+            digest
+        };
+        let whole = |digest: PayloadDigest| {
+            let directory = store.package_dir(digest);
+            directory.join("plugin.json").is_file()
+                && directory.join("assets").join("icon.bin").is_file()
+        };
+        let (first, second) = (tree(b"first"), tree(b"second"));
+        // A name the second package cannot be renamed to: a directory with something in it.
+        let blocked = store.root.join("staging").join(format!("removed-{second}"));
+        std::fs::create_dir_all(blocked.join("left")).expect("a directory");
+        let plan = |packages: &[PayloadDigest]| ReclaimPlan {
+            packages: packages.iter().map(|digest| (*digest, 10)).collect(),
+            payloads: Vec::new(),
+        };
+
+        let outcome = owned(|permit| store.remove(permit, &plan(&[second])));
+        assert!(
+            matches!(outcome, Err(CatalogueError::StorageUnavailable { .. })),
+            "nothing of the plan happened: {outcome:?}"
+        );
+        assert!(whole(second));
+
+        let outcome = owned(|permit| store.remove(permit, &plan(&[first, second])));
+        assert!(
+            matches!(outcome, Err(CatalogueError::PublicationUncertain { .. })),
+            "part of the plan happened: {outcome:?}"
+        );
+        assert!(!store.package_dir(first).exists(), "the first went whole");
+        assert!(
+            !store
+                .root
+                .join("staging")
+                .join(format!("removed-{first}"))
+                .exists(),
+            "and nothing of it is left aside"
+        );
+        assert!(whole(second), "the second is still whole");
     }
 
     #[test]

@@ -1783,14 +1783,101 @@ async fn kr_req_11_12_a_repository_keeps_as_many_generations_as_its_budget_allow
     }
 }
 
-/// The trust checkpoint and every kept index count against the retained metadata budget.
+/// Enrols the generation published at `at` into a catalogue of its own under `root`, with a
+/// retained metadata budget of `budget` bytes.
+fn retaining_at(
+    root: &std::path::Path,
+    at: &std::path::Path,
+    root_bytes: Vec<u8>,
+    budget: u64,
+) -> Catalogue {
+    let mut budgets = RepositoryBudgets::defaults();
+    budgets.retained_metadata_bytes = U64::new(budget);
+    let mut catalogue = Catalogue::open(root).expect("an openable catalogue");
+    catalogue
+        .enrol(
+            Enrolment::new(
+                repository(),
+                RepositoryKind::Official,
+                support::directory_url(&at.join("metadata")),
+                support::directory_url(&at.join("targets")),
+                root_bytes,
+                budgets,
+                CapabilityCeiling::default_ceiling(),
+            )
+            .expect("an enrollable repository"),
+            true,
+        )
+        .expect("the owner adopted the root");
+    catalogue
+}
+
+/// What a repository's store keeps against its retained metadata budget: the checkpoint, and every
+/// index document there.
+fn retained_bytes(catalogue: &Catalogue) -> u64 {
+    let store = catalogue.store(&repository()).expect("enrolled");
+    store.checkpoint_bytes().expect("readable")
+        + store
+            .index_documents()
+            .expect("readable")
+            .into_values()
+            .sum::<u64>()
+}
+
+/// The checkpoint and the index sizes a sync of `first` and then `second` leaves, measured in a
+/// catalogue of their own under `home` with room to spare.
+async fn measured(
+    home: &std::path::Path,
+    first: &Generation,
+    second: &Generation,
+) -> (u64, u64, u64, u64) {
+    let at = home.join("probe").join("generation");
+    support::copy_tree(&first.directory(), &at);
+    let mut probe = retaining_at(
+        &home.join("probe-catalogue"),
+        &at,
+        first.root_bytes(),
+        RepositoryBudgets::defaults().retained_metadata_bytes.get(),
+    );
+    probe
+        .sync(&repository())
+        .await
+        .expect("the first generation");
+    let store = probe.store(&repository()).expect("enrolled");
+    let first_checkpoint = store.checkpoint_bytes().expect("readable");
+    let first_index: u64 = store
+        .index_documents()
+        .expect("readable")
+        .into_values()
+        .sum();
+    std::fs::remove_dir_all(&at).expect("removable");
+    support::copy_tree(&second.directory(), &at);
+    probe
+        .sync(&repository())
+        .await
+        .expect("the second generation");
+    let second_checkpoint = store.checkpoint_bytes().expect("readable");
+    let second_index = store
+        .index_documents()
+        .expect("readable")
+        .into_values()
+        .sum::<u64>()
+        - first_index;
+    (
+        first_checkpoint,
+        first_index,
+        second_checkpoint,
+        second_index,
+    )
+}
+
+/// The trust checkpoint and every kept index count against the retained metadata budget, at each
+/// limit and one past it.
 ///
-/// A generation that fits beside the one before is kept with it. With less room than that the one
-/// before goes to make room, and with less room than the checkpoint and the new index alone the
-/// generation is refused before anything is written for it, and the one in use stays, with its
-/// index, as it was. The client writes the time it last saw into the checkpoint on every load, and
-/// that document's length varies by a few bytes from one load to the next, so the budgets here sit
-/// well clear of each boundary; the exact boundaries are the retention plan's own tests.
+/// A generation that fits beside the one before is kept with it. One byte less and the one before
+/// goes to make room, down to the checkpoint and the new index filling the budget exactly. One
+/// byte less again and the generation is refused before anything is kept for it, and the one in
+/// use stays, with its index and the checkpoint it was accepted with, as it was.
 #[tokio::test]
 async fn kr_req_11_12_the_retained_metadata_budget_counts_the_checkpoint_and_every_kept_index() {
     let home = tempfile::tempdir().expect("a temporary directory");
@@ -1815,97 +1902,36 @@ async fn kr_req_11_12_the_retained_metadata_budget_counts_the_checkpoint_and_eve
         },
     )
     .await;
-    let publish = |case: &str| {
-        let at = home.path().join(case).join("generation");
-        support::copy_tree(&first.directory(), &at);
-        at
-    };
-
-    // Measured once, with room to spare.
-    let probe_at = publish("probe");
-    let mut probe = Catalogue::open(&home.path().join("probe-catalogue")).expect("openable");
-    probe
-        .enrol(
-            Enrolment::new(
-                repository(),
-                RepositoryKind::Official,
-                support::directory_url(&probe_at.join("metadata")),
-                support::directory_url(&probe_at.join("targets")),
-                first.root_bytes(),
-                RepositoryBudgets::defaults(),
-                CapabilityCeiling::default_ceiling(),
-            )
-            .expect("an enrollable repository"),
-            true,
-        )
-        .expect("the owner adopted the root");
-    probe
-        .sync(&repository())
-        .await
-        .expect("the first generation");
-    let store = probe.store(&repository()).expect("enrolled");
-    let (first_checkpoint, first_index) = (
-        store.checkpoint_bytes().expect("readable"),
-        store
-            .index_documents()
-            .expect("readable")
-            .into_values()
-            .sum::<u64>(),
-    );
-    std::fs::remove_dir_all(&probe_at).expect("removable");
-    support::copy_tree(&second.directory(), &probe_at);
-    probe
-        .sync(&repository())
-        .await
-        .expect("the second generation");
-    let (checkpoint, second_index) = (
-        store.checkpoint_bytes().expect("readable"),
-        store
-            .index_documents()
-            .expect("readable")
-            .into_values()
-            .sum::<u64>()
-            - first_index,
-    );
-    // Well clear of the few bytes the time the client writes varies by.
-    let clear = 64;
-    assert!(first_index > 2 * clear);
+    let (first_checkpoint, first_index, checkpoint, second_index) =
+        measured(home.path(), &first, &second).await;
     assert!(
-        first_checkpoint + first_index + clear < checkpoint + second_index - clear,
+        first_index < second_index && first_checkpoint + first_index < checkpoint + second_index,
         "{first_checkpoint} {first_index} {checkpoint} {second_index}"
     );
 
     let both = checkpoint + first_index + second_index;
     for (budget, kept) in [
-        (both + clear, Some(2)),
-        (both - clear, Some(1)),
-        (checkpoint + second_index - clear, None),
+        (both, Some(2)),
+        (both - 1, Some(1)),
+        (checkpoint + second_index, Some(1)),
+        (checkpoint + second_index - 1, None),
     ] {
-        let at = publish(&format!("case-{budget}"));
-        let mut budgets = RepositoryBudgets::defaults();
-        budgets.retained_metadata_bytes = U64::new(budget);
-        let mut catalogue =
-            Catalogue::open(&home.path().join(format!("catalogue-{budget}"))).expect("openable");
-        catalogue
-            .enrol(
-                Enrolment::new(
-                    repository(),
-                    RepositoryKind::Official,
-                    support::directory_url(&at.join("metadata")),
-                    support::directory_url(&at.join("targets")),
-                    first.root_bytes(),
-                    budgets,
-                    CapabilityCeiling::default_ceiling(),
-                )
-                .expect("an enrollable repository"),
-                true,
-            )
-            .expect("the owner adopted the root");
+        let at = home
+            .path()
+            .join(format!("case-{budget}"))
+            .join("generation");
+        support::copy_tree(&first.directory(), &at);
+        let mut catalogue = retaining_at(
+            &home.path().join(format!("catalogue-{budget}")),
+            &at,
+            first.root_bytes(),
+            budget,
+        );
         catalogue
             .sync(&repository())
             .await
             .expect("the first generation fits");
-        let before = index_documents(&catalogue);
+        let before = (index_documents(&catalogue), checkpoint_of(&catalogue));
         std::fs::remove_dir_all(&at).expect("removable");
         support::copy_tree(&second.directory(), &at);
         let outcome = catalogue.sync(&repository()).await;
@@ -1913,6 +1939,7 @@ async fn kr_req_11_12_the_retained_metadata_budget_counts_the_checkpoint_and_eve
             .active(&repository())
             .expect("enrolled")
             .expect("a generation");
+        assert!(retained_bytes(&catalogue) <= budget, "{budget}");
         if let Some(kept) = kept {
             outcome.unwrap_or_else(|refusal| panic!("{budget}: {refusal}"));
             assert_eq!(active.generation, 2, "{budget}");
@@ -1924,13 +1951,139 @@ async fn kr_req_11_12_the_retained_metadata_budget_counts_the_checkpoint_and_eve
             panic!("{budget}: {refusal:?}");
         };
         assert_eq!(limit.resource, Resource::RetainedMetadataBytes);
-        assert!(limit.requested > budget);
+        assert_eq!(limit.requested, checkpoint + second_index);
         assert_eq!(active.generation, 1);
-        assert_eq!(index_documents(&catalogue), before);
+        assert_eq!(
+            (index_documents(&catalogue), checkpoint_of(&catalogue)),
+            before
+        );
         catalogue
             .index(&repository())
             .expect("the generation in use still reads");
     }
+}
+
+/// A checkpoint is published only where it fits beside the generation in use, because that is what
+/// stays if the sync goes no further.
+///
+/// The second generation's index is smaller than the first's, and its checkpoint, with three
+/// delegated roles, is larger. It fits beside its own index but not beside the generation in use,
+/// so the sync is refused before its checkpoint is kept: the first generation stays usable, the
+/// accepted checkpoint is the one it was accepted with, and what is kept stays inside the budget,
+/// after a restart as well.
+#[tokio::test]
+async fn kr_req_11_12_a_checkpoint_is_kept_only_where_it_fits_beside_the_generation_in_use() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let first = Generation::build(&home.path().join("first"), GenerationSpec::default()).await;
+    let second = Generation::build(
+        &home.path().join("second"),
+        GenerationSpec {
+            generation: 2,
+            keys: Some(first.keys()),
+            delegation_chain: 3,
+            capabilities: vec![PluginCapability::MetadataMatch],
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let (first_checkpoint, first_index, checkpoint, second_index) =
+        measured(home.path(), &first, &second).await;
+    let budget = (first_checkpoint + first_index).max(checkpoint + second_index);
+    assert!(
+        budget < checkpoint + first_index,
+        "{first_checkpoint} {first_index} {checkpoint} {second_index}"
+    );
+
+    let at = home.path().join("case").join("generation");
+    support::copy_tree(&first.directory(), &at);
+    let root = home.path().join("catalogue");
+    let mut catalogue = retaining_at(&root, &at, first.root_bytes(), budget);
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("the first generation fits");
+    let before = checkpoint_of(&catalogue);
+    std::fs::remove_dir_all(&at).expect("removable");
+    support::copy_tree(&second.directory(), &at);
+    let refusal = catalogue
+        .sync(&repository())
+        .await
+        .expect_err("the new checkpoint does not fit beside the generation in use");
+    let CatalogueError::ResourceLimit(limit) = &refusal else {
+        panic!("{refusal:?}");
+    };
+    assert_eq!(limit.resource, Resource::RetainedMetadataBytes);
+    assert_eq!(limit.requested, checkpoint + first_index);
+    for catalogue in [
+        catalogue,
+        Catalogue::open(&root).expect("the catalogue reopens"),
+    ] {
+        assert_eq!(checkpoint_of(&catalogue), before);
+        assert_eq!(
+            catalogue
+                .active(&repository())
+                .expect("enrolled")
+                .map(|active| active.generation),
+            Some(1)
+        );
+        catalogue
+            .index(&repository())
+            .expect("the generation in use still reads");
+        assert!(retained_bytes(&catalogue) <= budget);
+    }
+}
+
+/// A checkpoint holds one generation's documents. Under consistent snapshots the client names each
+/// delegated role's document by its version, and the documents of the generation before are not
+/// carried into the next checkpoint, so its size stays where it was however many generations are
+/// accepted.
+#[tokio::test]
+async fn kr_req_11_12_a_checkpoint_holds_one_generation_of_delegated_documents() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(
+        home.path(),
+        GenerationSpec {
+            delegation_chain: 3,
+            consistent_snapshot: true,
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    let mut sizes = Vec::new();
+    for number in 1..=4u64 {
+        if number > 1 {
+            generation.rewrite_as(number).await;
+        }
+        catalogue
+            .sync(&repository())
+            .await
+            .expect("a verified generation");
+        let held = checkpoint_of(&catalogue);
+        for level in 1..=3 {
+            let role = format!(".level-{level}.json");
+            let named: Vec<&String> = held.keys().filter(|name| name.ends_with(&role)).collect();
+            assert_eq!(
+                named,
+                vec![&format!("{number}{role}")],
+                "generation {number}"
+            );
+        }
+        sizes.push(
+            catalogue
+                .store(&repository())
+                .expect("enrolled")
+                .checkpoint_bytes()
+                .expect("readable"),
+        );
+    }
+    assert!(sizes.windows(2).all(|pair| pair[0] == pair[1]), "{sizes:?}");
 }
 
 /// An installed package costs its extracted copy as well as its cached payloads, and a package is
@@ -1996,6 +2149,168 @@ async fn kr_req_11_12_a_package_is_staged_only_inside_room_for_its_payloads_and_
             "nothing of the package was fetched: {fetched:?}"
         );
         assert!(absent(&store, generation.manifest_digest()));
+    }
+}
+
+/// The presentation's size in a published generation.
+fn presentation_size(generation: &Generation) -> u64 {
+    let index: kr_plugin_sdk::catalogue::CatalogueIndex = serde_json::from_slice(
+        &std::fs::read(generation.targets_dir().join("index.json")).expect("an index"),
+    )
+    .expect("a readable index");
+    index.entries[0]
+        .payloads
+        .iter()
+        .find(|payload| payload.path.as_str() == kr_plugin_sdk::package::PRESENTATION_FILE)
+        .expect("a presentation")
+        .size_bytes
+        .get()
+}
+
+/// A declaration that understates a payload's length is not served from the cache on its word.
+///
+/// The first release's presentation is cached here. The next release names the same bytes, by
+/// digest, at two paths, and its index and its targets metadata agree on a length shorter than the
+/// bytes are. The cached object is not that length, so it is not what is staged; fetched again
+/// under the declared length, the bytes run past it, and the install is refused there, before any
+/// of them is staged.
+#[tokio::test]
+async fn kr_req_11_12_a_cached_payload_is_staged_only_at_the_length_declared_for_it() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let first = Generation::build(home.path(), GenerationSpec::default()).await;
+    let length = presentation_size(&first);
+    let second = Generation::build(
+        &home.path().join("second"),
+        GenerationSpec {
+            generation: 2,
+            package_version: "0.2.0".to_owned(),
+            keys: Some(first.keys()),
+            asset_copy: true,
+            understated_presentation: Some(length - 10),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &first,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("the first generation");
+    catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &version(),
+            first.manifest_digest(),
+            InstallationGrant::none(),
+        )
+        .await
+        .expect("the first release");
+    first.replace_with(&second);
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("the second generation's two statements agree");
+    let refusal = catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &PackageVersion::parse("0.2.0").expect("a valid version"),
+            second.manifest_digest(),
+            InstallationGrant::none(),
+        )
+        .await
+        .expect_err("the bytes are longer than both statements say");
+    assert!(
+        matches!(&refusal, CatalogueError::Integrity { detail } if detail.contains("longer than")),
+        "{refusal:?}"
+    );
+    let store = catalogue.store(&repository()).expect("enrolled");
+    assert!(absent(&store, second.manifest_digest()));
+    assert!(complete(&store, first.manifest_digest()));
+}
+
+/// Two paths that share one digest are staged twice and fetched once, and the room made before
+/// staging counts exactly that: with that room the package installs, and one byte short of it the
+/// install is refused before anything is fetched.
+#[tokio::test]
+async fn kr_req_11_12_two_paths_that_share_a_digest_are_staged_twice_and_fetched_once() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(
+        home.path(),
+        GenerationSpec {
+            asset_copy: true,
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let fetched: u64 = payloads_of(&generation).values().sum();
+    let staged = fetched + presentation_size(&generation);
+    for (budget, fits) in [(fetched + staged, true), (fetched + staged - 1, false)] {
+        let mut budgets = RepositoryBudgets::defaults();
+        budgets.payload_cache_bytes = U64::new(budget);
+        let mut catalogue = Catalogue::open(&home.path().join(format!("catalogue-{budget}")))
+            .expect("an openable catalogue");
+        catalogue
+            .enrol(
+                Enrolment::new(
+                    repository(),
+                    RepositoryKind::Official,
+                    generation.metadata_url(),
+                    generation.targets_url(),
+                    generation.root_bytes(),
+                    budgets,
+                    CapabilityCeiling::default_ceiling(),
+                )
+                .expect("an enrollable repository"),
+                true,
+            )
+            .expect("the owner adopted the root");
+        let watched = Watched::default();
+        catalogue.set_transport(Arc::new(watched.clone()));
+        catalogue
+            .sync(&repository())
+            .await
+            .expect("a verified generation");
+        let outcome = catalogue
+            .install(
+                &repository(),
+                environment(),
+                &plugin(),
+                &version(),
+                generation.manifest_digest(),
+                InstallationGrant::none(),
+            )
+            .await;
+        let store = catalogue.store(&repository()).expect("enrolled");
+        if fits {
+            outcome.expect("the payloads once and the copy with both paths fill the budget");
+            assert!(complete(&store, generation.manifest_digest()));
+            continue;
+        }
+        let refusal = outcome.expect_err("one byte short");
+        let CatalogueError::ResourceLimit(limit) = &refusal else {
+            panic!("{refusal:?}");
+        };
+        assert_eq!(limit.stage, Stage::Declared);
+        assert_eq!(limit.requested, fetched + staged);
+        assert!(
+            !watched
+                .fetched
+                .lock()
+                .expect("the list")
+                .iter()
+                .any(|url| url.path().contains("/packages/")),
+            "nothing of the package was fetched"
+        );
     }
 }
 
@@ -3197,7 +3512,7 @@ async fn kr_req_11_09_installed_operations_survive_the_repository_being_removed(
 // ---------------------------------------------------------------------------------------------
 
 /// Every file of the accepted trust checkpoint, with its bytes.
-fn checkpoint(catalogue: &Catalogue) -> std::collections::BTreeMap<String, Vec<u8>> {
+fn checkpoint_of(catalogue: &Catalogue) -> std::collections::BTreeMap<String, Vec<u8>> {
     let directory = catalogue
         .store(&repository())
         .expect("enrolled")
@@ -3300,7 +3615,7 @@ async fn a_verification_that_does_not_finish_leaves_the_accepted_checkpoint_as_i
         .sync(&repository())
         .await
         .expect("a first generation");
-    let accepted = checkpoint(&catalogue);
+    let accepted = checkpoint_of(&catalogue);
     assert!(
         accepted.contains_key("timestamp.json"),
         "{:?}",
@@ -3317,7 +3632,7 @@ async fn a_verification_that_does_not_finish_leaves_the_accepted_checkpoint_as_i
         matches!(refused, Err(CatalogueError::PermissionDenied { .. })),
         "{refused:?}"
     );
-    assert_eq!(checkpoint(&catalogue), accepted, "refused at the commit");
+    assert_eq!(checkpoint_of(&catalogue), accepted, "refused at the commit");
 
     // Interrupted part way through the metadata.
     catalogue.set_transport(Arc::new(Damaging {
@@ -3325,7 +3640,7 @@ async fn a_verification_that_does_not_finish_leaves_the_accepted_checkpoint_as_i
         damage: Damage::DropsPartWay,
     }));
     assert!(catalogue.sync(&repository()).await.is_err());
-    assert_eq!(checkpoint(&catalogue), accepted, "interrupted");
+    assert_eq!(checkpoint_of(&catalogue), accepted, "interrupted");
 
     // Verified: the checkpoint is the new metadata, and no working copy is left behind.
     catalogue.set_transport(Arc::new(tough::FilesystemTransport));
@@ -3333,7 +3648,7 @@ async fn a_verification_that_does_not_finish_leaves_the_accepted_checkpoint_as_i
         .sync(&repository())
         .await
         .expect("the second generation");
-    assert_ne!(checkpoint(&catalogue), accepted);
+    assert_ne!(checkpoint_of(&catalogue), accepted);
     let staging = catalogue
         .store(&repository())
         .expect("enrolled")

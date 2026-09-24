@@ -196,6 +196,13 @@ pub struct GenerationSpec {
     pub previous_keys: Option<KeySet>,
     /// Fields the root carries beyond the ones the client knows, signed with the rest.
     pub root_extra: Vec<(String, serde_json::Value)>,
+    /// Whether the package carries the presentation's bytes a second time, as an asset at
+    /// `assets/presentation-copy.json`: two paths that share one digest.
+    pub asset_copy: bool,
+    /// A length the index and the targets metadata both declare for every file that holds the
+    /// presentation's bytes, in place of its real one: two signed statements that agree with each
+    /// other and not with the bytes.
+    pub understated_presentation: Option<u64>,
     /// A change made to the package's index entry after it is derived from the manifest, before
     /// the index is signed: an index that says something the manifest does not.
     pub edit_entry: Option<fn(&mut IndexEntry)>,
@@ -219,6 +226,8 @@ impl Default for GenerationSpec {
             root_version: 1,
             previous_keys: None,
             root_extra: Vec::new(),
+            asset_copy: false,
+            understated_presentation: None,
             edit_entry: None,
         }
     }
@@ -558,6 +567,41 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
     if let Some(edit) = spec.edit_entry {
         edit(&mut entry);
     }
+    // The names of the files that hold the presentation's bytes, and the length both signed
+    // statements declare for them where it is understated.
+    let presentation_digest = files
+        .iter()
+        .find(|(name, _)| name == kr_plugin_sdk::package::PRESENTATION_FILE)
+        .map(|(_, bytes)| PayloadDigest::of(bytes))
+        .expect("a presentation");
+    let understated: std::collections::BTreeSet<String> = files
+        .iter()
+        .filter(|(_, bytes)| PayloadDigest::of(bytes) == presentation_digest)
+        .map(|(name, _)| {
+            format!(
+                "packages/{}/{}/{}/{name}",
+                manifest.publisher_id, manifest.plugin_name, manifest.version
+            )
+        })
+        .collect();
+    if let Some(length) = spec.understated_presentation {
+        let mut total = entry.total_size_bytes.get();
+        for payload in &mut entry.payloads {
+            if payload.digest == presentation_digest {
+                total = total - payload.size_bytes.get() + length;
+                payload.size_bytes = kr_protocol::scalars::U64::new(length);
+            }
+        }
+        entry.total_size_bytes = kr_protocol::scalars::U64::new(total);
+    }
+    let declared = |name: &str, mut target: Target| {
+        if let Some(length) = spec.understated_presentation
+            && understated.contains(name)
+        {
+            target.length = length;
+        }
+        target
+    };
     let index = CatalogueIndex {
         index_version: INDEX_VERSION,
         generation: RepositoryGeneration::new(spec.generation),
@@ -652,7 +696,10 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
             for (name, _) in &files {
                 let target_name = format!("{prefix}/{name}");
                 let target_path = targets.join(&prefix).join(name);
-                let target = Target::from_path(&target_path).await.expect("a target");
+                let target = declared(
+                    &target_name,
+                    Target::from_path(&target_path).await.expect("a target"),
+                );
                 editor
                     .add_target(target_name.as_str(), target)
                     .expect("added");
@@ -671,7 +718,7 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
         }
         names.sort();
         for (name, path) in &names {
-            let target = Target::from_path(path).await.expect("a target");
+            let target = declared(name, Target::from_path(path).await.expect("a target"));
             editor.add_target(name.as_str(), target).expect("added");
         }
 
@@ -770,22 +817,35 @@ fn package_files(spec: &GenerationSpec) -> (PluginManifest, Vec<(String, Vec<u8>
             })
             .collect();
     }
+    let copy = "assets/presentation-copy.json";
+    if spec.asset_copy {
+        let mut asset = manifest
+            .payloads
+            .iter()
+            .find(|payload| payload.path.as_str() == kr_plugin_sdk::package::PRESENTATION_FILE)
+            .expect("the presentation is a payload")
+            .clone();
+        asset.role = kr_plugin_sdk::plugin::PayloadRole::Asset;
+        asset.path = kr_plugin_sdk::paths::PackagePath::new(copy).expect("a package path");
+        manifest.payloads.push(asset);
+    }
     let mut manifest_json =
         serde_json::to_string_pretty(&manifest).expect("the manifest is serialisable");
     manifest_json.push('\n');
-    (
-        manifest,
-        vec![
-            (
-                kr_plugin_sdk::package::MANIFEST_FILE.to_owned(),
-                manifest_json.into_bytes(),
-            ),
-            (
-                kr_plugin_sdk::package::PRESENTATION_FILE.to_owned(),
-                presentation.into_bytes(),
-            ),
-        ],
-    )
+    let mut files = vec![
+        (
+            kr_plugin_sdk::package::MANIFEST_FILE.to_owned(),
+            manifest_json.into_bytes(),
+        ),
+        (
+            kr_plugin_sdk::package::PRESENTATION_FILE.to_owned(),
+            presentation.clone().into_bytes(),
+        ),
+    ];
+    if spec.asset_copy {
+        files.push((copy.to_owned(), presentation.into_bytes()));
+    }
+    (manifest, files)
 }
 
 /// Returns the example package as its files.

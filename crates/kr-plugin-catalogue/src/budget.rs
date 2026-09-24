@@ -228,25 +228,25 @@ impl BudgetLedger {
     }
 
     /// Decides which accepted generations a repository stops keeping once `active` is the one it is
-    /// on.
+    /// on, or while it keeps no generation in use where `active` is none.
     ///
     /// `kept` is every generation it keeps now, `active` among them or not, and `checkpoint` is
-    /// what its trust checkpoint holds. The oldest generations it is no longer on go first: until
-    /// the count fits the retained-generation budget, and then until the checkpoint and every index
+    /// what its trust checkpoint counts. The oldest generations it is not on go first: until the
+    /// count fits the retained-generation budget, and then until the checkpoint and every index
     /// kept fit the retained metadata budget. The generation it is on is never one of them, so a
-    /// repository that cannot keep that one and its checkpoint is refused rather than left with
+    /// repository that cannot keep that one beside its checkpoint is refused rather than left with
     /// neither.
     ///
     /// # Errors
     ///
     /// Returns [`ResourceLimit`] naming the retained metadata when the checkpoint and the active
     /// generation's index alone are past that budget, and naming the retained generations when
-    /// that budget is too small to keep even the generation in use.
+    /// that budget keeps no generation at all.
     pub fn plan_retention(
         &self,
         checkpoint: u64,
         kept: &[Retained],
-        active: Retained,
+        active: Option<Retained>,
     ) -> Result<Vec<u64>, ResourceLimit> {
         let generations = self.budgets.retained_generations.get();
         if generations == 0 {
@@ -255,24 +255,26 @@ impl BudgetLedger {
                 limit: 0,
                 requested: 1,
                 stage: Stage::Actual,
-                subject: format!("generation {}", active.generation),
+                subject: "the generation a repository is on".to_owned(),
             });
         }
         let limit = self.budgets.retained_metadata_bytes.get();
+        let in_use = active.map(|active| active.generation);
         let mut others: Vec<Retained> = kept
             .iter()
-            .filter(|kept| kept.generation != active.generation)
+            .filter(|kept| Some(kept.generation) != in_use)
             .copied()
             .collect();
         others.sort_by_key(|kept| kept.generation);
+        let base = checkpoint.saturating_add(active.map_or(0, |active| active.index_bytes));
         let held = |others: &[Retained]| {
-            others.iter().fold(
-                checkpoint.saturating_add(active.index_bytes),
-                |total, kept| total.saturating_add(kept.index_bytes),
-            )
+            others
+                .iter()
+                .fold(base, |total, kept| total.saturating_add(kept.index_bytes))
         };
+        let count = |others: &[Retained]| others.len() as u64 + u64::from(active.is_some());
         let mut forgotten = Vec::new();
-        while !others.is_empty() && (others.len() as u64 >= generations || held(&others) > limit) {
+        while !others.is_empty() && (count(&others) > generations || held(&others) > limit) {
             forgotten.push(others.remove(0).generation);
         }
         let requested = held(&others);
@@ -282,9 +284,14 @@ impl BudgetLedger {
                 limit,
                 requested,
                 stage: Stage::Actual,
-                subject: format!(
-                    "the trust checkpoint and generation {}'s index",
-                    active.generation
+                subject: active.map_or_else(
+                    || "the trust checkpoint".to_owned(),
+                    |active| {
+                        format!(
+                            "the trust checkpoint and generation {}'s index",
+                            active.generation
+                        )
+                    },
                 ),
             });
         }
@@ -443,20 +450,20 @@ mod tests {
         // At the limit: three kept and the fourth accepted leaves three when three are allowed
         // once the oldest goes, and nothing goes when four are allowed.
         assert_eq!(
-            retaining(4, 1_000).plan_retention(0, &kept, retained(4, 10)),
+            retaining(4, 1_000).plan_retention(0, &kept, Some(retained(4, 10))),
             Ok(Vec::new())
         );
         assert_eq!(
-            retaining(3, 1_000).plan_retention(0, &kept, retained(4, 10)),
+            retaining(3, 1_000).plan_retention(0, &kept, Some(retained(4, 10))),
             Ok(vec![1])
         );
         assert_eq!(
-            retaining(1, 1_000).plan_retention(0, &kept, retained(4, 10)),
+            retaining(1, 1_000).plan_retention(0, &kept, Some(retained(4, 10))),
             Ok(vec![1, 2, 3])
         );
         // The generation in use is never one that goes, even when it is the oldest one named.
         assert_eq!(
-            retaining(1, 1_000).plan_retention(0, &kept, retained(2, 10)),
+            retaining(1, 1_000).plan_retention(0, &kept, Some(retained(2, 10))),
             Ok(vec![1, 3])
         );
     }
@@ -466,21 +473,21 @@ mod tests {
         let kept = [retained(1, 30), retained(2, 30)];
         // Checkpoint 40, the new index 30 and both kept ones: 130 fits exactly.
         assert_eq!(
-            retaining(3, 130).plan_retention(40, &kept, retained(3, 30)),
+            retaining(3, 130).plan_retention(40, &kept, Some(retained(3, 30))),
             Ok(Vec::new())
         );
         // One byte less, and the oldest goes to make room.
         assert_eq!(
-            retaining(3, 129).plan_retention(40, &kept, retained(3, 30)),
+            retaining(3, 129).plan_retention(40, &kept, Some(retained(3, 30))),
             Ok(vec![1])
         );
         // The checkpoint and the new index alone fit exactly once every older one goes.
         assert_eq!(
-            retaining(3, 70).plan_retention(40, &kept, retained(3, 30)),
+            retaining(3, 70).plan_retention(40, &kept, Some(retained(3, 30))),
             Ok(vec![1, 2])
         );
         let refusal = retaining(3, 69)
-            .plan_retention(40, &kept, retained(3, 30))
+            .plan_retention(40, &kept, Some(retained(3, 30)))
             .expect_err("the checkpoint and the new index alone are past the budget");
         assert_eq!(refusal.resource, Resource::RetainedMetadataBytes);
         assert_eq!(refusal.limit, 69);
@@ -492,9 +499,31 @@ mod tests {
     }
 
     #[test]
+    fn with_no_generation_in_use_every_kept_one_may_go_and_the_checkpoint_counts_alone() {
+        let kept = [retained(1, 30), retained(2, 30)];
+        assert_eq!(
+            retaining(2, 100).plan_retention(40, &kept, None),
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            retaining(1, 100).plan_retention(40, &kept, None),
+            Ok(vec![1])
+        );
+        assert_eq!(
+            retaining(2, 40).plan_retention(40, &kept, None),
+            Ok(vec![1, 2])
+        );
+        let refusal = retaining(2, 39)
+            .plan_retention(40, &kept, None)
+            .expect_err("the checkpoint alone is past the budget");
+        assert_eq!(refusal.resource, Resource::RetainedMetadataBytes);
+        assert_eq!(refusal.requested, 40);
+    }
+
+    #[test]
     fn a_repository_keeps_at_least_the_generation_it_is_on() {
         let refusal = retaining(0, 1_000)
-            .plan_retention(0, &[], retained(1, 10))
+            .plan_retention(0, &[], Some(retained(1, 10)))
             .expect_err("no generation may be kept");
         assert_eq!(refusal.resource, Resource::RetainedGenerations);
     }

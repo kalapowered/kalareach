@@ -570,6 +570,35 @@ impl Records<'_> {
         Ok(kept)
     }
 
+    /// Returns every generation every enrolment keeps, by enrolment key, in a stable order.
+    ///
+    /// A generation's record goes before its index document does, so two reads of this that differ
+    /// are how a reader tells that a document it was about to open may have been removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when a record cannot be read.
+    pub fn kept_everywhere(&self) -> CatalogueResult<Vec<(String, u64)>> {
+        let mut statement = self
+            .transaction
+            .prepare_cached(
+                "SELECT enrolment_key, generation FROM accepted_generations
+                  ORDER BY enrolment_key, generation",
+            )
+            .map_err(|source| self.failure(&source))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|source| self.failure(&source))?;
+        let mut kept = Vec::new();
+        for row in rows {
+            let (key, generation) = row.map_err(|source| self.failure(&source))?;
+            kept.push((key, unsigned(generation)?));
+        }
+        Ok(kept)
+    }
+
     /// Returns one enrolment by its key, where it is still enrolled.
     ///
     /// # Errors
@@ -1206,13 +1235,20 @@ impl EnrolmentRow {
         // location and the root's size against the budgets, was checked when this row was
         // written, and a budget the owner has since narrowed below the root is for the next sync
         // to refuse, not a record this host cannot read.
+        let id = RepositoryId::new(self.repository_id).map_err(unreadable)?;
+        // Budgets without every allowance this build enforces are a record it cannot read, and are
+        // reported as that, naming the repository. No release wrote an enrolment in another shape,
+        // so there is no other shape to read.
+        let budgets = serde_json::from_str(&self.budgets).map_err(|source| {
+            unreadable(format_args!("the budgets {id} was enrolled with: {source}"))
+        })?;
         let enrolment = Enrolment {
-            id: RepositoryId::new(self.repository_id).map_err(unreadable)?,
+            id,
             kind,
             metadata_url: location(&self.metadata_url)?,
             targets_url: location(&self.targets_url)?,
             root: self.root,
-            budgets: from_json(&self.budgets)?,
+            budgets,
             ceiling: CapabilityCeiling::with(capabilities_from(&self.ceiling)?),
             pinned_generation: self
                 .pinned_generation
