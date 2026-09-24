@@ -21163,12 +21163,32 @@ export interface RootCommandBlockResult {
  *
  * The integration's pre-execution hook asks the worker what to run, before it runs anything. The
  * command name and the argument vector are the person's; what the answer may do is add flags.
+ *
+ * The request also says which file the shell would run and where. A backend is established for
+ * that file and nothing else, and its working directory is checked against the revision the
+ * shell reported, so neither is left for the worker to guess from the command name.
  */
 export interface RootCommandResolveParams {
   /**
    * The invocation, split by the shell: the command name first, then its arguments.
    */
   argv: string[]
+  /**
+   * The working directory the invocation runs in.
+   */
+  cwd: string
+  /**
+   * The working-directory revision at the moment the shell asked, which is what anything
+   * granted in that directory is checked against.
+   */
+  cwd_revision: string
+  /**
+   * The executable the shell's own search resolved the command name to, as an absolute path.
+   *
+   * It is the file the invocation runs when it runs as typed. A search that went through a
+   * relative directory on the path is joined to `cwd`.
+   */
+  executable: string
   /**
    * Whether this is an interactive invocation rather than a line of a script.
    */

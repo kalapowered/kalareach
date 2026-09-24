@@ -368,6 +368,13 @@ async fn resolve_at(
     argv: &[&str],
     interactive: bool,
 ) -> kr_protocol::root::RootCommandResolveResult {
+    // What a shell's own search would have found: the path it was given, or the name in a
+    // directory on its search path.
+    let executable = match argv.first() {
+        Some(named) if named.contains('/') => (*named).to_owned(),
+        Some(name) => format!("/usr/local/bin/{name}"),
+        None => String::new(),
+    };
     wired
         .bridge
         .send_event(BridgeEvent::CommandResolve(
@@ -375,7 +382,10 @@ async fn resolve_at(
                 session_id: wired.session_id,
                 prompt_generation,
                 argv: argv.iter().map(|word| (*word).to_owned()).collect(),
+                executable,
                 interactive,
+                cwd: "/Users/someone/project".to_owned(),
+                cwd_revision: CwdRevision::new(1),
             },
         ))
         .await

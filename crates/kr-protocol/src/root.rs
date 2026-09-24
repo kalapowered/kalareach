@@ -995,6 +995,10 @@ pub struct CommandBackend {
 ///
 /// The integration's pre-execution hook asks the worker what to run, before it runs anything. The
 /// command name and the argument vector are the person's; what the answer may do is add flags.
+///
+/// The request also says which file the shell would run and where. A backend is established for
+/// that file and nothing else, and its working directory is checked against the revision the
+/// shell reported, so neither is left for the worker to guess from the command name.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RootCommandResolveParams {
@@ -1004,8 +1008,18 @@ pub struct RootCommandResolveParams {
     pub prompt_generation: PromptGeneration,
     /// The invocation, split by the shell: the command name first, then its arguments.
     pub argv: Vec<String>,
+    /// The executable the shell's own search resolved the command name to, as an absolute path.
+    ///
+    /// It is the file the invocation runs when it runs as typed. A search that went through a
+    /// relative directory on the path is joined to `cwd`.
+    pub executable: String,
     /// Whether this is an interactive invocation rather than a line of a script.
     pub interactive: bool,
+    /// The working directory the invocation runs in.
+    pub cwd: String,
+    /// The working-directory revision at the moment the shell asked, which is what anything
+    /// granted in that directory is checked against.
+    pub cwd_revision: CwdRevision,
 }
 
 /// The result of `root.command.resolve`.
@@ -1292,6 +1306,73 @@ mod tests {
         assert_eq!(
             ErrorCode::from_wire("AMBIGUOUS_ATTACHMENT"),
             Some(ErrorCode::AmbiguousAttachment)
+        );
+    }
+
+    /// What a bridge writes in front of an invocation, member for member.
+    #[derive(Serialize)]
+    struct WrittenResolve<'a> {
+        session_id: SessionId,
+        prompt_generation: PromptGeneration,
+        argv: Vec<&'a str>,
+        executable: &'a str,
+        interactive: bool,
+        cwd: &'a str,
+        cwd_revision: CwdRevision,
+    }
+
+    /// The same request as a bridge that names neither the executable nor the directory.
+    #[derive(Serialize)]
+    struct WrittenWithoutWhere<'a> {
+        session_id: SessionId,
+        prompt_generation: PromptGeneration,
+        argv: Vec<&'a str>,
+        interactive: bool,
+    }
+
+    #[test]
+    fn a_resolve_request_names_the_executable_and_the_directory_the_shell_resolved() {
+        let session_id = SessionId::new(Uuid::from_bytes([0x5e; 16]));
+        let written = WrittenResolve {
+            session_id,
+            prompt_generation: PromptGeneration::new(7),
+            argv: vec!["claude", "--resume"],
+            executable: "/opt/agents/bin/claude",
+            interactive: true,
+            cwd: "/Users/someone/project",
+            cwd_revision: CwdRevision::new(3),
+        };
+        let bytes = kr_cbor::to_canonical_vec(&written).expect("encodes");
+        let decoded: RootCommandResolveParams =
+            kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
+                .expect("the worker reads what the shell resolved and where it runs");
+        assert_eq!(
+            kr_cbor::to_canonical_vec(&decoded).expect("encodes"),
+            bytes,
+            "the request re-encodes to the bytes the shell wrote, every member kept"
+        );
+        let read = serde_json::to_value(&decoded).expect("a request describes itself");
+        assert_eq!(read["executable"], "/opt/agents/bin/claude");
+        assert_eq!(read["cwd"], "/Users/someone/project");
+        assert_eq!(read["cwd_revision"], "3");
+        assert_eq!(read["argv"], serde_json::json!(["claude", "--resume"]));
+
+        // A request that does not say which file the name resolved to, or where it would run, is
+        // not one a backend can be checked against.
+        let partial = kr_cbor::to_canonical_vec(&WrittenWithoutWhere {
+            session_id,
+            prompt_generation: PromptGeneration::new(7),
+            argv: vec!["claude"],
+            interactive: true,
+        })
+        .expect("encodes");
+        assert!(
+            kr_cbor::from_canonical_slice::<RootCommandResolveParams>(
+                &partial,
+                &kr_cbor::Limits::DEFAULT
+            )
+            .is_err(),
+            "a request without the executable and the directory is refused"
         );
     }
 

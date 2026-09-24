@@ -226,7 +226,7 @@ command in one of those shells takes neither the integration's flags nor a comma
 | `reader_idle` | The reader has nothing left to read | `session_id`, `prompt_generation`, `reader_revision`, `reader_context`, `snapshot`, `editor`, `cwd_revision` |
 | `eof_detach` | An eligible gesture at an empty primary prompt, under a fence | `session_id`, `fence_id`, `prompt_generation`, `input_epoch` |
 | `command_accepted` | At acceptance, inside the fenced context, before the reader leaves | `session_id`, `fence_id`, `prompt_generation`, `origin` |
-| `command_resolve` | In front of an interactive invocation, before the command starts | `session_id`, `prompt_generation`, `argv`, `interactive` |
+| `command_resolve` | In front of an interactive invocation, before the command starts | `session_id`, `prompt_generation`, `argv`, `executable` (the absolute path the shell's own search resolved the name to), `interactive`, `cwd`, `cwd_revision` |
 | `command_block` | When a command starts and again when it ends | `session_id`, `prompt_generation`, `command`, `started_at_ms`, `duration_ms`, `exit_status`, `cwd`, `cwd_revision` |
 | `gesture_changed` | The line discipline's `VEOF` changed, or the configured PSReadLine gesture did | `session_id`, `gesture`, `effective_at` |
 | `pre_eof_consumed` | An eligible gesture was consumed because it could not be attributed | `session_id`, `prompt_generation`, `reason`, `hint_printed` |
