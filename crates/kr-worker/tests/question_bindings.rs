@@ -490,3 +490,54 @@ fn a_helper_under_an_agent_the_broker_launched_is_bound_through_the_broker() {
     .expect_err("nothing establishes where it is");
     assert_eq!(unknown.code(), ErrorCode::ResourceUnavailable);
 }
+
+/// The broker's record of an agent that has ended, naming the identifier a live agent holds now,
+/// hides no helper under the live one: the helper is admitted to the session and bound to the
+/// live agent, whichever of the two records the broker walks first.
+#[test]
+fn an_ended_agents_record_hides_no_live_agent_that_holds_its_identifier() {
+    let me = this_process();
+    let parent = parent_process();
+    let mut ended = parent.clone();
+    ended.start_value = kr_protocol::scalars::U64::new(ended.start_value.get() ^ 0xFFFF);
+    // A boundary that holds nothing, read and found empty, and a root shell that is nobody's
+    // ancestor: only the broker's word admits this process.
+    let group = tempfile::tempdir().expect("a control group directory");
+    std::fs::write(group.path().join("cgroup.procs"), "").expect("an empty membership list");
+    let mut stranger = me.clone();
+    stranger.start_value = kr_protocol::scalars::U64::new(stranger.start_value.get() ^ 0xFFFF);
+    let boundary = SessionBoundary {
+        boundary: OwnershipBoundary::ControlGroup {
+            path: group.path().to_path_buf(),
+        },
+        root: stranger,
+    };
+    let pid = u32::try_from(me.pid.get()).expect("a process identifier");
+    let connection = ConnectionId::new(Uuid::from_bytes([4; 16]));
+    let first = ApplicationInstanceId::new(Uuid::from_bytes([1; 16]));
+    let second = ApplicationInstanceId::new(Uuid::from_bytes([2; 16]));
+    // Each record under each instance, so the ended one comes first in one of the two whatever
+    // order the broker keeps its instances in.
+    for (records, live) in [
+        ([(first, ended.clone()), (second, parent.clone())], second),
+        ([(first, parent.clone()), (second, ended.clone())], first),
+    ] {
+        let broker = Broker::open(None, session()).expect("a broker");
+        for (instance, process) in records {
+            launched(&broker, instance, process);
+        }
+        let admitted = kr_worker::questions::binding::verify(
+            Some(pid),
+            Some(&me),
+            connection,
+            Some(&boundary),
+            Some(&broker),
+        )
+        .expect("admitted under the live agent");
+        assert!(matches!(
+            kr_worker::questions::AgentBindings::binding_of(&broker, &admitted.process),
+            kr_worker::questions::AgentPlacement::Bound(binding)
+                if binding.application_instance_id == live
+        ));
+    }
+}

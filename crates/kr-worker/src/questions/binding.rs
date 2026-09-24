@@ -575,9 +575,10 @@ pub(crate) fn nearest_of(
 ///
 /// Only a candidate itself completes the chain: another process holding a candidate's identifier
 /// is not it, and that candidate is not further up either, because two running processes never
-/// hold one identifier, so it has ended. The chain reaches none of them where it ends before
-/// meeting one: at the top, at a parent that has ended, at a process that started before every one
-/// of them, or once every candidate has been passed that way.
+/// hold one identifier, so it has ended. A candidate is passed over that way only when no
+/// candidate is the process that holds the identifier. The chain reaches none of them where it
+/// ends before meeting one: at the top, at a parent that has ended, at a process that started
+/// before every one of them, or once every candidate has been passed that way.
 fn walk(
     table: &impl ProcessTable,
     from: &ProcessStartIdentity,
@@ -607,18 +608,17 @@ fn walk(
     let mut current = from.clone();
     for _ in 0..MAX_ANCESTRY_DEPTH {
         let current_pid = pid_of(&current);
-        if let Some(position) = open
+        // Several candidates can name this identifier, a record of one that has ended beside the
+        // one that holds it now, so every one of them is compared before any is passed over.
+        if let Some(&reached) = open
             .iter()
-            .position(|&index| pid_of(&candidates[index]) == current_pid)
+            .find(|&&index| current.matches(&candidates[index]))
         {
-            let held = open[position];
-            if current.matches(&candidates[held]) {
-                return Ancestry::Reaches(held);
-            }
-            open.remove(position);
-            if open.is_empty() {
-                return Ancestry::ReachesNone;
-            }
+            return Ancestry::Reaches(reached);
+        }
+        open.retain(|&index| pid_of(&candidates[index]) != current_pid);
+        if open.is_empty() {
+            return Ancestry::ReachesNone;
         }
         if let Some(&other) = open
             .iter()
@@ -1891,24 +1891,31 @@ mod tests {
             .expect("a placement")
             .parent;
         let parent = kr_ipc::identity::process_start_identity(parent_pid).expect("its identity");
-        // This process is its own nearest candidate, and its parent is found when it is not one.
+        // This process is its own nearest candidate on every platform: no link is read.
         assert_eq!(
             nearest_of(&mine, &[parent.clone(), mine.clone()]),
             Ancestry::Reaches(1)
         );
-        assert_eq!(
-            nearest_of(&mine, std::slice::from_ref(&parent)),
-            Ancestry::Reaches(0)
-        );
-        // The same identifiers with start values the kernel never reported are nobody's.
+        // Its parent is reached through the link a Unix kernel keeps current. A Windows kernel
+        // keeps the identifier after the parent exits, so there the link establishes nothing.
+        let above = nearest_of(&mine, std::slice::from_ref(&parent));
+        if cfg!(unix) {
+            assert_eq!(above, Ancestry::Reaches(0));
+        } else {
+            assert!(matches!(above, Ancestry::Undetermined(_)), "{above:?}");
+        }
+        // The same identifiers with start values the kernel never reported are nobody's. Showing
+        // that needs the same link, so on Windows it is not established either.
         let mut recycled = parent;
         recycled.start_value = kr_protocol::scalars::U64::new(recycled.start_value.get() ^ 0xFFFF);
         let mut stranger = mine.clone();
         stranger.start_value = kr_protocol::scalars::U64::new(stranger.start_value.get() ^ 0xFFFF);
-        assert_eq!(
-            nearest_of(&mine, &[recycled, stranger]),
-            Ancestry::ReachesNone
-        );
+        let neither = nearest_of(&mine, &[recycled, stranger]);
+        if cfg!(unix) {
+            assert_eq!(neither, Ancestry::ReachesNone);
+        } else {
+            assert!(matches!(neither, Ancestry::Undetermined(_)), "{neither:?}");
+        }
     }
 
     #[test]
@@ -1948,6 +1955,34 @@ mod tests {
             walk(&unread, &identity(300, 30), &[root(), identity(200, 20)]),
             Ancestry::Undetermined(why) if why.contains("Operation not permitted")
         ));
+    }
+
+    #[test]
+    fn a_record_of_a_process_that_ended_hides_no_live_one_holding_its_identifier() {
+        // Process 300 runs under 250, which started at 25 under 100, which started at 10 and has
+        // no parent. Records of processes that ended once held 250 and 300 too, from earlier.
+        let table = Scripted::default()
+            .found(&identity(300, 30))
+            .placement(300, &[placed(250)])
+            .found(&identity(250, 25))
+            .placement(250, &[placed(100)])
+            .found(&root())
+            .placement(100, &[placed(0)]);
+        // Whichever order the records are kept in, the live one is reached: the caller's parent,
+        // and the caller itself.
+        for (ended, live) in [
+            (identity(250, 20), identity(250, 25)),
+            (identity(300, 5), identity(300, 30)),
+        ] {
+            assert_eq!(
+                walk(&table, &identity(300, 30), &[ended.clone(), live.clone()]),
+                Ancestry::Reaches(1)
+            );
+            assert_eq!(
+                walk(&table, &identity(300, 30), &[live, ended]),
+                Ancestry::Reaches(0)
+            );
+        }
     }
 
     #[test]
