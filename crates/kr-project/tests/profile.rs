@@ -1614,6 +1614,17 @@ fn a_helper_directory_reached_through_a_link_is_named_as_the_directory_it_resolv
             "with no link in it"
         }
     );
+    // On macOS, where the sandbox judges an execution by its resolved path, the shape is required
+    // rather than hoped for: the system's Git names its helper directory from where it was
+    // started, and a Git from a packaging with a linked prefix reports that prefix. A Git that did
+    // neither would leave this test proving nothing, so it fails instead.
+    #[cfg(target_os = "macos")]
+    assert!(
+        through_a_link,
+        "the copy reports its helper directory through the link, which is the shape this test is \
+         about: it reported {}",
+        reported.display()
+    );
 
     let git = kr_project::git::GitProgram::at(&copy).expect("the copy resolves");
     let state = root.path().join("state");
