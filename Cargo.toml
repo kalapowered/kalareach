@@ -148,8 +148,8 @@ rusqlite = "=0.40.2"
 rustix = "=1.1.4"
 rustls-pki-types = "=1.15.1"
 # Checks a service's certificate against the platform's own trust store, as the managed-service
-# transport does, for the connection this product opens outside that transport: the rendezvous
-# room's WebSocket.
+# transport does, for the connections this product opens outside that transport: the rendezvous
+# room's WebSocket and mail submission.
 rustls-platform-verifier = "=0.7.0"
 schemars = "=1.2.2"
 semver = { version = "=1.0.28", features = ["serde"] }

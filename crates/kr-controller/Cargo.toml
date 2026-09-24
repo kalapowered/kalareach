@@ -40,8 +40,8 @@ kr-voice.workspace = true
 kr-attention.workspace = true
 kr-worker.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
-# The rendezvous room's WebSocket, opened on a TLS stream verified against the platform's trust
-# store.
+# The rendezvous room's WebSocket and mail submission, each opened on a TLS stream verified
+# against the platform's trust store, with no way to switch the verification off.
 rustls.workspace = true
 rustls-platform-verifier.workspace = true
 # The older answer shape a compatibility reader accepts publishes its schema like any protocol
@@ -79,8 +79,8 @@ kr-crypto.workspace = true
 kr-ipc = { workspace = true, features = ["testing"] }
 kr-term.workspace = true
 kr-transfer.workspace = true
-# Certificates a test issues for a loopback TLS server of its own, so a rendezvous request and the
-# room's WebSocket are checked against a real handshake.
+# Certificates a test issues for a loopback TLS server of its own, so a rendezvous request, the
+# room's WebSocket and mail submission are checked against a real handshake.
 rcgen.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
 tempfile.workspace = true
