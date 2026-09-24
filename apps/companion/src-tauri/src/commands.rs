@@ -1326,7 +1326,11 @@ mod tests {
     /// that performs a method refuses a parameter map that is not that method's shape with
     /// `INVALID_ARGUMENT`, which it can answer only by parsing before it asks for a host. The two
     /// reads that take nothing from the page go straight to that question, and the upload, which
-    /// takes a path rather than a map, refuses one that nobody dropped.
+    /// takes a path rather than a map, refuses one that nobody dropped. A voice start and a voice
+    /// stop take their values one by one rather than as a map, and refuse values that are not what
+    /// they claim to be in the same way. The stop closes the call this device is holding before it
+    /// parses anything, on purpose: section 15 keeps a local stop available whatever else fails,
+    /// and that closure contacts nothing.
     #[test]
     fn parameters_that_are_not_the_methods_shape_are_refused_before_anything_is_sent() {
         let refusal: Result<kr_protocol::session::SessionReadParams> =
@@ -1369,13 +1373,28 @@ mod tests {
             question_read,
             question_answer,
             pair_status,
+            voice_prepare,
+            voice_start,
+            voice_stop,
+            voice_grant,
+            voice_delegate,
+            voice_context,
         ]);
-        // One body for every command: each reads the arguments it takes and nothing else.
+        // One body for every command: each reads the arguments it takes and nothing else. The
+        // voice start and stop read theirs one by one. The identifiers they parse themselves are
+        // not identifiers, and the values the invoke layer types are of their types, so the
+        // refusal is the command's own rather than the invoke layer's.
+        let prepared = serde_json::to_value(kr_protocol::scalars::Digest256::from_bytes([0; 32]))
+            .expect("a digest");
         let foreign = serde_json::json!({
             "subject": {},
             "params": { "a_field_no_method_takes": true },
             "path": "/a/file/nobody/dropped",
             "sessionId": null,
+            "sessionIds": ["the session I was looking at"],
+            "durationSeconds": 60,
+            "prepared": prepared,
+            "voiceSessionId": "the call I was on",
         });
         for (command, method) in NAMED_COMMANDS {
             if method.is_none() {
