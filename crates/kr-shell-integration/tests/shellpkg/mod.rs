@@ -389,8 +389,8 @@ pub struct Commands {
     pub before_acceptance_answer: Vec<BridgeFrame>,
     /// Whether the worker side stops answering anything once it has answered the next resolve.
     pub silent_after_resolve: bool,
-    /// The request every answer the reader sent was for, in the order the answers arrived.
-    pub answer_ids: Vec<RequestId>,
+    /// The answers and events the bridge sent, together in the order they arrived.
+    pub arrivals: Vec<Arrival>,
     /// Set when this side is to close the endpoint once the event in hand has been read.
     close_requested: bool,
     /// Every resolve the bridge asked.
@@ -403,6 +403,15 @@ pub struct Commands {
     pub accepted: Vec<kr_protocol::root::RootCommandAcceptedParams>,
     /// Every reader entry the bridge reported.
     pub entries: Vec<RootEditorEnterParams>,
+}
+
+/// One frame the bridge sent, as the order of arrival needs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arrival {
+    /// The reader's answer to a request.
+    Answer(RequestId),
+    /// An event, by its name on the wire.
+    Event(&'static str),
 }
 
 impl Commands {
@@ -1023,6 +1032,7 @@ impl Session {
                     ) {
                         self.reader_lifetime += 1;
                     }
+                    self.commands.arrivals.push(Arrival::Event(name_of(&event)));
                     let outcome = self.routine_answer(&event);
                     if let Some(result) = outcome {
                         // What a case put ahead of this answer goes first, in the same write, so
@@ -1061,7 +1071,7 @@ impl Session {
                     }
                 }
                 BridgeFrame::Answer { id, answer } => {
-                    self.commands.answer_ids.push(id);
+                    self.commands.arrivals.push(Arrival::Answer(id));
                     self.answers.insert(id, (Instant::now(), answer));
                 }
                 other => panic!("a bridge sent {other:?}"),

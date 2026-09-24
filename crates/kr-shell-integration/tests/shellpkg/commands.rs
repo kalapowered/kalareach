@@ -14,13 +14,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use kr_protocol::root::{
-    CommandBypassReason, DETACH_HINT, LAUNCH_READER_BUDGET, LaunchCommand, RootCommandResolveParams,
+    CommandBypassReason, DETACH_HINT, LAUNCH_READER_BUDGET, LaunchCommand, ReaderContext,
+    RootCommandResolveParams,
 };
 use kr_protocol::session::{CommandIntegration, EnvironmentVariable};
 use kr_shell_integration::contract::events::ConsumeReason;
 use kr_shell_integration::contract::qualification::ShellKind;
 use kr_shell_integration::contract::requests::{
-    LaunchMailboxRequest, LaunchRejectionReason, LaunchTransactionId,
+    LaunchDecision, LaunchMailboxRequest, LaunchRejectionReason, LaunchTransactionId,
 };
 
 use super::*;
@@ -1050,7 +1051,10 @@ pub fn frames_that_arrive_while_a_command_waits_reach_the_reader_once(kind: Shel
     assert_eq!(asked.len(), 1, "one command asks once: {asked:?}");
     assert_eq!(last_run(&probes).arguments, ["amid-traffic"]);
 
-    // Each probe reads the fence as the frames before it, and only those, left it.
+    // Each probe reads the fence as the frames before it, and only those, left it, and it is the
+    // next reader that reads it: a wait that took the frames itself would answer at the prompt
+    // the line was typed at.
+    let mut next_prompt = None;
     for (id, fence_held, point) in [
         (before_refusal, true, "before the detach's refusal"),
         (after_refusal, false, "after the detach's refusal"),
@@ -1060,18 +1064,39 @@ pub fn frames_that_arrive_while_a_command_waits_reach_the_reader_once(kind: Shel
         let BridgeAnswer::Launch(decision) = session.answer(id) else {
             panic!("the reader answered a launch with something else")
         };
-        let reason = decision
-            .rejection()
-            .unwrap_or_else(|| panic!("a probe {point} installed a command"));
+        let LaunchDecision::Rejected(rejection) = decision else {
+            panic!("a probe {point} installed a command")
+        };
         assert_eq!(
-            reason != LaunchRejectionReason::FenceInvalid,
+            rejection.reason != LaunchRejectionReason::FenceInvalid,
             fence_held,
-            "{point}, the fence probed was {} held: {reason:?}",
-            if fence_held { "still" } else { "no longer" }
+            "{point}, the fence probed was {} held: {:?}",
+            if fence_held { "still" } else { "no longer" },
+            rejection.reason
+        );
+        let next = *next_prompt.get_or_insert_with(|| {
+            session
+                .commands
+                .entries
+                .iter()
+                .rev()
+                .find(|entry| entry.reader_context == ReaderContext::Primary)
+                .expect("the next reader entered")
+                .prompt_generation
+        });
+        assert!(
+            next > reader.prompt_generation,
+            "no reader had entered after the line"
+        );
+        assert_eq!(
+            rejection.prompt_generation, next,
+            "the probe {point} was read at another prompt than the next reader's"
         );
     }
+    let next_prompt = next_prompt.expect("the probes were answered");
 
-    // The refused detach is consumed with the hint, once, by the reader that took the refusal.
+    // The refused detach is consumed with the hint, once, by the reader that took the refusal, and
+    // between the two probes on either side of it.
     let (_, refused) = session.expect_event("the refused detach consumed", |event| {
         matches!(event, BridgeEvent::PreEofConsumed(_))
     });
@@ -1079,6 +1104,26 @@ pub fn frames_that_arrive_while_a_command_waits_reach_the_reader_once(kind: Shel
         unreachable!()
     };
     assert!(refused.hint_printed, "a refused detach printed no hint");
+    assert_eq!(refused.prompt_generation, next_prompt);
+    let arrivals = &session.commands.arrivals;
+    let at = |wanted: Arrival| {
+        arrivals
+            .iter()
+            .position(|arrival| *arrival == wanted)
+            .unwrap_or_else(|| panic!("{wanted:?} did not arrive"))
+    };
+    let (first_answer, second_answer) = (
+        at(Arrival::Answer(before_refusal)),
+        at(Arrival::Answer(after_refusal)),
+    );
+    let consumed_between = arrivals[first_answer..second_answer]
+        .iter()
+        .filter(|arrival| **arrival == Arrival::Event("pre_eof_consumed"))
+        .count();
+    assert_eq!(
+        consumed_between, 1,
+        "the refusal was not taken between the probes on either side of it: {arrivals:?}"
+    );
     assert!(
         !session.saw_event(Duration::from_millis(300), |event| matches!(
             event,
@@ -1107,10 +1152,12 @@ pub fn frames_that_arrive_while_a_command_waits_reach_the_reader_once(kind: Shel
     ];
     let answered: Vec<RequestId> = session
         .commands
-        .answer_ids
+        .arrivals
         .iter()
-        .copied()
-        .filter(|id| probed.contains(id))
+        .filter_map(|arrival| match arrival {
+            Arrival::Answer(id) if probed.contains(id) => Some(*id),
+            _ => None,
+        })
         .collect();
     assert_eq!(
         answered, probed,
