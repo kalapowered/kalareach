@@ -185,11 +185,6 @@ impl UtcFloor {
         self.owed.fetch_max(at_ms, Ordering::SeqCst);
     }
 
-    /// Records that a decision stood on the floor as it stands and is owed its record.
-    pub fn owe_current(&self) {
-        self.owe(self.get());
-    }
-
     /// Records that the floor has been written down up to `floor_ms`.
     pub fn wrote(&self, floor_ms: u64) {
         self.written.fetch_max(floor_ms, Ordering::SeqCst);
