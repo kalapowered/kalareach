@@ -554,19 +554,23 @@ impl SharingService {
     /// Revokes a grant and its descendants.
     ///
     /// `still_admitted` is as [`Self::share`]: run inside the transaction, before anything is
-    /// withdrawn.
+    /// withdrawn. `claim` is the hold of the action performing the revocation, when an action
+    /// performs it, and what it withdrew is written beside that claim in the same transaction
+    /// ([`GrantDirectory::revoke_claimed`]).
     ///
     /// # Errors
     ///
-    /// Returns an error when the store cannot be read or written, or when `still_admitted`
-    /// refuses.
+    /// Returns an error when the store cannot be read or written, when `still_admitted` refuses,
+    /// or when the claim cannot take the record.
     pub fn revoke(
         &self,
         grant_id: GrantId,
         now_ms: u64,
         still_admitted: impl FnOnce() -> Result<()>,
+        claim: Option<&crate::grants::ClaimHold>,
     ) -> Result<GrantRevocation> {
-        self.grants.revoke(grant_id, now_ms, still_admitted)
+        self.grants
+            .revoke_claimed(grant_id, now_ms, still_admitted, claim)
     }
 
     /// Lists the grants one issuer may see.

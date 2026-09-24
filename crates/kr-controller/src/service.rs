@@ -1656,6 +1656,10 @@ impl Controller {
     /// a deadline, and the wait for the store's lock and the read that follows it can each outlast
     /// one. The local owner's own revocation carries none.
     ///
+    /// `claim` is that mutation's hold on its action, and the rows it withdraws are written beside
+    /// the claim in the same transaction, so a repeat of an action whose answer was never recorded
+    /// is told exactly what it withdrew ([`Self::revocation_on_record`]).
+    ///
     /// # Errors
     ///
     /// Returns an error when the grant store or the registry cannot be read or written, or when
@@ -1664,6 +1668,7 @@ impl Controller {
         &self,
         grant_id: kr_protocol::ids::GrantId,
         carried: Option<&crate::authority::AdmittedMutation>,
+        claim: Option<&crate::grants::ClaimHold>,
     ) -> Result<kr_protocol::sharing::RevocationResult> {
         let now_ms = self.settled_now_ms();
         // The revocation writes its own fence debt inside the same transaction that revokes the
@@ -1677,11 +1682,14 @@ impl Controller {
             Some(carried) => {
                 let registry = self.registry.lock().await;
                 self.check_admission(&registry, carried)?;
-                self.sharing.revoke(grant_id, now_ms, || {
-                    self.check_admission(&registry, carried)
-                })?
+                self.sharing.revoke(
+                    grant_id,
+                    now_ms,
+                    || self.check_admission(&registry, carried),
+                    claim,
+                )?
             }
-            None => self.sharing.revoke(grant_id, now_ms, || Ok(()))?,
+            None => self.sharing.revoke(grant_id, now_ms, || Ok(()), claim)?,
         };
         self.complete_revocation(revocation.revoked.iter().copied().collect(), now_ms)
             .await
@@ -1697,7 +1705,8 @@ impl Controller {
     /// revision now in force, and the revoked device's record is already marked so it cannot be
     /// re-admitted at all.
     ///
-    /// `carried` is as [`Self::revoke_grant`]: the admission of the mutation this is performing.
+    /// `carried` and `claim` are as [`Self::revoke_grant`]: the admission of the mutation this is
+    /// performing, and its hold on its action, which the withdrawn rows are written beside.
     /// This withdrawal is more than one write and they are not in one store, so the admission is
     /// checked while it can still decide: before the grants are read, inside the transaction that
     /// withdraws them, and again before the device record when that transaction withdrew nothing
@@ -1713,6 +1722,7 @@ impl Controller {
         &self,
         device_id: kr_protocol::ids::DeviceId,
         carried: Option<&crate::authority::AdmittedMutation>,
+        claim: Option<&crate::grants::ClaimHold>,
     ) -> Result<kr_protocol::sharing::RevocationResult> {
         let now_ms = self.settled_now_ms();
         // Every write this makes happens while the registry guard is held, and the guard goes
@@ -1727,9 +1737,12 @@ impl Controller {
                 }
                 None => None,
             };
-            let revocation = self.sharing.grants().revoke_device(device_id, now_ms, || {
-                self.still_admitted(registry.as_deref(), carried)
-            })?;
+            let revocation = self.sharing.grants().revoke_device(
+                device_id,
+                now_ms,
+                || self.still_admitted(registry.as_deref(), carried),
+                claim,
+            )?;
             // The device record is marked revoked before the revision advances, so nothing can be
             // authorised against it in between. The directory is a view on this daemon's own
             // registry database, which is the file the network half keeps its device records in.
@@ -4921,7 +4934,8 @@ impl Controller {
         {
             Ok(Some(record)) => Some(respond(
                 mutation.request_id,
-                self.recorded_authority_change(mutation, record).await,
+                self.recorded_authority_change(actor_id, mutation, record)
+                    .await,
             )),
             Ok(None) => None,
             Err(error) => Some(respond(mutation.request_id, Err(error))),
@@ -4982,12 +4996,13 @@ impl Controller {
     /// [`Self::revocation_on_record`]), and otherwise as an outcome this host does not know.
     async fn recorded_authority_change(
         &self,
+        actor_id: &ActorId,
         mutation: &MutationRequest,
         record: crate::grants::ActionRecord,
     ) -> Result<ParamsValue> {
         match self.answer_without_fence(mutation, &record) {
             Some(answer) => answer,
-            None => self.revocation_on_record(mutation).await,
+            None => self.revocation_on_record(actor_id, mutation).await,
         }
     }
 
@@ -5043,55 +5058,57 @@ impl Controller {
         }
     }
 
-    /// What this host's records say an unfinished revocation withdrew, answered the way a
-    /// revocation that finds its work done is answered.
+    /// What an unfinished revocation did, answered the way a revocation that finds its work done
+    /// is answered, once this host's records show nothing is left for it to do.
     ///
-    /// The rows are the revocation's record, and they say which revocation withdrew each grant
-    /// ([`crate::grants::GrantDirectory::withdrawn_with`]). A grant revocation is answered once the
-    /// grant it names stands revoked, with what the revocation that withdrew it withdrew: the grant
-    /// and the descendants withdrawn under it, or nothing when it went with an ancestor, which is
-    /// what a repeat finds. A device revocation is answered once the device's own record stands
-    /// revoked, because that is its last write, and grants withdrawn beside a device record still
-    /// live are not a withdrawal this host can call finished. Its answer names the grants
-    /// withdrawn with that record: the device's grants its revocation named, at the moment the
-    /// record carries, and the descendants withdrawn under them. Any fence still owed runs first,
-    /// so the answer's revision and barrier are ones that hold; a fence is always safe to raise,
-    /// and it is the one the earlier attempt owed. Anything short of that is an outcome this host
-    /// does not know, and it is not performed again.
-    async fn revocation_on_record(&self, mutation: &MutationRequest) -> Result<ParamsValue> {
-        let withdrawn: Vec<kr_protocol::ids::GrantId> = match mutation.method.method() {
+    /// Nothing is left for a grant revocation once the grant it names stands revoked, because its
+    /// descendants went with it and none can be delegated from it since. Nothing is left for a
+    /// device revocation once the device's own record stands revoked, its last write, and so does
+    /// every grant the device holds: grants withdrawn beside a live record are not a finished
+    /// withdrawal, and a record revoked some other way says nothing of the grants. Answering then
+    /// and performing the revocation again would come to the same thing, so it is answered, and
+    /// never performed. The answer names what the action's own revocation withdrew, as its claim
+    /// records it ([`crate::grants::GrantDirectory::recorded_withdrawal`]), and nothing when it
+    /// withdrew nothing. Any fence still owed runs first, so the answer's revision and barrier are
+    /// ones that hold; a fence is always safe to raise, and it is the one the earlier attempt owed.
+    /// Anything short of that, and a claim an earlier build left with no record of what it
+    /// withdrew, is an outcome this host does not know.
+    async fn revocation_on_record(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+    ) -> Result<ParamsValue> {
+        let nothing_left = match mutation.method.method() {
             Some(Method::GrantRevoke) => {
                 let params: kr_protocol::sharing::GrantRevokeParams = parse(&mutation.params)?;
-                match self.sharing.grants().withdrawn_with(params.grant_id)? {
-                    Some(withdrawn) => withdrawn,
-                    None => return Err(unfinished_and_unknown()),
-                }
+                self.sharing
+                    .grants()
+                    .record(params.grant_id)?
+                    .is_some_and(|record| record.revoked_at_ms.is_some())
             }
             Some(Method::DeviceRevoke) => {
                 let params: kr_protocol::sharing::DeviceRevokeParams = parse(&mutation.params)?;
-                let Some(revoked_at) = self
-                    .devices
+                self.devices
                     .record_for_device(params.device_id)?
-                    .and_then(|record| record.revoked_at_ms)
-                else {
-                    return Err(unfinished_and_unknown());
-                };
-                let mut withdrawn = Vec::new();
-                for held in self.sharing.grants().records_for_device(params.device_id)? {
-                    if held.revoked_at_ms == Some(revoked_at.get())
-                        && held.revoked_by_parent.is_none()
-                    {
-                        withdrawn.extend(
-                            self.sharing
-                                .grants()
-                                .withdrawn_with(held.grant.grant_id)?
-                                .unwrap_or_default(),
-                        );
-                    }
-                }
-                withdrawn
+                    .is_some_and(|record| record.revoked_at_ms.is_some())
+                    && self
+                        .sharing
+                        .grants()
+                        .records_for_device(params.device_id)?
+                        .iter()
+                        .all(|held| held.revoked_at_ms.is_some())
             }
-            _ => return Err(unfinished_and_unknown()),
+            _ => false,
+        };
+        if !nothing_left {
+            return Err(unfinished_and_unknown());
+        }
+        let Some(withdrawn) = self
+            .sharing
+            .grants()
+            .recorded_withdrawal(actor_id, mutation.action_id)?
+        else {
+            return Err(unfinished_and_unknown());
         };
         let now_ms = self.settled_now_ms();
         encode(
@@ -5337,13 +5354,15 @@ impl Controller {
         let hold = match self.claim_authority_change(actor_id, mutation, claimed_at_ms)? {
             crate::grants::ActionClaim::Claimed { hold } => hold,
             crate::grants::ActionClaim::Recorded(record) => {
-                return self.recorded_authority_change(mutation, record).await;
+                return self
+                    .recorded_authority_change(actor_id, mutation, record)
+                    .await;
             }
         };
         let outcome = match method {
             Method::GrantCreate => self.grant_create(mutation, carried, claimed_at_ms).await,
-            Method::GrantRevoke => self.grant_revoke(mutation, carried).await,
-            Method::DeviceRevoke => self.device_revoke(mutation, carried).await,
+            Method::GrantRevoke => self.grant_revoke(mutation, carried, &hold).await,
+            Method::DeviceRevoke => self.device_revoke(mutation, carried, &hold).await,
             Method::DevicePreviewKeyUpdate => {
                 self.device_preview_key_update(actor_id, mutation).await
             }
@@ -5481,9 +5500,14 @@ impl Controller {
         &self,
         mutation: &MutationRequest,
         carried: crate::authority::AdmittedMutation,
+        hold: &crate::grants::ClaimHold,
     ) -> Result<ParamsValue> {
         let params: kr_protocol::sharing::GrantRevokeParams = parse(&mutation.params)?;
-        encode(&self.revoke_grant(params.grant_id, Some(&carried)).await?)
+        encode(
+            &self
+                .revoke_grant(params.grant_id, Some(&carried), Some(hold))
+                .await?,
+        )
     }
 
     /// Revokes a device, every grant it holds, and everything they were being used for.
@@ -5491,11 +5515,12 @@ impl Controller {
         &self,
         mutation: &MutationRequest,
         carried: crate::authority::AdmittedMutation,
+        hold: &crate::grants::ClaimHold,
     ) -> Result<ParamsValue> {
         let params: kr_protocol::sharing::DeviceRevokeParams = parse(&mutation.params)?;
         encode(
             &self
-                .revoke_device_authority(params.device_id, Some(&carried))
+                .revoke_device_authority(params.device_id, Some(&carried), Some(hold))
                 .await?,
         )
     }
@@ -5525,7 +5550,9 @@ impl Controller {
         let hold = match self.claim_authority_change(actor_id, mutation, kr_ipc::now_ms().get())? {
             crate::grants::ActionClaim::Claimed { hold } => hold,
             crate::grants::ActionClaim::Recorded(record) => {
-                return self.recorded_authority_change(mutation, record).await;
+                return self
+                    .recorded_authority_change(actor_id, mutation, record)
+                    .await;
             }
         };
         let outcome = self.device_preview_key_update(actor_id, mutation).await;

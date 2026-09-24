@@ -8,7 +8,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-09.08 | `a_device_revocation_is_performed_once_however_long_its_first_attempt_waits`, `a_retry_while_a_device_revocation_runs_is_told_it_has_not_finished`, `a_share_whose_record_was_never_written_is_answered_from_what_it_wrote_after_a_restart`, `a_revocation_whose_record_was_never_written_is_answered_from_the_rows_after_a_restart`, `an_authority_change_whose_attempt_ended_unrecorded_is_not_performed_again`, `a_refused_authority_change_is_refused_the_same_way_when_it_is_sent_again`, `an_unfinished_key_registration_is_not_answered_with_another_actions_registration`, `an_unfinished_revocation_pays_the_fence_it_still_owes_before_it_is_answered`, `an_unfinished_revocation_of_a_grant_still_standing_is_unknown`, `an_unfinished_device_revocation_is_answered_only_once_the_device_record_is_revoked`, `a_revocation_answered_from_the_rows_names_only_what_it_withdrew`, `a_device_revocation_answered_from_the_rows_names_only_what_it_withdrew`, `an_unfinished_destination_credential_is_unknown`, `a_claim_excludes_every_other_attempt_and_is_never_taken_over`, `an_earlier_receipts_table_migrates_once_and_its_open_claims_are_unfinished` |
+//! | KR-REQ-09.08 | `a_device_revocation_is_performed_once_however_long_its_first_attempt_waits`, `a_retry_while_a_device_revocation_runs_is_told_it_has_not_finished`, `a_share_whose_record_was_never_written_is_answered_from_what_it_wrote_after_a_restart`, `a_revocation_whose_record_was_never_written_is_answered_from_the_rows_after_a_restart`, `an_authority_change_whose_attempt_ended_unrecorded_is_not_performed_again`, `a_refused_authority_change_is_refused_the_same_way_when_it_is_sent_again`, `an_unfinished_key_registration_is_not_answered_with_another_actions_registration`, `an_unfinished_revocation_pays_the_fence_it_still_owes_before_it_is_answered`, `an_unfinished_revocation_of_a_grant_still_standing_is_unknown`, `an_unfinished_device_revocation_is_answered_only_once_the_device_record_is_revoked`, `a_revocation_answered_from_the_rows_names_only_what_it_withdrew`, `a_device_revocation_answered_from_the_rows_names_only_what_it_withdrew`, `an_unfinished_device_revocation_is_not_answered_while_the_device_holds_live_grants`, `a_device_revocation_on_a_floor_ahead_of_the_clock_names_only_what_it_withdrew`, `an_unfinished_destination_credential_is_unknown`, `a_claim_excludes_every_other_attempt_and_is_never_taken_over`, `a_claimed_revocation_writes_what_it_withdrew_beside_its_claim`, `an_earlier_receipts_table_migrates_once_and_its_open_claims_are_unfinished` |
 //! | KR-REQ-09.18 | `a_decision_that_reads_the_clock_waits_for_the_floor_whatever_the_grants_expiry`, `a_delegation_is_not_refused_as_expired_on_a_reading_this_host_could_not_write`, `a_paired_device_refused_while_the_floor_is_owed_is_told_storage_is_unavailable` |
 //! | KR-REQ-10.40 | `a_grant_carries_every_field_section_ten_names`, `the_host_intersects_the_grant_with_policy_on_every_request`, `a_delegation_narrows_and_never_extends`, `revoking_a_parent_revokes_every_descendant` |
 //! | KR-REQ-10.41 | `a_method_is_decided_from_the_registry_table_and_never_from_a_capability` |
@@ -167,7 +167,7 @@ fn a_withdrawal_that_loses_its_admission_at_the_store_writes_nothing() {
 
     // The same of a device's whole set: the read happens, the withdrawal does not.
     let refused = directory
-        .revoke_device(held.recipient_device_id, 4_100, lapsed)
+        .revoke_device(held.recipient_device_id, 4_100, lapsed, None)
         .expect_err("a lapsed admission withdraws nothing");
     assert!(
         refused.to_string().contains("window"),
@@ -363,9 +363,107 @@ fn a_claim_excludes_every_other_attempt_and_is_never_taken_over() {
     );
 }
 
+/// A revocation an action performs writes what it withdrew beside the action's claim, in the
+/// transaction that withdraws: all of it, or nothing when the withdrawal is refused, and once.
+#[test]
+fn a_claimed_revocation_writes_what_it_withdrew_beside_its_claim() {
+    use kr_controller::grants::ActionClaim;
+    use kr_protocol::ids::ActionId;
+
+    let directory = GrantDirectory::in_memory().expect("a grant store");
+    let actor = kr_protocol::ids::ActorId::new("local:501").expect("a principal");
+    let digest = kr_protocol::scalars::Digest256::from_bytes([3; 32]);
+    let claimed = |byte: u8| {
+        let action = ActionId::new(Uuid::from_bytes([byte; 16]));
+        match directory
+            .claim_action(&actor, action, &digest, 1_000)
+            .expect("claimed")
+        {
+            ActionClaim::Claimed { hold } => (action, hold),
+            ActionClaim::Recorded(record) => panic!("already claimed: {record:?}"),
+        }
+    };
+    let parent = grant(1, None, &[ActionRight::SessionView], GrantExpiry::Never);
+    let child = Grant {
+        grant_id: grant_id(2),
+        parent_grant_id: Nullable::some(parent.grant_id),
+        recipient_device_id: device_id(0xf2),
+        ..parent.clone()
+    };
+    let other = Grant {
+        recipient_device_id: device_id(0xf3),
+        ..grant(3, None, &[ActionRight::SessionView], GrantExpiry::Never)
+    };
+    for held in [&parent, &child, &other] {
+        directory
+            .issue(&record(held.clone()), || Ok(()))
+            .expect("written");
+    }
+
+    // A withdrawal refused inside its transaction writes neither the rows nor the record.
+    let (refused, hold) = claimed(0x10);
+    directory
+        .revoke_claimed(
+            parent.grant_id,
+            4_000,
+            || {
+                Err(kr_controller::error::ControllerError::PermissionDenied {
+                    detail: "the admission lapsed".to_owned(),
+                })
+            },
+            Some(&hold),
+        )
+        .expect_err("refused");
+    drop(hold);
+    assert_eq!(
+        directory
+            .recorded_withdrawal(&actor, refused)
+            .expect("readable"),
+        Some(Vec::new()),
+        "a claim no revocation committed under withdrew nothing"
+    );
+
+    let (revoked, hold) = claimed(0x11);
+    directory
+        .revoke_claimed(parent.grant_id, 4_100, || Ok(()), Some(&hold))
+        .expect("withdrawn");
+    // One claim, one withdrawal: a second under the same claim is refused, and withdraws nothing.
+    directory
+        .revoke_claimed(other.grant_id, 4_200, || Ok(()), Some(&hold))
+        .expect_err("the claim already records a withdrawal");
+    drop(hold);
+    assert_eq!(
+        directory
+            .recorded_withdrawal(&actor, revoked)
+            .expect("readable"),
+        Some(vec![parent.grant_id, child.grant_id])
+    );
+    assert!(
+        directory
+            .record(other.grant_id)
+            .expect("readable")
+            .expect("present")
+            .revoked_at_ms
+            .is_none()
+    );
+
+    let (device, hold) = claimed(0x12);
+    directory
+        .revoke_device(device_id(0xf3), 4_300, || Ok(()), Some(&hold))
+        .expect("withdrawn");
+    drop(hold);
+    assert_eq!(
+        directory
+            .recorded_withdrawal(&actor, device)
+            .expect("readable"),
+        Some(vec![other.grant_id])
+    );
+}
+
 /// A receipts table an earlier build wrote, with the lease column that let a later attempt take
 /// over an old claim, is brought to this build's shape once: the column goes, every row stays, and
-/// a claim that had no result is unfinished rather than one a later attempt can take.
+/// a claim that had no result is unfinished rather than one a later attempt can take. What such a
+/// claim's revocation withdrew was never kept, so it reads as not known, not as nothing.
 #[test]
 fn an_earlier_receipts_table_migrates_once_and_its_open_claims_are_unfinished() {
     use kr_controller::grants::{ActionClaim, ActionRecord};
@@ -425,6 +523,13 @@ fn an_earlier_receipts_table_migrates_once_and_its_open_claims_are_unfinished() 
             ActionClaim::Recorded(record) => assert_eq!(record, ActionRecord::Unfinished),
             ActionClaim::Claimed { .. } => panic!("an earlier build's open claim was taken over"),
         }
+        assert_eq!(
+            directory
+                .recorded_withdrawal(&actor, open)
+                .expect("readable"),
+            None,
+            "an earlier build kept no record of what the claim's revocation withdrew"
+        );
     }
     let columns: Vec<String> = rusqlite::Connection::open(&path)
         .expect("opens the store")
@@ -440,6 +545,10 @@ fn an_earlier_receipts_table_migrates_once_and_its_open_claims_are_unfinished() 
     );
     assert!(
         columns.iter().any(|column| column == "refusal_code"),
+        "{columns:?}"
+    );
+    assert!(
+        columns.iter().any(|column| column == "withdrawn"),
         "{columns:?}"
     );
 }
@@ -2215,7 +2324,7 @@ async fn a_local_revocation_advances_the_revision_and_answers_through_the_barrie
 
     let result = tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_grant(held.grant_id, None),
+        controller.revoke_grant(held.grant_id, None, None),
     )
     .await
     .expect("the revocation completes")
@@ -2293,7 +2402,7 @@ async fn a_revocation_whose_admission_no_longer_stands_withdraws_nothing() {
     };
     let refused = tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_grant(held.grant_id, Some(&lapsed)),
+        controller.revoke_grant(held.grant_id, Some(&lapsed), None),
     )
     .await
     .expect("completes")
@@ -2324,7 +2433,7 @@ async fn a_revocation_whose_admission_no_longer_stands_withdraws_nothing() {
     // The same revocation, carrying nothing, is the local owner's own and goes through.
     tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_grant(held.grant_id, None),
+        controller.revoke_grant(held.grant_id, None, None),
     )
     .await
     .expect("completes")
@@ -2344,7 +2453,7 @@ async fn a_repeated_revocation_withdraws_nothing_and_advances_nothing() {
 
     let first = tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_grant(held.grant_id, None),
+        controller.revoke_grant(held.grant_id, None, None),
     )
     .await
     .expect("completes")
@@ -2353,7 +2462,7 @@ async fn a_repeated_revocation_withdraws_nothing_and_advances_nothing() {
 
     let second = tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_grant(held.grant_id, None),
+        controller.revoke_grant(held.grant_id, None, None),
     )
     .await
     .expect("completes")
@@ -2376,7 +2485,7 @@ async fn a_repeated_revocation_withdraws_nothing_and_advances_nothing() {
         .expect("the host advances its own revision");
     let third = tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_grant(held.grant_id, None),
+        controller.revoke_grant(held.grant_id, None, None),
     )
     .await
     .expect("completes")
@@ -2424,7 +2533,7 @@ async fn a_device_revocation_takes_every_grant_that_device_held() {
 
     let result = tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_device_authority(recipient, None),
+        controller.revoke_device_authority(recipient, None, None),
     )
     .await
     .expect("the revocation completes")
@@ -2444,7 +2553,7 @@ async fn a_device_revocation_takes_every_grant_that_device_held() {
     // A second revocation of the same device withdraws nothing and advances nothing.
     let again = tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_device_authority(recipient, None),
+        controller.revoke_device_authority(recipient, None, None),
     )
     .await
     .expect("completes")
@@ -2607,10 +2716,9 @@ async fn a_device_revocation_is_performed_once_however_long_its_first_attempt_wa
     let (mutation, first) = host
         .claim_first_revocation(&mut client, action_id, recipient, stopped_since)
         .await;
-    assert!(
-        matches!(first, kr_controller::grants::ActionClaim::Claimed { .. }),
-        "{first:?}"
-    );
+    let kr_controller::grants::ActionClaim::Claimed { hold: first } = first else {
+        panic!("the first attempt claims its action: {first:?}");
+    };
 
     let retried = client
         .repeat(&mutation)
@@ -2634,7 +2742,7 @@ async fn a_device_revocation_is_performed_once_however_long_its_first_attempt_wa
     // The first attempt goes on to its effect.
     let performed = tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_device_authority(recipient, None),
+        controller.revoke_device_authority(recipient, None, Some(&first)),
     )
     .await
     .expect("the revocation completes")
@@ -2895,18 +3003,27 @@ async fn an_unfinished_revocation_pays_the_fence_it_still_owes_before_it_is_answ
     let digest =
         kr_protocol::digest::mutation_digest(&mutation, &actor).expect("the payload digest");
 
-    // The attempt claims, withdraws the rows with the fence they owe, and ends before the fence.
-    let claimed = controller
+    // The attempt claims, withdraws the rows with the fence they owe under its claim, and ends
+    // before the fence.
+    let kr_controller::grants::ActionClaim::Claimed { hold } = controller
         .sharing()
         .grants()
         .claim_action(&actor, action_id, &digest, kr_ipc::now_ms().get())
-        .expect("the attempt claims its action");
+        .expect("the attempt claims its action")
+    else {
+        panic!("the attempt claims its action");
+    };
     controller
         .sharing()
         .grants()
-        .revoke(parent.grant_id, kr_ipc::now_ms().get(), || Ok(()))
+        .revoke_claimed(
+            parent.grant_id,
+            kr_ipc::now_ms().get(),
+            || Ok(()),
+            Some(&hold),
+        )
         .expect("the rows are withdrawn");
-    drop(claimed);
+    drop(hold);
     assert!(
         !controller
             .sharing()
@@ -3276,14 +3393,17 @@ fn paired_record(device: DeviceId) -> kr_controller::service::net::devices::Devi
     }
 }
 
-/// The device revocation a local caller composes under `action`, claimed by a first attempt that
-/// then ended without recording anything, as the host's own dispatch claims it.
-async fn device_revocation_claimed_and_left(
+/// The device revocation a local caller composes under `action`, and the hold of the first attempt
+/// that claimed it, which goes on to act under it.
+async fn device_revocation_claimed(
     host: &Serving,
     client: &mut kr_ipc::client::LocalClient,
     action: u8,
     device: DeviceId,
-) -> kr_protocol::envelope::MutationRequest {
+) -> (
+    kr_protocol::envelope::MutationRequest,
+    kr_controller::grants::ClaimHold,
+) {
     let (mutation, claimed) = host
         .claim_first_revocation(
             client,
@@ -3292,12 +3412,10 @@ async fn device_revocation_claimed_and_left(
             kr_ipc::now_ms().get(),
         )
         .await;
-    assert!(
-        matches!(claimed, kr_controller::grants::ActionClaim::Claimed { .. }),
-        "{claimed:?}"
-    );
-    drop(claimed);
-    mutation
+    let kr_controller::grants::ActionClaim::Claimed { hold } = claimed else {
+        panic!("the first attempt claims its action: {claimed:?}");
+    };
+    (mutation, hold)
 }
 
 /// KR-REQ-09.08 and 23.27: a device revocation whose attempt ended unrecorded is answered from the
@@ -3306,7 +3424,7 @@ async fn device_revocation_claimed_and_left(
 /// One attempt withdrew the device's grants and ended before its record: grants withdrawn beside a
 /// record still live are not a finished withdrawal, and the retry is told the outcome is not
 /// known. Another withdrew everything, its record too, and ended before its answer: the retry is
-/// answered with what the rows show withdrawn.
+/// answered with what it withdrew.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unfinished_device_revocation_is_answered_only_once_the_device_record_is_revoked() {
     let host = Serving::start().await;
@@ -3327,12 +3445,13 @@ async fn an_unfinished_device_revocation_is_answered_only_once_the_device_record
         .grants()
         .issue(&record(partial_grant.clone()), || Ok(()))
         .expect("written");
-    let unfinished = device_revocation_claimed_and_left(&host, &mut client, 0x68, partial).await;
+    let (unfinished, hold) = device_revocation_claimed(&host, &mut client, 0x68, partial).await;
     controller
         .sharing()
         .grants()
-        .revoke_device(partial, kr_ipc::now_ms().get(), || Ok(()))
+        .revoke_device(partial, kr_ipc::now_ms().get(), || Ok(()), Some(&hold))
         .expect("the grants are withdrawn");
+    drop(hold);
     let refusal = client
         .repeat(&unfinished)
         .await
@@ -3368,14 +3487,15 @@ async fn an_unfinished_device_revocation_is_answered_only_once_the_device_record
         .grants()
         .issue(&record(whole_grant.clone()), || Ok(()))
         .expect("written");
-    let finished = device_revocation_claimed_and_left(&host, &mut client, 0x69, whole).await;
+    let (finished, hold) = device_revocation_claimed(&host, &mut client, 0x69, whole).await;
     let performed = tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_device_authority(whole, None),
+        controller.revoke_device_authority(whole, None, Some(&hold)),
     )
     .await
     .expect("the withdrawal completes")
     .expect("it succeeds");
+    drop(hold);
     let mut client = host.client().await;
     let answered: kr_protocol::sharing::RevocationResult = client
         .repeat(&finished)
@@ -3384,14 +3504,160 @@ async fn an_unfinished_device_revocation_is_answered_only_once_the_device_record
         .expect("the revocation is answered from the rows")
         .to_typed()
         .expect("a revocation result");
-    assert!(
-        answered.revoked_grants.contains(&whole_grant.grant_id),
-        "{answered:?}"
+    assert_eq!(
+        answered.revoked_grants, performed.revoked_grants,
+        "what the attempt withdrew"
     );
+    assert!(answered.revoked_grants.contains(&whole_grant.grant_id));
     assert_eq!(
         answered.authority_revision, performed.authority_revision,
         "its fence ran, so the revision did not move again"
     );
+}
+
+/// KR-REQ-09.08 and 23.27: a device whose record was revoked some other way, with its grants still
+/// standing, is not a finished device revocation. An unfinished revocation of it is told the
+/// outcome is not known, and nothing is withdrawn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unfinished_device_revocation_is_not_answered_while_the_device_holds_live_grants() {
+    let host = Serving::start().await;
+    let controller = &host.controller;
+    let mut client = host.client().await;
+    let device = device_id(0xd5);
+    let held = Grant {
+        recipient_device_id: device,
+        ..grant(0x45, None, &[ActionRight::SessionView], GrantExpiry::Never)
+    };
+    controller
+        .devices()
+        .commit(&paired_record(device))
+        .expect("a paired device");
+    controller
+        .sharing()
+        .grants()
+        .issue(&record(held.clone()), || Ok(()))
+        .expect("written");
+    let before = controller.policy().authority_revision();
+    let (unfinished, hold) = device_revocation_claimed(&host, &mut client, 0x6e, device).await;
+    drop(hold);
+    // The record alone, as the network half's own revocation of a device writes it.
+    assert!(
+        controller
+            .devices()
+            .revoke(device, TimestampMs::new(kr_ipc::now_ms().get()))
+            .expect("the record is written"),
+        "the record is revoked"
+    );
+
+    let refusal = client
+        .repeat(&unfinished)
+        .await
+        .expect("the daemon answers")
+        .expect_err("a device holding live grants is not a finished revocation");
+    assert_eq!(
+        refusal.code,
+        kr_protocol::error::ErrorCode::OutcomeUnknown,
+        "{refusal:?}"
+    );
+    let stored = controller
+        .sharing()
+        .grants()
+        .record(held.grant_id)
+        .expect("readable")
+        .expect("present");
+    assert!(stored.revoked_at_ms.is_none(), "nothing was withdrawn");
+    assert_eq!(controller.policy().authority_revision(), before);
+}
+
+/// KR-REQ-09.08 and 23.27: what a device revocation answered from its claim withdrew is told apart
+/// from an earlier revocation by the claim, not by the moment. On a clock floor ahead of this
+/// machine's clock, one of the device's grants withdrawn on its own and the device's revocation
+/// carry the same moment; the retry names only what the device's revocation withdrew.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_revocation_on_a_floor_ahead_of_the_clock_names_only_what_it_withdrew() {
+    let host = Serving::start().await;
+    let controller = &host.controller;
+    let device = device_id(0xd6);
+    controller
+        .devices()
+        .commit(&paired_record(device))
+        .expect("a paired device");
+    let earlier = Grant {
+        recipient_device_id: device,
+        ..grant(0x46, None, &[ActionRight::SessionView], GrantExpiry::Never)
+    };
+    let later = Grant {
+        recipient_device_id: device,
+        ..grant(0x47, None, &[ActionRight::FilesRead], GrantExpiry::Never)
+    };
+    for held in [&earlier, &later] {
+        controller
+            .sharing()
+            .grants()
+            .issue(&record(held.clone()), || Ok(()))
+            .expect("written");
+    }
+    // A reading an hour ahead of this machine's clock, so every reading after it is held there.
+    let ahead = kr_ipc::now_ms().get() + 60 * 60 * 1000;
+    controller
+        .update_policy(|policy| policy.observe_utc(ahead))
+        .expect("the floor is written");
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        controller.revoke_grant(earlier.grant_id, None, None),
+    )
+    .await
+    .expect("the earlier revocation completes")
+    .expect("it succeeds");
+
+    let mut client = host.client().await;
+    let action_id = kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x6f; 16]));
+    let mutation = client
+        .compose(
+            Method::DeviceRevoke,
+            action_id,
+            kr_protocol::envelope::ActionTarget::environment(host.temp.environment_id()),
+            &kr_protocol::sharing::DeviceRevokeParams { device_id: device },
+        )
+        .await
+        .expect("the revocation is composed");
+    let first: kr_protocol::sharing::RevocationResult = client
+        .repeat(&mutation)
+        .await
+        .expect("the daemon answers")
+        .expect("the device is revoked")
+        .to_typed()
+        .expect("a revocation result");
+    let moments: Vec<Option<u64>> = [&earlier, &later]
+        .iter()
+        .map(|held| {
+            controller
+                .sharing()
+                .grants()
+                .record(held.grant_id)
+                .expect("readable")
+                .expect("present")
+                .revoked_at_ms
+        })
+        .collect();
+    assert_eq!(moments[0], moments[1], "both withdrawals carry one moment");
+    assert!(!first.revoked_grants.contains(&earlier.grant_id));
+    drop(client);
+    host.forget_answer(action_id);
+
+    let mut client = host.client().await;
+    let again: kr_protocol::sharing::RevocationResult = client
+        .repeat(&mutation)
+        .await
+        .expect("the daemon answers")
+        .expect("the revocation is answered from its claim")
+        .to_typed()
+        .expect("a revocation result");
+    assert_eq!(
+        again.revoked_grants, first.revoked_grants,
+        "the answer the first attempt gave"
+    );
+    assert_eq!(again.authority_revision, first.authority_revision);
 }
 
 /// The claim a local caller's action takes, taken by a first attempt that then ended without
@@ -3442,7 +3708,7 @@ async fn a_revocation_answered_from_the_rows_names_only_what_it_withdrew() {
     }
     tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_grant(earlier.grant_id, None),
+        controller.revoke_grant(earlier.grant_id, None, None),
     )
     .await
     .expect("the earlier revocation completes")
@@ -3549,7 +3815,7 @@ async fn a_device_revocation_answered_from_the_rows_names_only_what_it_withdrew(
     }
     tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_grant(earlier.grant_id, None),
+        controller.revoke_grant(earlier.grant_id, None, None),
     )
     .await
     .expect("the earlier revocation completes")

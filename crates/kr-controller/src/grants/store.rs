@@ -282,6 +282,7 @@ impl GrantDirectory {
                      recorded_at_ms INTEGER,
                      refusal_code   TEXT,
                      refusal_detail TEXT,
+                     withdrawn      BLOB,
                      PRIMARY KEY (actor_id, action_id)
                  );
                  CREATE TABLE IF NOT EXISTS host_authority (
@@ -490,45 +491,6 @@ impl GrantDirectory {
         rows.into_iter().collect()
     }
 
-    /// Returns what the revocation that withdrew a grant withdrew with it, as the rows record it.
-    ///
-    /// A revocation writes the grant it names with no ancestor, and each descendant it withdraws
-    /// with that grant as the ancestor that took it; a withdrawn row is never written again. So a
-    /// grant a revocation named reads back with the descendants withdrawn under it, which is what
-    /// that revocation withdrew. A grant that went with an ancestor reads back with nothing,
-    /// because a revocation naming it afterwards withdraws nothing. `None` is a grant this host
-    /// does not hold or that still stands. A revocation whose record was never written is answered
-    /// from this.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the rows cannot be read.
-    pub fn withdrawn_with(&self, grant_id: GrantId) -> Result<Option<Vec<GrantId>>> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let subtree = subtree_within(&connection, grant_id)?;
-        let Some(named) = subtree.first() else {
-            return Ok(None);
-        };
-        if named.revoked_at_ms.is_none() {
-            return Ok(None);
-        }
-        if named.revoked_by_parent.is_some() {
-            return Ok(Some(Vec::new()));
-        }
-        Ok(Some(
-            subtree
-                .iter()
-                .filter(|record| {
-                    record.grant.grant_id == grant_id || record.revoked_by_parent == Some(grant_id)
-                })
-                .map(|record| record.grant.grant_id)
-                .collect(),
-        ))
-    }
-
     /// Returns every grant one device holds.
     ///
     /// # Errors
@@ -572,6 +534,26 @@ impl GrantDirectory {
         now_ms: u64,
         still_admitted: impl FnOnce() -> Result<()>,
     ) -> Result<GrantRevocation> {
+        self.revoke_claimed(grant_id, now_ms, still_admitted, None)
+    }
+
+    /// Revokes a grant and every grant delegated from it, as [`Self::revoke`] does, for the action
+    /// `claim` holds when an action performs the revocation.
+    ///
+    /// What it withdrew is written beside the action's claim in the transaction that withdraws it,
+    /// so the claim of an action whose answer was never recorded still says exactly what that
+    /// action withdrew, and whether it withdrew anything at all ([`Self::recorded_withdrawal`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::revoke`], and a storage error when the claim cannot take the record.
+    pub fn revoke_claimed(
+        &self,
+        grant_id: GrantId,
+        now_ms: u64,
+        still_admitted: impl FnOnce() -> Result<()>,
+        claim: Option<&ClaimHold>,
+    ) -> Result<GrantRevocation> {
         // The subtree is read and updated inside one transaction. A child written between the read
         // and the update would otherwise escape the cascade entirely, and a crash part way through
         // the loop would leave a subtree half revoked.
@@ -580,7 +562,11 @@ impl GrantDirectory {
             // holds, so a check made before it is a check with a read still to come.
             let subtree = Self::subtree_to_revoke(connection, grant_id)?;
             still_admitted()?;
-            Self::revoke_subtree(connection, grant_id, &subtree, now_ms)
+            let revocation = Self::revoke_subtree(connection, grant_id, &subtree, now_ms)?;
+            if let Some(hold) = claim {
+                record_withdrawal(connection, hold, &revocation.revoked)?;
+            }
+            Ok(revocation)
         })
     }
 
@@ -590,16 +576,20 @@ impl GrantDirectory {
     /// that device between two of these would survive its own device's revocation.
     ///
     /// `still_admitted` is as [`Self::revoke`]: run inside the transaction, after every subtree
-    /// this would withdraw has been read and before the first of them is withdrawn.
+    /// this would withdraw has been read and before the first of them is withdrawn. `claim` is as
+    /// [`Self::revoke_claimed`]: the claim of the action performing this, which is written what it
+    /// withdrew, an empty list included, in the same transaction.
     ///
     /// # Errors
     ///
-    /// Returns an error when the rows cannot be read or written, or when `still_admitted` refuses.
+    /// Returns an error when the rows cannot be read or written, when `still_admitted` refuses, or
+    /// when the claim cannot take the record.
     pub fn revoke_device(
         &self,
         device_id: DeviceId,
         now_ms: u64,
         still_admitted: impl FnOnce() -> Result<()>,
+        claim: Option<&ClaimHold>,
     ) -> Result<GrantRevocation> {
         self.in_transaction(|connection| {
             let held = read_for_device(connection, device_id)?;
@@ -646,6 +636,9 @@ impl GrantDirectory {
                 merged.devices.extend(one.devices);
                 merged.sessions.extend(one.sessions);
                 merged.covers_every_session |= one.covers_every_session;
+            }
+            if let Some(hold) = claim {
+                record_withdrawal(connection, hold, &merged.revoked)?;
             }
             Ok(merged)
         })
@@ -1280,6 +1273,47 @@ impl GrantDirectory {
         })
     }
 
+    /// What the revocation one actor's claimed action performed withdrew, as its claim records it
+    /// ([`Self::revoke_claimed`], [`Self::revoke_device`]).
+    ///
+    /// The grants in the order they were withdrawn. An empty list is a revocation that withdrew
+    /// nothing, and so is a claim with no record of one: every revocation an action performs
+    /// writes its record in the transaction that withdraws, so a claim without one saw no
+    /// revocation commit under it. `None` is a claim this host cannot say that of: one an earlier
+    /// build wrote and left open, which kept no such record, or no claim at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the row cannot be read, and an error when the record does not
+    /// decode.
+    pub fn recorded_withdrawal(
+        &self,
+        actor_id: &ActorId,
+        action_id: ActionId,
+    ) -> Result<Option<Vec<GrantId>>> {
+        let key = claim_key(actor_id, action_id);
+        let held: Option<Option<Vec<u8>>> = self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT withdrawn FROM authority_receipts
+                      WHERE actor_id = ?1 AND action_id = ?2",
+                    params![key.0, key.1.as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()
+        })?;
+        match held {
+            None => Ok(None),
+            Some(None) => Ok(Some(Vec::new())),
+            Some(Some(encoded)) if encoded.is_empty() => Ok(None),
+            Some(Some(encoded)) => {
+                kr_cbor::from_canonical_slice(&encoded, &kr_cbor::Limits::DEFAULT)
+                    .map(Some)
+                    .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+            }
+        }
+    }
+
     // --- Durable authority state ------------------------------------------------------------
 
     /// Reads this host's stored policy, if it has one.
@@ -1472,6 +1506,37 @@ fn claim_key(actor_id: &ActorId, action_id: ActionId) -> ClaimKey {
     (actor_id.as_str().to_owned(), *action_id.get().as_bytes())
 }
 
+/// Writes what one action's revocation withdrew beside its claim, inside the transaction that
+/// withdrew it.
+///
+/// Once: the row takes it only while it holds no outcome and no withdrawal. A claim with no row to
+/// take it refuses, and the withdrawal with it, because a withdrawal the claim does not record
+/// would read later as one that never happened.
+fn record_withdrawal(
+    connection: &Connection,
+    hold: &ClaimHold,
+    withdrawn: &[GrantId],
+) -> Result<()> {
+    let encoded = kr_cbor::to_canonical_vec(&withdrawn)
+        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+    let written = connection
+        .execute(
+            "UPDATE authority_receipts SET withdrawn = ?3
+              WHERE actor_id = ?1 AND action_id = ?2
+                AND result IS NULL AND refusal_code IS NULL AND withdrawn IS NULL",
+            params![hold.key.0, hold.key.1.as_slice(), encoded],
+        )
+        .map_err(ControllerError::registry)?;
+    if written == 1 {
+        Ok(())
+    } else {
+        Err(ControllerError::Storage {
+            operation: "record a revocation beside its action's claim",
+            detail: "the action's claim holds no row that can take it".to_owned(),
+        })
+    }
+}
+
 /// One claim row, as the store reads it back: the digest, the result once there is one, and the
 /// refusal's code and words once there is one of those.
 type ClaimRow = (Vec<u8>, Option<Vec<u8>>, Option<String>, Option<String>);
@@ -1526,9 +1591,12 @@ fn read_claim(
 ///
 /// Two earlier shapes exist. One carried a lease column, from when a later attempt could take over
 /// a claim whose lease had run out; that column goes, and nothing reads it. Both lacked the columns
-/// a refusal is kept in, which are added empty. The rows stay as they were: a claim with no result
-/// in either shape belongs to an attempt that ended with the daemon that wrote it, which is what a
-/// row with no result and no hold reads as.
+/// a refusal and a revocation's withdrawal are kept in, which are added empty. The rows stay as
+/// they were: a claim with no result in either shape belongs to an attempt that ended with the
+/// daemon that wrote it, which is what a row with no result and no hold reads as. Such a claim's
+/// revocation may have withdrawn grants without saying which, so its withdrawal is marked as one
+/// this host does not know (an empty value), rather than left reading as a revocation that
+/// withdrew nothing ([`GrantDirectory::recorded_withdrawal`]).
 ///
 /// One immediate transaction, which reads the shape inside it, so two processes opening one store
 /// at once change it once.
@@ -1554,6 +1622,15 @@ fn migrate_receipts(connection: &Connection) -> Result<()> {
             .execute_batch(
                 "ALTER TABLE authority_receipts ADD COLUMN refusal_code TEXT;
                  ALTER TABLE authority_receipts ADD COLUMN refusal_detail TEXT;",
+            )
+            .map_err(ControllerError::registry)?;
+    }
+    if !columns.contains("withdrawn") {
+        transaction
+            .execute_batch(
+                "ALTER TABLE authority_receipts ADD COLUMN withdrawn BLOB;
+                 UPDATE authority_receipts SET withdrawn = x''
+                  WHERE result IS NULL AND refusal_code IS NULL;",
             )
             .map_err(ControllerError::registry)?;
     }

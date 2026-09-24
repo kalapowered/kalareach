@@ -3557,22 +3557,23 @@ window has closed, or whose daemon has restarted since, is still told what happe
 * for an attempt that ended without recording what it did (the daemon stopped, or the attempt's
   task ended, in between), what this host's own records prove it did, and otherwise
   `OUTCOME_UNKNOWN`. A share is answered from the grant and the invitation it wrote, which take
-  identities derived from the action. A grant revocation is answered from the rows once the grant
-  it names stands revoked, and a device revocation once the device's own record does too, its last
-  write. The rows record which revocation withdrew each grant, so the answer names what that
-  withdrawal took: the grant and the descendants withdrawn under it, or nothing when the grant went
-  with an ancestor, as a repeat finds; for a device, the grants withdrawn with its record. Any fence
-  still owed runs before the answer goes back, so its revision and barrier hold. That fence
-  withdraws the registration of the connection that asked, as it does every other, so that
-  connection is told to open a new one and the retry on it is answered. Nothing else this host
-  keeps names the action that changed it: a device's record can hold a preview key because another
-  action registered the same one. So a revocation short of that, a preview-key registration, a
-  destination's credential or a voice change in this state is `OUTCOME_UNKNOWN`.
+  identities derived from the action. A revocation writes what it withdrew beside its action's
+  claim, in the transaction that withdraws, and is answered from that once nothing is left for it
+  to do: for a grant revocation, the grant it names stands revoked; for a device revocation, the
+  device's own record stands revoked, its last write, and so does every grant the device holds.
+  The answer names what the action withdrew, and nothing when another revocation had taken it
+  first. Any fence still owed runs before the answer goes back, so its revision and barrier hold.
+  That fence withdraws the registration of the connection that asked, as it does every other, so
+  that connection is told to open a new one and the retry on it is answered. A claim an earlier
+  build left open kept no record of what it withdrew. Nothing else this host keeps names the
+  action that changed it: a device's record can hold a preview key because another action
+  registered the same one. So a revocation short of that or with no such record, a preview-key
+  registration, a destination's credential or a voice change in this state is `OUTCOME_UNKNOWN`.
 
 No attempt takes over a claim, however long ago it was written: an attempt that is still running is
 not known to have stopped, and one that stopped may already have reached its effect. So a retry
-cannot fence the host a second time for one withdrawal or start a second metered call, and an
-action identifier reused with different parameters is a conflict rather than a second change.
+cannot perform a withdrawal a second time or start a second metered call, and an action identifier
+reused with different parameters is a conflict rather than a second change.
 
 The fence this daemon takes is host-wide: every registration is withdrawn and the connections that
 kept their authority are re-admitted at the revision now in force. Withdrawing one device's

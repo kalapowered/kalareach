@@ -1324,7 +1324,7 @@ fn a_delegation_narrows_what_the_issuer_holds() {
 
     // Revoking the owner takes the delegation with it.
     let revocation = service
-        .revoke(owner.grant.grant_id, NOW + 10, || Ok(()))
+        .revoke(owner.grant.grant_id, NOW + 10, || Ok(()), None)
         .expect("revoked");
     assert!(revocation.revoked.contains(&narrower.grant.grant_id));
 }
@@ -2237,7 +2237,7 @@ async fn revoking_a_shared_grant_completes_through_the_dispatch_barrier() {
     let before = controller.policy().authority_revision();
     let result = tokio::time::timeout(
         Duration::from_secs(20),
-        controller.revoke_grant(issued.grant.grant_id, None),
+        controller.revoke_grant(issued.grant.grant_id, None, None),
     )
     .await
     .expect("the revocation completes")
