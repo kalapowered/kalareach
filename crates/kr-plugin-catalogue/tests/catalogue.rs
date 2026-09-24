@@ -416,6 +416,97 @@ async fn kr_req_11_08_a_role_past_the_depth_bound_is_refused_before_its_document
     }
 }
 
+/// A root the client moves to may change whether the repository publishes consistent snapshots,
+/// and may carry fields the client does not know, which it signs over and accepts with the rest.
+/// The depth bound holds before any fetch all the same, in both directions: the chain is followed
+/// to the bound under the new naming, and the role past it is never requested.
+#[tokio::test]
+async fn kr_req_11_08_a_root_that_changes_snapshot_naming_keeps_the_depth_bound_before_fetch() {
+    for from_consistent in [false, true] {
+        for (depth, permitted) in [(3usize, true), (4, false)] {
+            let home = tempfile::tempdir().expect("a temporary directory");
+            let first = Generation::build(
+                home.path(),
+                GenerationSpec {
+                    consistent_snapshot: from_consistent,
+                    ..GenerationSpec::default()
+                },
+            )
+            .await;
+            let mut catalogue = enrolled(
+                home.path(),
+                &first,
+                RepositoryBudgets::defaults(),
+                CapabilityCeiling::default_ceiling(),
+            )
+            .await;
+            catalogue
+                .sync(&repository())
+                .await
+                .expect("the first generation");
+            first
+                .rotate_to(GenerationSpec {
+                    generation: 2,
+                    delegation_chain: depth,
+                    consistent_snapshot: !from_consistent,
+                    root_version: 2,
+                    root_extra: vec![("delegations".to_owned(), serde_json::json!(false))],
+                    ..GenerationSpec::default()
+                })
+                .await;
+            let watched = Watched::default();
+            catalogue.set_transport(Arc::new(watched.clone()));
+            let outcome = catalogue.sync(&repository()).await;
+            let fetched = watched.fetched.lock().expect("the list").clone();
+            let requested = |file: &str| {
+                fetched
+                    .iter()
+                    .any(|url| url.path().ends_with(&format!("/{file}")))
+            };
+            let named = |role: &str| {
+                if from_consistent {
+                    format!("{role}.json")
+                } else {
+                    format!("2.{role}.json")
+                }
+            };
+            let case = format!("from consistent snapshots {from_consistent}, depth {depth}");
+            assert!(
+                requested("2.root.json"),
+                "{case}: the rotation was followed"
+            );
+            if permitted {
+                let outcome = outcome.unwrap_or_else(|refusal| panic!("{case}: {refusal}"));
+                assert_eq!(outcome.generation.get(), 2, "{case}");
+                assert!(requested(&named("level-3")), "{case}: {fetched:?}");
+                catalogue
+                    .activate_package(
+                        &repository(),
+                        &plugin(),
+                        &version(),
+                        FetchReason::ExplicitInstall,
+                    )
+                    .await
+                    .unwrap_or_else(|refusal| panic!("{case}: {refusal}"));
+                continue;
+            }
+            let refusal = outcome.expect_err("a chain past the bound is refused");
+            assert!(
+                refusal.to_string().contains("deeper than 3 roles"),
+                "{case}: {refusal}"
+            );
+            assert!(
+                requested(&named("level-3")),
+                "{case}: the chain was followed under the new naming: {fetched:?}"
+            );
+            assert!(
+                !requested("level-4.json") && !requested("2.level-4.json"),
+                "{case}: the role past the bound was fetched: {fetched:?}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn kr_req_11_07_root_key_rotation_advances_and_withholding_rotated_root_fails() {
     let home = tempfile::tempdir().expect("a temporary directory");

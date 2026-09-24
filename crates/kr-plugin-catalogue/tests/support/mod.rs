@@ -190,6 +190,12 @@ pub struct GenerationSpec {
     /// Whether the root publishes consistent snapshots: every metadata document but the timestamp
     /// named with its version in front, and every target with its SHA-256.
     pub consistent_snapshot: bool,
+    /// The version of the root this generation is signed under.
+    pub root_version: u64,
+    /// The keys of the root this one replaces, which sign it as well, as a rotation is signed.
+    pub previous_keys: Option<KeySet>,
+    /// Fields the root carries beyond the ones the client knows, signed with the rest.
+    pub root_extra: Vec<(String, serde_json::Value)>,
     /// A change made to the package's index entry after it is derived from the manifest, before
     /// the index is signed: an index that says something the manifest does not.
     pub edit_entry: Option<fn(&mut IndexEntry)>,
@@ -210,6 +216,9 @@ impl Default for GenerationSpec {
             delegation_chain: 0,
             empty_leaf: false,
             consistent_snapshot: false,
+            root_version: 1,
+            previous_keys: None,
+            root_extra: Vec::new(),
             edit_entry: None,
         }
     }
@@ -284,6 +293,19 @@ impl Generation {
     #[must_use]
     pub fn targets_dir(&self) -> PathBuf {
         self.directory.join("targets")
+    }
+
+    /// Publishes `spec` at this location under a new root that this generation's root signs as
+    /// well, beside what is already here, so a client that trusts this generation's root moves to
+    /// the new one. The new root is signed with fresh keys unless `spec` names some.
+    pub async fn rotate_to(&self, spec: GenerationSpec) {
+        let keys = spec.keys.clone().unwrap_or_else(KeySet::generate);
+        let spec = GenerationSpec {
+            keys: Some(keys.clone()),
+            previous_keys: Some(self.keys.clone()),
+            ..spec
+        };
+        write_generation(&self.directory, &keys, &spec).await;
     }
 
     /// Rebuilds this generation in place at another generation number.
@@ -476,19 +498,41 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
     // republishes, which is what section 11's rule is about.
     let root_expires: jiff::Timestamp = "2036-01-01T00:00:00Z".parse().expect("a literal instant");
 
-    let root = keys.root_document(root_expires, spec.consistent_snapshot);
+    let root_version = NonZeroU64::new(spec.root_version).expect("a root version starts at one");
+    let mut root =
+        keys.root_document_with_version(root_version, root_expires, spec.consistent_snapshot);
+    root._extra.extend(spec.root_extra.iter().cloned());
     let signed_root = SignedRole::new(
         root.clone(),
-        &KeyHolder::Root(root),
+        &KeyHolder::Root(root.clone()),
         &keys.sources(),
         &SystemRandom::new(),
     )
     .await
     .expect("a signed root");
+    // A root after the first is signed by the root it replaces as well, which is what lets a
+    // client that trusts that one move to it.
+    let signed_root = match &spec.previous_keys {
+        Some(previous) => {
+            let old = SignedRole::new(
+                root.clone(),
+                &KeyHolder::Root(previous.root_document(root_expires, false)),
+                &previous.sources(),
+                &SystemRandom::new(),
+            )
+            .await
+            .expect("signed by the previous root");
+            signed_root
+                .add_old_signatures(old.signed().signatures.clone())
+                .expect("cross signed")
+        }
+        None => signed_root,
+    };
     let root_bytes = signed_root.buffer().clone();
+    let versioned_root = format!("{}.root.json", spec.root_version);
     std::fs::write(directory.join("root.json"), &root_bytes).expect("writable");
     std::fs::write(metadata.join("root.json"), &root_bytes).expect("writable");
-    std::fs::write(metadata.join("1.root.json"), &root_bytes).expect("writable");
+    std::fs::write(metadata.join(&versioned_root), &root_bytes).expect("writable");
 
     // The package, then the index that describes it.
     let (manifest, files) = package_files(spec);
@@ -657,6 +701,7 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
         .expect("a signed repository");
     signed.write(&metadata).await.expect("written");
     std::fs::write(metadata.join("root.json"), &root_bytes).expect("writable");
+    std::fs::write(metadata.join(&versioned_root), &root_bytes).expect("writable");
     if spec.consistent_snapshot {
         let mut names = vec!["index.json".to_owned()];
         names.extend(files.iter().map(|(name, _)| format!("{prefix}/{name}")));

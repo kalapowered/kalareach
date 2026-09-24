@@ -430,6 +430,15 @@ pub async fn verify(
             return Err(classify(&source));
         }
     };
+    // Every document the load asked for was one the transport could place, and the top-level
+    // targets document is among them. A load that ended any other way was not held to the depth
+    // bound, whatever the client made of it.
+    if !sync.resolved() {
+        return Err(CatalogueError::Untrusted {
+            detail: "the load finished without the top-level targets document this host follows"
+                .to_owned(),
+        });
+    }
     let versions = MetadataVersions {
         root: repository.root().signed.version.get(),
         timestamp: repository.timestamp().signed.version.get(),
@@ -958,8 +967,10 @@ enum Operation {
 enum Document {
     /// A root on the chain of trust, read for whether it publishes consistent snapshots.
     Root,
-    /// The timestamp or the snapshot, which only the allowance counts.
-    Unread,
+    /// The timestamp, which only the allowance counts.
+    Timestamp,
+    /// The snapshot, which only the allowance counts.
+    Snapshot,
     /// The top-level targets document.
     Targets,
     /// A delegated role's document, at its depth beneath the top-level targets role.
@@ -973,45 +984,19 @@ enum Document {
     Index,
 }
 
-/// The parts of a metadata document this host reads for itself: its type, a root's snapshot
-/// setting and the roles a targets document delegates to.
-///
-/// The client reads the same fields of the same bytes before it trusts them, so a document it
-/// accepts says the same thing here. One it refuses ends the load whatever is read here.
-#[derive(serde::Deserialize)]
-struct Shape {
-    signed: SignedShape,
-}
-
-#[derive(serde::Deserialize)]
-struct SignedShape {
-    #[serde(rename = "_type")]
-    kind: String,
-    #[serde(default)]
-    consistent_snapshot: bool,
-    #[serde(default)]
-    delegations: Option<DelegationsShape>,
-}
-
-#[derive(serde::Deserialize)]
-struct DelegationsShape {
-    #[serde(default)]
-    roles: Vec<RoleShape>,
-}
-
-#[derive(serde::Deserialize)]
-struct RoleShape {
-    name: String,
-}
-
 /// The delegation tree as the targets documents of one load describe it.
 ///
-/// The client fetches the top-level targets document before any delegated role's, and a role's
-/// document only after the document that delegates to it has arrived, so a role's depth is known
-/// before its document is asked for. A role is recognised by the file the client names its
-/// document with: the role's name percent-encoded, then `.json`, with the version in front where
-/// the root publishes consistent snapshots. A document that no delegation this load read names is
-/// not fetched at all.
+/// The client fetches roots, the timestamp, the snapshot and the top-level targets document, in
+/// that order, before any delegated role's, and a role's document only after the document that
+/// delegates to it has arrived, so a role's depth is known before its document is asked for. Each
+/// document is recognised by the file the client names it with, and read with the client's own
+/// types, so a document the client accepts says the same thing here; one that cannot be read here
+/// is refused, because what it would have said about the tree is not known. Until the top-level
+/// targets document arrives only those four kinds of document are fetched; after it, only the
+/// documents of roles a delivered document delegates to, recognised by the role's name
+/// percent-encoded, then `.json`, with the version in front where the root publishes consistent
+/// snapshots. Anything else is refused rather than fetched, so no misreading lets a document past
+/// the bound.
 #[derive(Debug, Default)]
 struct DelegationTree {
     /// Whether the root the client is on publishes consistent snapshots.
@@ -1037,18 +1022,26 @@ impl DelegationTree {
                     !version.is_empty() && version.bytes().all(|byte| byte.is_ascii_digit())
                 })
             };
-            let targets = if self.consistent_snapshot {
-                versioned(".targets.json")
-            } else {
-                file == "targets.json"
+            let named = |role: &str| {
+                if self.consistent_snapshot {
+                    versioned(&format!(".{role}.json"))
+                } else {
+                    file == format!("{role}.json")
+                }
             };
-            return Ok(if targets {
-                Document::Targets
-            } else if versioned(".root.json") {
-                Document::Root
+            return if versioned(".root.json") {
+                Ok(Document::Root)
+            } else if file == "timestamp.json" {
+                Ok(Document::Timestamp)
+            } else if named("snapshot") {
+                Ok(Document::Snapshot)
+            } else if named("targets") {
+                Ok(Document::Targets)
             } else {
-                Document::Unread
-            });
+                Err(format!(
+                    "{url} is not a document the client asks for before the top-level targets"
+                ))
+            };
         }
         let named = self
             .role_of(file)
@@ -1085,26 +1078,29 @@ impl DelegationTree {
     fn arrived(&mut self, document: &Document, bytes: &[u8]) -> Result<(), String> {
         let depth = match document {
             Document::Root => {
-                if let Ok(shape) = serde_json::from_slice::<Shape>(bytes)
-                    && shape.signed.kind == "root"
-                {
-                    self.consistent_snapshot = shape.signed.consistent_snapshot;
-                }
+                let root =
+                    serde_json::from_slice::<tough::schema::Signed<tough::schema::Root>>(bytes)
+                        .map_err(|source| {
+                            format!("a root on the chain of trust does not read: {source}")
+                        })?;
+                self.consistent_snapshot = root.signed.consistent_snapshot;
                 return Ok(());
             }
-            Document::Unread | Document::Index => return Ok(()),
+            Document::Timestamp | Document::Snapshot | Document::Index => return Ok(()),
             Document::Targets => 0,
             Document::Delegated { depth, .. } => *depth,
         };
-        let shape = serde_json::from_slice::<Shape>(bytes)
-            .ok()
-            .filter(|shape| shape.signed.kind == "targets")
-            .ok_or_else(|| "a targets document of this generation is not one".to_owned())?;
-        self.top_level_arrived = true;
-        for role in shape
+        let targets =
+            serde_json::from_slice::<tough::schema::Signed<Targets>>(bytes).map_err(|source| {
+                format!("a targets document of this generation does not read: {source}")
+            })?;
+        if matches!(document, Document::Targets) {
+            self.top_level_arrived = true;
+        }
+        for role in targets
             .signed
             .delegations
-            .map(|d| d.roles)
+            .map(|delegations| delegations.roles)
             .unwrap_or_default()
         {
             if self.depths.insert(role.name.clone(), depth + 1).is_some() {
@@ -1175,6 +1171,11 @@ impl SyncTransport {
     /// Returns the bytes of metadata and index fetched so far.
     fn spent(&self) -> u64 {
         self.state().spent
+    }
+
+    /// Returns true once the top-level targets document has arrived and been read.
+    fn resolved(&self) -> bool {
+        self.state().tree.top_level_arrived
     }
 }
 
@@ -1265,7 +1266,10 @@ impl futures::Stream for Counted {
                     this.done = true;
                     return Poll::Ready(Some(Err(refused(&this.url, Refusal::Allowance(limit)))));
                 }
-                if !matches!(this.document, Document::Unread | Document::Index) {
+                if !matches!(
+                    this.document,
+                    Document::Timestamp | Document::Snapshot | Document::Index
+                ) {
                     this.held.extend_from_slice(&chunk);
                 }
                 Poll::Ready(Some(Ok(chunk)))
@@ -1477,16 +1481,46 @@ mod tests {
             .expect("a document location")
     }
 
+    /// A targets document the client reads, delegating to `roles`.
     fn targets_document(roles: &[&str]) -> Vec<u8> {
-        let roles: Vec<serde_json::Value> = roles
-            .iter()
-            .map(|name| serde_json::json!({ "name": name }))
-            .collect();
-        serde_json::to_vec(&serde_json::json!({
-            "signed": { "_type": "targets", "delegations": { "keys": {}, "roles": roles } },
-            "signatures": []
-        }))
-        .expect("a literal document")
+        let targets = targets_with(Some(tough::schema::Delegations {
+            keys: std::collections::HashMap::new(),
+            roles: roles
+                .iter()
+                .map(|name| role(name, "packages/acme/*/*/*", None))
+                .collect(),
+        }));
+        serde_json::to_vec(&tough::schema::Signed {
+            signed: targets,
+            signatures: Vec::new(),
+        })
+        .expect("a serialisable document")
+    }
+
+    /// A root document the client reads, publishing consistent snapshots or not, and carrying
+    /// `extra` beside the fields the client knows.
+    fn root_document(consistent_snapshot: bool, extra: &[(&str, serde_json::Value)]) -> Vec<u8> {
+        let root = tough::schema::Root {
+            spec_version: "1.0.0".to_owned(),
+            consistent_snapshot,
+            version: std::num::NonZeroU64::new(2).expect("two is not zero"),
+            expires: "2036-01-01T00:00:00Z".parse().expect("a literal instant"),
+            keys: std::collections::HashMap::new(),
+            roles: std::collections::HashMap::new(),
+            _extra: extra
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), value.clone()))
+                .collect(),
+        };
+        let bytes = serde_json::to_vec(&tough::schema::Signed {
+            signed: root,
+            signatures: Vec::new(),
+        })
+        .expect("a serialisable document");
+        // The client reads it as a root, extension and all.
+        serde_json::from_slice::<tough::schema::Signed<tough::schema::Root>>(&bytes)
+            .expect("the client reads it");
+        bytes
     }
 
     #[test]
@@ -1494,8 +1528,8 @@ mod tests {
         let tree = DelegationTree::default();
         for (file, document) in [
             ("2.root.json", Document::Root),
-            ("timestamp.json", Document::Unread),
-            ("snapshot.json", Document::Unread),
+            ("timestamp.json", Document::Timestamp),
+            ("snapshot.json", Document::Snapshot),
             ("targets.json", Document::Targets),
         ] {
             assert_eq!(tree.classify(&document_url(file)), Ok(document), "{file}");
@@ -1510,8 +1544,24 @@ mod tests {
         );
         assert_eq!(
             consistent.classify(&document_url("7.snapshot.json")),
-            Ok(Document::Unread)
+            Ok(Document::Snapshot)
         );
+        // Anything else before the top-level targets is not a document the client asks for then,
+        // and neither is a name in the other snapshot mode's form.
+        for (tree, file) in [
+            (&tree, "vendor.json"),
+            (&tree, "7.targets.json"),
+            (&consistent, "targets.json"),
+            (&consistent, "snapshot.json"),
+        ] {
+            let refusal = tree
+                .classify(&document_url(file))
+                .expect_err("not a document asked for before the targets");
+            assert!(
+                refusal.contains("before the top-level targets"),
+                "{refusal}"
+            );
+        }
     }
 
     #[test]
@@ -1606,33 +1656,45 @@ mod tests {
 
     #[test]
     fn the_root_the_client_moves_to_decides_how_role_documents_are_named() {
-        let mut tree = DelegationTree::default();
-        let root = serde_json::to_vec(&serde_json::json!({
-            "signed": { "_type": "root", "consistent_snapshot": true },
-            "signatures": []
-        }))
-        .expect("a literal document");
-        tree.arrived(&Document::Root, &root).expect("a root");
-        assert_eq!(
-            tree.classify(&document_url("targets.json")),
-            Ok(Document::Unread),
-            "a consistent root names its targets document with a version"
-        );
-        tree.arrived(&Document::Targets, &targets_document(&["acme"]))
-            .expect("the top-level targets document");
-        assert!(tree.classify(&document_url("acme.json")).is_err());
-        assert!(tree.classify(&document_url("2.acme.json")).is_ok());
+        // A root may carry fields the client does not know, whatever their shape; the client
+        // reads it all the same, and so does this.
+        for (from, to) in [(false, true), (true, false)] {
+            let mut tree = DelegationTree {
+                consistent_snapshot: from,
+                ..DelegationTree::default()
+            };
+            let root = root_document(to, &[("delegations", serde_json::json!(false))]);
+            tree.arrived(&Document::Root, &root).expect("a root");
+            let (targets, other) = if to {
+                ("2.targets.json", "targets.json")
+            } else {
+                ("targets.json", "2.targets.json")
+            };
+            assert_eq!(tree.classify(&document_url(targets)), Ok(Document::Targets));
+            assert!(tree.classify(&document_url(other)).is_err());
+            tree.arrived(&Document::Targets, &targets_document(&["acme"]))
+                .expect("the top-level targets document");
+            let (role, other) = if to {
+                ("2.acme.json", "acme.json")
+            } else {
+                ("acme.json", "2.acme.json")
+            };
+            assert!(tree.classify(&document_url(role)).is_ok());
+            assert!(tree.classify(&document_url(other)).is_err());
+        }
     }
 
     #[test]
-    fn a_targets_document_that_is_not_one_is_refused() {
+    fn a_document_the_client_would_not_read_is_refused_rather_than_guessed_at() {
+        let snapshot = br#"{"signed": {"_type": "snapshot"}, "signatures": []}"#;
         let refusal = DelegationTree::default()
-            .arrived(
-                &Document::Targets,
-                b"{\"signed\": {\"_type\": \"snapshot\"}}",
-            )
+            .arrived(&Document::Targets, snapshot)
             .expect_err("not a targets document");
-        assert!(refusal.contains("is not one"), "{refusal}");
+        assert!(refusal.contains("does not read"), "{refusal}");
+        let refusal = DelegationTree::default()
+            .arrived(&Document::Root, snapshot)
+            .expect_err("not a root");
+        assert!(refusal.contains("does not read"), "{refusal}");
     }
 
     #[test]
