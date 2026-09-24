@@ -307,6 +307,7 @@ describe('the commercial surface (KR-REQ-17.32)', () => {
     const { controls } = start('ios', { channel: 'app_store' })
     controls.account.setUsage({
       state: 'read',
+      generation: 'aaaa',
       period_label: 'Usage in September 2026',
       lines: [{ label: 'Backup storage', used: 1.4, included: 5, unit: 'GB' }]
     })
@@ -315,6 +316,7 @@ describe('the commercial surface (KR-REQ-17.32)', () => {
       email: 'sam@example.com',
       name: null,
       usage_readable: true,
+      generation: 'aaaa',
       outcome: null
     })
     await person.click(await screen.findByRole('button', { name: /^Account/ }))

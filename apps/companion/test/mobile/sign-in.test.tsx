@@ -51,6 +51,7 @@ describe('signing in hands the ceremony to the system browser (KR-REQ-17.19)', (
     act(() => {
       controls.account.setUsage({
         state: 'read',
+        generation: 'aaaa',
         period_label: 'Usage in September 2026',
         lines: [{ label: 'Relay this month', used: 1.2, included: 10, unit: 'GB' }]
       })
@@ -59,6 +60,7 @@ describe('signing in hands the ceremony to the system browser (KR-REQ-17.19)', (
         email: 'sam@example.com',
         name: null,
         usage_readable: true,
+        generation: 'aaaa',
         outcome: null
       })
     })

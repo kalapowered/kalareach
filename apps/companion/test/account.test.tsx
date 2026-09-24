@@ -56,6 +56,7 @@ describe('the desktop Account sheet', () => {
         email: 'sam@example.com',
         name: null,
         usage_readable: false,
+        generation: 'aaaa',
         outcome: null
       })
     })
@@ -63,19 +64,21 @@ describe('the desktop Account sheet', () => {
     expect(item).toHaveTextContent('sam@example.com')
   })
 
-  it('never shows one sign-in\'s usage for another, however late it answers', async () => {
+  it('never shows one grant\'s usage for another, however late it answers', async () => {
     const person = userEvent.setup()
     const controls = start()
     controls.account.holdUsage()
-    const signedIn = (email: string): AccountView => ({
+    const signedIn = (email: string, generation: string): AccountView => ({
       state: 'signed_in',
       email,
       name: null,
       usage_readable: true,
+      generation,
       outcome: null
     })
-    const line = (used: number) => ({
+    const line = (generation: string, used: number) => ({
       state: 'read' as const,
+      generation,
       period_label: 'Usage in September 2026',
       lines: [{ label: 'Relay this month', used, included: 10, unit: 'GB' }]
     })
@@ -83,25 +86,50 @@ describe('the desktop Account sheet', () => {
     const sheet = await screen.findByRole('dialog', { name: 'Account' })
 
     act(() => {
-      controls.account.set(signedIn('first@example.com'))
+      controls.account.set(signedIn('first@example.com', 'aaaa'))
     })
     expect(await within(sheet).findByText('Usage has not been read yet.')).toBeInTheDocument()
     act(() => {
       controls.account.set({ state: 'signed_out', outcome: 'signed_out' })
     })
     act(() => {
-      controls.account.set(signedIn('second@example.com'))
+      controls.account.set(signedIn('second@example.com', 'bbbb'))
     })
     await within(sheet).findByText('Signed in as second@example.com.')
+    // Another sign-in of the same address, written by another window into the shared store, is
+    // another grant.
+    act(() => {
+      controls.account.set(signedIn('second@example.com', 'cccc'))
+    })
 
-    // The second sign-in's usage arrives, then the first's, late.
+    // The newest grant's usage arrives first, then the older grants' figures, late: only the
+    // newest is shown.
     await act(async () => {
-      controls.account.answerUsage(1, line(2))
-      controls.account.answerUsage(0, line(9))
+      controls.account.answerUsage(2, line('cccc', 4))
       await Promise.resolve()
     })
-    expect(await within(sheet).findByText('2 of 10 GB')).toBeInTheDocument()
+    expect(await within(sheet).findByText('4 of 10 GB')).toBeInTheDocument()
+    await act(async () => {
+      controls.account.answerUsage(1, line('bbbb', 2))
+      controls.account.answerUsage(0, line('aaaa', 9))
+      await Promise.resolve()
+    })
+    expect(within(sheet).getByText('4 of 10 GB')).toBeInTheDocument()
+    expect(within(sheet).queryByText('2 of 10 GB')).toBeNull()
     expect(within(sheet).queryByText('9 of 10 GB')).toBeNull()
+
+    // A read the backend answered for a grant other than the one the page asked about is not
+    // shown either.
+    act(() => {
+      controls.account.set(signedIn('second@example.com', 'dddd'))
+    })
+    await act(async () => {
+      controls.account.answerUsage(3, line('cccc', 5))
+      await Promise.resolve()
+    })
+    expect(within(sheet).queryByText('5 of 10 GB')).toBeNull()
+    expect(within(sheet).queryByText('4 of 10 GB')).toBeNull()
+    expect(within(sheet).getByText('Usage has not been read yet.')).toBeInTheDocument()
   })
 
   it('says a failed sign-out beside the account that stays signed in', async () => {
@@ -116,6 +144,7 @@ describe('the desktop Account sheet', () => {
         email: 'sam@example.com',
         name: null,
         usage_readable: false,
+        generation: 'aaaa',
         outcome: null
       })
     })
@@ -142,6 +171,7 @@ describe('the desktop Account sheet', () => {
         email: 'sam@example.com',
         name: 'Sam',
         usage_readable: false,
+        generation: 'aaaa',
         outcome: 'sign_out_failed'
       },
       { state: 'ended' },

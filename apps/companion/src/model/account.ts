@@ -98,6 +98,8 @@ export type AccountView =
       readonly email: string | null
       readonly name: string | null
       readonly usage_readable: boolean
+      /** Which grant this is: usage read for another grant is never shown for it. */
+      readonly generation: string
       readonly outcome: AccountOutcome | null
     }
   /** The sign-in ended by itself. */
@@ -113,7 +115,13 @@ export interface UsageLine {
 
 /** The account's usage. */
 export type UsageView =
-  | { readonly state: 'read'; readonly period_label: string; readonly lines: readonly UsageLine[] }
+  | {
+      readonly state: 'read'
+      /** The grant the figures were read with. */
+      readonly generation: string
+      readonly period_label: string
+      readonly lines: readonly UsageLine[]
+    }
   | { readonly state: 'not_granted' }
   | { readonly state: 'could_not_read' }
   | { readonly state: 'signed_out' }

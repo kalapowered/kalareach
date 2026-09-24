@@ -43,33 +43,30 @@ export interface AccountHandle {
   readonly readUsage: () => void
 }
 
-/** Who a view says is signed in, or null when nobody is. */
-function signedInAs(view: AccountView): string | null {
-  return view.state === 'signed_in' ? (view.email ?? '') : null
+/** The grant a view says is signed in, or null when none is. */
+function generationOf(view: AccountView | null): string | null {
+  return view?.state === 'signed_in' ? view.generation : null
 }
 
 /**
  * Reads where the device stands and follows every change the backend publishes.
  *
- * Usage belongs to one sign-in. Each change of who is signed in, including signing out, starts a
- * new epoch; a usage read answers for the epoch it was asked in, so figures read for one sign-in
- * are never shown for another, however late they arrive.
+ * Usage belongs to one grant, which the backend names in the view and in each usage it reads. A
+ * usage answer is kept only when the grant it was read with is still the one the view shows, so
+ * figures read for one sign-in are never shown for another, however late they arrive, including
+ * a sign-in another window wrote into the shared store.
  */
 export function useAccount(port: HostPort): AccountHandle {
   const [view, setView] = useState<AccountView | null>(null)
-  const [epoch, setEpoch] = useState(0)
-  const [usage, setUsage] = useState<{ readonly epoch: number; readonly usage: UsageView } | null>(
-    null
-  )
-  const current = useRef({ epoch: 0, who: null as string | null })
+  const [usage, setUsage] = useState<{
+    readonly generation: string
+    readonly usage: UsageView
+  } | null>(null)
+  const current = useRef<string | null>(null)
 
   const show = useCallback((next: AccountView) => {
+    current.current = generationOf(next)
     setView(next)
-    const who = signedInAs(next)
-    if (who === null || who !== current.current.who) {
-      current.current = { epoch: current.current.epoch + 1, who }
-      setEpoch(current.current.epoch)
-    }
   }, [])
 
   useEffect(() => {
@@ -92,9 +89,12 @@ export function useAccount(port: HostPort): AccountHandle {
   }, [port, show])
 
   const readUsage = useCallback(() => {
-    const asked = current.current.epoch
+    const asked = current.current
+    if (asked === null) return
     const keep = (read: UsageView) => {
-      if (asked === current.current.epoch) setUsage({ epoch: asked, usage: read })
+      if (asked !== current.current) return
+      if (read.state === 'read' && read.generation !== asked) return
+      setUsage({ generation: asked, usage: read })
     }
     port
       .accountUsage()
@@ -104,10 +104,11 @@ export function useAccount(port: HostPort): AccountHandle {
       })
   }, [port])
 
+  const generation = generationOf(view)
   const readable = view?.state === 'signed_in' && view.usage_readable
   useEffect(() => {
     if (readable) readUsage()
-  }, [readable, epoch, readUsage])
+  }, [readable, generation, readUsage])
 
   const signIn = useCallback(() => {
     // The panel says the browser is open before the browser appears, so a return by any path lands
@@ -134,8 +135,9 @@ export function useAccount(port: HostPort): AccountHandle {
       })
   }, [port, show])
 
-  // Usage is shown only while the sign-in may read it, and only what was read for this sign-in.
-  const shown = readable && usage?.epoch === epoch ? usage.usage : null
+  // Usage is shown only while the sign-in may read it, and only what was read for this grant.
+  const shown =
+    readable && usage !== null && usage.generation === generation ? usage.usage : null
   return { view, usage: shown, signIn, cancel, signOut, readUsage }
 }
 

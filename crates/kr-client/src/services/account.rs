@@ -1546,6 +1546,10 @@ pub enum AccountStatus {
         name: Option<String>,
         /// The scopes the grant carries.
         scopes: Vec<String>,
+        /// Which grant this is: the same for the grant's whole life, across its refreshes, and
+        /// another for any later sign-in, even of the same account. It names the grant without
+        /// holding anything that could be presented.
+        generation: String,
     },
     /// The sign-in ended by itself: the service no longer honours the grant.
     Ended,
@@ -1560,11 +1564,13 @@ impl fmt::Debug for AccountStatus {
                 email,
                 name,
                 scopes,
+                generation,
             } => formatter
                 .debug_struct("SignedIn")
                 .field("email", &email.as_ref().map(|_| "<present>"))
                 .field("name", &name.as_ref().map(|_| "<present>"))
                 .field("scopes", scopes)
+                .field("generation", generation)
                 .finish(),
         }
     }
@@ -1709,6 +1715,7 @@ impl SignedInAccount {
             email: grant.email.clone(),
             name: grant.name.clone(),
             scopes: grant.scopes.clone(),
+            generation: generation(grant),
         }
     }
 
@@ -2022,16 +2029,52 @@ impl SignedInAccount {
     /// # Errors
     ///
     /// Returns an error when no account is signed in, or the usage could not be read.
-    pub async fn usage(&self) -> Result<Option<AccountUsage>> {
+    pub async fn usage(&self) -> Result<Option<GrantUsage>> {
         match self.read_grant()? {
             None => Err(signed_out()),
             Some(grant) if !grant.carries(USAGE_SCOPE) => Ok(None),
             Some(_) => {
                 let access = self.token(USAGE_SCOPE).await?;
-                Ok(Some(self.service.usage(&access).await?))
+                // The figures are the grant's whose token asks for them, taken together with the
+                // token under the lock; a grant that replaced it meanwhile gets its own read.
+                let generation = {
+                    let _held = self.hold().await?;
+                    match self.read_grant()? {
+                        Some(current) if current.access_token.expose() == access.expose() => {
+                            generation(&current)
+                        }
+                        Some(_) | None => {
+                            return Err(ClientError::Host(ProtocolError::new(
+                                ErrorCode::OutcomeUnknown,
+                                "the sign-in changed while its usage was being read".to_owned(),
+                            )));
+                        }
+                    }
+                };
+                let usage = self.service.usage(&access).await?;
+                Ok(Some(GrantUsage { generation, usage }))
             }
         }
     }
+}
+
+/// Usage, with the generation of the grant it was read with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GrantUsage {
+    /// The grant the figures belong to, as [`AccountStatus::SignedIn`] names it.
+    pub generation: String,
+    /// The figures.
+    pub usage: AccountUsage,
+}
+
+/// A grant's generation: a digest of its identifier, which names the grant and can be presented
+/// nowhere.
+fn generation(grant: &StoredGrant) -> String {
+    let digest = sha2::Sha256::digest(grant.grant_id.as_bytes());
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// The refusal for a scope this sign-in does not carry.

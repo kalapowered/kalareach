@@ -21,8 +21,8 @@ use std::sync::{Arc, Mutex};
 
 use kr_client::services::account::{
     AccountService, AccountStatus, AccountUsage, Answer, AnswerFault, AuthorisationGrant,
-    AuthorisationRequest, Exchanged, IdentityRead, PendingAuthorisation, SignedInAccount,
-    USAGE_SCOPE, UsageResource,
+    AuthorisationRequest, Exchanged, GrantUsage, IdentityRead, PendingAuthorisation,
+    SignedInAccount, USAGE_SCOPE, UsageResource,
 };
 use serde::Serialize;
 use tokio::sync::watch;
@@ -103,6 +103,8 @@ pub enum AccountView {
         name: Option<String>,
         /// Whether this sign-in may read usage.
         usage_readable: bool,
+        /// Which grant this is, so usage read for another is never shown for it.
+        generation: String,
         /// How the last sign-out ended, when it left the account signed in.
         outcome: Option<Outcome>,
     },
@@ -129,6 +131,8 @@ pub struct UsageLineView {
 pub enum UsageView {
     /// Usage, read now.
     Read {
+        /// The grant it was read with, as the signed-in view names it.
+        generation: String,
         /// The heading the lines sit under.
         period_label: String,
         /// One line per resource.
@@ -235,10 +239,12 @@ impl Account {
                 email,
                 name,
                 scopes,
+                generation,
             }) => AccountView::SignedIn {
                 email,
                 name,
                 usage_readable: scopes.iter().any(|scope| scope == USAGE_SCOPE),
+                generation,
                 // Only a sign-out that failed leaves an outcome beside a signed-in account.
                 outcome: self
                     .outcome()
@@ -411,7 +417,7 @@ impl Account {
     /// The account's usage.
     pub async fn usage(&self) -> UsageView {
         match self.signed_in.usage().await {
-            Ok(Some(usage)) => usage_view(&usage),
+            Ok(Some(read)) => usage_view(&read),
             Ok(None) => UsageView::NotGranted,
             Err(error) if error.code() == kr_protocol::error::ErrorCode::HostNotConfigured => {
                 UsageView::SignedOut
@@ -469,7 +475,8 @@ pub const fn message(outcome: Outcome) -> &'static str {
 }
 
 /// Usage lines in words and figures, with nothing about money.
-fn usage_view(usage: &AccountUsage) -> UsageView {
+fn usage_view(read: &GrantUsage) -> UsageView {
+    let usage: &AccountUsage = &read.usage;
     let period_label = usage
         .lines
         .iter()
@@ -503,6 +510,7 @@ fn usage_view(usage: &AccountUsage) -> UsageView {
         })
         .collect();
     UsageView::Read {
+        generation: read.generation.clone(),
         period_label,
         lines,
     }
@@ -589,25 +597,29 @@ mod tests {
 
     #[test]
     fn usage_is_shown_in_figures_a_person_reads_and_names_no_money() {
-        let view = usage_view(&AccountUsage {
-            lines: vec![
-                UsageLine {
-                    resource: UsageResource::Relay,
-                    used_bytes: 1_234_000_000,
-                    allowance_bytes: 10_000_000_000,
-                    period: Some("2026-09".to_owned()),
-                },
-                UsageLine {
-                    resource: UsageResource::Sync,
-                    used_bytes: 12_345_678,
-                    allowance_bytes: 100_000_000,
-                    period: None,
-                },
-            ],
+        let view = usage_view(&GrantUsage {
+            generation: "0a1b2c3d4e5f6071".to_owned(),
+            usage: AccountUsage {
+                lines: vec![
+                    UsageLine {
+                        resource: UsageResource::Relay,
+                        used_bytes: 1_234_000_000,
+                        allowance_bytes: 10_000_000_000,
+                        period: Some("2026-09".to_owned()),
+                    },
+                    UsageLine {
+                        resource: UsageResource::Sync,
+                        used_bytes: 12_345_678,
+                        allowance_bytes: 100_000_000,
+                        period: None,
+                    },
+                ],
+            },
         });
         assert_eq!(
             view,
             UsageView::Read {
+                generation: "0a1b2c3d4e5f6071".to_owned(),
                 period_label: "Usage in September 2026".to_owned(),
                 lines: vec![
                     UsageLineView {

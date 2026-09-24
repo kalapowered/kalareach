@@ -847,6 +847,9 @@ struct Stub {
     /// When set, an identity read waits for a permit before it answers.
     identity_held: Option<tokio::sync::Semaphore>,
     identity_reads: AtomicUsize,
+    /// When set, a usage read waits for a permit before it answers.
+    usage_held: Option<tokio::sync::Semaphore>,
+    usage_reads: AtomicUsize,
     revoke_works: std::sync::atomic::AtomicBool,
     revoked: Mutex<Vec<String>>,
 }
@@ -975,6 +978,13 @@ impl Stub {
         }
     }
 
+    fn holding_usage() -> Self {
+        Self {
+            usage_held: Some(tokio::sync::Semaphore::new(0)),
+            ..Self::new()
+        }
+    }
+
     fn holding_identity() -> Self {
         Self {
             identity_held: Some(tokio::sync::Semaphore::new(0)),
@@ -1047,7 +1057,13 @@ impl AccountService for Stub {
     }
 
     fn usage<'a>(&'a self, _access: &'a AccountToken) -> ServiceFuture<'a, AccountUsage> {
-        Box::pin(async { Ok(AccountUsage::default()) })
+        Box::pin(async move {
+            self.usage_reads.fetch_add(1, Ordering::SeqCst);
+            if let Some(held) = &self.usage_held {
+                held.acquire().await.expect("a permit").forget();
+            }
+            Ok(AccountUsage::default())
+        })
     }
 }
 
@@ -1443,9 +1459,8 @@ async fn a_token_for_a_scope_the_grant_lacks_is_refused() {
         .expect_err("no lease scope");
     assert_eq!(refused.code(), ErrorCode::PermissionDenied);
     assert!(signed_in.token("voice").await.is_ok());
-    assert_eq!(
-        signed_in.usage().await.expect("usage"),
-        None,
+    assert!(
+        signed_in.usage().await.expect("usage").is_none(),
         "no usage scope"
     );
 }
@@ -1592,6 +1607,63 @@ async fn a_refresh_that_drops_the_asked_for_scope_is_kept_and_the_token_refused(
     assert_eq!(voice.expose(), "narrowed-1-access");
     assert_eq!(stub.refreshes.load(Ordering::SeqCst), 1);
     rewind();
+}
+
+/// Usage names the grant it was read with, as the status does: a sign-in that replaced the grant
+/// while the read was out, even for the same address, is another generation, so the page can tell
+/// the figures are not the current sign-in's.
+#[tokio::test]
+async fn usage_names_the_grant_it_was_read_with() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::holding_usage());
+    let store = Arc::new(MemoryStore::new());
+    let signed_in = account(&stub, &store);
+    signed_in
+        .commit(
+            issued_for("account-1", "grant-a", &["openid", USAGE_SCOPE]),
+            "a-nonce",
+        )
+        .await
+        .expect("the first sign-in");
+    let first = generation_of(&signed_in);
+
+    let reading = {
+        let signed_in = Arc::clone(&signed_in);
+        tokio::spawn(async move { signed_in.usage().await })
+    };
+    while stub.usage_reads.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+    signed_in
+        .commit(
+            issued_for("account-1", "grant-b", &["openid", USAGE_SCOPE]),
+            "b-nonce",
+        )
+        .await
+        .expect("the second sign-in, the same account");
+    let second = generation_of(&signed_in);
+    assert_ne!(first, second, "each grant is its own generation");
+    stub.usage_held
+        .as_ref()
+        .expect("a held read")
+        .add_permits(1);
+
+    let read = reading
+        .await
+        .expect("the read runs")
+        .expect("a read")
+        .expect("the grant carries the usage scope");
+    assert_eq!(read.generation, first, "the figures are the first grant's");
+    assert_ne!(read.generation, generation_of(&signed_in));
+}
+
+/// The generation the status names for the grant signed in now.
+fn generation_of(signed_in: &SignedInAccount) -> String {
+    match signed_in.status().expect("a status") {
+        AccountStatus::SignedIn { generation, .. } => generation,
+        other => panic!("not signed in: {other:?}"),
+    }
 }
 
 /// The scoped source on a host: an imported token is refused for a scope it was not issued with,
