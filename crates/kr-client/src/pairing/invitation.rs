@@ -61,6 +61,8 @@ pub struct InvitationSummary {
     /// The rights a direct invitation proposes. A code's proposal arrives only once the host has
     /// proved the code.
     pub rights: Option<Vec<ActionRight>>,
+    /// What those rights would let this device do, in words.
+    pub authority: Option<String>,
     /// When the grant a direct invitation proposes would end, if it would.
     pub grant_expires_at_ms: Option<u64>,
     /// When a direct invitation expires.
@@ -77,6 +79,7 @@ impl Invitation {
                 origin_host: Some(origin_host(&code.origin).to_owned()),
                 names_another_origin: code.names_another_origin,
                 rights: None,
+                authority: None,
                 grant_expires_at_ms: None,
                 expires_at_ms: None,
             },
@@ -85,6 +88,9 @@ impl Invitation {
                 origin_host: None,
                 names_another_origin: false,
                 rights: Some(payload.proposed_grant.actions.iter().copied().collect()),
+                authority: Some(super::owner::describe_rights(
+                    &payload.proposed_grant.actions,
+                )),
                 grant_expires_at_ms: match payload.proposed_grant.expiry {
                     GrantExpiry::Never => None,
                     GrantExpiry::At { expires_at_ms } => Some(expires_at_ms.get()),
