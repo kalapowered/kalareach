@@ -29,6 +29,8 @@ describe('the package contract', () => {
     expect(instanceLimits.faults_before_disable).toBe(3)
     expect(repositoryBudgets.metadata_bytes).toBe('67108864')
     expect(repositoryBudgets.metadata_entries).toBe('100000')
+    expect(repositoryBudgets.retained_generations).toBe('2')
+    expect(repositoryBudgets.retained_metadata_bytes).toBe('134217728')
     expect(repositoryBudgets.payload_cache_bytes).toBe('1073741824')
     expect(BigInt(instanceLimits.memory_bytes)).toBe(64n * 1024n * 1024n)
   })

@@ -231,7 +231,9 @@
     "full_offline_mirror": false,
     "metadata_bytes": "67108864",
     "metadata_entries": "100000",
-    "payload_cache_bytes": "1073741824"
+    "payload_cache_bytes": "1073741824",
+    "retained_generations": "2",
+    "retained_metadata_bytes": "134217728"
   },
   "sdk_version": "0.1.0",
   "wit_package": {

@@ -28,7 +28,7 @@ Nothing is fetched before a repository is enrolled, and enrolment fixes four thi
 | | |
 | --- | --- |
 | The trust root | The one this repository's metadata is verified against, and no other |
-| The budgets | 64 MiB of metadata, 100,000 entries and 1 GiB of cached payloads by default |
+| The budgets | 64 MiB of metadata and 100,000 entries a sync, two kept generations in 128 MiB of kept metadata, and 1 GiB of cached payloads by default |
 | The capability ceiling | Metadata matching, declarative presentation and already-authorised broker semantic events |
 | The mirror setting | Off, so a sync fetches metadata and not every payload |
 
@@ -166,13 +166,37 @@ the second check, and one that declares a gigabyte never reaches it.
 Exceeding a budget names the exact allowance that ran out, because "out of space" sends a person to
 the wrong setting. The last generation stays usable either way.
 
+Everything a repository leaves on disk is inside one of them:
+
+| What stays | Budget |
+| --- | --- |
+| The signed metadata and the index one sync fetches | Metadata: 64 MiB and 100,000 entries |
+| The generations kept, the one in use among them | Retained generations: two |
+| The trust checkpoint and every kept generation's index | Retained metadata: 128 MiB |
+| Cached payloads, the packages extracted from them, and a package being staged | Cached payloads: 1 GiB |
+
+A repository keeps the generation it is on and the one before it, so a reader that looked it up a
+moment before a sync moved it on still finds the index it was told about. Accepting a generation
+past the retained-generation budget removes the oldest it is no longer on, index and all, in the
+same commit that moves it on; so does a kept index that would take the kept metadata past its
+budget. A generation that does not fit beside the trust checkpoint on its own is refused before
+anything is fetched or written for it.
+
+An installed package costs its extracted copy as well as its cached payloads. A package is staged
+whole before it is renamed into place, so room for the copy it stages and for every payload it
+still has to fetch is made before anything is fetched: the staging is counted at its largest rather
+than discovered part way. Staging holds only the work of the operation holding the repository's
+lock, and whatever an operation that stopped left there is removed when the lock is next taken.
+
 Reclaiming space never takes a payload an installed package, a live binding or a pinned generation
 still needs. That is every file such a package consists of, not only the manifest its hash names: a
 component nobody can read is a binding that does not work, and an installed package with its files
-evicted is one that cannot run. What a live package consists of is read from the installation or
-the binding that holds it, or from its own manifest where it is activated here; one whose files
-this host cannot name stops the reclaim rather than being guessed at. When the only thing left to
-evict is one of those, the sync reports the limit instead.
+evicted is one that cannot run. An extracted package nothing holds goes before any cached payload:
+it is a second copy of payloads, and having it again costs only an extraction. What a live package
+consists of is read from the installation or the binding that holds it, or from its own manifest
+where it is activated here; one whose files this host cannot name stops the reclaim rather than
+being guessed at. When the only thing left to evict is one of those, the sync reports the limit
+instead.
 
 ## Matching, enabling and binding
 

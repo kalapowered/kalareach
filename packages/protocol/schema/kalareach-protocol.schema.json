@@ -4825,7 +4825,7 @@
         },
         "metadata_bytes": {
           "$ref": "#/$defs/U64",
-          "description": "Maximum bytes of catalogue metadata."
+          "description": "Maximum bytes of catalogue metadata one sync fetches, the index among them."
         },
         "metadata_entries": {
           "$ref": "#/$defs/U64",
@@ -4833,12 +4833,22 @@
         },
         "payload_cache_bytes": {
           "$ref": "#/$defs/U64",
-          "description": "Maximum bytes of cached payloads."
+          "description": "Maximum bytes of cached payloads, the packages extracted from them and a package being\nstaged.\n\nAn installed package costs its extracted copy as well as its cached payloads, and a\npackage is staged only once room for the payloads it fetches and the copy it stages is\nmade."
+        },
+        "retained_generations": {
+          "$ref": "#/$defs/U64",
+          "description": "How many accepted generations are kept, the one in use among them. At least one.\n\nA sync that accepts a generation past this number removes the oldest the repository is no\nlonger on."
+        },
+        "retained_metadata_bytes": {
+          "$ref": "#/$defs/U64",
+          "description": "Maximum bytes of metadata kept: the trust checkpoint and every kept generation's index.\n\nA sync makes room by removing the oldest generations the repository is no longer on, and\nis refused, with the generation in use left as it was, when the checkpoint and the new\ngeneration's index alone are more than this."
         }
       },
       "required": [
         "metadata_bytes",
         "metadata_entries",
+        "retained_generations",
+        "retained_metadata_bytes",
         "payload_cache_bytes",
         "full_offline_mirror"
       ],

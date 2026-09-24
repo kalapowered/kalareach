@@ -179,6 +179,8 @@ fn budgets() -> wire::CatalogueBudgets {
     wire::CatalogueBudgets {
         metadata_bytes: defaults.metadata_bytes,
         metadata_entries: defaults.metadata_entries,
+        retained_generations: defaults.retained_generations,
+        retained_metadata_bytes: defaults.retained_metadata_bytes,
         payload_cache_bytes: defaults.payload_cache_bytes,
         full_offline_mirror: false,
     }

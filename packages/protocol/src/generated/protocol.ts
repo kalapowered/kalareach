@@ -6758,6 +6758,14 @@ export interface CatalogueBudgets {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   payload_cache_bytes: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  retained_generations: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  retained_metadata_bytes: string
 }
 /**
  * The owner's confirmation of this exact enrolment.
@@ -6938,6 +6946,14 @@ export interface CatalogueBudgets1 {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   payload_cache_bytes: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  retained_generations: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  retained_metadata_bytes: string
 }
 /**
  * The budgets one repository runs inside.
@@ -6965,6 +6981,14 @@ export interface CatalogueBudgets2 {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   payload_cache_bytes: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  retained_generations: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  retained_metadata_bytes: string
 }
 /**
  * One vendor delegation beneath a repository's root.

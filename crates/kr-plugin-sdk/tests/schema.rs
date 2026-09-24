@@ -85,6 +85,11 @@ fn the_contract_table_carries_the_limits_and_the_vocabularies() {
     assert_eq!(contract["instance_limits"]["faults_before_disable"], 3);
     assert_eq!(contract["repository_budgets"]["metadata_bytes"], "67108864");
     assert_eq!(contract["repository_budgets"]["metadata_entries"], "100000");
+    assert_eq!(contract["repository_budgets"]["retained_generations"], "2");
+    assert_eq!(
+        contract["repository_budgets"]["retained_metadata_bytes"],
+        "134217728"
+    );
     assert_eq!(
         contract["repository_budgets"]["payload_cache_bytes"],
         "1073741824"

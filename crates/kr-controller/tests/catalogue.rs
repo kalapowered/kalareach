@@ -272,6 +272,8 @@ fn budgets() -> wire::CatalogueBudgets {
     wire::CatalogueBudgets {
         metadata_bytes: defaults.metadata_bytes,
         metadata_entries: defaults.metadata_entries,
+        retained_generations: defaults.retained_generations,
+        retained_metadata_bytes: defaults.retained_metadata_bytes,
         payload_cache_bytes: defaults.payload_cache_bytes,
         full_offline_mirror: false,
     }
@@ -428,6 +430,11 @@ async fn kr_req_23_28_the_catalogue_group_adds_syncs_pins_lists_and_removes() {
     assert_eq!(summary.entries, U64::new(7));
     assert_eq!(summary.budgets.metadata_bytes.get(), 64 * 1024 * 1024);
     assert_eq!(summary.budgets.metadata_entries.get(), 100_000);
+    assert_eq!(summary.budgets.retained_generations.get(), 2);
+    assert_eq!(
+        summary.budgets.retained_metadata_bytes.get(),
+        128 * 1024 * 1024
+    );
     assert_eq!(
         summary.budgets.payload_cache_bytes.get(),
         1024 * 1024 * 1024
@@ -563,6 +570,29 @@ async fn a_location_that_is_a_version_control_branch_is_refused() {
     assert_eq!(refused.code, ErrorCode::RepositoryUntrusted);
     assert!(
         refused.message.contains("never update authority"),
+        "{refused:?}"
+    );
+}
+
+/// A catalogue whose budgets would keep no generation at all is refused at enrolment: a repository
+/// keeps at least the generation it is on.
+#[tokio::test]
+async fn a_catalogue_that_would_keep_no_generation_is_refused() {
+    let host = host();
+    let mut params = add_params(&host);
+    params.budgets.retained_generations = U64::new(0);
+    let refused = refusal(
+        host.module
+            .write_frame_admitted(
+                &mutation(Method::CatalogueAdd, host.environment_id, &params),
+                Method::CatalogueAdd,
+                Some(host.confirmations()),
+            )
+            .await,
+    );
+    assert_eq!(refused.code, ErrorCode::InvalidArgument);
+    assert!(
+        refused.message.contains("at least one generation"),
         "{refused:?}"
     );
 }

@@ -3158,7 +3158,7 @@ export interface RepositoryBudgets {
    */
   full_offline_mirror: boolean
   /**
-   * Maximum bytes of catalogue metadata.
+   * Maximum bytes of catalogue metadata one sync fetches, the index among them.
    */
   metadata_bytes: string
   /**
@@ -3166,9 +3166,18 @@ export interface RepositoryBudgets {
    */
   metadata_entries: string
   /**
-   * Maximum bytes of cached payloads.
+   * Maximum bytes of cached payloads, the packages extracted from them and a package being
+   * staged.
    */
   payload_cache_bytes: string
+  /**
+   * How many accepted generations are kept, the one in use among them. At least one.
+   */
+  retained_generations: string
+  /**
+   * Maximum bytes of metadata kept: the trust checkpoint and every kept generation's index.
+   */
+  retained_metadata_bytes: string
 }
 /**
  * A node whose kind this build does not know.

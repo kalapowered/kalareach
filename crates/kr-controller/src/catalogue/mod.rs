@@ -980,6 +980,8 @@ fn summary(view: &RepositoryView) -> wire::CatalogueSummary {
         budgets: wire::CatalogueBudgets {
             metadata_bytes: enrolment.budgets.metadata_bytes,
             metadata_entries: enrolment.budgets.metadata_entries,
+            retained_generations: enrolment.budgets.retained_generations,
+            retained_metadata_bytes: enrolment.budgets.retained_metadata_bytes,
             payload_cache_bytes: enrolment.budgets.payload_cache_bytes,
             full_offline_mirror: enrolment.budgets.full_offline_mirror,
         },
@@ -1313,6 +1315,8 @@ fn enrolment_from(params: &wire::CatalogueAddParams) -> Answer<Enrolment> {
     let budgets = kr_plugin_sdk::limits::RepositoryBudgets {
         metadata_bytes: params.budgets.metadata_bytes,
         metadata_entries: params.budgets.metadata_entries,
+        retained_generations: params.budgets.retained_generations,
+        retained_metadata_bytes: params.budgets.retained_metadata_bytes,
         payload_cache_bytes: params.budgets.payload_cache_bytes,
         full_offline_mirror: params.budgets.full_offline_mirror,
     };

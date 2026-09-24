@@ -1626,6 +1626,390 @@ fn kr_req_11_12_the_defaults_are_sixty_four_mebibytes_a_hundred_thousand_entries
             .check_payload_bytes(1024 * 1024 * 1024 + 1, Stage::Declared, "component.wasm")
             .is_err()
     );
+    // Two generations kept, and room for both of them beside the trust checkpoint.
+    assert_eq!(ledger.budgets().retained_generations.get(), 2);
+    assert_eq!(
+        ledger.budgets().retained_metadata_bytes.get(),
+        2 * 64 * 1024 * 1024
+    );
+}
+
+/// The index documents a repository's store holds, by digest.
+fn index_documents(catalogue: &Catalogue) -> BTreeSet<PayloadDigest> {
+    catalogue
+        .store(&repository())
+        .expect("enrolled")
+        .index_documents()
+        .expect("a readable store")
+        .into_keys()
+        .collect()
+}
+
+/// A repository keeps as many generations as its retained-generation budget allows, the one it is
+/// on among them, however many it accepts. At the limit nothing goes; one past it, the oldest it
+/// is no longer on goes, its index document with it, as the next one is accepted. An index
+/// document nothing names, left by a sync that stopped, goes the same way.
+#[tokio::test]
+async fn kr_req_11_12_a_repository_keeps_as_many_generations_as_its_budget_allows() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    let mut accepted = Vec::new();
+    for number in 1..=4u64 {
+        if number > 1 {
+            generation.rewrite_as(number).await;
+        }
+        if number == 3 {
+            let store = catalogue.store(&repository()).expect("enrolled");
+            std::fs::write(
+                store.index_path(PayloadDigest::of(b"a document nothing names")),
+                b"{}",
+            )
+            .expect("writable");
+        }
+        catalogue
+            .sync(&repository())
+            .await
+            .expect("a verified generation");
+        let active = catalogue
+            .active(&repository())
+            .expect("enrolled")
+            .expect("a generation");
+        assert_eq!(active.generation, number);
+        accepted.push(active.index_digest);
+        let kept: BTreeSet<PayloadDigest> = accepted.iter().rev().take(2).copied().collect();
+        assert_eq!(
+            index_documents(&catalogue),
+            kept,
+            "after generation {number}"
+        );
+    }
+}
+
+/// The trust checkpoint and every kept index count against the retained metadata budget.
+///
+/// A generation that fits beside the one before is kept with it. With less room than that the one
+/// before goes to make room, and with less room than the checkpoint and the new index alone the
+/// generation is refused before anything is written for it, and the one in use stays, with its
+/// index, as it was. The client writes the time it last saw into the checkpoint on every load, and
+/// that document's length varies by a few bytes from one load to the next, so the budgets here sit
+/// well clear of each boundary; the exact boundaries are the retention plan's own tests.
+#[tokio::test]
+async fn kr_req_11_12_the_retained_metadata_budget_counts_the_checkpoint_and_every_kept_index() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let first = Generation::build(&home.path().join("first"), GenerationSpec::default()).await;
+    // The second generation asks for more, so its index is the larger of the two.
+    let second = Generation::build(
+        &home.path().join("second"),
+        GenerationSpec {
+            generation: 2,
+            keys: Some(first.keys()),
+            capabilities: vec![
+                PluginCapability::MetadataMatch,
+                PluginCapability::DeclarativePresentation,
+                PluginCapability::BrokerSemanticEvents,
+                PluginCapability::TerminalStream,
+                PluginCapability::TranscriptTail,
+                PluginCapability::ProcessObserve,
+                PluginCapability::UpstreamAction,
+                PluginCapability::FilesystemRead,
+            ],
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let publish = |case: &str| {
+        let at = home.path().join(case).join("generation");
+        support::copy_tree(&first.directory(), &at);
+        at
+    };
+
+    // Measured once, with room to spare.
+    let probe_at = publish("probe");
+    let mut probe = Catalogue::open(&home.path().join("probe-catalogue")).expect("openable");
+    probe
+        .enrol(
+            Enrolment::new(
+                repository(),
+                RepositoryKind::Official,
+                support::directory_url(&probe_at.join("metadata")),
+                support::directory_url(&probe_at.join("targets")),
+                first.root_bytes(),
+                RepositoryBudgets::defaults(),
+                CapabilityCeiling::default_ceiling(),
+            )
+            .expect("an enrollable repository"),
+            true,
+        )
+        .expect("the owner adopted the root");
+    probe
+        .sync(&repository())
+        .await
+        .expect("the first generation");
+    let store = probe.store(&repository()).expect("enrolled");
+    let (first_checkpoint, first_index) = (
+        store.checkpoint_bytes().expect("readable"),
+        store
+            .index_documents()
+            .expect("readable")
+            .into_values()
+            .sum::<u64>(),
+    );
+    std::fs::remove_dir_all(&probe_at).expect("removable");
+    support::copy_tree(&second.directory(), &probe_at);
+    probe
+        .sync(&repository())
+        .await
+        .expect("the second generation");
+    let (checkpoint, second_index) = (
+        store.checkpoint_bytes().expect("readable"),
+        store
+            .index_documents()
+            .expect("readable")
+            .into_values()
+            .sum::<u64>()
+            - first_index,
+    );
+    // Well clear of the few bytes the time the client writes varies by.
+    let clear = 64;
+    assert!(first_index > 2 * clear);
+    assert!(
+        first_checkpoint + first_index + clear < checkpoint + second_index - clear,
+        "{first_checkpoint} {first_index} {checkpoint} {second_index}"
+    );
+
+    let both = checkpoint + first_index + second_index;
+    for (budget, kept) in [
+        (both + clear, Some(2)),
+        (both - clear, Some(1)),
+        (checkpoint + second_index - clear, None),
+    ] {
+        let at = publish(&format!("case-{budget}"));
+        let mut budgets = RepositoryBudgets::defaults();
+        budgets.retained_metadata_bytes = U64::new(budget);
+        let mut catalogue =
+            Catalogue::open(&home.path().join(format!("catalogue-{budget}"))).expect("openable");
+        catalogue
+            .enrol(
+                Enrolment::new(
+                    repository(),
+                    RepositoryKind::Official,
+                    support::directory_url(&at.join("metadata")),
+                    support::directory_url(&at.join("targets")),
+                    first.root_bytes(),
+                    budgets,
+                    CapabilityCeiling::default_ceiling(),
+                )
+                .expect("an enrollable repository"),
+                true,
+            )
+            .expect("the owner adopted the root");
+        catalogue
+            .sync(&repository())
+            .await
+            .expect("the first generation fits");
+        let before = index_documents(&catalogue);
+        std::fs::remove_dir_all(&at).expect("removable");
+        support::copy_tree(&second.directory(), &at);
+        let outcome = catalogue.sync(&repository()).await;
+        let active = catalogue
+            .active(&repository())
+            .expect("enrolled")
+            .expect("a generation");
+        if let Some(kept) = kept {
+            outcome.unwrap_or_else(|refusal| panic!("{budget}: {refusal}"));
+            assert_eq!(active.generation, 2, "{budget}");
+            assert_eq!(index_documents(&catalogue).len(), kept, "{budget}");
+            continue;
+        }
+        let refusal = outcome.expect_err("the checkpoint and the new index alone are past it");
+        let CatalogueError::ResourceLimit(limit) = &refusal else {
+            panic!("{budget}: {refusal:?}");
+        };
+        assert_eq!(limit.resource, Resource::RetainedMetadataBytes);
+        assert!(limit.requested > budget);
+        assert_eq!(active.generation, 1);
+        assert_eq!(index_documents(&catalogue), before);
+        catalogue
+            .index(&repository())
+            .expect("the generation in use still reads");
+    }
+}
+
+/// An installed package costs its extracted copy as well as its cached payloads, and a package is
+/// staged only once there is room for the payloads it still has to fetch and the copy it stages.
+/// Past that room it is refused before anything is fetched.
+#[tokio::test]
+async fn kr_req_11_12_a_package_is_staged_only_inside_room_for_its_payloads_and_its_copy() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let package: u64 = payloads_of(&generation).values().sum();
+    for (budget, fits) in [(2 * package, true), (2 * package - 1, false)] {
+        let mut budgets = RepositoryBudgets::defaults();
+        budgets.payload_cache_bytes = U64::new(budget);
+        let mut catalogue = Catalogue::open(&home.path().join(format!("catalogue-{budget}")))
+            .expect("an openable catalogue");
+        catalogue
+            .enrol(
+                Enrolment::new(
+                    repository(),
+                    RepositoryKind::Official,
+                    generation.metadata_url(),
+                    generation.targets_url(),
+                    generation.root_bytes(),
+                    budgets,
+                    CapabilityCeiling::default_ceiling(),
+                )
+                .expect("an enrollable repository"),
+                true,
+            )
+            .expect("the owner adopted the root");
+        let watched = Watched::default();
+        catalogue.set_transport(Arc::new(watched.clone()));
+        catalogue
+            .sync(&repository())
+            .await
+            .expect("a verified generation");
+        let outcome = catalogue
+            .install(
+                &repository(),
+                environment(),
+                &plugin(),
+                &version(),
+                generation.manifest_digest(),
+                InstallationGrant::none(),
+            )
+            .await;
+        let store = catalogue.store(&repository()).expect("enrolled");
+        if fits {
+            outcome.expect("the payloads and the extracted copy fill the budget exactly");
+            assert!(complete(&store, generation.manifest_digest()));
+            continue;
+        }
+        let refusal = outcome.expect_err("one byte short of the payloads and the copy");
+        let CatalogueError::ResourceLimit(limit) = &refusal else {
+            panic!("{refusal:?}");
+        };
+        assert_eq!(limit.resource, Resource::PayloadCacheBytes);
+        assert_eq!(limit.stage, Stage::Declared);
+        assert_eq!(limit.requested, 2 * package);
+        let fetched = watched.fetched.lock().expect("the list").clone();
+        assert!(
+            !fetched.iter().any(|url| url.path().contains("/packages/")),
+            "nothing of the package was fetched: {fetched:?}"
+        );
+        assert!(absent(&store, generation.manifest_digest()));
+    }
+}
+
+/// Room is made with a package nothing holds any more before anything else, and never with one an
+/// installation holds.
+///
+/// While the first release is installed, its extracted copy is protected and the next release does
+/// not fit. Once it is uninstalled, its extracted copy is exactly the room the next release needs:
+/// that copy goes, and the cached payloads stay.
+#[tokio::test]
+async fn kr_req_11_12_room_is_made_with_an_extracted_package_nothing_holds() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let first = Generation::build(home.path(), GenerationSpec::default()).await;
+    let second = Generation::build(
+        &home.path().join("second"),
+        GenerationSpec {
+            generation: 2,
+            package_version: "0.2.0".to_owned(),
+            keys: Some(first.keys()),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let first_payloads = payloads_of(&first);
+    let package: u64 = first_payloads.values().sum();
+    let next = payloads_of(&second);
+    let needed: u64 = next.values().sum::<u64>()
+        + next
+            .iter()
+            .filter(|(digest, _)| !first_payloads.contains_key(*digest))
+            .map(|(_, size)| *size)
+            .sum::<u64>();
+    // The first release installed, cached and extracted, plus what the next one needs, less the
+    // first release's extracted copy.
+    let mut budgets = RepositoryBudgets::defaults();
+    budgets.payload_cache_bytes = U64::new(package + needed);
+    let mut catalogue = enrolled(
+        home.path(),
+        &first,
+        budgets,
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("the first generation");
+    catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &version(),
+            first.manifest_digest(),
+            InstallationGrant::none(),
+        )
+        .await
+        .expect("the first release");
+    first.replace_with(&second);
+    catalogue
+        .sync(&repository())
+        .await
+        .expect("the second generation");
+    let next_version = PackageVersion::parse("0.2.0").expect("a valid version");
+    let refusal = catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &next_version,
+            second.manifest_digest(),
+            InstallationGrant::none(),
+        )
+        .await
+        .expect_err("the first release's copy is protected while it is installed");
+    assert!(
+        matches!(&refusal, CatalogueError::ResourceLimit(limit)
+            if limit.resource == Resource::PayloadCacheBytes),
+        "{refusal:?}"
+    );
+    let store = catalogue.store(&repository()).expect("enrolled");
+    assert!(complete(&store, first.manifest_digest()));
+
+    catalogue
+        .uninstall(environment(), &plugin())
+        .expect("uninstalled");
+    catalogue
+        .install(
+            &repository(),
+            environment(),
+            &plugin(),
+            &next_version,
+            second.manifest_digest(),
+            InstallationGrant::none(),
+        )
+        .await
+        .expect("the first release's copy is the room the next one needs");
+    assert!(complete(&store, second.manifest_digest()));
+    assert!(absent(&store, first.manifest_digest()));
+    for (digest, size) in &first_payloads {
+        assert!(
+            store.holds_payload(*digest, *size).expect("readable"),
+            "{digest}: the cached payloads stay"
+        );
+    }
 }
 
 #[tokio::test]
@@ -3975,8 +4359,12 @@ fn payloads_of(generation: &Generation) -> std::collections::BTreeMap<PayloadDig
 
 /// A mirrored first generation whose cache is one byte short of taking the next one as well,
 /// and the next generation, published at the same location.
+///
+/// Where the test goes on to install the first generation's package, the budget also has room for
+/// the copy installing it extracts, which the payload budget counts beside the cached payloads.
 async fn mirrored_at_its_limit(
     home: &std::path::Path,
+    installs: bool,
 ) -> (
     Catalogue,
     Generation,
@@ -3996,7 +4384,8 @@ async fn mirrored_at_its_limit(
     let held = payloads_of(&first);
     let mut budgets = RepositoryBudgets::defaults();
     budgets.full_offline_mirror = true;
-    budgets.payload_cache_bytes = U64::new(held.values().sum::<u64>() + 1);
+    let package: u64 = held.values().sum();
+    budgets.payload_cache_bytes = U64::new(package * (1 + u64::from(installs)) + 1);
     let mut catalogue = enrolled(home, &first, budgets, CapabilityCeiling::default_ceiling()).await;
     catalogue
         .sync(&repository())
@@ -4018,7 +4407,7 @@ async fn mirrored_at_its_limit(
 #[tokio::test]
 async fn a_generation_pinned_while_a_sync_ran_keeps_every_payload_it_pins() {
     let home = tempfile::tempdir().expect("a temporary directory");
-    let (mut catalogue, _generation, pinned) = mirrored_at_its_limit(home.path()).await;
+    let (mut catalogue, _generation, pinned) = mirrored_at_its_limit(home.path(), false).await;
     let held = Held::new();
     catalogue.set_transport(Arc::new(held.clone()));
     let pin = async {
@@ -4060,7 +4449,7 @@ async fn a_generation_pinned_while_a_sync_ran_keeps_every_payload_it_pins() {
 #[tokio::test]
 async fn an_installation_keeps_its_payloads_when_room_is_made() {
     let home = tempfile::tempdir().expect("a temporary directory");
-    let (mut catalogue, _generation, installed) = mirrored_at_its_limit(home.path()).await;
+    let (mut catalogue, _generation, installed) = mirrored_at_its_limit(home.path(), true).await;
     let installation = catalogue
         .install(
             &repository(),
@@ -4086,6 +4475,10 @@ async fn an_installation_keeps_its_payloads_when_room_is_made() {
             "{digest} belongs to an installation"
         );
     }
+    assert!(
+        complete(&store, installation.package_digest),
+        "the installed package's extracted copy is kept whole"
+    );
 }
 
 /// Returns the bytes a sync of `generation` fetches while it loads the metadata, and the index's.
@@ -4237,7 +4630,7 @@ async fn metadata_under_a_location_with_a_fragment_is_counted_all_the_same() {
 #[tokio::test]
 async fn an_installation_pinned_while_a_sync_ran_keeps_its_payloads() {
     let home = tempfile::tempdir().expect("a temporary directory");
-    let (mut catalogue, _generation, installed) = mirrored_at_its_limit(home.path()).await;
+    let (mut catalogue, _generation, installed) = mirrored_at_its_limit(home.path(), true).await;
     let installation = catalogue
         .install(
             &repository(),

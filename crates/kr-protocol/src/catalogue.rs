@@ -54,11 +54,27 @@ pub enum CatalogueKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogueBudgets {
-    /// Maximum bytes of catalogue metadata.
+    /// Maximum bytes of catalogue metadata one sync fetches, the index among them.
     pub metadata_bytes: U64,
     /// Maximum number of index entries.
     pub metadata_entries: U64,
-    /// Maximum bytes of cached payloads.
+    /// How many accepted generations are kept, the one in use among them. At least one.
+    ///
+    /// A sync that accepts a generation past this number removes the oldest the repository is no
+    /// longer on.
+    pub retained_generations: U64,
+    /// Maximum bytes of metadata kept: the trust checkpoint and every kept generation's index.
+    ///
+    /// A sync makes room by removing the oldest generations the repository is no longer on, and
+    /// is refused, with the generation in use left as it was, when the checkpoint and the new
+    /// generation's index alone are more than this.
+    pub retained_metadata_bytes: U64,
+    /// Maximum bytes of cached payloads, the packages extracted from them and a package being
+    /// staged.
+    ///
+    /// An installed package costs its extracted copy as well as its cached payloads, and a
+    /// package is staged only once room for the payloads it fetches and the copy it stages is
+    /// made.
     pub payload_cache_bytes: U64,
     /// Whether every referenced payload is fetched rather than only what is installed.
     ///

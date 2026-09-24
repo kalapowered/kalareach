@@ -361,8 +361,9 @@ impl Enrolment {
     /// # Errors
     ///
     /// Returns [`CatalogueError::Untrusted`] when the location cannot carry signed generations or
-    /// the root is empty, and [`CatalogueError::ResourceLimit`] when the root is larger than the
-    /// metadata budget.
+    /// the root is empty, [`CatalogueError::ResourceLimit`] when the root is larger than the
+    /// metadata budget, and [`CatalogueError::InvalidArgument`] when the budgets would keep no
+    /// generation at all.
     pub fn new(
         id: RepositoryId,
         kind: RepositoryKind,
@@ -386,6 +387,13 @@ impl Enrolment {
             crate::budget::Stage::Actual,
             "root.json",
         )?;
+        if budgets.retained_generations.get() == 0 {
+            return Err(CatalogueError::InvalidArgument {
+                detail: "a repository keeps the generation it is on, so it retains at least one \
+                         generation"
+                    .to_owned(),
+            });
+        }
         Ok(Self {
             id,
             kind,
@@ -508,6 +516,39 @@ mod tests {
             CapabilityCeiling::default_ceiling(),
         )
         .expect("an enrollable repository")
+    }
+
+    #[test]
+    fn a_repository_retains_at_least_the_generation_it_is_on() {
+        let mut budgets = RepositoryBudgets::defaults();
+        budgets.retained_generations = kr_plugin_sdk::scalars::U64::new(0);
+        let refusal = Enrolment::new(
+            RepositoryId::new("official").expect("a valid identifier"),
+            RepositoryKind::Official,
+            url("https://plugins.example/metadata/"),
+            url("https://plugins.example/targets/"),
+            b"root".to_vec(),
+            budgets,
+            CapabilityCeiling::default_ceiling(),
+        )
+        .expect_err("no generation would be kept");
+        assert!(
+            matches!(refusal, CatalogueError::InvalidArgument { .. }),
+            "{refusal:?}"
+        );
+        budgets.retained_generations = kr_plugin_sdk::scalars::U64::new(1);
+        assert!(
+            Enrolment::new(
+                RepositoryId::new("official").expect("a valid identifier"),
+                RepositoryKind::Official,
+                url("https://plugins.example/metadata/"),
+                url("https://plugins.example/targets/"),
+                b"root".to_vec(),
+                budgets,
+                CapabilityCeiling::default_ceiling(),
+            )
+            .is_ok()
+        );
     }
 
     #[test]

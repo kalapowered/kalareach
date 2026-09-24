@@ -24,7 +24,12 @@ pub enum Resource {
     MetadataBytes,
     /// Entries in one repository's index.
     MetadataEntries,
-    /// Bytes of cached payloads held for one repository.
+    /// Accepted generations one repository keeps.
+    RetainedGenerations,
+    /// Bytes of metadata one repository keeps: its trust checkpoint and its kept indexes.
+    RetainedMetadataBytes,
+    /// Bytes of cached payloads held for one repository, with the packages extracted from them
+    /// and a package being staged.
     PayloadCacheBytes,
     /// Bytes in one package.
     PackageBytes,
@@ -39,6 +44,8 @@ impl Resource {
         match self {
             Self::MetadataBytes => "metadata_bytes",
             Self::MetadataEntries => "metadata_entries",
+            Self::RetainedGenerations => "retained_generations",
+            Self::RetainedMetadataBytes => "retained_metadata_bytes",
             Self::PayloadCacheBytes => "payload_cache_bytes",
             Self::PackageBytes => "package_bytes",
             Self::PackageFiles => "package_files",
@@ -50,6 +57,9 @@ impl Resource {
     pub const fn setting(self) -> &'static str {
         match self {
             Self::MetadataBytes | Self::MetadataEntries => "the repository's metadata budget",
+            Self::RetainedGenerations | Self::RetainedMetadataBytes => {
+                "the repository's retention budget"
+            }
             Self::PayloadCacheBytes => "the repository's cached payload budget",
             Self::PackageBytes | Self::PackageFiles => "the package size limit in the SDK",
         }
@@ -101,6 +111,15 @@ pub struct ResourceLimit {
     pub stage: Stage,
     /// What was being fetched or processed.
     pub subject: String,
+}
+
+/// One accepted generation a repository keeps, with the bytes its index document holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Retained {
+    /// The generation number.
+    pub generation: u64,
+    /// The bytes of its index document.
+    pub index_bytes: u64,
 }
 
 /// What one repository currently holds against its budgets.
@@ -206,6 +225,70 @@ impl BudgetLedger {
     pub const fn accept_metadata(&mut self, bytes: u64, entries: u64) {
         self.metadata_bytes = bytes;
         self.metadata_entries = entries;
+    }
+
+    /// Decides which accepted generations a repository stops keeping once `active` is the one it is
+    /// on.
+    ///
+    /// `kept` is every generation it keeps now, `active` among them or not, and `checkpoint` is
+    /// what its trust checkpoint holds. The oldest generations it is no longer on go first: until
+    /// the count fits the retained-generation budget, and then until the checkpoint and every index
+    /// kept fit the retained metadata budget. The generation it is on is never one of them, so a
+    /// repository that cannot keep that one and its checkpoint is refused rather than left with
+    /// neither.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResourceLimit`] naming the retained metadata when the checkpoint and the active
+    /// generation's index alone are past that budget, and naming the retained generations when
+    /// that budget is too small to keep even the generation in use.
+    pub fn plan_retention(
+        &self,
+        checkpoint: u64,
+        kept: &[Retained],
+        active: Retained,
+    ) -> Result<Vec<u64>, ResourceLimit> {
+        let generations = self.budgets.retained_generations.get();
+        if generations == 0 {
+            return Err(ResourceLimit {
+                resource: Resource::RetainedGenerations,
+                limit: 0,
+                requested: 1,
+                stage: Stage::Actual,
+                subject: format!("generation {}", active.generation),
+            });
+        }
+        let limit = self.budgets.retained_metadata_bytes.get();
+        let mut others: Vec<Retained> = kept
+            .iter()
+            .filter(|kept| kept.generation != active.generation)
+            .copied()
+            .collect();
+        others.sort_by_key(|kept| kept.generation);
+        let held = |others: &[Retained]| {
+            others.iter().fold(
+                checkpoint.saturating_add(active.index_bytes),
+                |total, kept| total.saturating_add(kept.index_bytes),
+            )
+        };
+        let mut forgotten = Vec::new();
+        while !others.is_empty() && (others.len() as u64 >= generations || held(&others) > limit) {
+            forgotten.push(others.remove(0).generation);
+        }
+        let requested = held(&others);
+        if requested > limit {
+            return Err(ResourceLimit {
+                resource: Resource::RetainedMetadataBytes,
+                limit,
+                requested,
+                stage: Stage::Actual,
+                subject: format!(
+                    "the trust checkpoint and generation {}'s index",
+                    active.generation
+                ),
+            });
+        }
+        Ok(forgotten)
     }
 
     /// Checks whether `bytes` more of cached payload fits.
@@ -338,6 +421,82 @@ mod tests {
                 .check_payload_bytes(1024, Stage::Actual, "component.wasm")
                 .is_ok()
         );
+    }
+
+    fn retained(generation: u64, index_bytes: u64) -> Retained {
+        Retained {
+            generation,
+            index_bytes,
+        }
+    }
+
+    fn retaining(generations: u64, metadata: u64) -> BudgetLedger {
+        let mut budgets = RepositoryBudgets::defaults();
+        budgets.retained_generations = kr_plugin_sdk::scalars::U64::new(generations);
+        budgets.retained_metadata_bytes = kr_plugin_sdk::scalars::U64::new(metadata);
+        BudgetLedger::new(budgets)
+    }
+
+    #[test]
+    fn the_oldest_generations_go_first_until_the_count_fits() {
+        let kept = [retained(1, 10), retained(2, 10), retained(3, 10)];
+        // At the limit: three kept and the fourth accepted leaves three when three are allowed
+        // once the oldest goes, and nothing goes when four are allowed.
+        assert_eq!(
+            retaining(4, 1_000).plan_retention(0, &kept, retained(4, 10)),
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            retaining(3, 1_000).plan_retention(0, &kept, retained(4, 10)),
+            Ok(vec![1])
+        );
+        assert_eq!(
+            retaining(1, 1_000).plan_retention(0, &kept, retained(4, 10)),
+            Ok(vec![1, 2, 3])
+        );
+        // The generation in use is never one that goes, even when it is the oldest one named.
+        assert_eq!(
+            retaining(1, 1_000).plan_retention(0, &kept, retained(2, 10)),
+            Ok(vec![1, 3])
+        );
+    }
+
+    #[test]
+    fn the_retained_metadata_counts_the_checkpoint_and_every_index_kept() {
+        let kept = [retained(1, 30), retained(2, 30)];
+        // Checkpoint 40, the new index 30 and both kept ones: 130 fits exactly.
+        assert_eq!(
+            retaining(3, 130).plan_retention(40, &kept, retained(3, 30)),
+            Ok(Vec::new())
+        );
+        // One byte less, and the oldest goes to make room.
+        assert_eq!(
+            retaining(3, 129).plan_retention(40, &kept, retained(3, 30)),
+            Ok(vec![1])
+        );
+        // The checkpoint and the new index alone fit exactly once every older one goes.
+        assert_eq!(
+            retaining(3, 70).plan_retention(40, &kept, retained(3, 30)),
+            Ok(vec![1, 2])
+        );
+        let refusal = retaining(3, 69)
+            .plan_retention(40, &kept, retained(3, 30))
+            .expect_err("the checkpoint and the new index alone are past the budget");
+        assert_eq!(refusal.resource, Resource::RetainedMetadataBytes);
+        assert_eq!(refusal.limit, 69);
+        assert_eq!(refusal.requested, 70);
+        assert!(
+            refusal.to_string().contains("retention budget"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn a_repository_keeps_at_least_the_generation_it_is_on() {
+        let refusal = retaining(0, 1_000)
+            .plan_retention(0, &[], retained(1, 10))
+            .expect_err("no generation may be kept");
+        assert_eq!(refusal.resource, Resource::RetainedGenerations);
     }
 
     #[test]

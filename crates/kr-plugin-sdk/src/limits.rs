@@ -26,6 +26,13 @@
 //! Enrolment sets these before the first fetch. Exceeding one leaves the previous generation
 //! usable and reports the exact resource that ran out; it never evicts a live-bound or pinned
 //! payload to finish a sync.
+//!
+//! | Budget | Default | What it holds |
+//! | --- | --- | --- |
+//! | Metadata | 64 MiB, 100,000 entries | What one sync fetches: the signed metadata and the index |
+//! | Retained generations | 2 | The accepted generations kept, the one in use among them |
+//! | Retained metadata | 128 MiB | The trust checkpoint and every kept generation's index |
+//! | Cached payloads | 1 GiB | Cached payloads, the packages extracted from them, and a package being staged |
 
 use serde::{Deserialize, Serialize};
 
@@ -67,10 +74,26 @@ pub const METADATA_BUDGET_BYTES: u64 = 64 * MIB;
 /// Default index entry budget for one repository.
 pub const METADATA_BUDGET_ENTRIES: u64 = 100_000;
 
+/// Default number of accepted generations one repository keeps.
+///
+/// The generation in use and the one before it: a reader that looked the repository up a moment
+/// before a sync moved it on still finds the index it was told about. The host configuration's
+/// retained-generation budget defaults to the same two.
+pub const RETAINED_GENERATIONS: u64 = 2;
+
+/// Default retained metadata budget for one repository: the trust checkpoint and every kept
+/// generation's index, together.
+///
+/// One metadata budget for each generation kept, so a repository whose metadata fits the default
+/// metadata budget keeps its default two generations.
+pub const RETAINED_METADATA_BUDGET_BYTES: u64 = RETAINED_GENERATIONS * METADATA_BUDGET_BYTES;
+
 /// Default cached payload budget for one repository.
 ///
-/// A larger full mirror needs the explicit full-offline-mirror setting; it is not reached by
-/// syncing more often.
+/// It holds the cached payloads, the packages extracted from them, and a package being staged at
+/// its largest, so an installed package costs its extracted copy as well as its cached one. A
+/// larger full mirror needs the explicit full-offline-mirror setting; it is not reached by syncing
+/// more often.
 pub const PAYLOAD_CACHE_BUDGET_BYTES: u64 = 1024 * MIB;
 
 /// Maximum size of one manifest document.
@@ -125,11 +148,16 @@ impl Default for InstanceLimits {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct RepositoryBudgets {
-    /// Maximum bytes of catalogue metadata.
+    /// Maximum bytes of catalogue metadata one sync fetches, the index among them.
     pub metadata_bytes: U64,
     /// Maximum number of index entries.
     pub metadata_entries: U64,
-    /// Maximum bytes of cached payloads.
+    /// How many accepted generations are kept, the one in use among them. At least one.
+    pub retained_generations: U64,
+    /// Maximum bytes of metadata kept: the trust checkpoint and every kept generation's index.
+    pub retained_metadata_bytes: U64,
+    /// Maximum bytes of cached payloads, the packages extracted from them and a package being
+    /// staged.
     pub payload_cache_bytes: U64,
     /// Whether every referenced payload is fetched rather than only what is installed.
     pub full_offline_mirror: bool,
@@ -142,6 +170,8 @@ impl RepositoryBudgets {
         Self {
             metadata_bytes: U64::new(METADATA_BUDGET_BYTES),
             metadata_entries: U64::new(METADATA_BUDGET_ENTRIES),
+            retained_generations: U64::new(RETAINED_GENERATIONS),
+            retained_metadata_bytes: U64::new(RETAINED_METADATA_BUDGET_BYTES),
             payload_cache_bytes: U64::new(PAYLOAD_CACHE_BUDGET_BYTES),
             full_offline_mirror: false,
         }
@@ -173,6 +203,8 @@ mod tests {
         let budgets = RepositoryBudgets::defaults();
         assert_eq!(budgets.metadata_bytes.get(), 67_108_864);
         assert_eq!(budgets.metadata_entries.get(), 100_000);
+        assert_eq!(budgets.retained_generations.get(), 2);
+        assert_eq!(budgets.retained_metadata_bytes.get(), 134_217_728);
         assert_eq!(budgets.payload_cache_bytes.get(), 1_073_741_824);
         assert!(!budgets.full_offline_mirror);
     }

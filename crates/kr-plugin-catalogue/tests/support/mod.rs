@@ -250,6 +250,12 @@ impl Generation {
         self.manifest_digest
     }
 
+    /// Returns the directory the generation is published in, metadata and targets.
+    #[must_use]
+    pub fn directory(&self) -> PathBuf {
+        self.directory.clone()
+    }
+
     /// Returns the adopted trust root's bytes.
     #[must_use]
     pub fn root_bytes(&self) -> Vec<u8> {

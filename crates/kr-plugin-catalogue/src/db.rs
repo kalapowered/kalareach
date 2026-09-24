@@ -423,6 +423,17 @@ CREATE TABLE IF NOT EXISTS receipts (
 PRAGMA foreign_keys = ON;
 ";
 
+/// One accepted generation a repository keeps, and the index document that is its.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeptGeneration {
+    /// The generation number.
+    pub generation: u64,
+    /// The digest its index document is named by.
+    pub index_digest: PayloadDigest,
+    /// The bytes that document holds.
+    pub index_bytes: u64,
+}
+
 /// The records, read inside one transaction.
 pub struct Records<'a> {
     transaction: &'a rusqlite::Transaction<'a>,
@@ -523,6 +534,40 @@ impl Records<'_> {
             })
         })
         .transpose()
+    }
+
+    /// Returns every generation one enrolment keeps, the oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when a record cannot be read.
+    pub fn kept_generations(&self, key: &EnrolmentKey) -> CatalogueResult<Vec<KeptGeneration>> {
+        let mut statement = self
+            .transaction
+            .prepare_cached(
+                "SELECT generation, index_digest, index_bytes FROM accepted_generations
+                  WHERE enrolment_key = ?1 ORDER BY generation",
+            )
+            .map_err(|source| self.failure(&source))?;
+        let rows = statement
+            .query_map(params![key.as_str()], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|source| self.failure(&source))?;
+        let mut kept = Vec::new();
+        for row in rows {
+            let (generation, digest, bytes) = row.map_err(|source| self.failure(&source))?;
+            kept.push(KeptGeneration {
+                generation: unsigned(generation)?,
+                index_digest: PayloadDigest::parse(&digest).map_err(unreadable)?,
+                index_bytes: unsigned(bytes)?,
+            });
+        }
+        Ok(kept)
     }
 
     /// Returns one enrolment by its key, where it is still enrolled.
@@ -824,6 +869,19 @@ impl Changes<'_> {
         self.execute(
             "UPDATE enrolments SET active_generation = ?2 WHERE enrolment_key = ?1",
             params![key.as_str(), number(active.generation)?],
+        )?;
+        Ok(())
+    }
+
+    /// Stops keeping one accepted generation, and every target it pinned with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when it cannot be written.
+    pub fn forget_generation(&self, key: &EnrolmentKey, generation: u64) -> CatalogueResult<()> {
+        self.execute(
+            "DELETE FROM accepted_generations WHERE enrolment_key = ?1 AND generation = ?2",
+            params![key.as_str(), number(generation)?],
         )?;
         Ok(())
     }

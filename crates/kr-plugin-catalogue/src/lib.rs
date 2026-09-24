@@ -80,12 +80,13 @@ use kr_protocol::ids::{EnvironmentId, RepositoryGeneration};
 
 pub use crate::authority::{Authority, Committed, Effect, Failure, Owner, Recording};
 pub use crate::broker::{BrokerBridge, UnboundBroker};
-pub use crate::budget::{BudgetLedger, Resource, ResourceLimit, Stage};
+pub use crate::budget::{BudgetLedger, Resource, ResourceLimit, Retained, Stage};
 pub use crate::ceiling::{
     CapabilityDecision, GrantRequirement, InstallationGrant, capability_from_str,
 };
 pub use crate::db::{
-    ActiveGeneration, Claimed, Durability, Enrolled, ReceiptClaim, ReceiptKey, ReceiptRecord,
+    ActiveGeneration, Claimed, Durability, Enrolled, KeptGeneration, ReceiptClaim, ReceiptKey,
+    ReceiptRecord,
 };
 pub use crate::error::{CatalogueError, CatalogueResult};
 pub use crate::install::{
@@ -100,6 +101,7 @@ pub use crate::trust::{MetadataVersions, VerifiedGeneration};
 
 use crate::authority::committed;
 use crate::db::{Changes, Db, Records};
+use crate::store::StoreLock;
 use crate::trust::{PACKAGE_PREFIX, TargetRecord};
 
 /// Why a payload is being fetched.
@@ -365,6 +367,27 @@ impl Catalogue {
         self.db
             .read(|records| records.enrolment(id))?
             .ok_or_else(|| not_enrolled(id))
+    }
+
+    /// Takes one enrolment's store lock, then reads the enrolment again under it.
+    ///
+    /// An enrolment read before the wait can be out of date once the lock is held: a sync in
+    /// another process may have moved the repository on to a generation that no longer keeps the
+    /// one read before, or removed it. What an operation relies on is read as it is once the lock
+    /// is held.
+    fn locked(&self, enrolled: &Enrolled) -> CatalogueResult<(Store, StoreLock, Enrolled)> {
+        let store = Store::open(&self.root, &enrolled.key)?;
+        let lock = store.lock()?;
+        let current = self
+            .db
+            .read(|records| records.enrolment_by_key(&enrolled.key))?
+            .ok_or_else(|| CatalogueError::NotFound {
+                detail: format!(
+                    "{} was removed while this waited for it",
+                    enrolled.enrolment.id
+                ),
+            })?;
+        Ok((store, lock, current))
     }
 
     /// Returns every enrolled repository, in a stable order.
@@ -1028,17 +1051,36 @@ impl Catalogue {
             })?;
         }
 
-        let index_digest = verified
+        // The index is kept in its canonical rendering, named by that rendering's digest, which is
+        // also what one generation number is compared by.
+        let rendered = verified
             .index
-            .digest()
+            .canonical_json()
             .map_err(|source| CatalogueError::Integrity {
                 detail: format!("the index could not be rendered: {source}"),
-            })?;
+            })?
+            .into_bytes();
+        let index_digest = PayloadDigest::of(&rendered);
         trust::check_generation(
             verified.generation,
             index_digest,
             accepted_of(enrolled.active),
             enrolled.enrolment.pinned_generation,
+        )?;
+        // What the repository keeps once this generation is the one it is on is checked before
+        // anything is fetched or written for it. A generation that cannot be kept beside the trust
+        // checkpoint is refused here, and the one in use stays as it was.
+        let arriving = Retained {
+            generation: verified.generation.get(),
+            index_bytes: rendered.len() as u64,
+        };
+        let kept = self
+            .db
+            .read(|records| records.kept_generations(&enrolled.key))?;
+        BudgetLedger::new(enrolled.enrolment.budgets).plan_retention(
+            store.checkpoint_bytes()?,
+            &retained(&kept),
+            arriving,
         )?;
 
         // A full mirror runs before the index is activated. Section 11 asks for the whole
@@ -1076,9 +1118,10 @@ impl Catalogue {
         // commit of its own: a document nothing names yet is what a later failure leaves behind,
         // and the receipt says so.
         let (digest, bytes) = committed(authority, &Effect::Index(id.clone()), |permit| {
-            store.write_index(permit, &verified.index)
+            store.write_index(permit, &rendered)
         })?;
-        committing(&mut self.db, change, |changes| {
+        let checkpoint = store.checkpoint_bytes()?;
+        let synced = committing(&mut self.db, change, |changes| {
             // Read again: the repository may have been removed, enrolled again or moved to
             // another generation while this sync fetched. Only the enrolment this sync
             // verified is changed, and only forward from the generation it holds now.
@@ -1102,6 +1145,19 @@ impl Catalogue {
                 versions,
             };
             changes.activate(&key, &active, &accepted_targets)?;
+            // The generations it no longer keeps go in the same commit that moves it on, the
+            // oldest first, decided from the records and the budgets as they are now.
+            let forgotten = BudgetLedger::new(current.enrolment.budgets).plan_retention(
+                checkpoint,
+                &retained(&changes.kept_generations(&key)?),
+                Retained {
+                    generation: active.generation,
+                    index_bytes: active.index_bytes,
+                },
+            )?;
+            for generation in forgotten {
+                changes.forget_generation(&key, generation)?;
+            }
             let repository = RepositoryView {
                 enrolment: current.enrolment,
                 active: Some(active),
@@ -1113,7 +1169,40 @@ impl Catalogue {
                     outcome,
                 },
             ))
-        })
+        })?;
+        self.remove_unnamed_indexes(&store, &enrolled.key, id, authority);
+        Ok(synced)
+    }
+
+    /// Removes every index document no generation this repository keeps names.
+    ///
+    /// The records that named a generation it stopped keeping are already gone, so no reader is
+    /// left holding a generation whose index has disappeared, and a document a sync wrote before
+    /// it stopped is removed the same way. The sync has happened whatever this does: a document it
+    /// cannot remove is left for the next sync to remove.
+    fn remove_unnamed_indexes(
+        &self,
+        store: &Store,
+        key: &EnrolmentKey,
+        id: &RepositoryId,
+        authority: &dyn Authority,
+    ) {
+        let Ok(kept) = self.db.read(|records| records.kept_generations(key)) else {
+            return;
+        };
+        let Ok(held) = store.index_documents() else {
+            return;
+        };
+        let unnamed: Vec<PayloadDigest> = held
+            .into_keys()
+            .filter(|digest| !kept.iter().any(|kept| kept.index_digest == *digest))
+            .collect();
+        if unnamed.is_empty() {
+            return;
+        }
+        let _ = committed(authority, &Effect::Forgotten(id.clone()), |permit| {
+            store.remove_index_documents(permit, &unnamed)
+        });
     }
 
     /// Fetches every payload the index references, inside the approved budget.
@@ -1294,9 +1383,7 @@ impl Catalogue {
         authority: &dyn Authority,
     ) -> CatalogueResult<PayloadDigest> {
         authority.check()?;
-        let enrolled = self.enrolled(id)?;
-        let store = Store::open(&self.root, &enrolled.key)?;
-        let _lock = store.lock()?;
+        let (store, _lock, enrolled) = self.locked(&self.enrolled(id)?)?;
         self.activate_locked(
             &enrolled,
             &store,
@@ -1374,6 +1461,41 @@ impl Catalogue {
         }
         extract::check_declared(&entry, &ledger_of(store, enrolled)?)?;
 
+        // The package is staged whole, beside everything the cache and the packages already here
+        // hold, and what it still has to fetch is cached on the way. Room for both is made before
+        // anything is fetched, so the staging is counted at its largest rather than discovered
+        // part way, and nothing this package consists of is what is removed to make it.
+        let package: BTreeSet<PayloadDigest> = std::iter::once(entry.manifest_digest)
+            .chain(entry.payloads.iter().map(|payload| payload.digest))
+            .collect();
+        let cached = store.cached_payloads()?;
+        let mut fetching: BTreeSet<PayloadDigest> = BTreeSet::new();
+        let (mut staging, mut fetched) = (0u64, 0u64);
+        for (digest, size) in std::iter::once((entry.manifest_digest, entry.manifest_size_bytes))
+            .chain(
+                entry
+                    .payloads
+                    .iter()
+                    .map(|payload| (payload.digest, payload.size_bytes)),
+            )
+        {
+            staging = staging.saturating_add(size.get());
+            if cached.get(&digest) != Some(&size.get()) && fetching.insert(digest) {
+                fetched = fetched.saturating_add(size.get());
+            }
+        }
+        reclaim(
+            &mut self.db,
+            authority,
+            &self.bindings,
+            &*self.broker,
+            &enrolled.key,
+            store,
+            staging.saturating_add(fetched),
+            &subject,
+            &package,
+        )?;
+
         let prefix = format!(
             "{PACKAGE_PREFIX}{}/{}/{}",
             entry.publisher_id, entry.plugin_name, entry.version
@@ -1387,6 +1509,7 @@ impl Catalogue {
                 store,
                 &format!("{prefix}/{MANIFEST_FILE}"),
                 entry.manifest_digest,
+                &package,
                 reason,
                 authority,
             )
@@ -1402,7 +1525,15 @@ impl Catalogue {
             let target = format!("{prefix}/{}", payload.path.as_str());
             let relative = extract::relative_target(&prefix, &target)?;
             let bytes = self
-                .fetch(enrolled, store, &target, payload.digest, reason, authority)
+                .fetch(
+                    enrolled,
+                    store,
+                    &target,
+                    payload.digest,
+                    &package,
+                    reason,
+                    authority,
+                )
                 .await?;
             staged.write(&relative, &bytes)?;
         }
@@ -1437,12 +1568,17 @@ impl Catalogue {
     }
 
     /// Fetches one payload by content hash, out of the generation this host accepted.
+    ///
+    /// `package` is everything the package being staged consists of, which room is never made by
+    /// removing.
+    #[allow(clippy::too_many_arguments)]
     async fn fetch(
         &mut self,
         enrolled: &Enrolled,
         store: &Store,
         target: &str,
         digest: PayloadDigest,
+        package: &BTreeSet<PayloadDigest>,
         reason: FetchReason,
         authority: &dyn Authority,
     ) -> CatalogueResult<Vec<u8>> {
@@ -1495,7 +1631,7 @@ impl Catalogue {
             store,
             accepted_target.record.length,
             target,
-            &BTreeSet::new(),
+            package,
         )?;
         let bytes = trust::fetch_accepted(
             &self.transport,
@@ -1627,9 +1763,7 @@ impl Catalogue {
     ) -> CatalogueResult<InstallationView> {
         let authority = change.authority;
         authority.check()?;
-        let enrolled = self.enrolled(id)?;
-        let store = Store::open(&self.root, &enrolled.key)?;
-        let _lock = store.lock()?;
+        let (store, _lock, enrolled) = self.locked(&self.enrolled(id)?)?;
         let active = enrolled.active.ok_or_else(|| CatalogueError::NotFound {
             detail: format!("{id} has no activated generation yet"),
         })?;
@@ -1777,8 +1911,7 @@ impl Catalogue {
                 .read(|records| records.enrolment_by_key(&installation.enrolment))?;
             match enrolled {
                 Some(enrolled) => {
-                    let store = Store::open(&self.root, &enrolled.key)?;
-                    let _lock = store.lock()?;
+                    let (store, _lock, enrolled) = self.locked(&enrolled)?;
                     self.activate_locked(
                         &enrolled,
                         &store,
@@ -2113,6 +2246,7 @@ fn reclaim(
         return Ok(());
     }
     let effect = Effect::Reclaim {
+        packages: plan.packages(),
         payloads: plan.payloads(),
         bytes: plan.bytes(),
     };
@@ -2197,20 +2331,34 @@ fn check_installation(
 }
 
 /// Returns what a sync or a fetch measures against: the enrolment's budgets and what its
-/// directory holds now.
+/// directory holds now, its cached payloads and the packages extracted from them.
 ///
 /// Counted from the directory each time rather than carried: a count kept in memory drifts from
 /// the directory whenever another writer changes it, and a budget nobody can explain is the
 /// result.
 fn ledger_of(store: &Store, enrolled: &Enrolled) -> CatalogueResult<BudgetLedger> {
     let mut ledger = BudgetLedger::new(enrolled.enrolment.budgets);
-    for size in store.cached_payloads()?.values() {
+    for size in store
+        .cached_payloads()?
+        .values()
+        .chain(store.package_trees()?.values())
+    {
         ledger.add_payload_bytes(*size);
     }
     if let Some(active) = enrolled.active {
         ledger.accept_metadata(active.index_bytes, active.entries);
     }
     Ok(ledger)
+}
+
+/// Returns what the retention budgets measure of each generation a repository keeps.
+fn retained(kept: &[KeptGeneration]) -> Vec<Retained> {
+    kept.iter()
+        .map(|kept| Retained {
+            generation: kept.generation,
+            index_bytes: kept.index_bytes,
+        })
+        .collect()
 }
 
 fn accepted_of(active: Option<ActiveGeneration>) -> Option<(RepositoryGeneration, PayloadDigest)> {

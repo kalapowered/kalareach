@@ -125,13 +125,18 @@ pub enum Effect {
     Payload(PayloadDigest),
     /// A verified package, moved into place under its manifest digest.
     Package(PayloadDigest),
-    /// Cached payloads nothing protects, removed to make room.
+    /// Extracted packages and cached payloads nothing protects, removed to make room.
     Reclaim {
+        /// How many extracted packages.
+        packages: u64,
         /// How many payloads.
         payloads: u64,
         /// How many bytes they held.
         bytes: u64,
     },
+    /// The index documents of generations a repository no longer keeps, removed once no record
+    /// names them.
+    Forgotten(RepositoryId),
 }
 
 impl core::fmt::Display for Effect {
@@ -143,9 +148,18 @@ impl core::fmt::Display for Effect {
             Self::Index(id) => write!(f, "a generation index for {id}"),
             Self::Payload(digest) => write!(f, "the payload {digest}"),
             Self::Package(digest) => write!(f, "the package {digest}"),
-            Self::Reclaim { payloads, bytes } => write!(
+            Self::Reclaim {
+                packages,
+                payloads,
+                bytes,
+            } => write!(
                 f,
-                "the removal of {payloads} cached payloads ({bytes} bytes) to make room"
+                "the removal of {packages} extracted packages and {payloads} cached payloads \
+                 ({bytes} bytes) to make room"
+            ),
+            Self::Forgotten(id) => write!(
+                f,
+                "the removal of the index documents of generations {id} no longer keeps"
             ),
         }
     }
@@ -293,14 +307,19 @@ fn left_behind(committed: &[Committed], error: &ProtocolError) -> String {
     let mut confirmed: Vec<String> = Vec::new();
     let mut unconfirmed: Vec<String> = Vec::new();
     let mut payloads = [0u64; 2];
-    let mut removed = [(0u64, 0u64); 2];
+    let mut removed = [(0u64, 0u64, 0u64); 2];
     for change in committed {
         let at = usize::from(!change.confirmed);
         match &change.effect {
             Effect::Payload(_) => payloads[at] = payloads[at].saturating_add(1),
-            Effect::Reclaim { payloads, bytes } => {
-                removed[at].0 = removed[at].0.saturating_add(*payloads);
-                removed[at].1 = removed[at].1.saturating_add(*bytes);
+            Effect::Reclaim {
+                packages,
+                payloads,
+                bytes,
+            } => {
+                removed[at].0 = removed[at].0.saturating_add(*packages);
+                removed[at].1 = removed[at].1.saturating_add(*payloads);
+                removed[at].2 = removed[at].2.saturating_add(*bytes);
             }
             effect => {
                 let list = if change.confirmed {
@@ -318,11 +337,12 @@ fn left_behind(committed: &[Committed], error: &ProtocolError) -> String {
             1 => list.push("1 payload written into the cache".to_owned()),
             count => list.push(format!("{count} payloads written into the cache")),
         }
-        let (count, bytes) = removed[at];
-        if count > 0 {
+        let (packages, payloads, bytes) = removed[at];
+        if packages > 0 || payloads > 0 {
             list.push(
                 Effect::Reclaim {
-                    payloads: count,
+                    packages,
+                    payloads,
                     bytes,
                 }
                 .to_string(),
