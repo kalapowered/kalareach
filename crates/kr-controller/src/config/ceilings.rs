@@ -168,39 +168,38 @@ pub fn configured_rights(ceilings: &ConfigurationCeilings) -> Option<CanonicalSe
     })
 }
 
-/// Decides one request against a grant, this host's policy and this host's configured ceiling.
+/// Decides one request against a grant, this host's policy and the rights ceiling in force.
 ///
 /// The grant and the policy are intersected by [`crate::grants::decide`], which is the one
 /// implementation of that arithmetic. What this adds is the third intersection section 26 asks
-/// for: the rights this host's own configuration allows. It only ever removes rights. A ceiling
-/// that named a right the grant and the policy did not already allow adds nothing, and
-/// [`Decided::refused_rights`] names each one so the effective-value report can say the
-/// configuration asked for something it did not get.
+/// for: the rights this host's own configuration allows, `ceiling`, which is `None` where the
+/// configuration sets no ceiling. It only ever removes rights. A ceiling that named a right the
+/// grant and the policy did not already allow adds nothing, and [`Decided::refused_rights`] names
+/// each one.
+///
+/// This is the decision a paired device's every request is taken through, so there is no second
+/// copy of the arithmetic anywhere a request passes.
 ///
 /// # Errors
 ///
-/// Returns whatever [`crate::grants::decide`] refused with. A ceiling narrows a permitted request;
-/// it never turns a refusal into something else.
+/// Returns [`CeilingRefusal::RemovedByConfiguration`] naming the right when the method needs a
+/// right the grant and the policy allow and the ceiling removed, and
+/// [`CeilingRefusal::Refused`] with whatever [`crate::grants::decide`] refused with otherwise. A
+/// ceiling narrows a request; it never turns a refusal into a permission.
 pub fn decide_with_ceiling(
-    ceilings: &ConfigurationCeilings,
+    ceiling: Option<&CanonicalSet<ActionRight>>,
     grant: &Grant,
     record: &GrantRecord,
     policy: &mut HostPolicy,
     request: AccessRequest,
-) -> Result<Decided, Refusal> {
-    let Some(ceiling) = configured_rights(ceilings) else {
+) -> Result<Decided, CeilingRefusal> {
+    let Some(ceiling) = ceiling else {
         return Ok(Decided {
-            permitted: decide(grant, record, policy, request)?,
+            permitted: decide(grant, record, policy, request).map_err(CeilingRefusal::Refused)?,
             removed: CanonicalSet::new(),
             refused_rights: CanonicalSet::new(),
         });
     };
-    // Intersect the grant with current policy first, so diagnostics reflect the combination
-    // of policy and ceiling restrictions rather than comparing against unconstrained grant actions.
-    let now_ms = policy.settled_now(request.now_ms);
-    let policy_intersection = policy.intersect(grant, &request, now_ms)?;
-    let policy_rights = policy_intersection.rights;
-
     // The ceiling is applied to the grant *before* the decision, never to its result. A method
     // whose required right this host's configuration has removed has to be refused, and a decision
     // taken against the unnarrowed grant would already have permitted it: emptying the answer
@@ -215,6 +214,24 @@ pub fn decide_with_ceiling(
             .collect(),
         ..grant.clone()
     };
+    // The decision first, so every rule it applies refuses in its own order and the ceiling only
+    // decides what the rules left to it.
+    let decided = decide(&narrowed, record, policy, request.clone());
+    // What the grant and the policy allow without the ceiling, which is what the ceiling is
+    // measured against: an organisation lease that narrows a role has narrowed it already.
+    let now_ms = policy.settled_now(request.now_ms);
+    let policy_rights = policy
+        .intersect(grant, &request, now_ms)
+        .map_or_else(|_| CanonicalSet::new(), |intersection| intersection.rights);
+    let permitted = match decided {
+        Ok(permitted) => permitted,
+        Err(Refusal::MissingRight { right })
+            if policy_rights.contains(&right) && !ceiling.contains(&right) =>
+        {
+            return Err(CeilingRefusal::RemovedByConfiguration { right });
+        }
+        Err(refusal) => return Err(CeilingRefusal::Refused(refusal)),
+    };
     let removed: CanonicalSet<ActionRight> = policy_rights
         .iter()
         .copied()
@@ -228,10 +245,61 @@ pub fn decide_with_ceiling(
         .filter(|right| !policy_rights.contains(right))
         .collect();
     Ok(Decided {
-        permitted: decide(&narrowed, record, policy, request)?,
+        permitted,
         removed,
         refused_rights,
     })
+}
+
+/// Why a request was refused once every intersection had been applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CeilingRefusal {
+    /// The grant and this host's policy refused it, whatever the configuration says.
+    Refused(Refusal),
+    /// The grant and the policy allow `right`, the method needs it, and this host's configuration
+    /// removed it.
+    RemovedByConfiguration {
+        /// The right the configuration removed.
+        right: ActionRight,
+    },
+}
+
+impl CeilingRefusal {
+    /// The sentence a caller is told.
+    ///
+    /// A right the configuration removed is named, with the reason, rather than reported as one
+    /// the grant does not carry: the grant does carry it, and a device holder told otherwise
+    /// would go looking for the wrong fix.
+    #[must_use]
+    pub fn detail(&self) -> String {
+        match self {
+            Self::Refused(refusal) => refusal.detail(),
+            Self::RemovedByConfiguration { right } => format!(
+                "this host's configuration removes {} from every grant on this host, although \
+                 this grant carries it",
+                right.as_str()
+            ),
+        }
+    }
+
+    /// The protocol error a refusal becomes, which is `PERMISSION_DENIED` whichever rule refused.
+    #[must_use]
+    pub fn to_protocol_error(&self) -> kr_protocol::error::ProtocolError {
+        kr_protocol::error::ProtocolError::new(
+            kr_protocol::error::ErrorCode::PermissionDenied,
+            self.detail(),
+        )
+    }
+}
+
+/// The rights a ceiling in force removes from every grant on this host, in the vocabulary's order.
+#[must_use]
+pub fn removed_by(ceiling: &CanonicalSet<ActionRight>) -> Vec<ActionRight> {
+    ActionRight::ALL
+        .iter()
+        .copied()
+        .filter(|right| !ceiling.contains(right))
+        .collect()
 }
 
 /// What one request came out as once every intersection had been applied.

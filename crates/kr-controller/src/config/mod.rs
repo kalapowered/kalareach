@@ -116,6 +116,23 @@ pub struct Accepted {
     /// A failure cannot be dropped on the floor here: it is part of the value every caller
     /// already has to hold, so the report says it and the edit path returns it.
     pub not_in_force: Option<Sentence>,
+    /// The rights ceiling a paired device's request is decided against.
+    pub rights: EnforcedRights,
+}
+
+/// The rights ceiling a paired device's request is decided against, and where it came from.
+///
+/// Written by every acceptance whose reading produced a document, before the fence that reading
+/// owes is raised, so a narrower ceiling decides every request from that moment. A reading that
+/// produced none - no file, a file this build cannot read, a version it does not know - decides
+/// nothing, and the ceiling already in force stays: a restriction an owner accepted is not lifted
+/// because a later reading could not use the file it was in.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EnforcedRights {
+    /// The rights a grant may carry on this host, when a ceiling is in force.
+    pub ceiling: Option<kr_protocol::scalars::CanonicalSet<kr_protocol::rights::ActionRight>>,
+    /// True when the document this report describes decided it.
+    pub from_document: bool,
 }
 
 impl Accepted {
@@ -176,6 +193,10 @@ impl Accepted {
                 from_document: true,
             },
         );
+        let rights = EnforcedRights {
+            ceiling: ceilings::configured_rights(&resolver.ceilings()),
+            from_document: resolver.loaded().document.is_some(),
+        };
         Self {
             resolver,
             sessions,
@@ -184,6 +205,7 @@ impl Accepted {
             fence_owed: None,
             effects_applied: true,
             not_in_force: None,
+            rights,
         }
     }
 }
@@ -458,7 +480,6 @@ pub fn effective(
         accepted.sessions,
     );
     let enrolment = ceilings::enrolment(&ceilings);
-    let rights = ceilings::configured_rights(&ceilings);
 
     let doc_path = resolver.document().display().to_string();
     let (session_source, session_origin) = if !accepted.sessions.from_document {
@@ -497,16 +518,38 @@ pub fn effective(
     };
     let enrolment_origin = (!supplied_budgets.is_empty()).then(|| doc_path.clone());
 
-    let rights_source = if ceilings.grant_rights.is_present() {
-        configuration::ValueSource::HostConfiguration
+    // What the document asks for, and the ceiling a paired device's request is decided against.
+    // They are the same on an ordinary host. Where this reading decided nothing - no document, one
+    // this build cannot read, one at a version it does not know - the ceiling this host last
+    // accepted is still the one in force, and the report says so rather than printing a lifted
+    // ceiling nothing is enforcing.
+    let configured_rights = ceilings::configured_rights(&ceilings);
+    let enforced_rights = &accepted.rights;
+    let (rights_source, rights_origin) = if !enforced_rights.from_document {
+        (
+            if enforced_rights.ceiling.is_some() {
+                configuration::ValueSource::HostConfiguration
+            } else {
+                configuration::ValueSource::Default
+            },
+            None,
+        )
+    } else if ceilings.grant_rights.is_present() {
+        (
+            configuration::ValueSource::HostConfiguration,
+            Some(doc_path),
+        )
     } else {
-        configuration::ValueSource::Default
+        (configuration::ValueSource::Default, None)
     };
-    let rights_origin = if ceilings.grant_rights.is_present() {
-        Some(doc_path)
-    } else {
-        None
-    };
+    let rights_line =
+        |rights: &kr_protocol::scalars::CanonicalSet<kr_protocol::rights::ActionRight>| {
+            if rights.is_empty() {
+                Sentence::new().stated("no right")
+            } else {
+                Sentence::new().terms(rights.iter().map(|right| right.as_str()), ", ")
+            }
+        };
     EffectiveConfiguration {
         schema_version: U64::new(configuration::VERSION),
         revision: U64::new(resolver.revision()),
@@ -589,22 +632,42 @@ pub fn effective(
             ),
             kr_protocol::hostinfo::CeilingValue {
                 key: "grant_rights".to_owned(),
-                configured: kr_protocol::scalars::Nullable(rights.as_ref().map(|rights| {
-                    Sentence::new().terms(rights.iter().map(|right| right.as_str()), ", ")
-                })),
-                value: rights.as_ref().map_or_else(
+                configured: kr_protocol::scalars::Nullable(
+                    configured_rights.as_ref().map(rights_line),
+                ),
+                value: enforced_rights.ceiling.as_ref().map_or_else(
                     || Sentence::new().stated("every right the grant and the host policy allow"),
-                    |rights| Sentence::new().terms(rights.iter().map(|right| right.as_str()), ", "),
+                    rights_line,
                 ),
                 source: rights_source,
                 origin: kr_protocol::scalars::Nullable(rights_origin),
                 effect: configuration::ValueEffect::Immediately,
-                narrowed_by: kr_protocol::scalars::Nullable(rights.as_ref().map(|_| {
-                    Sentence::new().stated(
-                        "the grant and the host policy are intersected first; this ceiling only \
-                         removes rights",
-                    )
-                })),
+                // What the ceiling in force removes, named right by right from the vocabulary, so
+                // an owner reading the report sees what a device can no longer do here.
+                narrowed_by: kr_protocol::scalars::Nullable(enforced_rights.ceiling.as_ref().map(
+                    |ceiling| {
+                        let removed = ceilings::removed_by(ceiling);
+                        let line = if enforced_rights.from_document {
+                            Sentence::new()
+                        } else {
+                            Sentence::new().stated(
+                                "this host is still enforcing the ceiling it last accepted, \
+                                 because this document did not decide it; ",
+                            )
+                        };
+                        let line = if removed.is_empty() {
+                            line.stated("this ceiling removes no right")
+                        } else {
+                            line.stated("this ceiling removes ")
+                                .terms(removed.iter().map(|right| right.as_str()), ", ")
+                                .stated(" from every grant on this host")
+                        };
+                        line.stated(
+                            "; the grant and the host policy are intersected first, and a right \
+                             named here that a grant does not carry adds nothing",
+                        )
+                    },
+                )),
                 refused: false,
             },
         ],

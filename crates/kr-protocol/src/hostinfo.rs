@@ -386,7 +386,9 @@ pub struct CeilingValue {
     pub origin: Nullable<String>,
     /// When it applies: immediately, only to sessions created afterwards, or at the next start.
     pub effect: configuration::ValueEffect,
-    /// What narrowed the configured value, when something did.
+    /// What narrowed the configured value, when something did. For the rights ceiling, which
+    /// narrows grants rather than being narrowed, it names the rights the ceiling in force removes
+    /// from every grant on this host.
     pub narrowed_by: Nullable<export::Sentence>,
     /// True when the configured value was more permissive and was refused.
     pub refused: bool,

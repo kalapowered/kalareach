@@ -324,6 +324,14 @@ pub struct Controller {
     /// Both are built once, at startup, from the document on disk then, so these are what the
     /// daemon acts on until it next starts, and a later edit is reported as applying then.
     started: crate::config::Started,
+    /// The rights ceiling a paired device's every request is decided against, when one is in force.
+    ///
+    /// Seeded from the document this environment durably accepted, and replaced by every
+    /// acceptance whose reading produced a document, before the fence that reading owes is raised:
+    /// a narrower ceiling decides every request from that moment, and the fence stops what was
+    /// admitted under the wider one. A reading that produced no document leaves it as it is.
+    pub(crate) rights_ceiling:
+        std::sync::Mutex<Option<CanonicalSet<kr_protocol::rights::ActionRight>>>,
     /// True while a ceiling this host accepted asked for a fence it could not raise.
     ///
     /// Section 26 fences dispatch before a change affecting authority is acknowledged, so a fence
@@ -555,6 +563,11 @@ impl Controller {
         // one on disk. What an edit owes is the difference between the two, so a daemon that seeded
         // itself from the file would derive nothing from a ceiling somebody removed while it was
         // not running, and would fence nothing.
+        // The rights ceiling this environment accepted is in force from the first request, before
+        // any acceptance below runs: it is what the fences recorded against it were raised for.
+        let rights_ceiling = accepted_document
+            .as_ref()
+            .and_then(|document| crate::config::ceilings::configured_rights(&document.ceilings));
         let mut accepted_configuration = crate::config::AcceptedState {
             revision: durably_accepted.revision,
             document: accepted_document,
@@ -711,6 +724,7 @@ impl Controller {
             accepted_configuration: Mutex::new(accepted_configuration),
             in_force: std::sync::Mutex::new(in_force),
             started,
+            rights_ceiling: std::sync::Mutex::new(rights_ceiling),
             fence_unraised: std::sync::atomic::AtomicBool::new(false),
             boot_identity: setup.boot_identity,
             boot_epoch,
@@ -1471,6 +1485,15 @@ impl Controller {
             revision
         };
         self.leases.revoke(revision);
+        // The host policy decides a paired device's request against the revision in force, so it
+        // follows this one. A grant issued from now on carries it, and a policy left at the
+        // previous revision would refuse that grant as claiming a revision this host never issued.
+        // The registry is the durable record of the revision, and a restored policy takes the
+        // higher of the two, so there is nothing more to write here.
+        self.policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .advance_authority_revision(revision);
         // The registrations are gone; the connections that held them are told. A frame already
         // waiting for its peer is stopped by its connection closing, not by the next check.
         self.fence_network_connections().await;
@@ -5639,6 +5662,24 @@ impl Controller {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             crate::config::InForce::of(&resolver);
+        // The rights ceiling a paired device's request is decided against, from this reading when
+        // it produced a document and as it was when it did not. Before the fence below, so a
+        // narrower ceiling decides every request from here on while the work admitted under the
+        // wider one is fenced; a reading that decided nothing lifts nothing.
+        let rights = {
+            let mut held = self
+                .rights_ceiling
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let decided = resolver.loaded().document.as_ref();
+            if let Some(document) = decided {
+                *held = crate::config::ceilings::configured_rights(&document.ceilings);
+            }
+            crate::config::EnforcedRights {
+                ceiling: held.clone(),
+                from_document: decided.is_some(),
+            }
+        };
         let (sessions, mut failure) = self.apply_session_limit(&resolver, &state).await;
         if sessions.from_document {
             // Recorded the moment the registry took it, separately from everything below. A later
@@ -5785,6 +5826,7 @@ impl Controller {
             fence_owed,
             effects_applied,
             not_in_force: failure,
+            rights,
         }
     }
 

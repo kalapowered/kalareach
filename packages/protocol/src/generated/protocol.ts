@@ -10575,7 +10575,9 @@ export interface CeilingValue {
    */
   key: string
   /**
-   * What narrowed the configured value, when something did.
+   * What narrowed the configured value, when something did. For the rights ceiling, which
+   * narrows grants rather than being narrowed, it names the rights the ceiling in force removes
+   * from every grant on this host.
    */
   narrowed_by: string | null
   /**

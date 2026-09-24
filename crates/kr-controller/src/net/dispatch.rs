@@ -10,9 +10,11 @@
 //!    answer is written. That is the fence a revocation sets: section 9's dispatch barrier covers a
 //!    worker's dispatch, and this covers a read or a subscription on a connection that was
 //!    authorised a moment earlier.
-//! 3. **The grant decides.** The rights the method requires are checked against the grant the
-//!    device holds: its expiry, the environment and session its selectors admit, the rights it
-//!    carries, and the content its history scope reaches.
+//! 3. **The grant decides, through the one intersection.** The grant the device holds is intersected
+//!    with this host's policy and with the rights ceiling its configuration put in force, and the
+//!    method is decided against what is left: the grant's expiry, the environment and session its
+//!    selectors admit, the rights the method requires, and the content its history scope reaches.
+//!    A right the configuration removed is refused by its name.
 //! 4. **The window decides.** A mutation's accepted deadline is the earliest of what its action
 //!    window has left, receipt time plus the requested lifetime, what remains of the grant's own
 //!    lifetime, and the dispatch lease's remaining time.
@@ -38,10 +40,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use kr_protocol::actor::ActorEnvelope;
+use kr_protocol::actor::{ActorEnvelope, ActorIngress};
 use kr_protocol::authority::{
     EffectClass, HistoryFilter, MethodEntry, RequiredAuthority, ResourceSelectorKind,
-    RightCondition,
 };
 use kr_protocol::envelope::{
     ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
@@ -50,6 +51,7 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{AuthorityRevision, ConnectionId, DeviceId, RequestId, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
+use kr_protocol::scalars::CanonicalSet;
 use kr_protocol::session::SessionListResult;
 use kr_transport::actor::ConnectionActor;
 use kr_transport::clock::ContinuousClock as _;
@@ -58,6 +60,7 @@ use kr_transport::window::AcceptedDeadline;
 
 use super::devices::DeviceRecord;
 use super::proxy::{RELAY_QUEUED_BYTES, RelayBudget, Relayed, Vouched, WorkerProxy};
+use crate::config::ceilings::CeilingRefusal;
 use crate::error::{ControllerError, Result};
 use crate::service::Controller;
 
@@ -776,13 +779,16 @@ impl RemoteConnection {
         // checked above, and the grant below, because an authority that has gone does not entitle
         // a caller to a result it once produced.
         let actor_id = self.device.principal();
-        if let Err(error) = self.check_grant(
+        // The rights this request was decided with: the grant as this host's policy and its
+        // configured ceiling leave it. They are what the worker is told the host checked.
+        let rights = match self.check_grant(
             mutation.target.session_id.as_ref().copied(),
             entry,
             claims_geometry(mutation),
         ) {
-            return failure(mutation.request_id, error);
-        }
+            Ok(rights) => rights,
+            Err(error) => return failure(mutation.request_id, error),
+        };
         // Every store that retains an action is asked in turn, in the order the local ingress asks
         // them: the daemon's own reservations first, then the project service's own record. A
         // project mutation's receipt lives with the project service, so a retry of one that lost
@@ -978,7 +984,7 @@ impl RemoteConnection {
                 let controller = Arc::clone(&self.controller);
                 let mutation = mutation.clone();
                 let envelope = self.envelope(validated);
-                let grant_rights = self.device.grant.actions.clone();
+                let grant_rights = rights;
                 let request_id = mutation.request_id;
                 // The answer comes back before the link that carried the close is released,
                 // because releasing it is what tells the worker the acceptance was delivered.
@@ -1375,7 +1381,10 @@ impl RemoteConnection {
                 }
             }
             // Everything else belongs to the worker that owns the session.
-            _ => self.proxied_mutation(mutation, accepted, validated).await,
+            _ => {
+                self.proxied_mutation(mutation, accepted, validated, rights)
+                    .await
+            }
         }
     }
 
@@ -1669,6 +1678,7 @@ impl RemoteConnection {
         mutation: &MutationRequest,
         accepted: AcceptedDeadline,
         validated: AuthorityRevision,
+        grant_rights: CanonicalSet<ActionRight>,
     ) -> ControlFrame {
         let Some(session_id) = mutation.target.session_id.as_ref().copied() else {
             return failure(
@@ -1706,10 +1716,11 @@ impl RemoteConnection {
         // cancellation here must not be what decides whether the outcome is recorded.
         let mutation = mutation.clone();
         let request_id = mutation.request_id;
-        // The grant's rights travel with the mutation. The worker admits an attachment and holds
-        // no grants: section 8's intersection of requested capabilities with the actor's rights is
-        // made where the attachment is admitted, out of what the host checked this request against.
-        let grant_rights = self.device.grant.actions.clone();
+        // The rights this request was decided with travel with the mutation: the grant as this
+        // host's policy and its configured ceiling leave it. The worker admits an attachment and
+        // holds no grants: section 8's intersection of requested capabilities with the actor's
+        // rights is made where the attachment is admitted, out of what the host checked this
+        // request against.
         let effect = tokio::spawn(async move {
             proxy
                 .forward_mutation(
@@ -1754,7 +1765,7 @@ impl RemoteConnection {
             Method::ActionRead.as_str(),
             Method::ActionRead.entry().version,
         )?;
-        self.check_grant(session_id, entry, false)
+        self.check_grant(session_id, entry, false).map(|_| ())
     }
 
     /// Returns this connection's link to one worker, opening it on first use.
@@ -2288,94 +2299,102 @@ impl RemoteConnection {
             })
     }
 
-    /// Checks the grant this device holds against what the method requires.
+    /// Decides this device's request through the one intersection, and returns the rights it was
+    /// decided with.
     ///
-    /// What is checked here is what a grant on its own can answer: whether it has expired, the
-    /// environment and session its selectors admit, the rights it carries for the conditions this
-    /// request meets, and whether the content the method returns is inside its history scope. A
-    /// requirement that depends on the resolved subject — resource ownership, a local caller's
-    /// token — is the subject's to answer, and the worker answers it inside its own dispatch
-    /// barrier where the subject cannot move.
+    /// Checked here first is what only this connection knows: whether the grant's own deadline,
+    /// anchored on the continuous clock when the connection was admitted, has passed. Everything a
+    /// grant, this host's policy and this host's configuration decide is then
+    /// [`Controller::decide_for_device`]'s, which is [`crate::config::ceilings::decide_with_ceiling`]:
+    /// the method's reachability, the grant's standing and expiry, the policy's organisation
+    /// leases and offline bound, the environment and session its selectors admit, and every right
+    /// the method requires under the conditions this request meets, taken from the grant as the
+    /// policy and the configured rights ceiling leave it. A right the configuration removed is
+    /// refused by name. Last comes the history scope. A requirement that depends on the resolved
+    /// subject - resource ownership, a local caller's token - is the subject's to answer, and the
+    /// worker answers it inside its own dispatch barrier where the subject cannot move.
     fn check_grant(
         &self,
         session_id: Option<SessionId>,
         entry: &'static MethodEntry,
         claims_geometry: bool,
-    ) -> std::result::Result<(), ProtocolError> {
-        let grant = &self.device.grant;
+    ) -> std::result::Result<CanonicalSet<ActionRight>, ProtocolError> {
         if !self.grant_is_current() {
             return Err(ProtocolError::new(
                 ErrorCode::PermissionDenied,
                 "this device's grant has expired",
             ));
         }
-        if !grant
-            .environment_selector
-            .admits(self.controller.paths().environment_id())
-        {
-            return Err(ProtocolError::new(
-                ErrorCode::PermissionDenied,
-                "this device's grant does not cover this environment",
-            ));
-        }
-        if let Some(session_id) = session_id
-            && !grant.session_selector.admits(session_id)
-        {
-            return Err(ProtocolError::new(
-                ErrorCode::PermissionDenied,
-                "this device's grant does not cover that session",
-            ));
-        }
-        for required in entry.required_rights {
-            if !Self::condition_holds(required.when, claims_geometry) {
-                continue;
-            }
-            match required.authority {
-                // The voice right lives in the separate voice grant section 15 ¶7 intersects with
-                // this one, not in the grant this connection was admitted under: a person holds
-                // their ordinary authority and chooses separately how much of it voice may use.
-                // It is resolved against that grant here, and the coordinator takes the
-                // intersection again at the moment of each decision.
-                RequiredAuthority::Right {
+        let grant = self.decided_grant(entry);
+        // The device's record is where its grant's standing is written: when it was committed,
+        // which is when its invitation was redeemed, and when it was revoked.
+        let record = crate::grants::GrantRecord {
+            grant: grant.clone(),
+            session_id: None,
+            issued_at_ms: self.device.paired_at_ms.get(),
+            activated_at_ms: Some(self.device.paired_at_ms.get()),
+            revoked_at_ms: self.device.revoked_at_ms.map(|at| at.get()),
+            revoked_by_parent: None,
+        };
+        let request = crate::grants::AccessRequest {
+            method: entry.method,
+            ingress: ActorIngress::PairedDevice,
+            environment_id: self.controller.paths().environment_id(),
+            session_id,
+            claims_geometry,
+            recipient_account: None,
+            own_subject: None,
+            now_ms: super::super::wall_clock_ms(),
+        };
+        let decided = self
+            .controller
+            .decide_for_device(&grant, &record, request)
+            .map_err(|refusal| match refusal {
+                CeilingRefusal::Refused(crate::grants::Refusal::MissingRight {
                     right: ActionRight::VoiceUse,
-                } if !self.holds_voice_grant() => {
-                    return Err(ProtocolError::new(
-                        ErrorCode::PermissionDenied,
-                        "this device holds no voice grant on this host",
-                    ));
-                }
+                }) => ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "this device holds no voice grant on this host",
+                ),
+                other => other.to_protocol_error(),
+            })?;
+        self.check_history(entry)?;
+        Ok(decided.permitted.rights)
+    }
+
+    /// The grant this device's requests are decided against: the one its pairing committed, with
+    /// one right resolved elsewhere.
+    ///
+    /// `voice.use` lives in the separate voice grant section 15 paragraph 7 intersects with this
+    /// one, not in the grant this connection was admitted under: a person holds their ordinary
+    /// authority and chooses separately how much of it voice may use. So it is taken out of this
+    /// grant and put back only for a method that needs it, when this device holds a live voice
+    /// grant carrying it. The policy and the configured ceiling then apply to it like any other
+    /// right, and the coordinator takes the intersection again at the moment of each decision.
+    fn decided_grant(&self, entry: &'static MethodEntry) -> kr_protocol::grant::Grant {
+        let needs_voice = entry.required_rights.iter().any(|required| {
+            matches!(
+                required.authority,
                 RequiredAuthority::Right {
-                    right: ActionRight::VoiceUse,
-                } => {}
-                RequiredAuthority::Right { right } if !grant.permits(right) => {
-                    return Err(ProtocolError::new(
-                        ErrorCode::PermissionDenied,
-                        format!("this device's grant does not carry {}", right.as_str()),
-                    ));
+                    right: ActionRight::VoiceUse
                 }
-                // Current read authority over the subject, which is the subject the request
-                // names. For a session that is `session.view` at the session's scope, which is
-                // what the grant can answer; the session's own state is the worker's to answer
-                // inside its barrier. A request that names no session has a subject of another
-                // kind — a repository, a working copy, this host itself — and demanding
-                // `session.view` for one of those would ask for authority over something the
-                // answer is not about. What still decides such a request is everything else this
-                // check makes: the grant's expiry, its environment selector, the rights the method
-                // requires outright, and its history scope.
-                RequiredAuthority::PresentViewAuthority
-                    if session_id.is_some() && !grant.permits(ActionRight::SessionView) =>
-                {
-                    return Err(ProtocolError::new(
-                        ErrorCode::PermissionDenied,
-                        "this device's grant carries no current read authority over that subject",
-                    ));
-                }
-                // A basis a grant does not express. The subject resolves it, and a caller that
-                // reaches the subject at all has already passed everything above.
-                _ => {}
-            }
+            )
+        });
+        let mut actions: CanonicalSet<ActionRight> = self
+            .device
+            .grant
+            .actions
+            .iter()
+            .copied()
+            .filter(|right| *right != ActionRight::VoiceUse)
+            .collect();
+        if needs_voice && self.holds_voice_grant() {
+            actions.insert(ActionRight::VoiceUse);
         }
-        self.check_history(entry)
+        kr_protocol::grant::Grant {
+            actions,
+            ..self.device.grant.clone()
+        }
     }
 
     /// Whether this device holds a live voice grant on this host.
@@ -2394,30 +2413,6 @@ impl RemoteConnection {
                         && record.grant.permits(ActionRight::VoiceUse)
                 })
             })
-    }
-
-    /// Returns whether a conditional requirement applies to this request.
-    ///
-    /// A condition the host cannot evaluate is treated as holding, so the requirement is checked
-    /// rather than skipped: a condition nobody can decide must not be the reason a right goes
-    /// unasked for.
-    const fn condition_holds(when: RightCondition, claims_geometry: bool) -> bool {
-        match when {
-            RightCondition::Always => true,
-            // A geometry claim is what the request asks for, and the request is what says so.
-            // `session.attach` and `attachment.configure` both carry the flag and the capability.
-            RightCondition::GeometryClaim => claims_geometry,
-            // Whose subject it is belongs to the subject, and these conditions are alternatives
-            // keyed to that answer: `own_subject` and `other_actor` cannot both hold, so treating
-            // both as holding would demand the authority for somebody else's subject from a caller
-            // acting on its own. The subject resolves them inside its own barrier, where it
-            // refuses what it must: a device detaches the attachment its connection created, and
-            // a receipt lookup keyed by the verified actor finds only that actor's own actions.
-            RightCondition::OwnSubject
-            | RightCondition::OtherActor
-            | RightCondition::CandidateEndpoint
-            | RightCondition::IssuingOwner => false,
-        }
     }
 
     /// Refuses a read whose content is outside the grant's history scope.

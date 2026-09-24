@@ -668,7 +668,7 @@ fn the_ceiling_narrows_the_grant_the_decision_is_taken_against() {
     // No ceiling: the grant decides on its own, and the input right is in the decision.
     let open_host = ConfigurationCeilings::default();
     let decided = ceilings::decide_with_ceiling(
-        &open_host,
+        ceilings::configured_rights(&open_host).as_ref(),
         &grant,
         &record,
         &mut policy,
@@ -690,7 +690,7 @@ fn the_ceiling_narrows_the_grant_the_decision_is_taken_against() {
         ..ConfigurationCeilings::default()
     };
     let decided = ceilings::decide_with_ceiling(
-        &narrowed,
+        ceilings::configured_rights(&narrowed).as_ref(),
         &grant,
         &record,
         &mut policy,
@@ -720,7 +720,7 @@ fn the_ceiling_narrows_the_grant_the_decision_is_taken_against() {
         ..ConfigurationCeilings::default()
     };
     let decided = ceilings::decide_with_ceiling(
-        &wider,
+        ceilings::configured_rights(&wider).as_ref(),
         &grant,
         &record,
         &mut policy,
@@ -729,6 +729,134 @@ fn the_ceiling_narrows_the_grant_the_decision_is_taken_against() {
     .expect("the grant still decides");
     assert!(!decided.permitted.rights.contains(&ActionRight::HostManage));
     assert!(decided.refused_rights.contains(&ActionRight::HostManage));
+
+    // A method that needs a right the ceiling removed is refused by that right's name, and the
+    // refusal says the configuration removed it rather than that the grant lacks it.
+    let refused = ceilings::decide_with_ceiling(
+        ceilings::configured_rights(&narrowed).as_ref(),
+        &grant,
+        &record,
+        &mut policy,
+        request(Method::InputWrite),
+    )
+    .expect_err("the input right is gone from this host");
+    assert_eq!(
+        refused,
+        ceilings::CeilingRefusal::RemovedByConfiguration {
+            right: ActionRight::TerminalInput
+        }
+    );
+    assert!(
+        refused.detail().contains("terminal.input") && refused.detail().contains("configuration"),
+        "{}",
+        refused.detail()
+    );
+
+    // And a method that needs a right the grant never carried is the grant's refusal, whatever
+    // the ceiling names.
+    let refused = ceilings::decide_with_ceiling(
+        ceilings::configured_rights(&wider).as_ref(),
+        &grant,
+        &record,
+        &mut policy,
+        request(Method::DeviceList),
+    )
+    .expect_err("the grant carries no host.manage");
+    assert_eq!(
+        refused,
+        ceilings::CeilingRefusal::Refused(crate::grants::Refusal::MissingRight {
+            right: ActionRight::HostManage
+        })
+    );
+
+    // What the ceiling in force removes from every grant, named from the vocabulary.
+    let removed = ceilings::removed_by(
+        &ceilings::configured_rights(&narrowed).expect("a configured ceiling"),
+    );
+    assert_eq!(removed.len(), ActionRight::ALL.len() - 1);
+    assert!(!removed.contains(&ActionRight::SessionView));
+}
+
+/// KR-REQ-26.15: the report names the rights ceiling in force and what it removes, and keeps a
+/// ceiling this host accepted when the document in front of it decides nothing.
+#[test]
+fn the_report_names_what_the_rights_ceiling_removes() {
+    use kr_protocol::rights::ActionRight;
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    edit_once(
+        &environment,
+        &Change::GrantRights(Some(vec![
+            ActionRight::SessionView.as_str().to_owned(),
+            ActionRight::TerminalInput.as_str().to_owned(),
+        ])),
+    )
+    .expect("a ceiling");
+    let report = reported(&environment);
+    let rights = report
+        .ceilings
+        .iter()
+        .find(|ceiling| ceiling.key == "grant_rights")
+        .expect("the rights ceiling");
+    assert_eq!(rights.value.as_str(), "session.view, terminal.input");
+    let removed = rights
+        .narrowed_by
+        .as_ref()
+        .expect("what it removes")
+        .as_str();
+    assert!(
+        removed.starts_with("this ceiling removes terminal.geometry, "),
+        "{removed}"
+    );
+    assert!(
+        removed.contains("host.manage, voice.use from every grant on this host"),
+        "{removed}"
+    );
+    assert!(!removed.contains("session.view,"), "{removed}");
+
+    // The document becomes unreadable; the ceiling this host accepted is what it still enforces.
+    let resolver = open(&environment);
+    let accepted = Accepted {
+        rights: EnforcedRights {
+            ceiling: ceilings::configured_rights(&resolver.ceilings()),
+            from_document: false,
+        },
+        ..Accepted::in_force(
+            Resolver::from_loaded(
+                kr_protocol::hostinfo::configuration::unreadable(
+                    Sentence::new().stated("this file must not be a symbolic link"),
+                ),
+                &environment,
+            ),
+            HardLimits::default(),
+        )
+    };
+    let report = effective(
+        &accepted,
+        HardLimits::default(),
+        WorkerProfile::HeadlessUser,
+    );
+    let rights = report
+        .ceilings
+        .iter()
+        .find(|ceiling| ceiling.key == "grant_rights")
+        .expect("the rights ceiling");
+    assert_eq!(rights.value.as_str(), "session.view, terminal.input");
+    assert!(
+        !rights.configured.is_present(),
+        "the document asks for nothing"
+    );
+    assert!(
+        rights
+            .narrowed_by
+            .as_ref()
+            .expect("why")
+            .as_str()
+            .starts_with("this host is still enforcing the ceiling it last accepted"),
+        "{:?}",
+        rights.narrowed_by
+    );
 }
 
 /// KR-REQ-01.23, KR-REQ-26.16: effects that failed leave the report describing what is enforced,

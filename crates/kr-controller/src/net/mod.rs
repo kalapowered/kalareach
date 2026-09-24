@@ -602,6 +602,13 @@ impl NetworkHost {
             revision
         };
         controller.leases.revoke(revision);
+        // The host policy decides a paired device's request against the revision in force, and a
+        // device paired after this revocation is issued a grant at this revision.
+        controller
+            .policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .advance_authority_revision(revision);
         controller.announce_authority_revision().await
     }
 
@@ -961,15 +968,15 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
                 kr_protocol::hostinfo::configuration::FILE_NAME,
             ))
         }
-        kr_transport::TransportError::Configuration { kind, reason, .. }
-            if kind == "bind address" =>
-        {
-            ControllerError::InvalidArgument(format!(
-                "{} in this host's configuration document ({}) is not usable: {reason}",
-                kr_protocol::hostinfo::configuration::NETWORK_BIND_ADDRESS.key,
-                kr_protocol::hostinfo::configuration::FILE_NAME,
-            ))
-        }
+        kr_transport::TransportError::Configuration {
+            kind: "bind address",
+            reason,
+            ..
+        } => ControllerError::InvalidArgument(format!(
+            "{} in this host's configuration document ({}) is not usable: {reason}",
+            kr_protocol::hostinfo::configuration::NETWORK_BIND_ADDRESS.key,
+            kr_protocol::hostinfo::configuration::FILE_NAME,
+        )),
         other => ControllerError::NotConfigured(other.to_string()),
     })?;
     *guard
@@ -1365,6 +1372,57 @@ impl Controller {
         .ok_or_else(|| ControllerError::WindowExpired {
             detail: "the deadline this action was admitted under has passed".to_owned(),
         })
+    }
+
+    /// Decides one paired device's request through the one intersection: its grant, this host's
+    /// policy and the rights ceiling this host's configuration put in force.
+    ///
+    /// [`crate::config::ceilings::decide_with_ceiling`] is the whole of the arithmetic; this only
+    /// supplies what the daemon holds. The policy is decided against in place, so the clock floor
+    /// the decision raises holds for every decision after it while the daemon runs. A refusal the
+    /// clock decided is also written down, because that is what a clock wound back before the next
+    /// start could otherwise revive; a permission needs no record, since a later reading can only
+    /// find the same grant expired sooner.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal, naming the right when this host's configuration removed one the
+    /// method needs.
+    pub(crate) fn decide_for_device(
+        &self,
+        grant: &kr_protocol::grant::Grant,
+        record: &crate::grants::GrantRecord,
+        request: crate::grants::AccessRequest,
+    ) -> std::result::Result<
+        crate::config::ceilings::Decided,
+        crate::config::ceilings::CeilingRefusal,
+    > {
+        let ceiling = self
+            .rights_ceiling
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut policy = self
+            .policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let decided = crate::config::ceilings::decide_with_ceiling(
+            ceiling.as_ref(),
+            grant,
+            record,
+            &mut policy,
+            request,
+        );
+        if let Err(crate::config::ceilings::CeilingRefusal::Refused(
+            crate::grants::Refusal::Expired { .. }
+            | crate::grants::Refusal::OfflineValidityLapsed { .. },
+        )) = &decided
+        {
+            // Written while the lock is held, like every other raise of the floor, and a write
+            // that fails leaves the refusal standing: it is already the stricter answer.
+            let _ = self.sharing.grants().store_policy(&policy.snapshot());
+        }
+        decided
     }
 
     /// Returns the authority revision this environment is at.

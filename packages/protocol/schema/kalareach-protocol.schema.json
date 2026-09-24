@@ -5266,7 +5266,7 @@
               "type": "null"
             }
           ],
-          "description": "What narrowed the configured value, when something did."
+          "description": "What narrowed the configured value, when something did. For the rights ceiling, which\nnarrows grants rather than being narrowed, it names the rights the ceiling in force removes\nfrom every grant on this host."
         },
         "origin": {
           "anyOf": [

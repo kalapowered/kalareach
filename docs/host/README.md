@@ -362,8 +362,28 @@ startup and again after every acceptance. A document this host can use decides t
 it names one or leaves it to the product default, because removing a ceiling is a choice. A
 document that is absent and one this build cannot read decide nothing at all, and then the number
 already in force stays and is what the report prints: a restriction an owner accepted is never
-lifted, or reported as lifted, because a later build could not read the file it was in. `grant_rights` narrows a grant before the method's required rights are checked, so
-a method whose right the ceiling has removed is refused rather than permitted with nothing in it.
+lifted, or reported as lifted, because a later build could not read the file it was in.
+
+`grant_rights` is applied where a paired device's request is decided. Every request a device sends
+goes through one decision: its grant, intersected with this host's policy (the organisation lease a
+grant requires and the bounded offline validity an owner chose) and then with the rights ceiling in
+force, before the method's required rights are checked. So a method whose right the ceiling has
+removed is refused, and the refusal names the right and says this host's configuration removed it,
+although the device's grant carries it. A ceiling that names a right a grant never carried adds
+nothing to that grant. The rights a device's mutation is forwarded to its worker with are the ones
+this decision left, so an attachment a worker admits cannot carry a capability the ceiling took
+away. The ceiling in force follows the document the same way the session number does: an
+acceptance that read a usable document puts its ceiling in force before it raises the fence that
+ceiling owes, and one that read no usable document leaves the ceiling as it was. `kr doctor` prints
+the rights in force, names every right they remove from every grant on this host, and says so when
+the ceiling in force is one this host accepted earlier rather than one the document in front of it
+decided.
+
+A narrower ceiling fences dispatch before the edit is acknowledged. The authority revision advances
+first, which withdraws every connection admitted under the wider ceiling; a device that reconnects
+is admitted at the new revision, and its requests are decided under the narrower ceiling from then
+on. The host policy moves to that revision with the registry, so a device paired after the edit is
+issued a grant this host recognises as its own.
 
 A secret is never in the document. `secrets` holds named references: what this configuration calls
 it, which secure store it lives in and its name inside that store. There is no field a value would
@@ -1595,9 +1615,12 @@ What the grant decides, for every request:
   condition this request meets — a `session.attach` whose `claim_geometry` registers a claim needs
   `terminal.geometry`. A condition the daemon cannot decide is treated as holding, so the right is
   asked for rather than skipped. *Asking for* a capability is not one of these conditions: it is a
-  request the host intersects, described below.
+  request the host intersects, described below. The rights are the grant's as this host's policy
+  and the rights ceiling its configuration put in force leave them, decided by the one function
+  every device request goes through; a right the ceiling removed is refused by its name.
 * **Capabilities.** What an attachment is granted is what it asked for intersected with the rights
-  the grant carries, made where the attachment is admitted. See "What an attachment may do".
+  this request was decided with, made where the attachment is admitted. See "What an attachment
+  may do".
 * **History.** Retained history is not served to a device at all: its scope is the grant's lower
   bound, that bound is a moment in time and a history page is a byte range, and a host that cannot
   narrow content to a grant refuses it rather than serving more than the grant allows. The

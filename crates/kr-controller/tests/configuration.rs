@@ -594,6 +594,157 @@ async fn an_address_the_document_chose_that_cannot_be_bound_is_named() {
     drop(controller);
 }
 
+/// The session list a device may always ask for when its grant carries viewing.
+fn session_list() -> kr_protocol::session::SessionListParams {
+    kr_protocol::session::SessionListParams {
+        environment_id: Nullable::null(),
+        include_closed: false,
+    }
+}
+
+/// The device list, which needs host management.
+const DEVICE_LIST: kr_protocol::sharing::DeviceListParams =
+    kr_protocol::sharing::DeviceListParams {
+        include_revoked: false,
+    };
+
+/// KR-REQ-26.15: a paired device's request is decided through the configured ceiling, and a right
+/// the configuration removed is refused by its name even though the device's grant carries it.
+///
+/// The device is paired after the ceiling was put in force, so its grant is issued at the
+/// revision the ceiling's fence advanced to: the same decision serves it everything else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_right_the_configuration_removed_is_refused_by_name_although_the_grant_carries_it() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    host.controller()
+        .apply_configuration(&Change::GrantRights(Some(vec![
+            ActionRight::SessionView.as_str().to_owned(),
+        ])))
+        .await
+        .expect("the owner keeps this host to viewing");
+
+    let (_device, session) = net_support::paired_device(
+        &host,
+        &owner,
+        &[ActionRight::SessionView, ActionRight::HostManage],
+    )
+    .await;
+    let _: kr_protocol::session::SessionListResult = session
+        .read(Method::SessionList, &session_list())
+        .await
+        .expect("viewing is inside the ceiling and is served");
+    let refused = session
+        .read::<_, kr_protocol::sharing::DeviceListResult>(Method::DeviceList, &DEVICE_LIST)
+        .await
+        .expect_err("host management is outside the ceiling");
+    let refused = refused.to_string();
+    assert!(
+        refused.contains("this host's configuration removes host.manage")
+            && refused.contains("although this grant carries it"),
+        "the refusal names the right and says the configuration removed it: {refused}"
+    );
+
+    session.close();
+    host.stop().await;
+}
+
+/// KR-REQ-26.15: a ceiling naming a right the device's grant lacks adds nothing to that grant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ceiling_naming_a_right_the_grant_lacks_adds_nothing() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    host.controller()
+        .apply_configuration(&Change::GrantRights(Some(vec![
+            ActionRight::SessionView.as_str().to_owned(),
+            ActionRight::HostManage.as_str().to_owned(),
+        ])))
+        .await
+        .expect("a ceiling that names host management");
+
+    let (_device, session) =
+        net_support::paired_device(&host, &owner, &[ActionRight::SessionView]).await;
+    let _: kr_protocol::session::SessionListResult = session
+        .read(Method::SessionList, &session_list())
+        .await
+        .expect("viewing is the grant's and the ceiling's");
+    let refused = session
+        .read::<_, kr_protocol::sharing::DeviceListResult>(Method::DeviceList, &DEVICE_LIST)
+        .await
+        .expect_err("the grant carries no host management, whatever the ceiling names")
+        .to_string();
+    assert!(
+        refused.contains("this grant does not carry host.manage"),
+        "the grant's own refusal, not the configuration's: {refused}"
+    );
+
+    session.close();
+    host.stop().await;
+}
+
+/// KR-REQ-26.15: an edit that narrows the ceiling fences a paired device's dispatch before it is
+/// acknowledged, and the device's next connection is decided under the narrower ceiling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_narrowed_ceiling_fences_a_device_before_the_edit_is_acknowledged() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = net_support::Device::create().await;
+    let record = net_support::pair_with(
+        &host,
+        &device,
+        &owner,
+        net_support::proposal(&[ActionRight::SessionView, ActionRight::HostManage]),
+    )
+    .await;
+    let session = net_support::connect(&host, &device, &record).await;
+    let _: kr_protocol::sharing::DeviceListResult = session
+        .read(Method::DeviceList, &DEVICE_LIST)
+        .await
+        .expect("host management is the grant's, with no ceiling in force");
+
+    let applied = host
+        .controller()
+        .apply_configuration(&Change::GrantRights(Some(vec![
+            ActionRight::SessionView.as_str().to_owned(),
+        ])))
+        .await
+        .expect("the edit is acknowledged");
+    assert!(applied.fences_dispatch, "a narrower ceiling owes a fence");
+    assert!(applied.barrier_holds);
+
+    // Acknowledged means fenced: the connection admitted under the wider ceiling is not served
+    // again, whatever it asks.
+    assert!(
+        session
+            .read::<_, kr_protocol::session::SessionListResult>(
+                Method::SessionList,
+                &session_list()
+            )
+            .await
+            .is_err(),
+        "the connection admitted before the edit is fenced"
+    );
+    session.close();
+
+    let session = net_support::connect(&host, &device, &record).await;
+    let _: kr_protocol::session::SessionListResult = session
+        .read(Method::SessionList, &session_list())
+        .await
+        .expect("a new connection is decided under the narrower ceiling, which keeps viewing");
+    let refused = session
+        .read::<_, kr_protocol::sharing::DeviceListResult>(Method::DeviceList, &DEVICE_LIST)
+        .await
+        .expect_err("and removes host management")
+        .to_string();
+    assert!(
+        refused.contains("this host's configuration removes host.manage"),
+        "{refused}"
+    );
+
+    session.close();
+    host.stop().await;
+}
+
 /// KR-REQ-26.15: a configured budget more permissive than section 11 allows never applies.
 ///
 /// Two gates, and this shows both. The document is refused when it is read, so nothing is taken
