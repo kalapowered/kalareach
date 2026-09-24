@@ -215,6 +215,7 @@ impl ExternalSender for ExternalDouble {
     fn send(
         &self,
         destination: &ExternalDestination,
+        _credential: Option<&kr_protocol::delivery::DestinationSecret>,
         message: &ExternalMessage,
     ) -> ExternalOutcome {
         self.endpoints
@@ -449,6 +450,15 @@ fn credential(expires_at_ms: u64) -> PushDeliveryCredential {
     }
 }
 
+/// Where a test keeps external destinations' credentials: in memory, never in the person's own
+/// credential store.
+fn secrets() -> kr_controller::push::secrets::DestinationSecrets {
+    kr_controller::push::secrets::DestinationSecrets::new(
+        Arc::new(kr_crypto::store::MemoryStore::new()),
+        kr_protocol::ids::EnvironmentId::new(uuid(0xee)),
+    )
+}
+
 struct Environment {
     module: DeliveryModule,
     device_preview: kr_crypto::keys::NotificationPreviewKeyPair,
@@ -465,6 +475,7 @@ fn environment() -> Environment {
         &path,
         kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
         kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+        secrets(),
     )
     .expect("a delivery module");
     Environment {
@@ -505,6 +516,7 @@ fn webhook(idempotency: Idempotency) -> DestinationRecord {
             kind: DestinationKind::Webhook,
             endpoint: "https://example.invalid/hook".to_owned(),
             idempotency,
+            credential: None,
         }),
         rule: Some(DeliveryRule {
             name: "on a failed command".to_owned(),
@@ -1564,6 +1576,7 @@ fn a_notification_the_gateway_is_holding_is_asked_about_rather_than_sent_again()
         &environment.path,
         kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
         kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+        secrets(),
     )
     .expect("a delivery module");
     reopened
@@ -1842,6 +1855,7 @@ fn the_journal_comes_back_with_its_work_and_its_account() {
         &path,
         kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
         kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+        secrets(),
     )
     .expect("a delivery module");
     reopened
@@ -2127,6 +2141,7 @@ fn a_destination_whose_endpoint_changed_after_admission_is_not_sent_to() {
         kind: DestinationKind::Webhook,
         endpoint: "https://elsewhere.invalid/hook".to_owned(),
         idempotency: Idempotency::Unsupported,
+        credential: None,
     });
     environment.module.configure(&moved).expect("a destination");
     let external = ExternalDouble::answering(Vec::new());
@@ -2189,6 +2204,7 @@ fn a_pass_sends_to_the_destination_its_claim_validated() {
                 kind: DestinationKind::Webhook,
                 endpoint: "https://elsewhere.invalid/hook".to_owned(),
                 idempotency: Idempotency::Unsupported,
+                credential: None,
             });
             environment.module.configure(&moved).expect("the edit");
         }
@@ -3122,6 +3138,7 @@ async fn a_runtime_recovers_first_and_then_drives_the_outbox_on_its_own_cadence(
             &directory.path().join("delivery.sqlite3"),
             kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
             kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+            secrets(),
         )
         .expect("a delivery module"),
     );
@@ -3813,12 +3830,12 @@ fn a_webhook_message_goes_to_its_endpoint_under_the_identifier_it_deduplicates_b
     });
     let message = webhook_message(Some("delivery-1"));
     assert_eq!(
-        sender.send(external_of(&deduplicating), &message),
+        sender.send(external_of(&deduplicating), None, &message),
         ExternalOutcome::Delivered
     );
     let plain = webhook(Idempotency::Unsupported);
     assert_eq!(
-        sender.send(external_of(&plain), &webhook_message(None)),
+        sender.send(external_of(&plain), None, &webhook_message(None)),
         ExternalOutcome::Delivered
     );
 
@@ -3901,6 +3918,7 @@ fn a_webhook_answer_is_read_as_what_it_says() {
         );
         let outcome = sender.send(
             external_of(destination),
+            None,
             &webhook_message(Some("delivery-1")),
         );
         assert!(expected(&outcome), "{answer} read as {outcome:?}");
@@ -4330,6 +4348,7 @@ async fn recovery_finishes_every_page_of_pending_events() {
             &directory.path().join("delivery.sqlite3"),
             kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
             kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+            secrets(),
         )
         .expect("a delivery module"),
     );
@@ -4410,6 +4429,7 @@ async fn a_recovery_that_fails_is_tried_again_before_anything_is_delivered() {
             &path,
             kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
             kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+            secrets(),
         )
         .expect("a delivery module"),
     );
@@ -5191,6 +5211,7 @@ async fn both_loops_ask_within_their_own_shares_while_the_gateway_retries() {
             &directory.path().join("delivery.sqlite3"),
             kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
             kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+            secrets(),
         )
         .expect("a delivery module"),
     );

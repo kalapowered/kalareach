@@ -28,15 +28,18 @@
 //!
 //! # Which kinds
 //!
-//! Webhooks alone. Slack, Discord, Telegram and email each need a credential from this host's
-//! secret store - a Slack or Discord webhook address is itself a bearer secret, and a destination's
-//! endpoint is never a credential - and nothing can put one there yet, so a destination of any of
-//! those kinds is refused where it is configured (see [`super::DeliveryModule::configure`]).
+//! Webhooks alone. Slack, Discord, Telegram and email each send with a credential - a Slack or
+//! Discord webhook address is itself a bearer secret, and a destination's endpoint is never a
+//! credential - which the owner hands over through `delivery.destination.secret.set` and this host
+//! keeps in its secret store once [`check_secret`] has found it the shape its service issues. A
+//! destination of any of those kinds is refused where it is configured (see
+//! [`super::DeliveryModule::configure`]).
 
 use std::sync::Arc;
 
 use kr_delivery::destination::{DestinationKind, ExternalDestination, Idempotency};
 use kr_delivery::external::{ExternalMessage, ExternalOutcome, ExternalSender};
+use kr_protocol::delivery::DestinationSecret;
 use kr_protocol::service::GatewayOrigin;
 
 use super::transport::{DeliveryTransports, nothing_was_sent};
@@ -66,6 +69,7 @@ impl ExternalSender for WebhookSender {
     fn send(
         &self,
         destination: &ExternalDestination,
+        _credential: Option<&DestinationSecret>,
         message: &ExternalMessage,
     ) -> ExternalOutcome {
         if destination.kind != DestinationKind::Webhook {
@@ -146,6 +150,29 @@ impl ExternalSender for WebhookSender {
                 detail: format!("the destination answered {status}"),
             },
         }
+    }
+}
+
+/// Checks a credential for the shape its service issues, before it is kept.
+///
+/// A credential is refused rather than kept when it could send content anywhere but the service
+/// its kind names, and every refusal names the rule it broke and never the credential.
+///
+/// # Errors
+///
+/// Returns the rule the credential broke.
+pub fn check_secret(secret: &DestinationSecret) -> Result<(), String> {
+    match secret {
+        DestinationSecret::Slack { webhook_url } => {
+            super::chat::check_slack_webhook(webhook_url.expose()).map(drop)
+        }
+        DestinationSecret::Discord { webhook_url } => {
+            super::chat::check_discord_webhook(webhook_url.expose()).map(drop)
+        }
+        DestinationSecret::Telegram { bot_token } => {
+            super::chat::check_telegram_token(bot_token.expose())
+        }
+        DestinationSecret::Email { account } => super::mail::check_account(account),
     }
 }
 

@@ -17,6 +17,7 @@
 
 use std::fmt;
 
+use kr_protocol::delivery::DestinationSecretKind;
 use kr_protocol::ids::{GrantId, InstallationId, PushSenderRecordId};
 use kr_protocol::scalars::{NotificationPreviewKey, StoredEnvelopeKey, TimestampMs};
 
@@ -128,6 +129,78 @@ impl DestinationKind {
     #[must_use]
     pub const fn recipients_read_the_content(self) -> bool {
         !matches!(self, Self::Push)
+    }
+
+    /// The kind of credential a destination of this kind sends with, or `None` for a kind that
+    /// sends with none.
+    ///
+    /// A paired device is reached through the gateway under the delivery credential its
+    /// installation issued, and a webhook's address is where it sends and nothing more. Each of the
+    /// other four needs a credential from the host's secret store: a Slack or Discord webhook
+    /// address is itself a bearer secret, Telegram sends through a bot token and email through a
+    /// mail submission account.
+    #[must_use]
+    pub const fn credential(self) -> Option<DestinationSecretKind> {
+        match self {
+            Self::Push | Self::Webhook => None,
+            Self::Slack => Some(DestinationSecretKind::Slack),
+            Self::Discord => Some(DestinationSecretKind::Discord),
+            Self::Telegram => Some(DestinationSecretKind::Telegram),
+            Self::Email => Some(DestinationSecretKind::Email),
+        }
+    }
+
+    /// The kind of destination a credential of `kind` is for.
+    #[must_use]
+    pub const fn for_credential(kind: DestinationSecretKind) -> Self {
+        match kind {
+            DestinationSecretKind::Slack => Self::Slack,
+            DestinationSecretKind::Discord => Self::Discord,
+            DestinationSecretKind::Telegram => Self::Telegram,
+            DestinationSecretKind::Email => Self::Email,
+        }
+    }
+
+    /// Who can read what a destination of this kind delivers, in the sentence a person is shown
+    /// when they configure one.
+    ///
+    /// Section 25: the recipients of an external destination read what it delivers, and encrypted
+    /// KalaReach routing does not make those messages private. The sentence names the recipients
+    /// and the service in between, because both read it.
+    #[must_use]
+    pub const fn who_can_read(self) -> &'static str {
+        match self {
+            Self::Push => {
+                "Only the paired device that holds this destination's notification-preview key can \
+                 read a preview. The gateway and the push provider carry it sealed, and see which \
+                 of six fixed alerts it is."
+            }
+            Self::Webhook => {
+                "Whoever runs the service at this address can read what this destination \
+                 delivers, and so can anyone that service passes it to. KalaReach's encrypted \
+                 routing does not make it private."
+            }
+            Self::Slack => {
+                "Everyone who can read the Slack channel this webhook posts to can read what this \
+                 destination delivers, and so can Slack. KalaReach's encrypted routing does not \
+                 make it private."
+            }
+            Self::Discord => {
+                "Everyone who can read the Discord channel this webhook posts to can read what \
+                 this destination delivers, and so can Discord. KalaReach's encrypted routing does \
+                 not make it private."
+            }
+            Self::Telegram => {
+                "Everyone in the Telegram chat this bot sends to can read what this destination \
+                 delivers, and so can Telegram. KalaReach's encrypted routing does not make it \
+                 private."
+            }
+            Self::Email => {
+                "Everyone who can read the recipient's mailbox can read what this destination \
+                 delivers, and so can every mail server that carries it. KalaReach's encrypted \
+                 routing does not make it private."
+            }
+        }
     }
 }
 
@@ -267,9 +340,10 @@ pub struct PushDestination {
 pub enum Idempotency {
     /// The destination accepts a delivery identifier and ignores a repeat of one it has seen.
     ///
-    /// The field name is the destination's own: a webhook header, a Slack client message
-    /// identifier, an email `Message-ID`. It is carried rather than assumed because the five
-    /// services do not agree on one.
+    /// The field name is the destination's own: the header a webhook's receiver reads it from. It
+    /// is carried rather than assumed because receivers do not agree on one. Slack's and Discord's
+    /// webhooks, Telegram's `sendMessage` and mail submission take no identifier they deduplicate
+    /// by, so a destination of those kinds is never configured with one.
     Supported {
         /// What the destination calls the identifier it deduplicates by.
         field: String,
@@ -308,19 +382,74 @@ pub struct DeliveryRule {
     pub grant_id: Option<GrantId>,
 }
 
+/// Which stored credential an external destination sends with.
+///
+/// A random value, written beside the credential in the host's secret store each time a credential
+/// is stored and copied onto the destination record when the destination is configured. It is
+/// derived from nothing, so the journal, its backups and every notification bound to the
+/// destination can carry it without carrying anything that tests a guess of the credential. A
+/// credential replaced under a configured destination gives it a new stamp, which is a new
+/// binding: a notification admitted while the old credential was in force is not sent with the new
+/// one, because the new one can reach somewhere else.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CredentialStamp(String);
+
+impl CredentialStamp {
+    /// The length of a stamp: 128 bits as lowercase hexadecimal.
+    pub const LEN: usize = 32;
+
+    /// Reads a stamp back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnreadable`] when the value is not 32 lowercase hexadecimal
+    /// characters.
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        if value.len() != Self::LEN
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(DeliveryError::JournalUnreadable(
+                "a credential stamp is 32 lowercase hexadecimal characters",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    /// A stamp nothing has used before.
+    #[must_use]
+    pub fn fresh() -> Self {
+        Self(uuid::Uuid::new_v4().simple().to_string())
+    }
+
+    /// Returns the stamp.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A service or address outside KalaReach.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExternalDestination {
     /// Which service.
     pub kind: DestinationKind,
-    /// The opaque reference the adapter resolves.
+    /// The opaque reference the adapter resolves: a webhook's address, a Telegram chat, an email
+    /// recipient, or for a Slack or Discord webhook the name a person gave the channel it posts to.
     ///
     /// It is never a credential. A token, a webhook secret or a password belongs in the host's
-    /// secret store and is fetched by the adapter that sends; storing one here would put it in
+    /// secret store and is fetched for the adapter that sends; storing one here would put it in
     /// this journal, in its backups and in anything that reads a destination record.
     pub endpoint: String,
     /// Whether the destination deduplicates by a delivery identifier this host can choose.
     pub idempotency: Idempotency,
+    /// Which stored credential it sends with, for a kind that sends with one.
+    ///
+    /// Configuration writes it from the host's secret store, whatever a caller put here, so a
+    /// record names the credential that was actually stored for it.
+    pub credential: Option<CredentialStamp>,
 }
 
 /// What a destination record holds.
@@ -433,6 +562,14 @@ impl DestinationRecord {
                         field(header);
                     }
                     Idempotency::Unsupported => field("not idempotent"),
+                }
+                // The credential goes where content goes: a Slack or Discord address is where the
+                // message lands, and a bot token or a mail account decides who sends it. It is
+                // written only when there is one, so a destination that sends with none binds
+                // exactly as it did before credentials were kept.
+                if let Some(stamp) = &external.credential {
+                    field("credential");
+                    field(stamp.as_str());
                 }
             }
         }
@@ -633,6 +770,7 @@ mod tests {
                 idempotency: Idempotency::Supported {
                     field: header.to_owned(),
                 },
+                credential: None,
             }),
             rule: Some(DeliveryRule {
                 name: "on failure".to_owned(),
@@ -658,6 +796,7 @@ mod tests {
                 kind: DestinationKind::Webhook,
                 endpoint: "https://example.invalid/hook".to_owned(),
                 idempotency,
+                credential: None,
             }),
             rule: Some(DeliveryRule {
                 name: "on failure".to_owned(),
@@ -677,6 +816,105 @@ mod tests {
         );
     }
 
+    fn slack_record(credential: Option<CredentialStamp>) -> DestinationRecord {
+        DestinationRecord {
+            id: DestinationId::new("team").expect("an identifier"),
+            destination: Destination::External(ExternalDestination {
+                kind: DestinationKind::Slack,
+                endpoint: "#alerts".to_owned(),
+                idempotency: Idempotency::Unsupported,
+                credential,
+            }),
+            rule: Some(DeliveryRule {
+                name: "on failure".to_owned(),
+                grant_id: None,
+            }),
+            enabled: true,
+            configured_at_ms: TimestampMs::new(1),
+        }
+    }
+
+    /// The stored credential decides where a Slack or Discord message lands and who sends a
+    /// Telegram or mail message, so a new one is a new binding.
+    #[test]
+    fn the_credential_a_destination_sends_with_is_part_of_its_binding() {
+        let first = CredentialStamp::fresh();
+        let second = CredentialStamp::fresh();
+        assert_ne!(first, second);
+        assert_ne!(
+            slack_record(Some(first.clone())).binding_digest(),
+            slack_record(Some(second)).binding_digest()
+        );
+        assert_ne!(
+            slack_record(Some(first)).binding_digest(),
+            slack_record(None).binding_digest()
+        );
+    }
+
+    /// A destination that sends with no credential binds exactly as it did before credentials were
+    /// kept, so the notifications a journal admitted then are still the ones it sends now.
+    #[test]
+    fn a_destination_with_no_credential_binds_as_it_always_did() {
+        let hook = DestinationRecord {
+            id: DestinationId::new("hook").expect("an identifier"),
+            destination: Destination::External(ExternalDestination {
+                kind: DestinationKind::Webhook,
+                endpoint: "https://example.invalid/hook".to_owned(),
+                idempotency: Idempotency::Unsupported,
+                credential: None,
+            }),
+            rule: Some(DeliveryRule {
+                name: "on failure".to_owned(),
+                grant_id: None,
+            }),
+            enabled: true,
+            configured_at_ms: TimestampMs::new(1),
+        };
+        let written = "4:hook;7:enabled;4:rule;10:on failure;1:-;8:external;7:webhook;\
+                       28:https://example.invalid/hook;14:not idempotent;";
+        assert_eq!(
+            hook.binding_digest(),
+            hex(&kr_cbor::sha256(written.as_bytes()))
+        );
+    }
+
+    #[test]
+    fn a_stamp_is_read_back_only_in_the_form_it_is_written() {
+        let fresh = CredentialStamp::fresh();
+        assert_eq!(fresh.as_str().len(), CredentialStamp::LEN);
+        assert_eq!(
+            CredentialStamp::new(fresh.as_str()).expect("a stamp"),
+            fresh
+        );
+        assert!(CredentialStamp::new("A".repeat(32)).is_err());
+        assert!(CredentialStamp::new("a".repeat(31)).is_err());
+        assert!(CredentialStamp::new("").is_err());
+    }
+
+    #[test]
+    fn every_kind_that_sends_with_a_credential_names_its_kind_and_back() {
+        for kind in DestinationKind::ALL {
+            match kind.credential() {
+                Some(credential) => {
+                    assert_eq!(DestinationKind::for_credential(credential), kind);
+                    assert_eq!(credential.as_str(), kind.as_str());
+                }
+                None => assert!(matches!(
+                    kind,
+                    DestinationKind::Push | DestinationKind::Webhook
+                )),
+            }
+            assert!(!kind.who_can_read().is_empty());
+        }
+        for kind in DestinationKind::EXTERNAL {
+            assert!(
+                kind.who_can_read().contains("does not make it private"),
+                "{kind}: {}",
+                kind.who_can_read()
+            );
+        }
+    }
+
     #[test]
     fn a_destination_with_no_rule_admits_nothing() {
         let record = DestinationRecord {
@@ -685,6 +923,7 @@ mod tests {
                 kind: DestinationKind::Webhook,
                 endpoint: "https://example.invalid/hook".to_owned(),
                 idempotency: Idempotency::Unsupported,
+                credential: None,
             }),
             rule: None,
             enabled: true,

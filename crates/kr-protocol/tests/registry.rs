@@ -333,6 +333,33 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         }
     }
 
+    // Section 25 documents Slack, Discord, Telegram and email delivery, and each of them sends
+    // through a credential the host keeps in its secret store, never in a destination's endpoint.
+    // Section 23 names no method that hands the host one, so this build adds one. A credential
+    // decides who reads what a destination delivers, so it is the owner's own act at this machine:
+    // served on the local socket alone, asking for host management, and answering nothing that
+    // carries the credential back.
+    let delivery = [("delivery.destination.secret.set", EffectClass::Write)];
+    for (name, effect) in delivery {
+        let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
+        assert_eq!(entry.effect, effect, "{name} carries its own effect class");
+        assert_eq!(
+            entry.group,
+            MethodGroup::HostAndEnvironment,
+            "{name} configures this host"
+        );
+        assert_eq!(
+            entry.ingress,
+            &[ActorIngress::LocalIpc],
+            "{name} is the owner's alone"
+        );
+        assert_eq!(
+            entry.required_rights,
+            &[RequiredRight::right(ActionRight::HostManage)],
+            "{name} asks for host management and nothing else"
+        );
+    }
+
     // Section 15 ¶12 requires the provider and the selected context scope to be shown before voice
     // starts, and section 23's voice row names no read that can answer that: `voice.context` names
     // a voice session, and by the time `voice.start` answers, the metered provider session exists.
@@ -455,6 +482,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             + added.len()
             + attention.len()
             + environments.len()
+            + delivery.len()
             + policy.len()
             + voice.len()
             + owner.len(),

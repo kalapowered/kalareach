@@ -752,11 +752,15 @@ impl Controller {
                 &setup.paths.secrets_dir(),
             )
             .map_err(ControllerError::registry)?;
-        let device_keys = net::host_device_keys(&*opened_store.store, setup.environment_id)?;
+        let secret_store: Arc<dyn kr_crypto::store::SecretStore> = Arc::from(opened_store.store);
+        let device_keys = net::host_device_keys(&*secret_store, setup.environment_id)?;
+        // External destinations' credentials are kept in the same store as this host's own keys,
+        // in a scope of their own, and never in the delivery journal.
         let delivery = Arc::new(crate::push::DeliveryModule::open(
             &setup.paths,
             device_keys.notification_preview,
             device_keys.stored_envelope,
+            crate::push::secrets::DestinationSecrets::new(secret_store, setup.environment_id),
         )?);
         // The runtime is built here and started once the daemon exists. Its renewals are proven
         // with this host's own authorisation key, which the installation named when it authorised
@@ -2067,6 +2071,7 @@ impl Controller {
                 | Method::GrantRevoke
                 | Method::DeviceRevoke
                 | Method::DevicePreviewKeyUpdate
+                | Method::DeliveryDestinationSecretSet
         ) {
             return self.retained_authority_change(actor_id, mutation);
         }
@@ -3548,6 +3553,25 @@ impl Controller {
                 let _: kr_protocol::sharing::DevicePreviewKeyUpdateParams =
                     parse(&mutation.params)?;
             }
+            // A notification destination belongs to this environment, not to a session. The
+            // credential is checked here, before the action is claimed, so a credential of the
+            // wrong shape is refused without holding its action identifier.
+            Method::DeliveryDestinationSecretSet => {
+                if mutation.target.session_id.as_ref().is_some()
+                    || mutation.target.application_instance_id.is_present()
+                {
+                    return Err(ControllerError::InvalidArgument(
+                        "a notification destination belongs to this environment, not to one \
+                         session"
+                            .to_owned(),
+                    ));
+                }
+                let params: kr_protocol::delivery::DeliveryDestinationSecretSetParams =
+                    parse(&mutation.params)?;
+                destination_identifier(&params.destination_id)?;
+                crate::push::external::check_secret(&params.secret)
+                    .map_err(ControllerError::InvalidArgument)?;
+            }
             _ if crate::voice::VoiceModule::serves(method) => {
                 crate::voice::VoiceModule::check_subject(method, mutation)?;
             }
@@ -4641,7 +4665,8 @@ impl Controller {
             Method::GrantCreate
             | Method::GrantRevoke
             | Method::DeviceRevoke
-            | Method::DevicePreviewKeyUpdate => {
+            | Method::DevicePreviewKeyUpdate
+            | Method::DeliveryDestinationSecretSet => {
                 self.authority_change(actor_id, mutation, method, carried)
                     .await
             }
@@ -4931,6 +4956,10 @@ impl Controller {
             Method::DevicePreviewKeyUpdate => {
                 self.device_preview_key_update(actor_id, mutation).await?
             }
+            Method::DeliveryDestinationSecretSet => {
+                self.delivery_destination_secret_set(mutation, carried)
+                    .await?
+            }
             _ => {
                 return Err(ControllerError::InvalidArgument(format!(
                     "{} is not an authority change this daemon serves",
@@ -4940,6 +4969,46 @@ impl Controller {
         };
         self.retain_authority_change(actor_id, mutation, &result)?;
         Ok(result)
+    }
+
+    /// Keeps the credential an external notification destination sends with.
+    ///
+    /// The owner's own act at this machine: the method is served on the local socket alone,
+    /// because a credential decides who reads what a destination delivers. The credential is
+    /// checked for the shape its service issues and then goes to the host's secret store; the
+    /// answer names the destination, the kind, whether it is in force, and who can read what it
+    /// delivers, and has no field the credential fits in. The action is claimed and retained like
+    /// every authority change here, by a digest over the whole request, which covers a window
+    /// identifier this host never writes down, so the retained digest cannot be used to test a
+    /// guess of the credential.
+    ///
+    /// The admission is asked again under the registry lock, which is held across the write, so a
+    /// withdrawal that completes while this waited stops it.
+    async fn delivery_destination_secret_set(
+        &self,
+        mutation: &MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Result<ParamsValue> {
+        let params: kr_protocol::delivery::DeliveryDestinationSecretSetParams =
+            parse(&mutation.params)?;
+        let destination_id = destination_identifier(&params.destination_id)?;
+        crate::push::external::check_secret(&params.secret)
+            .map_err(ControllerError::InvalidArgument)?;
+        let kind = params.secret.kind();
+        let registry = self.registry.lock().await;
+        self.check_admission(&registry, &carried)?;
+        let stored = self
+            .delivery
+            .store_secret(&destination_id, &params.secret)?;
+        drop(registry);
+        encode(&kr_protocol::delivery::DeliveryDestinationSecretSetResult {
+            destination_id: params.destination_id,
+            kind,
+            in_force: stored.in_force,
+            recipients_can_read: kr_delivery::destination::DestinationKind::for_credential(kind)
+                .who_can_read()
+                .to_owned(),
+        })
     }
 
     /// Shares a session: compiles the role, previews it, and writes the grant and its invitation.
@@ -8498,6 +8567,15 @@ async fn record_outcome(
     })
     .await
     .map_err(|error| ControllerError::supervision(error.to_string()))?
+}
+
+/// Reads a notification destination's identifier out of a request.
+fn destination_identifier(text: &str) -> Result<kr_delivery::destination::DestinationId> {
+    kr_delivery::destination::DestinationId::new(text).map_err(|_| {
+        ControllerError::InvalidArgument(
+            "a destination identifier is 1 to 128 bytes with no control characters".to_owned(),
+        )
+    })
 }
 
 fn parse<T: kr_protocol::wire::WireMessage>(params: &ParamsValue) -> Result<T> {

@@ -55,7 +55,7 @@ use kr_protocol::push::{PushSuppression, PushSuppressionReason};
 use kr_protocol::scalars::{NotificationPreviewKey, TimestampMs};
 
 use crate::destination::{
-    DeliveryRule, Destination, DestinationId, DestinationKind, DestinationRecord,
+    CredentialStamp, DeliveryRule, Destination, DestinationId, DestinationKind, DestinationRecord,
     ExternalDestination, Idempotency, PreviewKeys, PushDestination, RetiredPreviewKey,
 };
 use crate::error::{DeliveryError, Result};
@@ -67,10 +67,16 @@ use crate::error::{DeliveryError, Result};
 /// admitted for, writes an external destination's idempotency guarantee into its binding as a
 /// variant rather than as a value a header name could spell, refuses request bytes on a settled
 /// notification in the table itself, and keeps with each notification when its outcome is next
-/// asked about. A journal written under any other version is refused rather than read with the
-/// columns of another shape, matched against bindings this build no longer computes the same way,
-/// or trusted to hold no request it should not.
-const SCHEMA_VERSION: i64 = 6;
+/// asked about. Version 7 adds the stamp of the stored credential an external destination sends
+/// with, and binds a destination to it only when it has one, so every binding version 6 computed
+/// is computed the same way. A version 6 journal is brought forward in place, once, when it is
+/// opened ([`migrate_from_6`]); a journal written under any other version is refused rather than
+/// read with the columns of another shape, matched against bindings this build no longer computes
+/// the same way, or trusted to hold no request it should not.
+const SCHEMA_VERSION: i64 = 7;
+
+/// The one earlier schema this build brings forward rather than refusing.
+const PREVIOUS_SCHEMA_VERSION: i64 = 6;
 
 /// Every table a working journal has.
 ///
@@ -691,7 +697,7 @@ impl DeliveryJournal {
         Self::prepare(Connection::open_in_memory()?)
     }
 
-    fn prepare(connection: Connection) -> Result<Self> {
+    fn prepare(mut connection: Connection) -> Result<Self> {
         connection.busy_timeout(BUSY_TIMEOUT)?;
         // Foreign keys are what make "the event first" a property of the store. They are off by
         // default in SQLite, so turning them on is part of opening rather than a call somebody
@@ -725,6 +731,12 @@ impl DeliveryJournal {
             // EXISTS` over a store that has lost a table would answer every read from an empty one,
             // and an empty outbox and an empty privacy row say the opposite of what is true.
             Some(version) if version == SCHEMA_VERSION => {
+                let journal = Self { connection };
+                journal.check_schema()?;
+                Ok(journal)
+            }
+            Some(PREVIOUS_SCHEMA_VERSION) => {
+                migrate_from_6(&mut connection)?;
                 let journal = Self { connection };
                 journal.check_schema()?;
                 Ok(journal)
@@ -1080,6 +1092,7 @@ impl DeliveryJournal {
             mailbox_key,
             endpoint,
             idempotency_field,
+            credential_stamp,
         ) = match &record.destination {
             Destination::Push(push) => (
                 Some(push.installation_id.to_string()),
@@ -1102,6 +1115,7 @@ impl DeliveryJournal {
                 push.mailbox_key.map(|key| key.as_bytes().to_vec()),
                 None,
                 None,
+                None,
             ),
             Destination::External(external) => (
                 None,
@@ -1118,6 +1132,10 @@ impl DeliveryJournal {
                     Idempotency::Supported { field } => Some(field.clone()),
                     Idempotency::Unsupported => None,
                 },
+                external
+                    .credential
+                    .as_ref()
+                    .map(|stamp| stamp.as_str().to_owned()),
             ),
         };
         self.connection.execute(
@@ -1125,8 +1143,9 @@ impl DeliveryJournal {
                  (destination_id, kind, enabled, configured_at_ms, rule_name, grant_id,
                   installation_id, sender_record_id, preview_key, preview_revision,
                   previous_preview_key, previous_preview_revision, previous_preview_until_ms,
-                  previews_enabled, mailbox_key, endpoint, idempotency_field)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                  previews_enabled, mailbox_key, endpoint, idempotency_field, credential_stamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                     ?18)
              ON CONFLICT (destination_id) DO UPDATE SET
                  kind = excluded.kind,
                  enabled = excluded.enabled,
@@ -1142,7 +1161,8 @@ impl DeliveryJournal {
                  previews_enabled = excluded.previews_enabled,
                  mailbox_key = excluded.mailbox_key,
                  endpoint = excluded.endpoint,
-                 idempotency_field = excluded.idempotency_field",
+                 idempotency_field = excluded.idempotency_field,
+                 credential_stamp = excluded.credential_stamp",
             params![
                 record.id.as_str(),
                 record.destination.kind().as_str(),
@@ -1164,9 +1184,147 @@ impl DeliveryJournal {
                 mailbox_key,
                 endpoint,
                 idempotency_field,
+                credential_stamp,
             ],
         )?;
         Ok(())
+    }
+
+    /// Records that one destination now sends with another stored credential.
+    ///
+    /// Only the stamp changes, and only on a destination of `kind`. The binding the stamp is part
+    /// of changes with it, so a notification admitted while the destination sent with the
+    /// credential being replaced is refused at its claim rather than sent with the new one, which
+    /// can reach somewhere else. Returns the record as it now stands, or `None` when no destination
+    /// of that kind is configured under the identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
+    pub fn set_destination_credential(
+        &mut self,
+        destination_id: &DestinationId,
+        kind: DestinationKind,
+        stamp: &CredentialStamp,
+    ) -> Result<Option<DestinationRecord>> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE delivery_destinations SET credential_stamp = ?3
+              WHERE destination_id = ?1 AND kind = ?2",
+            params![destination_id.as_str(), kind.as_str(), stamp.as_str()],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let record = transaction
+            .query_row(
+                &format!("{DESTINATION_COLUMNS} WHERE destination_id = ?1"),
+                params![destination_id.as_str()],
+                decode_destination,
+            )
+            .optional()?
+            .transpose()?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    /// Removes one destination.
+    ///
+    /// Nothing more is sent to it: every notification queued for it is taken back in the same
+    /// transaction, so none waits for a claim to notice. One nothing dispatched is revoked and its
+    /// bytes go; one an earlier attempt already dispatched is an outcome this host can no longer
+    /// settle, and is recorded as one. The record goes too, unless a notification or an encrypted
+    /// object already names it: then it stays as the name of what was sent, out of service, with
+    /// no rule and no credential, and a destination configured under the identifier later is a new
+    /// one. An attempt on the wire is left to the pass that claimed it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the write fails, and
+    /// [`DeliveryError::JournalUnreadable`] when the stored kind is not one this build writes.
+    pub fn remove_destination(
+        &mut self,
+        destination_id: &DestinationId,
+        now_ms: u64,
+    ) -> Result<DestinationRemoval> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let kind: Option<String> = transaction
+            .query_row(
+                "SELECT kind FROM delivery_destinations WHERE destination_id = ?1",
+                params![destination_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(kind) = kind else {
+            return Ok(DestinationRemoval::default());
+        };
+        let kind = DestinationKind::from_stored(&kind).ok_or(DeliveryError::JournalUnreadable(
+            "a stored destination kind is not one this build writes",
+        ))?;
+        let queued: Vec<(String, i64, i64)> = {
+            let mut statement = transaction.prepare(
+                "SELECT notification_id, attempts, dispatched FROM delivery_notifications
+                  WHERE destination_id = ?1 AND state IN ('admitted', 'retrying')",
+            )?;
+            let rows = statement.query_map(params![destination_id.as_str()], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut removal = DestinationRemoval {
+            found: true,
+            ..DestinationRemoval::default()
+        };
+        for (identifier, attempts, dispatched) in queued {
+            if dispatched == 0 {
+                settle_in(
+                    &transaction,
+                    &identifier,
+                    as_u64(attempts),
+                    now_ms,
+                    DeliveryState::Revoked,
+                    "the destination was removed before this was sent",
+                )?;
+                removal.revoked += 1;
+            } else {
+                settle_in(
+                    &transaction,
+                    &identifier,
+                    as_u64(attempts),
+                    now_ms,
+                    unresolved_for(kind),
+                    "the destination was removed after an earlier attempt reached it, so whether \
+                     it arrived is not something this host can say",
+                )?;
+                removal.unresolved += 1;
+            }
+        }
+        let named: i64 = transaction.query_row(
+            "SELECT EXISTS (SELECT 1 FROM delivery_notifications WHERE destination_id = ?1)
+                 OR EXISTS (SELECT 1 FROM delivery_objects WHERE destination_id = ?1)",
+            params![destination_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if named != 0 {
+            transaction.execute(
+                "UPDATE delivery_destinations
+                    SET enabled = 0, rule_name = NULL, grant_id = NULL, credential_stamp = NULL
+                  WHERE destination_id = ?1",
+                params![destination_id.as_str()],
+            )?;
+            removal.kept_as_history = true;
+        } else {
+            transaction.execute(
+                "DELETE FROM delivery_destinations WHERE destination_id = ?1",
+                params![destination_id.as_str()],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(removal)
     }
 
     /// Returns one destination record.
@@ -2900,6 +3058,20 @@ impl DeliveryJournal {
     }
 }
 
+/// What removing one destination did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DestinationRemoval {
+    /// Whether a destination was configured under the identifier.
+    pub found: bool,
+    /// How many queued notifications nothing had dispatched, taken back unsent.
+    pub revoked: u64,
+    /// How many queued notifications an earlier attempt had dispatched, now outcomes nobody can
+    /// settle.
+    pub unresolved: u64,
+    /// Whether the record stays, out of service, as the name of what was already sent to it.
+    pub kept_as_history: bool,
+}
+
 /// One destination's spent allowance, as the journal holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredBudget {
@@ -2920,7 +3092,8 @@ pub struct StoredBudget {
 const DESTINATION_COLUMNS: &str = "SELECT destination_id, kind, enabled, configured_at_ms, \
      rule_name, grant_id, installation_id, sender_record_id, preview_key, preview_revision, \
      previous_preview_key, previous_preview_revision, previous_preview_until_ms, \
-     previews_enabled, mailbox_key, endpoint, idempotency_field FROM delivery_destinations";
+     previews_enabled, mailbox_key, endpoint, idempotency_field, credential_stamp \
+     FROM delivery_destinations";
 
 const NOTIFICATION_COLUMNS: &str = "SELECT notification_id, event_key, destination_id, state, \
      privacy_generation, content, payload_bytes, expires_at_ms, admitted_at_ms, attempts, \
@@ -2945,6 +3118,7 @@ type DestinationRow = (
     Option<Vec<u8>>,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
 fn decode_destination(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<DestinationRecord>> {
@@ -2966,6 +3140,7 @@ fn decode_destination(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Destin
         row.get(14)?,
         row.get(15)?,
         row.get(16)?,
+        row.get(17)?,
     );
     Ok(build_destination(columns))
 }
@@ -2989,6 +3164,7 @@ fn build_destination(columns: DestinationRow) -> Result<DestinationRecord> {
         mailbox_key,
         endpoint,
         idempotency_field,
+        credential_stamp,
     ) = columns;
     let kind = DestinationKind::from_stored(&kind).ok_or(DeliveryError::JournalUnreadable(
         "a stored destination kind is not one this build writes",
@@ -3043,6 +3219,7 @@ fn build_destination(columns: DestinationRow) -> Result<DestinationRecord> {
             idempotency: idempotency_field.map_or(Idempotency::Unsupported, |field| {
                 Idempotency::Supported { field }
             }),
+            credential: credential_stamp.map(CredentialStamp::new).transpose()?,
         })
     };
     let rule = rule_name.map(|name| {
@@ -3227,6 +3404,35 @@ fn admit_in(transaction: &rusqlite::Transaction<'_>, record: &DeliveryRecord) ->
 /// request, because neither will be presented again.
 ///
 /// `kind` is always the kind the delivery was admitted for, read from the delivery's own row.
+/// Brings a version 6 journal forward to version 7, in one transaction.
+///
+/// Version 7 adds one column, the stamp of the stored credential an external destination sends
+/// with. No destination a version 6 journal holds has one, because version 6 had no way to keep a
+/// credential, so every row gets none and every binding it computed is computed the same way. The
+/// version is read again inside the transaction, so two openers cannot both add the column.
+fn migrate_from_6(connection: &mut Connection) -> Result<()> {
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let version: i64 =
+        transaction.query_row("SELECT version FROM delivery_schema LIMIT 1", [], |row| {
+            row.get(0)
+        })?;
+    if version == PREVIOUS_SCHEMA_VERSION {
+        transaction
+            .execute_batch("ALTER TABLE delivery_destinations ADD COLUMN credential_stamp TEXT;")?;
+        transaction.execute(
+            "UPDATE delivery_schema SET version = ?1",
+            params![SCHEMA_VERSION],
+        )?;
+    } else if version != SCHEMA_VERSION {
+        return Err(DeliveryError::JournalUnreadable(
+            "the delivery journal changed schema version while it was being brought forward",
+        ));
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
 const fn unresolved_for(kind: DestinationKind) -> DeliveryState {
     match kind {
         DestinationKind::Push => DeliveryState::OutcomeUnknown,
@@ -3469,7 +3675,11 @@ const SCHEMA: &str = "
         previews_enabled INTEGER NOT NULL,
         mailbox_key BLOB,
         endpoint TEXT,
-        idempotency_field TEXT
+        idempotency_field TEXT,
+        -- Which stored credential an external destination sends with: a random stamp written
+        -- beside the credential in the host's secret store. Never the credential, and nothing
+        -- derived from it.
+        credential_stamp TEXT
     );
     CREATE UNIQUE INDEX IF NOT EXISTS delivery_destinations_installation_idx
         ON delivery_destinations(installation_id) WHERE installation_id IS NOT NULL;
@@ -3599,6 +3809,7 @@ mod tests {
                 idempotency: Idempotency::Supported {
                     field: "Idempotency-Key".to_owned(),
                 },
+                credential: None,
             }),
             rule: Some(DeliveryRule {
                 name: "on failure".to_owned(),
@@ -4666,6 +4877,7 @@ mod tests {
             kind: DestinationKind::Webhook,
             endpoint: "https://elsewhere.invalid/hook".to_owned(),
             idempotency: Idempotency::Unsupported,
+            credential: None,
         });
         journal.configure_destination(&moved).expect("the edit");
         assert_eq!(
@@ -5569,10 +5781,11 @@ mod tests {
         assert_eq!(journal.outstanding().expect("a count"), 1);
     }
 
-    /// A journal another schema version wrote is refused at open, whichever version it was.
+    /// A journal another schema version wrote is refused at open, whichever version it was, except
+    /// the one version this build brings forward.
     #[test]
     fn a_journal_written_under_another_schema_version_is_refused() {
-        for version in [SCHEMA_VERSION - 1, SCHEMA_VERSION + 1] {
+        for version in [PREVIOUS_SCHEMA_VERSION - 1, SCHEMA_VERSION + 1] {
             let directory = tempfile::tempdir().expect("a directory");
             let path = directory.path().join("delivery.sqlite3");
             drop(DeliveryJournal::open(&path).expect("a journal"));
@@ -5589,6 +5802,223 @@ mod tests {
                 "version {version} is refused"
             );
         }
+    }
+
+    /// Makes the journal at `path` look exactly as version 6 wrote it: no credential column, and
+    /// version 6 recorded.
+    fn as_version_6(path: &Path) {
+        let connection = rusqlite::Connection::open(path).expect("a connection");
+        connection
+            .execute_batch(
+                "ALTER TABLE delivery_destinations DROP COLUMN credential_stamp;
+                 UPDATE delivery_schema SET version = 6;",
+            )
+            .expect("the version 6 shape");
+    }
+
+    /// A version 6 journal is brought forward when it is opened, keeping its destinations and its
+    /// queued work, and every binding it computed still matches: a notification admitted under
+    /// version 6 is claimed and sent under version 7.
+    #[test]
+    fn a_version_6_journal_is_brought_forward_with_its_work_and_its_bindings() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("delivery.sqlite3");
+        {
+            let mut journal = DeliveryJournal::open(&path).expect("a journal");
+            journal
+                .register_consumer(&consumer(), 1)
+                .expect("registration");
+            journal
+                .configure_destination(&destination("hook"))
+                .expect("a destination");
+            journal
+                .take_events(&consumer(), &[taken(1, 1)], 1)
+                .expect("a page");
+            journal
+                .admit(&delivery(1, event(1), "hook"))
+                .expect("admitted");
+        }
+        as_version_6(&path);
+
+        let mut journal = DeliveryJournal::open(&path).expect("brought forward");
+        let version: i64 = journal
+            .connection
+            .query_row("SELECT version FROM delivery_schema", [], |row| row.get(0))
+            .expect("a version");
+        assert_eq!(version, SCHEMA_VERSION);
+        let hook = journal
+            .destination(&DestinationId::new("hook").expect("an identifier"))
+            .expect("a read")
+            .expect("the destination is still configured");
+        assert_eq!(
+            hook,
+            destination("hook"),
+            "and reads back as it was written"
+        );
+        assert!(
+            matches!(
+                journal
+                    .claim(NotificationId::new(uuid(1)), 2_000)
+                    .expect("a claim"),
+                Claim::Taken(_)
+            ),
+            "the binding version 6 recorded is the binding version 7 computes"
+        );
+        drop(journal);
+        assert!(
+            DeliveryJournal::open(&path).is_ok(),
+            "and it opens again as version 7"
+        );
+    }
+
+    /// A credential replaced under a configured destination is a new binding: what was admitted
+    /// while the old one was in force is not claimed for the new one.
+    #[test]
+    fn a_replaced_credential_is_a_new_binding() {
+        let mut journal = journal();
+        let slack = DestinationRecord {
+            id: DestinationId::new("team").expect("an identifier"),
+            destination: Destination::External(ExternalDestination {
+                kind: DestinationKind::Slack,
+                endpoint: "#alerts".to_owned(),
+                idempotency: Idempotency::Unsupported,
+                credential: Some(CredentialStamp::fresh()),
+            }),
+            ..destination("team")
+        };
+        journal
+            .configure_destination(&slack)
+            .expect("a destination");
+        journal
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect("a page");
+        journal
+            .admit(&delivery_for(1, event(1), &slack))
+            .expect("admitted");
+        assert_eq!(
+            journal
+                .set_destination_credential(
+                    &slack.id,
+                    DestinationKind::Telegram,
+                    &CredentialStamp::fresh()
+                )
+                .expect("a write"),
+            None,
+            "a credential of another kind changes nothing"
+        );
+        let replaced = journal
+            .set_destination_credential(
+                &slack.id,
+                DestinationKind::Slack,
+                &CredentialStamp::fresh(),
+            )
+            .expect("a write")
+            .expect("the destination is configured");
+        assert_ne!(replaced.binding_digest(), slack.binding_digest());
+        assert!(
+            matches!(
+                journal
+                    .claim(NotificationId::new(uuid(1)), 2_000)
+                    .expect("a claim"),
+                Claim::Settled(_)
+            ),
+            "what the old credential was admitted for is not sent with the new one"
+        );
+    }
+
+    /// Removing a destination takes back what was queued for it at once, keeps its name for what
+    /// already went, and forgets a destination nothing names.
+    #[test]
+    fn removing_a_destination_takes_back_its_queue_and_keeps_only_what_names_it() {
+        let mut journal = journal();
+        let unnamed = destination("unused");
+        journal
+            .configure_destination(&unnamed)
+            .expect("a destination");
+        journal
+            .take_events(&consumer(), &[taken(1, 1), taken(2, 2), taken(3, 3)], 3)
+            .expect("a page");
+        for byte in [1, 2, 3] {
+            journal
+                .admit(&delivery(byte, event(byte), "hook"))
+                .expect("admitted");
+        }
+        // The second went once and waits to be presented again; the third is on the wire.
+        claim(&mut journal, 2, 2_000);
+        journal
+            .record_attempt(&Transition {
+                notification_id: NotificationId::new(uuid(2)),
+                attempt: 1,
+                state: DeliveryState::Retrying,
+                started_at_ms: TimestampMs::new(2_000),
+                settled_at_ms: Some(TimestampMs::new(2_000)),
+                next_attempt_at_ms: Some(TimestampMs::new(60_000)),
+                next: crate::push::NextAction::Send,
+                detail: Some("the destination answered 503".to_owned()),
+                suppression: None,
+                left_this_host: true,
+                reported_by_destination: false,
+            })
+            .expect("a transition");
+        claim(&mut journal, 3, 2_000);
+
+        let hook = DestinationId::new("hook").expect("an identifier");
+        let removal = journal.remove_destination(&hook, 3_000).expect("a removal");
+        assert_eq!(
+            removal,
+            DestinationRemoval {
+                found: true,
+                revoked: 1,
+                unresolved: 1,
+                kept_as_history: true,
+            }
+        );
+        let state = |journal: &DeliveryJournal, byte: u8| {
+            journal
+                .delivery(NotificationId::new(uuid(byte)))
+                .expect("a read")
+                .expect("a record")
+        };
+        assert_eq!(state(&journal, 1).state, DeliveryState::Revoked);
+        assert!(state(&journal, 1).content.is_none(), "its bytes went");
+        assert_eq!(
+            state(&journal, 2).state,
+            DeliveryState::DuplicateUncertain,
+            "an earlier attempt reached the destination"
+        );
+        assert_eq!(
+            state(&journal, 3).state,
+            DeliveryState::InFlight,
+            "the attempt on the wire is its pass's"
+        );
+        let kept = journal
+            .destination(&hook)
+            .expect("a read")
+            .expect("the name of what was sent stays");
+        assert!(!kept.enabled);
+        assert_eq!(kept.rule, None);
+        let queued: i64 = journal
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM delivery_outbox WHERE notification_id IN (?1, ?2)",
+                params![uuid(1).to_string(), uuid(2).to_string()],
+                |row| row.get(0),
+            )
+            .expect("a count");
+        assert_eq!(queued, 0, "nothing of it waits to be sent");
+
+        let unused = journal
+            .remove_destination(&unnamed.id, 3_000)
+            .expect("a removal");
+        assert!(unused.found && !unused.kept_as_history);
+        assert_eq!(journal.destination(&unnamed.id).expect("a read"), None);
+        assert_eq!(
+            journal
+                .remove_destination(&unnamed.id, 3_000)
+                .expect("a removal"),
+            DestinationRemoval::default(),
+            "removing it again finds nothing"
+        );
     }
 
     /// An unknown outcome considered and left unresolved waits its turn, so the next one gets its,

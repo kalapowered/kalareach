@@ -178,6 +178,7 @@ mod tests {
                 kind: DestinationKind::Webhook,
                 endpoint: "https://example.invalid/hook".to_owned(),
                 idempotency: Idempotency::Unsupported,
+                credential: None,
             }),
             rule: Some(DeliveryRule {
                 name: "on failure".to_owned(),

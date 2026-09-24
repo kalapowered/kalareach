@@ -14,7 +14,10 @@
 //! | [`status`] | Asking that gateway what became of one, by its identifier |
 //! | [`credentials`] | The bearer this host delivers under |
 //! | [`sender`] | Renewing it through the gateway's two-step signed exchange |
-//! | [`external`] | Delivering to a webhook |
+//! | [`external`] | Delivering to a webhook, and checking a credential before it is kept |
+//! | [`chat`] | The shape of a Slack, Discord or Telegram credential and destination |
+//! | [`mail`] | The shape of a mail submission account and of a mail address |
+//! | [`secrets`] | Keeping an external destination's credential in the host's secret store |
 //! | [`authority`] | What an external destination's grant lets its recipient read |
 //!
 //! # What this daemon serves, and what it calls
@@ -33,16 +36,19 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use kr_delivery::destination::{
-    DeliveryRule, Destination, DestinationId, DestinationRecord, PreviewKeys, PushDestination,
+    DeliveryRule, Destination, DestinationId, DestinationKind, DestinationRecord, PreviewKeys,
+    PushDestination,
 };
 use kr_delivery::external::ExternalSender;
 use kr_delivery::journal::{
-    Claim, ClaimedDelivery, DeliveryJournal, DeliveryState, DueDelivery, Transition,
+    Claim, ClaimedDelivery, DeliveryJournal, DeliveryState, DestinationRemoval, DueDelivery,
+    Transition,
 };
 use kr_delivery::preview;
 use kr_delivery::producer::{Producer, RecipientAuthority};
 use kr_delivery::push::{DeliveryStatus, NextAction, PushSender, SenderCredentials, StatusAnswer};
 use kr_ipc::paths::EnvironmentPaths;
+use kr_protocol::delivery::DestinationSecret;
 use kr_protocol::method::Method;
 use kr_protocol::push::PushDeliveryRequest;
 use kr_protocol::scalars::{NotificationPreviewKey, TimestampMs};
@@ -50,10 +56,13 @@ use kr_protocol::scalars::{NotificationPreviewKey, TimestampMs};
 use crate::error::{ControllerError, Result};
 
 pub mod authority;
+pub mod chat;
 pub mod client;
 pub mod credentials;
 pub mod external;
+pub mod mail;
 pub mod runtime;
+pub mod secrets;
 pub mod sender;
 pub mod status;
 pub mod transport;
@@ -101,10 +110,20 @@ impl Clock for SystemClock {
 #[derive(Debug)]
 pub struct DeliveryModule {
     producer: Mutex<Producer>,
+    secrets: secrets::DestinationSecrets,
+}
+
+/// What storing one destination's credential did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoredSecret {
+    /// Whether a destination of the credential's kind is configured and enabled under the
+    /// identifier, and so sends with it from now on.
+    pub in_force: bool,
 }
 
 impl DeliveryModule {
-    /// Opens the environment's delivery journal beside the daemon's other state.
+    /// Opens the environment's delivery journal beside the daemon's other state, keeping external
+    /// destinations' credentials in `secrets`.
     ///
     /// # Errors
     ///
@@ -113,11 +132,13 @@ impl DeliveryModule {
         paths: &EnvironmentPaths,
         preview_key: kr_crypto::keys::NotificationPreviewKeyPair,
         mailbox_key: kr_crypto::keys::StoredEnvelopeKeyPair,
+        secrets: secrets::DestinationSecrets,
     ) -> Result<Self> {
         Self::open_at(
             &paths.state_dir().join(DELIVERY_JOURNAL),
             preview_key,
             mailbox_key,
+            secrets,
         )
     }
 
@@ -130,18 +151,86 @@ impl DeliveryModule {
         path: &Path,
         preview_key: kr_crypto::keys::NotificationPreviewKeyPair,
         mailbox_key: kr_crypto::keys::StoredEnvelopeKeyPair,
+        secrets: secrets::DestinationSecrets,
     ) -> Result<Self> {
         let journal = DeliveryJournal::open(path).map_err(unavailable)?;
         let producer = Producer::new(journal, preview_key, mailbox_key).map_err(unavailable)?;
         Ok(Self {
             producer: Mutex::new(producer),
+            secrets,
         })
     }
 
     /// Returns true when this module serves `method`.
     #[must_use]
     pub const fn serves(method: Method) -> bool {
-        matches!(method, Method::DevicePreviewKeyUpdate)
+        matches!(
+            method,
+            Method::DevicePreviewKeyUpdate | Method::DeliveryDestinationSecretSet
+        )
+    }
+
+    /// Keeps the credential one external destination sends with in the host's secret store.
+    ///
+    /// The credential goes to the secret store and nowhere else: not to the journal, whose record
+    /// gets a random stamp in its place, and not to anything this returns. A destination of the
+    /// credential's kind already configured under the identifier sends with the new credential
+    /// from now on, and its stamp changes with it, which is a new binding: a notification admitted
+    /// while it sent with the credential being replaced is not sent with this one. Under an
+    /// identifier nothing is configured under, or one configured as another kind, the credential
+    /// waits for a destination of its kind to be configured there; configuring a kind that sends
+    /// with no credential deletes it.
+    ///
+    /// The store is written first and the journal second. A host that stops between the two has a
+    /// credential whose stamp the record does not carry yet, and a pass refuses to send with a
+    /// credential whose stamp is not the record's, so nothing reaches the new destination under the
+    /// old binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Storage`] when the secret store or the journal cannot be
+    /// written.
+    pub fn store_secret(
+        &self,
+        destination_id: &DestinationId,
+        secret: &DestinationSecret,
+    ) -> Result<StoredSecret> {
+        let kind = DestinationKind::for_credential(secret.kind());
+        self.with(|producer| {
+            let stamp = self.secrets.put(destination_id, secret)?;
+            let record = producer
+                .journal_mut()
+                .set_destination_credential(destination_id, kind, &stamp)
+                .map_err(unavailable)?;
+            Ok(StoredSecret {
+                in_force: record.is_some_and(|record| record.enabled),
+            })
+        })
+    }
+
+    /// Removes one destination, and the credential kept for it with it.
+    ///
+    /// The credential goes first. A destination whose credential cannot be deleted stays
+    /// configured and the removal says why; one whose record cannot then be written has no
+    /// credential left to send with, so nothing more reaches it, and the removal can be asked for
+    /// again. Everything queued for it is taken back in the journal's own transaction
+    /// ([`DeliveryJournal::remove_destination`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Storage`] when the secret store or the journal cannot be written.
+    pub fn remove(
+        &self,
+        destination_id: &DestinationId,
+        now_ms: u64,
+    ) -> Result<DestinationRemoval> {
+        self.with(|producer| {
+            self.secrets.remove(destination_id)?;
+            producer
+                .journal_mut()
+                .remove_destination(destination_id, now_ms)
+                .map_err(unavailable)
+        })
     }
 
     /// Runs one caller against the producer.
@@ -271,7 +360,8 @@ impl DeliveryModule {
     /// webhook address it will not send to, and [`ControllerError::Storage`] when the journal
     /// cannot be written.
     pub fn configure(&self, record: &DestinationRecord) -> Result<()> {
-        if let Destination::External(external) = &record.destination {
+        let mut record = record.clone();
+        if let Destination::External(external) = &mut record.destination {
             if let Some(needs) = external::credential_needed(external.kind) {
                 return Err(ControllerError::InvalidArgument(format!(
                     "a {} destination needs a credential from this host's secret store, because \
@@ -282,11 +372,17 @@ impl DeliveryModule {
             }
             external::webhook_origin(&external.endpoint)
                 .map_err(ControllerError::InvalidArgument)?;
+            external.credential = None;
         }
         self.with(|producer| {
+            // A destination that sends with no credential replaces whatever was configured under
+            // its identifier, and a credential kept for what it replaced goes with it: it would
+            // otherwise be picked up by a destination of that kind configured here later, which
+            // nobody gave it to.
+            self.secrets.remove(&record.id)?;
             producer
                 .journal_mut()
-                .configure_destination(record)
+                .configure_destination(&record)
                 .map_err(unavailable)
         })
     }
@@ -884,7 +980,7 @@ impl DeliveryModule {
         }
         let message = client::message_from(&delivery.content)?;
         let attempt = delivery.attempt;
-        let outcome = external.send(destination, &message);
+        let outcome = external.send(destination, None, &message);
         let answered_at_ms = clock.now_ms().max(now_ms);
         let decision = kr_delivery::external::decide_external(
             &outcome,

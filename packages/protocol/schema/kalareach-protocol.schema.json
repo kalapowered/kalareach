@@ -8377,6 +8377,54 @@
       ],
       "type": "object"
     },
+    "DeliveryDestinationSecretSetParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `delivery.destination.secret.set`.",
+      "properties": {
+        "destination_id": {
+          "description": "The identifier the destination is configured under, or will be.",
+          "type": "string"
+        },
+        "secret": {
+          "$ref": "#/$defs/DestinationSecret",
+          "description": "The credential it sends with."
+        }
+      },
+      "required": [
+        "destination_id",
+        "secret"
+      ],
+      "type": "object"
+    },
+    "DeliveryDestinationSecretSetResult": {
+      "additionalProperties": false,
+      "description": "The result of `delivery.destination.secret.set`. It never carries the credential.",
+      "properties": {
+        "destination_id": {
+          "description": "The identifier the credential is kept under.",
+          "type": "string"
+        },
+        "in_force": {
+          "description": "Whether a destination of this kind is configured under the identifier now, and so sends\nwith this credential from here on.\n\nNotifications admitted while the destination sent with the credential this one replaced\nare not sent with this one: they were admitted for wherever that credential reached.",
+          "type": "boolean"
+        },
+        "kind": {
+          "$ref": "#/$defs/DestinationSecretKind",
+          "description": "Which kind of destination the credential is for."
+        },
+        "recipients_can_read": {
+          "description": "Who can read what this destination delivers, in a sentence a person is shown.\n\nSection 25: the recipients of an external destination read what it delivers, and\nKalaReach's encrypted routing does not make those messages private.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "destination_id",
+        "kind",
+        "in_force",
+        "recipients_can_read"
+      ],
+      "type": "object"
+    },
     "DescribedAction": {
       "additionalProperties": false,
       "description": "An action described by its caller, for the three actions no served method performs yet.",
@@ -8951,6 +8999,112 @@
         "name"
       ],
       "type": "object"
+    },
+    "DestinationSecret": {
+      "description": "The credential one external destination sends with.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A Slack incoming webhook. Its address is the credential: whoever holds it can post to the\nchannel it was made for.",
+          "properties": {
+            "kind": {
+              "const": "slack",
+              "type": "string"
+            },
+            "webhook_url": {
+              "$ref": "#/$defs/SecretText",
+              "description": "The webhook's address, as Slack issued it."
+            }
+          },
+          "required": [
+            "kind",
+            "webhook_url"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A Discord webhook. Its address carries the webhook's token, so the address is the\ncredential.",
+          "properties": {
+            "kind": {
+              "const": "discord",
+              "type": "string"
+            },
+            "webhook_url": {
+              "$ref": "#/$defs/SecretText",
+              "description": "The webhook's address, as Discord issued it."
+            }
+          },
+          "required": [
+            "kind",
+            "webhook_url"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A Telegram bot, which sends through its token.",
+          "properties": {
+            "bot_token": {
+              "$ref": "#/$defs/SecretText",
+              "description": "The bot's token, as Telegram issued it."
+            },
+            "kind": {
+              "const": "telegram",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "bot_token"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A mail submission account.",
+          "properties": {
+            "account": {
+              "$ref": "#/$defs/MailAccount",
+              "description": "The account."
+            },
+            "kind": {
+              "const": "email",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "account"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "DestinationSecretKind": {
+      "description": "The kinds of external destination that send with a credential.",
+      "oneOf": [
+        {
+          "const": "slack",
+          "description": "A Slack incoming webhook.",
+          "type": "string"
+        },
+        {
+          "const": "discord",
+          "description": "A Discord webhook.",
+          "type": "string"
+        },
+        {
+          "const": "telegram",
+          "description": "A Telegram bot.",
+          "type": "string"
+        },
+        {
+          "const": "email",
+          "description": "A mail submission account.",
+          "type": "string"
+        }
+      ]
     },
     "DestinationState": {
       "description": "What a destination looked like before an operation was allowed to use it.",
@@ -15713,6 +15867,60 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "MailAccount": {
+      "additionalProperties": false,
+      "description": "A mail submission account: the server a message is handed to and the account it is sent from.",
+      "properties": {
+        "from_address": {
+          "description": "The address the message is sent from.",
+          "type": "string"
+        },
+        "password": {
+          "$ref": "#/$defs/SecretText",
+          "description": "Its password."
+        },
+        "port": {
+          "$ref": "#/$defs/U64",
+          "description": "Its port."
+        },
+        "security": {
+          "$ref": "#/$defs/MailSecurity",
+          "description": "How the connection is protected."
+        },
+        "server": {
+          "description": "The submission server's host name or IP address.",
+          "type": "string"
+        },
+        "username": {
+          "$ref": "#/$defs/SecretText",
+          "description": "The account name the server authenticates."
+        }
+      },
+      "required": [
+        "server",
+        "port",
+        "security",
+        "username",
+        "password",
+        "from_address"
+      ],
+      "type": "object"
+    },
+    "MailSecurity": {
+      "description": "How a mail submission connection is protected before anything is sent over it.",
+      "oneOf": [
+        {
+          "const": "implicit_tls",
+          "description": "TLS from the first byte, the way submission on port 465 works.",
+          "type": "string"
+        },
+        {
+          "const": "starttls",
+          "description": "A plain connection that is upgraded with STARTTLS before anything else is sent, the way\nsubmission on port 587 works. A server that does not offer the upgrade is not sent to.",
+          "type": "string"
+        }
+      ]
+    },
     "MailboxPayloadType": {
       "description": "What an envelope carries.\n\nThe set is closed. A new payload kind is a new schema, not a new string a sender may invent:\nsection 23 forbids unknown fields and strip-and-verify behaviour on signed objects, and the\nsame rule applies to the type that decides how a payload is interpreted.",
       "oneOf": [
@@ -16129,6 +16337,11 @@
         {
           "const": "environment.refresh",
           "description": "Observe one enrolled environment now, and start it when the request asks for that.",
+          "type": "string"
+        },
+        {
+          "const": "delivery.destination.secret.set",
+          "description": "Keep the credential an external notification destination sends with in this host's secret store, under the destination's identifier. It is never answered back, and it goes when the destination does.",
           "type": "string"
         },
         {
@@ -27551,6 +27764,13 @@
       ],
       "type": "object"
     },
+    "SecretText": {
+      "description": "A credential or part of one: 1 to 4096 bytes, no control characters. The host keeps it in its secret store and never answers with it.",
+      "maxLength": 4096,
+      "minLength": 1,
+      "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$",
+      "type": "string"
+    },
     "SemanticChange": {
       "additionalProperties": false,
       "description": "One semantic change in the changed-since-last-visit view.",
@@ -33967,11 +34187,23 @@
     "decoding_trust": {
       "$ref": "#/$defs/DecodingTrust"
     },
+    "delivery_destination_secret_set_params": {
+      "$ref": "#/$defs/DeliveryDestinationSecretSetParams"
+    },
+    "delivery_destination_secret_set_result": {
+      "$ref": "#/$defs/DeliveryDestinationSecretSetResult"
+    },
     "desktop_capability_report": {
       "$ref": "#/$defs/DesktopCapabilityReport"
     },
     "desktop_context": {
       "$ref": "#/$defs/DesktopContext"
+    },
+    "destination_secret": {
+      "$ref": "#/$defs/DestinationSecret"
+    },
+    "destination_secret_kind": {
+      "$ref": "#/$defs/DestinationSecretKind"
     },
     "device_keys_complete_params": {
       "$ref": "#/$defs/DeviceKeysCompleteParams"
@@ -34533,6 +34765,12 @@
     },
     "log_view_state": {
       "$ref": "#/$defs/LogViewState"
+    },
+    "mail_account": {
+      "$ref": "#/$defs/MailAccount"
+    },
+    "mail_security": {
+      "$ref": "#/$defs/MailSecurity"
     },
     "materialisation_record": {
       "$ref": "#/$defs/MaterialisationRecord"

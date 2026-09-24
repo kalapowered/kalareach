@@ -537,6 +537,39 @@ export type ReverseOperation = 'filesystem_read' | 'filesystem_write' | 'termina
  */
 export type UpstreamMethod = string
 /**
+ * The credential one external destination sends with.
+ */
+export type DestinationSecret =
+  | {
+      kind: 'slack'
+      /**
+       * The webhook's address, as Slack issued it.
+       */
+      webhook_url: string
+    }
+  | {
+      kind: 'discord'
+      /**
+       * The webhook's address, as Discord issued it.
+       */
+      webhook_url: string
+    }
+  | {
+      /**
+       * The bot's token, as Telegram issued it.
+       */
+      bot_token: string
+      kind: 'telegram'
+    }
+  | {
+      account: MailAccount
+      kind: 'email'
+    }
+/**
+ * The kinds of external destination that send with a credential.
+ */
+export type DestinationSecretKind = 'slack' | 'discord' | 'telegram' | 'email'
+/**
  * One selected working copy and its policy.
  */
 export type WorkspaceId = string
@@ -926,6 +959,10 @@ export type VoiceSessionId = string
  * One automation definition.
  */
 export type WorkflowId = string
+/**
+ * How a mail submission connection is protected before anything is sent over it.
+ */
+export type MailSecurity = 'implicit_tls' | 'starttls'
 /**
  * Where a request entered the host.
  *
@@ -1746,8 +1783,12 @@ export interface KalaReachProtocol {
   declarative_table?: DeclarativeTable
   decoder_ledger_entry?: DecoderLedgerEntry
   decoding_trust?: DecodingTrust
+  delivery_destination_secret_set_params?: DeliveryDestinationSecretSetParams
+  delivery_destination_secret_set_result?: DeliveryDestinationSecretSetResult
   desktop_capability_report?: DesktopCapabilityReport
   desktop_context?: DesktopContext1
+  destination_secret?: DestinationSecret
+  destination_secret_kind?: DestinationSecretKind
   device_keys_complete_params?: DeviceKeysCompleteParams
   device_keys_complete_result?: DeviceKeysCompleteResult
   device_keys_declaration?: DeviceKeysDeclaration
@@ -1938,6 +1979,8 @@ export interface KalaReachProtocol {
   local_hello?: LocalHello
   local_hello_ack?: LocalHelloAck
   log_view_state?: LogViewState
+  mail_account?: MailAccount1
+  mail_security?: MailSecurity
   materialisation_record?: MaterialisationRecord1
   materialisation_result?: MaterialisationResult
   membership_lease?: MembershipLease
@@ -9166,6 +9209,101 @@ export interface DecodingTrust {
   schema_versions: string[]
 }
 /**
+ * Parameters of `delivery.destination.secret.set`.
+ */
+export interface DeliveryDestinationSecretSetParams {
+  /**
+   * The identifier the destination is configured under, or will be.
+   */
+  destination_id: string
+  /**
+   * The credential it sends with.
+   */
+  secret:
+    | {
+        kind: 'slack'
+        /**
+         * The webhook's address, as Slack issued it.
+         */
+        webhook_url: string
+      }
+    | {
+        kind: 'discord'
+        /**
+         * The webhook's address, as Discord issued it.
+         */
+        webhook_url: string
+      }
+    | {
+        /**
+         * The bot's token, as Telegram issued it.
+         */
+        bot_token: string
+        kind: 'telegram'
+      }
+    | {
+        account: MailAccount
+        kind: 'email'
+      }
+}
+/**
+ * The account.
+ */
+export interface MailAccount {
+  /**
+   * The address the message is sent from.
+   */
+  from_address: string
+  /**
+   * Its password.
+   */
+  password: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  port: string
+  /**
+   * How the connection is protected.
+   */
+  security: 'implicit_tls' | 'starttls'
+  /**
+   * The submission server's host name or IP address.
+   */
+  server: string
+  /**
+   * The account name the server authenticates.
+   */
+  username: string
+}
+/**
+ * The result of `delivery.destination.secret.set`. It never carries the credential.
+ */
+export interface DeliveryDestinationSecretSetResult {
+  /**
+   * The identifier the credential is kept under.
+   */
+  destination_id: string
+  /**
+   * Whether a destination of this kind is configured under the identifier now, and so sends
+   * with this credential from here on.
+   *
+   * Notifications admitted while the destination sent with the credential this one replaced
+   * are not sent with this one: they were admitted for wherever that credential reached.
+   */
+  in_force: boolean
+  /**
+   * Which kind of destination the credential is for.
+   */
+  kind: 'slack' | 'discord' | 'telegram' | 'email'
+  /**
+   * Who can read what this destination delivers, in a sentence a person is shown.
+   *
+   * Section 25: the recipients of an external destination read what it delivers, and
+   * KalaReach's encrypted routing does not make those messages private.
+   */
+  recipients_can_read: string
+}
+/**
  * Every capability record for one desktop, with the context they are about.
  */
 export interface DesktopCapabilityReport {
@@ -13243,6 +13381,35 @@ export interface LogViewState {
   view_id: string
 }
 /**
+ * A mail submission account: the server a message is handed to and the account it is sent from.
+ */
+export interface MailAccount1 {
+  /**
+   * The address the message is sent from.
+   */
+  from_address: string
+  /**
+   * Its password.
+   */
+  password: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  port: string
+  /**
+   * How the connection is protected.
+   */
+  security: 'implicit_tls' | 'starttls'
+  /**
+   * The submission server's host name or IP address.
+   */
+  server: string
+  /**
+   * The account name the server authenticates.
+   */
+  username: string
+}
+/**
  * A signed statement that one account held one role in one organisation.
  */
 export interface MembershipLease {
@@ -13406,6 +13573,7 @@ export interface MethodEntry {
     | 'environment.forget'
     | 'environment.inventory'
     | 'environment.refresh'
+    | 'delivery.destination.secret.set'
     | 'pair.invite'
     | 'pair.redeem'
     | 'pair.finish'
@@ -21337,6 +21505,7 @@ export interface ServiceRequestPayload {
     | 'environment.forget'
     | 'environment.inventory'
     | 'environment.refresh'
+    | 'delivery.destination.secret.set'
     | 'pair.invite'
     | 'pair.redeem'
     | 'pair.finish'

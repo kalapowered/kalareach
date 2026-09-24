@@ -34,6 +34,7 @@
 
 use std::collections::BTreeSet;
 
+use kr_protocol::delivery::DestinationSecret;
 use kr_protocol::grant::SessionSelector;
 use kr_protocol::ids::{NotificationId, SessionId};
 use kr_protocol::push::PushAlert;
@@ -163,12 +164,18 @@ pub enum ExternalOutcome {
 
 /// What a host sends an external message through.
 ///
-/// One trait for five services. Each adapter resolves its own credential from the host's secret
-/// store; nothing about a credential travels through this seam or through the delivery journal.
+/// One trait for five services. The credential a kind sends with is read from the host's secret
+/// store by the pass that sends, checked against the one the destination was configured with, and
+/// handed to the adapter for this one attempt: it never travels through the delivery journal, and
+/// a destination that sends with none is given none.
 pub trait ExternalSender: std::fmt::Debug {
-    /// Sends one message to one destination.
-    fn send(&self, destination: &ExternalDestination, message: &ExternalMessage)
-    -> ExternalOutcome;
+    /// Sends one message to one destination, with the credential that destination sends with.
+    fn send(
+        &self,
+        destination: &ExternalDestination,
+        credential: Option<&DestinationSecret>,
+        message: &ExternalMessage,
+    ) -> ExternalOutcome;
 }
 
 /// Composes one message from content the viewer is allowed to see.
@@ -504,6 +511,7 @@ mod tests {
             kind: DestinationKind::Webhook,
             endpoint: "https://example.invalid/hook".to_owned(),
             idempotency,
+            credential: None,
         }
     }
 

@@ -1203,6 +1203,7 @@ mod tests {
                 idempotency: Idempotency::Supported {
                     field: "Idempotency-Key".to_owned(),
                 },
+                credential: None,
             }),
             rule: Some(DeliveryRule {
                 name: "on failure".to_owned(),

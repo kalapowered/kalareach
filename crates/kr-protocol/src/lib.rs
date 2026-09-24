@@ -46,6 +46,7 @@
 //! | [`mailbox`] | Stored mailbox envelopes and their size buckets |
 //! | [`service`] | The credential every managed-service method authenticates with |
 //! | [`push`] | Push registration, sender authorisation and delivery |
+//! | [`delivery`] | The credential an external notification destination sends with |
 //! | [`archive`] | Backup key wraps, manifests, descriptors and recovery material |
 //! | [`collection_keys`] | A synchronised collection's key record: its members, its epoch and each member's key wrap |
 //! | [`account`] | Membership leases and the organisation policy-signing authority chain |
@@ -120,6 +121,7 @@ pub mod catalogue;
 pub mod changeset;
 pub mod collection_keys;
 pub mod confirmation;
+pub mod delivery;
 pub mod describe;
 pub mod desktop;
 pub mod digest;

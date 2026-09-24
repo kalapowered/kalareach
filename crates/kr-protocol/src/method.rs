@@ -395,6 +395,14 @@ methods! {
     confirmation: None, idempotency: ACTION,
     doc: "Observe one enrolled environment now, and start it when the request asks for that.";
 
+    DeliveryDestinationSecretSet = "delivery.destination.secret.set", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Keep the credential an external notification destination sends with in this host's \
+          secret store, under the destination's identifier. It is never answered back, and it \
+          goes when the destination does.";
+
     // ----- Pairing --------------------------------------------------------------------------
     PairInvite = "pair.invite", Pairing,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Host, Invitation],
@@ -1580,6 +1588,12 @@ mod tests {
         ("device.revoke", &[ActionRight::HostManage]),
         ("catalogue.add", &[ActionRight::HostManage]),
         ("plugin.install", &[ActionRight::HostManage]),
+        // Where notifications go: an external destination's credential decides who reads what
+        // it delivers.
+        (
+            "delivery.destination.secret.set",
+            &[ActionRight::HostManage],
+        ),
         // Sharing.
         ("grant.create", &[ActionRight::SessionShare]),
         ("grant.revoke", &[ActionRight::SessionShare]),

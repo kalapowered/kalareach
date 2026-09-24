@@ -81,6 +81,10 @@ use crate::confirmation::{
     OwnerConfirmationPendingParams, OwnerConfirmationPendingResult, OwnerConfirmationRequestParams,
     OwnerConfirmationRequestResult,
 };
+use crate::delivery::{
+    DeliveryDestinationSecretSetParams, DeliveryDestinationSecretSetResult, DestinationSecret,
+    DestinationSecretKind, MailAccount, MailSecurity,
+};
 use crate::describe::{
     DescriptionProvenance, DescriptionSetup, SessionDescribeParams, SessionDescribeResult,
     SessionRenameParams, SessionRenameResult,
@@ -732,6 +736,14 @@ pub fn protocol_schema() -> Value {
         "pair_invite_result" => PairInviteResult,
         "pairing_security_event" => PairingSecurityEvent,
         "rendezvous_message" => RendezvousMessage,
+        // External notification destinations: the credential one of them sends with, and the one
+        // method that hands it to the host. Appended for the same reason.
+        "delivery_destination_secret_set_params" => DeliveryDestinationSecretSetParams,
+        "delivery_destination_secret_set_result" => DeliveryDestinationSecretSetResult,
+        "destination_secret" => DestinationSecret,
+        "destination_secret_kind" => DestinationSecretKind,
+        "mail_account" => MailAccount,
+        "mail_security" => MailSecurity,
     }
     properties.insert(
         "identifiers".to_owned(),
