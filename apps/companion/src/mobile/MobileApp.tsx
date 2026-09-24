@@ -27,7 +27,7 @@ import { Account } from './views/Account'
 import { Inbox } from './views/Inbox'
 import { MobileHosts, MobileSessions } from './views/Places'
 import { MobileSession } from './views/MobileSession'
-import type { Channel, AccountState, Usage } from './model/account'
+import type { Channel } from '../model/account'
 import { ask } from './model/call'
 import { useKeyboardInset, useLifecycle } from './useLifecycle'
 import { detectSurface, type Surface } from './platform'
@@ -60,17 +60,16 @@ export function placeFromAddress(search: string): Place {
   return { tab: named ?? 'attention' }
 }
 
-/** What this build is, which decides only what the account screen may show. */
+/**
+ * What this build is, which decides only what the account screen may show. Where the device stands
+ * with an account is the backend's to say, so it is read from the host port, not from the build.
+ */
 export interface MobileBuild {
   readonly channel: Channel
-  readonly account: AccountState
-  readonly usage: Usage | null
 }
 
 const DEFAULT_BUILD: MobileBuild = {
-  channel: 'app_store',
-  account: { kind: 'local_only' },
-  usage: null
+  channel: 'app_store'
 }
 
 /** The phone application. */
@@ -220,14 +219,7 @@ export function MobileApp({
           />
         ) : null}
         {place.tab === 'hosts' ? <MobileHosts surface={resolved} /> : null}
-        {place.tab === 'account' ? (
-          <Account
-            surface={resolved}
-            channel={build.channel}
-            account={build.account}
-            usage={build.usage}
-          />
-        ) : null}
+        {place.tab === 'account' ? <Account surface={resolved} channel={build.channel} /> : null}
       </main>
 
       <TabBar

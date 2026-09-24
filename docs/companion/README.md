@@ -45,7 +45,16 @@ that means, and each rule is a fact about a file here rather than a convention:
   tokens into elements. It never produces an HTML string, so there is no markup to strip. Raw HTML
   in the source renders as the text it is.
 - **Links are checked and opened by the backend.** `https` and `mailto`, and nothing else. A link
-  in agent text is a button that asks the backend; the page never navigates.
+  in agent text is a button that asks the backend; the page never navigates, and it is granted no
+  opener command of its own.
+- **The window stays on the bundle.** The main window is built from its configuration with a
+  navigation handler that refuses any top-level navigation away from the bundled interface, and on
+  a desktop a handler that refuses new windows.
+- **Signing in happens in the system browser.** The account commands take nothing from the page.
+  The backend builds the authorisation request, hands it to the default browser (a loopback
+  listener on `127.0.0.1:8765` takes the answer) or, on a phone, to the platform's browser-backed
+  session, checks the answer and keeps the tokens in the device's secure store. The page is told
+  where the device stands and never sees an address, a code or a token.
 - **Images come through validated handles.** An image in a session is read by its attachment handle.
   A remote image is a placeholder with its URL and an import action, and the import is one request,
   over `https`, with a declared size limit.

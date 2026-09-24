@@ -268,9 +268,14 @@ picker and nothing else, applies to iOS and Android only, and is held to that by
 the page may listen for an event without being able to emit one. The interface is bundled: no
 mobile build loads its own code from the managed service.
 
-The account screen offers signing in and shows usage. It carries no payment form, no embedded
-checkout and no control whose purpose is to send a person somewhere to buy something, and the
-mobile tests read the rendered screen and fail on any of them. What is not there is the
-authentication itself and the call that reads usage: the screen draws what it is given. Local
+The account screen offers signing in and shows usage. Signing in hands the passkey ceremony to the
+system browser on `reach.kala.to`: iOS's authentication session (an HTTPS callback from iOS 17.4, a
+private-use `to.kala.reach:` callback before it), or Android's Auth Tab, with a Custom Tab and a
+verified link where the default browser has no Auth Tab. The page asks the backend to sign in and is
+told where the device stands; the address the browser opens, its code and the tokens stay in the
+backend, and the tokens are kept in the device's secure store (the protected keychain in the
+application's own group on iOS, files sealed under a Keystore key on Android). The screen carries
+no payment form, no embedded checkout and no control whose purpose is to send a person somewhere to
+buy something, and the mobile tests read the rendered screen and fail on any of them. Local
 operation needs no account, and the screen says so; what "everything local works" means on a phone
 is settled by the host connection, which is the packaging work above.

@@ -298,19 +298,6 @@
   text-align: center;
 }
 
-.m-section-title {
-  margin: var(--gap-5) 0 var(--gap-2);
-  font-size: 0.6875rem;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--faint);
-}
-
-.m-section-title:first-child {
-  margin-block-start: 0;
-}
-
 /* ---- Filters --------------------------------------------------------------------------------- */
 
 .m-filters {
@@ -536,28 +523,6 @@
   border-radius: 999px;
   background: var(--surface);
   font-size: 0.8125rem;
-}
-
-/* ---- Usage ----------------------------------------------------------------------------------- */
-
-.m-usage {
-  display: grid;
-  gap: var(--gap-1);
-  padding-block: var(--gap-2);
-}
-
-.m-meter {
-  block-size: 6px;
-  border-radius: 3px;
-  background: var(--subtle);
-  overflow: hidden;
-}
-
-.m-meter > span {
-  display: block;
-  block-size: 100%;
-  border-radius: 3px;
-  background: var(--accent);
 }
 
 /*

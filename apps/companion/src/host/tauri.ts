@@ -13,6 +13,8 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 
+import type { AccountView, UsageView } from '../model/account'
+
 import type {
   ApprovedLink,
   AttachmentHandle,
@@ -42,6 +44,9 @@ export const CONNECTION_EVENT = 'kr://connection'
 
 /** The event the backend publishes the paths of dropped files on. */
 export const DROPPED_EVENT = 'kr://dropped'
+
+/** The event the backend publishes the account's view on when it changes by itself. */
+export const ACCOUNT_EVENT = 'kr://account'
 
 /**
  * The refusal for an operation this build has no agreed shape for.
@@ -194,6 +199,26 @@ export function tauriPort(): HostPort {
     // write. The page never names a path of its own.
     chooseExportPath: (suggestedName) =>
       call<string | null>('choose_export_destination', { suggestedName }),
+
+    accountStatus: () => call<AccountView>('account_status', {}),
+    accountSignIn: () => call<AccountView>('account_sign_in', {}),
+    accountSignInCancel: () => call<undefined>('account_sign_in_cancel', {}),
+    accountSignOut: () => call<AccountView>('account_sign_out', {}),
+    accountUsage: () => call<UsageView>('account_usage', {}),
+    onAccount(listener: (view: AccountView) => void) {
+      let stop: (() => void) | null = null
+      let cancelled = false
+      void listen<AccountView>(ACCOUNT_EVENT, (event) => {
+        listener(event.payload)
+      }).then((unlisten) => {
+        if (cancelled) unlisten()
+        else stop = unlisten
+      })
+      return () => {
+        cancelled = true
+        stop?.()
+      }
+    },
 
     subscribe(listener: (event: HostEvent) => void) {
       const stops: (() => void)[] = []

@@ -5,9 +5,11 @@
  * and settings are never a fourth destination: they open over whatever the person is doing.
  */
 
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 
-import { Brand, Toast } from './components/ui'
+import { AccountPanel, useAccount } from './components/AccountPanel'
+import { Brand, Sheet, Toast } from './components/ui'
+import { isSigningIn, type AccountView } from './model/account'
 import { useApp, type Place } from './app/state'
 import { Attention } from './views/Attention'
 import { ChangeSets } from './views/ChangeSets'
@@ -28,9 +30,22 @@ const NAVIGATION: readonly { readonly place: Place; readonly label: string }[] =
 
 /** The application. */
 export function App(): ReactNode {
-  const { place, go, toast, dismissToast, port } = useApp()
+  const { place, go, toast, dismissToast, port, say } = useApp()
   const [connected, setConnected] = useState(true)
   const [reason, setReason] = useState<string | null>(null)
+  const account = useAccount(port)
+  const [accountOpen, setAccountOpen] = useState(false)
+
+  // A sign-in carries on while the sheet is closed. When it finishes then, the toast says so.
+  const lastAccount = useRef<AccountView | null>(null)
+  useEffect(() => {
+    const before = lastAccount.current
+    lastAccount.current = account.view
+    if (accountOpen || !before || !isSigningIn(before)) return
+    if (account.view?.state === 'signed_in') {
+      say(account.view.email === null ? 'Signed in.' : `Signed in as ${account.view.email}.`)
+    }
+  }, [account.view, accountOpen, say])
 
   useEffect(() => {
     let watching = true
@@ -121,6 +136,19 @@ export function App(): ReactNode {
           >
             Set up this Mac
           </button>
+          <button
+            type="button"
+            className="nav-item nav-item-account"
+            aria-haspopup="dialog"
+            onClick={() => {
+              setAccountOpen(true)
+            }}
+          >
+            <span className="nav-item-lines">
+              <span>Account</span>
+              <AccountDetail view={account.view} />
+            </span>
+          </button>
         </div>
       </aside>
 
@@ -154,7 +182,27 @@ export function App(): ReactNode {
         </footer>
       </div>
 
+      <Sheet
+        open={accountOpen}
+        title="Account"
+        description="Sessions keep running while this is open."
+        onClose={() => {
+          setAccountOpen(false)
+        }}
+      >
+        <AccountPanel account={account} surface="desktop" />
+      </Sheet>
+
       <Toast message={toast} onDismiss={dismissToast} />
     </div>
   )
+}
+
+/** The Account item's second line: signing in, or who is signed in. */
+function AccountDetail({ view }: { readonly view: AccountView | null }): ReactNode {
+  if (view && isSigningIn(view)) return <span className="nav-item-detail">Signing in…</span>
+  if (view?.state === 'signed_in' && view.email !== null) {
+    return <span className="nav-item-detail">{view.email}</span>
+  }
+  return null
 }

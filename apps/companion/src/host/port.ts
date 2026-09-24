@@ -28,6 +28,7 @@ import type {
 } from '@kalareach/protocol'
 import type { DocumentNode } from '@kalareach/plugin-sdk'
 
+import type { AccountView, UsageView } from '../model/account'
 import type { AttentionInbox, LaunchSurface } from '../model/pending'
 
 /** A failure a command answered with. */
@@ -475,6 +476,30 @@ export interface HostPort {
 
   /** Asks the platform where to write an export. `null` means the person cancelled. */
   chooseExportPath(suggestedName: string): Promise<string | null>
+
+  /** Where this device stands with an account. */
+  accountStatus(): Promise<AccountView>
+
+  /**
+   * Signs this device in, and settles when the attempt ends.
+   *
+   * The backend hands the passkey ceremony to the system browser on reach.kala.to. The page names
+   * nothing: not the address the browser opens, and never a code or a token. What comes back is
+   * where the device stands.
+   */
+  accountSignIn(): Promise<AccountView>
+
+  /** Ends the sign-in that is waiting for the browser. */
+  accountSignInCancel(): Promise<void>
+
+  /** Signs this device out, and tells the service. */
+  accountSignOut(): Promise<AccountView>
+
+  /** The account's usage, and nothing about money. */
+  accountUsage(): Promise<UsageView>
+
+  /** Where the device stands, each time it changes by itself. The returned function unsubscribes. */
+  onAccount(listener: (view: AccountView) => void): () => void
 
   /** Subscribes to the host's events. The returned function unsubscribes. */
   subscribe(listener: (event: HostEvent) => void): () => void

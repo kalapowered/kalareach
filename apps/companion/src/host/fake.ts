@@ -39,6 +39,7 @@ import type {
   PackageViews,
   RetainedArtefacts
 } from '../model/pending'
+import type { AccountView, UsageView } from '../model/account'
 import type {
   ApprovedLink,
   DroppedFile,
@@ -158,8 +159,26 @@ function nextActionId(): string {
   return actionId
 }
 
+/**
+ * The account, as the backend reports it: where the device stands, its usage, and the sign-in the
+ * page started, which a test settles with the view the attempt ended in. Nothing here opens a link:
+ * the backend hands the ceremony to the system browser, and the page never sees the address.
+ */
+export interface FakeAccount {
+  /** How many sign-ins the page asked for. */
+  readonly signIns: number
+  /** Sets where the device stands and tells the page, as the backend's event does. */
+  set(view: AccountView): void
+  /** Settles the sign-in that is waiting for the browser. */
+  finishSignIn(view: AccountView): void
+  /** Sets what a usage read answers. */
+  setUsage(usage: UsageView): void
+}
+
 /** What the fake host can be told to do before a test drives the interface. */
 export interface FakeHostControls {
+  /** The account. */
+  readonly account: FakeAccount
   /** Pushes one event to every subscriber. */
   emit(event: HostEvent): void
   /** Appends one node to a session's conversation and tells the interface about it. */
@@ -274,6 +293,21 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     startCapture: seed.capture
   }
   const voiceStarts: VoiceStartRequest[] = []
+
+  let accountView: AccountView = { state: 'signed_out', outcome: null }
+  let accountUsage: UsageView = { state: 'signed_out' }
+  let signIns = 0
+  let pendingSignIn: ((view: AccountView) => void) | null = null
+  const accountListeners = new Set<(view: AccountView) => void>()
+  const setAccount = (view: AccountView) => {
+    accountView = view
+    for (const listener of accountListeners) listener(view)
+  }
+  const settleSignIn = (view: AccountView) => {
+    const settle = pendingSignIn
+    pendingSignIn = null
+    settle?.(view)
+  }
 
   const requireConnection = () => {
     if (!connected) {
@@ -852,6 +886,32 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
 
     voiceCallState: () => Promise.resolve(voiceCallState(voice)),
 
+    accountStatus: () => Promise.resolve(accountView),
+    accountSignIn: () => {
+      signIns += 1
+      setAccount({ state: 'browser_open' })
+      return new Promise<AccountView>((resolve) => {
+        pendingSignIn = (view) => {
+          setAccount(view)
+          resolve(view)
+        }
+      })
+    },
+    accountSignInCancel: () => {
+      settleSignIn({ state: 'signed_out', outcome: 'cancelled' })
+      return Promise.resolve()
+    },
+    accountSignOut: () => {
+      accountUsage = { state: 'signed_out' }
+      setAccount({ state: 'signed_out', outcome: 'signed_out' })
+      return Promise.resolve(accountView)
+    },
+    accountUsage: () => Promise.resolve(accountUsage),
+    onAccount(listener) {
+      accountListeners.add(listener)
+      return () => accountListeners.delete(listener)
+    },
+
     subscribe(listener) {
       listeners.add(listener)
       return () => listeners.delete(listener)
@@ -863,6 +923,16 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   }
 
   const controls: FakeHostControls = {
+    account: {
+      get signIns() {
+        return signIns
+      },
+      set: setAccount,
+      finishSignIn: settleSignIn,
+      setUsage(usage) {
+        accountUsage = usage
+      }
+    },
     emit,
     appendNode(node) {
       nodes.push(node)

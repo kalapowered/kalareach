@@ -325,13 +325,17 @@ describe('what setup costs a person', () => {
       expect(screen.getByTestId('setup-recheck').textContent).toBe('Check again')
     })
 
-    // The shell's own connection watch and event subscription are the application's, not setup's.
-    const own = calls.filter((name) => !['connectionState', 'subscribe'].includes(name))
+    // The shell's own connection watch and event subscription are the application's, not setup's,
+    // and so is its read of the account the sidebar names, which reaches no host.
+    const own = calls.filter(
+      (name) => !['connectionState', 'subscribe', 'accountStatus', 'onAccount'].includes(name)
+    )
     expect(new Set(own)).toEqual(
       new Set(['setupIdentity', 'environmentCapabilities'])
     )
-    // Nothing on this path signs in, pairs, pays or registers for anything.
-    for (const name of calls) {
+    // Nothing on this path signs in, pairs, pays or registers for anything. The shell's read of
+    // where the account stands, and its subscription to changes, sign nothing in.
+    for (const name of calls.filter((name) => !['accountStatus', 'onAccount'].includes(name))) {
       expect(name).not.toMatch(/account|sign|billing|stripe|firebase|apple/i)
     }
   })

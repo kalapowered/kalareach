@@ -866,3 +866,152 @@ textarea::placeholder {
     border-color: currentColor;
   }
 }
+
+/* ---- The account panel ------------------------------------------------------------------------ */
+
+/*
+ * One panel for the phone's Account screen and the desktop's Account sheet. A change of state
+ * fades in over the state duration and does not travel, so reduced motion keeps it as it is; the
+ * keyboard rule makes it instant. The panel is one column at every width, sized in rem so a larger
+ * text size reflows it.
+ */
+.account-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-3);
+}
+
+.account-state {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-3);
+  opacity: 1;
+  transition: opacity var(--state) var(--ease-out);
+}
+
+@starting-style {
+  .account-state {
+    opacity: 0;
+  }
+}
+
+.account-status {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-2);
+  border-radius: 6px;
+}
+
+.account-status:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+}
+
+.account-lead {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+  font-size: 0.9375rem;
+  line-height: 1.45;
+  color: var(--text);
+}
+
+.account-note,
+.account-help {
+  margin: 0;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.account-help {
+  color: var(--faint);
+}
+
+.account-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--gap-2);
+}
+
+.account-section-title {
+  margin: var(--gap-2) 0 0;
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+/* A small ring beside "Signing in…", shown only when the exchange passes 400 ms. */
+.account-working {
+  inline-size: 0.75rem;
+  block-size: 0.75rem;
+  flex: none;
+  border: 2px solid currentColor;
+  border-inline-end-color: transparent;
+  border-radius: 50%;
+  opacity: 0.6;
+  animation: account-turn 800ms linear infinite;
+}
+
+@keyframes account-turn {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.account-usage {
+  display: grid;
+  gap: var(--gap-1);
+  padding-block: var(--gap-2);
+}
+
+.account-usage-head {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--gap-3);
+  font-size: 0.8125rem;
+}
+
+.account-usage-label {
+  color: var(--text);
+}
+
+.account-usage-figure {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.account-meter {
+  block-size: 6px;
+  border-radius: 3px;
+  background: var(--subtle);
+  overflow: hidden;
+}
+
+.account-meter > span {
+  display: block;
+  block-size: 100%;
+  border-radius: 3px;
+  background: var(--accent);
+}
+
+/* The sidebar's Account item carries a second line: signing in, or who is signed in. */
+.nav-item-lines {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 1px;
+}
+
+.nav-item-detail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.6875rem;
+  font-weight: 400;
+  color: var(--faint);
+}

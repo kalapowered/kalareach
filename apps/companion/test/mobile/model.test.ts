@@ -45,7 +45,7 @@ import {
   summarise
 } from '../../src/mobile/model/lifecycle'
 import { DRAFTS_KEY, deviceStore, memoryStore, readRecord, writeRecord } from '../../src/mobile/model/store'
-import { commercialSurface, describeAccount, usageFraction } from '../../src/mobile/model/account'
+import { commercialSurface, describeAccount, usageFraction } from '../../src/model/account'
 import { detectSurface, minimumTarget, showsBackControl, TOUCH_TARGET } from '../../src/mobile/platform'
 
 const NOW = 1_763_000_000_000
@@ -416,7 +416,7 @@ describe('the commercial surface on a mobile build (KR-REQ-17.32)', () => {
   })
 
   it('says plainly that no account is needed for local work', () => {
-    const text = describeAccount({ kind: 'local_only' })
+    const text = describeAccount({ state: 'signed_out', outcome: null })
     expect(text).toContain('work exactly as they do with one')
   })
 

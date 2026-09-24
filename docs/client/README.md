@@ -492,7 +492,13 @@ that it should not have is a control the host then refuses.
 
 `services` holds one trait per managed service section 17 names (account login, relay leases, push,
 encrypted sync and backup, managed inference), and `ServiceClients` holds one optional
-implementation of each. `services::relay` is the relay-lease client, because a lease is the one
+implementation of each. `services::account` is the account sign-in: the authorisation request a
+system browser is handed (S256 PKCE, a fresh state and nonce, the registered redirect byte for
+byte), the checks on what comes back (the redirect, one of each parameter, the state, the issuer,
+then a code used once), the exchange with its ID token checks, and `SignedInAccount`, which keeps
+the grant in a secure store under one lock across refreshes, sign-outs and restarts, revokes on
+sign-out, and is the `AccountTokenSource` every managed resource asks for a token with the scope it
+needs. `services::relay` is the relay-lease client, because a lease is the one
 managed resource a client cannot do without and still use a relay at all, and `services::voice` is
 the voice broker. `services::authority` carries the durable authority feed, where a remote owner
 publishes a signed revocation request and the host that owns the feed acknowledges what it applied,

@@ -18,7 +18,7 @@ import { AppProvider } from '../../src/app/state'
 import { fakeHost, type FakeHostControls } from '../../src/host/fake'
 import { Shell } from '../../src/mobile/entry'
 import { MobileApp, type MobileBuild } from '../../src/mobile/MobileApp'
-import { PURCHASE_WORDS } from '../../src/mobile/model/account'
+import { PURCHASE_WORDS } from '../../src/model/account'
 import { TOUCH_TARGET, type MobilePlatform } from '../../src/mobile/platform'
 
 function start(
@@ -304,18 +304,22 @@ describe('local feedback and the receipt (KR-REQ-13.05, KR-ACC-012)', () => {
 describe('the commercial surface (KR-REQ-17.32)', () => {
   it('signs in and shows usage, with nothing that takes money', async () => {
     const person = userEvent.setup()
-    start('ios', {
-      channel: 'app_store',
-      account: { kind: 'signed_in', identity: 'sam@example.com', plan: 'Standard' },
-      usage: {
-        periodLabel: 'This month',
-        lines: [{ label: 'Agent minutes', used: 140, included: 500, unit: 'minutes' }]
-      }
+    const { controls } = start('ios', { channel: 'app_store' })
+    controls.account.setUsage({
+      state: 'read',
+      period_label: 'Usage in September 2026',
+      lines: [{ label: 'Backup storage', used: 1.4, included: 5, unit: 'GB' }]
+    })
+    controls.account.set({
+      state: 'signed_in',
+      email: 'sam@example.com',
+      name: null,
+      usage_readable: true
     })
     await person.click(await screen.findByRole('button', { name: /^Account/ }))
     const account = await screen.findByTestId('mobile-account')
-    expect(account.textContent).toContain('sam@example.com')
-    expect(account.textContent).toContain('140 of 500 minutes')
+    expect(await within(account).findByText('Signed in as sam@example.com.')).toBeInTheDocument()
+    expect(await within(account).findByText('1.4 of 5 GB')).toBeInTheDocument()
 
     const text = (account.textContent ?? '').toLowerCase()
     for (const word of PURCHASE_WORDS) {
