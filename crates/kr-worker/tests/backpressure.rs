@@ -59,6 +59,8 @@ const SEND_QUEUE_BYTES: usize = 256 * 1024;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
+    // How long each stage took, printed at the end, so a run's duration says where it went.
+    let mut stages = Stages::default();
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
@@ -148,6 +150,7 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
     let (slow, slow_id) = attached(&endpoint, environment_id, session_id).await;
     let (quick, _) = attached(&endpoint, environment_id, session_id).await;
     let before = runtime.session().output_cursor();
+    stages.reached("both clients attached and subscribed");
     std::fs::write(&go, b"").expect("the application is let go");
 
     // One of them reads as fast as it can, and says what ended its stream.
@@ -218,6 +221,7 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
         started.elapsed(),
         finished(&draining)
     );
+    stages.reached("output reached the reading client");
 
     // The moment the promise is actually about. Everything above could have happened before the
     // silent client's queue filled; what section 9 requires is that the read loop keeps going
@@ -236,6 +240,7 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    stages.reached("the silent client's queue full");
     let at_overflow = runtime.session().output_cursor();
     let read_at_overflow = received.load(std::sync::atomic::Ordering::Relaxed);
     assert!(
@@ -281,6 +286,8 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
         started.elapsed()
     );
 
+    stages.reached("reading went on after the overflow");
+
     // The session is still running: the one that stopped reading held nothing up.
     assert_eq!(
         runtime.state(),
@@ -322,6 +329,7 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
         "the client that stopped reading was told to resynchronise after {:?}",
         started.elapsed()
     );
+    stages.reached("the silent client read its marker");
 
     // And what became of the client that kept reading, named rather than inferred. It may have
     // fallen behind too on a host that delivers more slowly than it reads, and then the same rule
@@ -347,6 +355,40 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
         }
     } else {
         draining.abort();
+    }
+    eprintln!("{stages}");
+}
+
+/// How long each stage of the test took, from the one before it.
+struct Stages {
+    last: Instant,
+    taken: Vec<(&'static str, Duration)>,
+}
+
+impl Default for Stages {
+    fn default() -> Self {
+        Self {
+            last: Instant::now(),
+            taken: Vec::new(),
+        }
+    }
+}
+
+impl Stages {
+    fn reached(&mut self, stage: &'static str) {
+        let now = Instant::now();
+        self.taken.push((stage, now - self.last));
+        self.last = now;
+    }
+}
+
+impl std::fmt::Display for Stages {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "stages:")?;
+        for (stage, taken) in &self.taken {
+            write!(formatter, " {stage} {:.2}s;", taken.as_secs_f64())?;
+        }
+        Ok(())
     }
 }
 
