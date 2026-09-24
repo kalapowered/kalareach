@@ -776,6 +776,9 @@ pub enum AgentResourceCause {
     RichAnswer,
     /// The native terminal's own answer settled it.
     NativeAnswer,
+    /// This host's own answer settled it: the upstream asked the host to perform the request, and
+    /// the host answered it after running or refusing the operation.
+    HostAnswer,
     /// The upstream answered or withdrew its own request.
     Upstream,
     /// A reconciliation after a reconnection or a recovery settled it.
@@ -793,6 +796,7 @@ impl AgentResourceCause {
             Self::Dispatched => "dispatched",
             Self::RichAnswer => "rich_answer",
             Self::NativeAnswer => "native_answer",
+            Self::HostAnswer => "host_answer",
             Self::Upstream => "upstream",
             Self::Reconciliation => "reconciliation",
         }

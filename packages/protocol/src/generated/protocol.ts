@@ -122,6 +122,7 @@ export type AgentResourceCause =
   | 'dispatched'
   | 'rich_answer'
   | 'native_answer'
+  | 'host_answer'
   | 'upstream'
   | 'reconciliation'
 /**
@@ -3414,6 +3415,7 @@ export interface AgentResourceEvent {
     | 'dispatched'
     | 'rich_answer'
     | 'native_answer'
+    | 'host_answer'
     | 'upstream'
     | 'reconciliation'
   /**

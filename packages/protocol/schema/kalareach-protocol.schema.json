@@ -1160,6 +1160,11 @@
           "type": "string"
         },
         {
+          "const": "host_answer",
+          "description": "This host's own answer settled it: the upstream asked the host to perform the request, and\nthe host answered it after running or refusing the operation.",
+          "type": "string"
+        },
+        {
           "const": "upstream",
           "description": "The upstream answered or withdrew its own request.",
           "type": "string"
