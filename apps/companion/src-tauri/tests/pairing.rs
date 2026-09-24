@@ -19,6 +19,7 @@ use companion_tauri::device::Device;
 use companion_tauri::owner::Owner;
 use kr_client::pairing::BoxFuture;
 use kr_client::pairing::candidate::{AttemptState, CandidateRoom};
+use kr_client::pairing::clock::DeviceClock;
 use kr_client::pairing::failure::FailureKind;
 use kr_client::pairing::owner::{Ceremony, CeremonyKind, CeremonyOutcome, ReviewOutcome};
 use kr_client::pairing::room::{RoomError, RoomSocket};
@@ -30,7 +31,9 @@ use kr_protocol::invitation::{
     InviteEntry, InviteGrantKind, InviteMode, InviteModeKind, PairInviteParams, PairInviteResult,
 };
 use kr_protocol::method::Method;
-use kr_protocol::pairing::{Locator, ProposedGrant, QrPayload, RendezvousOrigin};
+use kr_protocol::pairing::{
+    CodeQrPayload, Locator, ProposedGrant, QrPayload, RendezvousOrigin, ShortCode,
+};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Nullable, to_base64url};
 use net_support::pairing::{self as calls, Signer};
@@ -377,7 +380,9 @@ impl CountingRoom {
 /// KR-REQ-10.32: this computer counts its tries with a code in its own data directory, under its
 /// own secret store. Five charged attempts leave the sixth refused without a room being opened,
 /// and a second instance over the same directory and store refuses it too. The same code through
-/// another service is another budget, and opens a room.
+/// another service is another budget, and opens a room. A code read from its invitation's text
+/// shares the budget of the same code typed, and after a restart into another boot a code tried
+/// once is spent rather than given a fresh window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn this_computer_counts_its_tries_in_its_own_budget() {
     const CODE: &str = "aB3x-Yz7-9Qw";
@@ -450,4 +455,67 @@ async fn this_computer_counts_its_tries_in_its_own_budget() {
         .map(|(origin, _)| origin.as_str().to_owned())
         .collect();
     assert_eq!(origins.len(), 2);
+    second.stop().await;
+
+    // Another code, typed once and then read from its invitation's text: one budget.
+    const ANOTHER: &str = "Zx9k-Ab3-Cd4";
+    let third = device(
+        data.path(),
+        Arc::clone(&secrets),
+        room.clone(),
+        &Arc::new(Capture::default()),
+    );
+    third
+        .set_origin("https://reach.kala.to")
+        .expect("the default service again");
+    third.start_code(ANOTHER).expect("started");
+    let AttemptState::Ended { failure } = reached(&third, |_| false).await else {
+        panic!("the attempt ends");
+    };
+    assert_eq!(failure.tries_left, Some(4));
+    third.stop().await;
+    let text = QrPayload::Code(CodeQrPayload {
+        rendezvous_origin: RendezvousOrigin::new("https://reach.kala.to").expect("an origin"),
+        code: ShortCode::new(ANOTHER).expect("a code"),
+    })
+    .to_text()
+    .expect("the invitation's text");
+    let invitation = third.read(&text).expect("an invitation");
+    let summary = third.hold(invitation);
+    assert_eq!(summary.origin_host.as_deref(), Some("reach.kala.to"));
+    third.start_held().expect("started");
+    let AttemptState::Ended { failure } = reached(&third, |_| false).await else {
+        panic!("the attempt ends");
+    };
+    assert_eq!(
+        failure.tries_left,
+        Some(3),
+        "the text's attempt was charged to the typed code's budget"
+    );
+    third.stop().await;
+    assert_eq!(room.opened(), 8);
+
+    // After a restart into another boot, the code tried in the last one is spent.
+    let another_boot = kr_protocol::identity::BootIdentity {
+        value: kr_protocol::scalars::Bytes::new(vec![0xab; 16]),
+        ..kr_ipc::identity::boot_identity().expect("this boot")
+    };
+    let rebooted = support::device_in_boot(
+        data.path(),
+        Arc::clone(&secrets),
+        room.clone(),
+        &Arc::new(Capture::default()),
+        DeviceClock::of(&another_boot),
+    );
+    assert_eq!(refuses(&rebooted).await, FailureKind::DeviceTriesUsed);
+    rebooted.start_code(ANOTHER).expect("started");
+    let AttemptState::Ended { failure } = reached(&rebooted, |_| false).await else {
+        panic!("the attempt ends");
+    };
+    assert_eq!(
+        failure.kind,
+        FailureKind::DeviceTriesUsed,
+        "a tombstone, not a fresh window"
+    );
+    assert_eq!(room.opened(), 8, "and no room was opened for either");
 }
