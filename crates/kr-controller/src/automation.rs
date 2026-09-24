@@ -104,9 +104,9 @@ impl Daemon {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let at = daemon.continuous_now();
         let start = *anchor.get_or_insert_with(|| {
-            let settled = daemon.settled_utc_now();
+            let settled = std::time::Duration::from_millis(daemon.settled_utc_now());
             Anchor {
-                ms: settled,
+                reading: settled,
                 at,
                 last: settled,
             }
@@ -119,59 +119,57 @@ impl Daemon {
 
 /// The share of the continuous time that passes which a wall clock falling behind automation's
 /// count may take back: one part in this many, a millisecond a second.
-const SLEW_PARTS: u64 = 1_000;
+const SLEW_PARTS: u32 = 1_000;
 
-/// Where automation's clock counts from.
+/// Where automation's clock counts from, to the nanosecond.
 #[derive(Clone, Copy, Debug)]
 struct Anchor {
-    /// The reading the count starts from.
-    ms: u64,
+    /// The reading the count starts from, as time since the Unix epoch.
+    reading: std::time::Duration,
     /// The continuous instant that reading was taken at.
     at: kr_transport::clock::ContinuousInstant,
     /// The last reading given, which no later one is below.
-    last: u64,
+    last: std::time::Duration,
 }
 
-/// Automation's reading of UTC from the wall clock `wall`, read at the continuous instant `at`,
-/// and the anchor to keep.
+/// Automation's reading of UTC, in milliseconds, from the wall clock `wall_ms`, read at the
+/// continuous instant `at`, and the anchor to keep.
 ///
 /// The count is the suspend-aware continuous time since the anchor. The wall clock is the reading
 /// whenever it is no further behind the count than a thousandth of that time: a wall clock on
 /// time, set forward, or drifting as clocks do is followed, and the count starts again from it.
-/// One further behind, which is a wall clock set back, is not followed down: the reading goes on
-/// at the slowest rate allowed, closing on the wall clock by a millisecond a second. So every
-/// stretch of continuous time moves the reading on by all but a thousandth of it, whatever the
-/// wall clock does; the reading never goes backwards; and the anchor moves only to a reading the
-/// wall clock gave, so no rounding of the count adds up.
+/// One further behind, which is a wall clock set back or stopped, is not followed down: the reading
+/// goes on at the slowest rate allowed, closing on the wall clock by a millisecond a second. The
+/// count is kept to the nanosecond, so no reading, however often it is taken, rounds any of the
+/// time away: every stretch of continuous time moves the reading on by all but a thousandth of it,
+/// whatever the wall clock does, and the reading never goes backwards.
 fn reading_at(
     anchor: Anchor,
-    wall: u64,
+    wall_ms: u64,
     at: kr_transport::clock::ContinuousInstant,
 ) -> (u64, Anchor) {
-    let elapsed =
-        u64::try_from(at.saturating_duration_since(anchor.at).as_millis()).unwrap_or(u64::MAX);
+    let elapsed = at.saturating_duration_since(anchor.at);
     let slowest = anchor
-        .ms
+        .reading
         .saturating_add(elapsed)
         .saturating_sub(elapsed / SLEW_PARTS);
-    if wall >= slowest {
+    let wall = std::time::Duration::from_millis(wall_ms);
+    let kept = if wall >= slowest {
         let now = wall.max(anchor.last);
-        return (
-            now,
-            Anchor {
-                ms: now,
-                at,
-                last: now,
-            },
-        );
-    }
-    let now = slowest.max(anchor.last);
-    (
-        now,
         Anchor {
+            reading: now,
+            at,
             last: now,
+        }
+    } else {
+        Anchor {
+            last: slowest.max(anchor.last),
             ..anchor
-        },
+        }
+    };
+    (
+        u64::try_from(kept.last.as_millis()).unwrap_or(u64::MAX),
+        kept,
     )
 }
 
@@ -1285,7 +1283,49 @@ mod tests {
 
     /// A starting anchor for the clock tests, at `ms` and the manual clock's `at`.
     fn anchored(ms: u64, at: kr_transport::clock::ContinuousInstant) -> Anchor {
-        Anchor { ms, at, last: ms }
+        let reading = std::time::Duration::from_millis(ms);
+        Anchor {
+            reading,
+            at,
+            last: reading,
+        }
+    }
+
+    /// Readings taken more often than the wall clock moves, or between whole milliseconds, round
+    /// none of the continuous time away: a stopped wall clock read every half millisecond does not
+    /// hold automation time still, and reads 250.5 ms apart against a wall clock that moves 250 ms
+    /// lose no more than a thousandth.
+    #[test]
+    fn frequent_or_fractional_readings_lose_no_time() {
+        use kr_transport::clock::ContinuousClock;
+        let continuous = kr_transport::clock::ManualClock::new();
+        let mut anchor = anchored(10_000, continuous.now());
+        for _ in 0..10_000 {
+            continuous.advance(std::time::Duration::from_micros(500));
+            anchor = reading_at(anchor, 10_000, continuous.now()).1;
+        }
+        let (stopped, _) = reading_at(anchor, 10_000, continuous.now());
+        assert!(
+            stopped >= 10_000 + 4_995,
+            "five seconds against a stopped wall clock moved the reading by {}",
+            stopped - 10_000
+        );
+
+        let mut anchor = anchored(10_000, continuous.now());
+        let mut wall = 10_000;
+        let mut now = 0;
+        for _ in 0..2_000 {
+            continuous.advance(std::time::Duration::from_micros(250_500));
+            wall += 250;
+            let (read, kept) = reading_at(anchor, wall, continuous.now());
+            anchor = kept;
+            now = read;
+        }
+        assert!(
+            now >= 10_000 + 501_000 - 501,
+            "501 seconds moved the reading by {}",
+            now - 10_000
+        );
     }
 
     /// Automation's clock follows a wall clock that keeps pace, drift and a suspension included,
@@ -1357,6 +1397,7 @@ mod tests {
             (seed >> 33) % bound
         };
         let mut last = anchor.last;
+        let mut last_ms = 1_000_000;
         for _ in 0..20_000 {
             let advance = 1 + next(5_000);
             wall = match next(100) {
@@ -1365,16 +1406,18 @@ mod tests {
                 2 => wall.saturating_sub(next(2_000)),
                 _ => wall + advance - next(3).min(advance),
             };
-            continuous.advance(std::time::Duration::from_millis(advance));
-            let (now, kept) = reading_at(anchor, wall, continuous.now());
+            let step = std::time::Duration::from_micros(advance * 1_000 + next(1_000));
+            continuous.advance(step);
+            let (now_ms, kept) = reading_at(anchor, wall, continuous.now());
             anchor = kept;
-            assert!(now >= last, "never backwards");
+            assert!(now_ms >= last_ms, "never backwards");
+            let moved = kept.last.checked_sub(last).expect("never backwards");
             assert!(
-                now - last + 1 >= advance - advance / SLEW_PARTS,
-                "{advance} ms of continuous time moved the reading on by {}",
-                now - last
+                moved + std::time::Duration::from_nanos(1) >= step - step / SLEW_PARTS,
+                "{step:?} of continuous time moved the reading on by {moved:?}"
             );
-            last = now;
+            last = kept.last;
+            last_ms = now_ms;
         }
     }
 
