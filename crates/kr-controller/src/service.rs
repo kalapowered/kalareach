@@ -382,6 +382,14 @@ pub struct Controller {
     /// the policy's lock is held, and every later decision on the floor, and the network's record
     /// task, writes the floor again until a write lands.
     floor_owed: std::sync::atomic::AtomicBool,
+    /// Moves whenever something a paired device's authority is decided from changes: this host's
+    /// policy, or the rights ceiling in force.
+    ///
+    /// A batch a subscription carries is written under the decision that allowed it, and that
+    /// decision names the epoch it was taken at. The write boundary reads this at every attempt to
+    /// hand bytes over, so a change that lands while a batch waits for the writer or for the peer
+    /// stops it there: the batch is decided again, or, once bytes are moving, the connection ends.
+    authority_epoch: std::sync::atomic::AtomicU64,
     /// This host's half of the remote authority feed: the revisions only it issues, the revocation
     /// records it retains, and the synchronisation it owes before it serves remote work again.
     feed: std::sync::Mutex<crate::grants::AuthorityFeed>,
@@ -755,6 +763,7 @@ impl Controller {
             devices,
             policy,
             floor_owed: std::sync::atomic::AtomicBool::new(false),
+            authority_epoch: std::sync::atomic::AtomicU64::new(0),
             feed: std::sync::Mutex::new(feed),
             changesets,
             automation,
@@ -1813,6 +1822,9 @@ impl Controller {
         let value = change(&mut candidate);
         self.sharing.grants().store_policy(&candidate.snapshot())?;
         *held = candidate;
+        // Published with the policy, under its lock, so a decision that reads this epoch reads the
+        // policy it names or a later one.
+        self.advance_authority_epoch();
         Ok(value)
     }
 
@@ -1871,6 +1883,18 @@ impl Controller {
                 "kr-controller: could not record the clock floor this host decided from: {error}"
             ),
         }
+    }
+
+    /// The epoch a paired device's authority is decided at now.
+    pub(crate) fn authority_epoch(&self) -> u64 {
+        self.authority_epoch
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Moves the epoch, after a change to something a paired device's authority is decided from.
+    pub(crate) fn advance_authority_epoch(&self) {
+        self.authority_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Writes down a clock floor still owed its record, for a caller holding no decision of its
@@ -5728,6 +5752,9 @@ impl Controller {
                 let configured = crate::config::ceilings::configured_rights(&document.ceilings);
                 moved = *held != configured;
                 *held = configured;
+                if moved {
+                    self.advance_authority_epoch();
+                }
             }
             (
                 crate::config::EnforcedRights {

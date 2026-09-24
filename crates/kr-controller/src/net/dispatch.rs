@@ -30,6 +30,14 @@
 //! had already begun decided its bytes while the registration stood, and the closed connection is
 //! what stops it reaching a peer; the withdrawal itself never waits for a peer.
 //!
+//! A batch a subscription carries is a read that goes on, so it is also written under the decision
+//! that allowed it: the grant, this host's policy and the configured ceiling, taken for that batch.
+//! The boundary holds the batch to that decision after every wait and at every attempt to hand
+//! bytes over, through an epoch that any change to the policy or the ceiling moves and the moment
+//! the decision's own time bound runs out; the watch takes the whole decision again while the write
+//! waits. A decision that stops holding before the first byte goes has the batch decided again,
+//! and one that stops holding once bytes are moving ends the connection.
+//!
 //! # What outlives the connection
 //!
 //! A mutation's effect runs on its own task, so a durable commit is never left half done because a
@@ -100,6 +108,13 @@ pub const EFFECT_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
 /// away. Nothing polls while nothing is waiting.
 pub const AUTHORITY_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// How many times one relayed batch is decided before the relay gives up on it.
+///
+/// A decision stops holding before the batch's first byte goes when this host's policy or rights
+/// ceiling changed while the batch waited, and the batch is then decided again. A change that
+/// lands on every attempt is not one a batch waits out.
+pub const RELAY_DECISIONS: usize = 3;
+
 /// One connection's write boundary, and the latch a withdrawal sets.
 ///
 /// Deciding what to send and sending it are one step, and a withdrawal is the other side of the
@@ -118,8 +133,8 @@ pub struct RemoteOutput {
     /// dropped with the connection.
     delivery:
         std::sync::Mutex<std::collections::BTreeMap<RequestId, tokio::sync::oneshot::Sender<()>>>,
-    sender: ControlSender,
-    connection: iroh::endpoint::Connection,
+    /// Where the frames go: the connection's control stream.
+    sink: Box<dyn FrameSink>,
     /// The authority this connection writes under, read inside the turn.
     ///
     /// The latch above is what a *device* revocation sets. An authority revision the daemon
@@ -127,6 +142,91 @@ pub struct RemoteOutput {
     /// the registration itself is read here as well: either way, no frame begins on a connection
     /// whose authority has gone.
     authority: Arc<Authorisation>,
+}
+
+/// Where one connection's frames go.
+///
+/// The control stream, for every connection this host serves. It is a seam so the write boundary
+/// can be exercised against a writer that is held and a peer that stops reading, which a real
+/// stream does not let a test arrange on demand.
+trait FrameSink: Send + Sync + std::fmt::Debug {
+    /// Sends one frame for as long as `admits` holds, as [`ControlSender::send_while`] does.
+    fn send_while<'a>(
+        &'a self,
+        frame: &'a ControlFrame,
+        admits: &'a (dyn Fn() -> bool + Send + Sync),
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = kr_transport::Result<bool>> + Send + 'a>>;
+
+    /// Ends the connection, which is what stops a write that is still waiting on it.
+    fn close(&self);
+}
+
+/// A connection's control stream, and the connection it closes.
+#[derive(Debug)]
+struct ControlStream {
+    sender: ControlSender,
+    connection: iroh::endpoint::Connection,
+}
+
+impl FrameSink for ControlStream {
+    fn send_while<'a>(
+        &'a self,
+        frame: &'a ControlFrame,
+        admits: &'a (dyn Fn() -> bool + Send + Sync),
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = kr_transport::Result<bool>> + Send + 'a>>
+    {
+        Box::pin(self.sender.send_while(frame, admits))
+    }
+
+    fn close(&self) {
+        self.connection.close(
+            WITHDRAWN.into(),
+            b"this connection's authority was withdrawn",
+        );
+    }
+}
+
+/// The decision a batch a subscription carries is written under, for as long as it holds.
+///
+/// Both halves are read in the poll that hands bytes to the stream, so each is an atomic or a clock
+/// reading: the authority epoch the decision was taken at, which any change to this host's policy
+/// or rights ceiling moves, and the moment its own time bound runs out on the continuous clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RelayGrant {
+    epoch: u64,
+    until: Option<kr_transport::clock::ContinuousInstant>,
+}
+
+impl RelayGrant {
+    /// Returns whether the decision still holds at this instant.
+    fn holds(&self, controller: &Controller) -> bool {
+        controller.authority_epoch() == self.epoch
+            && self
+                .until
+                .is_none_or(|until| controller.clock.now() < until)
+    }
+}
+
+/// What a relayed batch is written under.
+#[derive(Clone, Copy)]
+struct Relaying<'a> {
+    /// The decision that allowed it.
+    grant: RelayGrant,
+    /// Takes the whole decision again. The watch calls it while the write waits, because a clock
+    /// stepped forward ends a decision without moving the epoch or the continuous clock.
+    redecide: &'a (dyn Fn() -> bool + Send + Sync),
+}
+
+/// How one write ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Written {
+    /// The frame reached the stream whole.
+    Sent,
+    /// The decision the batch was written under stopped holding before any of it went. Nothing is
+    /// in pieces, so the batch can be decided again.
+    Undecided,
+    /// Nothing more goes on this connection.
+    Withdrawn,
 }
 
 /// Records a grant's expiry for work that outlives the connection which admitted it.
@@ -249,12 +349,21 @@ impl Authorisation {
 
 impl RemoteOutput {
     fn new(session: &AuthorisedSession, authority: Arc<Authorisation>) -> Self {
+        Self::writing_to(
+            Box::new(ControlStream {
+                sender: session.control.sender(),
+                connection: session.connection.clone(),
+            }),
+            authority,
+        )
+    }
+
+    fn writing_to(sink: Box<dyn FrameSink>, authority: Arc<Authorisation>) -> Self {
         Self {
             turn: tokio::sync::Mutex::new(()),
             withdrawn: AtomicBool::new(false),
             delivery: std::sync::Mutex::new(std::collections::BTreeMap::new()),
-            sender: session.control.sender(),
-            connection: session.connection.clone(),
+            sink,
             authority,
         }
     }
@@ -275,38 +384,78 @@ impl RemoteOutput {
     ///   the watch below. A revocation that withdraws one closes the connection itself, which is
     ///   what stops a frame that is already waiting.
     pub async fn send(&self, frame: &ControlFrame) -> bool {
+        self.write(frame, None).await == Written::Sent
+    }
+
+    /// Writes one frame, and, for a batch a subscription carries, the decision that allowed it.
+    ///
+    /// A response answers a request that was decided when it arrived, so it is written under the
+    /// connection's own authority alone. A relayed batch is written under its decision as well, at
+    /// every point [`Self::send`] reads the connection's: after the turn, after the writer, at
+    /// every attempt to hand bytes over, and in the watch while the write waits, which also takes
+    /// the whole decision again. A decision that stops holding before the first byte goes leaves
+    /// nothing in pieces, so the batch is decided again; once bytes are moving the connection ends
+    /// with it.
+    async fn write(&self, frame: &ControlFrame, relaying: Option<Relaying<'_>>) -> Written {
         let _turn = self.turn.lock().await;
         if self.has_withdrawn() {
-            return false;
+            return Written::Withdrawn;
         }
         if !self.fence() {
             // Outside the poll, where a durable write belongs: the fence itself only reads the
             // clock, and an expiry it observed has to be written down by something that can.
             self.authority.note_expiry();
             self.withdraw();
-            return false;
+            return Written::Withdrawn;
         }
-        let fence = || self.fence();
+        let decided = || {
+            relaying
+                .as_ref()
+                .is_none_or(|relaying| relaying.grant.holds(&self.authority.controller))
+        };
+        if !decided() {
+            return Written::Undecided;
+        }
+        // Set the first time a byte may have gone. Until then the stream is whole whatever
+        // happens to this frame.
+        let begun = AtomicBool::new(false);
+        let admits = || {
+            let admitted = self.fence() && decided();
+            if admitted {
+                begun.store(true, Ordering::Release);
+            }
+            admitted
+        };
+        let redecide = relaying.map(|relaying| relaying.redecide);
         let written = tokio::select! {
-            written = self.sender.send_while(frame, &fence) => written,
-            () = self.authority_lost() => {
+            written = self.sink.send_while(frame, &admits) => written,
+            () = self.authority_lost(&decided, redecide) => {
+                if !begun.load(Ordering::Acquire)
+                    && !self.has_withdrawn()
+                    && self.authority.stands().await
+                {
+                    return Written::Undecided;
+                }
                 self.withdraw();
-                return false;
+                return Written::Withdrawn;
             }
         };
         match written {
             Ok(true) => {
                 self.delivered(frame);
-                true
+                Written::Sent
             }
+            // Refused before the first byte, and not by the connection's own authority: only the
+            // decision moved, and the stream is whole.
+            Ok(false) if !begun.load(Ordering::Acquire) && self.fence() => Written::Undecided,
             // Refused at the boundary: the authority this connection writes under has gone, so the
             // connection goes with it rather than waiting to be asked for something else.
             Ok(false) => {
                 self.authority.note_expiry();
                 self.withdraw();
-                false
+                Written::Withdrawn
             }
-            Err(_) => false,
+            Err(_) => Written::Withdrawn,
         }
     }
 
@@ -356,16 +505,26 @@ impl RemoteOutput {
         !self.has_withdrawn() && self.authority.has_time_left()
     }
 
-    /// Resolves once this connection stops being one this host may write to.
+    /// Resolves once this connection stops being one this host may write to, or the decision a
+    /// relayed write is under stops holding.
     ///
     /// It polls, because the daemon's own revocation path withdraws a registration without
     /// knowing which network connections hold it, and a grant runs out on a clock rather than on
     /// an event. The interval only matters while a write is waiting, which is the only time
-    /// anything is watching.
-    async fn authority_lost(&self) {
+    /// anything is watching. A relayed write's decision is taken again here too, outside the poll
+    /// where a durable write belongs.
+    async fn authority_lost(
+        &self,
+        decided: &(dyn Fn() -> bool + Send + Sync),
+        redecide: Option<&(dyn Fn() -> bool + Send + Sync)>,
+    ) {
         loop {
             tokio::time::sleep(AUTHORITY_POLL).await;
-            if self.has_withdrawn() || !self.authority.stands().await {
+            if self.has_withdrawn()
+                || !self.authority.stands().await
+                || !decided()
+                || redecide.is_some_and(|redecide| !redecide())
+            {
                 return;
             }
         }
@@ -379,10 +538,7 @@ impl RemoteOutput {
     /// stops it reaching a peer that is no longer authorised to receive it.
     pub fn withdraw(&self) {
         self.withdrawn.store(true, Ordering::Release);
-        self.connection.close(
-            WITHDRAWN.into(),
-            b"this connection's authority was withdrawn",
-        );
+        self.sink.close();
     }
 
     fn has_withdrawn(&self) -> bool {
@@ -785,7 +941,7 @@ impl RemoteConnection {
             entry,
             claims_geometry(mutation),
         ) {
-            Ok(rights) => rights,
+            Ok(decided) => decided.permitted.rights,
             Err(error) => return failure(mutation.request_id, error),
         };
         // Every store that retains an action is asked in turn, in the order the local ingress asks
@@ -2142,17 +2298,19 @@ impl RemoteConnection {
         self.authorised().await.is_ok()
     }
 
-    /// Decides again whether this connection may be written what its subscription carries.
+    /// Writes one batch this connection's subscription carries, and returns whether it went.
     ///
     /// What a subscription carries is a read that goes on after it was answered, and a continued
-    /// read still needs valid authority. So every batch the relay writes is decided through the
-    /// same intersection a request is, as a subscription to the session this connection is
-    /// attached to: its grant, this host's policy and the configured ceiling as they stand at that
-    /// moment. A grant this finds expired is latched and written down, as a request's is. Any
-    /// other refusal ends the connection and leaves the grant alone, because nothing about the
-    /// grant has ended: a lapsed offline bound, for one, holds again once the authority feed
-    /// synchronises, and the device is told why by the next request it makes.
-    pub async fn may_relay(&self) -> bool {
+    /// read still needs valid authority. So each batch is decided through the same intersection a
+    /// request is, as a subscription to the session this connection is attached to: its grant,
+    /// this host's policy and the configured ceiling as they stand at that moment. The batch is
+    /// then written under that decision, which the write boundary holds it to until the last byte
+    /// goes. A grant the decision finds expired is latched and written down, as a request's is.
+    /// Any other refusal leaves the grant alone, because nothing about the grant has ended: a
+    /// lapsed offline bound, for one, holds again once the authority feed synchronises, and the
+    /// device is told why by the next request it makes. Either way the batch is not written, and
+    /// the relay ends the connection.
+    pub async fn relay(&self, frame: &ControlFrame) -> bool {
         let attached = self
             .proxy
             .lock()
@@ -2163,8 +2321,43 @@ impl RemoteConnection {
         let Some(session_id) = attached else {
             return false;
         };
-        self.check_grant(Some(session_id), Method::EventsSubscribe.entry(), false)
-            .is_ok()
+        let redecide = || self.relay_grant(session_id).is_some();
+        // A decision that stopped holding before the first byte went is taken again. A change that
+        // lands on every attempt is not one this batch waits out.
+        for _ in 0..RELAY_DECISIONS {
+            let Some(grant) = self.relay_grant(session_id) else {
+                return false;
+            };
+            let relaying = Relaying {
+                grant,
+                redecide: &redecide,
+            };
+            match self.output.write(frame, Some(relaying)).await {
+                Written::Sent => return true,
+                Written::Undecided => {}
+                Written::Withdrawn => return false,
+            }
+        }
+        false
+    }
+
+    /// Decides whether this connection may be written what its subscription carries now, and
+    /// returns the decision for the write boundary to hold the batch to.
+    fn relay_grant(&self, session_id: SessionId) -> Option<RelayGrant> {
+        // Both read before the decision. A change that lands while it is taken is then one the
+        // write sees, and the continuous clock is sampled before the moment it is measured from,
+        // so the bound it gives can only be shorter.
+        let epoch = self.controller.authority_epoch();
+        let anchor = self.controller.clock.now();
+        let decided = self
+            .check_grant(Some(session_id), Method::EventsSubscribe.entry(), false)
+            .ok()?;
+        let until = decided.lapses_at_ms.and_then(|lapses_at_ms| {
+            anchor.checked_add(std::time::Duration::from_millis(
+                lapses_at_ms.saturating_sub(decided.decided_at_ms),
+            ))
+        });
+        Some(RelayGrant { epoch, until })
     }
 
     /// Refuses a request on a connection whose registration has been withdrawn.
@@ -2343,7 +2536,7 @@ impl RemoteConnection {
         session_id: Option<SessionId>,
         entry: &'static MethodEntry,
         claims_geometry: bool,
-    ) -> std::result::Result<CanonicalSet<ActionRight>, ProtocolError> {
+    ) -> std::result::Result<crate::config::ceilings::Decided, ProtocolError> {
         if !self.grant_is_current() {
             return Err(ProtocolError::new(
                 ErrorCode::PermissionDenied,
@@ -2394,7 +2587,7 @@ impl RemoteConnection {
                 other => other.to_protocol_error(),
             })?;
         self.check_history(entry)?;
-        Ok(decided.permitted.rights)
+        Ok(decided)
     }
 
     /// The grant this device's requests are decided against: the one its pairing committed, with
@@ -2763,5 +2956,351 @@ mod tests {
             )),
             "and an ordinary observing attachment claims nothing"
         );
+    }
+}
+
+#[cfg(test)]
+mod write_boundary {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use kr_protocol::envelope::{ControlEvent, ControlFrame};
+    use kr_protocol::ids::{ActorId, ConnectionId, DeviceId};
+    use kr_protocol::scalars::{DurationMs, Nullable};
+    use kr_transport::clock::ContinuousClock as _;
+
+    use super::{Authorisation, FrameSink, RelayGrant, Relaying, RemoteOutput, Written};
+    use crate::service::Controller;
+
+    /// How far one frame got at the peer.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Reached {
+        /// The first part of the frame, and then the peer stopped making room.
+        Part,
+        /// All of it.
+        Whole,
+    }
+
+    /// A control stream whose writer, and whose peer, a test holds.
+    ///
+    /// It keeps the contract a real one keeps: the writer is taken first, and `admits` is read
+    /// after it has been taken and before every attempt to hand bytes over.
+    #[derive(Debug)]
+    struct HeldStream {
+        /// The writer. A write takes a permit, and there are none until the test gives one.
+        writer: tokio::sync::Semaphore,
+        /// Room at the peer for the rest of a frame, when the peer stops reading part way.
+        room: Option<tokio::sync::Semaphore>,
+        /// One permit each time a write starts to wait: for the writer, or for the peer.
+        waits: tokio::sync::Semaphore,
+        reached: std::sync::Mutex<Vec<Reached>>,
+        closed: AtomicBool,
+    }
+
+    impl HeldStream {
+        fn new(peer_stops_reading: bool) -> Arc<Self> {
+            Arc::new(Self {
+                writer: tokio::sync::Semaphore::new(0),
+                room: peer_stops_reading.then(|| tokio::sync::Semaphore::new(0)),
+                waits: tokio::sync::Semaphore::new(0),
+                reached: std::sync::Mutex::new(Vec::new()),
+                closed: AtomicBool::new(false),
+            })
+        }
+
+        /// Returns once writes have started to wait `times` times.
+        async fn waited(&self, times: u32) {
+            self.waits
+                .acquire_many(times)
+                .await
+                .expect("the count stays open")
+                .forget();
+        }
+
+        fn reached(&self) -> Vec<Reached> {
+            self.reached
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn closed(&self) -> bool {
+            self.closed.load(Ordering::Acquire)
+        }
+    }
+
+    impl FrameSink for Arc<HeldStream> {
+        fn send_while<'a>(
+            &'a self,
+            _frame: &'a ControlFrame,
+            admits: &'a (dyn Fn() -> bool + Send + Sync),
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = kr_transport::Result<bool>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                self.waits.add_permits(1);
+                let _writer = self.writer.acquire().await.expect("the writer stays open");
+                if !admits() {
+                    return Ok(false);
+                }
+                if let Some(room) = &self.room {
+                    self.reached
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(Reached::Part);
+                    self.waits.add_permits(1);
+                    let _room = room.acquire().await.expect("the peer stays open");
+                }
+                if !admits() {
+                    return Ok(false);
+                }
+                self.reached
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(Reached::Whole);
+                Ok(true)
+            })
+        }
+
+        fn close(&self) {
+            self.closed.store(true, Ordering::Release);
+        }
+    }
+
+    /// A registered connection's write boundary, writing to `stream`.
+    fn output(controller: &Arc<Controller>, stream: &Arc<HeldStream>) -> RemoteOutput {
+        let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+        controller.admitted_table().insert(
+            connection_id,
+            crate::service::AdmittedConnection {
+                actor_id: ActorId::new("device:test").expect("a principal"),
+                admitted_revision: controller.policy().authority_revision(),
+            },
+        );
+        RemoteOutput::writing_to(
+            Box::new(Arc::clone(stream)),
+            Arc::new(Authorisation {
+                controller: Arc::clone(controller),
+                devices: Arc::clone(controller.devices()),
+                pending: Arc::new(crate::service::net::devices::PendingExpiry::default()),
+                clock: Arc::new(crate::service::net::devices::ClockTrust::default()),
+                device_id: DeviceId::new(kr_ipc::new_uuid()),
+                connection_id,
+                grant_deadline: None,
+                expired: AtomicBool::new(false),
+                recorded: AtomicBool::new(false),
+            }),
+        )
+    }
+
+    /// The decision a batch was written under, taken now and bounded by nothing but events.
+    fn decided_now(controller: &Controller) -> RelayGrant {
+        RelayGrant {
+            epoch: controller.authority_epoch(),
+            until: None,
+        }
+    }
+
+    fn batch() -> ControlFrame {
+        ControlFrame::Event(ControlEvent::Keepalive)
+    }
+
+    /// The owner chooses a bounded offline policy with no synchronisation to measure from, so a
+    /// paired device's remote access is outside its bound at once.
+    fn lapse_the_offline_bound(controller: &Controller) {
+        controller
+            .update_policy(|policy| {
+                policy.set_offline_validity(Some(kr_protocol::sharing::OfflineValidityPolicy {
+                    maximum_offline_ms: DurationMs::new(60_000),
+                    last_synchronised_at_ms: Nullable::null(),
+                }));
+            })
+            .expect("the owner's choice is recorded");
+    }
+
+    /// Asserts that the grant the connection writes under was left as it was.
+    fn grant_left_alone(output: &RemoteOutput) {
+        assert!(
+            output.authority.has_time_left(),
+            "a lapsed bound is not an expiry of the grant"
+        );
+        assert_eq!(
+            output.authority.pending.owed(),
+            0,
+            "and no expiry is written"
+        );
+    }
+
+    /// A batch decided while the bound held, and then held at the writer while it lapsed, does not
+    /// reach the peer when the writer comes free. Nothing of it went, so the stream is whole and
+    /// the batch is decided again rather than the connection ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_batch_held_at_the_writer_is_not_written_once_the_policy_moves() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::super::tests::daemon(&temp).await;
+        let stream = HeldStream::new(false);
+        let output = output(&controller, &stream);
+        let frame = batch();
+
+        stream.writer.add_permits(1);
+        let redecide = || true;
+        let relaying = Relaying {
+            grant: decided_now(&controller),
+            redecide: &redecide,
+        };
+        assert_eq!(
+            output.write(&batch(), Some(relaying)).await,
+            Written::Sent,
+            "with nothing moving, the batch goes"
+        );
+        // The writer is held again from here, and the wait that write made is counted.
+        stream
+            .writer
+            .try_acquire()
+            .expect("the writer came back")
+            .forget();
+        stream.waited(1).await;
+
+        let relaying = Relaying {
+            grant: decided_now(&controller),
+            redecide: &redecide,
+        };
+        let (written, ()) = tokio::join!(output.write(&frame, Some(relaying)), async {
+            stream.waited(1).await;
+            lapse_the_offline_bound(&controller);
+            stream.writer.add_permits(1);
+        });
+        assert_eq!(written, Written::Undecided);
+        assert_eq!(
+            stream.reached(),
+            vec![Reached::Whole],
+            "only the first batch went"
+        );
+        assert!(
+            !stream.closed(),
+            "the stream is whole, so the connection stands"
+        );
+        grant_left_alone(&output);
+        drop(controller);
+    }
+
+    /// The same, with the writer never coming free: the watch finds the decision gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_batch_that_waits_for_the_writer_is_decided_again_by_the_watch() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::super::tests::daemon(&temp).await;
+        let stream = HeldStream::new(false);
+        let output = output(&controller, &stream);
+        let frame = batch();
+
+        let redecide = || true;
+        let relaying = Relaying {
+            grant: decided_now(&controller),
+            redecide: &redecide,
+        };
+        let (written, ()) = tokio::join!(output.write(&frame, Some(relaying)), async {
+            stream.waited(1).await;
+            lapse_the_offline_bound(&controller);
+        });
+        assert_eq!(written, Written::Undecided);
+        assert!(stream.reached().is_empty(), "nothing reached the peer");
+        assert!(!stream.closed());
+        grant_left_alone(&output);
+        drop(controller);
+    }
+
+    /// A batch part way to a peer that stopped reading is abandoned when the policy moves, and the
+    /// connection is closed, which is what stops the rest of it: a frame left in pieces ends the
+    /// stream. Whether the peer makes room again or never does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_batch_waiting_for_the_peer_is_abandoned_once_the_policy_moves() {
+        for peer_makes_room in [true, false] {
+            let temp = kr_ipc::testing::TempHost::create();
+            let controller = super::super::tests::daemon(&temp).await;
+            let stream = HeldStream::new(true);
+            let output = output(&controller, &stream);
+            let frame = batch();
+            stream.writer.add_permits(1);
+
+            let redecide = || true;
+            let relaying = Relaying {
+                grant: decided_now(&controller),
+                redecide: &redecide,
+            };
+            let (written, ()) = tokio::join!(output.write(&frame, Some(relaying)), async {
+                // Once for the writer, and once for the peer.
+                stream.waited(2).await;
+                lapse_the_offline_bound(&controller);
+                if peer_makes_room {
+                    stream.room.as_ref().expect("a slow peer").add_permits(1);
+                }
+            });
+            assert_eq!(
+                written,
+                Written::Withdrawn,
+                "peer makes room: {peer_makes_room}"
+            );
+            assert_eq!(stream.reached(), vec![Reached::Part], "the rest never went");
+            assert!(stream.closed(), "the connection is closed");
+            grant_left_alone(&output);
+            drop(controller);
+        }
+    }
+
+    /// A decision bounded in time stops holding when its bound passes while the batch waits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_batch_held_past_its_decisions_bound_is_not_written() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::super::tests::daemon(&temp).await;
+        let stream = HeldStream::new(false);
+        let output = output(&controller, &stream);
+        let frame = batch();
+
+        let redecide = || true;
+        let relaying = Relaying {
+            grant: RelayGrant {
+                epoch: controller.authority_epoch(),
+                until: controller
+                    .clock
+                    .now()
+                    .checked_add(Duration::from_millis(30)),
+            },
+            redecide: &redecide,
+        };
+        let (written, ()) = tokio::join!(output.write(&frame, Some(relaying)), async {
+            stream.waited(1).await;
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            stream.writer.add_permits(1);
+        });
+        assert_eq!(written, Written::Undecided);
+        assert!(stream.reached().is_empty());
+        assert!(!stream.closed());
+        drop(controller);
+    }
+
+    /// A decision the watch takes again and finds refused stops a waiting batch, although nothing
+    /// the poll reads has moved: a clock stepped forward ends a decision that way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_batch_the_decision_no_longer_allows_is_not_written() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::super::tests::daemon(&temp).await;
+        let stream = HeldStream::new(false);
+        let output = output(&controller, &stream);
+        let frame = batch();
+
+        let allowed = AtomicBool::new(true);
+        let redecide = || allowed.load(Ordering::Acquire);
+        let relaying = Relaying {
+            grant: decided_now(&controller),
+            redecide: &redecide,
+        };
+        let (written, ()) = tokio::join!(output.write(&frame, Some(relaying)), async {
+            stream.waited(1).await;
+            allowed.store(false, Ordering::Release);
+        });
+        assert_eq!(written, Written::Undecided);
+        assert!(stream.reached().is_empty());
+        drop(controller);
     }
 }

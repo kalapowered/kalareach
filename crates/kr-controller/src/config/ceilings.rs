@@ -194,10 +194,14 @@ pub fn decide_with_ceiling(
     request: AccessRequest,
 ) -> Result<Decided, CeilingRefusal> {
     let Some(ceiling) = ceiling else {
+        let permitted =
+            decide(grant, record, policy, request.clone()).map_err(CeilingRefusal::Refused)?;
         return Ok(Decided {
-            permitted: decide(grant, record, policy, request).map_err(CeilingRefusal::Refused)?,
+            permitted,
             removed: CanonicalSet::new(),
             refused_rights: CanonicalSet::new(),
+            decided_at_ms: policy.settled_now(request.now_ms),
+            lapses_at_ms: lapses_at_ms(grant, policy, &request),
         });
     };
     // The ceiling is applied to the grant *before* the decision, never to its result. A method
@@ -248,7 +252,38 @@ pub fn decide_with_ceiling(
         permitted,
         removed,
         refused_rights,
+        decided_at_ms: now_ms,
+        lapses_at_ms: lapses_at_ms(grant, policy, &request),
     })
+}
+
+/// The first UTC moment a permitted request stops being permitted by the passage of time alone.
+///
+/// Two bounds can end a paired device's authority on a clock: the grant's own expiry, and, for a
+/// caller that is not at this machine under a personal grant, the bounded offline validity an
+/// owner chose, which holds up to the last moment inside it. A membership lease is not among them,
+/// because a request that carries no account is never admitted under one. Everything else that
+/// ends a decision is an event, and moves [`crate::service::Controller`]'s authority epoch.
+fn lapses_at_ms(grant: &Grant, policy: &HostPolicy, request: &AccessRequest) -> Option<u64> {
+    let expiry = match grant.expiry {
+        kr_protocol::grant::GrantExpiry::Never => None,
+        kr_protocol::grant::GrantExpiry::At { expires_at_ms } => Some(expires_at_ms.get()),
+    };
+    let offline = (request.ingress != kr_protocol::actor::ActorIngress::LocalIpc
+        && grant.organisation.as_ref().is_none())
+    .then(|| policy.offline_validity())
+    .flatten()
+    .and_then(|offline| {
+        offline.last_synchronised_at_ms.as_ref().map(|last| {
+            last.get()
+                .saturating_add(offline.maximum_offline_ms.get())
+                .saturating_add(1)
+        })
+    });
+    match (expiry, offline) {
+        (Some(expiry), Some(offline)) => Some(expiry.min(offline)),
+        (expiry, offline) => expiry.or(offline),
+    }
 }
 
 /// Why a request was refused once every intersection had been applied.
@@ -311,6 +346,12 @@ pub struct Decided {
     pub removed: CanonicalSet<ActionRight>,
     /// The rights the configuration's ceiling named that the grant and the policy did not carry.
     pub refused_rights: CanonicalSet<ActionRight>,
+    /// The UTC reading the decision was taken at: the later of the request's reading and this
+    /// host's floor.
+    pub decided_at_ms: u64,
+    /// The first UTC moment this decision stops holding by the passage of time alone, when
+    /// anything bounds it that way.
+    pub lapses_at_ms: Option<u64>,
 }
 
 /// Renders one ceiling for the effective-value report.

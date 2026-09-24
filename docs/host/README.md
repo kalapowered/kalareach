@@ -1662,11 +1662,19 @@ What the grant decides, for every request:
   inactive buffer, the scrollback or the backing transcript.
 
 What a subscription carries is a read that goes on after it was answered, so the same decision is
-taken again, as a subscription to the attached session, before each batch the host writes to it.
-A batch the grant, the policy or the ceiling no longer allows is not written, and the connection
-ends with it. Only an expired grant is written to the device's record; any other refusal leaves
-the grant alone. A lapsed offline bound, for one, holds again once the authority feed
-synchronises, and the device learns why from the next request it makes.
+taken again, as a subscription to the attached session, before each batch the host writes to it,
+and the batch is held to that decision until its last byte goes. A batch can wait: for the
+connection's writer, which the keepalive shares, or for a peer that has stopped reading. So every
+attempt to hand its bytes over checks that nothing the decision rests on has changed since (any
+change to this host's policy or rights ceiling moves an epoch the check reads) and that the
+decision's own time bound, the grant's expiry or the end of the offline bound, has not passed; and
+while the write waits, the whole decision is taken again every tenth of a second. A decision that
+stops holding before the first byte goes has the batch decided again. One that stops holding once
+bytes are moving ends the connection, because a frame left in pieces ends the stream. A batch the
+decision no longer allows is not written, and the connection ends with it. Only an expired grant
+is written to the device's record; any other refusal leaves the grant alone. A lapsed offline
+bound, for one, holds again once the authority feed synchronises, and the device learns why from
+the next request it makes.
 
 What the subject decides stays the subject's, and the conditional requirements the daemon cannot
 evaluate are exactly those: whose subject it is. A device detaches the attachment its own

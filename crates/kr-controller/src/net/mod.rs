@@ -772,30 +772,23 @@ async fn relay_loop(
             () = remote.link_lost() => return,
         };
         // Decided before it is written, like the request that opened the subscription: the grant,
-        // the policy and the ceiling as they stand now. A batch they no longer allow is not
-        // written, and the connection goes with it.
-        if !remote.may_relay().await {
-            remote.output().withdraw();
-            remote.release().await;
-            return;
-        }
-        // The registration and the grant are read inside the write boundary itself, and watched
-        // for as long as the write waits, so a revocation that lands while this frame is queued
-        // stops it there. The item holds its charge against the connection's queue until it has
-        // been written or dropped.
+        // the policy and the ceiling as they stand now. The registration, the grant and that
+        // decision are then read inside the write boundary itself, and watched for as long as the
+        // write waits, so a revocation or a change of policy that lands while this frame is queued
+        // stops it there. A batch they no longer allow is not written, and the connection goes
+        // with it. The item holds its charge against the connection's queue until it has been
+        // written or dropped.
         //
         // The write is raced against the link it is relaying, because a device that has stopped
         // consuming output would otherwise hold this frame, and the connection, for as long as it
         // liked: the link ending while a frame waits for the peer has to end the connection too.
         let written = tokio::select! {
-            written = remote.output().send(item.frame()) => written,
-            () = remote.link_lost() => {
-                remote.output().withdraw();
-                remote.release().await;
-                return;
-            }
+            written = remote.relay(item.frame()) => written,
+            () = remote.link_lost() => false,
         };
         if !written {
+            remote.output().withdraw();
+            remote.release().await;
             return;
         }
         drop(item);
@@ -1500,7 +1493,7 @@ mod tests {
     }
 
     /// Starts a daemon on an environment that may already hold an earlier daemon's records.
-    async fn daemon(temp: &kr_ipc::testing::TempHost) -> Arc<Controller> {
+    pub(super) async fn daemon(temp: &kr_ipc::testing::TempHost) -> Arc<Controller> {
         let environment = temp.environment();
         let environment_id = temp.environment_id();
         let secrets = environment.secrets_dir();
