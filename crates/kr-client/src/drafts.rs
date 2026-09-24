@@ -43,15 +43,21 @@ use std::path::{Path, PathBuf};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{
     AgentBindingRevision, ApplicationInstanceId, AttachmentId, DeviceId, DraftId, DraftRevision,
-    SessionId,
+    SessionId, SyncObjectId,
 };
 use kr_protocol::scalars::{Nullable, TimestampMs, Uuid};
+use kr_protocol::sync::SyncObjectKind;
 use kr_protocol::transfer::{AttachmentHandle, DraftState};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ClientError, Result};
 use crate::retry::UserAction;
-use crate::services::SyncPosition;
+use crate::services::{SyncExchanged, SyncPosition};
+use crate::sync::client::{Answer, ask_about, count_settled, diverged, end_fenced, forked};
+use crate::sync::store::standing;
+use crate::sync::{
+    Claimed, InGeneration, Outcome, Reconciled, Settlement, Standing, SyncError, SyncStore,
+};
 
 /// The most a draft's synchronised payload may carry, in bytes.
 ///
@@ -737,28 +743,40 @@ impl DraftStore {
         outcome
     }
 
-    /// Records where a draft reached on the synchronisation service.
+    /// Records where a draft reached on the synchronisation service, and says where the answer
+    /// stood against the note already here.
     ///
-    /// A note that already names a later write stands, and this returns false. Two answers can
-    /// arrive out of order: a publication is accepted, another device writes, a fetch brings that
-    /// down, and only then does the first answer come back naming the write before it. Writing
-    /// it would throw away what this device had already learnt, and leave a draft looking
+    /// A note that already names a later write stands, and this answers [`Standing::Earlier`]. Two
+    /// answers can arrive out of order: a publication is accepted, another device writes, a fetch
+    /// brings that down, and only then does the first answer come back naming the write before it.
+    /// Writing it would throw away what this device had already learnt, and leave a draft looking
     /// synchronised against an object that has moved on.
+    ///
+    /// A note naming the same place in the service's order under another name stands as well, and
+    /// this answers [`Standing::Forked`]: one place names one write for the life of a collection, so
+    /// the two come from two histories, and neither is a later state of the other. It is the rule a
+    /// setting's note is held to, and the same function decides both.
     ///
     /// # Errors
     ///
     /// Returns [`DraftError::Storage`] when the note cannot be read or written.
-    pub fn record_checkpoint(&self, draft_id: DraftId, checkpoint: SyncCheckpoint) -> Result<bool> {
+    pub fn record_checkpoint(
+        &self,
+        draft_id: DraftId,
+        checkpoint: SyncCheckpoint,
+    ) -> Result<Standing> {
         let bytes = kr_cbor::to_canonical_vec(&checkpoint)?;
         let guard = self.exclusive()?;
         let outcome = (|| {
-            if let Some(held) = self.read_checkpoint(draft_id)?
-                && held.position.write_sequence > checkpoint.position.write_sequence
-            {
-                return Ok(false);
+            let stands = match self.read_checkpoint(draft_id)? {
+                Some(held) => standing(held.position, checkpoint.position),
+                None => Standing::Later,
+            };
+            if matches!(stands, Standing::Earlier | Standing::Forked { .. }) {
+                return Ok(stands);
             }
             self.write_bytes(&self.checkpoint_path(draft_id), &bytes)?;
-            Ok(true)
+            Ok(stands)
         })();
         drop(guard);
         outcome
@@ -1327,6 +1345,16 @@ pub enum Published {
         /// Where the service holds the draft.
         position: SyncPosition,
     },
+    /// The answer came back for a publication admitted under an earlier privacy generation.
+    ///
+    /// The account of what left is kept, and nothing else is written: the note does not move and
+    /// no copy comes down, because section 24 publishes no late old-generation result.
+    Discarded {
+        /// The generation the publication was admitted under.
+        produced_under: u64,
+        /// The generation in force now.
+        current: u64,
+    },
 }
 
 /// What came down from the service, and where it was put.
@@ -1343,6 +1371,22 @@ pub struct Fetched {
     pub copy: Draft,
 }
 
+/// What bringing a draft down beside the local one did.
+enum BroughtDown {
+    /// It was kept beside the local draft, and the note was written.
+    ///
+    /// Behind a pointer because it carries two drafts and the other variant two numbers.
+    Kept(Box<Fetched>),
+    /// Privacy mode fenced production or moved past the generation the work was started under, so
+    /// nothing was written.
+    Discarded {
+        /// The generation the work was started under.
+        produced_under: u64,
+        /// The generation in force now.
+        current: u64,
+    },
+}
+
 /// One device's synchronised half of its drafts.
 ///
 /// The comparison is against the position this device last saw, which is kept beside the draft as
@@ -1352,26 +1396,68 @@ pub struct Fetched {
 /// the direction that matters on a device: what is kept is kept *beside* the local draft, so
 /// reconnecting never replaces the person's text with what was on the service.
 ///
+/// # One account per publication
+///
+/// Every publication keeps one record in the device's [`SyncStore`], the same store the settings
+/// client keeps its own in, so the barrier, the fence and privacy mode's cleanup reach a draft
+/// exactly as they reach a setting, and [`crate::sync::SyncClient::outstanding`] counts a draft
+/// that has left without an answer. The record is written before the call leaves and replaced
+/// whole at every step, so a device that stops anywhere comes back to one account of the
+/// publication, never two.
+///
+/// A publication is one piece of work with one identity, chosen when it is admitted. Publishing the
+/// same revision again while its answer is unknown is a later attempt at that work: it presents the
+/// same identity, the same bytes and the same comparison, so a service that already ran it answers
+/// from its receipt and runs nothing twice, and the record keeps the earliest and the latest
+/// instant any attempt was signed at. Nothing makes an attempt by itself. Section 23 retries
+/// nothing whose outcome is unknown, so a later attempt is always a caller asking for one.
+///
+/// # A lost answer
+///
+/// [`Self::reconcile_unsettled`] settles a publication whose answer never came back by the rule the
+/// settings client applies: it asks about the request's own identity, and a service that holds no
+/// receipt for it under the generation in force leaves it counted for the next pass, while one
+/// privacy mode has moved past is fenced in the same pass. An applied answer moves the note beside
+/// the draft, unless the note already names a later write; a refused one brings the other device's
+/// content down beside the draft.
+///
 /// A note that is lost or was never written costs a comparison, not a draft: the publication is
-/// refused, the content the service holds comes down beside the local draft, and the note is written
-/// from the position that fetch reported. The next publication then compares against it. A note
-/// that names a write the service no longer has, because it was reset or replaced, is the case
-/// that does not resolve itself: the publication is refused and there is nothing to
-/// fetch, and [`DraftStore::forget_checkpoint`] is how a caller says so.
-#[derive(Clone, Debug)]
+/// refused, the content the service holds comes down beside the local draft, and the note is
+/// written from the position that fetch reported. A note that names a write the service no longer
+/// has, because it was reset or replaced, is the case that does not resolve itself: the
+/// publication is refused and there is nothing to fetch, and [`DraftStore::forget_checkpoint`] is
+/// how a caller says so.
+#[derive(Debug)]
 pub struct DraftSync {
     service: std::sync::Arc<dyn crate::services::SyncBackupService>,
     sealer: std::sync::Arc<dyn DraftSealer>,
+    store: SyncStore,
 }
 
 impl DraftSync {
-    /// Builds the synchronised half over a service client and this device's sealing.
+    /// Builds the synchronised half over a service client, this device's sealing and the device's
+    /// synchronisation store.
+    ///
+    /// The store is the one the device's settings client keeps its records in. A draft kept its
+    /// accounts anywhere else would be a publication that store's barrier and cleanup could not
+    /// see.
     #[must_use]
     pub fn new(
         service: std::sync::Arc<dyn crate::services::SyncBackupService>,
         sealer: std::sync::Arc<dyn DraftSealer>,
+        store: SyncStore,
     ) -> Self {
-        Self { service, sealer }
+        Self {
+            service,
+            sealer,
+            store,
+        }
+    }
+
+    /// Returns the store this half keeps its publications' records in.
+    #[must_use]
+    pub const fn store(&self) -> &SyncStore {
+        &self.store
     }
 
     /// Publishes a draft, under compare and swap on the position this device last saw.
@@ -1382,88 +1468,154 @@ impl DraftSync {
     /// that this device does not hold, and the note beside it would name a revision whose text is
     /// somewhere else.
     ///
-    /// The draft and the note are read together, so the position this sends against is the one
-    /// that went with the revision it validated. A refused comparison is not a failure: it is the
-    /// answer that another device wrote first, and it brings that content down beside the local
-    /// draft rather than over it. Every other refusal is returned as it came.
+    /// The draft and the note are read together, so the position a new publication sends against
+    /// is the one that went with the revision it validated. When the publication of that revision
+    /// is already out with no answer, this is a later attempt at it, under its identity and with
+    /// its bytes and its comparison, as [`SyncStore::attempt_draft`] describes.
+    ///
+    /// A refused comparison is not a failure: it is the answer that another device wrote first, and
+    /// it brings that content down beside the local draft rather than over it. An answer that
+    /// arrives after privacy mode has moved past the publication's generation is
+    /// [`Published::Discarded`]. Any other failure leaves the
+    /// publication counted rather than guessing at whether it landed.
     ///
     /// # Errors
     ///
-    /// Returns the service's refusal, [`DraftError::NotTheStoredRevision`] when the revision named
-    /// is not the one this device holds, [`DraftError::NotOwned`] when the draft belongs to another
-    /// device, [`DraftError::TooLarge`] when it does not fit the contract, and
-    /// [`DraftError::Storage`] when a conflict copy or the note cannot be written.
+    /// Returns [`SyncError::Fenced`] while privacy mode is on, [`SyncError::InFlight`] when a call
+    /// for this publication is already out, [`SyncError::StaleCheckpoint`] or
+    /// [`SyncError::ForkedHistory`] when the answer cannot follow what this device's records hold,
+    /// the service's refusal, and, through [`SyncError::Client`],
+    /// [`DraftError::NotTheStoredRevision`] when the revision named is not the one this device
+    /// holds, [`DraftError::NotOwned`] when the draft belongs to another device,
+    /// [`DraftError::TooLarge`] when it does not fit the contract, and [`DraftError::Storage`] when
+    /// a copy or the note cannot be written.
     pub async fn publish(
         &self,
-        store: &DraftStore,
+        drafts: &DraftStore,
         draft_id: DraftId,
         expected_revision: DraftRevision,
         now: TimestampMs,
-    ) -> Result<Published> {
-        let (stored, note) = store.draft_and_checkpoint(draft_id)?;
-        if stored.device_id != store.device_id() {
-            return Err(DraftError::NotOwned {
+    ) -> crate::sync::Result<Published> {
+        let (stored, note) = drafts.draft_and_checkpoint(draft_id)?;
+        if stored.device_id != drafts.device_id() {
+            return Err(ClientError::from(DraftError::NotOwned {
                 draft_id,
                 owner: stored.device_id,
-                device_id: store.device_id(),
-            }
+                device_id: drafts.device_id(),
+            })
             .into());
         }
         if stored.revision != expected_revision {
-            return Err(DraftError::NotTheStoredRevision {
+            return Err(ClientError::from(DraftError::NotTheStoredRevision {
                 draft_id,
                 stored: stored.revision,
                 offered: expected_revision,
-            }
+            })
             .into());
         }
         let plaintext = DraftStore::encode_payload(&stored)?;
-        let ciphertext = self.sealer.seal(&plaintext)?;
         // What this device last saw the service hold, read with the draft above. A draft that has
         // never been published expects nothing to be there, which is no position at all.
         let expected = note.map(|note| note.position);
-        // One identity per attempt. This half keeps no record of a publication it has sent, so it
-        // has nothing to present a second time: every call is a first attempt, and saying so is
-        // more honest than reusing an identity whose receipt would answer for a different draft.
-        let request_id = kr_transport::random::fresh_uuid_v4()?;
-        // The instant this attempt is signed at. This half writes no record, so nothing later reads
-        // it back: a request whose answer is lost here is one nothing establishes the outcome of,
-        // which is what the settlement this half still lacks would fix.
-        match self
+        let attempt = self
+            .store
+            .attempt_draft(draft_id, stored.revision, expected, now, || {
+                self.sealer.seal(&plaintext).map_err(SyncError::from)
+            })?;
+        let answer = self
             .service
             .compare_exchange(
-                &draft_collection(draft_id),
-                request_id,
-                now.get(),
-                expected,
-                &ciphertext,
+                &attempt.record.collection(),
+                // The publication's own identity, which is what makes it answerable afterwards and
+                // what a later attempt presents again.
+                attempt.record.work_id,
+                // The instant the record says this attempt is signed at, so what is signed and what
+                // a fence later carries are the one value.
+                attempt.signed_at.get(),
+                // The comparison the publication was admitted with, which is part of what a
+                // service compares a later attempt against its receipt by.
+                attempt.record.expected.as_ref().copied(),
+                attempt.ciphertext.as_slice(),
             )
-            .await?
-        {
-            crate::services::SyncExchanged::Applied { position } => {
-                // A note that already names a later write stands; this answer would be the older
-                // one arriving late.
-                store.record_checkpoint(
-                    draft_id,
-                    SyncCheckpoint {
-                        position,
-                        published_revision: Nullable::some(stored.revision),
-                    },
+            .await;
+
+        match answer {
+            Ok(SyncExchanged::Applied { position }) => {
+                let settled = self.store.settle_draft(
+                    &attempt.dispatch,
+                    &attempt.record,
+                    Outcome::Accepted { position },
+                    drafts,
                 )?;
-                Ok(Published::Accepted { position })
-            }
-            // What the service kept of the refused write is named by the service. This half holds
-            // no record of a publication it has sent, so it has nowhere to write that name down;
-            // what it does instead is the same thing it does for every refusal, which is bring the
-            // other device's draft down beside this one under a fresh identity.
-            crate::services::SyncExchanged::Refused { retained: _ } => {
-                let fetched = self.fetch_beside(store, draft_id, now).await?;
-                Ok(Published::Conflicted {
-                    copy: fetched.copy.draft_id,
-                    remote_revision: fetched.remote.revision,
-                    position: fetched.position,
+                // The settlement is durable before this is raised. An answer this device's records
+                // cannot follow is one it may not carry on from, and the caller is told which.
+                if let Some(held) = settled.diverged {
+                    return Err(diverged(attempt.record.object_id, held, position));
+                }
+                Ok(match settled.settlement {
+                    Settlement::Published | Settlement::AlreadySettled => {
+                        Published::Accepted { position }
+                    }
+                    Settlement::Discarded {
+                        produced_under,
+                        current,
+                    } => Published::Discarded {
+                        produced_under,
+                        current,
+                    },
                 })
             }
+            Ok(SyncExchanged::Refused { retained }) => {
+                // The refusal is settled first and on its own, along with the account of whatever
+                // the service kept of this write, so a fetch this device cannot make costs the copy
+                // rather than the knowledge that the write did not land.
+                let settled = self.store.settle_draft(
+                    &attempt.dispatch,
+                    &attempt.record,
+                    Outcome::Refused { retained },
+                    drafts,
+                )?;
+                if let Settlement::Discarded {
+                    produced_under,
+                    current,
+                } = settled.settlement
+                {
+                    return Ok(Published::Discarded {
+                        produced_under,
+                        current,
+                    });
+                }
+                Ok(
+                    match self
+                        .bring_down(drafts, draft_id, attempt.record.produced_under.get(), now)
+                        .await?
+                    {
+                        BroughtDown::Kept(fetched) => Published::Conflicted {
+                            copy: fetched.copy.draft_id,
+                            remote_revision: fetched.remote.revision,
+                            position: fetched.position,
+                        },
+                        BroughtDown::Discarded {
+                            produced_under,
+                            current,
+                        } => Published::Discarded {
+                            produced_under,
+                            current,
+                        },
+                    },
+                )
+            }
+            // The identity this publication presented already answered a different request. That
+            // receipt accounts for the other request and never for these bytes, and the service
+            // compared them against it and declined to run them, so nothing of this attempt is on
+            // the service and nothing asks about the identity again.
+            Err(error) if error.code() == ErrorCode::IdConflict => {
+                self.store
+                    .close_unexecuted(&attempt.dispatch, attempt.record.work_id)?;
+                Err(error.into())
+            }
+            // Anything else leaves the outcome open, and the record where it counts.
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -1474,50 +1626,207 @@ impl DraftSync {
     /// was. Section 24 makes that the rule rather than a preference.
     ///
     /// The note is written from the position the service reported, so a device that had lost track
-    /// of where the object stood knows again.
+    /// of where the object stood knows again. Both it and the copy are written against the privacy
+    /// generation this fetch started under, so a fetch is refused while privacy mode is on and an
+    /// answer that arrives after a fence writes nothing.
     ///
     /// # Errors
     ///
-    /// Returns the service's refusal, [`ClientError::Cbor`] when the object is not a draft this
-    /// build reads or is larger than a synchronised object may carry, [`DraftError::Corrupt`] when
-    /// it opens to a different draft, and [`DraftError::Storage`] when the copy or the note cannot
-    /// be written.
+    /// Returns [`SyncError::Fenced`] while privacy mode is on, [`SyncError::LateResult`] when a
+    /// fence landed while the answer was on its way, [`SyncError::NotAWrite`] when the service
+    /// answered with a position no write of the draft can be at, [`SyncError::ForkedHistory`] when
+    /// the note names the same place under another name, the service's refusal, and, through
+    /// [`SyncError::Client`], [`ClientError::Cbor`] when the object is not a draft this build reads
+    /// or is larger than a synchronised object may carry, [`DraftError::Corrupt`] when it opens to a
+    /// different draft, and [`DraftError::Storage`] when the copy or the note cannot be written.
     pub async fn fetch_beside(
         &self,
-        store: &DraftStore,
+        drafts: &DraftStore,
         draft_id: DraftId,
         now: TimestampMs,
-    ) -> Result<Fetched> {
+    ) -> crate::sync::Result<Fetched> {
+        let privacy = self.store.privacy()?;
+        if privacy.fenced {
+            return Err(SyncError::Fenced {
+                generation: privacy.generation.get(),
+            });
+        }
+        match self
+            .bring_down(drafts, draft_id, privacy.generation.get(), now)
+            .await?
+        {
+            BroughtDown::Kept(fetched) => Ok(*fetched),
+            BroughtDown::Discarded {
+                produced_under,
+                current,
+            } => Err(SyncError::LateResult {
+                produced_under,
+                current,
+            }),
+        }
+    }
+
+    /// Asks the service what became of every draft publication this device has no answer for.
+    ///
+    /// It is the settings client's reconciliation, applied to drafts, with the draft store at hand
+    /// for what an answer writes there. Each publication is claimed before anything is asked about
+    /// it, and one somebody has a call out for is left counted. Each answer settles the publication
+    /// it is about and nothing else:
+    ///
+    /// - **applied** settles it as an accepted write, which records the publication and, under the
+    ///   generation in force, moves the note beside the draft, unless the note already names a
+    ///   later write;
+    /// - **refused** settles it as a write that did not replace the draft, records the copy the
+    ///   service kept of it, and brings down what the service holds instead, beside the draft;
+    /// - **no receipt** leaves it counted while its generation is in force, and past that
+    ///   generation it is fenced in the same pass;
+    /// - **fenced** ends it, with no account where the service says nothing ran and with the
+    ///   account kept where it cannot say so.
+    ///
+    /// Nothing is sent again. A service that cannot be asked leaves the publication counted.
+    /// `unsettled` in the report is the store's whole count, settings included, because it is the
+    /// one barrier privacy mode's cleanup measures.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Storage`] when the records cannot be read or a settlement cannot be
+    /// written, and whatever the draft store failed with when a note could not be.
+    pub async fn reconcile_unsettled(
+        &self,
+        drafts: &DraftStore,
+        now: TimestampMs,
+    ) -> crate::sync::Result<Reconciled> {
+        let mut report = Reconciled::default();
+        let dispatched: Vec<Uuid> = self
+            .store
+            .requests()?
+            .items
+            .iter()
+            .filter(|item| item.kind == SyncObjectKind::Draft && item.dispatched())
+            .map(|item| item.work_id)
+            .collect();
+        for work_id in dispatched {
+            let (dispatch, staged) = match self.store.claim_dispatched(work_id)? {
+                Claimed::Taken(dispatch, staged) => (dispatch, staged),
+                Claimed::InHand => {
+                    report.unresolved = report.unresolved.saturating_add(1);
+                    continue;
+                }
+                Claimed::Gone => continue,
+            };
+            match ask_about(&*self.service, &self.store, &staged).await? {
+                Answer::Applied(position) => {
+                    let settled = self.store.settle_draft(
+                        &dispatch,
+                        &staged,
+                        Outcome::Accepted { position },
+                        drafts,
+                    )?;
+                    count_settled(&settled, &mut report);
+                }
+                Answer::Refused(retained) => {
+                    let settled = self.store.settle_draft(
+                        &dispatch,
+                        &staged,
+                        Outcome::Refused { retained },
+                        drafts,
+                    )?;
+                    count_settled(&settled, &mut report);
+                    // The copy belongs to the generation that admitted the work, and a fetch this
+                    // device cannot make costs it rather than the settlement.
+                    if settled.settlement == Settlement::Published
+                        && !matches!(
+                            self.bring_down(
+                                drafts,
+                                DraftId::new(staged.object_id.get()),
+                                staged.produced_under.get(),
+                                now,
+                            )
+                            .await,
+                            Ok(BroughtDown::Kept(_))
+                        )
+                    {
+                        report.copies_not_taken = report.copies_not_taken.saturating_add(1);
+                    }
+                }
+                Answer::Fenced { never_ran } => {
+                    end_fenced(&self.store, &dispatch, &staged, never_ran, &mut report)?;
+                }
+                Answer::Open => report.unresolved = report.unresolved.saturating_add(1),
+            }
+        }
+        report.unsettled = self.store.unsettled()?;
+        Ok(report)
+    }
+
+    /// Brings what the service holds for a draft down beside it, under the generation the work it
+    /// answers was started under.
+    ///
+    /// What came down is a draft, so the position beside it is where a write of that draft landed.
+    /// A removal produced no draft and nought is a place nothing occupies, so content at either is
+    /// declined before anything is written. The copy and the note are written under one hold of
+    /// the synchronisation store, against the generation, so a cleanup that landed while the answer
+    /// was out finds nothing to undo. A note two histories claim is left where it is and reported,
+    /// after the copy is kept, because the copy is what the person chooses from either way.
+    async fn bring_down(
+        &self,
+        drafts: &DraftStore,
+        draft_id: DraftId,
+        produced_under: u64,
+        now: TimestampMs,
+    ) -> crate::sync::Result<BroughtDown> {
+        let object_id = SyncObjectId::new(draft_id.get());
         let (position, ciphertext) = self.service.fetch(&draft_collection(draft_id)).await?;
+        if position.is_removal() || position.write_sequence == 0 {
+            return Err(SyncError::NotAWrite {
+                object_id,
+                found: position,
+            });
+        }
         let plaintext = self.sealer.open(&ciphertext)?;
         let remote = DraftStore::decode_payload(&plaintext)?;
         // One collection holds one draft. An object that opens to a different one is not this
         // draft's, whatever opened it: sealing says the bytes came from a device that holds the
         // key, not that they belong where they were found.
         if remote.draft_id != draft_id {
-            return Err(DraftError::Corrupt {
+            return Err(ClientError::from(DraftError::Corrupt {
                 path: PathBuf::from(draft_collection(draft_id)),
                 reason: format!("it holds draft {}, not {draft_id}", remote.draft_id),
-            }
+            })
             .into());
         }
-        let copy = store.keep_copy(draft_id, &remote, now)?;
-        // Where the object stands is this device's to remember; the revision beside it in the note
-        // is not, because the revision that fetch carried is the other device's counter and nothing
-        // about this device's own copies follows from it.
-        store.record_checkpoint(
-            draft_id,
-            SyncCheckpoint {
-                position,
-                published_revision: Nullable::null(),
-            },
-        )?;
-
-        Ok(Fetched {
+        let applied = self.store.apply_under_generation(produced_under, || {
+            let copy = drafts.keep_copy(draft_id, &remote, now)?;
+            // Where the object stands is this device's to remember; the revision beside it in the
+            // note is not, because the revision that fetch carried is the other device's counter
+            // and nothing about this device's own copies follows from it.
+            let note = drafts.record_checkpoint(
+                draft_id,
+                SyncCheckpoint {
+                    position,
+                    published_revision: Nullable::null(),
+                },
+            )?;
+            Ok((copy, note))
+        })?;
+        let (copy, note) = match applied {
+            InGeneration::Applied(written) => written,
+            InGeneration::Discarded {
+                produced_under,
+                current,
+            } => {
+                return Ok(BroughtDown::Discarded {
+                    produced_under,
+                    current,
+                });
+            }
+        };
+        forked(object_id, note, position)?;
+        Ok(BroughtDown::Kept(Box::new(Fetched {
             remote,
             position,
             copy,
-        })
+        })))
     }
 }
 
@@ -2323,10 +2632,11 @@ mod tests {
             position: at(3),
             published_revision: Nullable::some(DraftRevision::new(2)),
         };
-        assert!(
+        assert_eq!(
             store
                 .record_checkpoint(draft.draft_id, checkpoint)
-                .expect("a note")
+                .expect("a note"),
+            Standing::Later
         );
         assert_eq!(
             store.checkpoint(draft.draft_id).expect("a note"),
@@ -2358,7 +2668,7 @@ mod tests {
         assert_eq!(store.load(draft.draft_id).expect("the draft").text, "one");
 
         // Forgetting a note a caller no longer trusts is the same thing said deliberately.
-        assert!(
+        assert_eq!(
             store
                 .record_checkpoint(
                     draft.draft_id,
@@ -2367,7 +2677,8 @@ mod tests {
                         published_revision: Nullable::null(),
                     },
                 )
-                .expect("a note")
+                .expect("a note"),
+            Standing::Later
         );
         store.forget_checkpoint(draft.draft_id).expect("forgotten");
         assert_eq!(store.checkpoint(draft.draft_id).expect("no note"), None);
@@ -2386,16 +2697,17 @@ mod tests {
             position: at(2),
             published_revision: Nullable::null(),
         };
-        assert!(
+        assert_eq!(
             store
                 .record_checkpoint(draft.draft_id, current)
-                .expect("a note")
+                .expect("a note"),
+            Standing::Later
         );
 
         // A publication this device made earlier, answered late, naming the write before it.
         // Writing it would throw away what the fetch already learnt.
-        assert!(
-            !store
+        assert_eq!(
+            store
                 .record_checkpoint(
                     draft.draft_id,
                     SyncCheckpoint {
@@ -2404,7 +2716,31 @@ mod tests {
                     },
                 )
                 .expect("a note"),
+            Standing::Earlier,
             "an older write was recorded over a newer one"
+        );
+        assert_eq!(
+            store.checkpoint(draft.draft_id).expect("a note"),
+            Some(current)
+        );
+
+        // Another name for the place the note already holds is a second history, and it stands
+        // no more than older news does.
+        let elsewhere = SyncPosition::at(
+            2,
+            crate::services::SyncRevision::new(Uuid::from_bytes([0xee; 16])),
+        );
+        assert_eq!(
+            store
+                .record_checkpoint(
+                    draft.draft_id,
+                    SyncCheckpoint {
+                        position: elsewhere,
+                        published_revision: Nullable::some(draft.revision),
+                    },
+                )
+                .expect("a note"),
+            Standing::Forked { held: at(2) }
         );
         assert_eq!(
             store.checkpoint(draft.draft_id).expect("a note"),
@@ -2416,10 +2752,11 @@ mod tests {
             position: at(3),
             published_revision: Nullable::some(draft.revision),
         };
-        assert!(
+        assert_eq!(
             store
                 .record_checkpoint(draft.draft_id, later)
-                .expect("a note")
+                .expect("a note"),
+            Standing::Later
         );
         assert_eq!(
             store.checkpoint(draft.draft_id).expect("a note"),

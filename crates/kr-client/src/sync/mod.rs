@@ -31,6 +31,11 @@
 //! where it belongs. Nothing in either path submits: [`crate::drafts::Draft::submission`] answers
 //! a question and performs nothing, and there is no call from here to a host at all.
 //!
+//! What the two halves share is the account. A draft publication keeps its one record in the
+//! [`SyncStore`] beside the settings, and is settled by the same rule, so the barrier, the fence
+//! and privacy mode's cleanup have one implementation and [`SyncClient::outstanding`] counts a
+//! draft that has left without an answer the way it counts a setting.
+//!
 //! # One object, one collection
 //!
 //! A collection holds one object, for the reason [`crate::drafts::draft_collection`] gives: the
@@ -64,9 +69,9 @@ pub use client::{
 };
 pub use keys::{CollectionKeys, CollectionSealer, MemoryCollectionKeys, StoredCollectionKeys};
 pub use store::{
-    Claimed, ConflictCopy, Dispatch, End, Fetched, Listing, Outcome, PinnedLabel, PrivacyRecord,
-    Publication, RequestRecord, RequestState, Result, Settled, Settlement, Standing,
-    SyncCheckpoint, SyncError, SyncStore, WhatLeft,
+    Attempt, Claimed, ConflictCopy, Dispatch, End, Fetched, InGeneration, Listing, Outcome,
+    PinnedLabel, PrivacyRecord, Publication, RequestRecord, RequestRevision, RequestState, Result,
+    Settled, Settlement, Standing, SyncCheckpoint, SyncError, SyncStore, WhatLeft,
 };
 
 /// What section 18 bullet 5 offers, part by part.

@@ -68,8 +68,8 @@ use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::sync::SyncObjectKind;
 
 use super::store::{
-    Claimed, ConflictCopy, End, Outcome, PrivacyRecord, RequestRecord, RequestState, Result,
-    Settlement, Standing, SyncCheckpoint, SyncError, SyncStore,
+    Claimed, ConflictCopy, Dispatch, End, Outcome, PrivacyRecord, RequestRecord, RequestState,
+    Result, Settled, Settlement, Standing, SyncCheckpoint, SyncError, SyncStore,
 };
 use super::{SyncBody, SyncObject, SyncSettings, Zeroising, sync_collection};
 use crate::drafts::DraftSealer;
@@ -417,7 +417,7 @@ impl SyncClient {
     /// object, and the service's own refusal otherwise.
     pub async fn publish(&self, object_id: SyncObjectId, now: TimestampMs) -> Result<Published> {
         let staged = self.store.admit(object_id, |object| self.seal(object))?;
-        let collection = sync_collection(staged.kind, object_id);
+        let collection = staged.collection();
 
         // The store marks the work sent, hands back the record it wrote and hands back ownership
         // of the dispatch, which is an operating-system lock on the request. Nothing else may
@@ -486,7 +486,7 @@ impl SyncClient {
                         current,
                     });
                 }
-                self.keep_what_the_service_holds(&staged, &collection, retained, now)
+                self.keep_what_the_service_holds(&staged, retained, now)
                     .await
             }
             // The identity this request presented already answered a different one. The receipt
@@ -513,11 +513,19 @@ impl SyncClient {
     async fn keep_what_the_service_holds(
         &self,
         staged: &RequestRecord,
-        collection: &str,
         retained: Option<SyncConflictId>,
         now: TimestampMs,
     ) -> Result<Published> {
-        let (position, other) = self.fetch_current(staged, collection).await?;
+        let collection = staged.collection();
+        // What came down is kept as a settings object beside this device's own. A draft's copy is
+        // a draft, which only the draft store keeps.
+        let offered = staged
+            .revision
+            .object()
+            .ok_or_else(|| SyncError::DraftElsewhere {
+                collection: collection.clone(),
+            })?;
+        let (position, other) = self.fetch_current(staged, &collection).await?;
         // A refusal keeps a copy whatever this device holds. The comparison did not replace the
         // object, so what came down is another device's content and the person chooses between the
         // two; that is not the fetch's question of whether the two are the same content at all.
@@ -527,7 +535,7 @@ impl SyncClient {
             retained: Nullable::from(retained),
             ..self.copy_of(
                 staged.object_id,
-                staged.revision,
+                offered,
                 staged.expected,
                 position,
                 &other,
@@ -619,7 +627,8 @@ impl SyncClient {
     ///
     /// Each one is asked about once per call, and one the service could not be asked about stays
     /// recorded for the next call rather than failing the rest. Asking twice is safe: a copy the
-    /// service no longer holds is already resolved, and it says so.
+    /// service no longer holds is already resolved, and it says so. A choice about a draft's copy is
+    /// recorded in the same store, and this asks about it in the draft's own collection.
     ///
     /// # Errors
     ///
@@ -630,8 +639,12 @@ impl SyncClient {
             let RequestState::Resolving { retained } = record.state else {
                 continue;
             };
-            let collection = sync_collection(record.kind, record.object_id);
-            if self.service.resolve(&collection, retained).await.is_ok() {
+            if self
+                .service
+                .resolve(&record.collection(), retained)
+                .await
+                .is_ok()
+            {
                 self.store.close_resolution(record.work_id)?;
                 report.dropped = report.dropped.saturating_add(1);
             } else {
@@ -900,26 +913,37 @@ impl SyncClient {
     /// tell the two apart. The claim is the store's and not this value's, so a second window of
     /// the application over the same store meets it as well.
     ///
+    /// A draft publication shares this store and this rule, and this pass settles it once privacy
+    /// mode has moved past the generation that admitted it: no answer to it can be published then,
+    /// so settling it writes nothing a draft store holds, and a cleanup that reconciles before it
+    /// measures ends drafts as it ends settings. Under the generation in force a draft's answer
+    /// moves the draft's note or keeps a copy beside the draft, both of which are the draft store's,
+    /// and this client holds none; [`crate::drafts::DraftSync::reconcile_unsettled`] settles it
+    /// there, and this pass counts it as unresolved.
+    ///
     /// # Errors
     ///
     /// Returns [`SyncError::Storage`] when the staged records cannot be read or a settlement
     /// cannot be written.
     pub async fn reconcile_unsettled(&self, now: TimestampMs) -> Result<Reconciled> {
         let mut report = Reconciled::default();
-        let dispatched: Vec<Uuid> = self
+        let dispatched: Vec<RequestRecord> = self
             .store
             .requests()?
             .items
-            .iter()
-            .filter(|item| item.dispatched())
-            .map(|item| item.work_id)
+            .into_iter()
+            .filter(RequestRecord::dispatched)
             .collect();
-        for work_id in dispatched {
+        for listed in dispatched {
+            if listed.kind == SyncObjectKind::Draft && !self.store.beyond_its_generation(&listed)? {
+                report.unresolved = report.unresolved.saturating_add(1);
+                continue;
+            }
             // The store decides who may decide. A request somebody has a call out for is not one
             // to conclude about: a service writes its receipt when it commits the write, so a
             // request still on the wire has none either, and only the device making the call can
             // tell the two apart. A request that is gone was settled while this pass ran.
-            let (dispatch, staged) = match self.store.claim_dispatched(work_id)? {
+            let (dispatch, staged) = match self.store.claim_dispatched(listed.work_id)? {
                 Claimed::Taken(dispatch, staged) => (dispatch, staged),
                 Claimed::InHand => {
                     report.unresolved = report.unresolved.saturating_add(1);
@@ -927,112 +951,25 @@ impl SyncClient {
                 }
                 Claimed::Gone => continue,
             };
-            let collection = sync_collection(staged.kind, staged.object_id);
-            let Ok(status) = self.service.request_status(&collection, work_id).await else {
-                report.unresolved = report.unresolved.saturating_add(1);
-                continue;
-            };
-            match status {
-                SyncRequestStatus::Applied { position } => {
-                    self.settle_acceptance(&dispatch, &staged, position, &mut report)?;
+            match ask_about(&*self.service, &self.store, &staged).await? {
+                Answer::Applied(position) => {
+                    let settled =
+                        self.store
+                            .settle(&dispatch, &staged, Outcome::Accepted { position })?;
+                    count_settled(&settled, &mut report);
                 }
-                SyncRequestStatus::Refused { retained } => {
-                    self.settle_refusal(
-                        &dispatch,
-                        &staged,
-                        &collection,
-                        retained,
-                        now,
-                        &mut report,
-                    )
-                    .await?;
+                Answer::Refused(retained) => {
+                    self.settle_refusal(&dispatch, &staged, retained, now, &mut report)
+                        .await?;
                 }
-                // Somebody fenced this request already, and the fence's own receipt recorded what
-                // the service established about the past. Asking again repeats it, so a request
-                // fenced once is settled the same way however often it is asked about.
-                SyncRequestStatus::Fenced { never_ran } => {
-                    self.close_fenced(&dispatch, &staged, never_ran, &mut report)?;
+                Answer::Fenced { never_ran } => {
+                    end_fenced(&self.store, &dispatch, &staged, never_ran, &mut report)?;
                 }
-                SyncRequestStatus::Unknown => {
-                    // Under the generation that admitted it the work is still wanted, so this pass
-                    // leaves it counted and the next one asks again. Past that generation no answer
-                    // to it could be published, and a barrier nothing can lift is not a barrier, so
-                    // the service is asked to end the request instead of this device guessing that
-                    // it never arrived.
-                    if !self.store.beyond_its_generation(&staged)? {
-                        report.unresolved = report.unresolved.saturating_add(1);
-                        continue;
-                    }
-                    // The fence carries the signing times the record holds, because the service
-                    // decides from them both whether anything can still have run and how long the
-                    // fence itself must outlive what it fences. A dispatched record always names
-                    // them, since the dispatch wrote the state and the instants together; one that
-                    // somehow names neither is left counted rather than fenced with a time this
-                    // device made up.
-                    let Some((first_signed_at, last_signed_at)) = staged.signing_times() else {
-                        report.unresolved = report.unresolved.saturating_add(1);
-                        continue;
-                    };
-                    match self
-                        .service
-                        .fence_request(
-                            &collection,
-                            work_id,
-                            first_signed_at.get(),
-                            last_signed_at.get(),
-                        )
-                        .await
-                    {
-                        Ok(SyncRequestFence::Fenced { never_ran }) => {
-                            self.close_fenced(&dispatch, &staged, never_ran, &mut report)?;
-                        }
-                        // The request landed between the two calls, so the fence found the receipt
-                        // the status query had missed and this is that answer.
-                        Ok(SyncRequestFence::Applied { position }) => {
-                            self.settle_acceptance(&dispatch, &staged, position, &mut report)?;
-                        }
-                        Ok(SyncRequestFence::Refused { retained }) => {
-                            self.settle_refusal(
-                                &dispatch,
-                                &staged,
-                                &collection,
-                                retained,
-                                now,
-                                &mut report,
-                            )
-                            .await?;
-                        }
-                        Err(_) => {
-                            report.unresolved = report.unresolved.saturating_add(1);
-                        }
-                    }
-                }
+                Answer::Open => report.unresolved = report.unresolved.saturating_add(1),
             }
         }
         report.unsettled = self.store.unsettled()?;
         Ok(report)
-    }
-
-    /// Settles one accepted write a reconciliation learned about, and counts what it found.
-    ///
-    /// A pass reports rather than refuses: it is ending a barrier rather than answering a caller
-    /// who is waiting for one publication, so an answer this device's records cannot follow is
-    /// counted and the account of the write is kept by its own record.
-    fn settle_acceptance(
-        &self,
-        dispatch: &super::store::Dispatch,
-        staged: &RequestRecord,
-        position: SyncPosition,
-        report: &mut Reconciled,
-    ) -> Result<()> {
-        let settled = self
-            .store
-            .settle(dispatch, staged, Outcome::Accepted { position })?;
-        report.settled = report.settled.saturating_add(1);
-        if settled.diverged.is_some() {
-            report.diverged = report.diverged.saturating_add(1);
-        }
-        Ok(())
     }
 
     /// Settles one refusal and brings down what the service holds instead.
@@ -1042,55 +979,26 @@ impl SyncClient {
     /// never the knowledge that the write did not replace the object.
     async fn settle_refusal(
         &self,
-        dispatch: &super::store::Dispatch,
+        dispatch: &Dispatch,
         staged: &RequestRecord,
-        collection: &str,
         retained: Option<SyncConflictId>,
         now: TimestampMs,
         report: &mut Reconciled,
     ) -> Result<()> {
         let settled = self
             .store
-            .settle(dispatch, staged, Outcome::Refused { retained })?
-            .settlement;
-        report.settled = report.settled.saturating_add(1);
+            .settle(dispatch, staged, Outcome::Refused { retained })?;
+        count_settled(&settled, report);
         // The copy belongs to the generation that admitted the work. A settlement the late-result
         // rule discarded may keep none, because a copy is retained content and the cleanup that
         // opened this generation has already removed it.
-        if settled == Settlement::Published
+        if settled.settlement == Settlement::Published
             && self
-                .keep_what_the_service_holds(staged, collection, retained, now)
+                .keep_what_the_service_holds(staged, retained, now)
                 .await
                 .is_err()
         {
             report.copies_not_taken = report.copies_not_taken.saturating_add(1);
-        }
-        Ok(())
-    }
-
-    /// Ends one request the service has fenced, and counts what that left behind.
-    ///
-    /// The barrier releases either way: nothing executes under a fenced identity, so no answer to
-    /// this request can arrive afterwards. What differs is what is left to say about it, and the
-    /// service is what says it: `never_ran` is the fence's own statement about its own records, and
-    /// this pass neither reads a clock nor compares one instant with another to reach it.
-    fn close_fenced(
-        &self,
-        dispatch: &super::store::Dispatch,
-        staged: &RequestRecord,
-        never_ran: bool,
-        report: &mut Reconciled,
-    ) -> Result<()> {
-        match self
-            .store
-            .close_fenced(dispatch, staged.work_id, never_ran)?
-        {
-            End::NeverRan => report.fenced = report.fenced.saturating_add(1),
-            End::Unaccounted => {
-                report.fenced = report.fenced.saturating_add(1);
-                report.accounts_kept = report.accounts_kept.saturating_add(1);
-            }
-            End::Nothing => report.unresolved = report.unresolved.saturating_add(1),
         }
         Ok(())
     }
@@ -1281,11 +1189,7 @@ impl SyncClient {
             .into_iter()
             .map(|record| Exported {
                 kind: format!("synchronised {}", record.kind),
-                reference: format!(
-                    "{} at {}",
-                    sync_collection(record.kind, record.object_id),
-                    record.position
-                ),
+                reference: format!("{} at {}", record.collection(), record.position),
                 left_at_ms: record.published_at_ms,
                 deletable: false,
             })
@@ -1303,7 +1207,7 @@ impl SyncClient {
                     ),
                     reference: format!(
                         "{}, which the service holds as copy {}",
-                        sync_collection(record.kind, record.object_id),
+                        record.collection(),
                         conflict_id
                     ),
                     left_at_ms: record.left_at(),
@@ -1318,11 +1222,7 @@ impl SyncClient {
             if record.dispatched() {
                 exported.push(Exported {
                     kind: format!("synchronised {}, sent without an answer", record.kind),
-                    reference: format!(
-                        "{} at revision {}",
-                        sync_collection(record.kind, record.object_id),
-                        record.revision
-                    ),
+                    reference: format!("{} at revision {}", record.collection(), record.revision),
                     // When this device let the content go. It does not say the service stored it,
                     // and nothing here can find that out.
                     left_at_ms: record.left_at(),
@@ -1338,7 +1238,7 @@ impl SyncClient {
                     kind: format!("synchronised {}, sent and never accounted for", record.kind),
                     reference: format!(
                         "{} at revision {}, which the service may hold",
-                        sync_collection(record.kind, record.object_id),
+                        record.collection(),
                         record.revision
                     ),
                     left_at_ms: record.left_at(),
@@ -1355,11 +1255,7 @@ impl SyncClient {
                         "synchronised {}, under another history of the collection",
                         record.kind
                     ),
-                    reference: format!(
-                        "{} at {}",
-                        sync_collection(record.kind, record.object_id),
-                        position
-                    ),
+                    reference: format!("{} at {}", record.collection(), position),
                     left_at_ms: record.left_at(),
                     deletable: false,
                 });
@@ -1447,13 +1343,126 @@ fn fresh_uuid() -> crate::Result<Uuid> {
     Ok(kr_transport::random::fresh_uuid_v4()?)
 }
 
+/// What the service said about one request, once the reconciliation rule has been applied to it.
+///
+/// The first three end the request; the fourth leaves it counted for the next pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Answer {
+    /// The service applied the write, leaving the object here, as the receipt recorded it.
+    Applied(SyncPosition),
+    /// The service refused the comparison, and kept this copy of the refused write when it kept one.
+    Refused(Option<SyncConflictId>),
+    /// The request is fenced, and the service says whether anything ever ran under it.
+    Fenced {
+        /// Whether the service established that nothing ever ran under the identity.
+        never_ran: bool,
+    },
+    /// Nothing established an outcome: the service could not be asked, it holds no receipt under
+    /// the generation in force, or it could not be asked to end the request.
+    Open,
+}
+
+/// Asks the service what became of one request, by the rule every reconciliation applies, settings
+/// and drafts alike.
+///
+/// The status first, under the request's own identity, because what the object holds afterwards is
+/// a fact about the object and not about any one write of it. An applied or a refused receipt is
+/// the answer, and a fence somebody already made repeats what that fence said about the past.
+///
+/// No receipt settles nothing on its own, because a request that has not been executed and one that
+/// is still on its way look the same from here. Under the generation that admitted the work it is
+/// still wanted, so the answer is open and the next pass asks again. Past that generation no answer
+/// to it could be published, and a barrier nothing can lift is not a barrier, so the service is
+/// asked in the same pass to **fence** the request, carrying the earliest and the latest instant the
+/// record says an attempt was signed at: the service decides from those whether anything can still
+/// have run and how long the fence must outlive what it fences. A fence ends the request, or finds
+/// the receipt of one that landed between the two calls. A record that names no signing time is
+/// left open rather than fenced with an instant this device made up.
+///
+/// A service that cannot be asked, for the status or for the fence, leaves the answer open. That is
+/// also where a fence the service refuses as out of its reach ends up: the work stays counted, and
+/// the same instants are presented again next time.
+pub(crate) async fn ask_about(
+    service: &dyn SyncBackupService,
+    store: &SyncStore,
+    staged: &RequestRecord,
+) -> Result<Answer> {
+    let collection = staged.collection();
+    let Ok(status) = service.request_status(&collection, staged.work_id).await else {
+        return Ok(Answer::Open);
+    };
+    Ok(match status {
+        SyncRequestStatus::Applied { position } => Answer::Applied(position),
+        SyncRequestStatus::Refused { retained } => Answer::Refused(retained),
+        SyncRequestStatus::Fenced { never_ran } => Answer::Fenced { never_ran },
+        SyncRequestStatus::Unknown => {
+            if !store.beyond_its_generation(staged)? {
+                return Ok(Answer::Open);
+            }
+            let Some((first_signed_at, last_signed_at)) = staged.signing_times() else {
+                return Ok(Answer::Open);
+            };
+            match service
+                .fence_request(
+                    &collection,
+                    staged.work_id,
+                    first_signed_at.get(),
+                    last_signed_at.get(),
+                )
+                .await
+            {
+                Ok(SyncRequestFence::Fenced { never_ran }) => Answer::Fenced { never_ran },
+                Ok(SyncRequestFence::Applied { position }) => Answer::Applied(position),
+                Ok(SyncRequestFence::Refused { retained }) => Answer::Refused(retained),
+                Err(_) => Answer::Open,
+            }
+        }
+    })
+}
+
+/// Counts one settlement a reconciliation made.
+///
+/// A pass reports rather than refuses: it is ending a barrier rather than answering a caller who is
+/// waiting for one publication, so an answer this device's records cannot follow is counted and
+/// the account of the write is kept by its own record.
+pub(crate) fn count_settled(settled: &Settled, report: &mut Reconciled) {
+    report.settled = report.settled.saturating_add(1);
+    if settled.diverged.is_some() {
+        report.diverged = report.diverged.saturating_add(1);
+    }
+}
+
+/// Ends one request the service has fenced, and counts what that left behind.
+///
+/// The barrier releases either way: nothing executes under a fenced identity, so no answer to the
+/// request can arrive afterwards. What differs is what is left to say about it, and the service is
+/// what says it: `never_ran` is the fence's own statement about its own records, and nothing here
+/// reads a clock or compares one instant with another to reach it.
+pub(crate) fn end_fenced(
+    store: &SyncStore,
+    dispatch: &Dispatch,
+    staged: &RequestRecord,
+    never_ran: bool,
+    report: &mut Reconciled,
+) -> Result<()> {
+    match store.close_fenced(dispatch, staged.work_id, never_ran)? {
+        End::NeverRan => report.fenced = report.fenced.saturating_add(1),
+        End::Unaccounted => {
+            report.fenced = report.fenced.saturating_add(1);
+            report.accounts_kept = report.accounts_kept.saturating_add(1);
+        }
+        End::Nothing => report.unresolved = report.unresolved.saturating_add(1),
+    }
+    Ok(())
+}
+
 /// Refuses an answer that claims a place in the order this device has already given to another.
 ///
 /// One write sequence names one write for the life of a collection, so two answers under one place
 /// in the order come from two histories, and this device's note is about a collection that no
 /// longer exists. The recovery is the explicit one: forget the checkpoint and start the object
 /// again against the service this device now talks to.
-fn forked(object_id: SyncObjectId, note: Standing, found: SyncPosition) -> Result<()> {
+pub(crate) fn forked(object_id: SyncObjectId, note: Standing, found: SyncPosition) -> Result<()> {
     match note {
         Standing::Forked { held } => Err(SyncError::ForkedHistory {
             object_id,
@@ -1469,7 +1478,11 @@ fn forked(object_id: SyncObjectId, note: Standing, found: SyncPosition) -> Resul
 /// Two answers are provably wrong rather than merely surprising, and the error says which: a smaller
 /// write sequence than this device's is a service that went back, and the same one is two histories
 /// claiming one place.
-fn diverged(object_id: SyncObjectId, held: SyncPosition, found: SyncPosition) -> SyncError {
+pub(crate) fn diverged(
+    object_id: SyncObjectId,
+    held: SyncPosition,
+    found: SyncPosition,
+) -> SyncError {
     if found.write_sequence < held.write_sequence {
         SyncError::StaleCheckpoint {
             object_id,

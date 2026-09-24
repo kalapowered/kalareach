@@ -4,7 +4,7 @@
 //!
 //! | What | Why it is here | What privacy mode does with it |
 //! | --- | --- | --- |
-//! | Requests | One record of each publication this device admitted, and where it got to | **It depends on where it got to.** Work that never left is removed; a request that reached the service is an account of what left, and stays. |
+//! | Requests | One record of each publication this device admitted, settings, a client's position and drafts alike, and where it got to | **It depends on where it got to.** Work that never left is removed; a request that reached the service is an account of what left, and stays. |
 //! | Conflict copies | What the service held when a write of this device's lost | Removed. It is content another device produced. |
 //! | Checkpoints | Where each object reached on the service | Removed. It is production state, not content, and losing it costs a comparison. |
 //! | Publications | That this device published a collection, and where the write landed | **Kept.** It is the only account of what left, and section 24 shows what left rather than pretending it did not. |
@@ -23,6 +23,15 @@
 //! an accepted write becomes the object's publication record. A device that stops between the two
 //! comes back with the record still saying "applied", and the next read finishes the step before it
 //! reports anything, which is deterministic and needs no service answer.
+//!
+//! # Drafts
+//!
+//! A draft publication keeps its one record here too, beside the settings, so the barrier, the
+//! fence and privacy mode's cleanup reach a draft the way they reach a setting and
+//! [`SyncStore::unsettled`] counts both. What is not here is the draft itself and the note beside
+//! it: both are the draft store's, and a settlement that moves a draft's note is handed the draft
+//! store to write it in. A draft store's lock is only ever taken inside this store's hold and
+//! never the other way round, so the two cannot wait on each other.
 //!
 //! # One store, one lock
 //!
@@ -49,13 +58,14 @@
 use std::path::{Path, PathBuf};
 
 use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::{SyncConflictId, SyncObjectId, SyncRevisionId};
+use kr_protocol::ids::{DraftId, DraftRevision, SyncConflictId, SyncObjectId, SyncRevisionId};
 use kr_protocol::mailbox::mailbox_size_bucket;
 use kr_protocol::scalars::{Bytes, Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::sync::{MAX_SYNC_CONFLICT_COPIES, SyncObjectKind};
 use serde::{Deserialize, Serialize};
 
 use super::SyncObject;
+use crate::drafts::{DraftStore, SyncCheckpoint as DraftCheckpoint};
 use crate::retry::UserAction;
 use crate::services::SyncPosition;
 
@@ -126,11 +136,13 @@ pub struct RequestRecord {
     /// The piece of work this is, which is the identity every exchange for it presents.
     pub work_id: Uuid,
     /// The object it publishes.
+    ///
+    /// A draft's own identity, for a draft: one collection holds one draft, under its identity.
     pub object_id: SyncObjectId,
     /// What kind of object it is.
     pub kind: SyncObjectKind,
     /// The revision it carries.
-    pub revision: SyncRevisionId,
+    pub revision: RequestRevision,
     /// The position it expects to replace.
     ///
     /// Null when this device believes nothing is there yet, which is the comparison a first
@@ -163,6 +175,56 @@ pub struct RequestRecord {
     pub last_signed_at_ms: Nullable<TimestampMs>,
     /// Where the request has got to.
     pub state: RequestState,
+}
+
+/// The revision one request carries, in the terms of what it publishes.
+///
+/// A settings object and a client's position name each write with a fresh revision of their own;
+/// a draft counts its own edits. Both are this device's, and neither is the position the service
+/// gives the write. The record says which it is rather than leaving the kind to imply it, because
+/// what a settlement writes from it differs: a setting's note lives in this store and a draft's in
+/// the draft store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum RequestRevision {
+    /// The revision this device gave a settings object or a client's position.
+    Object(SyncRevisionId),
+    /// This device's own revision of a draft.
+    Draft(DraftRevision),
+}
+
+impl RequestRevision {
+    /// Returns the object's revision, when the request publishes a settings object or a client's
+    /// position.
+    #[must_use]
+    pub const fn object(self) -> Option<SyncRevisionId> {
+        match self {
+            Self::Object(revision) => Some(revision),
+            Self::Draft(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for RequestRevision {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Object(revision) => std::fmt::Display::fmt(revision, formatter),
+            Self::Draft(revision) => std::fmt::Display::fmt(revision, formatter),
+        }
+    }
+}
+
+/// Returns the collection one object is published in.
+///
+/// A draft is named by the draft store's own rule and everything else by the synchronised half's,
+/// so a request, a publication and the service agree on one name whichever kind the object is.
+fn collection_of(kind: SyncObjectKind, object_id: SyncObjectId) -> String {
+    match kind {
+        SyncObjectKind::Draft => crate::drafts::draft_collection(DraftId::new(object_id.get())),
+        SyncObjectKind::Settings | SyncObjectKind::ClientSelection => {
+            super::sync_collection(kind, object_id)
+        }
+    }
 }
 
 /// Where one request has got to.
@@ -252,6 +314,12 @@ pub enum RequestState {
 }
 
 impl RequestRecord {
+    /// Returns the collection this request publishes in, which is what every call about it names.
+    #[must_use]
+    pub fn collection(&self) -> String {
+        collection_of(self.kind, self.object_id)
+    }
+
     /// Returns true when the work has been admitted and not sent.
     #[must_use]
     pub const fn admitted(&self) -> bool {
@@ -411,6 +479,14 @@ pub struct Publication {
     pub published_at_ms: TimestampMs,
 }
 
+impl Publication {
+    /// Returns the collection the object was published in.
+    #[must_use]
+    pub fn collection(&self) -> String {
+        collection_of(self.kind, self.object_id)
+    }
+}
+
 /// The privacy state this device records, durably.
 ///
 /// Durably, because section 24 records the generation before any subsystem is touched: a boundary
@@ -526,6 +602,20 @@ pub enum End {
     Nothing,
 }
 
+/// What running one step under the late-result rule did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InGeneration<T> {
+    /// The generation the work was started under is in force, and the step ran.
+    Applied(T),
+    /// Privacy mode fenced production or moved past that generation, so nothing ran.
+    Discarded {
+        /// The generation the work was started under.
+        produced_under: u64,
+        /// The generation in force now.
+        current: u64,
+    },
+}
+
 /// What settling one publication did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Settlement {
@@ -614,6 +704,17 @@ pub enum SyncError {
     #[error("request {work_id} has already been dispatched")]
     AlreadyDispatched {
         /// The request.
+        work_id: Uuid,
+    },
+    /// A call for this publication is out, and its answer is what settles it.
+    ///
+    /// A later attempt presents the same identity and the same bytes, so two attempts at once would
+    /// be one request sent twice with nobody able to say which answer came back. The attempt that
+    /// is out finishes first, and asking again afterwards either finds the publication settled or
+    /// makes the next attempt.
+    #[error("a call for request {work_id} is out; its answer settles it")]
+    InFlight {
+        /// The request the call is out for.
         work_id: Uuid,
     },
     /// The dispatch that was presented is another request's.
@@ -742,6 +843,9 @@ impl SyncError {
             | Self::Crypto(_) => ErrorCode::InvalidArgument,
             Self::Fenced { .. } | Self::LateResult { .. } => ErrorCode::PermissionDenied,
             Self::StaleCheckpoint { .. } | Self::ForkedHistory { .. } => ErrorCode::DraftConflict,
+            // What became of the publication is not known yet, and what makes it known is the
+            // answer to the call that is out rather than another one beside it.
+            Self::InFlight { .. } => ErrorCode::OutcomeUnknown,
             Self::Client(error) => error.code(),
         }
     }
@@ -759,6 +863,7 @@ impl SyncError {
             | Self::TooLarge { .. }
             | Self::NotThatObject { .. }
             | Self::AlreadyDispatched { .. }
+            | Self::InFlight { .. }
             | Self::OtherRequest { .. }
             | Self::DraftElsewhere { .. }
             | Self::NotAWrite { .. }
@@ -1123,7 +1228,7 @@ impl SyncStore {
                 work_id: self.fresh_id()?,
                 object_id,
                 kind: object.kind(),
-                revision: object.revision,
+                revision: RequestRevision::Object(object.revision),
                 // No note is no position, which is the comparison a first publication makes: it
                 // says nothing is there rather than naming a place nothing occupies.
                 expected: note.map_or(Nullable::null(), |note| Nullable::some(note.position)),
@@ -1303,6 +1408,132 @@ impl SyncStore {
                 _lock: owned,
             }),
         )
+    }
+
+    /// Makes one attempt at publishing a draft: the first, which admits the publication, or a later
+    /// one, which presents the publication already out for that revision again.
+    ///
+    /// A publication is one piece of work. Its identity is chosen when it is admitted and never
+    /// again, and its bytes are sealed once, so every attempt at it presents the same identity, the
+    /// same bytes and the same comparison, and a service that already ran it answers the later
+    /// attempt from its receipt rather than running it twice. Which publication an attempt belongs
+    /// to is the draft and the revision it carries. A draft edited since is other content, and so
+    /// another publication. So is one admitted under a privacy generation that is no longer in
+    /// force: no attempt now could publish its answer, and ending it is a reconciliation's work.
+    ///
+    /// Each attempt records the instant it is signed at, through [`RequestRecord::attempted_at`], in
+    /// the same replacement that writes the record, so a record that says it was sent always says
+    /// when, and the two instants a fence carries bound every attempt that was made.
+    ///
+    /// Admission and the first attempt are one step, under the hold the fence is decided in, so no
+    /// draft publication waits between the two for a fence to find: a fence that lands first refuses
+    /// the publication, and one that lands afterwards finds it recorded as sent. Nothing here sends
+    /// anything, and nothing makes an attempt on its own: section 23 retries nothing whose outcome is
+    /// unknown, so a later attempt is always a caller asking for one.
+    ///
+    /// The returned [`Attempt`] owns the dispatch. The request's lock is tried rather than waited
+    /// for, inside this store's hold, and a try waits on nothing, so the order the two locks are
+    /// taken in elsewhere is kept: a call already out for the publication refuses this attempt
+    /// instead of queueing behind it.
+    ///
+    /// `seal` runs only for a publication admitted here, inside the hold, so the ciphertext is made
+    /// under the generation the record names.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Fenced`] while privacy mode is on, [`SyncError::InFlight`] when a call
+    /// for the publication is out, whatever `seal` failed with, and [`SyncError::Storage`] when a
+    /// record or a lock cannot be read or written.
+    pub fn attempt_draft(
+        &self,
+        draft_id: DraftId,
+        revision: DraftRevision,
+        expected: Option<SyncPosition>,
+        signed_at: TimestampMs,
+        seal: impl FnOnce() -> Result<Vec<u8>>,
+    ) -> Result<Attempt> {
+        let object_id = SyncObjectId::new(draft_id.get());
+        let revision = RequestRevision::Draft(revision);
+        let guard = self.lock()?;
+        let outcome = (|| {
+            let privacy = self.read_privacy()?;
+            if privacy.fenced {
+                return Err(SyncError::Fenced {
+                    generation: privacy.generation.get(),
+                });
+            }
+            // The publication already out for this revision, under the generation in force. A
+            // record this build cannot read is not one an attempt can be made from, so it is left
+            // where it is and counted, as it is everywhere else.
+            let out =
+                self.read_requests()?
+                    .items
+                    .into_iter()
+                    .find_map(|record| match &record.state {
+                        RequestState::Dispatched { ciphertext }
+                            if record.kind == SyncObjectKind::Draft
+                                && record.object_id == object_id
+                                && record.revision == revision
+                                && record.produced_under == privacy.generation =>
+                        {
+                            Some((ciphertext.clone(), record))
+                        }
+                        _ => None,
+                    });
+            if let Some((ciphertext, held)) = out {
+                let Some(lock) = Lock::try_take(&self.named(held.work_id, CALLOUT_EXTENSION))?
+                else {
+                    return Err(SyncError::InFlight {
+                        work_id: held.work_id,
+                    });
+                };
+                let sent = held.attempted_at(signed_at);
+                self.write_request(&sent)?;
+                return Ok((sent, ciphertext, lock));
+            }
+
+            let ciphertext = Bytes::new(seal()?);
+            // A fresh identity nothing else can know yet, and its lock taken before its record is
+            // written, so there is no moment at which the record is on disk and nobody holds it.
+            let work_id = self.fresh_id()?;
+            let Some(lock) = Lock::try_take(&self.named(work_id, CALLOUT_EXTENSION))? else {
+                return Err(SyncError::InFlight { work_id });
+            };
+            let sent = RequestRecord {
+                work_id,
+                object_id,
+                kind: SyncObjectKind::Draft,
+                revision,
+                // No note is no position, which is the comparison a first publication makes.
+                expected: Nullable::from(expected),
+                produced_under: privacy.generation,
+                first_signed_at_ms: Nullable::null(),
+                last_signed_at_ms: Nullable::null(),
+                state: RequestState::Dispatched {
+                    ciphertext: ciphertext.clone(),
+                },
+            }
+            .attempted_at(signed_at);
+            if let Err(error) = self.write_request(&sent) {
+                // Nothing names this identity, so the lock it was given names nothing either.
+                drop(lock);
+                self.retire(work_id)?;
+                return Err(error);
+            }
+            Ok((sent, ciphertext, lock))
+        })();
+        drop(guard);
+        let (record, ciphertext, lock) = outcome?;
+        Ok(Attempt {
+            dispatch: Dispatch {
+                directory: self.directory.clone(),
+                work_id: record.work_id,
+                _lock: lock,
+            },
+            record,
+            ciphertext,
+            signed_at,
+        })
     }
 
     /// Closes one dispatched request the service will never execute, leaving no account.
@@ -1485,15 +1716,56 @@ impl SyncStore {
     /// a request somebody is still waiting on, and an answer is applied only where the record the
     /// store holds still expects one.
     ///
+    /// A draft's note is the draft store's rather than this store's, so an accepted draft
+    /// publication under the generation in force is [`Self::settle_draft`]'s to settle. This refuses
+    /// one rather than leave the note behind; every other answer about a draft it settles as it
+    /// settles a setting, because none of them writes a note.
+    ///
     /// # Errors
     ///
-    /// Returns [`SyncError::OtherRequest`] when the dispatch is held for a different request, and
-    /// [`SyncError::Storage`] when a record cannot be written or removed.
+    /// Returns [`SyncError::OtherRequest`] when the dispatch is held for a different request,
+    /// [`SyncError::DraftElsewhere`] for an accepted draft publication under the generation in
+    /// force, and [`SyncError::Storage`] when a record cannot be written or removed.
     pub fn settle(
         &self,
         dispatch: &Dispatch,
         record: &RequestRecord,
         outcome: Outcome,
+    ) -> Result<Settled> {
+        self.settle_noting(dispatch, record, outcome, None)
+    }
+
+    /// Applies what the service answered about one draft publication, and moves the draft's note in
+    /// the draft store it belongs to.
+    ///
+    /// Everything [`Self::settle`] does, with the note written where a draft's note lives. It is
+    /// written inside this store's hold and before the record that ends the request, for the reason
+    /// a setting's is: a stop between the two leaves the note ahead of a request that is still
+    /// counted, and the next settlement writes it again. It moves only for an accepted write, under
+    /// the generation in force, that this device's records can follow, and a note that already names
+    /// a later write stands, so an answer that is older news never takes it back.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::settle`], and whatever the draft store failed with when the note could not be
+    /// written, in which case the request is left where it was.
+    pub fn settle_draft(
+        &self,
+        dispatch: &Dispatch,
+        record: &RequestRecord,
+        outcome: Outcome,
+        drafts: &DraftStore,
+    ) -> Result<Settled> {
+        self.settle_noting(dispatch, record, outcome, Some(drafts))
+    }
+
+    /// Settles one request, writing its note in this store or in the draft store it is handed.
+    fn settle_noting(
+        &self,
+        dispatch: &Dispatch,
+        record: &RequestRecord,
+        outcome: Outcome,
+        drafts: Option<&DraftStore>,
     ) -> Result<Settled> {
         dispatch.owns(&self.directory, record.work_id)?;
         let path = self.named(record.work_id, REQUEST_EXTENSION);
@@ -1531,7 +1803,7 @@ impl SyncStore {
                     if let Some(replaced) = not_past(held.expected.as_ref().copied(), position) {
                         (RequestState::Diverged { position }, Some(replaced))
                     } else {
-                        self.accepted_at(&held, position, in_force)?
+                        self.accepted_at(&held, position, in_force, drafts)?
                     }
                 }
                 Outcome::Refused { retained } => (
@@ -1577,19 +1849,14 @@ impl SyncStore {
         held: &RequestRecord,
         position: SyncPosition,
         in_force: bool,
+        drafts: Option<&DraftStore>,
     ) -> Result<(RequestState, Option<SyncPosition>)> {
         // The note first, because it is the one thing here that is not an account. It
         // is production state a fenced generation has already had removed, so the
         // generation rule gates it; a stop between the two leaves the note ahead of a
         // request that is still counted, and the next reconciliation writes it again.
         let note = if in_force {
-            Some(self.write_checkpoint(
-                held.object_id,
-                SyncCheckpoint {
-                    position,
-                    published_revision: Nullable::some(held.revision),
-                },
-            )?)
+            Some(self.write_note(held, position, drafts)?)
         } else {
             None
         };
@@ -1610,6 +1877,48 @@ impl SyncStore {
             RequestState::Applied { position }
         };
         Ok((state, forked_at([note, Some(publication)])))
+    }
+
+    /// Moves the note beside the object one accepted write published, wherever that note lives, and
+    /// says where the answer stood against it.
+    ///
+    /// A setting's note is this store's. A draft's is the draft store's, and it is written there
+    /// under the same rule: a note that names a later write, or the same place under another name,
+    /// stands. A draft publication with no draft store to write in is refused rather than settled
+    /// without its note, because the next comparison would then name a place the object has left.
+    ///
+    /// The caller holds the lock.
+    fn write_note(
+        &self,
+        held: &RequestRecord,
+        position: SyncPosition,
+        drafts: Option<&DraftStore>,
+    ) -> Result<Standing> {
+        match held.revision {
+            RequestRevision::Object(revision) => self.write_checkpoint(
+                held.object_id,
+                SyncCheckpoint {
+                    position,
+                    published_revision: Nullable::some(revision),
+                },
+            ),
+            RequestRevision::Draft(revision) => {
+                let Some(drafts) = drafts else {
+                    return Err(SyncError::DraftElsewhere {
+                        collection: held.collection(),
+                    });
+                };
+                drafts
+                    .record_checkpoint(
+                        DraftId::new(held.object_id.get()),
+                        DraftCheckpoint {
+                            position,
+                            published_revision: Nullable::some(revision),
+                        },
+                    )
+                    .map_err(SyncError::from)
+            }
+        }
     }
 
     /// Finishes one settled request, writing what its answer still owes the store.
@@ -1787,6 +2096,42 @@ impl SyncStore {
                 copy: kept.map(|copy: ConflictCopy| copy.conflict_id),
                 note,
             })
+        })();
+        drop(guard);
+        applied
+    }
+
+    /// Runs one step under the late-result rule: only while production is not fenced and the
+    /// generation `produced_under` names is the one in force.
+    ///
+    /// It is what a fetch of a draft applies its answer through. The copy it keeps beside the draft
+    /// and the note it writes belong to the generation the fetch was started under, and both are in
+    /// the draft store, so the generation is read and `apply` runs under one hold of this store's
+    /// lock: a cleanup cannot land between the check and the writes. The draft store's own lock is
+    /// taken inside that hold, which is the one order the two are ever taken in.
+    ///
+    /// Returns what `apply` produced, or, under a generation privacy mode has fenced or moved past,
+    /// that nothing ran and which generation is in force instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever `apply` failed with, and [`SyncError::Storage`] when the privacy record
+    /// cannot be read.
+    pub fn apply_under_generation<T>(
+        &self,
+        produced_under: u64,
+        apply: impl FnOnce() -> Result<T>,
+    ) -> Result<InGeneration<T>> {
+        let guard = self.lock()?;
+        let applied = (|| {
+            let privacy = self.read_privacy()?;
+            if privacy.fenced || privacy.generation.get() != produced_under {
+                return Ok(InGeneration::Discarded {
+                    produced_under,
+                    current: privacy.generation.get(),
+                });
+            }
+            Ok(InGeneration::Applied(apply()?))
         })();
         drop(guard);
         applied
@@ -2532,6 +2877,24 @@ pub enum Claimed {
     Gone,
 }
 
+/// One attempt at a publication, and the dispatch it is made under.
+///
+/// Holding it is holding the dispatch: nothing else may decide what became of the request until it
+/// is dropped, and dropping it says this call is over, never that the request stopped at the
+/// service.
+#[derive(Debug)]
+pub struct Attempt {
+    /// The dispatch this attempt is made under.
+    pub dispatch: Dispatch,
+    /// The request's record as this attempt left it: the identity and the comparison every attempt
+    /// presents, and the earliest and the latest instant any attempt so far was signed at.
+    pub record: RequestRecord,
+    /// The sealed object every attempt at this publication carries, byte for byte.
+    pub ciphertext: Bytes,
+    /// The instant this attempt is signed at, which the record's two signing times now bound.
+    pub signed_at: TimestampMs,
+}
+
 /// Encodes an object and holds it to the size the service will actually take.
 ///
 /// The bound is on the **padded** length, because padding is what is sealed and what a service
@@ -2604,7 +2967,10 @@ fn largest_publishable_object() -> u64 {
 /// A removal takes a place in the order like any other answer, and the comparison reads it the same
 /// way: two answers that both remove the object at one place in the order are one removal said
 /// twice, and a removal and a write claiming one place are two histories.
-fn standing(held: SyncPosition, offered: SyncPosition) -> Standing {
+///
+/// A draft's note is held to this rule as well, so there is one answer to where a position stands
+/// whichever store keeps the note.
+pub(crate) fn standing(held: SyncPosition, offered: SyncPosition) -> Standing {
     match offered.write_sequence.cmp(&held.write_sequence) {
         std::cmp::Ordering::Greater => Standing::Later,
         std::cmp::Ordering::Equal if offered.revision == held.revision => Standing::Same,

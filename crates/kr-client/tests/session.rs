@@ -21,6 +21,7 @@ use kr_client::services::{
     ManagedService, NullService, RelayLeaseService, ServiceClients, SyncBackupService,
     SyncExchanged, SyncPosition, SyncRequestFence, SyncRequestStatus, SyncRevision,
 };
+use kr_client::sync::SyncStore;
 
 /// The position a service reports for the nth write of a collection.
 fn at(write_sequence: u64) -> SyncPosition {
@@ -1400,7 +1401,12 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
         .await
         .expect("the other device's write");
 
-    let sync = DraftSync::new(Arc::clone(&service) as Arc<_>, Arc::new(ReversingSealer));
+    // The device's synchronisation store, where each publication keeps its one record.
+    let sync = DraftSync::new(
+        Arc::clone(&service) as Arc<_>,
+        Arc::new(ReversingSealer),
+        SyncStore::open(directory.path().join("sync")).expect("a sync store"),
+    );
     let published = sync
         .publish(&store, draft.draft_id, draft.revision, TimestampMs::new(3))
         .await

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use kr_client::ClientError;
 use kr_client::drafts::{
     Draft, DraftSealer, DraftStore, DraftSync, DraftTarget, NotSubmittable,
-    Published as DraftPublished,
+    Published as DraftPublished, SyncCheckpoint as DraftCheckpoint, draft_collection,
 };
 use kr_client::services::{
     ServiceFuture, SyncBackupService, SyncExchanged, SyncPosition, SyncRequestFence,
@@ -18,15 +18,16 @@ use kr_client::services::{
 };
 use kr_client::sync::{
     Claimed, ClientSelection, ConflictCopy, Dispatch, Outcome, PrivacyRecord, Publication,
-    Published, Reconciled, RequestRecord, RequestState, Resolutions, Restored, SettingValue,
-    Settlement, StorageFeature, SyncBody, SyncCheckpoint, SyncClient, SyncError, SyncObject,
-    SyncSettings, SyncStore, fresh_object_id, fresh_revision, sync_collection,
+    Published, Reconciled, RequestRecord, RequestRevision, RequestState, Resolutions, Restored,
+    SettingValue, Settlement, StorageFeature, SyncBody, SyncCheckpoint, SyncClient, SyncError,
+    SyncObject, SyncSettings, SyncStore, fresh_object_id, fresh_revision, sync_collection,
 };
 use kr_crypto::envelope::{open_sync_object, seal_sync_object};
 use kr_crypto::secret::{Secret, SymmetricKey};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{
-    AgentBindingRevision, ApplicationInstanceId, DeviceId, SessionId, SyncConflictId, SyncObjectId,
+    AgentBindingRevision, ApplicationInstanceId, DeviceId, DraftRevision, SessionId,
+    SyncConflictId, SyncObjectId,
 };
 use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::sync::{MAX_SYNC_CONFLICT_COPIES, SyncObjectKind};
@@ -1699,6 +1700,7 @@ async fn a_draft_is_synchronised_as_a_draft_and_never_as_an_execution_request() 
     let drafts = DraftSync::new(
         Arc::clone(&service) as Arc<dyn SyncBackupService>,
         Arc::clone(&sealer),
+        SyncStore::open(directory.path().join("sync")).expect("a store"),
     );
     assert!(matches!(
         drafts
@@ -1779,6 +1781,894 @@ async fn a_draft_is_synchronised_as_a_draft_and_never_as_an_execution_request() 
             .await,
         Err(SyncError::Encoding(_))
     ));
+}
+
+// ---------------------------------------------------------------------------
+// KR-REQ-20.13 and KR-REQ-24.28: one account per draft publication
+// ---------------------------------------------------------------------------
+
+/// What a draft in these tests is written for.
+fn draft_target() -> DraftTarget {
+    DraftTarget::session(SessionId::new(Uuid::from_bytes([3; 16]))).in_application(
+        ApplicationInstanceId::new(Uuid::from_bytes([4; 16])),
+        AgentBindingRevision::new(1),
+    )
+}
+
+/// One device's drafts, over one directory: its draft store, its draft half over the device's
+/// synchronisation store, and the settings client over that same store, which is the client
+/// privacy mode drives.
+///
+/// Opening them again over the same directory is what a restart looks like: everything a process
+/// held is gone and what is on disk is all there is.
+fn draft_device(
+    directory: &std::path::Path,
+    service: Arc<dyn SyncBackupService>,
+) -> (DraftStore, DraftSync, SyncClient) {
+    let sealer: Arc<dyn DraftSealer> = Arc::new(DeviceSealer::new(0x5a));
+    let drafts = DraftStore::open(directory.join("drafts"), device(2)).expect("a draft store");
+    let sync = DraftSync::new(
+        Arc::clone(&service),
+        Arc::clone(&sealer),
+        SyncStore::open(directory.join("sync")).expect("the device's sync store"),
+    );
+    let client = SyncClient::new(
+        service,
+        sealer,
+        SyncStore::open(directory.join("sync")).expect("the same store"),
+    );
+    (drafts, sync, client)
+}
+
+/// The one record the device's store holds.
+fn the_only_record(client: &SyncClient) -> RequestRecord {
+    let requests = client.store().requests().expect("requests");
+    assert!(requests.unreadable.is_empty());
+    assert_eq!(
+        requests.items.len(),
+        1,
+        "one publication, one record: {:?}",
+        requests.items
+    );
+    requests.items[0].clone()
+}
+
+/// How many accounts of what left the device's store holds, of either kind.
+fn accounts(client: &SyncClient) -> usize {
+    let left = client.store().what_left().expect("what left");
+    left.requests.len() + left.publications.len()
+}
+
+/// Another device's write of the same draft, sealed under the key every device of this suite shares.
+fn their_write_of(draft: &Draft) -> (Draft, Vec<u8>) {
+    let theirs = Draft {
+        device_id: device(9),
+        revision: DraftRevision::new(3),
+        text: "what the other device had".to_owned(),
+        ..draft.clone()
+    };
+    let sealed = DeviceSealer::new(0x5a)
+        .seal(&DraftStore::encode_payload(&theirs).expect("canonical bytes"))
+        .expect("sealed");
+    (theirs, sealed)
+}
+
+#[tokio::test]
+async fn a_draft_publication_keeps_one_account_in_the_store_settings_keep_theirs_in() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let draft = drafts
+        .create(
+            draft_target(),
+            "a prompt I have not sent".to_owned(),
+            TimestampMs::new(NOW),
+        )
+        .expect("a draft");
+
+    // The service applies the write and the answer never comes back.
+    service.lose_the_next_answer().await;
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(NOW),
+    )
+    .await
+    .expect_err("the answer never came back");
+
+    // One record, in the store the settings client counts from, written before the call left and
+    // naming exactly what the call carried.
+    let record = the_only_record(&client);
+    assert_eq!(record.kind, SyncObjectKind::Draft);
+    assert_eq!(record.object_id, SyncObjectId::new(draft.draft_id.get()));
+    assert_eq!(record.revision, RequestRevision::Draft(draft.revision));
+    assert_eq!(record.collection(), draft_collection(draft.draft_id));
+    assert!(record.dispatched());
+    assert_eq!(
+        record.signing_times(),
+        Some((TimestampMs::new(NOW), TimestampMs::new(NOW)))
+    );
+    let sent = service.exchanges().await;
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].request_id, record.work_id);
+    assert_eq!(sent[0].collection, record.collection());
+    assert_eq!(sent[0].signed_at_ms, NOW);
+    assert_eq!(record.ciphertext(), Some(sent[0].ciphertext.as_slice()));
+
+    // The barrier privacy mode measures counts it, and what left names it.
+    assert_eq!(client.outstanding().expect("a count"), 1);
+    let exported = client.exported().expect("exported");
+    assert_eq!(exported.len(), 1);
+    assert!(
+        exported[0]
+            .kind
+            .contains("synchronised draft, sent without an answer"),
+        "{exported:?}"
+    );
+    assert!(
+        exported[0]
+            .reference
+            .contains(&draft_collection(draft.draft_id))
+    );
+    assert_eq!(exported[0].left_at_ms, TimestampMs::new(NOW));
+
+    // And the draft is exactly as the person left it.
+    assert_eq!(drafts.load(draft.draft_id).expect("the draft"), draft);
+}
+
+#[tokio::test]
+async fn a_later_attempt_at_a_draft_publication_presents_its_identity_and_its_bytes() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let draft = drafts
+        .create(draft_target(), "a prompt".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+
+    service.lose_the_next_answer().await;
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(NOW),
+    )
+    .await
+    .expect_err("the answer never came back");
+
+    // The person asks again. It is the same publication, so it is the same request: the identity,
+    // the bytes and the comparison are the first attempt's, and only the signing time is its own.
+    let published = sync
+        .publish(
+            &drafts,
+            draft.draft_id,
+            draft.revision,
+            TimestampMs::new(NOW + 30),
+        )
+        .await
+        .expect("answered");
+    assert_eq!(published, DraftPublished::Accepted { position: at(1) });
+    let sent = service.exchanges().await;
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1].request_id, sent[0].request_id);
+    assert_eq!(sent[1].ciphertext, sent[0].ciphertext);
+    assert_eq!(sent[1].expected, sent[0].expected);
+    assert_eq!(sent[1].collection, sent[0].collection);
+    assert_eq!(
+        (sent[0].signed_at_ms, sent[1].signed_at_ms),
+        (NOW, NOW + 30)
+    );
+
+    // The service answered from its receipt: the one write the first attempt made.
+    assert_eq!(
+        service.stored(&sent[0].collection).await.expect("stored").0,
+        at(1)
+    );
+    assert_eq!(
+        drafts.checkpoint(draft.draft_id).expect("a note"),
+        Some(DraftCheckpoint {
+            position: at(1),
+            published_revision: Nullable::some(draft.revision),
+        })
+    );
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    let left = client.store().what_left().expect("what left");
+    assert!(left.requests.is_empty());
+    assert_eq!(left.publications.len(), 1, "one publication, one account");
+    assert_eq!(left.publications.items[0].kind, SyncObjectKind::Draft);
+    assert_eq!(
+        left.publications.items[0].published_at_ms,
+        TimestampMs::new(NOW),
+        "the account says when the content first left"
+    );
+
+    // Edited since, it is other content and so another publication, under an identity of its own.
+    let edited = drafts
+        .update(
+            &Draft {
+                text: "a prompt, edited".to_owned(),
+                ..draft.clone()
+            },
+            TimestampMs::new(NOW + 40),
+        )
+        .expect("an edit");
+    assert_eq!(
+        sync.publish(
+            &drafts,
+            edited.draft_id,
+            edited.revision,
+            TimestampMs::new(NOW + 50),
+        )
+        .await
+        .expect("answered"),
+        DraftPublished::Accepted { position: at(2) }
+    );
+    let sent = service.exchanges().await;
+    assert_eq!(sent.len(), 3);
+    assert_ne!(sent[2].request_id, sent[0].request_id);
+    assert_eq!(sent[2].expected, Some(at(1)));
+}
+
+#[tokio::test]
+async fn every_attempt_at_a_draft_publication_lies_between_the_two_instants_its_fence_carries() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let draft = drafts
+        .create(draft_target(), "a prompt".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+
+    // Two attempts, neither of which arrives, the second signed on a clock that was put back.
+    service.drop_the_next_request().await;
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(NOW + 10),
+    )
+    .await
+    .expect_err("it never arrived");
+    service.drop_the_next_request().await;
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(NOW + 5),
+    )
+    .await
+    .expect_err("it never arrived");
+    let record = the_only_record(&client);
+    assert_eq!(
+        record.signing_times(),
+        Some((TimestampMs::new(NOW + 5), TimestampMs::new(NOW + 10))),
+        "the earliest and the latest, not the first and the last"
+    );
+    let sent = service.exchanges().await;
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0].request_id, sent[1].request_id);
+    assert_eq!(sent[0].ciphertext, sent[1].ciphertext);
+
+    // Privacy mode moves past the generation that admitted it. The service holds no receipt, so the
+    // cleanup fences the request, carrying both instants, and every attempt made lies between them.
+    client.fence(1).expect("fenced");
+    let cancelled = client
+        .cancel_undispatched(1, TimestampMs::new(NOW + 20))
+        .await
+        .expect("cancelled");
+    assert_eq!(
+        service.fence_requests().await,
+        vec![Fence {
+            collection: draft_collection(draft.draft_id),
+            request_id: record.work_id,
+            first_signed_at_ms: NOW + 5,
+            last_signed_at_ms: NOW + 10,
+        }]
+    );
+    assert_eq!(cancelled.reconciled.fenced, 1);
+    assert_eq!(
+        cancelled.reconciled.accounts_kept, 0,
+        "the service says nothing ran under it"
+    );
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    assert_eq!(client.exported().expect("exported"), Vec::new());
+}
+
+#[tokio::test]
+async fn a_stop_between_any_two_writes_of_a_draft_publication_leaves_one_account() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let draft = drafts
+        .create(draft_target(), "a prompt".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+    assert_eq!(accounts(&client), 0, "nothing has been written yet");
+
+    // Stopped after the record that says the content was sent, and before an answer. The content
+    // may have left, so it is counted, and it is one account.
+    service.lose_the_next_answer().await;
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(NOW),
+    )
+    .await
+    .expect_err("the answer never came back");
+    let dispatched = the_only_record(&client);
+    let path = directory
+        .path()
+        .join("sync")
+        .join(format!("{}.request", dispatched.work_id));
+    assert_eq!(client.outstanding().expect("a count"), 1);
+    assert_eq!(accounts(&client), 1);
+    assert_eq!(client.exported().expect("exported").len(), 1);
+
+    // Stopped after the note the answer moved, which the draft store holds, and before the answer
+    // reached the record. The record is what counts, so the request is still waiting: one account.
+    drafts
+        .record_checkpoint(
+            draft.draft_id,
+            DraftCheckpoint {
+                position: at(1),
+                published_revision: Nullable::some(draft.revision),
+            },
+        )
+        .expect("a note");
+    assert_eq!(client.outstanding().expect("a count"), 1);
+    assert_eq!(accounts(&client), 1);
+
+    // Stopped after the answer reached the record and before the account it owes was written. The
+    // request is over, so nothing counts it, and the next read writes the account: one entry.
+    leave_record_as_it_was(
+        &path,
+        &RequestRecord {
+            state: RequestState::Applied { position: at(1) },
+            ..dispatched.clone()
+        },
+    );
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    let exported = client.exported().expect("exported");
+    assert_eq!(
+        exported.len(),
+        1,
+        "one publication is one entry: {exported:?}"
+    );
+    assert!(exported[0].reference.contains("write 1"));
+    assert!(
+        exported[0]
+            .reference
+            .contains(&draft_collection(draft.draft_id))
+    );
+    assert_eq!(exported[0].left_at_ms, TimestampMs::new(NOW));
+    assert!(!path.exists(), "the record goes once its account stands");
+
+    // Stopped after the account was written and before the record went. Still one account.
+    leave_record_as_it_was(
+        &path,
+        &RequestRecord {
+            state: RequestState::Applied { position: at(1) },
+            ..dispatched.clone()
+        },
+    );
+    assert_eq!(accounts(&client), 1);
+    assert_eq!(client.exported().expect("exported").len(), 1);
+    assert!(!path.exists());
+
+    // The draft store has one draft and the note, and nothing of the publication beyond them.
+    assert_eq!(
+        drafts.list().expect("a listing").drafts,
+        vec![draft.clone()]
+    );
+    assert_eq!(
+        drafts
+            .checkpoint(draft.draft_id)
+            .expect("a note")
+            .map(|note| note.position),
+        Some(at(1))
+    );
+}
+
+#[tokio::test]
+async fn a_draft_publication_under_an_identity_another_request_wore_leaves_no_account() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let draft = drafts
+        .create(draft_target(), "a prompt".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+
+    // The service compared these bytes with the receipt the identity already has and declined to
+    // run them, so nothing of this publication is on the service and nothing will be.
+    service.give_the_next_identity_to_another_request().await;
+    let error = sync
+        .publish(
+            &drafts,
+            draft.draft_id,
+            draft.revision,
+            TimestampMs::new(NOW),
+        )
+        .await
+        .expect_err("one identity, two requests");
+    assert_eq!(error.code(), ErrorCode::IdConflict);
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    assert_eq!(accounts(&client), 0);
+    assert_eq!(drafts.checkpoint(draft.draft_id).expect("a note"), None);
+    assert_eq!(drafts.load(draft.draft_id).expect("the draft"), draft);
+}
+
+#[tokio::test]
+async fn a_second_call_for_a_draft_publication_that_is_out_is_refused_rather_than_sent_beside_it() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(GatedService::new());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let sync = Arc::new(sync);
+    let draft = drafts
+        .create(draft_target(), "a prompt".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+
+    let first = tokio::spawn({
+        let (sync, drafts) = (Arc::clone(&sync), drafts.clone());
+        async move {
+            sync.publish(
+                &drafts,
+                draft.draft_id,
+                draft.revision,
+                TimestampMs::new(NOW),
+            )
+            .await
+        }
+    });
+    service.wait_for_a_publication().await;
+    let record = the_only_record(&client);
+
+    // The same publication, asked for again while its call is out. Sending it beside the first
+    // would be one request twice with nobody able to say which answer came back.
+    let error = sync
+        .publish(
+            &drafts,
+            draft.draft_id,
+            draft.revision,
+            TimestampMs::new(NOW + 1),
+        )
+        .await
+        .expect_err("a call is out");
+    assert!(
+        matches!(error, SyncError::InFlight { work_id } if work_id == record.work_id),
+        "{error:?}"
+    );
+    assert_eq!(error.code(), ErrorCode::OutcomeUnknown);
+    assert_eq!(
+        the_only_record(&client),
+        record,
+        "nothing was written for it"
+    );
+
+    service.let_it_go();
+    assert_eq!(
+        first.await.expect("the task finished").expect("answered"),
+        DraftPublished::Accepted { position: at(1) }
+    );
+    assert_eq!(service.inner.exchanges().await.len(), 1);
+    assert_eq!(client.outstanding().expect("a count"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// KR-REQ-20.13 and KR-REQ-24.28: a draft publication whose answer was lost
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_restart_between_the_dispatch_and_the_answer_settles_the_draft_by_asking_about_it() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let draft = {
+        let (drafts, sync, _) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+        let draft = drafts
+            .create(draft_target(), "a prompt".to_owned(), TimestampMs::new(NOW))
+            .expect("a draft");
+        service.lose_the_next_answer().await;
+        sync.publish(
+            &drafts,
+            draft.draft_id,
+            draft.revision,
+            TimestampMs::new(NOW),
+        )
+        .await
+        .expect_err("the answer never came back");
+        draft
+    };
+
+    // The process ends and a new one opens the same stores. What is on disk is all it has.
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    assert_eq!(client.outstanding().expect("a count"), 1);
+    let record = the_only_record(&client);
+
+    let reconciled = sync
+        .reconcile_unsettled(&drafts, TimestampMs::new(NOW + 60))
+        .await
+        .expect("reconciled");
+    assert_eq!(reconciled.settled, 1);
+    assert_eq!(reconciled.unresolved, 0);
+    assert_eq!(reconciled.unsettled, 0);
+    // It asked about the request's own identity, and sent nothing again.
+    assert_eq!(
+        service.status_queries().await,
+        vec![(draft_collection(draft.draft_id), record.work_id)]
+    );
+    assert_eq!(service.exchanges().await.len(), 1);
+
+    // The note moved to where the receipt says this write left the draft, naming this revision.
+    assert_eq!(
+        drafts.checkpoint(draft.draft_id).expect("a note"),
+        Some(DraftCheckpoint {
+            position: at(1),
+            published_revision: Nullable::some(draft.revision),
+        })
+    );
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    let exported = client.exported().expect("exported");
+    assert_eq!(exported.len(), 1);
+    assert_eq!(exported[0].kind, "synchronised draft");
+    assert!(exported[0].reference.contains("write 1"));
+
+    // A settled draft is still a draft nobody sent. The text is the person's, and the one path
+    // towards a submission answers a question and performs nothing.
+    let held = drafts.load(draft.draft_id).expect("the draft");
+    assert_eq!(held, draft);
+    assert_eq!(held.submission(), Ok(&draft.target));
+}
+
+#[tokio::test]
+async fn a_lost_answer_to_a_draft_the_service_refused_brings_the_other_content_down_beside_it() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let draft = drafts
+        .create(draft_target(), "mine".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+    let (theirs, sealed) = their_write_of(&draft);
+    service
+        .compare_exchange(
+            &draft_collection(draft.draft_id),
+            fresh_request_id(),
+            NOW,
+            None,
+            &sealed,
+        )
+        .await
+        .expect("the other device's write");
+
+    // This device's comparison is refused, and the answer is lost on its way back.
+    service.lose_the_next_answer().await;
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(NOW),
+    )
+    .await
+    .expect_err("the answer never came back");
+    assert_eq!(client.outstanding().expect("a count"), 1);
+
+    let reconciled = sync
+        .reconcile_unsettled(&drafts, TimestampMs::new(NOW + 1))
+        .await
+        .expect("reconciled");
+    assert_eq!(reconciled.settled, 1);
+    assert_eq!(reconciled.copies_not_taken, 0);
+    assert_eq!(reconciled.unsettled, 0);
+
+    // The local draft is exactly as it was, and the other device's content is beside it.
+    assert_eq!(drafts.load(draft.draft_id).expect("the draft"), draft);
+    let listing = drafts.list().expect("a listing");
+    assert_eq!(listing.drafts.len(), 2);
+    let copy = listing
+        .drafts
+        .iter()
+        .find(|held| held.draft_id != draft.draft_id)
+        .expect("the copy");
+    assert_eq!(copy.conflict_of, Nullable::some(draft.draft_id));
+    assert_eq!(copy.text, theirs.text);
+    assert_eq!(
+        drafts.checkpoint(draft.draft_id).expect("a note"),
+        Some(DraftCheckpoint {
+            position: at(1),
+            published_revision: Nullable::null(),
+        }),
+        "the note names where the other device's write stands, and no revision of this device's"
+    );
+
+    // The service kept the refused write, so the account of it stays and says it can be dropped.
+    let exported = client.exported().expect("exported");
+    assert_eq!(exported.len(), 1);
+    assert!(exported[0].kind.contains("kept as a copy by the service"));
+    assert!(exported[0].deletable);
+}
+
+#[tokio::test]
+async fn a_draft_publication_the_service_holds_no_receipt_for_stays_counted_under_its_generation() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let draft = drafts
+        .create(draft_target(), "a prompt".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+    service.drop_the_next_request().await;
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(NOW),
+    )
+    .await
+    .expect_err("it never arrived");
+
+    // Each pass asks, and while the generation that admitted it is in force nothing ends it.
+    for pass in 1..=2 {
+        let reconciled = sync
+            .reconcile_unsettled(&drafts, TimestampMs::new(NOW + pass))
+            .await
+            .expect("reconciled");
+        assert_eq!(reconciled.unresolved, 1);
+        assert_eq!(reconciled.settled + reconciled.fenced, 0);
+        assert_eq!(reconciled.unsettled, 1);
+    }
+    assert_eq!(service.status_queries().await.len(), 2);
+    assert!(service.fence_requests().await.is_empty());
+
+    // The settings client leaves a draft under its generation to the draft half: it asks nothing,
+    // and it counts the draft as the barrier still waiting.
+    let by_settings = client
+        .reconcile_unsettled(TimestampMs::new(NOW + 3))
+        .await
+        .expect("reconciled");
+    assert_eq!(by_settings.unresolved, 1);
+    assert_eq!(by_settings.unsettled, 1);
+    assert_eq!(service.status_queries().await.len(), 2);
+    assert_eq!(client.outstanding().expect("a count"), 1);
+    assert_eq!(drafts.checkpoint(draft.draft_id).expect("a note"), None);
+}
+
+#[tokio::test]
+async fn a_draft_publication_privacy_mode_has_moved_past_is_ended_by_the_settings_clients_cleanup()
+{
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+
+    // One publication applied with its answer lost, and one that never arrived.
+    let landed = drafts
+        .create(draft_target(), "landed".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+    service.lose_the_next_answer().await;
+    sync.publish(
+        &drafts,
+        landed.draft_id,
+        landed.revision,
+        TimestampMs::new(NOW),
+    )
+    .await
+    .expect_err("the answer never came back");
+    let lost = drafts
+        .create(draft_target(), "lost".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+    service.drop_the_next_request().await;
+    sync.publish(&drafts, lost.draft_id, lost.revision, TimestampMs::new(NOW))
+        .await
+        .expect_err("it never arrived");
+    assert_eq!(client.outstanding().expect("a count"), 2);
+
+    // A service that cannot be asked to end a request leaves the barrier where it was.
+    client.fence(3).expect("fenced");
+    service.stop_fencing_requests().await;
+    let unreachable = client
+        .cancel_undispatched(3, TimestampMs::new(NOW + 1))
+        .await
+        .expect("cancelled");
+    assert_eq!(unreachable.reconciled.settled, 1, "the receipt answered");
+    assert_eq!(unreachable.reconciled.unresolved, 1);
+    assert_eq!(unreachable.in_flight, 1);
+
+    // Once it can be, the cleanup ends it: the status query finds no receipt, and the fence in the
+    // same pass says nothing ran, so nothing of it is anywhere.
+    service.answer_fences_again().await;
+    let cancelled = client
+        .cancel_undispatched(3, TimestampMs::new(NOW + 2))
+        .await
+        .expect("cancelled");
+    assert_eq!(cancelled.reconciled.fenced, 1);
+    assert_eq!(cancelled.reconciled.accounts_kept, 0);
+    assert_eq!(cancelled.in_flight, 0);
+    assert_eq!(client.outstanding().expect("a count"), 0);
+
+    // The one that landed is the account of what left, and neither answer moved a note: both
+    // belong to a generation privacy mode has closed.
+    let exported = client.exported().expect("exported");
+    assert_eq!(exported.len(), 1, "{exported:?}");
+    assert!(
+        exported[0]
+            .reference
+            .contains(&draft_collection(landed.draft_id))
+    );
+    assert_eq!(drafts.checkpoint(landed.draft_id).expect("a note"), None);
+    assert_eq!(drafts.checkpoint(lost.draft_id).expect("a note"), None);
+}
+
+#[tokio::test]
+async fn a_draft_publication_fenced_after_its_receipt_was_swept_keeps_the_account_of_what_left() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let draft = drafts
+        .create(draft_target(), "a prompt".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+    service.lose_the_next_answer().await;
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(NOW),
+    )
+    .await
+    .expect_err("the answer never came back");
+    service
+        .sweep_the_receipt(the_only_record(&client).work_id)
+        .await;
+
+    // Long enough later that nothing depends on how soon the fence follows. The service swept a
+    // receipt an attempt under this identity could have borne, so it cannot say nothing ran: the
+    // fence still ends the request, and the account stays.
+    let after = NOW + A_LONG_TIME_MS;
+    service.its_clock_reads(after).await;
+    client.fence(2).expect("fenced");
+    let cancelled = client
+        .cancel_undispatched(2, TimestampMs::new(after))
+        .await
+        .expect("cancelled");
+    assert_eq!(cancelled.reconciled.fenced, 1);
+    assert_eq!(cancelled.reconciled.accounts_kept, 1);
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    let exported = client.exported().expect("exported");
+    assert_eq!(exported.len(), 1);
+    assert!(exported[0].kind.contains("never accounted for"));
+    assert!(
+        exported[0]
+            .reference
+            .contains(&draft_collection(draft.draft_id))
+    );
+    assert_eq!(exported[0].left_at_ms, TimestampMs::new(NOW));
+}
+
+#[tokio::test]
+async fn an_answer_about_a_draft_that_is_older_news_never_moves_its_note_back() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let draft = drafts
+        .create(draft_target(), "mine".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+
+    // This device's write lands at the first place and its answer is lost. Another device then
+    // writes over it, and a fetch brings that down, so the note names the second place.
+    service.lose_the_next_answer().await;
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(NOW),
+    )
+    .await
+    .expect_err("the answer never came back");
+    let (_, sealed) = their_write_of(&draft);
+    service
+        .compare_exchange(
+            &draft_collection(draft.draft_id),
+            fresh_request_id(),
+            NOW,
+            Some(at(1)),
+            &sealed,
+        )
+        .await
+        .expect("the other device's write");
+    sync.fetch_beside(&drafts, draft.draft_id, TimestampMs::new(NOW + 1))
+        .await
+        .expect("fetched");
+    let learnt = DraftCheckpoint {
+        position: at(2),
+        published_revision: Nullable::null(),
+    };
+    assert_eq!(
+        drafts.checkpoint(draft.draft_id).expect("a note"),
+        Some(learnt)
+    );
+
+    // The lost answer is settled now, and it is about the write before the one the note names. It
+    // is recorded as what left, and the note stays where the later answer put it.
+    let reconciled = sync
+        .reconcile_unsettled(&drafts, TimestampMs::new(NOW + 2))
+        .await
+        .expect("reconciled");
+    assert_eq!(reconciled.settled, 1);
+    assert_eq!(reconciled.diverged, 0, "older news is not another history");
+    assert_eq!(
+        drafts.checkpoint(draft.draft_id).expect("a note"),
+        Some(learnt)
+    );
+    let published = client.store().publications().expect("records");
+    assert_eq!(published.len(), 1);
+    assert_eq!(published.items[0].position, at(1));
+}
+
+#[tokio::test]
+async fn an_accepted_draft_answered_at_the_place_it_replaced_is_never_recorded_as_applied() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let draft = drafts
+        .create(draft_target(), "one".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+    assert_eq!(
+        sync.publish(
+            &drafts,
+            draft.draft_id,
+            draft.revision,
+            TimestampMs::new(NOW)
+        )
+        .await
+        .expect("published"),
+        DraftPublished::Accepted { position: at(1) }
+    );
+    let note = drafts
+        .checkpoint(draft.draft_id)
+        .expect("a note")
+        .expect("one was written");
+
+    // The next write is accepted at the very place it replaced, under another name: a service
+    // whose history forked. It is not a later state of the draft this device published.
+    let edited = drafts
+        .update(
+            &Draft {
+                text: "two".to_owned(),
+                ..draft.clone()
+            },
+            TimestampMs::new(NOW + 1),
+        )
+        .expect("an edit");
+    let forked_at = SyncPosition::at(1, SyncRevision::new(Uuid::from_bytes([0xee; 16])));
+    service.applies_the_next_write_at(forked_at).await;
+    let error = sync
+        .publish(
+            &drafts,
+            edited.draft_id,
+            edited.revision,
+            TimestampMs::new(NOW + 1),
+        )
+        .await
+        .expect_err("another history");
+    assert!(
+        matches!(error, SyncError::ForkedHistory { found, .. } if found == forked_at),
+        "{error:?}"
+    );
+
+    // The request's own record keeps the account of what left, the note stays where this device's
+    // own write left it, and nothing is counted as waiting.
+    assert_eq!(
+        the_only_record(&client).state,
+        RequestState::Diverged {
+            position: forked_at
+        }
+    );
+    assert_eq!(
+        drafts.checkpoint(draft.draft_id).expect("a note"),
+        Some(note)
+    );
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    assert!(
+        client
+            .exported()
+            .expect("exported")
+            .iter()
+            .any(|entry| entry.kind.contains("under another history"))
+    );
 }
 
 // ---------------------------------------------------------------------------
