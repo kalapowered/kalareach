@@ -240,6 +240,36 @@ mod tests {
         assert_eq!(map.len(), 1);
     }
 
+    /// KR-REQ-17.43: the relay mode an endpoint is built with is a custom map of exactly the
+    /// selected relays: every one of them, nothing else, and never the public default or staging
+    /// map.
+    #[test]
+    fn the_relay_mode_is_a_custom_map_of_exactly_the_selected_relays() {
+        let selected: Vec<iroh::RelayUrl> = [
+            "https://relay-1.reach.kala.to",
+            "https://relay-2.reach.kala.to",
+        ]
+        .into_iter()
+        .map(|url| url.parse().expect("a relay URL"))
+        .collect();
+        let config = EndpointConfig {
+            relay_urls: selected.clone(),
+            ..EndpointConfig::default()
+        };
+        let mode = relay_mode(&config);
+        assert_ne!(mode, RelayMode::Default);
+        assert_ne!(mode, RelayMode::Staging);
+        let RelayMode::Custom(map) = mode else {
+            panic!("a selected relay map is custom");
+        };
+        assert_eq!(
+            map.urls::<std::collections::BTreeSet<_>>(),
+            selected
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+    }
+
     /// KR-REQ-10.02: discovery is configured only when selected, apart from the relay choice.
     #[tokio::test]
     async fn a_minimal_endpoint_reaches_no_service_it_was_not_given() {

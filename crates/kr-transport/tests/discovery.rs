@@ -2,12 +2,13 @@
 //!
 //! Section 17 puts three rules on how an endpoint is found. It reaches exactly the services its
 //! configuration selects and inherits nothing from a preset or a public default. Its public record
-//! names its relay and never its direct addresses, which travel through pairing and over the
-//! authenticated connection instead. And an address hint a device holds from pairing is not a
-//! permanent route: when the host has moved, the device resolves the identity it pinned again.
+//! names its relay and never its direct addresses. And an address hint a device holds from pairing
+//! is not a permanent route: when the host has moved, the device resolves the identity it pinned
+//! again.
 //!
-//! Everything here is real iroh on loopback, with endpoints this crate builds from a configuration
-//! the way a host and a device build theirs.
+//! Everything here is real iroh. The relay servers and Pkarr relays listen on loopback in this
+//! process, and the endpoints are the ones this crate builds from a configuration, as a host and a
+//! device build theirs.
 
 mod support;
 
@@ -135,20 +136,23 @@ fn accept_paired(
 
 /// KR-REQ-17.43: an endpoint is built from the minimal preset with the selected relay map, Pkarr
 /// publisher, Pkarr resolver and DNS lookup added by name, and nothing else. Its home relay is the
-/// selected relay and no public relay is in its map; its signed record reaches the selected Pkarr
-/// relay; a peer with the same selection resolves it through the selected Pkarr relay and asks the
-/// DNS lookup under the selected origin, and no other service answers; and no public publisher or
-/// resolver, local discovery or Mainline DHT is among its services.
+/// selected relay and no public relay is in its map; its signed record is published to the selected
+/// publisher and not to the resolver; a peer with the same selection resolves it from the selected
+/// resolver and not from the publisher, asks the DNS lookup under the selected origin, and asks no
+/// other service; and no public publisher or resolver, local discovery or Mainline DHT is among its
+/// services.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_endpoint_reaches_exactly_the_relay_pkarr_and_dns_services_it_selected() {
     const ORIGIN: &str = "discovery.kalareach.test";
     let relay = LocalRelay::spawn().await;
-    let pkarr = PkarrRelay::spawn();
+    // One Pkarr relay for each role, so an endpoint that used one selection for both roles fails.
+    let publisher = PkarrRelay::spawn();
+    let resolver = PkarrRelay::spawn();
     let selection = EndpointConfig {
         relay_urls: vec![relay.url.clone()],
         discovery: DiscoveryConfig {
-            pkarr_publisher_url: Some(pkarr.url.clone()),
-            pkarr_resolver_url: Some(pkarr.url.clone()),
+            pkarr_publisher_url: Some(publisher.url.clone()),
+            pkarr_resolver_url: Some(resolver.url.clone()),
             dns_origin: Some(ORIGIN.to_owned()),
             ..DiscoveryConfig::default()
         },
@@ -190,15 +194,17 @@ async fn an_endpoint_reaches_exactly_the_relay_pkarr_and_dns_services_it_selecte
         "the home relay is the selected one"
     );
 
-    // The publisher: the signed record reaches the selected Pkarr relay.
-    eventually("the record reaches the selected Pkarr relay", || {
-        pkarr.holds(&host.endpoint.id())
+    // The publisher: the signed record is published to the selected publisher, and a reader of
+    // that publisher finds it naming the relay. Nothing is published to the resolver.
+    let id = host.endpoint.id();
+    eventually("the record is published to the selected publisher", || {
+        publisher.publications(&id) > 0
     })
     .await;
     let reader = side(
         &EndpointConfig {
             discovery: DiscoveryConfig {
-                pkarr_resolver_url: Some(pkarr.url.clone()),
+                pkarr_resolver_url: Some(publisher.url.clone()),
                 ..DiscoveryConfig::default()
             },
             bind_addr: loopback(),
@@ -208,12 +214,22 @@ async fn an_endpoint_reaches_exactly_the_relay_pkarr_and_dns_services_it_selecte
         false,
     )
     .await;
-    resolve_naming(&reader.endpoint, host.endpoint.id(), &relay.url).await;
+    resolve_naming(&reader.endpoint, id, &relay.url).await;
+    assert_eq!(
+        resolver.publications(&id),
+        0,
+        "nothing is published to the resolver"
+    );
 
-    // The resolvers: everything the peer's services say about the host. The Pkarr resolver answers
-    // from the selected relay with the host's record, the DNS lookup is asked and finds nothing
-    // because the test's origin is served by no name server, and nothing else is asked at all.
-    let (answers, failures) = resolve(&peer.endpoint, host.endpoint.id()).await;
+    // The resolvers. The resolver holds the host's record because the test puts it there, the way
+    // a deployment's publication reaches the service it resolves from. Everything the peer's
+    // services then say about the host: the Pkarr resolver answers from the selected resolver and
+    // the publisher is not asked, the DNS lookup is asked and finds nothing because the test's
+    // origin is served by no name server, and nothing else is asked at all.
+    resolver.hold(&id, publisher.record(&id).expect("the published record"));
+    let asked_publisher = publisher.lookups(&id);
+    let asked_resolver = resolver.lookups(&id);
+    let (answers, failures) = resolve(&peer.endpoint, id).await;
     assert_eq!(answers.len(), 1, "one service found the host: {answers:?}");
     assert_eq!(answers[0].service, "pkarr");
     assert_eq!(answers[0].relays, vec![relay.url.clone()]);
@@ -221,6 +237,15 @@ async fn an_endpoint_reaches_exactly_the_relay_pkarr_and_dns_services_it_selecte
         failures,
         vec!["Service 'dns' failed".to_owned()],
         "the only other service asked is the DNS lookup"
+    );
+    assert!(
+        resolver.lookups(&id) > asked_resolver,
+        "the peer resolved the host from the selected resolver"
+    );
+    assert_eq!(
+        publisher.lookups(&id),
+        asked_publisher,
+        "and never from the publisher"
     );
 
     // The DNS lookup asks the machine's own name servers, which a test cannot point at a server of
@@ -240,7 +265,8 @@ async fn an_endpoint_reaches_exactly_the_relay_pkarr_and_dns_services_it_selecte
     );
 
     // No public relay is in the map. Removing a relay returns its configuration when it was there,
-    // which the selected relay shows last.
+    // which the selected relay shows last. That the map holds the selected relays and nothing else
+    // is the relay mode's own test, beside the builder.
     for public in [
         iroh::defaults::prod::default_relay_map(),
         iroh::defaults::staging::default_relay_map(),
@@ -262,12 +288,13 @@ async fn an_endpoint_reaches_exactly_the_relay_pkarr_and_dns_services_it_selecte
     host.endpoint.close().await;
 }
 
-/// KR-REQ-17.45: a host's direct addresses stay out of its public record and reach a device over
-/// the authenticated connection instead. The host has direct addresses and selects a relay and a
-/// Pkarr publisher under the default publication rules. The signed record anybody can read from the
-/// Pkarr relay names the relay and none of the direct addresses; a device that knows only the
-/// host's identity resolves that record, connects through the relay, and the connection then opens
-/// a direct path to the host that the record never carried.
+/// KR-REQ-17.45: a host's direct addresses stay out of its public record. The host has direct
+/// addresses and selects a relay and a Pkarr publisher under the default publication rules. The
+/// signed record anybody can read from the Pkarr relay names the relay and none of the direct
+/// addresses. A device given nothing but the host's identity resolves that record, connects through
+/// the relay and authenticates the host, and the connection then opens a direct path to one of the
+/// host's direct addresses, which neither the record nor anything else the device was given
+/// carried.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_public_record_names_the_relay_and_never_a_direct_address() {
     let relay = LocalRelay::spawn().await;
@@ -324,8 +351,8 @@ async fn the_public_record_names_the_relay_and_never_a_direct_address() {
         Admitted::Authorised(_)
     ));
 
-    // The connection learns a direct path to the host from the host itself, inside the encrypted
-    // connection: none of the host's direct addresses was in anything the device could look up.
+    // The connection then opens a direct path to one of the host's direct addresses, although the
+    // device was given the host's identity alone and the record it resolved carries none of them.
     eventually("the connection opens a direct path to the host", || {
         connection.paths().iter().any(
             |path| matches!(path.remote_addr(), TransportAddr::Ip(addr) if direct.contains(addr)),
@@ -337,11 +364,12 @@ async fn the_public_record_names_the_relay_and_never_a_direct_address() {
     host.endpoint.close().await;
 }
 
-/// KR-REQ-17.45: a hint from pairing is not a permanent route. A device pairs while the host's
-/// home relay is one relay and keeps the bundle that says so, current relay and all. The host then
-/// moves to another relay and the bundle is stale. Dialling with that bundle, the device resolves
-/// the host's pinned identity again through the Pkarr relay the bundle selected, reaches the host
-/// on its new relay, and authenticates it against the record it paired with.
+/// KR-REQ-17.45: an address hint from pairing is not a permanent route. The device's fixture holds a
+/// paired host record and the network configuration a pairing bundle carries: the host's selection,
+/// with the relay the host is on. The host then moves to another relay, so that configuration is
+/// stale. Dialling with it, the device resolves the host's pinned identity again through the Pkarr
+/// relay the configuration selected, reaches the host on its new relay, and authenticates it
+/// against the paired record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_device_with_a_stale_bundle_resolves_the_pinned_host_again_on_its_new_relay() {
     let first = LocalRelay::spawn().await;
@@ -373,7 +401,7 @@ async fn a_device_with_a_stale_bundle_resolves_the_pinned_host_again_on_its_new_
     tokio::time::timeout(PATIENCE, host.endpoint.online())
         .await
         .expect("the host reaches its first relay");
-    // What pairing handed the device: the host's selection with its current relay.
+    // The configuration a pairing bundle carries: the host's selection, with the relay it is on.
     let bundle = hosted_on(&first.url)
         .to_network_config()
         .expect("the host's network configuration");
@@ -384,10 +412,10 @@ async fn a_device_with_a_stale_bundle_resolves_the_pinned_host_again_on_its_new_
             .map(|hint| hint.as_str().to_owned())
             .collect::<Vec<_>>(),
         vec![first.url.to_string()],
-        "the bundle carries the host's current relay"
+        "the configuration names the relay the host is on"
     );
 
-    // The device builds its endpoint from the bundle, and dials from the bundle.
+    // The device builds its endpoint from that configuration and dials the host at its hints.
     let from_bundle = EndpointConfig {
         relay_ca_roots: anchors.clone(),
         bind_addr: loopback(),
