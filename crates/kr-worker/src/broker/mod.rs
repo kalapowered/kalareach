@@ -91,7 +91,8 @@ pub use crate::broker::attach::{
     hello_frame,
 };
 pub use crate::broker::bridge::{
-    AdmittedBridge, BridgeDeclaration, BridgeStream, BridgeSurface, InstalledBridge,
+    AdmittedBridge, BridgeDeclaration, BridgeStream, BridgeSurface, HookReport, InstalledBridge,
+    Observation, ObservedEvent, ThreadChange,
 };
 pub use crate::broker::capability::{CapabilityOwner, Probe};
 pub use crate::broker::duplex::{
@@ -231,6 +232,8 @@ pub struct Instance {
     frame_order: std::collections::VecDeque<SourceEventHandle>,
     /// How many bytes those frames hold.
     frame_bytes: usize,
+    /// What this instance's native bridge has reported about its threads.
+    bridge: crate::broker::bridge::BridgeThreads,
 }
 
 impl Instance {
@@ -649,6 +652,7 @@ impl Broker {
                 frames: BTreeMap::new(),
                 frame_order: std::collections::VecDeque::new(),
                 frame_bytes: 0,
+                bridge: crate::broker::bridge::BridgeThreads::default(),
             },
         );
         Ok(())
@@ -690,38 +694,8 @@ impl Broker {
         thread_id: Option<AgentThreadId>,
         now: TimestampMs,
     ) -> Result<AgentBindingRevision> {
-        let mut state = self.state();
-        if !state.instances.contains_key(&application_instance_id) {
-            return Err(unknown_instance(application_instance_id));
-        }
-        // The conversation moves first, because it is the check that can refuse. Advancing a
-        // revision and then finding the conversation taken would leave the instance at a revision
-        // whose thread it does not own.
-        if let Some(thread) = thread_id.as_ref() {
-            state
-                .profiles
-                .select_conversation(application_instance_id, thread.as_str())?;
-        } else {
-            state.profiles.leave_conversation(application_instance_id);
-        }
-        let instance = state
-            .instances
-            .get_mut(&application_instance_id)
-            .ok_or_else(|| unknown_instance(application_instance_id))?;
-        instance.binding_revision =
-            AgentBindingRevision::new(instance.binding_revision.get().saturating_add(1));
-        instance.thread_id = thread_id;
-        instance.turn_id = None;
-        instance.advance_generation();
-        let revision = instance.binding_revision;
-        state.tokens.withdraw(application_instance_id);
-        state.capabilities.invalidate_instance(
-            application_instance_id,
-            InstanceInvalidation::BindingChanged,
-            "the upstream owner or selected thread changed",
-            now,
-        );
-        Ok(revision)
+        self.state()
+            .advance_binding(application_instance_id, thread_id, now)
     }
 
     /// Records the turn the upstream says is running.
@@ -2867,6 +2841,48 @@ impl Broker {
 }
 
 impl BrokerState {
+    /// Advances one instance's binding revision, under the lock the caller already holds.
+    ///
+    /// See [`Broker::advance_binding`]: this is its whole body, here so that a decision that reads
+    /// the binding and then moves it is one operation under one lock.
+    fn advance_binding(
+        &mut self,
+        application_instance_id: ApplicationInstanceId,
+        thread_id: Option<AgentThreadId>,
+        now: TimestampMs,
+    ) -> Result<AgentBindingRevision> {
+        if !self.instances.contains_key(&application_instance_id) {
+            return Err(unknown_instance(application_instance_id));
+        }
+        // The conversation moves first, because it is the check that can refuse. Advancing a
+        // revision and then finding the conversation taken would leave the instance at a revision
+        // whose thread it does not own.
+        if let Some(thread) = thread_id.as_ref() {
+            self.profiles
+                .select_conversation(application_instance_id, thread.as_str())?;
+        } else {
+            self.profiles.leave_conversation(application_instance_id);
+        }
+        let instance = self
+            .instances
+            .get_mut(&application_instance_id)
+            .ok_or_else(|| unknown_instance(application_instance_id))?;
+        instance.binding_revision =
+            AgentBindingRevision::new(instance.binding_revision.get().saturating_add(1));
+        instance.thread_id = thread_id;
+        instance.turn_id = None;
+        instance.advance_generation();
+        let revision = instance.binding_revision;
+        self.tokens.withdraw(application_instance_id);
+        self.capabilities.invalidate_instance(
+            application_instance_id,
+            InstanceInvalidation::BindingChanged,
+            "the upstream owner or selected thread changed",
+            now,
+        );
+        Ok(revision)
+    }
+
     /// Takes the claim on one pending resource.
     ///
     /// The recheck covers everything that could have changed while the answer was being encoded:

@@ -65,9 +65,12 @@
 //! attest the request's own thread, the binding revision the request was made under. The worker's
 //! broker is the bridge for the agents it launched. It proves membership by the kernel's parent
 //! chain, or on Windows by the job an agent was started in, and neither says which of an agent's
-//! threads a request came from, so it attests no revision: a helper under a launched agent asks
-//! application-scoped questions, and they end with the agent's instance. A source that no bridge
-//! describes is application-scoped as well.
+//! threads a request came from, so it attests no revision when a question is asked: a helper under
+//! a launched agent asks application-scoped questions, and they end with the agent's instance. An
+//! application's native bridge can say more once the tool call that asked has finished, because the
+//! application's own hook reports which thread ran it; that per-request context reaches the ledger
+//! through [`AgentBindings::attested`], and from then on a switch of thread invalidates the
+//! question. A source that no bridge describes is application-scoped as well.
 
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{AgentBindingRevision, ApplicationInstanceId, ConnectionId};
@@ -178,6 +181,22 @@ pub trait AgentBindings: Send + Sync + std::fmt::Debug {
         &self,
         application_instance_id: ApplicationInstanceId,
     ) -> Option<AgentBindingRevision>;
+
+    /// Returns the binding revision a request was made under, when a bridge reported the thread
+    /// that request came from after it was made.
+    ///
+    /// A bridge that sees the application's own tool calls can say which thread ran a call only
+    /// once the call has finished, which is after the question it asked exists. What it says then
+    /// is still per-request source context, and it is recorded for that question. None when no
+    /// bridge said anything about the request.
+    fn attested(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+        request_id: &str,
+    ) -> Option<AgentBindingRevision> {
+        let _ = (application_instance_id, request_id);
+        None
+    }
 }
 
 /// Binds the caller on this connection to this session.

@@ -561,7 +561,8 @@ impl Store {
             .connection
             .prepare(
                 "SELECT questions.question_id, expires_at_ms, expires_at_boot_ms, source_process,
-                        question_bindings.application_instance_id, question_bindings.revision
+                        question_bindings.application_instance_id, question_bindings.revision,
+                        questions.request_id
                  FROM questions
                  LEFT JOIN question_bindings
                         ON question_bindings.question_id = questions.question_id
@@ -577,6 +578,7 @@ impl Store {
                     row.get::<_, Vec<u8>>(3)?,
                     row.get::<_, Option<Vec<u8>>>(4)?,
                     row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             })
             .map_err(QuestionError::unavailable)?
@@ -584,8 +586,15 @@ impl Store {
             .map_err(QuestionError::unavailable)?;
         drop(statement);
         let mut expired = Vec::new();
-        for (identifier, utc_deadline, boot_deadline, encoded_process, instance, revision) in
-            candidates
+        for (
+            identifier,
+            utc_deadline,
+            boot_deadline,
+            encoded_process,
+            instance,
+            revision,
+            request_id,
+        ) in candidates
         {
             let question_id = QuestionId::new(uuid_from(&identifier)?);
             let due = now.utc_ms.get() >= utc_deadline || now.boot_ms >= boot_deadline;
@@ -598,6 +607,28 @@ impl Store {
                     kr_ipc::identity::ProcessState::Ended
                 ),
                 Err(_) => false,
+            };
+            // A question asked under a bridged agent with no revision yet may have one now: the
+            // application's bridge reports which thread ran the call that asked it once the call
+            // has finished. That revision is recorded once, and it is what a switch is judged by
+            // from then on.
+            let revision = match (agents, instance.as_deref(), revision) {
+                (Some(agents), Some(bound), None) => {
+                    let attested = agents
+                        .attested(ApplicationInstanceId::new(uuid_from(bound)?), &request_id)
+                        .map(|attested| count(attested.get()));
+                    if let Some(attested) = attested {
+                        self.connection
+                            .execute(
+                                "UPDATE question_bindings SET revision = ?1
+                                 WHERE question_id = ?2 AND revision IS NULL",
+                                params![attested, identifier.as_slice()],
+                            )
+                            .map_err(QuestionError::unavailable)?;
+                    }
+                    attested
+                }
+                (_, _, recorded) => recorded,
             };
             // An agent instance that ended takes its binding with it, and a detected switch
             // invalidates the unanswered questions asked under the binding it left. Only a question

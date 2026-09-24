@@ -8,8 +8,14 @@
 //! Either proves which application a helper serves and nothing about which thread a request came
 //! from. One helper can serve several threads, one after another or at once, and a request
 //! made in one thread can arrive after the broker has seen another selected. Section 11 records a
-//! thread binding only with verified per-request source context, so this bridge attests none: the
-//! questions are application-scoped and no thread-switch detection is claimed for them.
+//! thread binding only with verified per-request source context, so membership attests none: when
+//! a question is asked it is application-scoped.
+//!
+//! What can say which thread a request came from is the application's own native bridge. A hook
+//! reports the thread that ran each finished tool call, so when that call asked a contact question
+//! the broker records the binding revision it was made under, and the ledger reads it through
+//! [`AgentBindings::attested`]. From then on a switch of thread invalidates that question. See
+//! [`crate::broker::bridge`].
 
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{AgentBindingRevision, ApplicationInstanceId};
@@ -65,5 +71,13 @@ impl AgentBindings for Broker {
         self.binding_state(application_instance_id)
             .ok()
             .map(|state| state.binding_revision)
+    }
+
+    fn attested(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+        request_id: &str,
+    ) -> Option<AgentBindingRevision> {
+        self.attested_request(application_instance_id, request_id)
     }
 }

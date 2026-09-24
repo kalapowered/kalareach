@@ -846,6 +846,57 @@ impl NativeGateway {
         })
     }
 
+    /// Reads the one observation an admitted hook sends, applies it, and closes the connection.
+    ///
+    /// The hook sends its observation straight behind its hello, and it waits for this host to
+    /// close the connection before it answers its application, so an observation that selects a
+    /// thread is applied before the application goes on: Claude Code holds a session's first
+    /// response until its `SessionStart` hooks have finished.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::InvalidArgument`] when the bridge is not a hook, sends nothing in
+    /// time, or sends something that is not an observation, and whatever the broker refuses when it
+    /// applies one.
+    pub async fn observe_hook(
+        &self,
+        mut admitted: crate::broker::bridge::AdmittedBridge,
+    ) -> Result<crate::broker::bridge::HookReport> {
+        if admitted.surface != crate::broker::bridge::BridgeSurface::Hook {
+            return Err(BrokerError::invalid(
+                "only a hook reports an observation; a channel is served, not observed",
+            ));
+        }
+        let body = tokio::time::timeout(
+            crate::broker::bridge::BRIDGE_FRAME_DEADLINE,
+            admitted.stream.read_frame(),
+        )
+        .await
+        .map_err(|_| {
+            BrokerError::invalid(format!(
+                "the hook sent no observation within {} seconds",
+                crate::broker::bridge::BRIDGE_FRAME_DEADLINE.as_secs()
+            ))
+        })??
+        .ok_or_else(|| {
+            BrokerError::invalid("the hook closed its connection without an observation")
+        })?;
+        let observation = crate::broker::bridge::Observation::from_frame(&body)?;
+        let (thread, attested, cursor) = self.broker.observe_bridge(
+            self.launch.application_instance_id,
+            &admitted.process,
+            &observation,
+            kr_ipc::now_ms(),
+        )?;
+        admitted.stream.close().await;
+        Ok(crate::broker::bridge::HookReport {
+            observation,
+            thread,
+            attested,
+            cursor,
+        })
+    }
+
     /// Everything after the accept, for one connection.
     async fn admit<CR, CW>(
         &self,
