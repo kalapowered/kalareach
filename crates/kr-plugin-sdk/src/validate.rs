@@ -23,7 +23,7 @@ use crate::capability::PluginCapability;
 use crate::connector::{
     ConnectorManifest, DecisionDestination, FieldPath, FieldSegment, Framing,
     MAX_CLASSIFIED_METHODS, MAX_DECISION_VALUE_BYTES, MAX_FIELD_PATH_DEPTH, MethodClass,
-    RouteDirection,
+    ResponseCorrelation, RouteDirection,
 };
 use crate::digest::PayloadDigest;
 use crate::effect::{
@@ -1043,6 +1043,27 @@ fn check_manifest(
         check_implementation(manifest, connector, action, report);
     }
 
+    // A table with a decision destination says which relayed requests ask for a decision and
+    // which decisions they offer, and it writes the answer. Interpreting a native request and
+    // answering one are the two approval grants section 11 keeps apart, so a package whose table
+    // does both asks for both, whether or not an action uses the destination yet.
+    if connector.is_some_and(|connector| connector.decision_destination.is_present()) {
+        for needed in [
+            PluginCapability::ApprovalDecode,
+            PluginCapability::ApprovalRespond,
+        ] {
+            if !manifest.requests(needed) {
+                report.push(Finding::at(
+                    FindingCode::EffectWithoutCapability,
+                    MANIFEST_FILE,
+                    format!(
+                        "the connector table interprets approval requests and answers them through its decision destination, and the package does not request {needed}"
+                    ),
+                ));
+            }
+        }
+    }
+
     if let Some(bridge) = &manifest.native_bridge.0 {
         if !manifest.requests(PluginCapability::NativeBridgeInstall) {
             report.push(Finding::at(
@@ -1538,6 +1559,21 @@ fn check_parameters(schema: &ParameterSchema, owner: &str, report: &mut Report) 
                         ),
                     ));
                 }
+                // An invocation names a choice by its identifier alone. Two choices with one
+                // identifier are one choice with two labels, and a person picking the second
+                // label would submit whatever the first one means.
+                let mut offered = BTreeSet::new();
+                for choice in choices {
+                    if !offered.insert(&choice.id) {
+                        report.push(Finding::new(
+                            FindingCode::ParameterSchemaInvalid,
+                            format!(
+                                "{owner} offers the choice {} for {} more than once",
+                                choice.id, parameter.name
+                            ),
+                        ));
+                    }
+                }
             }
             ParameterKind::Integer { minimum, maximum } if minimum > maximum => {
                 report.push(Finding::new(
@@ -2026,6 +2062,27 @@ fn check_field_path(path: &FieldPath, owner: &str, report: &mut Report) {
     }
 }
 
+/// Spells a field path as a reader would: member names joined by dots, indices in brackets.
+fn dotted(path: &FieldPath) -> String {
+    let mut text = String::new();
+    for segment in &path.segments {
+        match segment {
+            FieldSegment::Member { name } => {
+                if !text.is_empty() {
+                    text.push('.');
+                }
+                text.push_str(name);
+            }
+            FieldSegment::Index { index } => {
+                text.push('[');
+                text.push_str(&index.to_string());
+                text.push(']');
+            }
+        }
+    }
+    text
+}
+
 /// Returns true when text is a usable header name.
 fn is_header_name(text: &str) -> bool {
     !text.is_empty()
@@ -2236,6 +2293,25 @@ fn check_decision_destination(
         invalid(format!(
             "the decision destination answers {answers}, which the table classifies as unsupported"
         ));
+    }
+
+    // An answer is a response to the request it answers, so it carries the identifier where the
+    // table matches every response to its request. A table that matches responses by their order
+    // has no such place, and an answer could not say which request it is for.
+    match &connector.response_correlation {
+        ResponseCorrelation::MatchingId { id_path } => {
+            if &destination.request_id_path != id_path {
+                invalid(format!(
+                    "the decision destination writes the identifier at {}, and the table matches a response to its request at {}",
+                    dotted(&destination.request_id_path),
+                    dotted(id_path)
+                ));
+            }
+        }
+        ResponseCorrelation::Ordered {} => invalid(
+            "the table matches responses by order, so an answer could not name the request it answers; a table with a decision destination matches them by identifier"
+                .to_owned(),
+        ),
     }
 
     let paths = [

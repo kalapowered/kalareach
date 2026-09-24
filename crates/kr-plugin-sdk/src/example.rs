@@ -564,16 +564,14 @@ pub fn example_connector_table() -> crate::connector::ConnectorManifest {
                 method: MethodName::new("approval.answer").expect("a literal method name"),
                 class: MethodClass::Mutation,
                 evidence: summary(
-                    "Answers the request named by params.request_id, which runs or refuses the tool call",
+                    "Answers the request whose identifier it repeats, which runs or refuses the tool call",
                 ),
             },
         ],
         decision_destination: Nullable(Some(DecisionDestination {
             answers: MethodName::new("approval.request").expect("a literal method name"),
             method: MethodName::new("approval.answer").expect("a literal method name"),
-            request_id_path: FieldPath {
-                segments: vec![member("params"), member("request_id")],
-            },
+            request_id_path: path("id"),
             decision_path: FieldPath {
                 segments: vec![member("params"), member("decision")],
             },
@@ -679,6 +677,12 @@ pub fn example_connector_manifest(
             CapabilityRequest {
                 capability: PluginCapability::UpstreamAction,
                 reason: summary("Send a prompt the person wrote to the bound application"),
+            },
+            CapabilityRequest {
+                capability: PluginCapability::ApprovalDecode,
+                reason: summary(
+                    "Read which tool call an approval request is about and the decisions it offers",
+                ),
             },
             CapabilityRequest {
                 capability: PluginCapability::ApprovalRespond,

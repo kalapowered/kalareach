@@ -120,6 +120,7 @@ fn a_manifest_declares_identity_ranges_match_rules_platforms_hashes_and_capabili
             "presentation.declarative",
             "broker.semantic_events",
             "upstream.action",
+            "approval.decode",
             "approval.respond"
         ]
     );

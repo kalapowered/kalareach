@@ -185,6 +185,27 @@ fn kr_req_12_18_an_answer_travels_to_the_application_as_a_classified_mutation() 
     );
 }
 
+/// KR-REQ-12.18: an answer is a response to the request it answers, so it carries the identifier
+/// where the table matches every response to its request, and a table that matches responses by
+/// their order cannot answer approvals at all.
+#[test]
+fn kr_req_12_18_an_answer_carries_the_identifier_where_responses_are_matched() {
+    refused(
+        &table_only(|table| {
+            destination(table).request_id_path = members(&["params", "request_id"]);
+        }),
+        FindingCode::ConnectorTableInvalid,
+        "writes the identifier at params.request_id, and the table matches a response to its request at id",
+    );
+    refused(
+        &table_only(|table| {
+            table.response_correlation = kr_plugin_sdk::connector::ResponseCorrelation::Ordered {};
+        }),
+        FindingCode::ConnectorTableInvalid,
+        "the table matches responses by order",
+    );
+}
+
 /// KR-REQ-12.18: an answer's two paths are member names inside the depth bound, and neither
 /// meets the other or the method name.
 #[test]
@@ -216,7 +237,7 @@ fn kr_req_12_18_an_answer_is_written_to_fields_that_can_hold_it() {
     );
     refused(
         &table_only(|table| {
-            destination(table).decision_path = members(&["params", "request_id"]);
+            destination(table).decision_path = members(&["id"]);
         }),
         FindingCode::ConnectorTableInvalid,
         "overlapping fields",
@@ -317,6 +338,16 @@ fn kr_req_11_47_only_the_destination_answers() {
         FindingCode::ImplementationUnsatisfied,
         "keeps for answers",
     );
+    // A table that interprets approval requests asks for the grant to interpret them.
+    refused(
+        &manifest_only(|manifest| {
+            manifest
+                .capabilities
+                .retain(|request| request.capability.as_str() != "approval.decode");
+        }),
+        FindingCode::EffectWithoutCapability,
+        "does not request approval.decode",
+    );
     // An answer needs the capability its class names.
     refused(
         &manifest_only(|manifest| {
@@ -356,6 +387,20 @@ fn kr_req_12_18_an_answer_offers_only_decisions_the_table_can_send() {
         }),
         FindingCode::ImplementationUnsatisfied,
         "which is not a choice",
+    );
+    // One identifier is one decision: a second label for it would send the first one's meaning.
+    refused(
+        &manifest_only(|manifest| {
+            let action = answer_action(manifest);
+            if let ParameterKind::Choice { choices } = &mut action.parameters.parameters[0].kind {
+                choices.push(kr_plugin_sdk::effect::ParameterChoice {
+                    id: name("allow"),
+                    label: kr_plugin_sdk::text::Label::new("Deny").expect("a label"),
+                });
+            }
+        }),
+        FindingCode::ParameterSchemaInvalid,
+        "offers the choice allow for decision more than once",
     );
     refused(
         &manifest_only(|manifest| {
@@ -415,11 +460,13 @@ fn kr_req_12_18_an_answer_needs_a_table_with_a_destination() {
     );
 }
 
-/// KR-REQ-12.18 and KR-REQ-11.34: the whole declarative path, with no component on it. An
-/// invocation that names the pending resource and a decision is checked against the action, the
-/// decision is read from it, and the table writes the answer from that decision and the pending
-/// request's own identifier. Without the resource, or with a decision the action does not offer,
-/// nothing is written.
+/// KR-REQ-12.18 and KR-REQ-11.34: the package's half of a declarative answer, with no component on
+/// it. An invocation that names a pending resource and a decision is checked against the action,
+/// the decision is read from it, and the table writes the answer from that decision and the method
+/// and identifier the pending request arrived with. Without a resource, with a decision the action
+/// does not offer, or for a request of another method, nothing is written. Which method and
+/// identifier belong to the named resource is the host's record, not the package's: the broker
+/// keeps them with the resource.
 #[test]
 fn kr_req_12_18_an_invocation_becomes_the_answer_the_table_writes() {
     let document = example::example_connector_presentation_json().into_bytes();
@@ -451,12 +498,19 @@ fn kr_req_12_18_an_invocation_becomes_the_answer_the_table_writes() {
         .expect("the answer carries a decision");
     assert_eq!(
         table
-            .answer(&serde_json::json!(41), decision)
+            .answer("approval/request", &serde_json::json!(41), decision)
             .expect("the table writes the answer"),
         serde_json::json!({
             "method": "approval/answer",
-            "params": {"request_id": 41, "decision": "approved"}
+            "id": 41,
+            "params": {"decision": "approved"}
         })
+    );
+    assert!(
+        table
+            .answer("turn/start", &serde_json::json!(41), decision)
+            .is_err(),
+        "a request of another method gets no answer"
     );
 
     assert_eq!(
@@ -472,7 +526,11 @@ fn kr_req_12_18_an_invocation_becomes_the_answer_the_table_writes() {
     ));
     assert!(
         table
-            .answer(&serde_json::json!(41), &name("allow-always"))
+            .answer(
+                "approval/request",
+                &serde_json::json!(41),
+                &name("allow-always")
+            )
             .is_err()
     );
 }

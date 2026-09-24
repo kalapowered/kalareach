@@ -45,8 +45,8 @@
     {
       "role": "connector",
       "path": "connector.json",
-      "digest": "62bfe3f017bfe6b7938bb060d5deda151d82703770ccad21607df1f75428c6de",
-      "size_bytes": "3222"
+      "digest": "161edfac685266be2184090eccb7944c4ae64a13317355ef41ef4b6645a5d98e",
+      "size_bytes": "3139"
     },
     {
       "role": "presentation",
@@ -71,6 +71,10 @@
     {
       "capability": "upstream.action",
       "reason": "Send a prompt the person wrote to the bound application"
+    },
+    {
+      "capability": "approval.decode",
+      "reason": "Read which tool call an approval request is about and the decisions it offers"
     },
     {
       "capability": "approval.respond",

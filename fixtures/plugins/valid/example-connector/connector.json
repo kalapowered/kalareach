@@ -99,7 +99,7 @@
     {
       "method": "approval.answer",
       "class": "mutation",
-      "evidence": "Answers the request named by params.request_id, which runs or refuses the tool call"
+      "evidence": "Answers the request whose identifier it repeats, which runs or refuses the tool call"
     }
   ],
   "decision_destination": {
@@ -109,11 +109,7 @@
       "segments": [
         {
           "type": "member",
-          "name": "params"
-        },
-        {
-          "type": "member",
-          "name": "request_id"
+          "name": "id"
         }
       ]
     },

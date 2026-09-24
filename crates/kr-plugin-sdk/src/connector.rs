@@ -258,6 +258,9 @@ pub struct DecisionDestination {
     /// The routed method that carries the answer.
     pub method: MethodName,
     /// Where the answer carries the identifier of the request it answers.
+    ///
+    /// An answer is a response to that request, so this is where the table matches a response to
+    /// its request: the path of its [`ResponseCorrelation::MatchingId`].
     pub request_id_path: FieldPath,
     /// Where the answer carries the decision.
     pub decision_path: FieldPath,
@@ -292,6 +295,12 @@ pub enum AnswerError {
     /// The table declares no decision destination, so it answers nothing.
     #[error("the connector table declares no decision destination")]
     NoDestination,
+    /// The request is not one the destination answers.
+    #[error("{method} is not a request the connector table's decision destination answers")]
+    NotAnswered {
+        /// The method the request arrived as, as the wire spells it.
+        method: String,
+    },
     /// The decision is not one the destination maps.
     #[error("{decision} is not a decision the connector table maps to an upstream value")]
     UnknownDecision {
@@ -374,21 +383,24 @@ impl ConnectorManifest {
 
     /// Writes the answer to one pending request.
     ///
+    /// The pending request is named by what the table read from it when it arrived: its method as
+    /// the wire spells it, and its identifier at [`Self::request_id_path`]. A request of any method
+    /// other than the one the destination answers gets no answer from it.
+    ///
     /// The answer is the destination's method as the wire spells it, at the table's method path,
-    /// with the pending request's own identifier at the destination's identifier path and the
-    /// upstream's value for the decision at its decision path. `request_id` is the identifier the
-    /// table read from the request when it arrived, at [`Self::request_id_path`], and it is written
-    /// back exactly. Nothing else goes in.
+    /// with the request's identifier, written back exactly, at the destination's identifier path and
+    /// the upstream's value for the decision at its decision path. Nothing else goes in.
     ///
     /// # Errors
     ///
     /// Returns [`AnswerError::NoDestination`] when the table answers nothing,
-    /// [`AnswerError::UnknownDecision`] for a decision the mapping does not list,
-    /// [`AnswerError::RequestId`] for an identifier that is not a string or a number, and
-    /// [`AnswerError::Unwritable`] for a table validation refuses: an unrouted destination method,
-    /// a path with an index segment, or two paths that meet.
+    /// [`AnswerError::NotAnswered`] for a request of another method, [`AnswerError::UnknownDecision`]
+    /// for a decision the mapping does not list, [`AnswerError::RequestId`] for an identifier that
+    /// is not a string or a number, and [`AnswerError::Unwritable`] for a table validation refuses:
+    /// an unrouted destination method, a path with an index segment, or two paths that meet.
     pub fn answer(
         &self,
+        request_method: &str,
         request_id: &serde_json::Value,
         decision: &ParameterName,
     ) -> Result<serde_json::Value, AnswerError> {
@@ -396,6 +408,17 @@ impl ConnectorManifest {
             .decision_destination
             .as_ref()
             .ok_or(AnswerError::NoDestination)?;
+        let answered = self
+            .route_for_wire_name(request_method)
+            .is_some_and(|route| {
+                route.method == destination.answers
+                    && route.direction != RouteDirection::HostToUpstream
+            });
+        if !answered {
+            return Err(AnswerError::NotAnswered {
+                method: request_method.to_owned(),
+            });
+        }
         let value =
             destination
                 .value_for(decision)
@@ -594,6 +617,19 @@ mod tests {
         ParameterName::new(text).expect("valid decision")
     }
 
+    /// The wire method of the Channels surface's relayed tool approval.
+    const PERMISSION_REQUEST: &str = "notifications/claude/channel/permission_request";
+
+    /// Reads a path out of a message, as the table reads a frame.
+    fn read<'a>(message: &'a serde_json::Value, path: &FieldPath) -> Option<&'a serde_json::Value> {
+        path.segments
+            .iter()
+            .try_fold(message, |value, segment| match segment {
+                FieldSegment::Member { name } => value.get(name),
+                FieldSegment::Index { index } => value.get(*index as usize),
+            })
+    }
+
     /// The Channels surface's three notifications, with the permission answer as its destination.
     fn channels() -> ConnectorManifest {
         let route = |name: &str, wire: &str, direction| Route {
@@ -661,7 +697,11 @@ mod tests {
         let table = channels();
         assert_eq!(
             table
-                .answer(&serde_json::json!("abcde"), &decision("allow"))
+                .answer(
+                    PERMISSION_REQUEST,
+                    &serde_json::json!("abcde"),
+                    &decision("allow")
+                )
                 .expect("an answer"),
             serde_json::json!({
                 "method": "notifications/claude/channel/permission",
@@ -670,7 +710,11 @@ mod tests {
         );
         assert_eq!(
             table
-                .answer(&serde_json::json!("fghij"), &decision("deny"))
+                .answer(
+                    PERMISSION_REQUEST,
+                    &serde_json::json!("fghij"),
+                    &decision("deny")
+                )
                 .expect("an answer"),
             serde_json::json!({
                 "method": "notifications/claude/channel/permission",
@@ -680,10 +724,67 @@ mod tests {
         // A numeric identifier goes back as the number it was.
         assert_eq!(
             table
-                .answer(&serde_json::json!(11), &decision("allow"))
+                .answer(
+                    PERMISSION_REQUEST,
+                    &serde_json::json!(11),
+                    &decision("allow")
+                )
                 .expect("an answer")["params"]["request_id"],
             serde_json::json!(11)
         );
+    }
+
+    /// KR-REQ-12.18: the table reads its own answer back as the answer to the request: the wire
+    /// method routes to the destination's method, travelling to the application as a mutation, and
+    /// the identifier is where the table matches a response to its request.
+    #[test]
+    fn kr_req_12_18_the_table_reads_its_answer_back_as_the_answer_to_that_request() {
+        let table = channels();
+        let answer = table
+            .answer(
+                PERMISSION_REQUEST,
+                &serde_json::json!("abcde"),
+                &decision("deny"),
+            )
+            .expect("an answer");
+        let wire = read(&answer, &table.method_path)
+            .and_then(serde_json::Value::as_str)
+            .expect("the answer names its method where the table reads one");
+        let route = table
+            .route_for_wire_name(wire)
+            .expect("the table routes the answer");
+        assert_eq!(route.method, method("channel.permission"));
+        assert_eq!(route.direction, RouteDirection::HostToUpstream);
+        assert_eq!(table.classify(&route.method), MethodClass::Mutation);
+        let ResponseCorrelation::MatchingId { id_path } = &table.response_correlation else {
+            panic!("the table matches responses by identifier");
+        };
+        assert_eq!(read(&answer, id_path), Some(&serde_json::json!("abcde")));
+        let destination = table.decision_destination.as_ref().expect("a destination");
+        assert_eq!(
+            read(&answer, &destination.decision_path),
+            Some(&serde_json::json!("deny"))
+        );
+    }
+
+    /// KR-REQ-12.18: a destination answers only the requests of the method it names. A message
+    /// the table routes the other way, or one it does not route at all, gets no answer from it.
+    #[test]
+    fn kr_req_12_18_only_the_named_request_is_answered() {
+        let table = channels();
+        for other in [
+            "notifications/claude/channel",
+            "notifications/claude/channel/permission",
+            "tools/call",
+        ] {
+            assert_eq!(
+                table.answer(other, &serde_json::json!("abcde"), &decision("allow")),
+                Err(AnswerError::NotAnswered {
+                    method: other.to_owned()
+                }),
+                "{other} was answered"
+            );
+        }
     }
 
     /// KR-REQ-12.18: a decision the table does not map is refused rather than written, and so is
@@ -692,7 +793,11 @@ mod tests {
     fn kr_req_12_18_an_unmatched_decision_or_identifier_is_refused() {
         let table = channels();
         assert_eq!(
-            table.answer(&serde_json::json!("abcde"), &decision("allow-always")),
+            table.answer(
+                PERMISSION_REQUEST,
+                &serde_json::json!("abcde"),
+                &decision("allow-always")
+            ),
             Err(AnswerError::UnknownDecision {
                 decision: decision("allow-always")
             })
@@ -704,13 +809,17 @@ mod tests {
             serde_json::json!(["abcde"]),
         ] {
             assert_eq!(
-                table.answer(&identifier, &decision("allow")),
+                table.answer(PERMISSION_REQUEST, &identifier, &decision("allow")),
                 Err(AnswerError::RequestId),
                 "{identifier} was written as an identifier"
             );
         }
         assert_eq!(
-            manifest().answer(&serde_json::json!("abcde"), &decision("allow")),
+            manifest().answer(
+                PERMISSION_REQUEST,
+                &serde_json::json!("abcde"),
+                &decision("allow")
+            ),
             Err(AnswerError::NoDestination)
         );
     }
@@ -730,7 +839,11 @@ mod tests {
         }];
         assert_eq!(
             table
-                .answer(&serde_json::json!("abcde"), &decision("approve"))
+                .answer(
+                    PERMISSION_REQUEST,
+                    &serde_json::json!("abcde"),
+                    &decision("approve")
+                )
                 .expect("an answer")["params"]["behavior"],
             serde_json::json!("acceptForSession")
         );
@@ -754,7 +867,11 @@ mod tests {
             ],
         };
         assert!(matches!(
-            indexed.answer(&serde_json::json!("abcde"), &decision("allow")),
+            indexed.answer(
+                PERMISSION_REQUEST,
+                &serde_json::json!("abcde"),
+                &decision("allow")
+            ),
             Err(AnswerError::Unwritable { .. })
         ));
 
@@ -766,7 +883,11 @@ mod tests {
             .expect("a destination")
             .decision_path = member_path(&["params", "request_id"]);
         assert!(matches!(
-            colliding.answer(&serde_json::json!("abcde"), &decision("allow")),
+            colliding.answer(
+                PERMISSION_REQUEST,
+                &serde_json::json!("abcde"),
+                &decision("allow")
+            ),
             Err(AnswerError::Unwritable { .. })
         ));
 
@@ -778,7 +899,11 @@ mod tests {
             .expect("a destination")
             .decision_path = member_path(&["params", "request_id", "behavior"]);
         assert!(matches!(
-            inside.answer(&serde_json::json!("abcde"), &decision("allow")),
+            inside.answer(
+                PERMISSION_REQUEST,
+                &serde_json::json!("abcde"),
+                &decision("allow")
+            ),
             Err(AnswerError::Unwritable { .. })
         ));
     }
