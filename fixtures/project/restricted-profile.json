@@ -11,7 +11,7 @@
       "key": "core.fsmonitor",
       "sentinel": "fsmonitor",
       "git_would_run_it_during": "every status and every index refresh",
-      "how_this_host_stops_it": "core.fsmonitor=false as an override no configuration file can undo, plus core.untrackedCache=false and --no-optional-locks so no index is written"
+      "how_this_host_stops_it": "core.fsmonitor set to nothing as an override no configuration file can undo, which every Git from 2.32 on reads as no monitor (before 2.36 the value false would name a hook program), plus core.untrackedCache=false and --no-optional-locks so no index is written"
     },
     {
       "key": "core.hooksPath",

@@ -1681,8 +1681,11 @@ impl RestrictedProfile {
                 "core.hooksPath".to_owned(),
                 self.hooks.as_os_str().to_owned(),
             ),
-            // No filesystem monitor: neither a hook program nor the built-in daemon.
-            ("core.fsmonitor".to_owned(), OsString::from("false")),
+            // No filesystem monitor: neither a hook program nor the built-in daemon. Set to
+            // nothing rather than to `false`: Git before 2.36 reads the key as a hook program's
+            // path, where `false` names a program and nothing names none, and from 2.36 on nothing
+            // is the boolean false.
+            ("core.fsmonitor".to_owned(), OsString::new()),
             ("core.fsmonitorHookVersion".to_owned(), OsString::new()),
             ("core.untrackedCache".to_owned(), OsString::from("false")),
             // No pager and no editor. The child has no terminal either, so both are belt and
@@ -3430,7 +3433,9 @@ mod tests {
             named("core.hooksPath"),
             Some(OsString::from("/state/git-profile/hooks"))
         );
-        assert_eq!(named("core.fsmonitor"), Some(OsString::from("false")));
+        // Nothing, which every release from the oldest this host accepts reads as no monitor: a
+        // release before 2.36 would read `false` as a hook program's name.
+        assert_eq!(named("core.fsmonitor"), Some(OsString::new()));
         assert_eq!(named("diff.external"), Some(OsString::new()));
         // No transport was named, so every one of them stays refused.
         assert_eq!(named("protocol.allow"), Some(OsString::from("never")));
