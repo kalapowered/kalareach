@@ -36,7 +36,14 @@ remember_process() {
   local started
   started="$(process_started "$1")"
   [ -n "$started" ] || return 0
-  owned_processes+=("$1|$started|$2")
+  record_process "$1" "$started" "$2"
+}
+
+# record_process <number> <started> <program>
+# Records a process whose start time and program were read where it was started, by whatever
+# started it, so the record says what that process was and not what the number names later.
+record_process() {
+  owned_processes+=("$1|$2|$3")
 }
 
 # is_same_process <number> <started> <program>

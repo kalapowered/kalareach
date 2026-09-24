@@ -283,42 +283,56 @@ cat >"$run_root/bin/launch-gui.sh" <<'SCRIPT'
 # instance of a graphical application in the background, and records what the login session then
 # has registered. Then it waits, so the session stays live while the evidence is read.
 evidence="$1"
+run_root="$2"
 /bin/launchctl managername > "$evidence/managername" 2>&1
-/usr/bin/pgrep -u "$(id -u)" -f "TextEdit.app/Contents/MacOS/TextEdit" > "$evidence/textedit-before" 2>/dev/null || true
 # A new instance, in the background: nothing the person at the machine is using is touched, and
-# nothing takes the foreground.
-/usr/bin/open -g -n -a TextEdit
+# nothing takes the foreground. It is given this run's root as an argument it ignores, and that
+# argument is what tells this instance apart from every other TextEdit on the machine, whenever
+# that one started.
+/usr/bin/open -g -n -a TextEdit --args -KalaReachRun "$run_root"
 sleep 3
 /usr/bin/lsappinfo list > "$evidence/lsappinfo" 2>&1 || true
-/usr/bin/pgrep -u "$(id -u)" -f "TextEdit.app/Contents/MacOS/TextEdit" > "$evidence/textedit-after" 2>/dev/null || true
+# The instance this shell started, found by that argument: its number, when it started and what it
+# runs, read in one look, so the record describes this process and nothing that takes its number
+# later. The start time is the first 24 characters of what `ps` prints for it.
+for pid in $(/usr/bin/pgrep -u "$(id -u)" -f "TextEdit.app/Contents/MacOS/TextEdit" 2>/dev/null); do
+  line="$(LC_ALL=C /bin/ps -o lstart=,command= -p "$pid" 2>/dev/null)"
+  command="$(printf '%s' "$line" | cut -c25- | sed 's/^ *//')"
+  case $command in
+    *" -KalaReachRun $run_root")
+      printf '%s|%s|%s\n' "$pid" "$(printf '%s' "$line" | cut -c1-24)" "$command"
+      ;;
+  esac
+done > "$evidence/textedit-started"
 exec cat
 SCRIPT
 chmod +x "$run_root/bin/launch-gui.sh"
 cat >"$run_root/bin/session-shell.sh" <<SCRIPT
 #!/bin/sh
-exec "$run_root/bin/launch-gui.sh" "$run_root/evidence"
+exec "$run_root/bin/launch-gui.sh" "$run_root/evidence" "$run_root"
 SCRIPT
 chmod +x "$run_root/bin/session-shell.sh"
 "$kr" new --invisible --desktop --cwd "$run_root" --shell "$run_root/bin/session-shell.sh" --json \
   >"$run_root/evidence/create-gui.json"
 gui_display="$(read_json "$run_root/evidence/create-gui.json" display_number)"
 for _ in $(seq 1 100); do
-  [ -s "$run_root/evidence/textedit-after" ] && break
+  [ -e "$run_root/evidence/textedit-started" ] && break
   sleep 0.2
 done
 require "$(cat "$run_root/evidence/managername" 2>/dev/null || true)" "Aqua" \
   "the invisible session's shell is in the graphical login context"
-new_gui="$(comm -13 <(sort -u "$run_root/evidence/textedit-before" 2>/dev/null || true) \
-  <(sort -u "$run_root/evidence/textedit-after" 2>/dev/null || true) || true)"
+new_gui=""
+# Recorded as the session's shell saw each one start, so a number is not signalled once it names
+# something else, and no TextEdit this run did not start is ever recorded.
+while IFS='|' read -r pid started command; do
+  [ -n "$pid" ] || continue
+  record_process "$pid" "$started" "$command"
+  new_gui="$new_gui $pid"
+done <"$run_root/evidence/textedit-started"
 if [ -z "$new_gui" ]; then
   fail "a graphical application started from the session's shell"
 else
-  # Recorded as the process each number names now, so the number is not signalled once it names
-  # something else.
-  for pid in $new_gui; do
-    remember_process "$pid" "$(process_command "$pid")"
-  done
-  echo "  ok: a graphical application started from the session's shell: $new_gui"
+  echo "  ok: a graphical application started from the session's shell:$new_gui"
 fi
 if grep -q "TextEdit" "$run_root/evidence/lsappinfo" 2>/dev/null; then
   echo "  ok: the login session has it registered as one of its applications"
