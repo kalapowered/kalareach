@@ -144,18 +144,26 @@ impl ProfileStore {
     /// Answers every refusal an execution can make, without publishing anything.
     ///
     /// The caller writes the profile's record between this and [`ProfileStore::execute`], so a
-    /// failed write leaves no reservation behind for a launch that never happened.
+    /// failed write leaves no reservation behind for a launch that never happened. An instance
+    /// that was already launched is refused first: a second launch would take over its record.
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::Launch`] with the refusal that applies.
+    /// Returns [`BrokerError::InvalidArgument`] when the instance was already launched, and
+    /// [`BrokerError::Launch`] with the refusal that applies otherwise.
     pub fn check_executable(
         &self,
         intent: &LaunchIntent,
         now: &ForegroundMark,
         application_instance_id: ApplicationInstanceId,
     ) -> Result<()> {
-        let _ = application_instance_id;
+        // One launch for one instance, decided under the broker's lock with the execution itself,
+        // so two launches naming one instance cannot both go ahead.
+        if self.instances.contains_key(&application_instance_id) {
+            return Err(BrokerError::invalid(format!(
+                "{application_instance_id} was already launched, and one instance runs one launch"
+            )));
+        }
         if !now.is_idle() {
             return Err(BrokerError::Launch(LaunchRefusal::ForegroundChanged));
         }
