@@ -8,7 +8,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-09.08 | `a_device_revocation_is_performed_once_however_long_its_first_attempt_waits`, `a_retry_while_a_device_revocation_runs_is_told_it_has_not_finished`, `a_share_whose_record_was_never_written_is_answered_from_what_it_wrote_after_a_restart`, `a_revocation_whose_record_was_never_written_is_not_performed_again_after_a_restart`, `an_authority_change_whose_attempt_ended_unrecorded_is_not_performed_again`, `a_refused_authority_change_is_refused_the_same_way_when_it_is_sent_again`, `a_claim_excludes_every_other_attempt_and_is_never_taken_over`, `an_earlier_receipts_table_migrates_once_and_its_open_claims_are_unfinished` |
+//! | KR-REQ-09.08 | `a_device_revocation_is_performed_once_however_long_its_first_attempt_waits`, `a_retry_while_a_device_revocation_runs_is_told_it_has_not_finished`, `a_share_whose_record_was_never_written_is_answered_from_what_it_wrote_after_a_restart`, `a_revocation_whose_record_was_never_written_is_not_performed_again_after_a_restart`, `an_authority_change_whose_attempt_ended_unrecorded_is_not_performed_again`, `a_refused_authority_change_is_refused_the_same_way_when_it_is_sent_again`, `an_unfinished_key_registration_is_not_answered_with_another_actions_registration`, `a_claim_excludes_every_other_attempt_and_is_never_taken_over`, `an_earlier_receipts_table_migrates_once_and_its_open_claims_are_unfinished` |
 //! | KR-REQ-10.40 | `a_grant_carries_every_field_section_ten_names`, `the_host_intersects_the_grant_with_policy_on_every_request`, `a_delegation_narrows_and_never_extends`, `revoking_a_parent_revokes_every_descendant` |
 //! | KR-REQ-10.41 | `a_method_is_decided_from_the_registry_table_and_never_from_a_capability` |
 //! | KR-REQ-10.43 | `an_owner_grant_stays_valid_until_it_is_revoked`, `an_invitation_is_view_only_for_an_hour_and_bounded_at_thirty_days` |
@@ -2725,6 +2725,103 @@ async fn an_authority_change_whose_attempt_ended_unrecorded_is_not_performed_aga
         .expect("present");
     assert!(stored.revoked_at_ms.is_none(), "nothing was withdrawn");
     assert_eq!(controller.policy().authority_revision(), before);
+}
+
+/// One notification-preview key registration, as a paired device sends it.
+fn key_registration(
+    environment_id: EnvironmentId,
+    action: u8,
+    device: DeviceId,
+    key: kr_protocol::scalars::NotificationPreviewKey,
+    revision: u64,
+) -> kr_protocol::envelope::MutationRequest {
+    kr_protocol::envelope::MutationRequest {
+        action_id: kr_protocol::ids::ActionId::new(Uuid::from_bytes([action; 16])),
+        request_id: kr_protocol::ids::RequestId::new(u64::from(action)),
+        method: Method::DevicePreviewKeyUpdate.into(),
+        method_version: kr_protocol::method::MethodVersion::V1,
+        grant_id: Nullable::null(),
+        target: kr_protocol::envelope::ActionTarget::environment(environment_id),
+        expected: kr_protocol::envelope::ParamsValue::empty(),
+        action_window_id: kr_protocol::ids::ActionWindowId::new("window-1").expect("a window"),
+        requested_ttl_ms: kr_protocol::scalars::DurationMs::new(30_000),
+        params: kr_protocol::envelope::ParamsValue::from_typed(
+            &kr_protocol::sharing::DevicePreviewKeyUpdateParams {
+                device_id: device,
+                notification_preview: key,
+                revision: kr_protocol::ids::DeviceKeyRevision::new(revision),
+            },
+        )
+        .expect("the parameters encode"),
+    }
+}
+
+/// KR-REQ-09.08: a key registration whose attempt ended unrecorded is not answered with what
+/// another action did. The first action's attempt claimed it and ended with nothing written, as an
+/// attempt refused by the delivery journal does when the daemon stops before it records the
+/// refusal. A second action then registers the same key at the same revision. The first action,
+/// sent again, is told its outcome is not known: the device's record holds that key because of the
+/// second action, and nothing this host keeps says the first one did anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unfinished_key_registration_is_not_answered_with_another_actions_registration() {
+    let (temp, controller) = daemon().await;
+    let environment_id = temp.environment_id();
+    let device = device_id(0xd1);
+    let actor = kr_transport::listener::device_principal(&device);
+    let initial = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair");
+    let rotated = kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair");
+    controller
+        .devices()
+        .commit(&kr_controller::service::net::devices::DeviceRecord {
+            device_id: device,
+            endpoint_id: kr_protocol::scalars::EndpointKey::from_bytes([1; 32]),
+            device_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
+            authorisation: kr_protocol::scalars::AuthorisationKey::from_bytes([2; 32]),
+            stored_envelope: None,
+            device_name: kr_protocol::pairing::DeviceName::new("phone").expect("a name"),
+            platform: kr_protocol::pairing::DevicePlatform::Ios,
+            grant: Grant {
+                recipient_device_id: device,
+                ..grant(1, None, &[ActionRight::SessionView], GrantExpiry::Never)
+            },
+            paired_at_ms: TimestampMs::new(1_000),
+            revoked_at_ms: None,
+            expired_at_ms: None,
+            committed_invitation_id: None,
+            notification_preview: Some(*initial.public()),
+        })
+        .expect("a paired device");
+
+    // The first action's attempt claims it and ends with nothing written and nothing recorded.
+    let first = key_registration(environment_id, 0x71, device, *rotated.public(), 2);
+    let digest = kr_protocol::digest::mutation_digest(&first, &actor).expect("a digest");
+    let claimed = controller
+        .sharing()
+        .grants()
+        .claim_action(&actor, first.action_id, &digest, kr_ipc::now_ms().get())
+        .expect("the first attempt claims its action");
+    assert!(
+        matches!(claimed, kr_controller::grants::ActionClaim::Claimed { .. }),
+        "{claimed:?}"
+    );
+    drop(claimed);
+
+    // Another action registers the same key at the same revision.
+    let second = key_registration(environment_id, 0x72, device, *rotated.public(), 2);
+    controller
+        .preview_key_update_action(&actor, &second)
+        .await
+        .expect("the second action registers the key");
+
+    let refusal = controller
+        .preview_key_update_action(&actor, &first)
+        .await
+        .expect_err("the first action is not answered with the second one's registration");
+    assert_eq!(
+        refusal.code(),
+        kr_protocol::error::ErrorCode::OutcomeUnknown,
+        "{refusal}"
+    );
 }
 
 /// KR-REQ-09.08: an authority change refused before its effect is refused the same way when the

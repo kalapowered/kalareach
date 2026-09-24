@@ -4975,46 +4975,21 @@ impl Controller {
     /// prove it.
     ///
     /// A grant and the invitation that carries it take identities derived from the action and are
-    /// written in one commit, so finding them is finding what the change wrote, and the answer is
-    /// rebuilt from what was written rather than proposed again. A preview-key registration's
-    /// answer is the registration itself, and it happened when the device's record holds that key
-    /// at that revision: the delivery journal takes it first, and a start copies the journal's
-    /// registration into the device's record. Nothing else this host keeps says what one
-    /// particular action did.
+    /// written in one commit, so finding them is finding what this action wrote, and the answer is
+    /// rebuilt from what was written rather than proposed again. Nothing else this host keeps names
+    /// the action that changed it: a device's record holding the key a registration asked for may
+    /// hold it because another action registered the same key, and a revoked grant may have been
+    /// revoked by any of several.
     fn proven_authority_change(&self, mutation: &MutationRequest) -> Result<Option<ParamsValue>> {
-        match mutation.method.method() {
-            Some(Method::GrantCreate) => {
-                let action = mutation.action_id.get();
-                let shared = self.sharing.shared(
-                    kr_protocol::ids::GrantId::new(Self::derived_identity(action, b"grant")),
-                    kr_protocol::ids::InvitationId::new(Self::derived_identity(
-                        action,
-                        b"invitation",
-                    )),
-                )?;
-                shared.as_ref().map(encode).transpose()
-            }
-            Some(Method::DevicePreviewKeyUpdate) => {
-                let params: kr_protocol::sharing::DevicePreviewKeyUpdateParams =
-                    parse(&mutation.params)?;
-                let held = self
-                    .devices
-                    .record_for_device(params.device_id)?
-                    .is_some_and(|record| {
-                        record.device_key_revision == params.revision
-                            && record.notification_preview == Some(params.notification_preview)
-                    });
-                held.then(|| {
-                    encode(&kr_protocol::sharing::DevicePreviewKeyUpdateResult {
-                        device_id: params.device_id,
-                        revision: params.revision,
-                        notification_preview: params.notification_preview,
-                    })
-                })
-                .transpose()
-            }
-            _ => Ok(None),
+        if mutation.method.method() != Some(Method::GrantCreate) {
+            return Ok(None);
         }
+        let action = mutation.action_id.get();
+        let shared = self.sharing.shared(
+            kr_protocol::ids::GrantId::new(Self::derived_identity(action, b"grant")),
+            kr_protocol::ids::InvitationId::new(Self::derived_identity(action, b"invitation")),
+        )?;
+        shared.as_ref().map(encode).transpose()
     }
 
     /// Keeps what a claimed action came to, under the hold that claimed it.
@@ -5422,9 +5397,9 @@ impl Controller {
     /// happened since. A device whose answer was lost asks again with the same action and is told
     /// what it was told the first time, even after a later rotation or once the window this
     /// action was admitted in has closed; a new action with an old revision is still refused. An
-    /// attempt that ended without recording its answer is not performed again: the repeat is told
-    /// the registration when the device's record holds it, and otherwise that the outcome is not
-    /// known.
+    /// attempt that ended without recording its answer is not performed again, and the repeat is
+    /// told the outcome is not known: the device's record may hold that key because another action
+    /// registered it.
     ///
     /// # Errors
     ///

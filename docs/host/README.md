@@ -3556,9 +3556,10 @@ window has closed, or whose daemon has restarted since, is still told what happe
 * for an attempt that ended without recording what it did (the daemon stopped, or the attempt's
   task ended, in between), what this host's own records prove it did, and otherwise
   `OUTCOME_UNKNOWN`. A share is answered from the grant and the invitation it wrote, which take
-  identities derived from the action, and a preview-key registration from the device's record when
-  that holds the key at that revision. Nothing else this host keeps names the action that changed
-  it, so a revocation or a voice change in this state is `OUTCOME_UNKNOWN`.
+  identities derived from the action. Nothing else this host keeps names the action that changed
+  it: a device's record can hold a preview key because another action registered the same one, and
+  a grant can have been revoked by any of several. So a revocation, a preview-key registration, a
+  destination's credential or a voice change in this state is `OUTCOME_UNKNOWN`.
 
 No attempt takes over a claim, however long ago it was written: an attempt that is still running is
 not known to have stopped, and one that stopped may already have reached its effect. So a retry
