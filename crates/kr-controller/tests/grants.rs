@@ -9,7 +9,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-09.08 | `a_device_revocation_is_performed_once_however_long_its_first_attempt_waits`, `a_retry_while_a_device_revocation_runs_is_told_it_has_not_finished`, `a_share_whose_record_was_never_written_is_answered_from_what_it_wrote_after_a_restart`, `a_revocation_whose_record_was_never_written_is_answered_from_the_rows_after_a_restart`, `an_authority_change_whose_attempt_ended_unrecorded_is_not_performed_again`, `a_refused_authority_change_is_refused_the_same_way_when_it_is_sent_again`, `an_unfinished_key_registration_is_not_answered_with_another_actions_registration`, `an_unfinished_revocation_pays_the_fence_it_still_owes_before_it_is_answered`, `an_unfinished_revocation_of_a_grant_still_standing_is_unknown`, `an_unfinished_device_revocation_is_answered_only_once_the_device_record_is_revoked`, `an_unfinished_destination_credential_is_unknown`, `a_claim_excludes_every_other_attempt_and_is_never_taken_over`, `an_earlier_receipts_table_migrates_once_and_its_open_claims_are_unfinished` |
-//! | KR-REQ-09.18 | `a_decision_that_reads_the_clock_waits_for_the_floor_whatever_the_grants_expiry`, `a_delegation_is_not_refused_as_expired_on_a_reading_this_host_could_not_write` |
+//! | KR-REQ-09.18 | `a_decision_that_reads_the_clock_waits_for_the_floor_whatever_the_grants_expiry`, `a_delegation_is_not_refused_as_expired_on_a_reading_this_host_could_not_write`, `a_paired_device_refused_while_the_floor_is_owed_is_told_storage_is_unavailable` |
 //! | KR-REQ-10.40 | `a_grant_carries_every_field_section_ten_names`, `the_host_intersects_the_grant_with_policy_on_every_request`, `a_delegation_narrows_and_never_extends`, `revoking_a_parent_revokes_every_descendant` |
 //! | KR-REQ-10.41 | `a_method_is_decided_from_the_registry_table_and_never_from_a_capability` |
 //! | KR-REQ-10.43 | `an_owner_grant_stays_valid_until_it_is_revoked`, `an_invitation_is_view_only_for_an_hour_and_bounded_at_thirty_days` |
@@ -24,6 +24,8 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+
+mod net_support;
 
 use kr_controller::grants::{
     AccessRequest, AuthorityFeed, FeedRefusal, GrantDirectory, GrantRecord, HostPolicy, Refusal,
@@ -1642,6 +1644,102 @@ fn a_decision_that_reads_the_clock_waits_for_the_floor_whatever_the_grants_expir
             refusal: MembershipRefusal::NoLease
         })
     );
+}
+
+/// KR-REQ-09.18: a paired device whose request reads the clock while this host's clock floor is
+/// owed its record is refused with `STORAGE_UNAVAILABLE`: a transient failure of this host's store,
+/// not a verdict on the device's authority, which the device may ask about again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paired_device_refused_while_the_floor_is_owed_is_told_storage_is_unavailable() {
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner).await;
+    let device = net_support::Device::create().await;
+    let paired = net_support::pair_with(
+        &host,
+        &device,
+        &owner,
+        net_support::proposal(&[ActionRight::SessionView]),
+    )
+    .await;
+    let raw = net_support::RawDevice::connect(&host, &device, &paired).await;
+    raw.claim();
+    let listing = kr_protocol::session::SessionListParams {
+        environment_id: Nullable::null(),
+        include_closed: false,
+    };
+    raw.read(Method::SessionList, &listing)
+        .await
+        .expect("the device lists its sessions");
+
+    // The owner bounds remote personal access in time, so the device's requests read the clock.
+    host.controller()
+        .update_policy(|policy| {
+            policy.set_offline_validity(Some(OfflineValidityPolicy {
+                maximum_offline_ms: kr_protocol::scalars::DurationMs::new(60 * 60 * 1000),
+                last_synchronised_at_ms: Nullable::some(TimestampMs::new(kr_ipc::now_ms().get())),
+            }));
+        })
+        .expect("the owner chooses an offline bound");
+    raw.read(Method::SessionList, &listing)
+        .await
+        .expect("inside the bound");
+
+    // The store refuses the policy, and a decision of the owner's stands on a floor it cannot write.
+    let registry =
+        rusqlite::Connection::open(host.registry_database()).expect("opens the registry");
+    registry
+        .busy_timeout(Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    registry
+        .execute_batch(
+            "CREATE TRIGGER refuse_policy BEFORE INSERT ON host_authority
+             WHEN NEW.key = 'policy'
+             BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("the fault is in place");
+    let mut client = host.client().await;
+    client
+        .request(
+            Method::GrantList,
+            &kr_protocol::sharing::GrantListParams {
+                session_id: Nullable::null(),
+                include_resolved: true,
+            },
+        )
+        .await
+        .expect("the daemon answers")
+        .expect("the owner's listing is answered");
+
+    let refusal = raw
+        .read(Method::SessionList, &listing)
+        .await
+        .expect_err("a request that reads the clock waits for the floor's record");
+    assert_eq!(
+        refusal.code,
+        kr_protocol::error::ErrorCode::StorageUnavailable,
+        "{refusal:?}"
+    );
+
+    // The store recovers, and the owner's next decision writes the floor down.
+    registry
+        .execute_batch("DROP TRIGGER refuse_policy;")
+        .expect("the fault is cleared");
+    client
+        .request(
+            Method::GrantList,
+            &kr_protocol::sharing::GrantListParams {
+                session_id: Nullable::null(),
+                include_resolved: true,
+            },
+        )
+        .await
+        .expect("the daemon answers")
+        .expect("the owner's listing is answered");
+    raw.read(Method::SessionList, &listing)
+        .await
+        .expect("once the floor is written down, the request is decided on its merits");
+    raw.close();
+    host.stop().await;
 }
 
 /// The stored policy is what a host reads back, and a restored old policy cannot revive authority.

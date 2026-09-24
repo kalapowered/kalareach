@@ -319,13 +319,18 @@ impl CeilingRefusal {
         }
     }
 
-    /// The protocol error a refusal becomes, which is `PERMISSION_DENIED` whichever rule refused.
+    /// The protocol error a refusal becomes: the grant and policy's own refusal as that refusal
+    /// reports itself ([`Refusal::to_protocol_error`]), and `PERMISSION_DENIED` for a right the
+    /// configuration removed.
     #[must_use]
     pub fn to_protocol_error(&self) -> kr_protocol::error::ProtocolError {
-        kr_protocol::error::ProtocolError::new(
-            kr_protocol::error::ErrorCode::PermissionDenied,
-            self.detail(),
-        )
+        match self {
+            Self::Refused(refusal) => refusal.to_protocol_error(),
+            Self::RemovedByConfiguration { .. } => kr_protocol::error::ProtocolError::new(
+                kr_protocol::error::ErrorCode::PermissionDenied,
+                self.detail(),
+            ),
+        }
     }
 }
 
