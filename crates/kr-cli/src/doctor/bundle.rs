@@ -45,11 +45,12 @@ pub const SESSIONS_ENTRY: &str = "content/sessions.json";
 pub struct Content {
     /// The entry's name inside the archive, under [`CONTENT_PREFIX`].
     ///
-    /// A literal in this source rather than a value with a runtime half. The name is written into
-    /// the archive's own header, which no allowlist stands in front of, and it is written into the
-    /// manifest beside it; a name with two spellings would be a bundle saying one thing about
-    /// itself and carrying another. This product composes every entry name out of its own words,
-    /// so the type says so and there is nowhere in one to put something that arrived.
+    /// The name is written into the archive's own header, which no allowlist stands in front of,
+    /// and into the manifest beside it, from this one value, so the two cannot spell one entry
+    /// two ways. What keeps it to this product's own words is the producer rather than the type:
+    /// `&'static str` is a lifetime, not an origin, and a runtime string leaked with
+    /// `Box::leak` fits it as well as a literal does. The one producer, the content export
+    /// `kr doctor --include-content` builds, passes [`SESSIONS_ENTRY`].
     pub entry: &'static str,
     /// What it holds, in the words the command prints before it writes.
     pub describes: Sentence,

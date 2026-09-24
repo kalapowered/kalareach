@@ -2988,9 +2988,11 @@ pub mod configuration {
 /// token from a sentence, and no pattern can.
 ///
 /// The sentences this build writes about itself go through [`Sentence`], whose only text is
-/// `&'static str`: a literal in this source. A message that arrived at runtime is a `String` and
-/// cannot be put in one, so a check's detail cannot come to carry a library's error message by
-/// somebody interpolating it.
+/// `&'static str`, which every caller in this product passes as a literal in this source. A
+/// message that arrived at runtime is a `String` and cannot be put in one, so a check's detail
+/// cannot come to carry a library's error message by somebody interpolating it. The type
+/// establishes a lifetime rather than an origin, as [`Stated`] says: it stops the mistake, not a
+/// caller that leaks a string on purpose.
 pub mod export {
     use schemars::JsonSchema;
     use serde::{Deserialize, Serialize};
@@ -3617,14 +3619,17 @@ pub mod export {
     /// `kr-controller/0.1.0` is one. A support bundle names it in full, because which build is
     /// running is the first thing somebody reading one needs and a length would tell them nothing.
     ///
-    /// Naming it in full is safe because nothing of the text survives the parse. The text reaches
-    /// the command that writes a bundle in a reply, over a socket, so where it came from
-    /// establishes nothing about it. What is stored is a word out of [`BuildComponent`] and three
-    /// numbers, and what is rendered is composed from those: this build's own vocabulary and its
-    /// own arithmetic, with no borrowed substring anywhere in it. A version that is anything but
-    /// three numbers, and a component that is not one this product builds, are not a build
-    /// identity; they fail the parse and leave as their class and their length like any other
-    /// name. There is deliberately no accessor returning the text that was parsed.
+    /// What the parse establishes is a shape, not a build. The text reaches the command that
+    /// writes a bundle in a reply, over a socket, so where it came from establishes nothing about
+    /// it, and the parse does not change that: `kr-controller/123456.7.8` parses and renders as
+    /// itself, so the reply still chooses the three numbers, and a bundle names the build the
+    /// daemon reported rather than proving which one is installed. What the shape does establish
+    /// is that nothing else gets in: what is stored is a word out of [`BuildComponent`] and three
+    /// numbers of at most nine digits, and what is rendered is composed from those, with no
+    /// borrowed substring anywhere in it. A version that is anything but three numbers, and a
+    /// component that is not one this product builds, fail the parse and leave as their class
+    /// and their length like any other name. There is deliberately no accessor returning the text
+    /// that was parsed.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct BuildIdentity {
         component: BuildComponent,
@@ -3853,10 +3858,11 @@ pub mod export {
 
     /// A sentence this build writes about its own host.
     ///
-    /// The only text it takes is `&'static str`, which is a literal in this source. A message from
-    /// a library, a path, or anything else that arrived at runtime is a `String` and cannot be put
-    /// in one; what such a value contributes is a number, a member of a closed set, an identifier
-    /// this host generated, or its class and its length.
+    /// The only text it takes is `&'static str`, which every caller passes as a literal in this
+    /// source; like [`Stated`], the type establishes that lifetime rather than the origin. A
+    /// message from a library, a path, or anything else that arrived at runtime is a `String` and
+    /// cannot be put in one; what such a value contributes is a number, a member of a closed set,
+    /// an identifier this host generated, or its class and its length.
     ///
     /// That is the whole of why a check's detail cannot come to carry a credential. It is not that
     /// each caller remembers to redact: it is that there is nowhere in a sentence to put text that
@@ -4454,92 +4460,170 @@ mod tests {
         }
     }
 
-    /// KR-REQ-26.44: the allowlist covers every field of every type an export can reach.
+    /// The schema generator the coverage walks read.
     ///
-    /// Walked from the three export roots through the schema itself rather than through a list of
-    /// types somebody keeps up to date: every reference is followed, arrays and alternatives are
-    /// descended, and every object the walk arrives at must have a content class for each of its
-    /// members. So a type reached only inside another exported type is covered, and a member
-    /// added to one tomorrow fails this on the day it is added whether or not anything in this
-    /// file names it.
-    #[test]
-    fn every_exported_field_is_classed() {
-        use schemars::generate::SchemaSettings;
+    /// The serialising contract, because an export is what a serialiser writes. A member a reader
+    /// skips (`skip_deserializing`) is absent from the deserialising schema and present in every
+    /// document this host sends, so a walk of the reader's schema would never see it.
+    fn export_generator() -> schemars::SchemaGenerator {
+        schemars::generate::SchemaSettings::draft2020_12()
+            .for_serialize()
+            .into_generator()
+    }
+
+    /// Keywords whose value is a subschema the coverage walk does not follow.
+    ///
+    /// Each could hold members the walk would then never see, so meeting one is a refusal rather
+    /// than a gap: a type whose schema needs one has to be walked here before it can be exported.
+    const UNFOLLOWED: [&str; 10] = [
+        "$defs",
+        "definitions",
+        "$dynamicRef",
+        "$recursiveRef",
+        "dependentSchemas",
+        "dependencies",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "additionalItems",
+        "contentSchema",
+    ];
+
+    /// The keywords that make an object a map, whose keys are text somebody chose.
+    ///
+    /// The map-key policy is that no export carries one. A member's name is a word this build
+    /// declared and the allowlist classes; a map key is a value, and nothing classes it. So a map
+    /// reached from an export is refused here, whatever its values are, and a type that wants one
+    /// has to decide what its keys are made of first. `additionalProperties: false` is the one
+    /// form of these that is not a map: it is how a closed object says it has no other members.
+    const MAP_KEYWORDS: [&str; 3] = ["additionalProperties", "patternProperties", "propertyNames"];
+
+    /// Every named object an export's schema reaches, with its members.
+    ///
+    /// Every reference is followed, and so is every keyword beside it, because a reference with
+    /// siblings is one schema rather than two: members written beside it belong to the object
+    /// that holds them. Arrays, conditions and negations are descended with the owning name
+    /// cleared, so an object with members that has no name of its own is a refusal rather than a
+    /// set of members attributed to whatever contained it; alternatives keep the name, because an
+    /// alternative is another shape of the same value.
+    ///
+    /// # Errors
+    ///
+    /// Returns what it could not account for: a subschema that admits any value, a keyword in
+    /// [`UNFOLLOWED`], a map, an object with members and no name, and a reference that is not to a
+    /// definition this generator wrote.
+    fn reach(
+        roots: &[serde_json::Value],
+        defined: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>, String>
+    {
         use std::collections::{BTreeMap, BTreeSet};
 
-        /// Follows one node, recording each named object's members and classing each of them.
-        ///
-        /// `owner` is the definition the node belongs to. A reference moves it; descending into a
-        /// member clears it, so an object nested inside a member with no name of its own is a
-        /// failure rather than a set of members attributed to whatever contained them.
         fn walk(
             node: &serde_json::Value,
             defined: &serde_json::Map<String, serde_json::Value>,
             owner: Option<&str>,
             seen: &mut BTreeSet<String>,
             reached: &mut BTreeMap<String, BTreeSet<String>>,
-        ) {
-            let serde_json::Value::Object(schema) = node else {
-                return;
+        ) -> Result<(), String> {
+            let schema = match node {
+                // A schema nothing satisfies holds nothing.
+                serde_json::Value::Bool(false) => return Ok(()),
+                serde_json::Value::Object(schema) if !schema.is_empty() => schema,
+                _ => {
+                    return Err(format!(
+                        "an export reaches a value of any shape, which nothing classes: {node}"
+                    ));
+                }
             };
-            if let Some(reference) = schema.get("$ref").and_then(serde_json::Value::as_str) {
+            if let Some(keyword) = UNFOLLOWED
+                .iter()
+                .find(|keyword| schema.contains_key(**keyword))
+            {
+                return Err(format!(
+                    "an export reaches {keyword}, which this walk does not follow: {node}"
+                ));
+            }
+            for keyword in MAP_KEYWORDS {
+                let map = match schema.get(keyword) {
+                    Some(serde_json::Value::Bool(false)) if keyword == "additionalProperties" => {
+                        false
+                    }
+                    Some(_) => true,
+                    None => false,
+                };
+                if map {
+                    return Err(format!(
+                        "an export reaches a map ({keyword}), whose keys nothing classes: {node}"
+                    ));
+                }
+            }
+            if let Some(reference) = schema.get("$ref") {
                 let name = reference
-                    .rsplit('/')
-                    .next()
-                    .expect("a reference names a type")
-                    .to_owned();
+                    .as_str()
+                    .and_then(|reference| reference.strip_prefix("#/$defs/"))
+                    .ok_or_else(|| {
+                        format!("an export reaches a reference to no definition here: {node}")
+                    })?
+                    .replace("~1", "/")
+                    .replace("~0", "~");
                 if seen.insert(name.clone()) {
                     let definition = defined
                         .get(&name)
-                        .unwrap_or_else(|| panic!("{name} is referred to and not defined"));
-                    walk(definition, defined, Some(&name), seen, reached);
+                        .ok_or_else(|| format!("{name} is referred to and not defined"))?;
+                    walk(definition, defined, Some(&name), seen, reached)?;
                 }
-                return;
+                // And on to its siblings, which belong to this node rather than to the reference.
             }
-            if let Some(serde_json::Value::Object(members)) = schema.get("properties") {
-                let name = owner.unwrap_or_else(|| {
-                    panic!("an export reaches an object with members and no name: {node}")
-                });
-                for member in members.keys() {
+            if let Some(members) = schema.get("properties") {
+                let serde_json::Value::Object(members) = members else {
+                    return Err(format!("properties that are not an object: {node}"));
+                };
+                let name = owner.ok_or_else(|| {
+                    format!("an export reaches an object with members and no name: {node}")
+                })?;
+                for (member, below) in members {
                     reached
                         .entry(name.to_owned())
                         .or_default()
                         .insert(member.clone());
-                    assert!(
-                        export::class_of(name, member).is_some(),
-                        "{name}.{member} is reachable from an export and has no content class"
-                    );
-                }
-                for below in members.values() {
-                    walk(below, defined, None, seen, reached);
+                    walk(below, defined, None, seen, reached)?;
                 }
             }
-            for key in [
-                "items",
-                "additionalProperties",
-                "propertyNames",
-                "contains",
-                "not",
-                "if",
-                "then",
-                "else",
-            ] {
-                if let Some(below) = schema.get(key) {
-                    walk(below, defined, None, seen, reached);
+            for keyword in ["items", "contains", "not", "if", "then", "else"] {
+                if let Some(below) = schema.get(keyword) {
+                    walk(below, defined, None, seen, reached)?;
                 }
             }
-            // An alternative is another shape of the same value, so it keeps the name: a nullable
-            // member and a variant of an enumeration both arrive here.
-            for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
-                if let Some(serde_json::Value::Array(alternatives)) = schema.get(key) {
+            for keyword in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+                if let Some(alternatives) = schema.get(keyword) {
+                    let serde_json::Value::Array(alternatives) = alternatives else {
+                        return Err(format!("{keyword} that is not an array: {node}"));
+                    };
                     for alternative in alternatives {
-                        walk(alternative, defined, owner, seen, reached);
+                        walk(alternative, defined, owner, seen, reached)?;
                     }
                 }
             }
+            Ok(())
         }
 
-        let mut generator = SchemaSettings::draft2020_12().into_generator();
+        let mut seen = BTreeSet::new();
+        let mut reached = BTreeMap::new();
+        for root in roots {
+            walk(root, defined, None, &mut seen, &mut reached)?;
+        }
+        Ok(reached)
+    }
+
+    /// KR-REQ-26.44: the allowlist covers every field of every type an export can reach.
+    ///
+    /// Walked from the export roots through the schema of what is written rather than through a
+    /// list of types somebody keeps up to date, by [`reach`]. So a type reached only inside
+    /// another exported type is covered, and a member added to one tomorrow fails this on the day
+    /// it is added whether or not anything in this file names it.
+    #[test]
+    fn every_exported_field_is_classed() {
+        let mut generator = export_generator();
         let roots = vec![
             generator.subschema_for::<SupportBundle>().to_value(),
             generator.subschema_for::<HostDoctorResult>().to_value(),
@@ -4548,10 +4632,14 @@ mod tests {
                 .to_value(),
         ];
         let defined = generator.take_definitions(false);
-        let mut seen = BTreeSet::new();
-        let mut reached: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for root in &roots {
-            walk(root, &defined, None, &mut seen, &mut reached);
+        let reached = reach(&roots, &defined).unwrap_or_else(|problem| panic!("{problem}"));
+        for (name, members) in &reached {
+            for member in members {
+                assert!(
+                    export::class_of(name, member).is_some(),
+                    "{name}.{member} is reachable from an export and has no content class"
+                );
+            }
         }
         assert!(
             reached.len() > 15,
@@ -4571,6 +4659,133 @@ mod tests {
                 entry.type_name,
                 entry.field
             );
+        }
+    }
+
+    /// KR-REQ-26.44: the coverage walk sees what a reference's siblings add, and refuses every
+    /// form it cannot account for rather than passing over it.
+    #[test]
+    fn the_coverage_walk_follows_a_reference_and_its_siblings_and_refuses_the_rest() {
+        let defined = serde_json::json!({
+            "Outer": {
+                "$ref": "#/$defs/Inner",
+                "properties": { "beside": { "type": "string" } }
+            },
+            "Inner": {
+                "type": "object",
+                "properties": { "inside": { "type": "string" } }
+            }
+        });
+        let defined = defined.as_object().expect("definitions");
+        let reached = reach(&[serde_json::json!({ "$ref": "#/$defs/Outer" })], defined)
+            .expect("a reference with a sibling is walked");
+        assert!(reached["Outer"].contains("beside"), "{reached:?}");
+        assert!(reached["Inner"].contains("inside"), "{reached:?}");
+
+        for (node, named) in [
+            (
+                serde_json::json!({ "type": "object", "patternProperties": { "^[0-9]+$": { "type": "string" } } }),
+                "patternProperties",
+            ),
+            (
+                serde_json::json!({ "type": "object", "additionalProperties": { "type": "string" } }),
+                "additionalProperties",
+            ),
+            (
+                serde_json::json!({ "type": "object", "additionalProperties": true }),
+                "additionalProperties",
+            ),
+            (
+                serde_json::json!({ "propertyNames": { "type": "string" } }),
+                "propertyNames",
+            ),
+            (
+                serde_json::json!({ "unevaluatedProperties": { "type": "string" } }),
+                "unevaluatedProperties",
+            ),
+            (
+                serde_json::json!({ "dependentSchemas": { "a": { "type": "string" } } }),
+                "dependentSchemas",
+            ),
+            (serde_json::json!(true), "any shape"),
+            (serde_json::json!({}), "any shape"),
+            (serde_json::json!({ "items": {} }), "any shape"),
+            (
+                serde_json::json!({ "$ref": "https://example.com/elsewhere" }),
+                "reference to no definition",
+            ),
+            (
+                serde_json::json!({ "$ref": "#/$defs/Missing" }),
+                "not defined",
+            ),
+            (
+                serde_json::json!({ "items": { "properties": { "x": { "type": "string" } } } }),
+                "no name",
+            ),
+        ] {
+            let refused = reach(std::slice::from_ref(&node), defined)
+                .expect_err("a form the walk cannot account for");
+            assert!(refused.contains(named), "{node} was refused as: {refused}");
+        }
+        // A closed object says so with `false`, and that is not a map.
+        let closed = serde_json::json!({
+            "Closed": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": { "only": { "type": "string" } }
+            }
+        });
+        let reached = reach(
+            &[serde_json::json!({ "$ref": "#/$defs/Closed" })],
+            closed.as_object().expect("definitions"),
+        )
+        .expect("a closed object is walked");
+        assert!(reached["Closed"].contains("only"));
+    }
+
+    /// KR-REQ-26.44: the coverage walk reads the schema of what is written, so a member a reader
+    /// skips is still one the allowlist has to class; and a map is refused however its keys are
+    /// written, including the integer keys schemars describes with `patternProperties`.
+    #[test]
+    fn the_coverage_walk_reads_what_a_serialiser_writes_and_refuses_every_map() {
+        #[derive(Serialize, Deserialize, JsonSchema)]
+        struct Written {
+            shown: String,
+            #[serde(skip_deserializing)]
+            written_only: String,
+        }
+
+        let mut generator = export_generator();
+        let root = generator.subschema_for::<Written>().to_value();
+        let reached =
+            reach(&[root], &generator.take_definitions(false)).expect("a plain object is walked");
+        assert!(reached["Written"].contains("written_only"), "{reached:?}");
+
+        // The reader's schema does not have it, which is exactly why the walk does not read that.
+        let mut reader = schemars::generate::SchemaSettings::draft2020_12().into_generator();
+        let root = reader.subschema_for::<Written>().to_value();
+        let reached =
+            reach(&[root], &reader.take_definitions(false)).expect("a plain object is walked");
+        assert!(!reached["Written"].contains("written_only"), "{reached:?}");
+
+        #[derive(Serialize, JsonSchema)]
+        struct ByNumber {
+            entries: std::collections::BTreeMap<u32, String>,
+        }
+        #[derive(Serialize, JsonSchema)]
+        struct ByName {
+            entries: std::collections::BTreeMap<String, String>,
+        }
+        let mut generator = export_generator();
+        let roots = [
+            generator.subschema_for::<ByNumber>().to_value(),
+            generator.subschema_for::<ByName>().to_value(),
+        ];
+        let defined = generator.take_definitions(false);
+        for root in roots {
+            let refused = reach(std::slice::from_ref(&root), &defined)
+                .expect_err("a map reached from an export");
+            assert!(refused.contains("a map ("), "{refused}");
         }
     }
 
@@ -4652,6 +4867,12 @@ mod tests {
         assert!(sentence.contains("[name withheld, 7 bytes]"), "{sentence}");
     }
 
+    /// The bytes a probe read for the boot a test host is in.
+    const BOOT_BYTES: [u8; 16] = [
+        0x5a, 0x17, 0xc3, 0x09, 0x8e, 0x42, 0x4d, 0x61, 0xb0, 0x2f, 0x93, 0x7c, 0x11, 0xe8, 0x06,
+        0xd4,
+    ];
+
     /// One desktop context, populated the way a probe reports one.
     fn a_desktop() -> crate::desktop::DesktopContext {
         crate::desktop::DesktopContext {
@@ -4663,8 +4884,8 @@ mod tests {
             os_user: "someone".to_owned(),
             uid: Nullable(None),
             boot_identity: BootIdentity {
-                source: crate::identity::BootIdentitySource::BootTime,
-                value: crate::scalars::Bytes::new(Vec::new()),
+                source: crate::identity::BootIdentitySource::MacosBootSessionUuid,
+                value: crate::scalars::Bytes::new(BOOT_BYTES.to_vec()),
             },
             graphic_access: false,
             remote: false,
@@ -4946,6 +5167,57 @@ mod tests {
         let written = serde_json::to_string(&export::environment_capabilities(parsed))
             .expect("the export serialises");
         assert!(!written.contains(PLANTED), "{written}");
+    }
+
+    /// KR-REQ-26.44: an exported boot identity says which facility it came from and carries none
+    /// of its value, and the context this host keeps for itself keeps every byte.
+    ///
+    /// The marker walk cannot show this, because the value is bytes and a marker is not valid
+    /// base64url: it would leave the field as it was. So the fixture carries real bytes, the reply
+    /// is read back the way a command reads one, and the reduction is checked on what came back.
+    #[test]
+    fn an_exported_boot_identity_keeps_its_source_and_none_of_its_value() {
+        let desktop = a_desktop();
+        assert_eq!(desktop.boot_identity.value.as_slice(), BOOT_BYTES);
+        let answer = crate::desktop::EnvironmentCapabilitiesResult {
+            environment_id: an_environment(),
+            desktop: crate::desktop::DesktopCapabilityReport {
+                desktop: desktop.clone(),
+                records: vec![capability_record()],
+            },
+            default_worker_profile: WorkerProfile::HeadlessUser,
+            persistence: Vec::new(),
+            power: crate::desktop::SleepInhibitionState::off(
+                crate::desktop::InhibitionMechanism::None,
+                crate::desktop::PowerSource::Unknown,
+            ),
+        };
+        let read: crate::desktop::EnvironmentCapabilitiesResult =
+            serde_json::from_value(serde_json::to_value(&answer).expect("the answer serialises"))
+                .expect("a reply parses");
+        assert_eq!(
+            read.desktop.desktop.boot_identity, desktop.boot_identity,
+            "the reply carries the bytes to be reduced"
+        );
+
+        let exported = export::environment_capabilities(read.clone());
+        assert_eq!(
+            exported.desktop.desktop.boot_identity.source, desktop.boot_identity.source,
+            "which facility this platform reads is kept"
+        );
+        assert!(
+            exported.desktop.desktop.boot_identity.value.is_empty(),
+            "and none of the value leaves"
+        );
+        let written = serde_json::to_string(&exported).expect("the export serialises");
+        assert!(
+            !written.contains(&crate::scalars::to_base64url(&BOOT_BYTES)),
+            "{written}"
+        );
+        assert_eq!(
+            read.desktop.desktop.boot_identity, desktop.boot_identity,
+            "the context this host compares against is untouched"
+        );
     }
 
     /// KR-REQ-26.44: a row that declares its own class does not decide what its text is.

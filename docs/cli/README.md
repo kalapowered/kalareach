@@ -655,7 +655,9 @@ because which build is running is the first thing somebody reading one needs. No
 survives the parse: what is kept is the program's name, out of the closed list of the programs this
 product builds, and the three numbers of its version. What is printed is composed from those.
 `kr-controller/0.1.0` is named in full; a component this product does not build and a version that
-is not three numbers are not a build identity, and carry their length like any other name.
+is not three numbers are not a build identity, and carry their length like any other name. The
+parse settles the shape and not the build: the reply still chooses the three numbers, so a bundle
+names the build the daemon reported rather than proving which one is installed.
 
 That is why a credential cannot reach a bundle by being spelled in an unexpected way. Nothing reads
 a value to decide about it, so a lower-case scheme word, an unfamiliar token alphabet and a
