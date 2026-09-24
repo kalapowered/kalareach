@@ -7142,6 +7142,7 @@
           "description": "Issuing an invitation that proposes this grant.",
           "properties": {
             "issue_invitation": {
+              "additionalProperties": false,
               "properties": {
                 "grant_kind": {
                   "$ref": "#/$defs/InviteGrantKind",
@@ -7186,6 +7187,7 @@
           "description": "Adding this candidate as a device.",
           "properties": {
             "confirm_device": {
+              "additionalProperties": false,
               "properties": {
                 "candidate": {
                   "$ref": "#/$defs/PairCandidateView",
@@ -7267,6 +7269,7 @@
           "description": "Issuing a persistent pairing invitation proposing exactly this grant.\n\nThe host binds [`crate::invitation::issuance_digest`] over all four members, so the\napproval issues exactly this mode at exactly this origin, and the grant's rights.",
           "properties": {
             "issue_invitation": {
+              "additionalProperties": false,
               "properties": {
                 "grant_kind": {
                   "$ref": "#/$defs/InviteGrantKind",
@@ -7311,6 +7314,7 @@
           "description": "Confirming the candidate that holds this invitation.\n\nThe host reads the candidate it bound: its keys, the proposed rights and the digest over the\nexact transcript and bundles the owner is shown.",
           "properties": {
             "confirm_device": {
+              "additionalProperties": false,
               "properties": {
                 "invitation_id": {
                   "$ref": "#/$defs/InvitationId",
@@ -14859,6 +14863,7 @@
           "description": "The code, the origin a candidate must use, and the code-mode QR.",
           "properties": {
             "code": {
+              "additionalProperties": false,
               "properties": {
                 "code": {
                   "$ref": "#/$defs/ShortCode",
@@ -14891,6 +14896,7 @@
           "description": "The self-contained QR payload.",
           "properties": {
             "direct": {
+              "additionalProperties": false,
               "properties": {
                 "qr_text": {
                   "$ref": "#/$defs/QrText",
@@ -14933,6 +14939,7 @@
           "description": "A ten-character code through a rendezvous service.",
           "properties": {
             "code": {
+              "additionalProperties": false,
               "properties": {
                 "rendezvous_origin": {
                   "anyOf": [
@@ -18820,6 +18827,7 @@
           "description": "A short-code candidate: the transcript both devices confirmed and both bundle hashes.",
           "properties": {
             "code": {
+              "additionalProperties": false,
               "properties": {
                 "client_bundle_hash": {
                   "$ref": "#/$defs/Digest256",
@@ -18852,6 +18860,7 @@
           "description": "A direct candidate: the digest of `D` and of its complete key bundle.",
           "properties": {
             "direct": {
+              "additionalProperties": false,
               "properties": {
                 "client_key_digest": {
                   "$ref": "#/$defs/Digest256",
@@ -25154,6 +25163,7 @@
           "description": "The candidate asks to be admitted under its attempt, with its fresh nonce.",
           "properties": {
             "admit": {
+              "additionalProperties": false,
               "properties": {
                 "client_nonce": {
                   "$ref": "#/$defs/Nonce256",
@@ -25176,6 +25186,7 @@
           "description": "The host's nonce and its SPAKE2 message, role A.",
           "properties": {
             "host_pake": {
+              "additionalProperties": false,
               "properties": {
                 "host_nonce": {
                   "$ref": "#/$defs/Nonce256",
@@ -25203,6 +25214,7 @@
           "description": "The candidate's SPAKE2 message, role B.",
           "properties": {
             "client_pake": {
+              "additionalProperties": false,
               "properties": {
                 "message": {
                   "$ref": "#/$defs/Bytes",
@@ -25225,6 +25237,7 @@
           "description": "The candidate's confirmation tag, `HMAC-SHA256(client-confirm-key, T)`.",
           "properties": {
             "client_confirmation": {
+              "additionalProperties": false,
               "properties": {
                 "tag": {
                   "$ref": "#/$defs/Mac256",
@@ -25247,6 +25260,7 @@
           "description": "The host's confirmation tag, `HMAC-SHA256(host-confirm-key, T)`.",
           "properties": {
             "host_confirmation": {
+              "additionalProperties": false,
               "properties": {
                 "tag": {
                   "$ref": "#/$defs/Mac256",
@@ -25269,6 +25283,7 @@
           "description": "One sealed bundle message. Its direction and type are authenticated, not sent: each side\nknows which phase it is in.",
           "properties": {
             "bundle": {
+              "additionalProperties": false,
               "properties": {
                 "ciphertext": {
                   "$ref": "#/$defs/Bytes",
@@ -25306,6 +25321,7 @@
           "description": "The host ends the attempt, with the stable code it would report anywhere else.\n\nAn authentication failure is `PAIRING_AUTH_FAILED` and says nothing more, whether the code,\nthe origin or the peer was wrong.",
           "properties": {
             "refused": {
+              "additionalProperties": false,
               "properties": {
                 "code": {
                   "$ref": "#/$defs/ErrorCode",

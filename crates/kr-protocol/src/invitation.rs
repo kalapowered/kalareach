@@ -38,7 +38,7 @@ pub enum InviteModeKind {
 
 /// How an invitation is offered.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum InviteMode {
     /// A ten-character code through a rendezvous service.
     Code {
@@ -214,7 +214,7 @@ impl JsonSchema for QrText {
 
 /// How the issuing owner offers an invitation it has just issued.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum InviteEntry {
     /// The code, the origin a candidate must use, and the code-mode QR.
     Code {
@@ -252,7 +252,7 @@ pub struct PairInviteResult {
 /// `pair.confirm` names it back. An approval that named less would not say which candidate the
 /// owner was shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PairingApproval {
     /// A short-code candidate: the transcript both devices confirmed and both bundle hashes.
     Code {
@@ -389,7 +389,7 @@ pub struct PairingSecurityEvent {
 /// room and the iroh path are two routes, and a finish that overtook the bundle would name a
 /// transcript the host has not bound to a candidate yet.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RendezvousMessage {
     /// The candidate asks to be admitted under its attempt, with its fresh nonce.
     Admit {

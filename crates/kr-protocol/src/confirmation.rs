@@ -36,7 +36,7 @@ use crate::scalars::{AuthorisationKey, CanonicalSet, Digest256, Nullable, Timest
 
 /// What an owner confirmation is asked for.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ConfirmationSubject {
     /// Issuing a persistent pairing invitation proposing exactly this grant.
     ///
@@ -127,7 +127,7 @@ pub struct OwnerConfirmationPendingParams {}
 
 /// What an owner is asked to approve, as its device shows it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ConfirmationDisplay {
     /// Issuing an invitation that proposes this grant.
     IssueInvitation {
