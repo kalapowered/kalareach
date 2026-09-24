@@ -1001,9 +1001,9 @@ fn output_of(bytes: &[u8]) -> ControlFrame {
 /// A keystroke is complete once both its answer and its echo have arrived, in either order, and
 /// its figure is the time to the echo.
 ///
-/// The host answers a write before the byte reaches the application, and the echo travels the
-/// output path on its own, so on a busy machine the echo can reach the client first. That is a
-/// keystroke like any other rather than a sample that failed.
+/// The host answers a write without waiting for the byte to reach the application, and the echo
+/// travels the output path on its own, so on a busy machine the echo can reach the client first.
+/// That is a keystroke like any other rather than a sample that failed.
 #[test]
 fn a_keystroke_is_its_answer_and_its_echo_in_either_order() {
     let millis = Duration::from_millis;
