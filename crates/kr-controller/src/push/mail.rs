@@ -161,9 +161,9 @@ pub fn check_account(account: &MailAccount) -> Result<(), String> {
 pub struct MailDeadlines {
     /// Reaching the server, TLS included.
     pub connect: Duration,
-    /// Each reply before the message is sent.
+    /// Each command's write and its reply before the message is sent.
     pub reply: Duration,
-    /// The reply to the message itself, which a server may take a while to give.
+    /// Writing the message, and the reply to it, which a server may take a while to give.
     pub final_reply: Duration,
 }
 
@@ -397,11 +397,15 @@ impl MailSubmission {
         // The message, dot-stuffed. Nothing is sent until the line that ends it is written: a
         // failure before that leaves a message the server discards.
         let stuffed = dot_stuff(message);
-        wire.send_raw(&stuffed)
+        wire.send_raw(&stuffed, self.deadlines.final_reply)
             .await
-            .map_err(|_| not_sent("the connection ended while the message was being sent"))?;
+            .map_err(|_| not_sent("the message could not be written to the mail server in time"))?;
         // From here the server may have taken the message, whatever else happens.
-        if wire.send_raw(b".\r\n").await.is_err() {
+        if wire
+            .send_raw(b".\r\n", self.deadlines.final_reply)
+            .await
+            .is_err()
+        {
             return Err(unknown(
                 "the connection ended as the message was finished, so whether the server took it \
                  is not known",
@@ -430,7 +434,7 @@ impl MailSubmission {
         };
         // A polite end. The outcome is already decided and nothing here can change it.
         let _ = tokio::time::timeout(self.deadlines.reply, async {
-            if wire.send(b"QUIT").await.is_ok() {
+            if wire.send(b"QUIT", self.deadlines.reply).await.is_ok() {
                 let _ = wire.reply().await;
             }
         })
@@ -544,7 +548,7 @@ impl MailSubmission {
         accepted: impl Fn(u16) -> bool,
     ) -> Result<Reply, ExternalOutcome> {
         if let Some(command) = command {
-            wire.send(command)
+            wire.send(command, self.deadlines.reply)
                 .await
                 .map_err(|_| not_sent(format!("the connection ended before {what}")))?;
         }
@@ -658,20 +662,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
         self.buffer.is_empty().then_some(self.stream)
     }
 
-    /// Writes one command and the CR LF that ends it.
-    async fn send(&mut self, command: &[u8]) -> std::io::Result<()> {
+    /// Writes one command and the CR LF that ends it, within `deadline`.
+    async fn send(&mut self, command: &[u8], deadline: Duration) -> std::io::Result<()> {
         let mut line = Vec::with_capacity(command.len() + 2);
         line.extend_from_slice(command);
         line.extend_from_slice(b"\r\n");
-        let written = self.send_raw(&line).await;
+        let written = self.send_raw(&line, deadline).await;
         // The line may hold a credential; it is cleared rather than left for the allocator.
         drop(kr_crypto::secret::SecretVec::new(line));
         written
     }
 
-    async fn send_raw(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        self.stream.write_all(bytes).await?;
-        self.stream.flush().await
+    /// Writes bytes and flushes them, within `deadline`.
+    ///
+    /// Every write has one. A server that stops reading fills the connection's buffers, and a
+    /// write with no deadline would then wait for ever, holding the pass and every notification
+    /// behind it.
+    async fn send_raw(&mut self, bytes: &[u8], deadline: Duration) -> std::io::Result<()> {
+        tokio::time::timeout(deadline, async {
+            self.stream.write_all(bytes).await?;
+            self.stream.flush().await
+        })
+        .await
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?
     }
 
     /// Reads one line, without its line ending.

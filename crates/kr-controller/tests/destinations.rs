@@ -1291,6 +1291,8 @@ struct MailScript {
     rcpt_reply: &'static str,
     /// Answers the message with this, or ends the connection without answering when `None`.
     final_reply: Option<&'static str>,
+    /// Agrees to take the message and then stops reading.
+    stalls_after_data: bool,
 }
 
 impl MailScript {
@@ -1303,6 +1305,7 @@ impl MailScript {
             auth_reply: Some("235 2.7.0 Authentication successful"),
             rcpt_reply: "250 2.1.5 Ok",
             final_reply: Some("250 2.0.0 Ok: queued as 1"),
+            stalls_after_data: false,
         }
     }
 
@@ -1495,6 +1498,10 @@ async fn serve_secure<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
             write_line(stream.get_mut(), script.rcpt_reply).await;
         } else if command == "DATA" {
             write_line(stream.get_mut(), "354 End data with <CR><LF>.<CR><LF>").await;
+            if script.stalls_after_data {
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                return;
+            }
             loop {
                 let mut raw = Vec::new();
                 if stream.read_until(b'\n', &mut raw).await.unwrap_or(0) == 0 {
@@ -1854,6 +1861,59 @@ fn a_mail_servers_answer_is_read_by_where_it_came() {
             "{case}: whether the message was sent"
         );
     }
+}
+
+/// KR-REQ-24.12: a mail server that agrees to take a message and then stops reading cannot hold an
+/// attempt, and the pass behind it, for ever. The write has a deadline, and a message that could not
+/// be written before its terminating line is one nothing was sent of.
+#[test]
+fn a_mail_server_that_stops_reading_cannot_hold_the_attempt() {
+    use kr_controller::push::mail::{MailDeadlines, MailSubmission, compose_mail};
+
+    let runtime = runtime();
+    let trusted = authority("kalareach test authority");
+    let server = MailServer::start(
+        &runtime,
+        MailScript {
+            stalls_after_data: true,
+            ..MailScript::implicit()
+        },
+        &trusted,
+    );
+    // Far more than a connection's buffers hold, so the write has to wait for the server.
+    let body = "x".repeat(70).repeat(512 * 1024 / 70 * 64);
+    let message = compose_mail(
+        "alerts@example.com",
+        "person@example.com",
+        "A KalaReach session is waiting for an approval.",
+        &body,
+        kr_ipc::now_ms().get(),
+        "stalled",
+    )
+    .expect("a message");
+    let submission = MailSubmission::trusting(&trusted.der).with_deadlines(MailDeadlines {
+        connect: std::time::Duration::from_secs(10),
+        reply: std::time::Duration::from_secs(10),
+        final_reply: std::time::Duration::from_secs(2),
+    });
+    let started = std::time::Instant::now();
+    let outcome = runtime.block_on(submission.submit(
+        &account(&server, MailSecurity::ImplicitTls),
+        "person@example.com",
+        &message,
+    ));
+    assert!(
+        matches!(
+            outcome,
+            kr_delivery::external::ExternalOutcome::NotDispatched { .. }
+        ),
+        "{outcome:?}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "the attempt ended at its deadline: {:?}",
+        started.elapsed()
+    );
 }
 
 // ----- A pass through the real senders ------------------------------------------------------
