@@ -616,7 +616,17 @@ pub fn support_set(
             continue;
         };
         let resolved = std::fs::canonicalize(&loader).map_err(|error| unnamed(&loader, &error))?;
-        refuse_broad(&resolved, &loader)?;
+        if *required && broad(&resolved) {
+            return Err(ProjectError::GitFailed {
+                detail: format!(
+                    "{} is started through {}, which lies where no support object may, so the \
+                     support set of an invocation for a caller bounded by a grant cannot be named",
+                    crate::git::redact(&candidate.display().to_string()),
+                    crate::git::redact(&resolved.display().to_string())
+                )
+                .into(),
+            });
+        }
         if !required && !loaders.contains(&resolved) {
             return Err(ProjectError::GitFailed {
                 detail: format!(
@@ -789,33 +799,31 @@ const NEVER_OVER: &[&str] = &["/usr", "/opt", "/home", "/root", "/srv", "/mnt", 
 fn library_directory(library: &Path) -> Result<PathBuf> {
     let resolved = std::fs::canonicalize(library).map_err(|error| unnamed(library, &error))?;
     let directory = resolved.parent().unwrap_or(&resolved).to_owned();
-    refuse_broad(&directory, library)?;
+    if broad(&directory) {
+        return Err(ProjectError::GitFailed {
+            detail: format!(
+                "{} is in {}, which is not a directory this host grants as a support directory, so \
+                 the support set of an invocation for a caller bounded by a grant cannot be named",
+                crate::git::redact(&library.display().to_string()),
+                crate::git::redact(&directory.display().to_string())
+            )
+            .into(),
+        });
+    }
     Ok(directory)
 }
 
-/// Refuses a support object that lies in, or holds, a tree no support object may, or that holds a
+/// Returns whether a support object lies in, or holds, a tree no support object may, or holds a
 /// tree a support directory may only lie in.
-fn refuse_broad(object: &Path, named: &Path) -> Result<()> {
-    let broad = NEVER_SUPPORT
+fn broad(object: &Path) -> bool {
+    NEVER_SUPPORT
         .iter()
         .map(Path::new)
         .any(|tree| object.starts_with(tree) || tree.starts_with(object))
         || NEVER_OVER
             .iter()
             .map(Path::new)
-            .any(|tree| tree.starts_with(object));
-    if broad {
-        return Err(ProjectError::GitFailed {
-            detail: format!(
-                "{} is in {}, which is not a support object this host grants, so the support set \
-                 of an invocation for a caller bounded by a grant cannot be named",
-                crate::git::redact(&named.display().to_string()),
-                crate::git::redact(&object.display().to_string())
-            )
-            .into(),
-        });
-    }
-    Ok(())
+            .any(|tree| tree.starts_with(object))
 }
 
 /// Reads eight bytes as a number, the low byte first.
@@ -1197,10 +1205,7 @@ mod tests {
             "/usr",
             "/home",
         ] {
-            assert!(
-                refuse_broad(Path::new(object), Path::new("a library")).is_err(),
-                "{object} is not a support object"
-            );
+            assert!(broad(Path::new(object)), "{object} is not a support object");
         }
         for object in [
             "/usr/lib/x86_64-linux-gnu",
@@ -1208,10 +1213,7 @@ mod tests {
             "/opt/git/lib",
             "/home/linuxbrew/.linuxbrew/lib",
         ] {
-            assert!(
-                refuse_broad(Path::new(object), Path::new("a library")).is_ok(),
-                "{object} is a library directory"
-            );
+            assert!(!broad(Path::new(object)), "{object} is a library directory");
         }
         // The same refusal where a listed library resolves: a file in the system's configuration
         // directory is named with the directory it is in.
@@ -1224,7 +1226,10 @@ mod tests {
         // And a real library of this host's shell is in a directory that is granted.
         let support = support_of(Path::new("/bin/sh"));
         for directory in support.libraries() {
-            refuse_broad(directory, directory).expect("the shell's library directory is granted");
+            assert!(
+                !broad(directory),
+                "the shell's library directory is granted"
+            );
         }
     }
 
