@@ -2780,6 +2780,135 @@ async fn a_membership_file_changed_behind_the_devices_back_is_refused() {
     assert!(!owner.publishes());
 }
 
+/// Sends an addition that stays in flight, and returns the request and the record in flight.
+async fn an_addition_in_flight(
+    world: &World,
+    owner: &mut Node,
+    added: &Node,
+) -> (Uuid, CollectionKeyRecord) {
+    world.hosts.commit(added.device(), true);
+    owner.refresh().await;
+    let plan = owner
+        .membership
+        .plan_share(&added.auth(), now())
+        .expect("a committed device");
+    owner.membership.authorise(&plan, now()).expect("a plan");
+    world.fate(Fate::Hold);
+    assert_eq!(owner.step().await, Step::Built { built: true });
+    let request = owner.candidate_request().expect("a candidate");
+    assert_eq!(owner.step().await, Step::Dispatched);
+    assert_eq!(owner.step().await, Step::Sent { answered: false });
+    let flight = world.state().held[0].record.clone();
+    (request, flight)
+}
+
+/// Changes the membership file behind the device's back: the first run of `from`'s bytes becomes
+/// `to`'s.
+fn change_file(node: &Node, from: &[u8], to: &[u8]) {
+    let path = node.root.path().join("membership").join("membership.facts");
+    let mut bytes = std::fs::read(&path).expect("the membership file");
+    let at = bytes
+        .windows(from.len())
+        .position(|window| window == from)
+        .expect("the bytes in the file");
+    bytes[at..at + from.len()].copy_from_slice(to);
+    std::fs::write(&path, bytes).expect("written back");
+}
+
+/// A file changed behind the device's back so that it no longer names the request its dispatched
+/// candidate was sent under is refused, and the candidate stays: nothing can settle a request
+/// nobody can name, so the device sends nothing, forgets its keys, and records no new membership,
+/// neither a join nor a new collection, while that request may still run.
+#[tokio::test]
+async fn a_dispatched_request_a_changed_file_no_longer_names_blocks_a_new_membership() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut other = Node::new(&world);
+    let added = Node::new(&world);
+    let collection = collection_of(&world, &mut owner, &mut [&mut other]).await;
+    let epoch = epoch_of(&world.newest(&collection));
+    let (request, _) = an_addition_in_flight(&world, &mut owner, &added).await;
+
+    change_file(&owner, request.as_bytes(), Uuid::NIL.as_bytes());
+    owner.restart();
+    assert!(owner.out() && !owner.publishes());
+    loop {
+        let step = owner.step().await;
+        assert!(!owner.publishes());
+        if step == Step::Nothing {
+            break;
+        }
+        assert!(matches!(step, Step::ForgotKeys { .. }), "{step:?}");
+    }
+    assert!(owner.held(&collection, epoch).is_none());
+    assert_eq!(world.sends(request), 1);
+    assert_eq!(
+        world.state().held.len(),
+        1,
+        "the request is still in flight"
+    );
+
+    let plan = owner
+        .membership
+        .plan_join(collection, now())
+        .expect("a plan");
+    assert!(matches!(
+        owner.membership.join(&plan, now()).await,
+        Err(MembershipError::UnsettledRequest)
+    ));
+    assert!(matches!(
+        owner.membership.start(collection_id(0x78), now()).await,
+        Err(MembershipError::UnsettledRequest)
+    ));
+    assert!(owner.out());
+}
+
+/// A candidate whose recorded key mark was changed behind the device's back, so that it is no
+/// longer the mark of the key in the candidate's own wrap, is refused on load: the membership
+/// ends, the request is settled while out, and a record another member issues carrying the
+/// candidate's key is never installed.
+#[tokio::test]
+async fn a_candidate_whose_key_mark_was_changed_behind_the_devices_back_ends_the_membership() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut other = Node::new(&world);
+    let added = Node::new(&world);
+    let collection = collection_of(&world, &mut owner, &mut [&mut other]).await;
+    let epoch = epoch_of(&world.newest(&collection));
+    let (request, flight) = an_addition_in_flight(&world, &mut owner, &added).await;
+    let key = key_in(&flight, &other);
+
+    let mut input = b"kr-collection-key-mark/1".to_vec();
+    input.extend_from_slice(key.expose());
+    let mark = kr_cbor::sha256(&input);
+    let mut changed = mark;
+    changed[0] ^= 0x01;
+    change_file(&owner, &mark, &changed);
+    owner.restart();
+    assert!(owner.out() && !owner.publishes());
+    assert_eq!(owner.step().await, Step::Settled(Settlement::Fenced));
+    assert!(
+        world.state().held.is_empty(),
+        "the fence stops the request for good"
+    );
+
+    let head = world.newest(&collection);
+    let reusing = issue(
+        &other,
+        &head,
+        &[owner.device(), other.device()],
+        epoch + 1,
+        &key,
+    );
+    world.append(&collection, reusing);
+    for (step, publishes) in run(&mut owner).await {
+        assert!(!publishes, "{step:?}");
+    }
+    assert!(owner.held(&collection, epoch + 1).is_none());
+    assert!(owner.out());
+    assert_eq!(world.sends(request), 1);
+}
+
 /// A record whose issuer the hosts report with another stored-envelope key than its record names
 /// is never opened for use: check 3 fails, and the device rotates the issuer out.
 #[tokio::test]

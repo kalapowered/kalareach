@@ -77,6 +77,12 @@ impl<E: Environment> Reconciler<E> {
             && facts.records.windows(2).all(|pair| match pair {
                 [previous, next] => self.env.follows(previous, next),
                 _ => true,
+            })
+            // The candidate is this device's own record, and the mark it carries is the mark of
+            // the key in this device's own wrap in it: the mark withdrawn if it never applies.
+            && facts.candidate.as_ref().is_none_or(|candidate| {
+                self.env.valid(&facts.collection, &candidate.record)
+                    && self.env.mark_of(&candidate.record) == Some(candidate.mark)
             });
         Ok(Some(if consistent { facts } else { facts.refused() }))
     }
@@ -519,6 +525,7 @@ impl<E: Environment> Reconciler<E> {
         self.sending = None;
         if let Some(candidate) = facts.candidate.clone()
             && let Some(signed_at) = candidate.dispatched
+            && !facts.unsettleable()
         {
             let settle = self.settlement_of(&facts, &candidate, signed_at).await?;
             let mut next = facts.clone();

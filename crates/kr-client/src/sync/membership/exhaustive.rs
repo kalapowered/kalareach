@@ -2367,11 +2367,23 @@ fn every_weakened_rule_makes_the_exhaustive_test_fail() {
 
 /// A file whose facts no sequence of writes produces is refused on load: the device reads it as
 /// being out of the collection with a join awaiting the owner, in facts that pass the load check.
-/// A dispatched candidate with a request identity is settled first, by status and fence, and its
-/// key withdrawn; then the keys the store may still hold are forgotten, one epoch a step and one
-/// write a step.
+/// So is one whose candidate carries a mark that is not the mark of the key in its own wrap. A
+/// dispatched candidate with a request identity is settled first, by status and fence, and its
+/// key withdrawn; one the file no longer names can never be settled, so it stays and no new
+/// membership is recorded. The keys the store may still hold are forgotten, one epoch a step and
+/// one write a step.
 #[test]
 fn a_file_no_sequence_of_writes_produces_is_refused_and_a_rejoin_offered() {
+    /// What becomes of the refused file's candidate.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Then {
+        /// There is none, or it was never dispatched and goes.
+        Gone,
+        /// It is settled first.
+        Settled,
+        /// It stays, since nothing can settle it.
+        Stays,
+    }
     let mut installed_after_the_head = steady([0; 10]);
     installed_after_the_head.facts.installed = 3;
     let mut without_an_identity = genesis([0; 10]);
@@ -2382,41 +2394,49 @@ fn a_file_no_sequence_of_writes_produces_is_refused_and_a_rejoin_offered() {
     if let Some(candidate) = &mut dispatched_without_an_identity.facts.candidate {
         candidate.dispatched = Some(NOW);
     }
-    let withdrawn_key = KeyLabel::Fresh {
+    let key = KeyLabel::Fresh {
         epoch: 1,
         base: 2,
         members: bit(D) | bit(A) | bit(X),
         attempt: 0,
     };
-    let mut dispatched_in_a_bad_file = installed_after_the_head.clone();
-    dispatched_in_a_bad_file.facts.candidate = Some(Candidate {
+    let candidate = Candidate {
         record: ModelRecord {
             revision: 3,
             epoch: 1,
             members: bit(D) | bit(A) | bit(X),
             issuer: D,
-            key: withdrawn_key,
+            key,
         },
-        mark: withdrawn_key,
+        mark: key,
         request: uuid_of(1),
         dispatched: Some(NOW),
-    });
+    };
+    let mut dispatched_in_a_bad_file = installed_after_the_head.clone();
+    dispatched_in_a_bad_file.facts.candidate = Some(candidate.clone());
     dispatched_in_a_bad_file.next_request = 2;
-    for (world, settles) in [
-        (installed_after_the_head, false),
-        (without_an_identity, false),
-        (dispatched_without_an_identity, false),
-        (dispatched_in_a_bad_file, true),
+    let mut mark_changed = steady([0; 10]);
+    mark_changed.facts.candidate = Some(Candidate {
+        mark: KeyLabel::Other { revision: 9 },
+        ..candidate
+    });
+    mark_changed.next_request = 2;
+    assert!(mark_changed.facts.check(&D).is_ok());
+    for (world, then) in [
+        (installed_after_the_head, Then::Gone),
+        (without_an_identity, Then::Gone),
+        (dispatched_without_an_identity, Then::Stays),
+        (dispatched_in_a_bad_file, Then::Settled),
+        (mark_changed, Then::Settled),
     ] {
-        assert!(world.facts.check(&D).is_err());
         let read = run(&world, false, |reconciler| reconciler.read());
         let (facts, _) = read
             .value
             .expect("readable")
             .expect("a membership, refused");
-        assert!(facts.out, "a join awaits the owner");
+        assert!(facts.out && !world.facts.out, "a join awaits the owner");
         assert!(facts.check(&D).is_ok());
-        assert_eq!(facts.dispatched(), settles);
+        assert_eq!(facts.dispatched(), then != Then::Gone);
         assert_eq!(read.writes, 0, "reading writes nothing");
 
         let mut current = world;
@@ -2432,11 +2452,11 @@ fn a_file_no_sequence_of_writes_produces_is_refused_and_a_rejoin_offered() {
             }
             steps.push(step);
         }
-        if settles {
+        if then == Then::Settled {
             // The settling write is the first write, and it carries the refused facts with it.
             assert_eq!(steps.remove(0), Step::Settled(Settlement::Fenced));
             assert!(current.facts.check(&D).is_ok());
-            assert!(current.facts.withdrawn.contains(&withdrawn_key));
+            assert!(current.facts.out && current.facts.candidate.is_none());
         }
         assert!(
             steps
@@ -2449,11 +2469,32 @@ fn a_file_no_sequence_of_writes_produces_is_refused_and_a_rejoin_offered() {
             .value
             .expect("readable")
             .expect("a membership, refused");
-        assert!(facts.out && facts.candidate.is_none());
+        assert!(facts.out);
+        assert_eq!(facts.candidate.is_some(), then == Then::Stays);
         assert!(
             current.store.is_empty(),
             "the collection's keys are forgotten"
         );
+        let joined = run(&current, true, |reconciler| {
+            block_on(reconciler.join(collection()))
+        });
+        if then == Then::Stays {
+            assert!(
+                matches!(joined.value, Err(MembershipError::UnsettledRequest)),
+                "{:?}",
+                joined.value
+            );
+            assert_eq!(joined.writes, 0);
+        } else {
+            assert!(
+                !matches!(
+                    joined.value,
+                    Err(MembershipError::UnsettledRequest | MembershipError::KeysStillHeld)
+                ),
+                "{:?}",
+                joined.value
+            );
+        }
     }
 }
 

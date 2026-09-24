@@ -469,21 +469,26 @@ impl<K: Kinds> Facts<K> {
             .is_some_and(|candidate| candidate.dispatched.is_some())
     }
 
+    /// Whether the dispatched candidate is one a refused file no longer names: out, dispatched,
+    /// and without a request identity. Its request may have been sent and may still run, and no
+    /// status or fence can answer for a request nobody can name, so it is never settled and no new
+    /// membership is recorded while it stands.
+    pub(crate) fn unsettleable(&self) -> bool {
+        self.out
+            && self.candidate.as_ref().is_some_and(|candidate| {
+                candidate.dispatched.is_some() && candidate.request == Uuid::NIL
+            })
+    }
+
     /// Facts the load check refused, read as this device being out of the collection with a join
     /// awaiting the owner (row 3). The records go, since nothing about them can be trusted; a
     /// rejoin reads the chain again from the service. What is kept is the collection, the
     /// outcomes, the epochs of the keys the store may still hold, so the steps that follow can
     /// forget them, and a dispatched candidate, whose request row 1 still settles first. One
-    /// without a request identity was never sent, so it has nothing to settle and goes too.
+    /// whose request identity the file lost stays too: nothing can settle a request nobody can
+    /// name, so no new membership is recorded while it stands (see [`Self::unsettleable`]).
     pub(crate) fn refused(mut self) -> Self {
         self.leave();
-        if self
-            .candidate
-            .as_ref()
-            .is_some_and(|candidate| candidate.request == Uuid::NIL)
-        {
-            self.candidate = None;
-        }
         self.join = 1;
         self.installed = 0;
         self.head = 0;
@@ -568,6 +573,7 @@ impl<K: Kinds> Facts<K> {
             .candidate
             .as_ref()
             .is_some_and(|candidate| candidate.request == Uuid::NIL)
+            && !self.unsettleable()
         {
             return Err(Inconsistent("a candidate without a request identity"));
         }

@@ -548,9 +548,10 @@ pub enum MembershipError {
     /// membership is recorded only after them.
     #[error("the keys of the collection this device left are not all forgotten yet")]
     KeysStillHeld,
-    /// A request this device dispatched in the collection it left is not settled yet; a new
-    /// membership is recorded only after it.
-    #[error("a request sent in the collection this device left is not settled yet")]
+    /// A request this device dispatched in the collection it left is not settled yet, or can
+    /// never be because a refused membership file no longer names it; a new membership is
+    /// recorded only after it is settled.
+    #[error("a request sent in the collection this device left is not settled")]
     UnsettledRequest,
     /// The head is at the last epoch or revision a counter holds, which has no successor, so no
     /// further record can follow it.
