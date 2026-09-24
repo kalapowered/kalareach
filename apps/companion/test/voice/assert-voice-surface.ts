@@ -828,16 +828,16 @@ const CANCEL_PANEL = '<section><h2>Cancel what the agent is doing</h2><button>Ca
 
 /**
  * Every check a claim is made with, held first to pages made to fail it and to a page made to pass
- * it, before any claim: a sentence whose end is not drawn in each way a page can manage that, an
- * animation that never ends and one that hides the end only when it finishes among them; a
- * section, a name, a capture line, a heading, a button and a running call drawn transparent; a rate
- * drawn with its decimal point moved, a session drawn "Session 1b", a button named "Mute" that
- * draws "Unmute", and a section asked for nothing; a cancellation drawn transparent, drawn over the
- * call controls, or copied among them hidden; and a start control or a call heading that is
- * present but hidden.
+ * it, before any claim, in each engine a claim is made in: a sentence whose end is not drawn in
+ * each way a page can manage that, among them an animation that never ends, one that hides the end
+ * only when it finishes, and one that shows it only in short flashes; a section, a name, a capture
+ * line, a heading, a button and a running call drawn transparent; a rate drawn with its decimal
+ * point moved, a session drawn "Session 1b", a button named "Mute" that draws "Unmute", and a
+ * section asked for nothing; a cancellation drawn transparent, drawn over the call controls, or
+ * copied among them hidden; and a start control or a call heading that is present but hidden.
  */
-async function checkTheChecks(): Promise<void> {
-  const browser = await chromium.launch({ headless: true })
+async function checkTheChecks(engine: BrowserType, engineName: string): Promise<void> {
+  const browser = await engine.launch({ headless: true })
   try {
     const page = await browser.newPage()
 
@@ -927,7 +927,9 @@ async function checkTheChecks(): Promise<void> {
   } finally {
     await browser.close()
   }
-  console.log('[assert-voice-surface] every check refused each page made to fail it and passed the page made to pass it')
+  console.log(
+    `[assert-voice-surface] in ${engineName}, every check refused each page made to fail it and passed the page made to pass it`
+  )
 }
 
 /**
@@ -1033,7 +1035,9 @@ async function main(): Promise<void> {
     )
   }
   const base = (addressArgument ?? 'http://localhost:4188').replace(/\/$/, '')
-  await checkTheChecks()
+  // In each engine a claim is made in, since what a page draws and how it moves is the engine's.
+  await checkTheChecks(chromium, 'Chromium')
+  await checkTheChecks(webkit, 'WebKit')
   for (const target of TARGETS) {
     await assertTarget(base, target)
   }
