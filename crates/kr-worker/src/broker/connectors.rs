@@ -58,6 +58,20 @@ pub struct BridgeFacts {
     pub forwarder: PathBuf,
 }
 
+/// One executable a signed qualification record of the connector names: its digest and the
+/// version it is.
+///
+/// The version of an application is taken from here and nowhere else: a record that names the
+/// digest of the exact bytes says what those bytes are, and a file beside the executable says
+/// nothing that ties it to them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QualifiedExecutable {
+    /// The SHA-256 digest of the executable the record names.
+    pub digest: Digest256,
+    /// The version the record says it is.
+    pub version: String,
+}
+
 /// What an installation hands the worker for one installed package that carries a connector.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectorSource {
@@ -71,6 +85,8 @@ pub struct ConnectorSource {
     pub bridge: Option<BridgeFacts>,
     /// The capabilities the installation granted, which bound what the package may do here.
     pub granted: BTreeSet<PluginCapability>,
+    /// The executables the connector's signed qualification records name.
+    pub qualified: Vec<QualifiedExecutable>,
 }
 
 /// Why a connector source was not read into a connector.
@@ -248,6 +264,17 @@ impl InstalledConnector {
         })
     }
 
+    /// Returns the version a signed qualification record names for an executable with this digest,
+    /// where one does.
+    #[must_use]
+    pub fn qualified_version(&self, digest: &Digest256) -> Option<&str> {
+        self.source
+            .qualified
+            .iter()
+            .find(|qualified| &qualified.digest == digest)
+            .map(|qualified| qualified.version.as_str())
+    }
+
     /// Returns true when one of the package's match rules recognises this executable.
     #[must_use]
     pub fn matches_executable(&self, path: &str) -> bool {
@@ -365,6 +392,13 @@ pub mod fixture {
     use kr_protocol::scalars::Digest256;
 
     use super::{BridgeFacts, ConnectorCommand, ConnectorSource};
+
+    /// The digest of the Claude Code executable the connector is qualified against, macOS arm64.
+    pub const QUALIFIED_DIGEST: [u8; 32] = [
+        0xbd, 0x24, 0x56, 0x62, 0xfb, 0x8a, 0x0e, 0x32, 0x1b, 0x3b, 0xf1, 0x33, 0xe9, 0x30, 0x37,
+        0x1d, 0x65, 0x63, 0xc3, 0x87, 0x52, 0x78, 0x85, 0xf3, 0x0b, 0x26, 0x13, 0xae, 0x3a, 0xba,
+        0x14, 0xd6,
+    ];
     use crate::broker::bridge::BridgeSurface;
 
     /// The command Claude Code's integration resolves.
@@ -636,6 +670,7 @@ pub mod fixture {
             ]
             .into_iter()
             .collect::<BTreeSet<_>>(),
+            qualified: Vec::new(),
         })
     }
 }
