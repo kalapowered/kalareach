@@ -10,10 +10,12 @@
 
 mod net_support;
 
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures_util::{SinkExt, StreamExt};
 use iroh::endpoint::Connection;
 use kr_client::ClientError;
 use kr_client::pairing::BoxFuture;
@@ -27,7 +29,7 @@ use kr_client::pairing::owner::{
     ReviewOutcome, SessionChannel, Subject,
 };
 use kr_client::pairing::paired::{PairedHost, PairedHosts};
-use kr_client::pairing::room::{RoomError, RoomSocket};
+use kr_client::pairing::room::{RoomConnector, RoomError, RoomSocket};
 use kr_client::session::Session;
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::MemoryStore;
@@ -56,13 +58,21 @@ use kr_protocol::pairing::{
 use kr_protocol::preauth::{
     PairFinishResult, PairRedeemParams, PairRedeemResult, PairStatusParams, PairStatusResult,
 };
-use kr_protocol::rendezvous::{ClientFrame, ServiceFrame, decode_message, encode_message};
+use kr_protocol::rendezvous::{
+    ClientFrame, ServiceFrame, decode_client_frame, decode_message, encode_frame, encode_message,
+};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Digest256, EndpointKey, Nullable, SecretBytes32};
 use kr_transport::handshake::LocalIdentity;
 use net_support::pairing::{self as calls, Signer};
 use net_support::{Host, proposal};
+use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
+use tokio_websockets::{Message, ServerBuilder};
 
 /// How long a test waits for a pairing step before it fails as stuck.
 const WATCHDOG: Duration = Duration::from_secs(60);
@@ -289,19 +299,22 @@ fn showed_a_value(seen: &Arc<Mutex<Vec<AttemptState>>>) -> bool {
     seen.lock().expect("the record").iter().any(shows_a_value)
 }
 
-/// Issues a code invitation at this host's default origin, once `signer` has confirmed it.
+/// Issues a code invitation at `origin`, or this host's default origin, once `signer` has
+/// confirmed it.
 async fn invite_code(
     environment: EnvironmentId,
     client: &mut LocalClient,
     grant: &ProposedGrant,
+    origin: Option<&RendezvousOrigin>,
     signer: &Signer<'_>,
 ) -> PairInviteResult {
+    let origin = origin.map_or_else(Nullable::null, |origin| Nullable::some(origin.clone()));
     calls::confirm_subject(
         environment,
         client,
         ConfirmationSubject::IssueInvitation {
             mode: InviteModeKind::Code,
-            rendezvous_origin: Nullable::null(),
+            rendezvous_origin: origin.clone(),
             grant_kind: InviteGrantKind::SessionInvitation,
             proposed_grant: grant.clone(),
         },
@@ -315,7 +328,7 @@ async fn invite_code(
         Method::PairInvite,
         &PairInviteParams {
             mode: InviteMode::Code {
-                rendezvous_origin: Nullable::null(),
+                rendezvous_origin: origin,
             },
             grant_kind: InviteGrantKind::SessionInvitation,
             proposed_grant: grant.clone(),
@@ -633,7 +646,7 @@ async fn a_device_pairs_by_code_through_the_product_client() {
     let environment = host.environment_id;
     let mut client = host.client().await;
     let owner = Signer::OwnerDevice(&owner_keys);
-    let invited = invite_code(environment, &mut client, &viewer(), &owner).await;
+    let invited = invite_code(environment, &mut client, &viewer(), None, &owner).await;
     let (origin, code, _) = code_of(&invited);
 
     let device = ProductDevice::new(Arc::new(host.room.clone()), |link| Arc::new(link));
@@ -718,7 +731,7 @@ async fn a_host_tag_that_does_not_verify_ends_the_attempt_before_anything_is_tru
     let environment = host.environment_id;
     let mut client = host.client().await;
     let owner = Signer::OwnerDevice(&owner_keys);
-    let invited = invite_code(environment, &mut client, &viewer(), &owner).await;
+    let invited = invite_code(environment, &mut client, &viewer(), None, &owner).await;
     let (origin, code, _) = code_of(&invited);
 
     let sent = Arc::new(Mutex::new(Vec::new()));
@@ -772,7 +785,7 @@ async fn a_finish_answered_with_another_value_shows_no_value() {
     let environment = host.environment_id;
     let mut client = host.client().await;
     let owner = Signer::OwnerDevice(&owner_keys);
-    let invited = invite_code(environment, &mut client, &viewer(), &owner).await;
+    let invited = invite_code(environment, &mut client, &viewer(), None, &owner).await;
     let (origin, code, _) = code_of(&invited);
 
     let device = ProductDevice::new(Arc::new(host.room.clone()), |link| {
@@ -812,7 +825,7 @@ async fn the_finish_is_bound_to_the_endpoint_the_client_authenticated() {
     let environment = host.environment_id;
     let mut client = host.client().await;
     let owner = Signer::OwnerDevice(&owner_keys);
-    let invited = invite_code(environment, &mut client, &viewer(), &owner).await;
+    let invited = invite_code(environment, &mut client, &viewer(), None, &owner).await;
     let (origin, code, _) = code_of(&invited);
 
     let elsewhere = (
@@ -882,7 +895,7 @@ async fn a_finish_whose_answer_was_lost_is_asked_about_again() {
     let environment = host.environment_id;
     let mut client = host.client().await;
     let owner = Signer::OwnerDevice(&owner_keys);
-    let invited = invite_code(environment, &mut client, &viewer(), &owner).await;
+    let invited = invite_code(environment, &mut client, &viewer(), None, &owner).await;
     let (origin, code, _) = code_of(&invited);
 
     let (link, making) = watching(|link| link.lose_finish_answer = true);
@@ -938,7 +951,7 @@ async fn a_device_that_stopped_after_recording_its_host_resumes_through_the_reco
     let environment = host.environment_id;
     let mut client = host.client().await;
     let owner = Signer::OwnerDevice(&owner_keys);
-    let invited = invite_code(environment, &mut client, &viewer(), &owner).await;
+    let invited = invite_code(environment, &mut client, &viewer(), None, &owner).await;
     let (origin, code, _) = code_of(&invited);
 
     let device = ProductDevice::new(Arc::new(host.room.clone()), |link| Arc::new(link));
@@ -995,7 +1008,7 @@ async fn an_approval_the_device_cannot_learn_by_its_deadline_is_unknown() {
     let environment = host.environment_id;
     let mut client = host.client().await;
     let owner = Signer::OwnerDevice(&owner_keys);
-    let invited = invite_code(environment, &mut client, &viewer(), &owner).await;
+    let invited = invite_code(environment, &mut client, &viewer(), None, &owner).await;
     let (origin, code, _) = code_of(&invited);
 
     let (link, making) = watching(|link| link.sever_after_finish = true);
@@ -1052,7 +1065,7 @@ async fn a_host_that_stops_answering_is_not_waited_on_past_the_deadline() {
     let environment = host.environment_id;
     let mut client = host.client().await;
     let owner = Signer::OwnerDevice(&owner_keys);
-    let invited = invite_code(environment, &mut client, &viewer(), &owner).await;
+    let invited = invite_code(environment, &mut client, &viewer(), None, &owner).await;
     let (origin, code, _) = code_of(&invited);
 
     let (link, making) = watching(|link| link.answers_before_silence = Some(1));
@@ -1082,7 +1095,7 @@ async fn a_resumed_attempt_says_how_many_tries_are_left() {
     let environment = host.environment_id;
     let mut client = host.client().await;
     let owner = Signer::OwnerDevice(&owner_keys);
-    let invited = invite_code(environment, &mut client, &viewer(), &owner).await;
+    let invited = invite_code(environment, &mut client, &viewer(), None, &owner).await;
     let (origin, code, _) = code_of(&invited);
 
     let device = ProductDevice::new(Arc::new(host.room.clone()), |link| Arc::new(link));
@@ -1110,6 +1123,159 @@ async fn a_resumed_attempt_says_how_many_tries_are_left() {
             .expect("readable")
             .is_none()
     );
+}
+
+/// A certificate authority a test trusts, which issues a room's certificate.
+struct Authority {
+    der: CertificateDer<'static>,
+    issuer: Issuer<'static, KeyPair>,
+}
+
+impl Authority {
+    fn new(name: &str) -> Self {
+        let mut params = CertificateParams::new(Vec::new()).expect("certificate parameters");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        params
+            .distinguished_name
+            .push(DnType::CommonName, name.to_owned());
+        let key = KeyPair::generate().expect("a key pair");
+        let certificate = params.self_signed(&key).expect("a certificate");
+        Self {
+            der: certificate.der().clone(),
+            issuer: Issuer::new(params, key),
+        }
+    }
+
+    /// The product's room connector, trusting this authority alone.
+    fn connector(&self) -> RoomConnector {
+        let mut roots = RootCertStore::empty();
+        roots.add(self.der.clone()).expect("a root");
+        RoomConnector::with_tls(
+            ClientConfig::builder_with_provider(Arc::new(
+                tokio_rustls::rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+        )
+    }
+
+    fn acceptor(&self) -> TlsAcceptor {
+        let key = KeyPair::generate().expect("a key pair");
+        let leaf = CertificateParams::new(vec!["127.0.0.1".to_owned()])
+            .expect("certificate parameters")
+            .signed_by(&key, &self.issuer)
+            .expect("a certificate");
+        TlsAcceptor::from(Arc::new(
+            ServerConfig::builder_with_provider(Arc::new(
+                tokio_rustls::rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![leaf.der().clone(), self.der.clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+            )
+            .expect("a server configuration"),
+        ))
+    }
+}
+
+/// The host's room behind TLS on loopback, as the service serves it: each candidate socket at
+/// `/api/pair/room/<locator>/candidate` is carried into `room`. Returns the origin it answers at.
+async fn room_behind_tls(
+    authority: &Authority,
+    room: net_support::room::TestRoom,
+) -> RendezvousOrigin {
+    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .expect("a loopback port");
+    let port = listener.local_addr().expect("an address").port();
+    let acceptor = authority.acceptor();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let (acceptor, room) = (acceptor.clone(), room.clone());
+            tokio::spawn(async move {
+                let Ok(stream) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let Ok((request, end)) = ServerBuilder::new().accept(stream).await else {
+                    return;
+                };
+                let Some(locator) = request
+                    .uri()
+                    .path()
+                    .strip_prefix("/api/pair/room/")
+                    .and_then(|rest| rest.strip_suffix("/candidate"))
+                else {
+                    return;
+                };
+                let socket = room.candidate(locator);
+                let (mut to_device, mut from_device) = end.split();
+                let RoomSocket {
+                    outgoing,
+                    mut incoming,
+                } = socket;
+                let down = async move {
+                    while let Some(frame) = incoming.recv().await {
+                        let frame = Message::binary(encode_frame(&frame).expect("a frame"));
+                        if to_device.send(frame).await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = to_device.close().await;
+                };
+                let up = async move {
+                    while let Some(Ok(message)) = from_device.next().await {
+                        if message.is_close() {
+                            return;
+                        }
+                        if !message.is_binary() {
+                            continue;
+                        }
+                        let Ok(frame) = decode_client_frame(message.as_payload()) else {
+                            return;
+                        };
+                        if outgoing.send(frame).await.is_err() {
+                            return;
+                        }
+                    }
+                };
+                tokio::join!(down, up);
+            });
+        }
+    });
+    RendezvousOrigin::new(format!("https://127.0.0.1:{port}")).expect("an origin")
+}
+
+/// KR-REQ-10.23, KR-REQ-10.19: the room socket the product opens over TLS pairs when a host
+/// answers in the room, so the endings the scripted room behind TLS plays are the room's, not the
+/// socket's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_pairs_through_a_room_behind_tls() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let authority = Authority::new("rendezvous test authority");
+    let origin = room_behind_tls(&authority, host.room.clone()).await;
+    let invited = invite_code(environment, &mut client, &viewer(), Some(&origin), &owner).await;
+    let (named, code, _) = code_of(&invited);
+    assert_eq!(named, origin, "the invitation names the room behind TLS");
+
+    let device = ProductDevice::new(Arc::new(authority.connector()), |link| Arc::new(link));
+    let (attempt, mut shown) = device.enter(&origin, &code);
+    awaiting_value(&mut shown).await;
+    let confirmed =
+        calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+            .await
+            .expect("the owner approves");
+    let paired = outcome(attempt).await.expect("paired");
+    assert_eq!(paired.device_id, confirmed.device_id);
 }
 
 /// KR-REQ-10.36, KR-REQ-10.37: a device running the product client redeems a direct invitation,
@@ -1251,7 +1417,7 @@ async fn the_hosts_invitation_reads_back_in_the_companion_reader() {
     let mut client = host.client().await;
     let owner = Signer::OwnerDevice(&owner_keys);
 
-    let invited = invite_code(environment, &mut client, &viewer(), &owner).await;
+    let invited = invite_code(environment, &mut client, &viewer(), None, &owner).await;
     let (origin, code, text) = code_of(&invited);
     let Invitation::Code(read) = read_invitation(&text, &origin).expect("an invitation") else {
         panic!("a code invitation reads as a code");
