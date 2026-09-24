@@ -884,8 +884,8 @@ impl Pairing {
     /// host reports it so, and only then lets the waiting attempt go and reports the pairing.
     ///
     /// A host that cannot be reached leaves the attempt waiting, so the next start asks again,
-    /// until its time has passed; the record of the host stays either way, because the host
-    /// committed this device.
+    /// until its time has passed, which is checked before every step; the record of the host stays
+    /// either way, because the host committed this device.
     async fn confirm_committed(
         &self,
         mut host: PairedHost,
@@ -907,9 +907,19 @@ impl Pairing {
             .enumerate()
         {
             if index > 0 {
-                tokio::time::sleep(*delay).await;
+                tokio::time::sleep((*delay).min(self.left(pending))).await;
             }
-            let session = match within(WAIT_STEP, self.link.connect_paired(&host, &identity)).await
+            // The attempt's own deadline holds here too. Past it the device stops asking, and it
+            // keeps its record of the host, which committed it.
+            if self.left(pending).is_zero() {
+                last = "the attempt's time ran out".to_owned();
+                break;
+            }
+            let session = match within(
+                self.step(pending),
+                self.link.connect_paired(&host, &identity),
+            )
+            .await
             {
                 Ok(session) => session,
                 Err(error) => {
@@ -917,7 +927,7 @@ impl Pairing {
                     continue;
                 }
             };
-            let status: Result<PairStatusResult, LinkError> = within(WAIT_STEP, async {
+            let status: Result<PairStatusResult, LinkError> = within(self.step(pending), async {
                 session
                     .read(Method::PairStatus, &params)
                     .await
@@ -943,13 +953,14 @@ impl Pairing {
                     continue;
                 }
             }
-            let environments: Result<EnvironmentListResult, LinkError> = within(WAIT_STEP, async {
-                session
-                    .read(Method::EnvironmentList, &EmptyParams {})
-                    .await
-                    .map_err(|error| LinkError::Lost(error.to_string()))
-            })
-            .await;
+            let environments: Result<EnvironmentListResult, LinkError> =
+                within(self.step(pending), async {
+                    session
+                        .read(Method::EnvironmentList, &EmptyParams {})
+                        .await
+                        .map_err(|error| LinkError::Lost(error.to_string()))
+                })
+                .await;
             session.close();
             if let Some(label) = environments.ok().and_then(|listed| {
                 listed
@@ -967,7 +978,7 @@ impl Pairing {
             });
             return Ok(host);
         }
-        if self.clock.wall_clock_ms() >= pending.recover_until_ms {
+        if self.left(pending).is_zero() {
             let _ = self.hosts.clear_attempt();
         }
         Err(PairingFailure::new(
