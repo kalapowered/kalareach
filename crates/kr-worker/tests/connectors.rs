@@ -200,3 +200,22 @@ fn a_command_two_packages_integrate_resolves_to_neither() {
     assert_eq!(refused.len(), 2);
     assert!(sources.for_command("claude").is_none());
 }
+
+/// An integration's command must be a command name one of the package's match rules recognises:
+/// a path is not one, and neither is another application's name.
+#[test]
+fn a_command_the_package_does_not_recognise_is_refused() {
+    let store = Store::new("command");
+    let valid = store.package();
+    InstalledConnector::read(valid.clone()).expect("the package as installed is read");
+    for command in ["bin/claude", "/usr/local/bin/claude", "codex", ""] {
+        let mut source = valid.clone();
+        source.integration.command = command.to_owned();
+        let refusal = InstalledConnector::read(source).expect_err("refused");
+        assert!(
+            refusal.detail.contains("command name") || refusal.detail.contains("match rules"),
+            "{command:?}: {}",
+            refusal.detail
+        );
+    }
+}

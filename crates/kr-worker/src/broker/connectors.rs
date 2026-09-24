@@ -642,8 +642,6 @@ pub mod fixture {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::*;
 
     #[test]
@@ -653,20 +651,5 @@ mod tests {
         let refused = sources.replace(Vec::new());
         assert!(refused.is_empty());
         assert!(sources.matching("/usr/local/bin/claude").is_none());
-    }
-
-    #[test]
-    fn a_path_is_not_a_command_name() {
-        let source = ConnectorSource {
-            package_digest: Digest256::from_bytes([0; 32]),
-            package_dir: Path::new("/nonexistent").to_path_buf(),
-            integration: ConnectorCommand {
-                command: "bin/claude".to_owned(),
-                flags: Vec::new(),
-            },
-            bridge: None,
-            granted: BTreeSet::new(),
-        };
-        assert!(InstalledConnector::read(source).is_err());
     }
 }
