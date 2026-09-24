@@ -81,12 +81,32 @@ fn write_recorder(path: &Path, record: &Path, head: &str, tail: &str) {
 /// Some systems check a program the first time anything starts it, and on a busy machine that
 /// check can outlast a reply window. It is paid here, outside every timed wait, rather than by the
 /// shell a case is timing.
+///
+/// A process another test starts while the program is being written keeps a copy of the written
+/// file's descriptor until it starts its own program, and until then Linux refuses to start this
+/// one as busy. That lasts as long as the other start takes, so this one is tried again. Once it
+/// has started, nothing can hold the file open for writing any more, so every later start is clear.
 pub fn run_once(path: &Path, record: &Path) {
-    let status = std::process::Command::new(path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .unwrap_or_else(|error| panic!("{} does not start: {error}", path.display()));
+    let mut attempted = 0;
+    let status = loop {
+        attempted += 1;
+        match std::process::Command::new(path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            Ok(status) => break status,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempted < 100 =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!(
+                "{} does not start, after {attempted} attempts: {error}",
+                path.display()
+            ),
+        }
+    };
     assert!(
         status.success(),
         "{} failed its first start",

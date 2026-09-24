@@ -1702,11 +1702,27 @@ impl RealProbes {
         .expect("an executable program");
         // Some systems check a program the first time anything starts it, and on a busy machine
         // that check can outlast a wait. It is paid here, before the shell that is timed starts it.
-        let status = std::process::Command::new(&program)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .expect("the program starts");
+        // A process another test starts while the program is being written keeps a copy of its
+        // descriptor until it starts its own program, and until then Linux refuses to start this
+        // one as busy, so the start is tried again; once it has started, every later start is clear.
+        let mut attempted = 0;
+        let status = loop {
+            attempted += 1;
+            match std::process::Command::new(&program)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+            {
+                Ok(status) => break status,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && attempted < 100 =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("the program starts, after {attempted} attempts: {error}"),
+            }
+        };
         assert!(status.success(), "the program failed its first start");
         let _ = std::fs::remove_file(root.join("record"));
         std::fs::write(root.join("script.sh"), "kr-probe from-a-script\n").expect("a script");
