@@ -1,0 +1,53 @@
+# How continuous integration checks Cargo.lock against the RustSec advisory database. `cargo audit`
+# reads this file when it runs at the root of the workspace, so a local run applies the same rules.
+#
+# Every advisory against a crate in the lock fails the check, whether it reports a vulnerability,
+# unsound code or an unmaintained crate. One is let through only by naming it below, with the
+# reason it is accepted and the condition for taking it out again. An informational notice is
+# printed and does not fail the check, because `cargo audit` has no setting that would make it. A
+# yanked release is not an advisory, and the check does not look for one.
+
+[advisories]
+ignore = [
+    # glib 0.18.5 is unsound: the iterator `Variant::array_iter_str` returns can hand a null
+    # pointer to `CStr::from_ptr`. No crate in the lock calls `array_iter_str` outside glib's own
+    # tests. glib comes with the companion application's GTK 3 window stack, on Linux only, and the
+    # fix is in glib 0.20, which that stack does not use. Remove this once the lock carries no glib
+    # older than 0.20.
+    "RUSTSEC-2024-0429",
+    # lru 0.16.4 is unsound when a key's `Drop` panics inside `LruCache::pop`. Its one user here is
+    # the terminal emulator's image cache (wezterm-term), which is keyed by `[u8; 32]`, and that
+    # has no `Drop` to panic. The fix is in lru 0.18.2. Remove this once the lock carries no lru
+    # older than 0.18.2.
+    "RUSTSEC-2026-0253",
+    # adler 1.0.2 is unmaintained, succeeded by adler2. It checks the zlib streams miniz_oxide 0.7
+    # inflates for the terminal emulator's compressed images. The advisory reports no defect.
+    # Remove this once the lock no longer carries adler 1.0.2.
+    "RUSTSEC-2025-0056",
+    # paste 1.0.15 is unmaintained. It is a procedural macro, so it runs only while the workspace
+    # compiles. It comes through netlink-packet-core, under iroh's network monitor (netwatch,
+    # netdev), and through pulp and rav1e, under the image crate's EXR and AVIF codecs. The advisory
+    # reports no defect. Remove this once the lock no longer carries paste.
+    "RUSTSEC-2024-0436",
+    # proc-macro-error 1.0.4 is unmaintained. It serves glib-macros and gtk3-macros 0.18, procedural
+    # macros in the companion application's GTK 3 stack, so it too runs only while the workspace
+    # compiles. The advisory reports no defect. Remove this once the lock no longer carries
+    # proc-macro-error.
+    "RUSTSEC-2024-0370",
+    # The unic crates 0.9.0 are unmaintained. They are the Unicode identifier tables urlpattern 0.3
+    # reads when the companion application parses the URL patterns in its capability files
+    # (tauri-utils). The advisories report no defect. Remove these once the lock carries no unic
+    # crate.
+    "RUSTSEC-2025-0075", # unic-char-range
+    "RUSTSEC-2025-0080", # unic-common
+    "RUSTSEC-2025-0081", # unic-char-property
+    "RUSTSEC-2025-0098", # unic-ucd-version
+    "RUSTSEC-2025-0100", # unic-ucd-ident
+]
+
+[output]
+deny = ["unmaintained", "unsound"]
+quiet = false
+
+[yanked]
+enabled = false

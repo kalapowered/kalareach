@@ -215,6 +215,34 @@ jobs:
       - name: Terminal fixtures are current
         run: cargo run --locked -p kr-term --bin kr-term-fixtures -- --check
 
+      # Every crate in Cargo.lock, checked against the RustSec advisory database as it stands when
+      # this step runs. .cargo/audit.toml says what fails the check and names each advisory this
+      # workspace has accepted, with its reason and the condition for removing it. The checker is
+      # one release, and its archive has to match the digest here before it runs; it and the
+      # database are public downloads, so the step needs no credential. It runs whatever the steps
+      # before it did, and every step after it runs whatever this one does, so an advisory published
+      # since the last run fails the job without hiding any other result.
+      - name: Dependencies against the RustSec advisories
+        if: ${{ !cancelled() }}
+        env:
+          CARGO_AUDIT_VERSION: "0.22.2"
+          CARGO_AUDIT_SHA256: "7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428"
+        run: |
+          set -euo pipefail
+          release="cargo-audit-x86_64-unknown-linux-musl-v$CARGO_AUDIT_VERSION"
+          tag="cargo-audit%2Fv$CARGO_AUDIT_VERSION"
+          curl --fail --silent --show-error --location --retry 3 --output "$RUNNER_TEMP/$release.tgz" \
+            "https://github.com/rustsec/rustsec/releases/download/$tag/$release.tgz"
+          echo "$CARGO_AUDIT_SHA256  $RUNNER_TEMP/$release.tgz" | sha256sum --check --strict
+          tar --extract --gzip --file "$RUNNER_TEMP/$release.tgz" --directory "$RUNNER_TEMP"
+          status=0
+          "$RUNNER_TEMP/$release/cargo-audit" audit || status=$?
+          # Which state of the database this run was judged against, pass or fail. `cargo audit`
+          # keeps it in the Cargo home.
+          git -C "${CARGO_HOME:-$HOME/.cargo}/advisory-db" log -1 \
+            --format="advisory database at %H (%cI)" || true
+          exit "$status"
+
       # The legs that check a client against a live deployment rather than against something this
       # repository wrote. The workspace test above ran them with no deployment named, where each one
       # prints why it did nothing; this one names one, so a leg that did not run is a failure here.
