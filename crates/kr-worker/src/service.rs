@@ -406,6 +406,32 @@ impl WorkerService {
     )]
     const fn wait_before_admission(&self) {}
 
+    /// Takes the turn to write on the current attention connection and holds it until the
+    /// returned guard is dropped, for this host's own tests.
+    ///
+    /// Every frame the connection carries waits for its turn, so a statement then waits exactly as
+    /// it waits behind a frame the daemon is not reading. A test cannot make that wait through the
+    /// socket alone, because how much a socket takes before it refuses more differs between
+    /// platforms. Nothing when there is no attention connection.
+    #[cfg(feature = "testing")]
+    pub async fn hold_attention_turn(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let connection_id = self.attention_fence.current_connection()?;
+        let turn = self
+            .admitted
+            .lock()
+            .expect("the connection registry is not poisoned")
+            .get(&connection_id)
+            .map(|registration| Arc::clone(&registration.writable.turn))?;
+        Some(turn.lock_owned().await)
+    }
+
+    /// Returns whether a privacy transition is raised, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn attention_transition_raised(&self) -> bool {
+        self.attention_fence.is_raised()
+    }
+
     /// Returns the generation this worker currently accepts.
     #[must_use]
     pub fn accepted_generation(&self) -> Option<ControllerGeneration> {

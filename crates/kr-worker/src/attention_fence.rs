@@ -330,6 +330,16 @@ impl AttentionFence {
         self.state().raised
     }
 
+    /// Returns the attention connection that speaks for the daemon now, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn current_connection(&self) -> Option<ConnectionId> {
+        self.state()
+            .current
+            .as_ref()
+            .map(|current| current.connection_id)
+    }
+
     /// Waits until the daemon acknowledges the statement at `sequence`, or a later one, on the
     /// connection current when the acknowledgement arrives, until `deadline`.
     ///

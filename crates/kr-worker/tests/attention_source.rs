@@ -1479,41 +1479,39 @@ async fn a_dropped_transition_is_settled_and_a_second_raise_waits_for_it() {
     assert!(!link.statement(Duration::from_secs(5)).await.raised);
 }
 
-/// KR-REQ-24.11: a statement the worker cannot write whole within its bound ends the attention
+/// KR-REQ-24.11: a statement the worker cannot write within its bound ends the attention
 /// connection, and the next connection's first statement carries the fence as it is by then: the
 /// transition still raised, and then its settlement.
+///
+/// The connection's writer is held busy, so the raise's statement waits for its turn until its
+/// bound passes; a statement the peer has part of when the bound passes is the bounded write's own
+/// test, in the service.
 #[tokio::test]
 async fn a_statement_that_cannot_be_written_ends_the_connection() {
     let host = host().await;
-    for index in 0..256 {
-        notify(&host, &format!("{index} {}", "x".repeat(600)));
-    }
     let mut older = daemon(&host, ControllerConnectionRole::Attention).await;
-    // Pages nobody reads, larger together than the socket holds: the connection's writer is held
-    // by one the socket will not take, and nothing but a withdrawal ends that wait.
-    for round in 0..3_u64 {
-        older
-            .writer()
-            .write_message(&ControlFrame::AttentionSources(AttentionSourcesRequest {
-                request_id: RequestId::new(40 + round),
-                max_records: U64::new(256),
-                ..sources(0, 0, 0)
-            }))
-            .await
-            .expect("writes the request");
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let held = host
+        .service
+        .hold_attention_turn()
+        .await
+        .expect("an attention connection");
 
     let transition = tokio::time::timeout(Duration::from_secs(20), raise(&host))
         .await
         .expect("the raise returns")
         .expect("the raise finishes");
-    // The older connection has ended: whatever it still holds, the stream ends.
+    // The older connection has ended, and the raise never went out on it.
     tokio::time::timeout(Duration::from_secs(20), async {
-        while older.client.recv().await.is_ok() {}
+        while let Ok(frame) = older.client.recv().await {
+            assert!(
+                !matches!(frame, ControlFrame::AttentionBarrier(_)),
+                "no statement went out while the writer was busy: {frame:?}"
+            );
+        }
     })
     .await
     .expect("the older connection ends");
+    drop(held);
 
     let mut newer = daemon(&host, ControllerConnectionRole::Attention).await;
     assert!(
@@ -1544,64 +1542,55 @@ async fn a_worker_that_cannot_read_its_generation_keeps_the_barrier() {
 
 /// KR-REQ-24.11: a settlement whose caller stops waiting for it while the connection's writer is
 /// busy is still stated: the statement is its own task's, not the caller's.
+///
+/// The writer is held busy, the settlement is seen to have begun (the fence is settled and its
+/// statement is waiting for the writer), and only then does its caller stop waiting.
 #[tokio::test]
 async fn a_settlement_whose_caller_stops_waiting_is_still_stated() {
     let host = host().await;
-    for index in 0..256 {
-        notify(&host, &format!("{index} {}", "x".repeat(600)));
-    }
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
     let raising = raise(&host);
     let raised = link.statement(Duration::from_secs(5)).await;
     link.acknowledge(&raised).await;
     let transition = raising.await.expect("the raise finishes");
 
-    // Pages nobody reads yet hold the connection's writer, so the settlement has to wait for it.
-    for round in 0..3_u64 {
-        link.writer()
-            .write_message(&ControlFrame::AttentionSources(AttentionSourcesRequest {
-                request_id: RequestId::new(60 + round),
-                max_records: U64::new(256),
-                ..sources(0, 0, 0)
-            }))
-            .await
-            .expect("writes the request");
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let held = host
+        .service
+        .hold_attention_turn()
+        .await
+        .expect("an attention connection");
     let settling = tokio::spawn(transition.settle());
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while host.service.attention_transition_raised() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the settlement begins");
     assert!(
         !settling.is_finished(),
         "the settlement waits for the writer"
     );
     settling.abort();
+    assert!(
+        settling.await.is_err_and(|error| error.is_cancelled()),
+        "its caller stopped waiting before it was stated"
+    );
 
-    // Reading the pages frees the writer; the settlement goes after them.
-    let settled = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match link.client.recv().await.expect("the worker answers") {
-                ControlFrame::AttentionBarrier(statement) => return statement,
-                ControlFrame::AttentionSourcePage(_)
-                | ControlFrame::Notification(_)
-                | ControlFrame::Event(_) => {}
-                other => panic!("the worker answered {other:?}"),
-            }
-        }
-    })
-    .await
-    .expect("the settlement is stated");
+    // Freeing the writer lets the statement go, though nobody waits for it any more.
+    drop(held);
+    let settled = link.statement(Duration::from_secs(5)).await;
     assert!(!settled.raised);
     assert_eq!(settled.generation, Nullable::some(U64::ZERO));
 }
 
 /// KR-REQ-24.11: a settlement that cannot be written ends the connection, and the next
 /// connection's first statement settles the transition at the generation committed.
+///
+/// The connection's writer is held busy past the settlement's bound.
 #[tokio::test]
 async fn a_settlement_that_cannot_be_written_is_stated_by_the_next_connection() {
     let host = host().await;
-    for index in 0..256 {
-        notify(&host, &format!("{index} {}", "x".repeat(600)));
-    }
     let mut older = daemon(&host, ControllerConnectionRole::Attention).await;
     let raising = raise(&host);
     let raised = older.statement(Duration::from_secs(5)).await;
@@ -1610,27 +1599,25 @@ async fn a_settlement_that_cannot_be_written_is_stated_by_the_next_connection() 
     let mut attention = host.service.attention_privacy();
     enable_with(&host, &mut attention);
 
-    // Pages nobody reads hold the connection's writer past the settlement's bound.
-    for round in 0..3_u64 {
-        older
-            .writer()
-            .write_message(&ControlFrame::AttentionSources(AttentionSourcesRequest {
-                request_id: RequestId::new(80 + round),
-                max_records: U64::new(256),
-                ..sources(0, 0, 0)
-            }))
-            .await
-            .expect("writes the request");
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let held = host
+        .service
+        .hold_attention_turn()
+        .await
+        .expect("an attention connection");
     tokio::time::timeout(Duration::from_secs(10), transition.settle())
         .await
         .expect("the settlement gives up at its bound");
     tokio::time::timeout(Duration::from_secs(20), async {
-        while older.client.recv().await.is_ok() {}
+        while let Ok(frame) = older.client.recv().await {
+            assert!(
+                !matches!(frame, ControlFrame::AttentionBarrier(_)),
+                "the settlement never went out on the older connection: {frame:?}"
+            );
+        }
     })
     .await
     .expect("the older connection ends");
+    drop(held);
 
     let newer = daemon(&host, ControllerConnectionRole::Attention).await;
     let first = &newer.statements[0];
