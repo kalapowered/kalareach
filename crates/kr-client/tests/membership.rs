@@ -3306,7 +3306,8 @@ async fn a_restored_device_joins_only_after_a_fresh_authorisation() {
         Err(MembershipError::NotCommitted)
     ));
     // The records list the device it replaces, whose keys it does not have, so a join the owner
-    // confirmed on it finds no record that lists it.
+    // confirmed on it finds no record that lists it. The service answers a device no record lists
+    // as it answers a missing collection ...
     let early = restored
         .membership
         .plan_join(collection, now())
@@ -3315,6 +3316,25 @@ async fn a_restored_device_joins_only_after_a_fresh_authorisation() {
         restored.membership.join(&early, now()).await,
         Err(MembershipError::NotListed)
     ));
+    // ... and a valid chain handed to it anyway, which lists the device it replaces and not it, is
+    // refused by the device itself.
+    world.forge_next(KeyRecords::Records(world.chain(&collection)));
+    let handed = restored
+        .membership
+        .plan_join(collection, now())
+        .expect("a plan");
+    assert!(matches!(
+        restored.membership.join(&handed, now()).await,
+        Err(MembershipError::NotListed)
+    ));
+    assert!(
+        restored
+            .membership
+            .members()
+            .expect("a readable membership")
+            .is_none(),
+        "no membership was recorded"
+    );
     let lost_epoch = epoch_of(&world.newest(&collection));
     for epoch in 0..=lost_epoch + 2 {
         assert!(restored.held(&collection, epoch).is_none(), "epoch {epoch}");
