@@ -1025,9 +1025,10 @@ fn kr_req_12_02_a_launch_profile_records_what_was_resolved() {
             None,
         )
         .expect("the launch is prepared");
-    let resolved = broker
+    let reservation = broker
         .execute_launch(&intent, &ForegroundMark::idle(4), instance(2))
         .expect("the launch runs");
+    let resolved = reservation.profile();
     assert_eq!(resolved.binary.resolved_path, "/usr/local/bin/codex");
     assert_eq!(resolved.binary.distribution, "homebrew");
     assert_eq!(resolved.binary.version, "0.9.1");
@@ -1098,17 +1099,17 @@ fn kr_req_12_05_no_second_process_runs_against_one_saved_conversation() {
             Some("thread-7".to_owned()),
         )
         .expect("the launch is prepared");
-    broker
+    let reservation = broker
         .execute_launch(&first, &ForegroundMark::idle(4), instance(2))
         .expect("the first execution runs");
     broker
-        .register_instance(
-            instance(2),
+        .register_launched(
+            reservation,
             IntegrationMode::Gateway,
-            None,
             Some(managed(instance(2), true)),
         )
-        .expect("the instance is registered");
+        .expect("the instance is registered")
+        .commit();
 
     let second = broker
         .prepare_launch(
@@ -1138,9 +1139,166 @@ fn kr_req_12_05_no_second_process_runs_against_one_saved_conversation() {
         .expect("the selection changes");
     assert_eq!(broker.conversation_owner("thread-7"), None);
     assert_eq!(broker.conversation_owner("thread-8"), Some(instance(2)));
-    broker
+    let _second = broker
         .execute_launch(&second, &ForegroundMark::idle(4), instance(3))
         .expect("the conversation it left is free for another execution");
+}
+
+/// One identifier names one instance, and the path that holds it owns it: an executed launch's
+/// reservation, a registration or an adoption. No other path can take it, so no path can later
+/// give back what another one took.
+#[test]
+fn kr_req_12_02_an_instance_one_path_holds_cannot_be_taken_by_another() {
+    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
+    let intent = broker
+        .prepare_launch(
+            profile(IntegrationMode::Gateway, [3; 32], "0.9.1"),
+            ForegroundMark::idle(4),
+            None,
+        )
+        .expect("the launch is prepared");
+    let reservation = broker
+        .execute_launch(&intent, &ForegroundMark::idle(4), instance(2))
+        .expect("the launch runs");
+    broker
+        .adopt_instance(
+            profile(IntegrationMode::NativeTerminal, [4; 32], "1.0.0"),
+            instance(2),
+            None,
+        )
+        .expect_err("an adoption cannot take an identifier a launch reserved");
+    broker
+        .register_instance(instance(2), IntegrationMode::NativeTerminal, None, None)
+        .expect_err("a registration cannot take an identifier a launch reserved");
+    assert_eq!(
+        broker
+            .profile_of(instance(2))
+            .expect("the identifier is still the launch's")
+            .binary
+            .version,
+        "0.9.1"
+    );
+    broker
+        .register_launched(
+            reservation,
+            IntegrationMode::Gateway,
+            Some(managed(instance(2), true)),
+        )
+        .expect("the launch registers the instance it reserved")
+        .commit();
+    assert_eq!(
+        broker
+            .binding_state(instance(2))
+            .expect("the launched instance is live")
+            .mode,
+        IntegrationMode::Gateway
+    );
+
+    // The other order: an adoption first, then a launch naming the same identifier.
+    let observed = LaunchProfile {
+        profile_id: LaunchProfileId::new("lp-observed").expect("valid"),
+        ..profile(IntegrationMode::NativeTerminal, [4; 32], "1.0.0")
+    };
+    broker
+        .adopt_instance(observed, instance(3), None)
+        .expect("the detected process is adopted");
+    let later = broker
+        .prepare_launch(
+            profile(IntegrationMode::Gateway, [3; 32], "0.9.1"),
+            ForegroundMark::idle(5),
+            None,
+        )
+        .expect("the launch is prepared");
+    broker
+        .execute_launch(&later, &ForegroundMark::idle(5), instance(3))
+        .expect_err("a launch cannot take an identifier an adoption recorded");
+    broker
+        .register_instance(instance(3), IntegrationMode::Gateway, None, None)
+        .expect_err("nor can a second registration");
+    assert_eq!(
+        broker
+            .profile_of(instance(3))
+            .expect("the adoption keeps its profile")
+            .mode,
+        IntegrationMode::NativeTerminal
+    );
+    assert_eq!(
+        broker
+            .binding_state(instance(3))
+            .expect("the adopted instance is live")
+            .mode,
+        IntegrationMode::NativeTerminal,
+        "detection after launch never creates a gateway"
+    );
+}
+
+/// A launch that fails before it commits gives back exactly what it took, whether it failed before
+/// or after its instance was registered, and a retry of the same launch then succeeds.
+#[test]
+fn kr_req_12_02_a_failed_launch_gives_back_only_its_own() {
+    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
+    broker
+        .register_instance(instance(5), IntegrationMode::NativeTerminal, None, None)
+        .expect("another path's instance");
+    let intent = broker
+        .prepare_launch(
+            profile(IntegrationMode::Gateway, [3; 32], "0.9.1"),
+            ForegroundMark::idle(4),
+            Some("thread-7".to_owned()),
+        )
+        .expect("the launch is prepared");
+
+    // Failed before its instance was registered: the reservation is dropped.
+    let reservation = broker
+        .execute_launch(&intent, &ForegroundMark::idle(4), instance(2))
+        .expect("the launch runs");
+    assert_eq!(broker.conversation_owner("thread-7"), Some(instance(2)));
+    drop(reservation);
+    assert!(broker.profile_of(instance(2)).is_none());
+    assert_eq!(broker.conversation_owner("thread-7"), None);
+
+    // Failed after its instance was registered: the guard is dropped before its commit.
+    let reservation = broker
+        .execute_launch(&intent, &ForegroundMark::idle(4), instance(2))
+        .expect("the retry runs");
+    let registered = broker
+        .register_launched(
+            reservation,
+            IntegrationMode::Gateway,
+            Some(managed(instance(2), true)),
+        )
+        .expect("the instance is registered");
+    assert!(broker.binding_state(instance(2)).is_ok());
+    registered.abandon();
+    assert!(
+        broker.binding_state(instance(2)).is_err(),
+        "the failed launch's instance is gone"
+    );
+    assert!(broker.profile_of(instance(2)).is_none());
+    assert_eq!(
+        broker.conversation_owner("thread-7"),
+        None,
+        "and its conversation is free"
+    );
+    assert!(
+        broker.binding_state(instance(5)).is_ok(),
+        "another path's instance is untouched"
+    );
+
+    // And a retry of the same launch goes ahead.
+    let reservation = broker
+        .execute_launch(&intent, &ForegroundMark::idle(4), instance(2))
+        .expect("the retry runs");
+    broker
+        .register_launched(
+            reservation,
+            IntegrationMode::Gateway,
+            Some(managed(instance(2), true)),
+        )
+        .expect("and registers")
+        .commit();
+    assert_eq!(broker.conversation_owner("thread-7"), Some(instance(2)));
+    assert!(broker.binding_state(instance(2)).is_ok());
 }
 
 /// KR-REQ-11.16: a probe declares what it will do and how long it may take before it runs, and a
@@ -1849,7 +2007,7 @@ fn kr_req_12_02_a_launch_the_fence_refuses_leaves_the_profile_it_would_have_repl
             None,
         )
         .expect("the launch is prepared");
-    broker
+    let _running = broker
         .execute_launch(&intent, &ForegroundMark::idle(4), instance(2))
         .expect("the launch runs");
 

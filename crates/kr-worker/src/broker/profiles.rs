@@ -260,6 +260,12 @@ impl ProfileStore {
             .and_then(|profile_id| self.profiles.get(profile_id))
     }
 
+    /// Returns true when an execution or an adoption holds this instance's identifier.
+    #[must_use]
+    pub fn holds(&self, application_instance_id: ApplicationInstanceId) -> bool {
+        self.instances.contains_key(&application_instance_id)
+    }
+
     /// Returns one profile.
     #[must_use]
     pub fn profile(&self, profile_id: &LaunchProfileId) -> Option<&LaunchProfile> {
@@ -281,6 +287,137 @@ impl ProfileStore {
     pub fn restore(&mut self, profiles: impl IntoIterator<Item = LaunchProfile>) {
         for profile in profiles {
             self.profiles.insert(profile.profile_id.clone(), profile);
+        }
+    }
+}
+
+/// One executed launch's hold on its instance, before the process it starts is registered.
+///
+/// [`crate::broker::Broker::execute_launch`] makes it, and it is the only thing that can register
+/// the instance it reserved: [`crate::broker::Broker::register_launched`] consumes it. A
+/// reservation dropped instead, because what the launch starts failed first, gives back what the
+/// execution took, and only that: the instance's identifier and its conversation. Nothing else can
+/// give them back, and nothing else can take them while it is held.
+#[must_use = "a reservation that is dropped gives its instance back"]
+#[derive(Debug)]
+pub struct LaunchReservation<'a> {
+    broker: &'a crate::broker::Broker,
+    application_instance_id: ApplicationInstanceId,
+    profile: LaunchProfile,
+    held: bool,
+}
+
+impl<'a> LaunchReservation<'a> {
+    pub(crate) const fn new(
+        broker: &'a crate::broker::Broker,
+        application_instance_id: ApplicationInstanceId,
+        profile: LaunchProfile,
+    ) -> Self {
+        Self {
+            broker,
+            application_instance_id,
+            profile,
+            held: true,
+        }
+    }
+
+    /// Returns the instance this launch reserved.
+    #[must_use]
+    pub const fn application_instance_id(&self) -> ApplicationInstanceId {
+        self.application_instance_id
+    }
+
+    /// Returns the profile the launch runs under.
+    #[must_use]
+    pub const fn profile(&self) -> &LaunchProfile {
+        &self.profile
+    }
+
+    /// Hands the reservation on to the registration that consumes it.
+    pub(crate) fn into_parts(
+        mut self,
+    ) -> (
+        &'a crate::broker::Broker,
+        ApplicationInstanceId,
+        LaunchProfile,
+    ) {
+        self.held = false;
+        (
+            self.broker,
+            self.application_instance_id,
+            self.profile.clone(),
+        )
+    }
+}
+
+impl Drop for LaunchReservation<'_> {
+    fn drop(&mut self) {
+        if self.held {
+            self.broker.give_back_launch(self.application_instance_id);
+        }
+    }
+}
+
+/// A launched instance, registered, whose launch has not finished publishing itself.
+///
+/// It owns what the launch took (the instance, its profile's reservation, and whatever tokens and
+/// capability records were made for the instance meanwhile) until [`RegisteredLaunch::commit`]. A
+/// launch that fails after the instance was registered drops it, or calls
+/// [`RegisteredLaunch::abandon`], and exactly those are given back; an instance another path
+/// registered is never among them, because no other path can register an identifier this one
+/// holds.
+#[must_use = "a registered launch that is not committed gives everything back"]
+#[derive(Debug)]
+pub struct RegisteredLaunch<'a> {
+    broker: &'a crate::broker::Broker,
+    application_instance_id: ApplicationInstanceId,
+    profile: LaunchProfile,
+    committed: bool,
+}
+
+impl<'a> RegisteredLaunch<'a> {
+    pub(crate) const fn new(
+        broker: &'a crate::broker::Broker,
+        application_instance_id: ApplicationInstanceId,
+        profile: LaunchProfile,
+    ) -> Self {
+        Self {
+            broker,
+            application_instance_id,
+            profile,
+            committed: false,
+        }
+    }
+
+    /// Returns the instance this launch registered.
+    #[must_use]
+    pub const fn application_instance_id(&self) -> ApplicationInstanceId {
+        self.application_instance_id
+    }
+
+    /// Returns the profile the launch runs under.
+    #[must_use]
+    pub const fn profile(&self) -> &LaunchProfile {
+        &self.profile
+    }
+
+    /// Keeps the instance: the launch has published everything it publishes, and the instance now
+    /// ends only as an instance does.
+    pub fn commit(mut self) -> LaunchProfile {
+        self.committed = true;
+        self.profile.clone()
+    }
+
+    /// Gives back everything the launch took.
+    pub fn abandon(self) {
+        drop(self);
+    }
+}
+
+impl Drop for RegisteredLaunch<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.broker.give_back_launch(self.application_instance_id);
         }
     }
 }

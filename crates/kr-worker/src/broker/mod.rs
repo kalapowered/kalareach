@@ -129,7 +129,9 @@ pub use crate::broker::process::{
     BackendStop, BrokerTransport, Credential, ManagedProcess, SourceFrame, TransportHandle,
     stop_backend,
 };
-pub use crate::broker::profiles::{ForegroundMark, LaunchIntent, ProfileStore, new_profile_id};
+pub use crate::broker::profiles::{
+    ForegroundMark, LaunchIntent, LaunchReservation, ProfileStore, RegisteredLaunch, new_profile_id,
+};
 pub use crate::broker::semantic::{GrantLowerBound, HistoryFilter, Replay, SemanticLog};
 pub use crate::broker::tokens::{Invocation, TokenStore};
 pub use crate::broker::volatile::{RecoveryGeneration, VolatileState, VolatileTransition};
@@ -785,15 +787,20 @@ impl Broker {
 
     // -- instances ----------------------------------------------------------------------------
 
-    /// Registers one managed application instance.
+    /// Registers one application instance no launch of this broker made.
     ///
     /// Its semantic numbering resumes after whatever cursor an adapter last checkpointed, so a
     /// restarted worker never issues a cursor an adapter has already passed, and a replay from
     /// before the restart is a visible gap rather than a silently empty answer.
     ///
+    /// An identifier another path holds is refused: one already registered, and one a launch has
+    /// reserved or an adoption has recorded. A launch registers its own instance through
+    /// [`Broker::register_launched`], with the reservation that proves the identifier is its own.
+    ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::LedgerUnavailable`] when the checkpoint cannot be read.
+    /// Returns [`BrokerError::LedgerUnavailable`] when the checkpoint cannot be read, and
+    /// [`BrokerError::InvalidArgument`] when the identifier is already held.
     pub fn register_instance(
         &self,
         application_instance_id: ApplicationInstanceId,
@@ -801,41 +808,106 @@ impl Broker {
         profile_id: Option<LaunchProfileId>,
         process: Option<ManagedProcess>,
     ) -> Result<()> {
+        let semantic = self.resumed_semantics(application_instance_id)?;
+        let mut state = self.state();
+        state.check_unheld(application_instance_id)?;
+        state.insert_instance(application_instance_id, mode, profile_id, process, semantic);
+        Ok(())
+    }
+
+    /// Registers the instance one executed launch reserved, with the process it started.
+    ///
+    /// The reservation is consumed, so only the launch that holds it can register its instance,
+    /// and what comes back owns the instance until the launch commits it. A failure here gives
+    /// the reservation back with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the checkpoint cannot be read, and
+    /// [`BrokerError::InvalidArgument`] when the identifier is already registered, which no
+    /// reservation leaves possible.
+    pub fn register_launched<'a>(
+        &self,
+        reservation: LaunchReservation<'a>,
+        mode: IntegrationMode,
+        process: Option<ManagedProcess>,
+    ) -> Result<RegisteredLaunch<'a>> {
+        let application_instance_id = reservation.application_instance_id();
+        let semantic = self.resumed_semantics(application_instance_id)?;
+        let mut state = self.state();
+        if state.instances.contains_key(&application_instance_id) {
+            return Err(BrokerError::invalid(format!(
+                "{application_instance_id} is already registered, and a launch registers only the \
+                 instance it reserved"
+            )));
+        }
+        let (broker, application_instance_id, profile) = reservation.into_parts();
+        state.insert_instance(
+            application_instance_id,
+            mode,
+            Some(profile.profile_id.clone()),
+            process,
+            semantic,
+        );
+        Ok(RegisteredLaunch::new(
+            broker,
+            application_instance_id,
+            profile,
+        ))
+    }
+
+    /// Records an application instance the host detected rather than started, with the profile it
+    /// was observed running, as one operation.
+    ///
+    /// Section 12: manual launches remain valid and trigger the same detection and capability
+    /// process, and detection never creates a gateway after the fact, so the instance has no
+    /// process record and the mode is the one observed. An identifier another path holds is
+    /// refused, and the profile is written before either is kept, so a refused or failed adoption
+    /// leaves nothing behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::InvalidArgument`] when the identifier is already held, and
+    /// [`BrokerError::LedgerUnavailable`] when the checkpoint cannot be read or the profile cannot
+    /// be recorded.
+    pub fn adopt_instance(
+        &self,
+        profile: LaunchProfile,
+        application_instance_id: ApplicationInstanceId,
+        saved_conversation: Option<String>,
+    ) -> Result<()> {
+        let semantic = self.resumed_semantics(application_instance_id)?;
+        let mut state = self.state();
+        state.check_unheld(application_instance_id)?;
+        state.stored(kr_ipc::now_ms(), "a launch profile", |ledger| {
+            ledger.put_profile(&profile, Some(application_instance_id))
+        })?;
+        let mode = profile.mode;
+        let profile_id = profile.profile_id.clone();
+        state
+            .profiles
+            .adopt(profile, application_instance_id, saved_conversation);
+        state.insert_instance(
+            application_instance_id,
+            mode,
+            Some(profile_id),
+            None,
+            semantic,
+        );
+        Ok(())
+    }
+
+    /// Reads where one instance's semantic numbering resumes.
+    fn resumed_semantics(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+    ) -> Result<crate::broker::semantic::SemanticLog> {
         let consumed = self.state().ledger.checkpoint(application_instance_id)?;
         let mut semantic = crate::broker::semantic::SemanticLog::new();
         if let Some(consumed) = consumed {
             semantic.resume_after(consumed);
         }
-        let mut state = self.state();
-        let replaced = state.instances.insert(
-            application_instance_id,
-            Instance {
-                application_instance_id,
-                process,
-                binding_revision: AgentBindingRevision::new(1),
-                source_generation: SourceGeneration::new(1),
-                thread_id: None,
-                turn_id: None,
-                mode,
-                profile_id,
-                rich_suspension: None,
-                dispatch: None,
-                attachments: 0,
-                semantic,
-                commands: Vec::new(),
-                frames: BTreeMap::new(),
-                frame_order: std::collections::VecDeque::new(),
-                frame_bytes: 0,
-                bridge: crate::broker::bridge::BridgeThreads::default(),
-                host_files: None,
-            },
-        );
-        // An instance registered again under the same identity has ended as the one it was, and
-        // the agent it named is let go of unless the new one names it too.
-        if let Some(agent) = replaced.and_then(|instance| instance.process) {
-            release_agent_job(&state.instances, &agent.process);
-        }
-        Ok(())
+        Ok(semantic)
     }
 
     /// Returns one instance's binding state.
@@ -1079,20 +1151,27 @@ impl Broker {
         }
     }
 
-    /// Gives back everything one launch took, because it failed after the launch was executed.
+    /// Gives back everything one launch took, because it failed before it was committed.
     ///
     /// An executed launch has reserved its conversation and named its instance, and it may have
     /// registered that instance, before the process it started can be used. A launch that fails
     /// after that point gives all of it back, so a retry is not refused for a launch that never
-    /// happened and nothing is left describing a process that was stopped. It is for an instance
-    /// the failed launch took: [`crate::broker::NativeGateway::launch`] refuses one that is already
-    /// live before it executes anything, so there is nothing of another launch's here to give back.
-    pub fn abandon_launch(&self, application_instance_id: ApplicationInstanceId) {
+    /// happened and nothing is left describing a process that was stopped. Only the guards a launch
+    /// holds call this, [`LaunchReservation`] and [`RegisteredLaunch`], and no other path can
+    /// register or adopt an identifier either of them holds, so what is given back is the launch's
+    /// own.
+    pub(crate) fn give_back_launch(&self, application_instance_id: ApplicationInstanceId) {
         let mut state = self.state();
-        state.instances.remove(&application_instance_id);
+        let removed = state.instances.remove(&application_instance_id);
+        if let Some(agent) = removed.and_then(|instance| instance.process) {
+            release_agent_job(&state.instances, &agent.process);
+        }
         state.tokens.withdraw(application_instance_id);
         state.profiles.release(application_instance_id);
         state.capabilities.forget(application_instance_id);
+        state
+            .bindings
+            .retain(|_, binding| binding.application_instance_id != application_instance_id);
     }
 
     // -- bindings, grants and decoding trust --------------------------------------------------
@@ -2092,51 +2171,40 @@ impl Broker {
         Ok(intent)
     }
 
-    /// Executes a prepared launch, or refuses it.
+    /// Executes a prepared launch, or refuses it, and reserves its instance for it.
+    ///
+    /// What comes back is the launch's hold on the instance: it registers the instance through
+    /// [`Broker::register_launched`], and dropping it gives back what this took.
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::Launch`] with the refusal that applies.
+    /// Returns [`BrokerError::Launch`] with the refusal that applies, and
+    /// [`BrokerError::InvalidArgument`] when the identifier is already held.
     pub fn execute_launch(
         &self,
         intent: &LaunchIntent,
         now: &ForegroundMark,
         application_instance_id: ApplicationInstanceId,
-    ) -> Result<LaunchProfile> {
+    ) -> Result<LaunchReservation<'_>> {
         let mut state = self.state();
         // Refuse first, write second, publish third. A reservation published before its record
         // was written would outlive a failed write, and the retry would be refused for a launch
         // that never happened.
+        state.check_unheld(application_instance_id)?;
         state
             .profiles
             .check_executable(intent, now, application_instance_id)?;
         state.stored(kr_ipc::now_ms(), "a launch profile", |ledger| {
             ledger.put_profile(&intent.profile, Some(application_instance_id))
         })?;
-        state.profiles.execute(intent, now, application_instance_id)
-    }
-
-    /// Records a launch the host detected rather than started.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::LedgerUnavailable`] when the profile cannot be recorded.
-    pub fn adopt_launch(
-        &self,
-        profile: LaunchProfile,
-        application_instance_id: ApplicationInstanceId,
-        saved_conversation: Option<String>,
-    ) -> Result<()> {
-        let mut state = self.state();
-        // Written first and adopted second, so a launch the fence refuses leaves no reservation
-        // behind that nothing recorded.
-        state.stored(kr_ipc::now_ms(), "a launch profile", |ledger| {
-            ledger.put_profile(&profile, Some(application_instance_id))
-        })?;
-        state
+        let profile = state
             .profiles
-            .adopt(profile, application_instance_id, saved_conversation);
-        Ok(())
+            .execute(intent, now, application_instance_id)?;
+        Ok(LaunchReservation::new(
+            self,
+            application_instance_id,
+            profile,
+        ))
     }
 
     /// Returns the profile one instance was launched under.
@@ -3597,6 +3665,62 @@ impl BrokerState {
         let finished = self.volatile.finish_recovery(generation)?;
         self.continuous.clear();
         Ok(finished)
+    }
+
+    /// Refuses an identifier another path already holds.
+    ///
+    /// Registered, reserved by an executed launch, or recorded by an adoption: whichever path
+    /// holds it owns it until that path gives it back, and nothing else may take it, so nothing
+    /// else can later remove what that path owns. Both maps are read here, under the one lock the
+    /// acquisition that follows takes.
+    fn check_unheld(&self, application_instance_id: ApplicationInstanceId) -> Result<()> {
+        if self.instances.contains_key(&application_instance_id) {
+            return Err(BrokerError::invalid(format!(
+                "{application_instance_id} is already registered, and one identifier names one \
+                 instance"
+            )));
+        }
+        if self.profiles.holds(application_instance_id) {
+            return Err(BrokerError::invalid(format!(
+                "{application_instance_id} is held by a launch or an adoption, and only that one \
+                 may register it"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Keeps one new instance, whose identifier the caller has established is its own to take.
+    fn insert_instance(
+        &mut self,
+        application_instance_id: ApplicationInstanceId,
+        mode: IntegrationMode,
+        profile_id: Option<LaunchProfileId>,
+        process: Option<ManagedProcess>,
+        semantic: crate::broker::semantic::SemanticLog,
+    ) {
+        self.instances.insert(
+            application_instance_id,
+            Instance {
+                application_instance_id,
+                process,
+                binding_revision: AgentBindingRevision::new(1),
+                source_generation: SourceGeneration::new(1),
+                thread_id: None,
+                turn_id: None,
+                mode,
+                profile_id,
+                rich_suspension: None,
+                dispatch: None,
+                attachments: 0,
+                semantic,
+                commands: Vec::new(),
+                frames: BTreeMap::new(),
+                frame_order: std::collections::VecDeque::new(),
+                frame_bytes: 0,
+                bridge: crate::broker::bridge::BridgeThreads::default(),
+                host_files: None,
+            },
+        );
     }
 
     /// Returns what one method of one connection asks this host to perform, when it asks for

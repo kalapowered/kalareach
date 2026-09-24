@@ -780,12 +780,14 @@ impl NativeGateway {
         }
         crate::broker::process::check_private_directory(&self.runtime_directory)?;
         let credential = Credential::generate()?;
-        let profile = self
-            .broker
-            .execute_launch(intent, foreground, application_instance_id)?;
-        let mut command = std::process::Command::new(&profile.binary.resolved_path);
+        // The launch's hold on its instance. Every failure from here gives back what it took, by
+        // dropping it, and nothing else can take or give back the instance while it is held.
+        let broker = Arc::clone(&self.broker);
+        let reservation = broker.execute_launch(intent, foreground, application_instance_id)?;
+        let program = reservation.profile().binary.resolved_path.clone();
+        let mut command = std::process::Command::new(&program);
         command
-            .args(&profile.arguments)
+            .args(&reservation.profile().arguments)
             .current_dir(&self.runtime_directory)
             .env("KR_REGISTRATION", &registration_path)
             .env("KR_CREDENTIAL", &credential_path)
@@ -794,19 +796,13 @@ impl NativeGateway {
             // whatever the launched process says to the host that started it.
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped());
-        let (child, started) = match start_agent(&mut command, &profile.binary.resolved_path) {
-            Ok(started) => started,
-            Err(error) => {
-                self.broker.abandon_launch(application_instance_id);
-                return Err(error);
-            }
-        };
+        let (child, started) = start_agent(&mut command, &program)?;
         #[cfg(feature = "testing")]
         {
             self.last_started = Some(started.clone());
         }
         let published = self.publish(
-            &profile,
+            reservation,
             &started,
             credential,
             mode,
@@ -815,7 +811,8 @@ impl NativeGateway {
             &registration_path,
         );
         match published {
-            Ok(registration) => {
+            Ok((registration, registered)) => {
+                let profile = registered.commit();
                 self.launch.expected_process = Some(started.clone());
                 self.registration = Some(registration);
                 Ok(Launched {
@@ -825,8 +822,9 @@ impl NativeGateway {
                 })
             }
             Err(error) => {
+                // What the launch took went back with its guard; the process it started is
+                // stopped and waited for here.
                 stop_started(child, &started);
-                self.broker.abandon_launch(application_instance_id);
                 Err(error)
             }
         }
@@ -839,16 +837,16 @@ impl NativeGateway {
     /// again: the name is free for a retry, and no secret is left behind for a process that was
     /// stopped.
     #[allow(clippy::too_many_arguments)]
-    fn publish(
+    fn publish<'b>(
         &self,
-        profile: &kr_protocol::broker::LaunchProfile,
+        reservation: crate::broker::LaunchReservation<'b>,
         started: &ProcessStartIdentity,
         credential: Credential,
         mode: kr_protocol::broker::IntegrationMode,
         now: kr_protocol::scalars::TimestampMs,
         credential_path: &std::path::Path,
         registration_path: &std::path::Path,
-    ) -> Result<Registration> {
+    ) -> Result<(Registration, crate::broker::RegisteredLaunch<'b>)> {
         let application_instance_id = self.launch.application_instance_id;
         let process = ManagedProcess::new(
             application_instance_id,
@@ -856,7 +854,7 @@ impl NativeGateway {
             crate::broker::process::TransportHandle {
                 transport: crate::broker::process::BrokerTransport::PrivateSocket,
                 application_instance_id,
-                executable_digest: profile.binary.digest,
+                executable_digest: reservation.profile().binary.digest,
                 process: started.clone(),
             },
             credential,
@@ -866,7 +864,7 @@ impl NativeGateway {
             now,
         );
         process.write_registration(credential_path)?;
-        let recorded = self.record(profile, started, process, mode, registration_path);
+        let recorded = self.record(reservation, started, process, mode, registration_path);
         if recorded.is_err() {
             // Best effort: a file that cannot be removed now is refused as a stale name by the
             // next launch's create, which is the safe way round.
@@ -875,25 +873,26 @@ impl NativeGateway {
         recorded
     }
 
-    /// Records a started process with the broker and publishes the registration that names it.
-    fn record(
+    /// Registers a started process with the broker and publishes the registration that names it.
+    ///
+    /// The registration is the launch's until it commits: a registration file that cannot be
+    /// written drops the guard, which gives the instance back.
+    fn record<'b>(
         &self,
-        profile: &kr_protocol::broker::LaunchProfile,
+        reservation: crate::broker::LaunchReservation<'b>,
         started: &ProcessStartIdentity,
         process: ManagedProcess,
         mode: kr_protocol::broker::IntegrationMode,
         registration_path: &std::path::Path,
-    ) -> Result<Registration> {
+    ) -> Result<(Registration, crate::broker::RegisteredLaunch<'b>)> {
         let application_instance_id = self.launch.application_instance_id;
-        self.broker.register_instance(
-            application_instance_id,
-            mode,
-            Some(profile.profile_id.clone()),
-            Some(process),
-        )?;
+        let profile_id = reservation.profile().profile_id.clone();
+        let registered = self
+            .broker
+            .register_launched(reservation, mode, Some(process))?;
         let registration = Registration::new(
             self.endpoint.address().clone(),
-            profile.profile_id.clone(),
+            profile_id,
             application_instance_id,
             started.clone(),
         );
@@ -914,7 +913,7 @@ impl NativeGateway {
                 ))
             },
         )?;
-        Ok(registration)
+        Ok((registration, registered))
     }
 
     /// Returns the address a launched process is told to connect to.
