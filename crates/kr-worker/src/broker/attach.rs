@@ -392,9 +392,9 @@ async fn recover_views(
     session_id: kr_protocol::ids::SessionId,
     cursor: &mut crate::broker::ReplayCursor,
 ) {
-    // One recovery is one piece of news, however many pages it reads. Telling the views again for
-    // each page would queue a marker per page, and these markers cost a subscriber's queue
-    // nothing, so repeating them is the one thing that could grow a bounded queue without bound.
+    // One recovery is one piece of news, however many pages it reads. The lock is given back
+    // between pages, so a view can install its fresh state part way through; telling the views
+    // again for a later page would send that view back for another one it does not need.
     let mut told = false;
     loop {
         let replay = match broker.replay_after(*cursor) {

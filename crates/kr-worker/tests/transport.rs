@@ -652,7 +652,9 @@ async fn kr_req_11_27_a_clients_own_answer_travels_the_transport_and_a_second_on
         PendingState::Resolved
     );
 
-    // A second answer to the same request is refused, and nothing more reaches the upstream.
+    // A second answer to the same request is refused, and nothing more reaches the upstream. What
+    // the upstream was sent is read once the writers have finished, so a write still on its way
+    // would be in it.
     assert!(
         owner
             .from_client(answer, TimestampMs::new(4))
@@ -660,20 +662,13 @@ async fn kr_req_11_27_a_clients_own_answer_travels_the_transport_and_a_second_on
             .is_err(),
         "one resource takes one answer"
     );
-    assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            next_line(&mut upstream_reader),
-        )
-        .await
-        .is_err(),
-        "the refusal happened before any bytes went"
+    let sent = everything_sent_upstream(owner, drained, upstream_reader).await;
+    assert_eq!(
+        answers_for(&sent, 12),
+        0,
+        "the refusal happened before any bytes went: {sent:?}"
     );
-
-    drop(owner);
     drop(client_reader);
-    drop(upstream_reader);
-    drained.abort();
 }
 
 /// The environment every connection in this suite runs in, which is where a grant has to be.
@@ -2737,12 +2732,14 @@ async fn settled_within(
     }
 }
 
-/// Drains everything an observer has been told, without waiting for more.
-async fn told(observations: &mut kr_worker::broker::Observations) -> Vec<(u64, PendingState)> {
+/// Takes everything an observer has been told, without waiting for more.
+///
+/// A resolution is queued inside the transition that produces it. A caller reads this once every
+/// producer has finished (its calls returned, its tasks joined, its resources settled), so what it
+/// takes is all there will be, and an empty answer is an absence rather than a quiet moment.
+fn told(observations: &mut kr_worker::broker::Observations) -> Vec<(u64, PendingState)> {
     let mut seen = Vec::new();
-    while let Ok(Some(transition)) =
-        tokio::time::timeout(std::time::Duration::from_millis(250), observations.next()).await
-    {
+    while let Some(transition) = observations.try_next() {
         seen.push((transition.sequence, transition.state));
     }
     seen
@@ -2849,14 +2846,14 @@ async fn kr_req_12_11_every_transition_is_recorded_with_its_event_and_announced_
             .expect("each resource reaches a state nothing follows");
     }
 
-    let told_first = told(&mut first).await;
-    let told_second = told(&mut second).await;
+    let told_first = told(&mut first);
+    let told_second = told(&mut second);
     assert_eq!(
         told_first, told_second,
         "both authorised observers of this instance read the same events in the same order"
     );
     assert!(
-        told(&mut unrelated).await.is_empty(),
+        told(&mut unrelated).is_empty(),
         "an observer of another instance is told nothing about this one"
     );
     assert!(
@@ -2925,8 +2922,8 @@ async fn kr_req_12_11_every_transition_is_recorded_with_its_event_and_announced_
     // What the race produced is drained from both observers, so the order it was announced in is
     // compared rather than assumed: two paths settling one resource is exactly where an order
     // could differ between two observers, and it does not.
-    let raced_first = told(&mut first).await;
-    let raced_second = told(&mut second).await;
+    let raced_first = told(&mut first);
+    let raced_second = told(&mut second);
     assert_eq!(
         raced_first, raced_second,
         "both observers read the race in the same order"
@@ -2936,7 +2933,7 @@ async fn kr_req_12_11_every_transition_is_recorded_with_its_event_and_announced_
         "and in the order the transitions committed: {raced_first:?}"
     );
     assert!(
-        told(&mut unrelated).await.is_empty(),
+        told(&mut unrelated).is_empty(),
         "and the observer of another instance still reads none of it"
     );
     let announced: Vec<(u64, PendingState)> = told_first
@@ -3164,7 +3161,7 @@ async fn kr_req_12_11_a_second_gateway_joins_the_observers_of_the_first() {
         .await
         .expect("the upstream withdraws it");
     assert!(
-        !told(&mut first).await.is_empty(),
+        !told(&mut first).is_empty(),
         "the observer that was already watching is still told"
     );
 
@@ -3206,7 +3203,7 @@ async fn kr_req_12_11_an_observer_that_falls_behind_is_withdrawn_rather_than_gro
             .await
             .expect("the upstream withdraws it");
     }
-    let seen = told(&mut watching).await;
+    let seen = told(&mut watching);
     assert!(
         !seen.is_empty(),
         "the observer read what it could before it fell behind"
@@ -3233,7 +3230,7 @@ async fn kr_req_12_11_an_observer_that_falls_behind_is_withdrawn_rather_than_gro
         .await
         .expect("the upstream withdraws it");
     assert!(
-        told(&mut watching).await.is_empty(),
+        told(&mut watching).is_empty(),
         "a subscription that overflowed is withdrawn rather than resumed"
     );
     assert!(
@@ -3407,7 +3404,23 @@ async fn kr_req_11_32_a_full_byte_queue_refuses_in_place_and_ends_the_connection
         .chain([&first_refused, &refused_id, &taken_id])
         .copied()
         .collect();
-    let told = answers_to(&mut client, &expected).await;
+    let mut told = answers_to(&mut client, &expected).await;
+    // Then the count, once nothing can add to it. The owner goes, both writers are joined (the
+    // upstream one gives up its stuck write at its own deadline), and the terminal's end is read
+    // to its end, so an answer written after the last expected one is in what is counted.
+    owner.shutdown();
+    drop(owner);
+    tokio::time::timeout(LIVENESS_DEADLINE, drained)
+        .await
+        .expect("the writers finish")
+        .expect("the writers are joined");
+    tokio::time::timeout(
+        LIVENESS_DEADLINE,
+        tokio::io::AsyncReadExt::read_to_string(&mut client, &mut told),
+    )
+    .await
+    .expect("the terminal's end reaches its end")
+    .expect("the terminal's end is readable");
     let mut answers: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
     for line in told.lines().filter(|line| !line.trim().is_empty()) {
         let body: serde_json::Value = serde_json::from_str(line.trim()).expect("a response frame");
@@ -3439,8 +3452,6 @@ async fn kr_req_11_32_a_full_byte_queue_refuses_in_place_and_ends_the_connection
         admitted.len() + second.len() + 3,
         "and about nothing else: {answers:?}"
     );
-
-    drained.abort();
 }
 
 /// One request the terminal makes of its upstream, padded to a size the byte bound notices.
@@ -3676,11 +3687,10 @@ async fn kr_req_12_11_every_event_says_what_class_of_content_its_resource_holds(
         "and it follows the recording"
     );
 
-    // An observer reading the live stream is told the same thing the outbox holds.
+    // An observer reading the live stream is told the same thing the outbox holds. Both
+    // transitions were produced by calls that have returned, so the queue already holds them.
     let mut live = Vec::new();
-    while let Ok(Some(transition)) =
-        tokio::time::timeout(std::time::Duration::from_millis(250), observations.next()).await
-    {
+    while let Some(transition) = observations.try_next() {
         live.push((transition.event_id, transition.content));
     }
     for event in recorded.iter().chain(after.iter()) {
@@ -4234,11 +4244,11 @@ async fn kr_req_11_32_teardown_closes_admission_and_joins_both_writers() {
     drop(dispatch);
 }
 
-/// Reads the terminal's end until every request in `expected` has been answered, and then whatever
-/// is already waiting behind those answers.
+/// Reads the terminal's end until every request in `expected` has been answered.
 ///
 /// The connection's own writer answers the terminal, and it can still be writing after the
 /// connection has ended, so what decides is the answers themselves rather than a quiet moment.
+/// Whether anything follows them is for the caller to read once that writer has finished.
 async fn answers_to(
     stream: &mut tokio::io::DuplexStream,
     expected: &std::collections::BTreeSet<u32>,
@@ -4272,9 +4282,7 @@ async fn answers_to(
         );
         held.extend_from_slice(&chunk[..bytes]);
     }
-    let mut told = String::from_utf8_lossy(&held).into_owned();
-    told.push_str(&read_available(stream).await);
-    told
+    String::from_utf8_lossy(&held).into_owned()
 }
 
 /// Reads whatever is waiting on one pipe, without waiting for more.
@@ -5804,10 +5812,16 @@ async fn kr_req_12_11_a_recovery_that_cannot_cover_the_interval_tells_the_views_
             Ok(None) | Err(_) => break,
         }
     }
-    // And nothing more is said about it while the recovery finishes its remaining pages.
-    while let Ok(Some(delivery)) =
-        tokio::time::timeout(std::time::Duration::from_secs(3), stream.recv()).await
-    {
+    // And nothing more is said about it while the recovery finishes its remaining pages, or when
+    // delivery ends and runs its last recovery, which finds the same loss. Delivery is ended and
+    // joined before the count, so every page any recovery read has been delivered by then; the
+    // view has not started again, so the loss is not news to it a second time.
+    broker.observatory().withdraw(GatewayConnectionId::new(1));
+    tokio::time::timeout(LIVENESS_DEADLINE, carrying)
+        .await
+        .expect("delivery ends when its observation is withdrawn")
+        .expect("its task is joined");
+    while let Some(delivery) = stream.try_recv() {
         match delivery {
             kr_worker::output::OutputDelivery::AgentResource { bytes, .. } => {
                 stream.written(bytes);
@@ -5828,10 +5842,9 @@ async fn kr_req_12_11_a_recovery_that_cannot_cover_the_interval_tells_the_views_
     assert_eq!(
         markers.len(),
         1,
-        "one recovery is one piece of news, however many pages it reads"
+        "one loss is one piece of news to a view, however many pages and recoveries find it"
     );
 
-    carrying.abort();
     served.drained.abort();
 }
 

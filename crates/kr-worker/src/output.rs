@@ -23,6 +23,12 @@ use tokio::sync::mpsc;
 /// The bound on one subscriber's queued bytes.
 pub const DEFAULT_SEND_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 
+/// What one resynchronisation marker costs a subscriber's queue.
+///
+/// A marker is small, and it is still something queued for a peer, so it is charged like
+/// everything else. It is at least what any marker encodes to, whatever its reason and cursors.
+pub const RESYNC_MARKER_BYTES: usize = 96;
+
 /// One thing delivered to a subscriber.
 #[derive(Clone, Debug)]
 pub enum OutputDelivery {
@@ -73,6 +79,10 @@ pub enum OutputDelivery {
         bytes: usize,
     },
     /// The subscriber must discard its partial state and install a fresh snapshot.
+    ///
+    /// A subscriber is told this once for each time it has to resynchronise, whatever number of
+    /// reasons arise before it has: the fresh snapshot it installs covers every one of them. The
+    /// marker is charged [`RESYNC_MARKER_BYTES`] against the subscriber's queue.
     Resync(ResyncRequired),
     /// The attachment was detached. Nothing more will arrive on this stream.
     Detached,
@@ -87,7 +97,8 @@ impl OutputDelivery {
         match self {
             Self::Bytes { bytes, .. } | Self::Screen { bytes, .. } => bytes.len(),
             Self::Projection { bytes, .. } | Self::AgentResource { bytes, .. } => *bytes,
-            Self::EditorBusy(_) | Self::Resync(_) | Self::Detached | Self::Closed(_) => 0,
+            Self::Resync(_) => RESYNC_MARKER_BYTES,
+            Self::EditorBusy(_) | Self::Detached | Self::Closed(_) => 0,
         }
     }
 
@@ -213,6 +224,15 @@ impl OutputStream {
         self.receiver.recv().await
     }
 
+    /// Takes the next delivery already queued, without waiting for one.
+    ///
+    /// It is what a reader that knows everything producing for it has finished uses to take the
+    /// whole of what it was sent, rather than waiting for a quiet moment and calling that the end.
+    /// The same accounting rule applies as for [`OutputStream::recv`].
+    pub fn try_recv(&mut self) -> Option<OutputDelivery> {
+        self.receiver.try_recv().ok()
+    }
+
     /// Releases the bytes of a delivery that has reached the peer.
     pub fn written(&self, delivery_len: usize) {
         // Saturating, because a resynchronisation can discard deliveries this subscriber will
@@ -243,6 +263,35 @@ struct Subscriber {
     /// size is looking at its own window of the grid, so what it is sent is computed for it and
     /// delivered to it alone.
     presentation: Presentation,
+}
+
+impl Subscriber {
+    /// Tells this subscriber to resynchronise, once, and charges the marker to its queue.
+    ///
+    /// One marker waits per subscription until the subscriber resubscribes. A subscriber that is
+    /// already resynchronising is sent nothing more, whatever the new reason: its resubscription
+    /// takes a fresh screen and presentation under the session's lock, so what it installs covers
+    /// every reason that arose in between. A second marker would tell it nothing, and repeating
+    /// markers is the one thing that could still grow a queue that has stopped taking output.
+    ///
+    /// Everything already queued stays the subscriber's, and it releases those bytes as it reads;
+    /// the marker is added to them rather than replacing them.
+    ///
+    /// Returns false when the subscriber's end has gone, which its caller removes it for.
+    fn resynchronise(&mut self, reason: ResyncReason, cursor: u64, oldest_retained: u64) -> bool {
+        if self.resynchronising {
+            return !self.sender.is_closed();
+        }
+        self.resynchronising = true;
+        self.queued.fetch_add(RESYNC_MARKER_BYTES, Ordering::AcqRel);
+        self.sender
+            .send(OutputDelivery::Resync(ResyncRequired {
+                reason,
+                cursor: U64::new(cursor),
+                oldest_retained_cursor: U64::new(oldest_retained),
+            }))
+            .is_ok()
+    }
 }
 
 /// How one subscriber is being served.
@@ -467,20 +516,14 @@ impl OutputHub {
             }
             let queued = subscriber.queued.load(Ordering::Acquire);
             if queued.saturating_add(bytes.len()) > subscriber.limit {
-                subscriber.resynchronising = true;
                 // Nothing is trimmed and nothing is zeroed here. The subscriber still owns what is
                 // already queued and releases it as it reads; stopping new output is what bounds
                 // the queue. Zeroing the counter would make those later releases underflow it.
-                let marker = ResyncRequired {
-                    reason: ResyncReason::SendQueueFull,
-                    cursor: U64::new(cursor),
-                    oldest_retained_cursor: U64::new(oldest_retained_cursor),
-                };
-                if subscriber
-                    .sender
-                    .send(OutputDelivery::Resync(marker))
-                    .is_err()
-                {
+                if !subscriber.resynchronise(
+                    ResyncReason::SendQueueFull,
+                    cursor,
+                    oldest_retained_cursor,
+                ) {
                     gone.push(*id);
                 }
                 resynchronised.push(*id);
@@ -567,17 +610,11 @@ impl OutputHub {
         }
         let queued = subscriber.queued.load(Ordering::Acquire);
         if queued.saturating_add(cost) > subscriber.limit {
-            subscriber.resynchronising = true;
-            let marker = ResyncRequired {
-                reason: ResyncReason::SendQueueFull,
-                cursor: U64::new(cursor),
-                oldest_retained_cursor: U64::new(oldest_retained_cursor),
-            };
-            if subscriber
-                .sender
-                .send(OutputDelivery::Resync(marker))
-                .is_err()
-            {
+            if !subscriber.resynchronise(
+                ResyncReason::SendQueueFull,
+                cursor,
+                oldest_retained_cursor,
+            ) {
                 self.subscribers.remove(&attachment_id);
             }
             return true;
@@ -617,17 +654,11 @@ impl OutputHub {
         }
         let queued = subscriber.queued.load(Ordering::Acquire);
         if queued.saturating_add(cost) > subscriber.limit {
-            subscriber.resynchronising = true;
-            let marker = ResyncRequired {
-                reason: ResyncReason::SendQueueFull,
-                cursor: U64::new(cursor),
-                oldest_retained_cursor: U64::new(oldest_retained_cursor),
-            };
-            if subscriber
-                .sender
-                .send(OutputDelivery::Resync(marker))
-                .is_err()
-            {
+            if !subscriber.resynchronise(
+                ResyncReason::SendQueueFull,
+                cursor,
+                oldest_retained_cursor,
+            ) {
                 self.subscribers.remove(&attachment_id);
             }
             return true;
@@ -662,17 +693,11 @@ impl OutputHub {
         }
         let queued = subscriber.queued.load(Ordering::Acquire);
         if queued.saturating_add(bytes.len()) > subscriber.limit {
-            subscriber.resynchronising = true;
-            let marker = ResyncRequired {
-                reason: ResyncReason::SendQueueFull,
-                cursor: U64::new(cursor),
-                oldest_retained_cursor: U64::new(oldest_retained_cursor),
-            };
-            if subscriber
-                .sender
-                .send(OutputDelivery::Resync(marker))
-                .is_err()
-            {
+            if !subscriber.resynchronise(
+                ResyncReason::SendQueueFull,
+                cursor,
+                oldest_retained_cursor,
+            ) {
                 self.subscribers.remove(&attachment_id);
             }
             return true;
@@ -703,18 +728,17 @@ impl OutputHub {
         cursor: u64,
         oldest_retained_cursor: u64,
     ) {
-        if let Some(subscriber) = self.subscribers.get_mut(&attachment_id) {
-            // The same accounting rule as an overflow. Bytes already queued still belong to the
-            // subscriber and it releases them as it reads; zeroing the counter here would make
-            // every one of those releases subtract from nothing.
-            subscriber.resynchronising = true;
-            let _ = subscriber
-                .sender
-                .send(OutputDelivery::Resync(ResyncRequired {
-                    reason,
-                    cursor: U64::new(cursor),
-                    oldest_retained_cursor: U64::new(oldest_retained_cursor),
-                }));
+        // The same accounting rule as an overflow. Bytes already queued still belong to the
+        // subscriber and it releases them as it reads; zeroing the counter here would make every
+        // one of those releases subtract from nothing.
+        let gone = self
+            .subscribers
+            .get_mut(&attachment_id)
+            .is_some_and(|subscriber| {
+                !subscriber.resynchronise(reason, cursor, oldest_retained_cursor)
+            });
+        if gone {
+            self.subscribers.remove(&attachment_id);
         }
     }
 
@@ -725,15 +749,14 @@ impl OutputHub {
         cursor: u64,
         oldest_retained_cursor: u64,
     ) {
-        for subscriber in self.subscribers.values_mut() {
-            subscriber.resynchronising = true;
-            let _ = subscriber
-                .sender
-                .send(OutputDelivery::Resync(ResyncRequired {
-                    reason,
-                    cursor: U64::new(cursor),
-                    oldest_retained_cursor: U64::new(oldest_retained_cursor),
-                }));
+        let mut gone = Vec::new();
+        for (id, subscriber) in &mut self.subscribers {
+            if !subscriber.resynchronise(reason, cursor, oldest_retained_cursor) {
+                gone.push(*id);
+            }
+        }
+        for id in gone {
+            self.subscribers.remove(&id);
         }
     }
 }
@@ -952,13 +975,106 @@ mod tests {
             }
             other => panic!("the slow subscriber was resynchronised: {other:?}"),
         }
+        // Publishing never waits, so once it has returned everything it queued is queued: the
+        // absence is read then, not after a quiet moment.
         hub.publish_direct(16, &Arc::new(vec![b'c'; 8]), 0);
+        hub.require_resync_all(ResyncReason::AgentStreamGap, 24, 0);
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(20), slow.recv())
-                .await
-                .is_err(),
-            "nothing more is queued until the client resubscribes"
+            slow.try_recv().is_none(),
+            "nothing more is queued until the client resubscribes, not even a second marker"
         );
+    }
+
+    /// Every reason there is, so a new one cannot be added without being measured below.
+    fn every_reason() -> [ResyncReason; 4] {
+        let reasons = [
+            ResyncReason::SendQueueFull,
+            ResyncReason::HistoryEvicted,
+            ResyncReason::ProjectionReset,
+            ResyncReason::AgentStreamGap,
+        ];
+        for reason in reasons {
+            match reason {
+                ResyncReason::SendQueueFull
+                | ResyncReason::HistoryEvicted
+                | ResyncReason::ProjectionReset
+                | ResyncReason::AgentStreamGap => {}
+            }
+        }
+        reasons
+    }
+
+    #[test]
+    fn a_marker_is_charged_at_least_what_it_encodes_to() {
+        for reason in every_reason() {
+            let widest = ResyncRequired {
+                reason,
+                cursor: U64::new(u64::MAX),
+                oldest_retained_cursor: U64::new(u64::MAX),
+            };
+            let encoded = crate::snapshot::wire::measure(&widest)
+                .expect("a marker encodes")
+                .bytes;
+            assert!(
+                encoded <= RESYNC_MARKER_BYTES,
+                "a {reason:?} marker encodes to {encoded} bytes and is charged \
+                 {RESYNC_MARKER_BYTES}"
+            );
+            assert_eq!(OutputDelivery::Resync(widest).len(), RESYNC_MARKER_BYTES);
+        }
+    }
+
+    /// A subscriber is told once for each fresh state it has to install, and the telling is
+    /// charged. However many reasons arise before it resubscribes, one marker is queued; after it
+    /// has, the next reason is news again.
+    #[test]
+    fn a_marker_is_charged_and_queued_once_until_the_subscriber_resubscribes() {
+        let mut hub = OutputHub::new();
+        let mut stream = hub.subscribe(identifier(1), 1024, Presentation::Direct);
+        for cursor in 0..8 {
+            hub.require_resync(identifier(1), ResyncReason::ProjectionReset, cursor, 0);
+            hub.require_resync_all(ResyncReason::AgentStreamGap, cursor, 0);
+        }
+        assert_eq!(
+            stream.queued_bytes(),
+            RESYNC_MARKER_BYTES,
+            "one marker, charged"
+        );
+        let marker = stream.try_recv().expect("the subscriber is told");
+        assert!(matches!(
+            &marker,
+            OutputDelivery::Resync(ResyncRequired {
+                reason: ResyncReason::ProjectionReset,
+                ..
+            })
+        ));
+        assert!(stream.try_recv().is_none(), "and told once");
+        stream.written(marker.len());
+        assert_eq!(stream.queued_bytes(), 0, "reading it gives its bytes back");
+
+        let mut fresh = hub.subscribe(identifier(1), 1024, Presentation::Direct);
+        hub.require_resync_all(ResyncReason::AgentStreamGap, 8, 0);
+        assert!(matches!(
+            fresh.try_recv(),
+            Some(OutputDelivery::Resync(ResyncRequired {
+                reason: ResyncReason::AgentStreamGap,
+                ..
+            }))
+        ));
+        assert_eq!(fresh.queued_bytes(), RESYNC_MARKER_BYTES);
+    }
+
+    #[test]
+    fn a_subscriber_whose_end_has_gone_is_removed_when_it_is_told_to_resynchronise() {
+        let mut hub = OutputHub::new();
+        drop(hub.subscribe(identifier(1), 1024, Presentation::Direct));
+        let staying = hub.subscribe(identifier(2), 1024, Presentation::Direct);
+        hub.require_resync_all(ResyncReason::AgentStreamGap, 0, 0);
+        assert_eq!(hub.subscribers(), vec![identifier(2)]);
+        // Already resynchronising, so nothing is sent to it; its end going is still noticed.
+        drop(staying);
+        hub.require_resync(identifier(2), ResyncReason::ProjectionReset, 0, 0);
+        assert!(hub.is_empty());
     }
 
     #[tokio::test]

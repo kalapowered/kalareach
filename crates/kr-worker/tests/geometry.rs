@@ -1219,6 +1219,11 @@ async fn a_window_that_changed_presentation_is_told_while_the_application_is_idl
         "and the canonical geometry did not move"
     );
 
+    // The client does what a marker asks and resubscribes, which installs the screen it now
+    // matches. One marker waits per subscription until then, so the way back is news to this
+    // fresh subscription rather than a second marker behind the first.
+    subscribe_over(&mut client, &wired, attachment).await;
+
     // And back again, with the application still writing nothing.
     let reported = reported_and_told(
         &mut client,

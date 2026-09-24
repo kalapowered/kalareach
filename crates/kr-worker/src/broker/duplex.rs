@@ -998,6 +998,15 @@ impl Observations {
         self.events.recv().await
     }
 
+    /// Takes the next resolution already queued, without waiting for one.
+    ///
+    /// A resolution is queued inside the transition that produces it, under the broker's own
+    /// lock. So once every call that could produce one has returned, what this takes is all there
+    /// is to read, and an empty answer is an absence rather than a quiet moment.
+    pub fn try_next(&mut self) -> Option<ResourceTransition> {
+        self.events.try_recv().ok()
+    }
+
     /// Takes a fresh queue for the same connection, unless its observation has ended.
     ///
     /// Returns false when the connection has been torn down, which is the signal to stop
