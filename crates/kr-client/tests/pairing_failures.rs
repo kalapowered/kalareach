@@ -7,10 +7,10 @@
 //! verified are three phases, and each claims only what its evidence supports. A scripted room on
 //! loopback, behind TLS a test issues, plays each ending.
 //!
-//! The same socket and TLS, carried into a room a host answers in, pairs; that exchange needs a
-//! host, so it is in kr-controller's `tests/pairing_client.rs`.
+//! The room is `support/room_tls.rs`, which kr-controller's `tests/pairing_client.rs` also serves
+//! a host's room through: there the same harness carries the device's socket to a host that
+//! answers, and the device pairs. That exchange needs a host, so it is in that suite.
 
-use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,75 +33,18 @@ use kr_protocol::rendezvous::{
     encode_message,
 };
 use kr_protocol::scalars::{Bytes, Nonce256, Uuid};
-use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use room_tls::{Authority, RoomEnd};
 use tokio::sync::watch;
-use tokio_rustls::TlsAcceptor;
-use tokio_websockets::{Message, ServerBuilder, WebSocketStream};
+use tokio_websockets::Message;
+
+#[path = "support/room_tls.rs"]
+mod room_tls;
 
 /// How long a test waits for an attempt before it fails as stuck.
 const WATCHDOG: Duration = Duration::from_secs(40);
 
 /// The code every attempt here enters: locator `aB3x`, secret `Yz79Qw`.
 const CODE: &str = "aB3x-Yz7-9Qw";
-
-struct Authority {
-    der: CertificateDer<'static>,
-    issuer: Issuer<'static, KeyPair>,
-}
-
-impl Authority {
-    fn new(name: &str) -> Self {
-        let mut params = CertificateParams::new(Vec::new()).expect("certificate parameters");
-        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-        params
-            .distinguished_name
-            .push(DnType::CommonName, name.to_owned());
-        let key = KeyPair::generate().expect("a key pair");
-        let certificate = params.self_signed(&key).expect("a certificate");
-        Self {
-            der: certificate.der().clone(),
-            issuer: Issuer::new(params, key),
-        }
-    }
-
-    fn connector(&self) -> RoomConnector {
-        let mut roots = RootCertStore::empty();
-        roots.add(self.der.clone()).expect("a root");
-        RoomConnector::with_tls(
-            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_safe_default_protocol_versions()
-                .expect("protocol versions")
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
-        )
-    }
-
-    fn acceptor(&self) -> TlsAcceptor {
-        let key = KeyPair::generate().expect("a key pair");
-        let leaf = CertificateParams::new(vec!["127.0.0.1".to_owned()])
-            .expect("certificate parameters")
-            .signed_by(&key, &self.issuer)
-            .expect("a certificate");
-        TlsAcceptor::from(Arc::new(
-            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_safe_default_protocol_versions()
-                .expect("protocol versions")
-                .with_no_client_auth()
-                .with_single_cert(
-                    vec![leaf.der().clone(), self.der.clone()],
-                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
-                )
-                .expect("a server configuration"),
-        ))
-    }
-}
-
-type RoomEnd = WebSocketStream<tokio_rustls::server::TlsStream<TcpStream>>;
 
 /// What the scripted room does with the one socket it is sent.
 #[derive(Clone, Copy)]
@@ -119,45 +62,22 @@ enum Script {
 
 /// A room on loopback that plays one script, and the origin it answers at.
 async fn scripted(authority: &Authority, script: Script) -> RendezvousOrigin {
-    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .await
-        .expect("a loopback port");
-    let port = listener.local_addr().expect("an address").port();
-    let origin = RendezvousOrigin::new(format!("https://127.0.0.1:{port}")).expect("an origin");
-    let acceptor = authority.acceptor();
-    let served = origin.clone();
-    tokio::spawn(async move {
-        let Ok((stream, _)) = listener.accept().await else {
-            return;
-        };
-        let Ok(mut stream) = acceptor.accept(stream).await else {
-            return;
-        };
+    room_tls::serve(authority, move |stream, origin| async move {
         if let Script::Status(status, body) = script {
-            let mut head = Vec::new();
-            while !head.ends_with(b"\r\n\r\n") {
-                let Ok(byte) = stream.read_u8().await else {
-                    return;
-                };
-                head.push(byte);
-            }
-            let answer = format!(
-                "HTTP/1.1 {status} Scripted\r\ncontent-type: text/html\r\ncontent-length: {}\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(answer.as_bytes()).await;
-            let _ = stream.flush().await;
-            let _ = tokio::time::timeout(WATCHDOG, stream.read_u8()).await;
+            room_tls::answer(stream, status, body).await;
             return;
         }
-        let Ok((_, mut end)) = ServerBuilder::new().accept(stream).await else {
+        let Some((_, _, mut end)) = room_tls::upgrade(stream).await else {
             return;
         };
-        play(&mut end, script, &served).await;
+        play(&mut end, script, &origin).await;
         // Held open: the attempt's side decides how it ends.
-        let _ = tokio::time::timeout(WATCHDOG, async { while end.next().await.is_some() {} }).await;
-    });
-    origin
+        let _ = tokio::time::timeout(room_tls::HOLD, async {
+            while end.next().await.is_some() {}
+        })
+        .await;
+    })
+    .await
 }
 
 async fn send(end: &mut RoomEnd, frame: &ServiceFrame) {
