@@ -2513,12 +2513,14 @@ mod tests {
     fn a_staging_directory_linked_while_the_lock_is_awaited_is_not_cleared_through_it() {
         let (directory, store) = store();
         let staging = store.root.join("staging");
-        std::fs::write(staging.join("left behind"), b"an operation stopped").expect("writable");
         let elsewhere = directory.path().join("elsewhere");
         std::fs::create_dir(&elsewhere).expect("a directory");
         std::fs::write(elsewhere.join("sentinel"), b"not the catalogue's").expect("writable");
 
         let held = store.lock().expect("the lock");
+        // Left while the lock is held, after taking it cleared staging, so only the operation
+        // that waits for the lock can clear it.
+        std::fs::write(staging.join("left behind"), b"an operation stopped").expect("writable");
         let (reached, waiting) = std::sync::mpsc::channel();
         let other = store.clone();
         let waiter = std::thread::spawn(move || {
@@ -2531,6 +2533,10 @@ mod tests {
         let aside = directory.path().join("aside");
         std::fs::rename(&staging, &aside).expect("moved aside");
         std::os::unix::fs::symlink(&elsewhere, &staging).expect("a link");
+        assert!(
+            aside.join("left behind").is_file(),
+            "what was left is still there while the lock is held"
+        );
         drop(held);
         waiter
             .join()
