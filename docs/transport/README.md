@@ -95,8 +95,8 @@ device's own choice, not something one device selects on another's behalf.
 
 `endpoint::connect` dials a peer, and `NetworkTransport::connect` uses it. A connection that no
 path could open fails as `TransportError::Connect`, except in one case: a relay on the connection's
-route turned this endpoint away. Then it fails as `TransportError::RelayRefused`, which names the
-relay, the kind of refusal, what the relay said and what may still work. A managed relay turns an
+route had turned this endpoint away. Then it fails as `TransportError::RelayRefused`, which names
+the relay, the kind of refusal, what the relay said and what may still work. A managed relay turns an
 endpoint away when its relay allowance is spent, and section 17 requires that to be reported as
 what it is rather than as a host that did not answer.
 
@@ -120,17 +120,20 @@ and its separator is kept whole and shown as it is, with no kind of its own.
 A refusal counts only when the relay that gave it is on the route: a relay the dialled address
 names, or one the endpoint already holds for the peer, both of which iroh tries. iroh keeps a
 relay's reason only for the endpoint's own home relay, and only as the latest thing that relay
-said, so the status is followed for the whole attempt and read again whenever a decision rests on
-it. A refusal stands while iroh dials the relay again, and ends when the relay admits the endpoint,
-when the latest attempt to reach it failed for another cause, or when it is no longer a home relay,
-since nothing it says afterwards is reported. A refusal by a home relay that is not on the route
+said, so the status is followed for the whole attempt: every value it delivers is taken in as it is
+delivered, and it is read again whenever a decision rests on it. A refusal stands while iroh dials
+the relay again, and ends when the relay admits the endpoint, when the latest attempt to reach it
+failed for another cause, or when it is no longer a home relay, since nothing it says afterwards is
+reported. A refusal by a home relay that is not on the route
 says nothing about the connection. A route relay that is not the endpoint's home relay leaves no
 reason to read, and a failure through it is reported as `TransportError::Connect`.
 
-A refusal explains only a failure in which nothing answered: an attempt that timed out. A peer that
-answered and refused, an endpoint that was closing and a request that could not be made at all are
-each their own reason and are reported as `TransportError::Connect`, whatever a relay said at the
-time.
+A refusal is reported only for an attempt that was made and then timed out before any connection
+was established. A request that could not be made at all, a peer that answered and refused, and an
+endpoint that was closing are each their own reason and are reported as `TransportError::Connect`,
+whatever a relay said at the time. The timeout alone does not prove the refusal caused it: a peer
+that began the handshake and then fell silent times out the same way. What the failure reports is
+that a relay on the route had turned this endpoint away when the attempt ran out.
 
 An endpoint with no IP transport, one built with `relay_only`, has nothing but relays to try, so
 once every relay on its route has refused it the attempt ends at once rather than at its 30-second

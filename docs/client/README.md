@@ -69,9 +69,9 @@ the identifier again, and inventing a new one would submit the same intent twice
 
 A connection that a relay stood in the way of is not reported as a host that did not answer.
 `NetworkTransport::connect` returns `ClientError::Transport` holding
-`TransportError::RelayRefused` when a relay on the route turned this device away and nothing else
-reached the host: it names the relay, carries what the relay said, and lists the kinds of path that
-may still work. Its code comes from the kind token the relay's reason starts with: a spent
+`TransportError::RelayRefused` when the attempt timed out without a connection while a relay on the
+route had turned this device away, or when the device had nothing but refusing relays to try: it
+names the relay, carries what the relay said, and lists the kinds of path that may still work. Its code comes from the kind token the relay's reason starts with: a spent
 allowance is `QUOTA_EXCEEDED`, a relay that is stopping is `SERVICE_CAPACITY`, and a reason with no
 known token is `RESOURCE_UNAVAILABLE`, like any other connection that could not be made. A device
 whose only path is the relay learns this as soon as the relay refuses it; one that can take a direct
