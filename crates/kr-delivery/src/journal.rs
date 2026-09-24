@@ -2835,13 +2835,18 @@ impl DeliveryJournal {
     /// first question and a repeat one take their turns on one timeline, and a steady stream of
     /// new unknown outcomes never keeps an older repeat question waiting.
     ///
+    /// The admission time orders a first question and never withholds one. Only a repeat question
+    /// has a schedule to wait for; a record never asked is due at once, even when the clock has
+    /// been set back past its admission, so a correction of the host's clock cannot hold a first
+    /// question back for as long as the correction.
+    ///
     /// # Errors
     ///
     /// Returns [`DeliveryError::JournalUnavailable`] when the read fails.
     pub fn unknown_due(&self, now_ms: u64, limit: usize) -> Result<Vec<DeliveryRecord>> {
         let mut statement = self.connection.prepare(&format!(
             "{NOTIFICATION_COLUMNS} WHERE state = 'outcome_unknown'
-               AND COALESCE(question_due_at_ms, admitted_at_ms) <= ?1
+               AND COALESCE(question_due_at_ms, 0) <= ?1
              ORDER BY COALESCE(question_due_at_ms, admitted_at_ms), admitted_at_ms
              LIMIT ?2"
         ))?;
@@ -5683,50 +5688,57 @@ mod tests {
         );
     }
 
+    /// Admits one delivery to `destination` at `at`, claims it and settles it as an outcome nobody
+    /// knows, the way a send whose connection was reset leaves it.
+    fn unknown_outcome(
+        journal: &mut DeliveryJournal,
+        destination: &DestinationRecord,
+        byte: u8,
+        at: u64,
+    ) {
+        journal
+            .take_events(
+                &consumer(),
+                &[taken(byte, u64::from(byte))],
+                u64::from(byte),
+            )
+            .expect("a page");
+        journal
+            .admit(&DeliveryRecord {
+                admitted_at_ms: TimestampMs::new(at),
+                expires_at_ms: TimestampMs::new(at + 1_000),
+                ..delivery_for(byte, event(byte), destination)
+            })
+            .expect("admitted");
+        claim(journal, byte, at);
+        journal
+            .record_attempt(&Transition {
+                notification_id: NotificationId::new(uuid(byte)),
+                attempt: 1,
+                state: DeliveryState::OutcomeUnknown,
+                started_at_ms: TimestampMs::new(at),
+                settled_at_ms: Some(TimestampMs::new(at)),
+                next_attempt_at_ms: None,
+                next: crate::push::NextAction::None,
+                detail: Some("the connection was reset".to_owned()),
+                suppression: None,
+                left_this_host: true,
+                reported_by_destination: false,
+            })
+            .expect("a transition");
+    }
+
     /// An unknown outcome whose repeat question fell due keeps its turn while newer outcomes keep
     /// becoming unknown: first questions and repeat ones wait on one timeline, from the moment
     /// each fell due, so more new records every sweep than a sweep asks about never push it back.
     #[test]
     fn a_repeat_question_is_not_held_back_by_outcomes_that_became_unknown_after_it() {
-        fn unknown(journal: &mut DeliveryJournal, phone: &DestinationRecord, byte: u8, at: u64) {
-            journal
-                .take_events(
-                    &consumer(),
-                    &[taken(byte, u64::from(byte))],
-                    u64::from(byte),
-                )
-                .expect("a page");
-            journal
-                .admit(&DeliveryRecord {
-                    admitted_at_ms: TimestampMs::new(at),
-                    expires_at_ms: TimestampMs::new(at + 1_000),
-                    ..delivery_for(byte, event(byte), phone)
-                })
-                .expect("admitted");
-            claim(journal, byte, at);
-            journal
-                .record_attempt(&Transition {
-                    notification_id: NotificationId::new(uuid(byte)),
-                    attempt: 1,
-                    state: DeliveryState::OutcomeUnknown,
-                    started_at_ms: TimestampMs::new(at),
-                    settled_at_ms: Some(TimestampMs::new(at)),
-                    next_attempt_at_ms: None,
-                    next: crate::push::NextAction::None,
-                    detail: Some("the connection was reset".to_owned()),
-                    suppression: None,
-                    left_this_host: true,
-                    reported_by_destination: false,
-                })
-                .expect("a transition");
-        }
-
         let mut journal = journal();
         let phone = phone();
         journal
             .configure_destination(&phone)
             .expect("a destination");
-        unknown(&mut journal, &phone, 1, 1_000);
+        unknown_outcome(&mut journal, &phone, 1, 1_000);
         // Asked about and left unresolved: its next question falls due five minutes later.
         journal
             .note_question(NotificationId::new(uuid(1)), 2_000)
@@ -5738,7 +5750,7 @@ mod tests {
             // as many as a sweep of twenty-five asks about.
             let at = repeat_due + 1 + round * 5 * 60 * 1000;
             for _ in 0..25 {
-                unknown(&mut journal, &phone, byte, at);
+                unknown_outcome(&mut journal, &phone, byte, at);
                 byte += 1;
             }
             let offered = journal.unknown_due(at + 1_000, 25).expect("a read");
@@ -5749,6 +5761,49 @@ mod tests {
                 "the repeat question that fell due first is offered first"
             );
         }
+    }
+
+    /// A clock set back after an outcome became unknown does not delay its first question: the
+    /// record is offered at once, while a record already asked about still waits its backoff.
+    #[test]
+    fn a_first_question_is_offered_at_once_when_the_clock_is_behind_its_admission() {
+        let mut journal = journal();
+        let phone = phone();
+        journal
+            .configure_destination(&phone)
+            .expect("a destination");
+        unknown_outcome(&mut journal, &phone, 1, 1_000);
+        journal
+            .note_question(NotificationId::new(uuid(1)), 2_000)
+            .expect("noted");
+        let repeat_due = 2_000 + crate::push::question_backoff_ms(1);
+        // Admitted an hour ahead of the clock this sweep reads: the host's clock has since been
+        // set back.
+        let admitted_ahead = 3_601_000;
+        unknown_outcome(&mut journal, &phone, 2, admitted_ahead);
+        let offered = |at: u64| -> Vec<NotificationId> {
+            journal
+                .unknown_due(at, 10)
+                .expect("a read")
+                .into_iter()
+                .map(|record| record.notification_id)
+                .collect()
+        };
+        assert_eq!(
+            offered(3_000),
+            vec![NotificationId::new(uuid(2))],
+            "the record never asked about is due at once, and the one asked about still waits"
+        );
+        assert_eq!(
+            offered(repeat_due - 1),
+            vec![NotificationId::new(uuid(2))],
+            "the backoff holds until it has run"
+        );
+        assert_eq!(
+            offered(repeat_due),
+            vec![NotificationId::new(uuid(1)), NotificationId::new(uuid(2))],
+            "once both are due they take their turns by when each fell due"
+        );
     }
 
     /// Sends and status questions are selected apart, each with its own bound: a question that
