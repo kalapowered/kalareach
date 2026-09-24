@@ -21240,6 +21240,15 @@ export interface CommandBackend {
    */
   environment: EnvironmentVariable[]
   /**
+   * The absolute path of the launcher the shell runs the invocation through: this
+   * installation's `kr-hook`, which presents the invocation to the backend before it becomes
+   * the program.
+   *
+   * The shell never searches for it. A launcher that is not an absolute path, or is not there,
+   * is refused, and the invocation runs exactly as it was typed.
+   */
+  launcher: string
+  /**
    * The prompt generation it is bound to.
    *
    * One backend per accepted line. A second resolve for the same generation is answered with

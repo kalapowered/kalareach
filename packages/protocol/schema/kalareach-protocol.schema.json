@@ -6791,6 +6791,10 @@
           },
           "type": "array"
         },
+        "launcher": {
+          "description": "The absolute path of the launcher the shell runs the invocation through: this\ninstallation's `kr-hook`, which presents the invocation to the backend before it becomes\nthe program.\n\nThe shell never searches for it. A launcher that is not an absolute path, or is not there,\nis refused, and the invocation runs exactly as it was typed.",
+          "type": "string"
+        },
         "prompt_generation": {
           "$ref": "#/$defs/PromptGeneration",
           "description": "The prompt generation it is bound to.\n\nOne backend per accepted line. A second resolve for the same generation is answered with\nthe binding that already exists rather than with another one, and a generation that has\nmoved on has no binding at all: there is no route by which a program that is already\nrunning acquires one."
@@ -6803,7 +6807,8 @@
       "required": [
         "session_id",
         "prompt_generation",
-        "environment"
+        "environment",
+        "launcher"
       ],
       "type": "object"
     },

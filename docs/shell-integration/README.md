@@ -76,7 +76,7 @@ The nested objects of the handshake:
 | `abi` | `mailbox`, `pre_eof`, `fence_proof`, `cancellation`, `launch_delivery` |
 | `accepted` | `protocol`, `session_id`, `editor_abi`, `hold_ms`, `gesture`, `hint`, `secret_location`, `unexport` |
 | `refused.error` | `code`, `message`, `retry`, `diagnostic_id` |
-| `backend` | `session_id`, `prompt_generation`, `environment`, or null where the host establishes none |
+| `backend` | `session_id`, `prompt_generation`, `environment`, `launcher` (the absolute path of the installation's `kr-hook`), or null where the host establishes none |
 | `event_result` | `editor_entered`, `editor_left`, `detached`, `command_recorded`, `command_resolved`, `command_block_recorded`, `received`, or `refused` with an error |
 
 A bridge holds a fence only between a `published` and the `invalidated` that ends it: every reason

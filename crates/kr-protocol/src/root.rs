@@ -989,6 +989,13 @@ pub struct CommandBackend {
     /// They name this session and the worker's own private endpoint. A bypassed invocation is
     /// given none of them, which is what keeps its execution the one the person asked for.
     pub environment: Vec<crate::session::EnvironmentVariable>,
+    /// The absolute path of the launcher the shell runs the invocation through: this
+    /// installation's `kr-hook`, which presents the invocation to the backend before it becomes
+    /// the program.
+    ///
+    /// The shell never searches for it. A launcher that is not an absolute path, or is not there,
+    /// is refused, and the invocation runs exactly as it was typed.
+    pub launcher: String,
 }
 
 /// Parameters of `root.command.resolve`.
@@ -1373,6 +1380,65 @@ mod tests {
             )
             .is_err(),
             "a request without the executable and the directory is refused"
+        );
+    }
+
+    /// What a worker writes for an established backend, member for member.
+    #[derive(Serialize)]
+    struct WrittenBackend<'a> {
+        session_id: SessionId,
+        prompt_generation: PromptGeneration,
+        environment: Vec<crate::session::EnvironmentVariable>,
+        launcher: &'a str,
+    }
+
+    /// The same backend from a worker that names no launcher.
+    #[derive(Serialize)]
+    struct WrittenBackendWithoutLauncher {
+        session_id: SessionId,
+        prompt_generation: PromptGeneration,
+        environment: Vec<crate::session::EnvironmentVariable>,
+    }
+
+    #[test]
+    fn a_backend_names_the_launcher_the_shell_runs_the_invocation_through() {
+        let session_id = SessionId::new(Uuid::from_bytes([0x5e; 16]));
+        let environment = vec![crate::session::EnvironmentVariable {
+            name: "KR_REGISTRATION".to_owned(),
+            value: "/run/kr/launch/registration".to_owned(),
+        }];
+        let bytes = kr_cbor::to_canonical_vec(&WrittenBackend {
+            session_id,
+            prompt_generation: PromptGeneration::new(7),
+            environment: environment.clone(),
+            launcher: "/Applications/KalaReach.app/Contents/MacOS/kr-hook",
+        })
+        .expect("encodes");
+        let decoded: CommandBackend =
+            kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
+                .expect("the shell reads the launcher the worker named");
+        assert_eq!(
+            kr_cbor::to_canonical_vec(&decoded).expect("encodes"),
+            bytes,
+            "the backend re-encodes to the bytes the worker wrote, every member kept"
+        );
+        let read = serde_json::to_value(&decoded).expect("a backend describes itself");
+        assert_eq!(
+            read["launcher"],
+            "/Applications/KalaReach.app/Contents/MacOS/kr-hook"
+        );
+
+        // A backend that leaves the shell to find the launcher on its own search path is not one.
+        let unnamed = kr_cbor::to_canonical_vec(&WrittenBackendWithoutLauncher {
+            session_id,
+            prompt_generation: PromptGeneration::new(7),
+            environment,
+        })
+        .expect("encodes");
+        assert!(
+            kr_cbor::from_canonical_slice::<CommandBackend>(&unnamed, &kr_cbor::Limits::DEFAULT)
+                .is_err(),
+            "a backend without its launcher is refused"
         );
     }
 
