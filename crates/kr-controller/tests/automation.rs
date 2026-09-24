@@ -2243,16 +2243,23 @@ fn issue_grant(
 /// on, as it holds a device's own request. A decision taken after the wall clock was wound back
 /// reads UTC inside the bound again, and is refused all the same.
 ///
-/// Nothing here races the machine. The synchronisation the bound is measured from is an hour ahead
-/// of this host's wall clock, as a feed whose clock runs ahead of this host's would report it, so
-/// every reading of UTC the test gives and every reading the host takes for itself is inside the
-/// bound for that hour: whatever refuses the grant here is the continuous clock. While the bound is
-/// an hour long, which no load outlasts, a decision is permitted, and so is the same decision under
-/// a wall clock wound back. The owner then narrows the bound to 100 ms on the same synchronisation,
-/// which keeps the time already spent, and the test waits on the daemon's own continuous clock
-/// until more than that has passed since the bound was anchored: the decision is refused, although
-/// UTC is still an hour inside it. Widening the bound again admits the same decision, which is the
-/// control: the refusal was the bound on the continuous clock and nothing the refusal left behind.
+/// The daemon's clocks are its own and cannot be set from a test, so this works with what the
+/// daemon reads. The synchronisation the bound is measured from is an hour ahead of this host's
+/// wall clock, as a feed whose clock runs ahead of this host's would report it, so UTC, as the test
+/// gives it and as the host reads it for itself, stays inside the bound for that hour, and the
+/// refusal below can only be the continuous clock's. While the bound is an hour long a decision is
+/// permitted, and so is the same decision under a wall clock wound back. The owner then narrows
+/// the bound to 100 ms on the same synchronisation, which keeps the time already spent, and the
+/// test waits on the daemon's own continuous clock until more than that has passed since the bound
+/// was anchored: the decision is refused, although UTC is still inside it. Widening the bound again
+/// admits the same decision, which is the control: the refusal was the bound on the continuous
+/// clock and nothing the refusal left behind.
+///
+/// What it does not establish: it rests on the host not stalling for an hour. A stall or a
+/// suspension of an hour between setting the bound and the decisions taken under it would run the
+/// hour-long bound out, or carry UTC past the synchronisation, and fail the test; no ordinary load
+/// comes near that, where the 200 ms this test used to rely on did. A controller that took its
+/// clocks from the test would let it advance them by hand instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_workflow_grant_is_held_to_the_offline_bound_on_the_continuous_clock() {
     use kr_automation::{AuthoritySource, AutomationError};
