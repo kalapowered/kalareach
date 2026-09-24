@@ -37,7 +37,14 @@ use common::{Keys, LIVENESS_DEADLINE, carries, take_the_keys};
 /// A session this test hosts, served on its own endpoint.
 struct Host {
     _temp: kr_ipc::testing::TempHost,
-    _service: Arc<WorkerService>,
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "only the tests that set the transport ask the service"
+        )
+    )]
+    service: Arc<WorkerService>,
     runtime: Arc<SessionRuntime>,
     session_id: SessionId,
     environment_id: EnvironmentId,
@@ -72,6 +79,29 @@ async fn host(script: &str) -> Host {
 /// Those are the tasks that ingest what the terminal gives, watch the root shell and time the paste
 /// recogniser. The endpoint, its connections and a closure's sequence run where the caller does.
 async fn host_on(script: &str, tasks: &tokio::runtime::Handle) -> Host {
+    host_served(script, tasks, Listener::bind).await
+}
+
+/// Hosts a session whose shell runs `script`, served on a listener whose connections are given a
+/// send buffer of [`SEND_BUFFER`].
+///
+/// A client that stops reading then holds what that buffer holds, which this test sets, rather
+/// than what a platform's default holds.
+#[cfg(unix)]
+async fn host_on_a_narrow_transport(script: &str) -> Host {
+    host_served(script, &tokio::runtime::Handle::current(), |endpoint| {
+        Listener::bind_with_send_buffer(endpoint, SEND_BUFFER)
+    })
+    .await
+}
+
+/// Hosts a session whose shell runs `script`, with the session's own tasks on `tasks`, served on
+/// the listener `bind` makes.
+async fn host_served(
+    script: &str,
+    tasks: &tokio::runtime::Handle,
+    bind: impl FnOnce(&kr_ipc::paths::Endpoint) -> kr_ipc::Result<Listener>,
+) -> Host {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
@@ -125,7 +155,7 @@ async fn host_on(script: &str, tasks: &tokio::runtime::Handle) -> Host {
     let endpoint = environment
         .worker_endpoint(DisplayNumber::new(1))
         .expect("an endpoint");
-    let listener = Listener::bind(&endpoint).expect("binds the endpoint");
+    let listener = bind(&endpoint).expect("binds the endpoint");
     let service = Arc::new(
         WorkerService::new(
             Arc::clone(&runtime),
@@ -145,7 +175,7 @@ async fn host_on(script: &str, tasks: &tokio::runtime::Handle) -> Host {
     tokio::spawn(Arc::clone(&service).serve(listener));
     Host {
         _temp: temp,
-        _service: service,
+        service,
         runtime,
         session_id,
         environment_id,
@@ -234,6 +264,7 @@ async fn watching(host: &Host) -> LocalClient {
 }
 
 /// Polls until `condition` holds, and fails with how long it waited when it never does.
+#[cfg(unix)]
 async fn until(what: &str, mut condition: impl FnMut() -> bool) {
     let started = tokio::time::Instant::now();
     while !condition() {
@@ -346,37 +377,220 @@ async fn a_client_that_has_gone_holds_nothing_up() {
     );
 }
 
-/// A client that has stopped reading keeps its notice owed, and the worker's wait for it ends at
-/// the bound the caller gives rather than when the client comes back.
+/// The send buffer each connection is given where a test sets what a client that stops reading
+/// holds.
+///
+/// The operating system keeps a buffer of this order (Linux doubles what it is asked for), so a
+/// frame of [`BATCH_BYTES`] that a client is not reading stops part way on every platform, and
+/// whatever is queued behind that frame stays queued.
+#[cfg(unix)]
+const SEND_BUFFER: usize = 4 * 1024;
+
+/// One batch of output, delivered as one frame fifty times larger than [`SEND_BUFFER`].
+#[cfg(unix)]
+const BATCH_BYTES: usize = 200 * 1024;
+
+/// Gives the session `bytes` as its terminal would, and settles the screen as a quiet terminal
+/// does: the two steps the worker takes with a batch its read loop hands over.
+#[cfg(unix)]
+fn write_output(host: &Host, bytes: &[u8]) {
+    let mut session = host.runtime.session();
+    let _ = session.ingest_output(bytes);
+    let _ = session.quiesce_output();
+}
+
+/// Attaches and subscribes a terminal over a connection of its own, which reads nothing more until
+/// the test reads it.
+#[cfg(unix)]
+async fn stalled(host: &Host) -> (LocalClient, AttachmentId) {
+    let (mut client, attachment_id) = attach(host).await;
+    subscribe(&mut client, host, attachment_id).await;
+    (client, attachment_id)
+}
+
+/// Closes the session and waits for its record.
+#[cfg(unix)]
+async fn close(host: &Host) -> ClosureRecord {
+    let (_, gate) = host.runtime.close(ClosureReason::CloseRequested);
+    gate.release();
+    closed(host).await
+}
+
+/// KR-REQ-07.52: a worker whose session has closed waits for an attachment that stopped reading to
+/// be sent the closure, for its bound and no longer, and one that reads again is sent all the
+/// output it was owed and then the closure.
+///
+/// The transport each client holds is one this test sets, and each client stops part way through a
+/// frame far larger than it, so the notice queued behind that frame cannot be written until the
+/// client reads, on any platform. The wait is the one a worker makes before it exits, started
+/// here, so what is measured is its bound from its own beginning.
+///
+/// Unix only, because the transport this sets is a Unix socket's buffer.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_client_that_stopped_reading_holds_the_worker_only_until_the_bound() {
-    // More output than this client's queue holds, sent to a client that never reads any of it.
-    let host = host("read -r _; head -c 2000000 /dev/zero | tr '\\0' x; read -r _; exit 0").await;
-    let (stalled, mut keys) = attached_holding_the_keys(&host).await;
-    keys.release(&host.runtime);
-    // The session says when this client has fallen a whole queue behind: a megabyte it was owed
-    // had not been taken off the connection. That is the moment the closure is let happen. A
-    // local socket holds a few hundred kilobytes at the most, so the notice queued behind that
-    // megabyte cannot be written while the client reads nothing; a transport that held it all
-    // would let the notice through and fail the check below, never pass it wrongly.
-    until(
-        "the client that stopped reading to fall a whole queue behind",
-        || host.runtime.session().is_resynchronising(keys.attachment()),
+    let host = host_on_a_narrow_transport("read -r _").await;
+    let (never, never_attachment) = stalled(&host).await;
+    let (mut resuming, resuming_attachment) = stalled(&host).await;
+    write_output(&host, &vec![b'x'; BATCH_BYTES]);
+    for (attachment_id, what) in [
+        (never_attachment, "the client that never reads again"),
+        (resuming_attachment, "the client that reads again"),
+    ] {
+        until(&format!("{what} to stop part way through a frame"), || {
+            host.service.part_way_through_a_frame(attachment_id)
+        })
+        .await;
+    }
+    let record = close(&host).await;
+
+    let started = tokio::time::Instant::now();
+    let delivered = tokio::time::timeout(
+        LIVENESS_DEADLINE,
+        host.runtime.closure_delivered(CLOSURE_NOTICE_TIMEOUT),
     )
-    .await;
-    keys.release(&host.runtime);
-    closed(&host).await;
+    .await
+    .unwrap_or_else(|_| panic!("the wait was still going {LIVENESS_DEADLINE:?} after it began"));
+    let waited = started.elapsed();
+    assert!(
+        !delivered,
+        "neither client that is not reading has been sent its notice"
+    );
+    assert!(
+        waited >= CLOSURE_NOTICE_TIMEOUT,
+        "the wait held for its bound of {CLOSURE_NOTICE_TIMEOUT:?}, and it ended after {waited:?}"
+    );
+    // A timer's task runs a moment after the timer fires, and a busy machine makes that moment
+    // longer. A wait that went on for the clients would still be going, because neither reads.
+    assert!(
+        waited < CLOSURE_NOTICE_TIMEOUT * 2,
+        "the wait ended at its bound of {CLOSURE_NOTICE_TIMEOUT:?}, not {waited:?}"
+    );
+
+    let (output, sent) = until_the_closure(&mut resuming).await;
+    assert_eq!(
+        sent, record,
+        "the client that read again was sent the record"
+    );
+    assert_eq!(
+        output.iter().filter(|byte| **byte == b'x').count(),
+        BATCH_BYTES,
+        "and every byte of the output it was owed before it"
+    );
     assert!(
         !host
             .runtime
             .closure_delivered(Duration::from_millis(500))
             .await,
-        "the notice of a client that is not reading is still owed"
+        "the notice of the client that is still not reading is still owed"
     );
-    drop(stalled);
+    drop(never);
     assert!(
         host.runtime.closure_delivered(CLOSURE_NOTICE_TIMEOUT).await,
-        "and once that client has gone it is owed nothing"
+        "and once that client has gone the worker is owed nothing"
+    );
+}
+
+/// KR-REQ-07.52, KR-REQ-09.23: a client that fell a whole queue behind is told to resynchronise,
+/// and is still sent the closure, straight after the marker and as the last thing on its stream.
+///
+/// Falling behind loses output, not the news of how the session ended. The client stops reading
+/// part way through a frame on a transport this test sets, and the session is given batches until
+/// the client's queue is full and it is marked for resynchronisation. The session then closes, the
+/// notice stays owed while the client reads nothing, and the client reading again finds what was
+/// queued before the marker, the marker, and the closure.
+///
+/// Unix only, because the transport this sets is a Unix socket's buffer.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_fell_a_queue_behind_is_sent_the_marker_and_then_the_closure() {
+    let host = host_on_a_narrow_transport("read -r _").await;
+    let (mut behind, attachment_id) = stalled(&host).await;
+    let mut given = 0_usize;
+    while !host.runtime.session().is_resynchronising(attachment_id) {
+        assert!(
+            given < 64 * BATCH_BYTES,
+            "the client was not marked for resynchronisation after {given} bytes"
+        );
+        write_output(&host, &vec![b'x'; BATCH_BYTES]);
+        given += BATCH_BYTES;
+    }
+    until("the client to stop part way through a frame", || {
+        host.service.part_way_through_a_frame(attachment_id)
+    })
+    .await;
+    let record = close(&host).await;
+    assert!(
+        !host
+            .runtime
+            .closure_delivered(Duration::from_millis(500))
+            .await,
+        "the notice of a client that is behind and not reading is owed"
+    );
+
+    let started = tokio::time::Instant::now();
+    let mut output = 0_usize;
+    let mut marked = false;
+    let sent = loop {
+        let remaining = LIVENESS_DEADLINE.saturating_sub(started.elapsed());
+        let frame = match tokio::time::timeout(remaining, behind.recv()).await {
+            Ok(Ok(frame)) => frame,
+            Ok(Err(error)) => panic!(
+                "the connection ended ({error}) before the closure, after {output} bytes of \
+                 output and {} the marker",
+                if marked { "after" } else { "before" }
+            ),
+            Err(_) => panic!("waited {LIVENESS_DEADLINE:?} for the closure"),
+        };
+        let ControlFrame::Notification(notification) = frame else {
+            continue;
+        };
+        match notification.event_type.as_str() {
+            "session.output" => {
+                assert!(
+                    !marked,
+                    "nothing of the output reaches the client after the marker"
+                );
+                let event: OutputEvent = notification
+                    .payload
+                    .to_typed()
+                    .expect("an output event decodes");
+                output += event
+                    .bytes
+                    .as_slice()
+                    .iter()
+                    .filter(|byte| **byte == b'x')
+                    .count();
+            }
+            "session.resync" => {
+                assert!(!marked, "the client is marked once");
+                marked = true;
+            }
+            SESSION_CLOSED_EVENT => {
+                break notification
+                    .payload
+                    .to_typed::<ClosureRecord>()
+                    .expect("the closure carries the session's closure record");
+            }
+            other => assert!(
+                !marked,
+                "nothing reaches the client between the marker and the closure, and {other} did"
+            ),
+        }
+    };
+    assert!(
+        marked,
+        "the client was told to resynchronise before the closure"
+    );
+    assert_eq!(sent, record, "and was sent the session's own record");
+    assert!(
+        output > 0 && output < given,
+        "what was queued before the marker arrived, {output} of the {given} bytes given, and the \
+         rest was not"
+    );
+    assert!(
+        host.runtime.closure_delivered(CLOSURE_NOTICE_TIMEOUT).await,
+        "and once it has the closure the worker is owed nothing"
     );
 }
 
