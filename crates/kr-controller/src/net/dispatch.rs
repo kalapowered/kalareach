@@ -188,13 +188,17 @@ impl FrameSink for ControlStream {
 
 /// The decision a batch a subscription carries is written under, for as long as it holds.
 ///
-/// Both halves are read in the poll that hands bytes to the stream, so each is an atomic or a clock
-/// reading: the authority epoch the decision was taken at, which any change to this host's policy
-/// or rights ceiling moves, and the moment its own time bound runs out on the continuous clock.
+/// Every part is read in the poll that hands bytes to the stream, so each is an atomic or a clock
+/// reading that never waits: the authority epoch the decision was taken at, which any change to
+/// this host's policy or rights ceiling moves; the offline bound as the host anchored it on the
+/// continuous clock, which a wall clock wound back cannot lengthen; and the moment in UTC the
+/// decision stops holding, against this host's reading of UTC, so a clock stepped forward or a
+/// floor another decision raised ends it at once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RelayGrant {
     epoch: u64,
     until: Option<kr_transport::clock::ContinuousInstant>,
+    lapses_at_ms: Option<u64>,
 }
 
 impl RelayGrant {
@@ -204,6 +208,9 @@ impl RelayGrant {
             && self
                 .until
                 .is_none_or(|until| controller.clock.now() < until)
+            && self
+                .lapses_at_ms
+                .is_none_or(|lapses_at_ms| controller.settled_utc_now() < lapses_at_ms)
     }
 }
 
@@ -941,7 +948,7 @@ impl RemoteConnection {
             entry,
             claims_geometry(mutation),
         ) {
-            Ok(decided) => decided.permitted.rights,
+            Ok(decision) => decision.decided.permitted.rights,
             Err(error) => return failure(mutation.request_id, error),
         };
         // Every store that retains an action is asked in turn, in the order the local ingress asks
@@ -2344,20 +2351,19 @@ impl RemoteConnection {
     /// Decides whether this connection may be written what its subscription carries now, and
     /// returns the decision for the write boundary to hold the batch to.
     fn relay_grant(&self, session_id: SessionId) -> Option<RelayGrant> {
-        // Both read before the decision. A change that lands while it is taken is then one the
-        // write sees, and the continuous clock is sampled before the moment it is measured from,
-        // so the bound it gives can only be shorter.
+        // Read before the decision, so a change that lands while it is taken is one the write
+        // sees. The time bounds are the decision's own: the offline bound as the host anchored it
+        // on the continuous clock, which a decision taken again finds unchanged, and the moment in
+        // UTC the decision stops holding.
         let epoch = self.controller.authority_epoch();
-        let anchor = self.controller.clock.now();
-        let decided = self
+        let decision = self
             .check_grant(Some(session_id), Method::EventsSubscribe.entry(), false)
             .ok()?;
-        let until = decided.lapses_at_ms.and_then(|lapses_at_ms| {
-            anchor.checked_add(std::time::Duration::from_millis(
-                lapses_at_ms.saturating_sub(decided.decided_at_ms),
-            ))
-        });
-        Some(RelayGrant { epoch, until })
+        Some(RelayGrant {
+            epoch,
+            until: decision.offline_until,
+            lapses_at_ms: decision.decided.lapses_at_ms,
+        })
     }
 
     /// Refuses a request on a connection whose registration has been withdrawn.
@@ -2536,7 +2542,7 @@ impl RemoteConnection {
         session_id: Option<SessionId>,
         entry: &'static MethodEntry,
         claims_geometry: bool,
-    ) -> std::result::Result<crate::config::ceilings::Decided, ProtocolError> {
+    ) -> std::result::Result<super::DeviceDecision, ProtocolError> {
         if !self.grant_is_current() {
             return Err(ProtocolError::new(
                 ErrorCode::PermissionDenied,
@@ -2554,6 +2560,9 @@ impl RemoteConnection {
             revoked_at_ms: self.device.revoked_at_ms.map(|at| at.get()),
             revoked_by_parent: None,
         };
+        // The continuous clock first, so a bound anchored from the wall-clock reading after it can
+        // only come early.
+        let sampled = self.controller.clock.now();
         let request = crate::grants::AccessRequest {
             method: entry.method,
             ingress: ActorIngress::PairedDevice,
@@ -2566,7 +2575,7 @@ impl RemoteConnection {
         };
         let decided = self
             .controller
-            .decide_for_device(&grant, &record, request)
+            .decide_for_device(&grant, &record, request, sampled)
             .map_err(|refusal| match refusal {
                 CeilingRefusal::Refused(crate::grants::Refusal::MissingRight {
                     right: ActionRight::VoiceUse,
@@ -3099,6 +3108,7 @@ mod write_boundary {
         RelayGrant {
             epoch: controller.authority_epoch(),
             until: None,
+            lapses_at_ms: None,
         }
     }
 
@@ -3265,6 +3275,7 @@ mod write_boundary {
                     .clock
                     .now()
                     .checked_add(Duration::from_millis(30)),
+                lapses_at_ms: None,
             },
             redecide: &redecide,
         };
@@ -3302,5 +3313,65 @@ mod write_boundary {
         assert_eq!(written, Written::Undecided);
         assert!(stream.reached().is_empty());
         drop(controller);
+    }
+
+    /// A batch whose decision runs out at a moment in UTC is not written once another decision
+    /// has read a clock past that moment, although the epoch has not moved and the wall clock
+    /// the boundary reads may be behind: the floor that decision raised is read at every attempt.
+    /// Whether the batch waited for the writer, or had started and waited for the peer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_batch_is_not_written_once_the_floor_passes_its_decision() {
+        for peer_stops_reading in [false, true] {
+            let temp = kr_ipc::testing::TempHost::create();
+            let controller = super::super::tests::daemon(&temp).await;
+            let stream = HeldStream::new(peer_stops_reading);
+            let output = output(&controller, &stream);
+            let frame = batch();
+            if peer_stops_reading {
+                stream.writer.add_permits(1);
+            }
+            let (lasting, lasting_record) = super::super::tests::granted(
+                kr_protocol::grant::GrantExpiry::Never,
+                controller.policy().authority_revision(),
+            );
+            let lapses_at_ms = kr_ipc::now_ms().get() + 60 * 60 * 1000;
+
+            let redecide = || true;
+            let relaying = Relaying {
+                grant: RelayGrant {
+                    epoch: controller.authority_epoch(),
+                    until: None,
+                    lapses_at_ms: Some(lapses_at_ms),
+                },
+                redecide: &redecide,
+            };
+            let (written, ()) = tokio::join!(output.write(&frame, Some(relaying)), async {
+                stream.waited(if peer_stops_reading { 2 } else { 1 }).await;
+                // Another request is decided at a reading past the moment, which raises the floor.
+                controller
+                    .decide_for_device(
+                        &lasting,
+                        &lasting_record,
+                        super::super::tests::listing(&temp, lapses_at_ms + 1),
+                        controller.clock.now(),
+                    )
+                    .expect("a grant that does not expire");
+                if peer_stops_reading {
+                    stream.room.as_ref().expect("a slow peer").add_permits(1);
+                } else {
+                    stream.writer.add_permits(1);
+                }
+            });
+            if peer_stops_reading {
+                assert_eq!(written, Written::Withdrawn);
+                assert_eq!(stream.reached(), vec![Reached::Part]);
+                assert!(stream.closed());
+            } else {
+                assert_eq!(written, Written::Undecided);
+                assert!(stream.reached().is_empty());
+                assert!(!stream.closed());
+            }
+            drop(controller);
+        }
     }
 }

@@ -390,6 +390,22 @@ pub struct Controller {
     /// hand bytes over, so a change that lands while a batch waits for the writer or for the peer
     /// stops it there: the batch is decided again, or, once bytes are moving, the connection ends.
     authority_epoch: std::sync::atomic::AtomicU64,
+    /// The policy's clock floor as this daemon last saw it, for a reader that cannot take the lock.
+    ///
+    /// The write boundary decides at every attempt to hand bytes over whether a relayed batch's
+    /// decision has run out by this host's reading of UTC, and that reading is the later of the
+    /// wall clock and the floor. A poll cannot wait for the policy's lock, so it reads the floor
+    /// through the lock when nobody holds it and this copy when somebody does. Every decision this
+    /// daemon takes raises it, and it only ever rises.
+    utc_floor: std::sync::atomic::AtomicU64,
+    /// The bounded offline validity as it was anchored on the continuous clock, once for the bound
+    /// and the synchronisation it is measured from.
+    ///
+    /// Measured in UTC, the bound would be lengthened by a wall clock wound back while it runs: the
+    /// floor holds UTC still until the clock catches up. Anchored once, it runs on the clock that
+    /// cannot be wound back, and a lapse it records stays a lapse until the owner changes the bound
+    /// or the authority feed synchronises.
+    offline_anchor: std::sync::Mutex<Option<net::OfflineAnchor>>,
     /// This host's half of the remote authority feed: the revisions only it issues, the revocation
     /// records it retains, and the synchronisation it owes before it serves remote work again.
     feed: std::sync::Mutex<crate::grants::AuthorityFeed>,
@@ -661,6 +677,7 @@ impl Controller {
             None => crate::grants::HostPolicy::personal(authority_revision),
         };
         sharing.grants().store_policy(&policy.snapshot())?;
+        let utc_floor = policy.utc_floor_ms();
         let policy = Arc::new(std::sync::Mutex::new(policy));
         let mut feed = match sharing.grants().stored_feed()? {
             Some(stored) => crate::grants::AuthorityFeed::restore(&stored),
@@ -764,6 +781,8 @@ impl Controller {
             policy,
             floor_owed: std::sync::atomic::AtomicBool::new(false),
             authority_epoch: std::sync::atomic::AtomicU64::new(0),
+            utc_floor: std::sync::atomic::AtomicU64::new(utc_floor),
+            offline_anchor: std::sync::Mutex::new(None),
             feed: std::sync::Mutex::new(feed),
             changesets,
             automation,
@@ -1824,6 +1843,7 @@ impl Controller {
         *held = candidate;
         // Published with the policy, under its lock, so a decision that reads this epoch reads the
         // policy it names or a later one.
+        self.publish_floor(held.utc_floor_ms());
         self.advance_authority_epoch();
         Ok(value)
     }
@@ -1844,6 +1864,7 @@ impl Controller {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         policy.observe_utc(now_ms);
+        self.publish_floor(policy.utc_floor_ms());
         let settled = policy.settled_now(now_ms);
         // Whatever the caller decides from this reading stands on the floor, so the floor is owed
         // its record. A failure leaves the raised floor in memory, because a floor only moves
@@ -1883,6 +1904,24 @@ impl Controller {
                 "kr-controller: could not record the clock floor this host decided from: {error}"
             ),
         }
+    }
+
+    /// Raises the published copy of the policy's clock floor to `floor`.
+    pub(crate) fn publish_floor(&self, floor: u64) {
+        self.utc_floor
+            .fetch_max(floor, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// This host's reading of UTC for a caller that cannot wait: the later of the wall clock and
+    /// the policy's floor, read through the lock when it is free and from the published copy when
+    /// it is not. It never waits, so it may be called from inside a poll.
+    pub(crate) fn settled_utc_now(&self) -> u64 {
+        if let Ok(policy) = self.policy.try_lock() {
+            self.publish_floor(policy.utc_floor_ms());
+        }
+        kr_ipc::now_ms()
+            .get()
+            .max(self.utc_floor.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// The epoch a paired device's authority is decided at now.

@@ -777,6 +777,105 @@ fn the_ceiling_narrows_the_grant_the_decision_is_taken_against() {
     assert!(!removed.contains(&ActionRight::SessionView));
 }
 
+/// A decision says when time alone ends it: the grant's expiry, or for a caller away from this
+/// machine the end of the bounded offline validity, whichever comes first, and nothing when neither
+/// can be represented.
+#[test]
+fn a_decision_lapses_at_its_grants_expiry_or_the_end_of_the_offline_bound() {
+    use kr_protocol::actor::ActorIngress;
+    use kr_protocol::grant::{
+        EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector,
+    };
+    use kr_protocol::ids::{AuthorityRevision, DeviceId, EnvironmentId, GrantId};
+    use kr_protocol::method::Method;
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::scalars::{CanonicalSet, DurationMs, TimestampMs, Uuid};
+    use kr_protocol::sharing::OfflineValidityPolicy;
+
+    let environment_id = EnvironmentId::new(Uuid::from_bytes([0xe1; 16]));
+    let grant = |expiry| Grant {
+        grant_id: GrantId::new(Uuid::from_bytes([2; 16])),
+        parent_grant_id: Nullable::null(),
+        issuer_device_id: DeviceId::new(Uuid::from_bytes([0xf2; 16])),
+        recipient_device_id: DeviceId::new(Uuid::from_bytes([0xf3; 16])),
+        authority_revision: AuthorityRevision::new(1),
+        environment_selector: EnvironmentSelector::Any,
+        session_selector: SessionSelector::Any,
+        actions: [ActionRight::SessionView].into_iter().collect(),
+        history: HistoryScope {
+            lower_bound_ms: Nullable::null(),
+            include_live_screen: false,
+            named_questions: CanonicalSet::new(),
+            named_approvals: CanonicalSet::new(),
+        },
+        expiry,
+        organisation: Nullable::null(),
+    };
+    let lapses = |expiry, offline: Option<OfflineValidityPolicy>, ingress| {
+        let grant = grant(expiry);
+        let record = crate::grants::GrantRecord {
+            session_id: None,
+            grant: grant.clone(),
+            issued_at_ms: 1_000,
+            activated_at_ms: Some(1_000),
+            revoked_at_ms: None,
+            revoked_by_parent: None,
+        };
+        let mut policy = crate::grants::HostPolicy::personal(AuthorityRevision::new(1));
+        policy.set_offline_validity(offline);
+        ceilings::decide_with_ceiling(
+            None,
+            &grant,
+            &record,
+            &mut policy,
+            crate::grants::AccessRequest {
+                method: Method::SessionList,
+                ingress,
+                environment_id,
+                session_id: None,
+                claims_geometry: false,
+                recipient_account: None,
+                own_subject: None,
+                now_ms: 1_000,
+            },
+        )
+        .expect("the grant decides")
+        .lapses_at_ms
+    };
+    let expiring = GrantExpiry::At {
+        expires_at_ms: TimestampMs::new(9_000),
+    };
+    let bounded = OfflineValidityPolicy {
+        maximum_offline_ms: DurationMs::new(1_000),
+        last_synchronised_at_ms: Nullable::some(TimestampMs::new(500)),
+    };
+    let remote = ActorIngress::PairedDevice;
+
+    assert_eq!(lapses(GrantExpiry::Never, None, remote), None);
+    assert_eq!(lapses(expiring, None, remote), Some(9_000));
+    assert_eq!(
+        lapses(GrantExpiry::Never, Some(bounded), remote),
+        Some(1_501),
+        "the bound holds through its last millisecond"
+    );
+    assert_eq!(lapses(expiring, Some(bounded), remote), Some(1_501));
+    assert_eq!(
+        lapses(GrantExpiry::Never, Some(bounded), ActorIngress::LocalIpc),
+        None,
+        "a person at this machine is not held to the offline bound"
+    );
+    let unbounded = OfflineValidityPolicy {
+        maximum_offline_ms: DurationMs::new(u64::MAX),
+        last_synchronised_at_ms: Nullable::some(TimestampMs::new(1)),
+    };
+    assert_eq!(
+        lapses(GrantExpiry::Never, Some(unbounded), remote),
+        None,
+        "a bound that ends beyond every representable moment ends at none of them"
+    );
+    assert_eq!(lapses(expiring, Some(unbounded), remote), Some(9_000));
+}
+
 /// KR-REQ-26.15: the report names the rights ceiling in force and what it removes, and keeps a
 /// ceiling this host accepted when the document in front of it decides nothing.
 #[test]

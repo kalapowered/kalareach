@@ -1667,14 +1667,22 @@ and the batch is held to that decision until its last byte goes. A batch can wai
 connection's writer, which the keepalive shares, or for a peer that has stopped reading. So every
 attempt to hand its bytes over checks that nothing the decision rests on has changed since (any
 change to this host's policy or rights ceiling moves an epoch the check reads) and that the
-decision's own time bound, the grant's expiry or the end of the offline bound, has not passed; and
-while the write waits, the whole decision is taken again every tenth of a second. A decision that
+decision's own time bound, the grant's expiry or the end of the offline bound, has not passed:
+by this host's reading of UTC, the later of the wall clock and the floor any decision has raised,
+and by the continuous clock the offline bound is anchored on. None of these waits for a lock or a
+disk. While the write waits, the whole decision is taken again every tenth of a second. A decision that
 stops holding before the first byte goes has the batch decided again. One that stops holding once
 bytes are moving ends the connection, because a frame left in pieces ends the stream. A batch the
 decision no longer allows is not written, and the connection ends with it. Only an expired grant
 is written to the device's record; any other refusal leaves the grant alone. A lapsed offline
 bound, for one, holds again once the authority feed synchronises, and the device learns why from
 the next request it makes.
+
+The bounded offline validity is held on the continuous clock for every device decision, not only
+in UTC. The first decision under a bound and the synchronisation it is measured from anchors when
+the bound runs out, and every later decision, a relayed batch's retry among them, finds the same
+anchor: a wall clock wound back while the bound runs does not lengthen it, and once it has run out
+it stays out until the owner changes the bound or the authority feed synchronises.
 
 What the subject decides stays the subject's, and the conditional requirements the daemon cannot
 evaluate are exactly those: whose subject it is. A device detaches the attachment its own

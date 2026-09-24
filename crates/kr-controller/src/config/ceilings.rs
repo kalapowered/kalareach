@@ -274,10 +274,12 @@ fn lapses_at_ms(grant: &Grant, policy: &HostPolicy, request: &AccessRequest) -> 
     .then(|| policy.offline_validity())
     .flatten()
     .and_then(|offline| {
-        offline.last_synchronised_at_ms.as_ref().map(|last| {
+        // The first moment outside the bound, when the clock can represent it. One it cannot is a
+        // bound every representable moment is inside.
+        offline.last_synchronised_at_ms.as_ref().and_then(|last| {
             last.get()
-                .saturating_add(offline.maximum_offline_ms.get())
-                .saturating_add(1)
+                .checked_add(offline.maximum_offline_ms.get())?
+                .checked_add(1)
         })
     });
     match (expiry, offline) {

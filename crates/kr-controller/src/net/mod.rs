@@ -61,7 +61,7 @@ use kr_pairing::host::HostIdentity;
 use kr_protocol::ids::{ActorId, AuthorityRevision, ConnectionId, DeviceId, DeviceKeyRevision};
 use kr_protocol::pairing::NetworkConfig;
 use kr_protocol::scalars::EndpointKey;
-use kr_transport::clock::ContinuousInstant;
+use kr_transport::clock::{ContinuousClock as _, ContinuousInstant};
 use kr_transport::handshake::{HostEpochs, LocalIdentity, PairedDirectory};
 use kr_transport::listener::{AuthorisedSession, BoxFuture, HostHandler, ListenerConfig};
 use kr_transport::preauth::PairingSurface;
@@ -697,6 +697,25 @@ impl NetworkHost {
             .upgrade()
             .ok_or_else(|| ControllerError::NotConfigured("this daemon has stopped".to_owned()))
     }
+}
+
+/// The bounded offline validity, anchored on the continuous clock.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OfflineAnchor {
+    /// The bound and the synchronisation it is measured from, as the policy held them when the
+    /// anchor was taken. A different one is a different anchor.
+    bound: kr_protocol::sharing::OfflineValidityPolicy,
+    /// When the bound runs out, or `None` when it ends beyond what the clock can represent.
+    until: Option<ContinuousInstant>,
+}
+
+/// A paired device's request, as this host decided it.
+#[derive(Clone, Debug)]
+pub(crate) struct DeviceDecision {
+    /// The decision itself.
+    pub decided: crate::config::ceilings::Decided,
+    /// When the offline bound it stood inside runs out on the continuous clock, when one applies.
+    pub offline_until: Option<ContinuousInstant>,
 }
 
 /// How often this host writes down what its wall clock reads.
@@ -1392,6 +1411,12 @@ impl Controller {
     /// since a later reading can only find the same grant expired sooner. A record still owed from
     /// an earlier refusal is written by whichever decision comes next.
     ///
+    /// The bounded offline validity is held on the continuous clock as well as in UTC: the first
+    /// decision under a bound and the synchronisation it is measured from anchors when it runs
+    /// out, and a later decision that finds the anchor passed refuses, whatever a wall clock wound
+    /// back since then says. `sampled` is the continuous clock, read before the request's
+    /// wall-clock reading was taken, so the anchor can only come early.
+    ///
     /// # Errors
     ///
     /// Returns the refusal, naming the right when this host's configuration removed one the
@@ -1401,10 +1426,8 @@ impl Controller {
         grant: &kr_protocol::grant::Grant,
         record: &crate::grants::GrantRecord,
         request: crate::grants::AccessRequest,
-    ) -> std::result::Result<
-        crate::config::ceilings::Decided,
-        crate::config::ceilings::CeilingRefusal,
-    > {
+        sampled: ContinuousInstant,
+    ) -> std::result::Result<DeviceDecision, crate::config::ceilings::CeilingRefusal> {
         let ceiling = self
             .rights_ceiling
             .lock()
@@ -1414,13 +1437,39 @@ impl Controller {
             .policy
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The bound a remote caller under a personal grant is held to, which is the policy's own
+        // rule for when it applies.
+        let offline = (request.ingress != kr_protocol::actor::ActorIngress::LocalIpc
+            && grant.organisation.as_ref().is_none())
+        .then(|| policy.offline_validity().copied())
+        .flatten();
         let decided = crate::config::ceilings::decide_with_ceiling(
             ceiling.as_ref(),
             grant,
             record,
             &mut policy,
-            request,
+            request.clone(),
         );
+        self.publish_floor(policy.utc_floor_ms());
+        let offline_until = offline.and_then(|offline| {
+            self.offline_until(offline, policy.settled_now(request.now_ms), sampled)
+        });
+        let decided = match decided {
+            // Anchored and passed: the bound has run out on the clock that cannot be wound back.
+            Ok(_) if offline_until.is_some_and(|until| self.clock.now() >= until) => {
+                Err(crate::config::ceilings::CeilingRefusal::Refused(
+                    crate::grants::Refusal::OfflineValidityLapsed {
+                        last_synchronised_at_ms: offline.and_then(|offline| {
+                            offline.last_synchronised_at_ms.as_ref().map(|at| at.get())
+                        }),
+                    },
+                ))
+            }
+            decided => decided.map(|decided| DeviceDecision {
+                decided,
+                offline_until,
+            }),
+        };
         if matches!(
             &decided,
             Err(crate::config::ceilings::CeilingRefusal::Refused(
@@ -1436,6 +1485,49 @@ impl Controller {
             self.write_owed_floor(&policy);
         }
         decided
+    }
+
+    /// Returns when `offline` runs out on the continuous clock, anchoring it the first time it is
+    /// asked about this bound and this synchronisation.
+    ///
+    /// `settled_ms` is this host's reading of UTC for the decision, and `sampled` the continuous
+    /// clock read before it. What is left of the bound at that reading is anchored from that
+    /// instant, and nothing but a different bound or a later synchronisation replaces the anchor:
+    /// a decision after a wall clock wound back finds the same anchor. A bound that has already
+    /// run out anchors at `sampled`, so its lapse is kept the same way. `None` when the bound ends
+    /// beyond what the clock can represent.
+    fn offline_until(
+        &self,
+        offline: kr_protocol::sharing::OfflineValidityPolicy,
+        settled_ms: u64,
+        sampled: ContinuousInstant,
+    ) -> Option<ContinuousInstant> {
+        let mut held = self
+            .offline_anchor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(anchor) = held.as_ref()
+            && anchor.bound == offline
+        {
+            return anchor.until;
+        }
+        // A bound that was never synchronised is outside itself from the moment it is chosen,
+        // which the decision has already refused; it anchors as run out.
+        let remaining = match offline.last_synchronised_at_ms.as_ref() {
+            None => Some(0),
+            Some(last) => last
+                .get()
+                .checked_add(offline.maximum_offline_ms.get())
+                .and_then(|end| end.checked_add(1))
+                .map(|end| end.saturating_sub(settled_ms)),
+        };
+        let until = remaining
+            .and_then(|remaining| sampled.checked_add(std::time::Duration::from_millis(remaining)));
+        *held = Some(OfflineAnchor {
+            bound: offline,
+            until,
+        });
+        until
     }
 
     /// Returns the authority revision this environment is at.
@@ -1470,6 +1562,8 @@ mod tests {
     use kr_protocol::method::Method;
     use kr_protocol::rights::ActionRight;
     use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs};
+
+    use kr_transport::clock::ContinuousClock as _;
 
     use crate::config::ceilings::CeilingRefusal;
     use crate::grants::{AccessRequest, GrantRecord, Refusal};
@@ -1524,7 +1618,10 @@ mod tests {
     }
 
     /// A redeemed grant to one device, carrying viewing.
-    fn granted(expiry: GrantExpiry, authority_revision: AuthorityRevision) -> (Grant, GrantRecord) {
+    pub(super) fn granted(
+        expiry: GrantExpiry,
+        authority_revision: AuthorityRevision,
+    ) -> (Grant, GrantRecord) {
         let device_id = DeviceId::new(kr_ipc::new_uuid());
         let grant = Grant {
             grant_id: GrantId::new(kr_ipc::new_uuid()),
@@ -1556,7 +1653,7 @@ mod tests {
     }
 
     /// A paired device's session listing, read against the wall clock as it says `now_ms`.
-    fn listing(temp: &kr_ipc::testing::TempHost, now_ms: u64) -> AccessRequest {
+    pub(super) fn listing(temp: &kr_ipc::testing::TempHost, now_ms: u64) -> AccessRequest {
         AccessRequest {
             method: Method::SessionList,
             ingress: ActorIngress::PairedDevice,
@@ -1624,7 +1721,12 @@ mod tests {
         );
         let (lasting, lasting_record) = granted(GrantExpiry::Never, revision);
         controller
-            .decide_for_device(&expiring, &expiring_record, listing(&temp, now))
+            .decide_for_device(
+                &expiring,
+                &expiring_record,
+                listing(&temp, now),
+                controller.clock.now(),
+            )
             .expect("the grant stands before it expires");
 
         // From here every write of the host's policy fails, as it would on a full disk.
@@ -1633,7 +1735,12 @@ mod tests {
         // The wall clock steps past the expiry. The grant is refused, and the floor it was refused
         // on cannot be written.
         let refused = controller
-            .decide_for_device(&expiring, &expiring_record, listing(&temp, expires + 1))
+            .decide_for_device(
+                &expiring,
+                &expiring_record,
+                listing(&temp, expires + 1),
+                controller.clock.now(),
+            )
             .expect_err("the grant has run out by this reading");
         assert!(
             matches!(refused, CeilingRefusal::Refused(Refusal::Expired { .. })),
@@ -1642,14 +1749,24 @@ mod tests {
         assert!(written_floor(&controller) < expires, "the write failed");
         // The clock is wound back. The floor in memory still refuses, and its write still fails.
         controller
-            .decide_for_device(&expiring, &expiring_record, listing(&temp, now))
+            .decide_for_device(
+                &expiring,
+                &expiring_record,
+                listing(&temp, now),
+                controller.clock.now(),
+            )
             .expect_err("a clock wound back does not revive the grant while this daemon runs");
 
         // Storage recovers. The next decision is a permission for another grant, which owes no
         // record of its own, and it writes the floor the refusal stood on before it answers.
         allow_policy_writes(&registry);
         controller
-            .decide_for_device(&lasting, &lasting_record, listing(&temp, now))
+            .decide_for_device(
+                &lasting,
+                &lasting_record,
+                listing(&temp, now),
+                controller.clock.now(),
+            )
             .expect("a grant that does not expire is served");
         assert!(
             written_floor(&controller) > expires,
@@ -1661,7 +1778,12 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let controller = daemon(&temp).await;
         let refused = controller
-            .decide_for_device(&expiring, &expiring_record, listing(&temp, now))
+            .decide_for_device(
+                &expiring,
+                &expiring_record,
+                listing(&temp, now),
+                controller.clock.now(),
+            )
             .expect_err("the refusal outlives the daemon that made it");
         assert!(
             matches!(refused, CeilingRefusal::Refused(Refusal::Expired { .. })),
@@ -1690,12 +1812,22 @@ mod tests {
             .expect("the owner chooses an offline bound of an hour");
         let (lasting, lasting_record) = granted(GrantExpiry::Never, revision);
         controller
-            .decide_for_device(&lasting, &lasting_record, listing(&temp, now))
+            .decide_for_device(
+                &lasting,
+                &lasting_record,
+                listing(&temp, now),
+                controller.clock.now(),
+            )
             .expect("inside the bound");
 
         let registry = refuse_policy_writes(&temp);
         let refused = controller
-            .decide_for_device(&lasting, &lasting_record, listing(&temp, now + 2 * hour))
+            .decide_for_device(
+                &lasting,
+                &lasting_record,
+                listing(&temp, now + 2 * hour),
+                controller.clock.now(),
+            )
             .expect_err("the wall clock steps past the bound");
         assert!(
             matches!(
@@ -1719,7 +1851,12 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let controller = daemon(&temp).await;
         let refused = controller
-            .decide_for_device(&lasting, &lasting_record, listing(&temp, now))
+            .decide_for_device(
+                &lasting,
+                &lasting_record,
+                listing(&temp, now),
+                controller.clock.now(),
+            )
             .expect_err("a clock wound back before the restart does not bring the bound back");
         assert!(
             matches!(
@@ -1728,6 +1865,71 @@ mod tests {
             ),
             "{refused:?}"
         );
+        drop(controller);
+    }
+
+    /// The offline bound runs out on the continuous clock it was anchored on. A decision taken
+    /// after the wall clock was wound back reads UTC inside the bound again, and is refused all the
+    /// same; a synchronisation of the authority feed anchors the bound afresh.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_offline_bound_runs_out_on_the_clock_it_was_anchored_on() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = daemon(&temp).await;
+        let revision = controller.policy().authority_revision();
+        let synchronised = kr_ipc::now_ms().get();
+        controller
+            .update_policy(|policy| {
+                policy.set_offline_validity(Some(kr_protocol::sharing::OfflineValidityPolicy {
+                    maximum_offline_ms: kr_protocol::scalars::DurationMs::new(200),
+                    last_synchronised_at_ms: Nullable::some(TimestampMs::new(synchronised)),
+                }));
+            })
+            .expect("the owner chooses an offline bound of a fifth of a second");
+        let (lasting, lasting_record) = granted(GrantExpiry::Never, revision);
+        let decision = controller
+            .decide_for_device(
+                &lasting,
+                &lasting_record,
+                listing(&temp, synchronised),
+                controller.clock.now(),
+            )
+            .expect("inside the bound");
+        assert!(
+            decision.offline_until.is_some(),
+            "and the bound is anchored"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // The wall clock has been wound back five seconds. With the floor this host holds, UTC is
+        // still inside the bound.
+        let refused = controller
+            .decide_for_device(
+                &lasting,
+                &lasting_record,
+                listing(&temp, synchronised - 5_000),
+                controller.clock.now(),
+            )
+            .expect_err("the bound ran out on the continuous clock");
+        assert!(
+            matches!(
+                refused,
+                CeilingRefusal::Refused(Refusal::OfflineValidityLapsed { .. })
+            ),
+            "{refused:?}"
+        );
+
+        let again = synchronised + 1_000;
+        controller
+            .update_policy(|policy| policy.note_feed_synchronised(again))
+            .expect("the authority feed synchronises");
+        controller
+            .decide_for_device(
+                &lasting,
+                &lasting_record,
+                listing(&temp, again),
+                controller.clock.now(),
+            )
+            .expect("a synchronisation anchors the bound afresh");
         drop(controller);
     }
 }
