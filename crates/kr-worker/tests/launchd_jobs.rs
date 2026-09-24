@@ -419,20 +419,25 @@ async fn until_ended(identity: &ProcessStartIdentity, what: &str) {
     }
 }
 
-/// Starts each worker's job through launchd as this host does, with the system's own `sleep` for a
-/// few seconds in place of a worker, and then says it cannot tell whether anything started, which
-/// is what a launch answers when its kickstart failed part way. The labels it started are kept for
-/// the test.
+/// Starts each worker's job through launchd as this host does, with the system's own shell in place
+/// of a worker, waiting until the test creates `release`, and then says it cannot tell whether
+/// anything started, which is what a launch answers when its kickstart failed part way. The labels
+/// it started are kept for the test.
 #[derive(Debug)]
 struct NamesNoProcess {
     started: Arc<std::sync::Mutex<Vec<String>>>,
+    release: PathBuf,
 }
 
 impl WorkerSupervisor for NamesNoProcess {
     fn start(&self, launch: &kr_controller::supervision::WorkerLaunch) -> LaunchOutcome {
         let mut service = launch.service();
-        service.program = PathBuf::from("/bin/sleep");
-        service.arguments = vec!["3".to_owned()];
+        service.program = PathBuf::from("/bin/sh");
+        service.arguments = vec![
+            "-c".to_owned(),
+            "while [ ! -e \"$0\" ]; do sleep 0.1; done".to_owned(),
+            self.release.display().to_string(),
+        ];
         let outcome = LaunchdSupervisor::new().start_service(&service);
         self.started
             .lock()
@@ -530,15 +535,18 @@ async fn a_worker_ended_outright_has_its_job_removed() {
 }
 
 /// A launch that could not say what it started still has its job removed, once the process in it
-/// has ended: the job is asked about until launchd lets it go, not once.
+/// has ended: the job is asked about until launchd lets it go, not once, and while its process runs
+/// it is left alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_launch_that_named_no_process_has_its_job_removed_once_it_ends() {
     let host = Host::create();
     let started = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let release = host.temp.root().join("release");
     let daemon = host
         .start_with(|| {
             Box::new(NamesNoProcess {
                 started: Arc::clone(&started),
+                release: release.clone(),
             })
         })
         .await;
@@ -575,11 +583,21 @@ async fn a_launch_that_named_no_process_has_its_job_removed_once_it_ends() {
         .first()
         .cloned()
         .expect("the supervisor started a job");
+    let target = format!("gui/{}/{job}", kr_ipc::paths::current_uid());
+    assert!(
+        has_process(&target),
+        "the job's process runs until this test lets it end"
+    );
+    // A moment in which the daemon has looked at the job and found its process running.
+    tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(
         loaded(&job),
-        vec![format!("gui/{}/{job}", kr_ipc::paths::current_uid())],
-        "the job is loaded while the process in it runs"
+        vec![target.clone()],
+        "a job whose process still runs is left loaded"
     );
+    assert!(has_process(&target), "and its process was not ended");
+
+    std::fs::write(&release, b"").expect("lets the job's process end");
     host.until_retired(&job, "the job of a launch that named no process")
         .await;
 

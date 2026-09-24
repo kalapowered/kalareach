@@ -105,9 +105,10 @@ defined_jobs() {
   done
 }
 
-# Each of those jobs launchd still has loaded, as <domain>/<label>, one to a line. A job launchd
-# could not answer about is named with its answer, so a question nobody could read is not taken
-# for a job that has gone. A host with no launchd has no such job.
+# Each of those jobs launchd still has loaded, as <domain>/<label>, one to a line. launchd answers
+# 113 for a job a domain does not have and 112 for a domain that is not there. A job launchd could
+# not answer about otherwise is named with its answer, so a question nobody could read is not
+# taken for a job that has gone. A host with no launchd has no such job.
 jobs_left() {
   [ "$(uname -s)" = Darwin ] || return 0
   local uid label domain rc
@@ -117,7 +118,7 @@ jobs_left() {
       /bin/launchctl print "$domain/$label" >/dev/null 2>&1 && rc=0 || rc=$?
       case $rc in
         0) echo "$domain/$label" ;;
-        113) ;;
+        112 | 113) ;;
         *) echo "$domain/$label (launchctl print answered $rc)" ;;
       esac
     done

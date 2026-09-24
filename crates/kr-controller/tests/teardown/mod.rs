@@ -707,14 +707,16 @@ fn remove_launchd_jobs(environment: &EnvironmentPaths) -> Vec<String> {
 }
 
 /// Whether launchd has `target` loaded: yes, no, or why that could not be established. launchd
-/// answers 113 for a job it does not have.
+/// answers 113 for a job a domain does not have, and 112 for a domain that is not there, such as
+/// the graphical domain of a user who is not logged in, which has nothing loaded in it.
 #[cfg(target_os = "macos")]
 fn loaded(target: &str) -> Result<bool, String> {
+    const NO_SUCH_DOMAIN: i32 = 112;
     const NOT_LOADED: i32 = 113;
     let status = run_bounded(Command::new("/bin/launchctl").arg("print").arg(target))?;
     match status.code() {
         Some(0) => Ok(true),
-        Some(NOT_LOADED) => Ok(false),
+        Some(NO_SUCH_DOMAIN | NOT_LOADED) => Ok(false),
         _ => Err(format!(
             "launchctl could not say whether {target} is loaded: {status}"
         )),
