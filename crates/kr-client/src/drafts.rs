@@ -1601,7 +1601,9 @@ impl DraftSync {
     /// Returns [`SyncError::Fenced`] while privacy mode is on, [`SyncError::InFlight`] when a call
     /// for this publication is already out, [`SyncError::StaleCheckpoint`] or
     /// [`SyncError::ForkedHistory`] when the answer cannot follow what this device's records hold,
-    /// the service's refusal, and, through [`SyncError::Client`],
+    /// [`SyncError::SignedBeforeCutoff`] when the service refused the attempt as signed before its
+    /// cutoff, which ends the publication with its account kept, the service's refusal, and,
+    /// through [`SyncError::Client`],
     /// [`DraftError::NotTheStoredRevision`] when the revision named is not the one this device
     /// holds, [`DraftError::NotOwned`] when the draft belongs to another device,
     /// [`DraftError::TooLarge`] when it does not fit the contract, and [`DraftError::Storage`] when
@@ -1745,6 +1747,17 @@ impl DraftSync {
                         },
                     },
                 )
+            }
+            // Refused as signed before the service's cutoff: this attempt ran nothing, and the
+            // identity is never presented again, since an earlier attempt of it may have run and
+            // had its receipt swept. The publication ends here with its account kept, and
+            // publishing the draft again is new work under an identity of its own.
+            Ok(SyncExchanged::SignedBeforeCutoff) => {
+                self.store
+                    .close_signed_before_cutoff(&attempt.dispatch, attempt.record.work_id)?;
+                Err(SyncError::SignedBeforeCutoff {
+                    object_id: attempt.record.object_id,
+                })
             }
             // The identity this publication presented already answered a different request. That
             // receipt accounts for the other request and never for these bytes, and the service

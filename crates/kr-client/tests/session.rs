@@ -1281,7 +1281,11 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
                         never_ran: FENCE_FOUND_NO_RUN,
                         recovery,
                     },
-                    None => SyncRequestStatus::Unknown { recovery },
+                    // An attempt refused as signed before the cutoff leaves no receipt, and this
+                    // service records none for it.
+                    Some(Some(SyncExchanged::SignedBeforeCutoff)) | None => {
+                        SyncRequestStatus::Unknown { recovery }
+                    }
                 },
             )
         })
@@ -1312,7 +1316,8 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
                 Some(SyncExchanged::Refused { retained, .. }) => {
                     SyncRequestFence::Refused { retained, recovery }
                 }
-                None => SyncRequestFence::Fenced {
+                // No receipt holds a refusal before the cutoff, which records nothing.
+                Some(SyncExchanged::SignedBeforeCutoff) | None => SyncRequestFence::Fenced {
                     never_ran: FENCE_FOUND_NO_RUN,
                     recovery,
                 },

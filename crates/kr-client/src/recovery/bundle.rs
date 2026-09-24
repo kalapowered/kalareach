@@ -54,6 +54,7 @@ use kr_protocol::archive::{
     ArchiveCheckpoint, RECOVERY_BUNDLE_SCHEMA_VERSION, RecoveryBundle, RecoveryContext,
     RecoveryKit, TrustedProducer, TrustedWriter,
 };
+use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::SyncConflictId;
 use kr_protocol::scalars::{
     Bytes, Digest256, KeyId, Nullable, StoredEnvelopeKey, TimestampMs, U64,
@@ -658,6 +659,16 @@ impl BundleStore {
                 self.answered();
                 Err(RecoveryError::BundleConflict { expected, retained })
             }
+            // Refused as signed before the service's cutoff: this write ran nothing. This store
+            // concludes no more from that than from a write that was never answered, so the write
+            // stays outstanding until it is ended, as one would.
+            Ok(SyncExchanged::SignedBeforeCutoff) => Err(RecoveryError::BundleOutcomeUnknown {
+                sent,
+                source: Box::new(ClientError::Host(ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "the service refused the write as signed before its cutoff, and ran nothing",
+                ))),
+            }),
             // Anything else stopped the exchange from being answered at all, and an exchange that
             // was not answered may still have been executed. This device concludes nothing from it
             // and says so, which is the safe direction.

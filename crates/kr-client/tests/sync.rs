@@ -281,6 +281,9 @@ struct Service {
     /// The recovery the service's last restore recorded, which every answer names, or none for a
     /// service never put back.
     recovery: Mutex<Option<SyncRecoveryId>>,
+    /// The instant before which a request signed is refused where it would act, which the
+    /// deployed service derives from the receipts it swept, or nothing where it has none.
+    cutoff_ms: Mutex<Option<u64>>,
 }
 
 /// What an export of the service holds, which a restore puts back.
@@ -457,6 +460,13 @@ impl Service {
         }
     }
 
+    /// Refuses every request signed before `instant_ms`, where it would act, without running it
+    /// or recording anything: the cutoff a service keeps so that a request whose receipt it swept
+    /// is never run as a first admission.
+    async fn cuts_off_signatures_before(&self, instant_ms: u64) {
+        *self.cutoff_ms.lock().await = Some(instant_ms);
+    }
+
     /// Returns how far the service has swept its receipts.
     async fn swept_through(&self) -> u64 {
         *self.swept_through_ms.lock().await
@@ -574,6 +584,11 @@ impl Service {
                 )));
             }
             return Ok(answer(receipt.recorded, self.history().await));
+        }
+        // Where the request would act, one signed before the cutoff runs nothing and leaves no
+        // receipt: the refusal is the whole of the answer.
+        if (*self.cutoff_ms.lock().await).is_some_and(|cutoff| signed_at_ms < cutoff) {
+            return Ok(SyncExchanged::SignedBeforeCutoff);
         }
         let history = self.history().await;
         let mut objects = self.objects.lock().await;
@@ -2300,6 +2315,121 @@ async fn a_draft_publication_under_an_identity_another_request_wore_leaves_no_ac
     assert_eq!(accounts(&client), 0);
     assert_eq!(drafts.checkpoint(draft.draft_id).expect("a note"), None);
     assert_eq!(drafts.load(draft.draft_id).expect("the draft"), draft);
+}
+
+/// A publication the service refused as signed before its cutoff is over: the attempt ran nothing
+/// and no attempt signed then ever runs. The request ends at once with its account kept, and
+/// nothing asks about it or sends it again.
+#[tokio::test]
+async fn a_publication_refused_as_signed_before_the_cutoff_ends_there_and_keeps_its_account() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let first = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&first).expect("stored");
+
+    service.cuts_off_signatures_before(NOW + 1).await;
+    let refused = client
+        .publish(object_id, TimestampMs::new(NOW))
+        .await
+        .expect_err("signed before the cutoff");
+    assert!(
+        matches!(refused, SyncError::SignedBeforeCutoff { object_id: named } if named == object_id),
+        "{refused:?}"
+    );
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied);
+
+    assert_eq!(client.outstanding().expect("a count"), 0, "over");
+    let record = the_only_record(&client);
+    assert_eq!(record.state, RequestState::Unaccounted, "its account kept");
+    assert_eq!(accounts(&client), 1);
+    assert_eq!(client.store().checkpoint(object_id).expect("a note"), None);
+
+    client
+        .reconcile_unsettled(TimestampMs::new(NOW + 2))
+        .await
+        .expect("reconciled");
+    assert_eq!(service.exchanges().await.len(), 1, "never sent again");
+    assert!(service.status_queries().await.is_empty(), "nothing asked");
+    assert!(service.fence_requests().await.is_empty(), "nothing fenced");
+}
+
+/// A later attempt at a draft publication that the service refuses as signed before its cutoff
+/// ends the publication. The first attempt ran and its receipt was swept, so presenting the
+/// identity again could run it a second time; the refused attempt ran nothing, the identity is
+/// never presented again, and the account of what left stays.
+#[tokio::test]
+async fn a_draft_attempt_refused_as_signed_before_the_cutoff_is_never_made_again() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let draft = drafts
+        .create(draft_target(), "a prompt".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+
+    // The first attempt runs and its answer is lost; its receipt is swept, and the cutoff the
+    // service derives from the sweep passes every instant inside the span.
+    service.lose_the_next_answer().await;
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(NOW),
+    )
+    .await
+    .expect_err("the answer never came back");
+    let first = the_only_record(&client);
+    service.sweep_the_receipt(first.work_id).await;
+    let cutoff = service.swept_through().await + 3 * SERVICE_REQUEST_FRESHNESS_MS;
+    service.cuts_off_signatures_before(cutoff).await;
+
+    // A later attempt inside the span presents the identity again and is refused before it runs.
+    let refused = sync
+        .publish(
+            &drafts,
+            draft.draft_id,
+            draft.revision,
+            TimestampMs::new(NOW + 1),
+        )
+        .await
+        .expect_err("signed before the cutoff");
+    assert!(
+        matches!(refused, SyncError::SignedBeforeCutoff { .. }),
+        "{refused:?}"
+    );
+    let sent = service.exchanges().await;
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1].request_id, first.work_id, "presented once more");
+
+    // Over, with its account kept, and nothing asks about it.
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    assert_eq!(the_only_record(&client).state, RequestState::Unaccounted);
+    assert_eq!(accounts(&client), 1);
+    sync.reconcile_unsettled(&drafts, TimestampMs::new(NOW + 2))
+        .await
+        .expect("reconciled");
+    assert!(service.status_queries().await.is_empty(), "nothing asked");
+    assert!(service.fence_requests().await.is_empty(), "nothing fenced");
+
+    // Publishing the draft again is new work under an identity of its own, which the cutoff
+    // refuses as well until the service's clock has passed it.
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(NOW + 3),
+    )
+    .await
+    .expect_err("signed before the cutoff too");
+    let sent = service.exchanges().await;
+    assert_eq!(sent.len(), 3);
+    assert_ne!(sent[2].request_id, first.work_id, "never presented again");
+    assert_eq!(accounts(&client), 2, "both accounts kept");
 }
 
 #[tokio::test]

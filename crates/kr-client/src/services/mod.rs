@@ -570,18 +570,14 @@ pub enum SyncExchanged {
         /// which names no place and still says which history of the collection holds nothing.
         recovery: Option<SyncRecoveryId>,
     },
-}
-
-impl SyncExchanged {
-    /// Returns the history this answer came from: the recovery it named, or none for a service
-    /// never put back.
-    #[must_use]
-    pub const fn recovery(&self) -> Option<SyncRecoveryId> {
-        match self {
-            Self::Applied { position } => position.recovery(),
-            Self::Refused { recovery, .. } => *recovery,
-        }
-    }
+    /// The service refused this attempt as signed before the collection's cutoff.
+    ///
+    /// A service keeps a receipt for a while and no longer, so a request signed long enough ago
+    /// could be one it ran and no longer holds the receipt of. It therefore ran nothing, recorded
+    /// nothing, and runs no attempt signed then. That ends the attempt, and the request with it:
+    /// presenting the identity again, signed now, could run the work a second time. It says
+    /// nothing of an earlier attempt under the same identity, which may have run.
+    SignedBeforeCutoff,
 }
 
 /// What a synchronisation service recorded about one request.
@@ -811,6 +807,9 @@ pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
     /// whether anything ran. An implementation signs with this value and does not substitute
     /// another: a retry is a fresh attempt with a fresh signing time the caller supplies, never the
     /// same attempt re-dated.
+    ///
+    /// An attempt signed before the collection's cutoff is refused without running, and the
+    /// refusal is an answer about that attempt: [`SyncExchanged::SignedBeforeCutoff`].
     fn compare_exchange<'a>(
         &'a self,
         collection: &'a str,

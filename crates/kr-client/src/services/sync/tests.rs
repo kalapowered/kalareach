@@ -822,7 +822,6 @@ async fn every_answer_names_the_history_its_places_are_in() {
                 recovery: Some(restored),
             }
         );
-        assert_eq!(answered.recovery(), Some(restored));
     }
 
     let mut applied = status(request, "applied", false);
@@ -1255,6 +1254,48 @@ async fn the_services_own_refusals_are_errors_that_say_what_they_are() {
         out_of_reach.to_string().contains("keeps a refusal for"),
         "the service's own message is what a person is shown: {out_of_reach}"
     );
+}
+
+#[tokio::test]
+async fn a_write_signed_before_the_cutoff_is_an_answer_that_ends_its_attempt() {
+    // The service refuses an attempt signed before the collection's cutoff without running it. To
+    // a write that is an answer about the attempt, because its caller must never present the
+    // identity again. Every other request is signed as it is sent, so to them it stays the error
+    // the service named, and every other refusal of a write stays an error too.
+    let (client, recorder) = sync_client();
+    let object = identity(7);
+    let bytes = published(&sealed(b"theme=dark"));
+    let cut_off = || {
+        refusal(
+            409,
+            "SIGNED_BEFORE_CUTOFF",
+            "That request was signed before this collection's cutoff and was not run.",
+        )
+    };
+
+    recorder.answering_with(vec![cut_off()]);
+    assert_eq!(
+        client
+            .compare_exchange(&settings_of(object), identity(8), now_ms(), None, &bytes)
+            .await
+            .expect("an answer"),
+        SyncExchanged::SignedBeforeCutoff
+    );
+
+    recorder.answering_with(vec![cut_off()]);
+    assert!(
+        client
+            .request_status(&settings_of(object), identity(8))
+            .await
+            .is_err(),
+        "a status query is no write"
+    );
+    recorder.answering_with(vec![refusal(409, "ID_CONFLICT", "reused")]);
+    let taken = client
+        .compare_exchange(&settings_of(object), identity(8), now_ms(), None, &bytes)
+        .await
+        .expect_err("another refusal of a write");
+    assert_eq!(taken.code(), ErrorCode::IdConflict);
 }
 
 #[tokio::test]

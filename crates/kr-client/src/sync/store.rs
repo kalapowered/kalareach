@@ -1044,6 +1044,18 @@ pub enum SyncError {
         /// The object.
         object_id: SyncObjectId,
     },
+    /// The service refused the publication's attempt as signed before the collection's cutoff.
+    ///
+    /// The attempt ran nothing, and the request is over: it is never attempted again, and its
+    /// record stays as the account of what left this device, since an earlier attempt may have run.
+    /// Publishing again is new work under an identity of its own.
+    #[error(
+        "the publication of {object_id} was refused as signed before the service's cutoff; publishing it again is new work"
+    )]
+    SignedBeforeCutoff {
+        /// The object.
+        object_id: SyncObjectId,
+    },
     /// The client failed.
     #[error("{0}")]
     Client(#[from] Box<crate::ClientError>),
@@ -1080,7 +1092,10 @@ impl SyncError {
             | Self::NotAWrite { .. }
             | Self::Encoding(_)
             | Self::Crypto(_) => ErrorCode::InvalidArgument,
-            Self::Fenced { .. } | Self::LateResult { .. } => ErrorCode::PermissionDenied,
+            // The service will run nothing under the identity, as for a fenced one.
+            Self::Fenced { .. } | Self::LateResult { .. } | Self::SignedBeforeCutoff { .. } => {
+                ErrorCode::PermissionDenied
+            }
             Self::StaleCheckpoint { .. } | Self::ForkedHistory { .. } => ErrorCode::DraftConflict,
             // Nothing followed from the answer, and a fresh read of the history this device reads
             // is what follows.
@@ -1117,6 +1132,7 @@ impl SyncError {
             | Self::StaleCheckpoint { .. }
             | Self::ForkedHistory { .. }
             | Self::UnfollowedHistory { .. }
+            | Self::SignedBeforeCutoff { .. }
             | Self::Encoding(_)
             | Self::Crypto(_) => UserAction::Nothing,
         }
@@ -2029,6 +2045,47 @@ impl SyncStore {
                 return Ok(false);
             }
             self.remove_file(&path)?;
+            self.retire(work_id)?;
+            Ok(true)
+        })();
+        drop(guard);
+        outcome
+    }
+
+    /// Ends one dispatched request whose attempt the service refused as signed before its cutoff,
+    /// keeping its account.
+    ///
+    /// The refused attempt ran nothing and recorded nothing, and no attempt signed then ever runs.
+    /// Presenting the identity again, signed now, could run the work a second time, because the
+    /// receipt of an earlier attempt may be the one the service swept; so nothing is attempted
+    /// under it again, and nothing asks about it. What the refusal cannot say is whether an earlier
+    /// attempt ran before that receipt went, so the record stays, with no content in it, as the
+    /// account of what left this device, as it does after a fence that cannot say.
+    ///
+    /// One case stays open: an earlier attempt signed later than this one, which only a clock
+    /// corrected backwards between the two produces, could still be on its way and run. The
+    /// account already says what that would put on the service.
+    ///
+    /// Returns true when a record was ended, false when the work was never sent or something had
+    /// already settled it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::OtherRequest`] when the dispatch is held for a different request, and
+    /// [`SyncError::Storage`] when a record cannot be read or written.
+    pub fn close_signed_before_cutoff(&self, dispatch: &Dispatch, work_id: Uuid) -> Result<bool> {
+        dispatch.owns(&self.directory, work_id)?;
+        let path = self.named(work_id, REQUEST_EXTENSION);
+        let guard = self.lock()?;
+        let outcome = (|| {
+            // The record on disk decides, never the copy a caller holds.
+            let Some(held) = self.read_request(&path)? else {
+                return Ok(false);
+            };
+            if !held.dispatched() {
+                return Ok(false);
+            }
+            self.write_request(&held.in_state(RequestState::Unaccounted))?;
             self.retire(work_id)?;
             Ok(true)
         })();

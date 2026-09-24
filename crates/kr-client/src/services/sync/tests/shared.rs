@@ -1416,6 +1416,16 @@ async fn a_shared_write_names_its_home_and_epoch_and_reads_both_answering_refusa
     // A collection that does not list this device is an answer too.
     recorder.answering_with(vec![refusal(404, "COLLECTION_ABSENT", "not a member")]);
     assert_eq!(write(4).await.expect("an answer"), Keyed::Absent);
+    // So is a write signed before the collection's cutoff, which ran nothing and left no receipt,
+    // and so names no key records.
+    recorder.answering_with(vec![refusal(409, "SIGNED_BEFORE_CUTOFF", "cut off")]);
+    assert_eq!(
+        write(4).await.expect("an answer"),
+        Keyed::Answered {
+            answer: SyncExchanged::SignedBeforeCutoff,
+            head: None
+        }
+    );
 
     // A retired refusal that does not name the head or names it twice, an answer naming an epoch
     // without its revision, and the other refusals are not answers.

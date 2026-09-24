@@ -56,6 +56,14 @@
 //! key-record reads return that as [`KeyRecords::Absent`] and [`RecordAt::Absent`]. A collection
 //! only its home writes answers neither, so for it both stay errors.
 //!
+//! A write to either kind of collection can meet a third. `SIGNED_BEFORE_CUTOFF` refuses an
+//! attempt signed before the collection's cutoff, which a service keeps so that a request whose
+//! receipt it has swept is never run as a first admission: the attempt ran nothing and recorded
+//! nothing, and no attempt signed then ever runs. An exchange returns it as
+//! [`SyncExchanged::SignedBeforeCutoff`], an answer that ends the attempt, and a caller never
+//! presents the identity again, signed now or otherwise. Every other request is signed at the
+//! instant it is sent, so for them it stays the error the service named.
+//!
 //! # What it keeps
 //!
 //! Nothing. Every ordering fact is the service's: the position an exchange answers, what a receipt
@@ -1160,7 +1168,15 @@ impl ManagedSyncService {
             expected,
             &sealed,
         );
-        match reply(self.ask(&request, Some(signed_at_ms)).await?, true)? {
+        let answer = self.ask(&request, Some(signed_at_ms)).await?;
+        if signed_before_cutoff(&answer) {
+            // It left no receipt, and so names no key records either.
+            return Ok(Keyed::Answered {
+                answer: SyncExchanged::SignedBeforeCutoff,
+                head: None,
+            });
+        }
+        match reply(answer, true)? {
             Reply::Data(data) => {
                 let answer: ExchangeAnswer = read(data, "what an exchange answered")?;
                 let head = head_of(answer.key_epoch, answer.key_revision, answer.recovery_id.0)?;
@@ -1540,8 +1556,14 @@ impl ManagedSyncService {
             expected,
             &object,
         );
-        let data = self.ask(&request, Some(signed_at_ms)).await?.data()?;
-        exchanged(read(data, "what an exchange answered")?, named.object_id)
+        let answer = self.ask(&request, Some(signed_at_ms)).await?;
+        if signed_before_cutoff(&answer) {
+            return Ok(SyncExchanged::SignedBeforeCutoff);
+        }
+        exchanged(
+            read(answer.data()?, "what an exchange answered")?,
+            named.object_id,
+        )
     }
 
     /// One status query: what the service recorded about one request identity.
@@ -2017,6 +2039,12 @@ fn reply(answer: Answer, write: bool) -> Result<Reply<serde_json::Value>> {
             _ => Err(refusal.into_error()),
         },
     }
+}
+
+/// Whether an answer to a write is the refusal of an attempt signed before the collection's
+/// cutoff, which is an answer about that attempt rather than an error.
+fn signed_before_cutoff(answer: &Answer) -> bool {
+    matches!(answer, Answer::Refused(refusal) if refusal.code() == "SIGNED_BEFORE_CUTOFF")
 }
 
 /// The collection's epoch and revision a retired refusal names, both of which it must name, once.

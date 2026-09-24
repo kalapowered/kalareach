@@ -416,7 +416,9 @@ impl SyncClient {
     /// Returns [`SyncError::Fenced`] while privacy mode is on, [`SyncError::Unknown`] when this
     /// device holds no such object, [`SyncError::StaleCheckpoint`] or
     /// [`SyncError::ForkedHistory`] when what the service holds cannot follow the note beside this
-    /// object, and the service's own refusal otherwise.
+    /// object, [`SyncError::SignedBeforeCutoff`] when the service refused the attempt as signed
+    /// before its cutoff, which ends the request with its account kept, and the service's own
+    /// refusal otherwise.
     pub async fn publish(&self, object_id: SyncObjectId, now: TimestampMs) -> Result<Published> {
         let staged = self.store.admit(object_id, |object| self.seal(object))?;
         let collection = staged.collection();
@@ -506,6 +508,14 @@ impl SyncClient {
                 }
                 self.keep_what_the_service_holds(&staged, retained, now)
                     .await
+            }
+            // Refused as signed before the service's cutoff: this attempt ran nothing and no
+            // attempt signed then ever runs. The request ends here, never attempted again, and its
+            // record stays as the account of what left.
+            Ok(SyncExchanged::SignedBeforeCutoff) => {
+                self.store
+                    .close_signed_before_cutoff(&dispatch, staged.work_id)?;
+                Err(SyncError::SignedBeforeCutoff { object_id })
             }
             // The identity this request presented already answered a different one. The receipt
             // under it accounts for that request and never for this payload, so nothing may be
