@@ -1161,10 +1161,12 @@ fn a_timestamp_is_integer_milliseconds_on_the_wire() {
     }
 }
 
-/// KR-REQ-23.14: read-only metadata may carry a field its schema declares optional, present or
-/// absent, and a field no schema declares is refused there just as it is in a mutation.
+/// KR-REQ-23.14: an object outside read-only metadata stays closed even when its schema declares an
+/// optional field. A history gap reads its cause present or absent, an absent cause is not on the
+/// wire at all, and a field the gap does not declare is refused by the schema step before typed
+/// decoding, not ignored as read-only metadata would ignore it.
 #[test]
-fn read_only_metadata_may_carry_an_explicitly_optional_field_and_nothing_else() {
+fn a_closed_object_takes_its_optional_field_either_way_and_refuses_an_undeclared_one() {
     use kr_protocol::recovery::{HistoryGap, HistoryGapCause};
 
     let without = HistoryGap {
@@ -1199,9 +1201,12 @@ fn read_only_metadata_may_carry_an_explicitly_optional_field_and_nothing_else() 
     let extended = kr_cbor::encode(&CanonicalValue::Map(
         kr_cbor::CanonicalMap::from_sorted_entries(entries).expect("sorted"),
     ));
+    let refusal = kr_protocol::wire::decode::<HistoryGap>(&extended, &Limits::DEFAULT)
+        .expect_err("the schema step refuses an undeclared field in a closed object");
+    assert_eq!(refusal.rule(), "unknown_field", "{refusal}");
     assert!(
         kr_cbor::from_canonical_slice::<HistoryGap>(&extended, &Limits::DEFAULT).is_err(),
-        "an undeclared field is refused even in read-only metadata"
+        "and so does the type itself"
     );
 }
 
