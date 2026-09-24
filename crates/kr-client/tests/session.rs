@@ -1121,6 +1121,8 @@ struct RemoteObjects {
     receipts: Mutex<std::collections::HashMap<(String, Uuid), RequestReceipt>>,
     /// The copies it kept of refused writes, until the person chooses about them.
     copies: Mutex<std::collections::HashSet<SyncConflictId>>,
+    /// Whether the next exchange is applied and its answer lost on the way back.
+    lose_the_next_answer: Mutex<bool>,
 }
 
 /// What every fence this suite's service records says about the past.
@@ -1208,6 +1210,12 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
                     answered: Some(answered),
                 },
             );
+            if std::mem::take(&mut *self.lose_the_next_answer.lock().await) {
+                return Err(ClientError::Host(ProtocolError::new(
+                    ErrorCode::UpstreamUnavailable,
+                    "the answer never came back",
+                )));
+            }
             Ok(answered)
         })
     }
@@ -1473,7 +1481,11 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
     // A draft this device edited offline is published against the generation this device last saw,
     // which is none: its own revision counter has nothing to do with the service's.
     let fresh = store
-        .create(target, "a second draft".to_owned(), TimestampMs::new(4))
+        .create(
+            target.clone(),
+            "a second draft".to_owned(),
+            TimestampMs::new(4),
+        )
         .expect("a draft");
     let fresh = store
         .update(
@@ -1595,8 +1607,37 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
         "the note the fetch wrote is what the next comparison names"
     );
 
+    // A publication whose answer is lost is settled by asking the service about the request, with
+    // the host still connected. The draft comes out of it exactly as it went in, and settling it is
+    // not a way towards a submission either.
+    let third = store
+        .create(target, "a third draft".to_owned(), TimestampMs::new(11))
+        .expect("a draft");
+    *service.lose_the_next_answer.lock().await = true;
+    sync.publish(&store, third.draft_id, third.revision, TimestampMs::new(12))
+        .await
+        .expect_err("the answer never came back");
+    let reconciled = sync
+        .reconcile_unsettled(&store, TimestampMs::new(13))
+        .await
+        .expect("reconciled");
+    assert_eq!(reconciled.settled, 1);
+    assert_eq!(reconciled.unsettled, 0);
+    assert_eq!(
+        store
+            .checkpoint(third.draft_id)
+            .expect("a note")
+            .expect("the settlement wrote one"),
+        SyncCheckpoint {
+            position: at(1),
+            published_revision: Nullable::some(third.revision),
+        }
+    );
+    assert_eq!(store.load(third.draft_id).expect("the draft"), third);
+
     // The whole exercise, with the host still there: a draft was written, presented, re-presented,
-    // carried across a reconnect, overtaken and synchronised, and nothing was ever submitted.
+    // carried across a reconnect, overtaken, synchronised and settled after a lost answer, and
+    // nothing was ever submitted.
     let _: SessionList = session
         .read(Method::SessionList, &Empty {})
         .await

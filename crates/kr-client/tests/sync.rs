@@ -3300,6 +3300,155 @@ async fn a_refusal_whose_other_content_never_came_down_is_still_dropped_on_reque
 }
 
 // ---------------------------------------------------------------------------
+// KR-REQ-24.28: privacy mode reaches draft publications
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn privacy_enabled_while_a_draft_publication_is_in_flight_publishes_no_late_result() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(GatedService::new());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let sync = Arc::new(sync);
+    let draft = drafts
+        .create(draft_target(), "a prompt".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+
+    // The publication leaves and waits at the service.
+    let publishing = tokio::spawn({
+        let (sync, drafts) = (Arc::clone(&sync), drafts.clone());
+        async move {
+            sync.publish(
+                &drafts,
+                draft.draft_id,
+                draft.revision,
+                TimestampMs::new(NOW),
+            )
+            .await
+        }
+    });
+    service.wait_for_a_publication().await;
+    assert_eq!(client.outstanding().expect("a count"), 1, "it has left");
+
+    // Privacy mode is enabled while it is in flight, through the client the host drives. Nothing of
+    // a draft waits between admission and dispatch for a cancellation to take back, and the one in
+    // flight is counted rather than hidden: only the device making the call can tell it from one
+    // that never arrived.
+    client.fence(5).expect("fenced");
+    let cancelled = client
+        .cancel_undispatched(5, TimestampMs::new(NOW + 1))
+        .await
+        .expect("cancelled");
+    assert_eq!(cancelled.undispatched, 0);
+    assert_eq!(cancelled.in_flight, 1);
+    assert_eq!(cancelled.reconciled.unresolved, 1);
+
+    // The answer comes back for a publication admitted under the generation before. It is not
+    // published, and the note beside the draft does not move.
+    service.let_it_go();
+    assert_eq!(
+        publishing
+            .await
+            .expect("the task finished")
+            .expect("answered"),
+        DraftPublished::Discarded {
+            produced_under: 0,
+            current: 5,
+        }
+    );
+    assert_eq!(drafts.checkpoint(draft.draft_id).expect("a note"), None);
+
+    // The upload happened, and the device says so rather than pretending it did not. Cleanup is
+    // complete once nothing is outstanding, and removing retained content leaves this account.
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    let removed = client
+        .remove_retained(5, TimestampMs::new(NOW + 2))
+        .await
+        .expect("removed");
+    assert_eq!(removed.records, 0);
+    let exported = client.exported().expect("exported");
+    assert_eq!(exported.len(), 1);
+    assert_eq!(exported[0].kind, "synchronised draft");
+    assert!(exported[0].reference.contains("write 1"));
+    assert!(!exported[0].deletable);
+
+    // While privacy mode is on, no draft is published and none is fetched, and nothing is sent.
+    let sent = service.inner.exchanges().await.len();
+    assert!(matches!(
+        sync.publish(
+            &drafts,
+            draft.draft_id,
+            draft.revision,
+            TimestampMs::new(NOW + 3),
+        )
+        .await,
+        Err(SyncError::Fenced { generation: 5 })
+    ));
+    assert!(matches!(
+        sync.fetch_beside(&drafts, draft.draft_id, TimestampMs::new(NOW + 3))
+            .await,
+        Err(SyncError::Fenced { generation: 5 })
+    ));
+    assert_eq!(service.inner.exchanges().await.len(), sent);
+    assert_eq!(client.outstanding().expect("a count"), 0);
+
+    // The draft is the person's, exactly as they left it, and nothing on this path submitted it.
+    let held = drafts.load(draft.draft_id).expect("the draft");
+    assert_eq!(held, draft);
+    assert_eq!(held.submission(), Ok(&draft.target));
+}
+
+#[tokio::test]
+async fn a_fetch_whose_answer_arrives_after_privacy_is_enabled_keeps_nothing() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(GatedService::new());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let sync = Arc::new(sync);
+    let draft = drafts
+        .create(draft_target(), "mine".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+    let (_, sealed) = their_write_of(&draft);
+    service
+        .inner
+        .compare_exchange(
+            &draft_collection(draft.draft_id),
+            fresh_request_id(),
+            NOW,
+            None,
+            &sealed,
+        )
+        .await
+        .expect("the other device's write");
+
+    // The service answers the fetch, and the answer is held on its way back.
+    service.hold_the_next_fetch().await;
+    let fetching = tokio::spawn({
+        let (sync, drafts) = (Arc::clone(&sync), drafts.clone());
+        async move {
+            sync.fetch_beside(&drafts, draft.draft_id, TimestampMs::new(NOW + 1))
+                .await
+        }
+    });
+    service.wait_for_a_publication().await;
+
+    // Privacy mode is enabled before the answer lands, so what it brought is not kept: no copy
+    // beside the draft and no note, both of which would be content the cleanup had just removed.
+    client.fence(2).expect("fenced");
+    service.let_it_go();
+    assert!(matches!(
+        fetching.await.expect("the task finished"),
+        Err(SyncError::LateResult {
+            produced_under: 0,
+            current: 2,
+        })
+    ));
+    assert_eq!(
+        drafts.list().expect("a listing").drafts,
+        vec![draft.clone()]
+    );
+    assert_eq!(drafts.checkpoint(draft.draft_id).expect("a note"), None);
+}
+
+// ---------------------------------------------------------------------------
 // KR-REQ-20.13: a checkpoint the service no longer holds
 // ---------------------------------------------------------------------------
 
