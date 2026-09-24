@@ -1121,6 +1121,24 @@ pub fn direct_verification_value(transcript: &DirectTranscript) -> String {
     hex_prefix(&sha256(&kr_cbor::encode(&input)))
 }
 
+/// Returns a verification value as people read it: groups of four separated by a space, so
+/// `f3c146fd` is shown as `f3c1 46fd`.
+///
+/// Section 10 asks for the value to be grouped identically on both devices. Every surface that
+/// shows one to a person groups it here, and a value typed back is compared with its spaces
+/// removed.
+#[must_use]
+pub fn group_verification_value(value: &str) -> String {
+    let mut grouped = String::with_capacity(value.len() + value.len() / 4);
+    for (index, character) in value.chars().enumerate() {
+        if index > 0 && index % 4 == 0 {
+            grouped.push(' ');
+        }
+        grouped.push(character);
+    }
+    grouped
+}
+
 fn hex_prefix(digest: &[u8; 32]) -> String {
     let mut out = String::with_capacity(VERIFICATION_VALUE_LEN);
     for byte in &digest[..VERIFICATION_VALUE_LEN / 2] {
@@ -2181,6 +2199,30 @@ mod tests {
 
     fn origin() -> RendezvousOrigin {
         RendezvousOrigin::new("https://reach.kala.to").expect("a canonical origin")
+    }
+
+    /// KR-REQ-10.37: a verification value is shown in two groups of four, the same way on every
+    /// surface: the values the published vectors carry group as people read them.
+    #[test]
+    fn a_verification_value_is_grouped_as_people_read_it() {
+        for (fixture, expected) in [
+            (
+                include_str!("../../../fixtures/pairing/direct.json"),
+                "f3c1 46fd",
+            ),
+            (
+                include_str!("../../../fixtures/pairing/transcript.json"),
+                "d7a6 827a",
+            ),
+        ] {
+            let document: serde_json::Value = serde_json::from_str(fixture).expect("a fixture");
+            let value = document["verification_value"]["value"]
+                .as_str()
+                .expect("a verification value");
+            assert_eq!(value.len(), VERIFICATION_VALUE_LEN);
+            assert_eq!(group_verification_value(value), expected);
+        }
+        assert_eq!(group_verification_value(""), "");
     }
 
     #[test]
