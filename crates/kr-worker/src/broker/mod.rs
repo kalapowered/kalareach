@@ -25,6 +25,7 @@
 //! | [`endpoint`] | The bound local socket, and who the kernel says connected to it |
 //! | [`error`] | The broker's refusals, each mapped to a stable protocol code |
 //! | [`gateway`] | The core-declarative forwarding path, the closed rich table and reverse calls |
+//! | [`host`] | Reverse operations, performed only through the host directory a session granted |
 //! | [`ledger`] | The durable records, in the worker's own journal file |
 //! | [`attach`] | Endpoint acceptance, launch authentication and the connection it becomes |
 //! | [`bridge`] | The native bridge an application starts: its admission, and what it reports |
@@ -55,6 +56,7 @@ pub mod endpoint;
 pub mod error;
 pub mod framing;
 pub mod gateway;
+pub mod host;
 pub mod ledger;
 pub mod listener;
 pub mod methods;
@@ -106,6 +108,10 @@ pub use crate::broker::framing::Framing;
 pub use crate::broker::gateway::{
     Connection, ConnectionOrigin, Forwarded, Gateway, PreparedResponse, ReverseRequest,
     RichInvocation,
+};
+pub use crate::broker::host::{
+    FileAccess, HostFiles, MAX_REVERSE_ANSWER_BYTES, MAX_REVERSE_IN_FLIGHT, MAX_REVERSE_READ_BYTES,
+    MAX_REVERSE_WRITE_BYTES, REVERSE_DEADLINE,
 };
 pub use crate::broker::ledger::{
     BindingRecord, ClientIntent, ClientRequestOutcome, Ledger, TransitionCause, TransitionEvent,
@@ -234,6 +240,12 @@ pub struct Instance {
     frame_bytes: usize,
     /// What this instance's native bridge has reported about its threads.
     bridge: crate::broker::bridge::BridgeThreads,
+    /// The directory this instance's upstream may ask this host to read or write in, where one is
+    /// granted.
+    ///
+    /// Absent is the default and the safe one: every reverse file operation is then refused with a
+    /// reason, and nothing is opened.
+    host_files: Option<std::sync::Arc<HostFiles>>,
 }
 
 impl Instance {
@@ -348,6 +360,40 @@ pub struct NativeAnswer {
     pub resource_id: PendingResourceId,
     /// The bytes to forward, exactly as the native client wrote them.
     pub frame: Vec<u8>,
+}
+
+/// What the broker made of one request frame the upstream sent.
+#[derive(Debug)]
+pub enum UpstreamArrival {
+    /// A request or notification for the native client, recorded before it is forwarded.
+    Forward {
+        /// What the core read the frame as.
+        forwarded: Forwarded,
+        /// The resource it was recorded as, when it expects a response.
+        resource: Option<PendingResource>,
+    },
+    /// A request this host performs itself, recorded with its one answer already admitted.
+    Reverse(ReverseAdmission),
+}
+
+/// One reverse request this host recorded and admitted to answer itself.
+///
+/// It exists only as what [`Broker::receive_upstream`] returns for a request the connection's own
+/// pinned table names as a reverse operation. The record, the decision about what to do and the
+/// resource's one admission to answer are taken together under the broker's lock, with the marker
+/// committed, so no native or rich writer can answer the request and nothing of the operation has
+/// happened yet. The caller performs what [`ReverseAdmission::plan`] says, away from any reader,
+/// and reports the answer's fate through [`Broker::reverse_answered`].
+#[derive(Debug)]
+pub struct ReverseAdmission {
+    /// The request, the site it runs at and how its answer is recorded.
+    pub reverse: ReverseRequest,
+    /// The resource the request was recorded as.
+    pub resource_id: PendingResourceId,
+    /// What this host decided to do about it before the admission was taken.
+    pub plan: crate::broker::host::Plan,
+    /// The members of this connection's frames the answer is written with.
+    pub shape: crate::broker::host::AnswerShape,
 }
 
 /// One request of the native client's, admitted to be forwarded to its own upstream.
@@ -665,6 +711,7 @@ impl Broker {
                 frame_order: std::collections::VecDeque::new(),
                 frame_bytes: 0,
                 bridge: crate::broker::bridge::BridgeThreads::default(),
+                host_files: None,
             },
         );
         Ok(())
@@ -1111,11 +1158,17 @@ impl Broker {
     /// A request the table does not classify also suspends the instance's rich mutations, because
     /// nothing here knows what it did.
     ///
+    /// A request the table names as a reverse operation is not forwarded: this host performs it,
+    /// and [`Broker::receive_upstream`] records it with its one answer already admitted. It is
+    /// refused here rather than recorded as an ordinary request, because a reverse request
+    /// recorded without that admission is one the native client or a rich answer could claim.
+    ///
     /// # Errors
     ///
     /// Returns [`BrokerError::PermissionDenied`] when the connection is not a worker-launched
-    /// native one, [`BrokerError::InvalidArgument`] when the frame is not one the table describes,
-    /// and [`BrokerError::LedgerUnavailable`] when a durable record cannot be written.
+    /// native one, [`BrokerError::InvalidArgument`] when the frame is not one the table describes
+    /// or names a reverse operation, and [`BrokerError::LedgerUnavailable`] when a durable record
+    /// cannot be written.
     pub fn forward_native(
         &self,
         connection: GatewayConnectionId,
@@ -1124,106 +1177,177 @@ impl Broker {
     ) -> Result<(Forwarded, Option<PendingResource>)> {
         let mut state = self.state();
         let forwarded = state.gateway.forward_native(connection, frame)?;
-        // Before anything is counted, recorded or suspended. An upstream that mints an identifier
-        // in this host's own namespace is an upstream whose next response this host could not tell
-        // from an answer to a request of its own, and a refusal that left a resource, a ledger row
-        // and a retained source behind it would have made the ambiguity anyway.
-        if let Some(request) = forwarded.request.as_ref()
-            && crate::broker::duplex::is_host_minted(&request.upstream)
-        {
+        if let Some(operation) = state.reverse_operation(connection, &forwarded.method) {
             return Err(BrokerError::invalid(format!(
-                "{} begins with {}, which names the requests this host sends, and an upstream \
-                 request cannot be one of those",
-                request.upstream,
-                crate::broker::duplex::HOST_REQUEST_PREFIX
+                "{} asks this host to perform {operation}, and such a request is admitted with its \
+                 one answer rather than forwarded",
+                forwarded.method
             )));
         }
-        let application_instance_id = state
+        let resource = state.record_native(connection, &forwarded, frame, now)?;
+        Ok((forwarded, resource))
+    }
+
+    /// Takes one request frame the upstream sent: records it and says where it goes.
+    ///
+    /// Most requests go to the native client, recorded first, exactly as
+    /// [`Broker::forward_native`] records them. A request the connection's own pinned table names
+    /// as a reverse operation is one this host performs itself, and three things happen to it under
+    /// this one lock, in this order:
+    ///
+    /// 1. **It is recorded**, as every request with an identifier is.
+    /// 2. **What to do about it is decided** from the request and the instance's granted host
+    ///    directory alone. Nothing touches the filesystem here; a request the grant does not cover,
+    ///    a name that leaves the directory or a write over its bound becomes a refusal.
+    /// 3. **The one admission to answer it is taken, and the marker committed.** No native answer
+    ///    and no rich answer can take it afterwards, so the host's answer is the only one; and a
+    ///    crash from here on leaves a record that says an answer may already have gone, so a
+    ///    restart never performs the operation a second time.
+    ///
+    /// `site` and `os_user` are where the connection runs, which the caller derived from the
+    /// connection itself and never from the request.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Broker::forward_native`] returns for a frame it would refuse, including a
+    /// reverse operation whose table entry expects no response, which this host could not answer;
+    /// and [`BrokerError::LedgerUnavailable`] when the record or the marker cannot be written.
+    pub fn receive_upstream(
+        &self,
+        connection: GatewayConnectionId,
+        frame: &[u8],
+        site: kr_protocol::ids::EnvironmentId,
+        os_user: &str,
+        now: TimestampMs,
+    ) -> Result<UpstreamArrival> {
+        let mut state = self.state();
+        let forwarded = state.gateway.forward_native(connection, frame)?;
+        let Some(operation) = state.reverse_operation(connection, &forwarded.method) else {
+            let resource = state.record_native(connection, &forwarded, frame, now)?;
+            return Ok(UpstreamArrival::Forward {
+                forwarded,
+                resource,
+            });
+        };
+        let Some(request) = forwarded
+            .request
+            .clone()
+            .filter(|_| forwarded.expects_response)
+        else {
+            return Err(BrokerError::invalid(format!(
+                "{} asks this host to perform {operation} without an identifier to answer on, \
+                 and this host answers every operation it performs",
+                forwarded.method
+            )));
+        };
+        let held = state
             .gateway
             .connection(connection)
-            .map(|held| held.application_instance_id)
+            .cloned()
             .ok_or_else(|| BrokerError::unknown(format!("no gateway connection {connection}")))?;
-        // The native path keeps working while the journal is faulted. What the gap records is
-        // that it did.
-        state.volatile.note_native_request();
+        let body = serde_json::from_slice::<serde_json::Value>(frame)
+            .ok()
+            .and_then(|body| body.as_object().cloned())
+            .ok_or_else(|| BrokerError::invalid("a native frame is a JSON object"))?;
+        let reverse = state.gateway.reverse_request(
+            connection,
+            request.upstream.clone(),
+            operation,
+            site,
+            os_user,
+        )?;
+        let resource = state
+            .record_native(connection, &forwarded, frame, now)?
+            .ok_or_else(|| BrokerError::invalid("a reverse request is recorded as a resource"))?;
+        let grant = state
+            .instances
+            .get(&resource.application_instance_id)
+            .and_then(|instance| instance.host_files.clone());
+        let plan = crate::broker::host::Plan::decide(
+            &body,
+            &held.table.params_field,
+            operation,
+            grant.as_ref(),
+            site,
+            state.volatile.writes_are_durable(),
+        );
+        let transition = state
+            .arbitration
+            .plan_writer_dispatch(&request, Transmitter::Host)?;
+        state.commit_transition(
+            transition,
+            now,
+            crate::broker::ledger::TransitionCause::Dispatched,
+            None,
+        )?;
+        state.volatile.note_native_response();
+        Ok(UpstreamArrival::Reverse(ReverseAdmission {
+            reverse,
+            resource_id: resource.resource_id,
+            plan,
+            shape: crate::broker::host::AnswerShape::of(&held.table),
+        }))
+    }
 
-        if forwarded.suspends_rich_mutations
-            && let Some(instance) = state.instances.get_mut(&application_instance_id)
-        {
-            instance.rich_suspension = Some(format!(
-                "{} is not classified by this connector's table, so what it changed is unknown",
-                forwarded.method
-            ));
-        }
+    /// Records what became of this host's own answer to a reverse request.
+    ///
+    /// An answer that reached the upstream for an operation whose outcome is known resolves the
+    /// resource. Anything else leaves it uncertain: an answer that did not go, or went in part, and
+    /// an operation that may have changed a file it did not finish with.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::PermissionDenied`] when this host does not hold the admission, and
+    /// [`BrokerError::Arbitration`] when the resource has already ended.
+    pub fn reverse_answered(
+        &self,
+        request: &DownstreamRequestId,
+        to: PendingState,
+        now: TimestampMs,
+    ) -> Result<PendingResource> {
+        let mut state = self.state();
+        let transition = state
+            .arbitration
+            .plan_writer_settled(request, Transmitter::Host, to)?;
+        state.commit_transition(
+            transition,
+            now,
+            crate::broker::ledger::TransitionCause::HostAnswer,
+            None,
+        )
+    }
 
-        let Some(request) = forwarded.request.clone() else {
-            return Ok((forwarded, None));
-        };
-        if !forwarded.expects_response {
-            return Ok((forwarded, None));
-        }
-        // The frame *is* the source event, and the broker records it here rather than trusting a
-        // caller to record it and then to name the right one. That is what ties an interpretation
-        // to the bytes it is an interpretation of. It is built now and retained only once the
-        // admission has been written, because retaining evicts, and a refused request must not
-        // cost an accepted one its source.
+    /// Grants one instance's upstream a directory it may ask this host to read, or to read and
+    /// write, in.
+    ///
+    /// Section 11 keeps filesystem access a grant of its own, and this is that grant for reverse
+    /// operations. It replaces whatever the instance held before.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] when this broker holds no such instance.
+    pub fn grant_host_files(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+        files: HostFiles,
+    ) -> Result<()> {
+        let mut state = self.state();
         let instance = state
             .instances
-            .get(&application_instance_id)
+            .get_mut(&application_instance_id)
             .ok_or_else(|| unknown_instance(application_instance_id))?;
-        let source_generation = instance.source_generation;
-        let source = SourceEventHandle::new(format!("src-{}", kr_ipc::new_uuid()))
-            .map_err(|error| BrokerError::invalid(format!("source handle: {error}")))?;
-        let source_frame = SourceFrame::new(source.clone(), source_generation, frame, now)?;
-        if state.arbitration.holds_request(&request) {
-            return Err(BrokerError::invalid(format!(
-                "{request} already names a pending resource"
-            )));
+        instance.host_files = Some(std::sync::Arc::new(files));
+        Ok(())
+    }
+
+    /// Withdraws one instance's granted host directory.
+    ///
+    /// Nothing new is admitted under it from here. An operation already admitted holds the grant
+    /// it was decided under until it finishes, because it was already running.
+    pub fn withdraw_host_files(&self, application_instance_id: ApplicationInstanceId) {
+        if let Some(instance) = self.state().instances.get_mut(&application_instance_id) {
+            instance.host_files = None;
         }
-        let resource = PendingResource {
-            resource_id: PendingResourceId::new(Uuid::from_bytes(*kr_ipc::new_uuid().as_bytes())),
-            application_instance_id,
-            request,
-            kind: PendingKind::ReverseRpc,
-            method: forwarded.method.clone(),
-            classification: forwarded.classification,
-            source_generation,
-            state: PendingState::Pending,
-            durability: state.volatile.durability(),
-            deadline_ms: Nullable::null(),
-            recorded_at: now,
-            // Opaque. A decoder's verified interpretation is what makes it answerable.
-            interpretation_verified: false,
-        };
-        // What decides whether the row is written is whether the ledger can take a write now,
-        // the same predicate every later transition uses. What the record *says* about itself is
-        // the mode's own durability, which is the honest label for a resource admitted while a
-        // gap was open.
-        // The record and the event that announces it, in one transaction: a request this host
-        // took is a state change, and section 24 puts the change and its announcement together.
-        let event = state.next_transition_event(
-            &resource,
-            now,
-            crate::broker::ledger::TransitionCause::Recorded,
-            None,
-        );
-        if state.volatile.writes_are_durable() {
-            state.ledger.record_opaque(&resource, &event)?;
-        } else {
-            state.announced_without_record(&event);
-        }
-        state.remember(&event);
-        state.publish(&resource, &event);
-        state
-            .arbitration
-            .record(resource.clone(), None, Some(source))?;
-        // A request recorded while a recovery is running belongs to an upstream that has not said
-        // what it still holds, so it joins what that recovery owes.
-        state.volatile.owe_one(application_instance_id, connection);
-        if let Some(instance) = state.instances.get_mut(&application_instance_id) {
-            instance.retain(source_frame);
-        }
-        Ok((forwarded, Some(resource)))
     }
 
     /// Admits one request or notification the native client is making of its own upstream.
@@ -1363,7 +1487,9 @@ impl Broker {
     ) -> Result<NativeAnswer> {
         let mut state = self.state();
         let request = state.gateway.correlate_response(connection, frame)?;
-        let transition = state.arbitration.plan_native_dispatch(&request)?;
+        let transition = state
+            .arbitration
+            .plan_writer_dispatch(&request, Transmitter::Native)?;
         let resource_id = transition.resource.resource_id;
         // The marker before the bytes, exactly as the rich path does it. A crash between them
         // leaves a record saying an answer may already have gone, which is what stops a restart
@@ -1445,7 +1571,10 @@ impl Broker {
         now: TimestampMs,
     ) -> Result<PendingResource> {
         let mut state = self.state();
-        let transition = state.arbitration.plan_native_settled(&answer.request, to)?;
+        let transition =
+            state
+                .arbitration
+                .plan_writer_settled(&answer.request, Transmitter::Native, to)?;
         state.commit_transition(
             transition,
             now,
@@ -2896,6 +3025,127 @@ impl BrokerState {
             now,
         );
         Ok(revision)
+    }
+
+    /// Returns what one method of one connection asks this host to perform, when it asks for
+    /// anything.
+    fn reverse_operation(
+        &self,
+        connection: GatewayConnectionId,
+        method: &UpstreamMethod,
+    ) -> Option<kr_protocol::gateway::ReverseOperation> {
+        self.gateway
+            .connection(connection)
+            .and_then(|held| held.table.reverse_of(method))
+    }
+
+    /// Records one native request the core has read, before anything is done with it.
+    fn record_native(
+        &mut self,
+        connection: GatewayConnectionId,
+        forwarded: &Forwarded,
+        frame: &[u8],
+        now: TimestampMs,
+    ) -> Result<Option<PendingResource>> {
+        // Before anything is counted, recorded or suspended. An upstream that mints an identifier
+        // in this host's own namespace is an upstream whose next response this host could not tell
+        // from an answer to a request of its own, and a refusal that left a resource, a ledger row
+        // and a retained source behind it would have made the ambiguity anyway.
+        if let Some(request) = forwarded.request.as_ref()
+            && crate::broker::duplex::is_host_minted(&request.upstream)
+        {
+            return Err(BrokerError::invalid(format!(
+                "{} begins with {}, which names the requests this host sends, and an upstream \
+                 request cannot be one of those",
+                request.upstream,
+                crate::broker::duplex::HOST_REQUEST_PREFIX
+            )));
+        }
+        let application_instance_id = self
+            .gateway
+            .connection(connection)
+            .map(|held| held.application_instance_id)
+            .ok_or_else(|| BrokerError::unknown(format!("no gateway connection {connection}")))?;
+        // The native path keeps working while the journal is faulted. What the gap records is
+        // that it did.
+        self.volatile.note_native_request();
+
+        if forwarded.suspends_rich_mutations
+            && let Some(instance) = self.instances.get_mut(&application_instance_id)
+        {
+            instance.rich_suspension = Some(format!(
+                "{} is not classified by this connector's table, so what it changed is unknown",
+                forwarded.method
+            ));
+        }
+
+        let Some(request) = forwarded.request.clone() else {
+            return Ok(None);
+        };
+        if !forwarded.expects_response {
+            return Ok(None);
+        }
+        // The frame *is* the source event, and the broker records it here rather than trusting a
+        // caller to record it and then to name the right one. That is what ties an interpretation
+        // to the bytes it is an interpretation of. It is built now and retained only once the
+        // admission has been written, because retaining evicts, and a refused request must not
+        // cost an accepted one its source.
+        let instance = self
+            .instances
+            .get(&application_instance_id)
+            .ok_or_else(|| unknown_instance(application_instance_id))?;
+        let source_generation = instance.source_generation;
+        let source = SourceEventHandle::new(format!("src-{}", kr_ipc::new_uuid()))
+            .map_err(|error| BrokerError::invalid(format!("source handle: {error}")))?;
+        let source_frame = SourceFrame::new(source.clone(), source_generation, frame, now)?;
+        if self.arbitration.holds_request(&request) {
+            return Err(BrokerError::invalid(format!(
+                "{request} already names a pending resource"
+            )));
+        }
+        let resource = PendingResource {
+            resource_id: PendingResourceId::new(Uuid::from_bytes(*kr_ipc::new_uuid().as_bytes())),
+            application_instance_id,
+            request,
+            kind: PendingKind::ReverseRpc,
+            method: forwarded.method.clone(),
+            classification: forwarded.classification,
+            source_generation,
+            state: PendingState::Pending,
+            durability: self.volatile.durability(),
+            deadline_ms: Nullable::null(),
+            recorded_at: now,
+            // Opaque. A decoder's verified interpretation is what makes it answerable.
+            interpretation_verified: false,
+        };
+        // What decides whether the row is written is whether the ledger can take a write now,
+        // the same predicate every later transition uses. What the record *says* about itself is
+        // the mode's own durability, which is the honest label for a resource admitted while a
+        // gap was open.
+        // The record and the event that announces it, in one transaction: a request this host
+        // took is a state change, and section 24 puts the change and its announcement together.
+        let event = self.next_transition_event(
+            &resource,
+            now,
+            crate::broker::ledger::TransitionCause::Recorded,
+            None,
+        );
+        if self.volatile.writes_are_durable() {
+            self.ledger.record_opaque(&resource, &event)?;
+        } else {
+            self.announced_without_record(&event);
+        }
+        self.remember(&event);
+        self.publish(&resource, &event);
+        self.arbitration
+            .record(resource.clone(), None, Some(source))?;
+        // A request recorded while a recovery is running belongs to an upstream that has not said
+        // what it still holds, so it joins what that recovery owes.
+        self.volatile.owe_one(application_instance_id, connection);
+        if let Some(instance) = self.instances.get_mut(&application_instance_id) {
+            instance.retain(source_frame);
+        }
+        Ok(Some(resource))
     }
 
     /// Takes the claim on one pending resource.

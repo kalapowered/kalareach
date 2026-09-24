@@ -47,6 +47,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use crate::broker::Broker;
 use crate::broker::error::{BrokerError, Result};
 use crate::broker::framing::Framing;
+use crate::broker::host::Performed;
 use crate::broker::ledger::ClientRequestOutcome;
 use crate::broker::methods::{
     PendingTransmission, UpstreamBody, UpstreamDispatch, UpstreamOutcome, UpstreamRequest,
@@ -1408,11 +1409,15 @@ pub enum Carried {
         resource_id: Option<PendingResourceId>,
     },
     /// A reverse request the upstream asked this host to perform.
+    ///
+    /// It was recorded with its one answer admitted, and it runs away from this reader: its answer
+    /// reaches the upstream when the operation has finished, been refused or overrun its deadline,
+    /// and that answer's fate settles the resource.
     Reverse {
         /// What was asked for.
         operation: ReverseOperation,
-        /// Whether this host could do it.
-        performed: bool,
+        /// The resource the request was recorded as.
+        resource_id: PendingResourceId,
     },
     /// A request the client made of the upstream, forwarded under an identifier of this host's.
     ClientRequest {
@@ -1497,7 +1502,26 @@ pub struct Duplex {
     os_user: String,
     stopping: Arc<tokio::sync::Notify>,
     stopped: Arc<std::sync::atomic::AtomicBool>,
+    /// How many reverse operations may run at once on this connection.
+    ///
+    /// A place is held until the platform returns from the operation, not until its deadline, so a
+    /// stalled filesystem holds a bounded number of threads however many requests arrive.
+    reverse_slots: Arc<tokio::sync::Semaphore>,
+    /// How long one reverse operation has before the upstream is told it did not finish, in
+    /// milliseconds.
+    reverse_deadline_ms: AtomicU64,
+    /// A pause immediately before the next reverse operation touches the filesystem, which this
+    /// host's own tests arm to stand at that point. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    reverse_pause: std::sync::Mutex<Option<ReversePause>>,
 }
+
+/// The two ends of one armed pause: what says the operation arrived, and what lets it go.
+#[cfg(feature = "testing")]
+type ReversePause = (
+    std::sync::mpsc::SyncSender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
 
 impl Duplex {
     /// Builds one owner over an already-opened gateway connection and the two ends it writes to.
@@ -1543,6 +1567,15 @@ impl Duplex {
             os_user: os_user.into(),
             stopping: Arc::clone(&failing.stopping),
             stopped: Arc::clone(&failing.stopped),
+            reverse_slots: Arc::new(tokio::sync::Semaphore::new(
+                crate::broker::host::MAX_REVERSE_IN_FLIGHT,
+            )),
+            reverse_deadline_ms: AtomicU64::new(
+                u64::try_from(crate::broker::host::REVERSE_DEADLINE.as_millis())
+                    .unwrap_or(u64::MAX),
+            ),
+            #[cfg(feature = "testing")]
+            reverse_pause: std::sync::Mutex::new(None),
         });
         let sweeping = {
             // The sweep watches the owner rather than owning it. A strong reference here would
@@ -1728,24 +1761,34 @@ impl Duplex {
         // A request names a method and a response does not, which is the one distinction the
         // qualified table guarantees. Asking the broker to correlate a request would resolve a
         // resource on the strength of a matching identifier alone.
-        let forwarded = match self.broker.forward_native(self.connection, frame, now) {
-            Ok(carried) => carried,
+        let arrival = match self.broker.receive_upstream(
+            self.connection,
+            frame,
+            self.site,
+            &self.os_user,
+            now,
+        ) {
+            Ok(arrival) => arrival,
             Err(_) => return self.upstream_response(frame, now),
         };
-        let (forwarded, resource) = forwarded;
-        // What the upstream asks this host to do is a separate contract with its own admission,
-        // and nothing of it happens on this path.
-        if let Some(operation) = self
-            .broker
-            .connection(self.connection)
-            .and_then(|connection| connection.table.reverse_of(&forwarded.method))
-        {
-            let performed = self.refuse_reverse(operation, frame).await?;
-            return Ok(Carried::Reverse {
-                operation,
-                performed,
-            });
-        }
+        let (forwarded, resource) = match arrival {
+            crate::broker::UpstreamArrival::Forward {
+                forwarded,
+                resource,
+            } => (forwarded, resource),
+            // What the upstream asks this host to do was admitted with its one answer. It runs
+            // away from this reader, so a slow or stalled file holds its own work and nothing the
+            // upstream says behind it.
+            crate::broker::UpstreamArrival::Reverse(admission) => {
+                let operation = admission.reverse.operation;
+                let resource_id = admission.resource_id;
+                self.run_reverse(admission);
+                return Ok(Carried::Reverse {
+                    operation,
+                    resource_id,
+                });
+            }
+        };
         // Recorded first, forwarded second. Section 11 puts the record before the forwarding so
         // that a crash in between leaves a request this host knows about rather than one it does
         // not.
@@ -2009,58 +2052,152 @@ impl Duplex {
         queued.map(|_| ())
     }
 
-    /// Refuses one reverse request, before anything of it could have an effect.
+    /// Runs one admitted reverse request away from the reader, and answers it once.
     ///
-    /// The upstream asked this host to act in the agent's own environment. That runs through the
-    /// broker's own file authority under an exclusive execution admission, and until that path
-    /// exists the request is refused with a qualified reason rather than performed outside it.
-    async fn refuse_reverse(&self, operation: ReverseOperation, frame: &[u8]) -> Result<bool> {
-        let body: serde_json::Value = serde_json::from_slice(frame).map_err(|error| {
-            BrokerError::invalid(format!("this frame is not readable: {error}"))
-        })?;
-        let connection = self.broker.connection(self.connection).ok_or_else(|| {
-            BrokerError::unknown(format!("no gateway connection {}", self.connection))
-        })?;
-        let upstream_request_id = body
-            .get(&connection.table.request_id_field)
-            .and_then(|member| serde_json::to_string(member).ok())
-            .and_then(|text| UpstreamRequestId::new(text).ok())
-            .ok_or_else(|| {
-                BrokerError::invalid("a reverse request carries the identifier it is answered on")
-            })?;
-        // The site is the gateway's, derived from the connection rather than taken from the
-        // request: section 12 runs these in the agent's own environment with its own user, and
-        // that is true only if the request does not get to say where.
-        let reverse = self.broker.reverse_request(
-            self.connection,
-            upstream_request_id.clone(),
-            operation,
-            self.site,
-            &self.os_user,
-        )?;
-        let mut answer = serde_json::Map::new();
-        answer.insert(
-            connection.table.response_id_field.clone(),
-            serde_json::from_str(upstream_request_id.as_str()).unwrap_or(serde_json::Value::Null),
-        );
-        answer.insert(
-            connection.table.error_field.clone(),
-            serde_json::json!({
-                "code": -32_601,
-                "message": format!(
-                    "{} runs against the host resources this session granted, and this host has \
-                     granted none for it",
-                    reverse.operation.as_str()
-                ),
+    /// The admission was taken with the request's record and the marker is committed, so this is
+    /// the only answer the request will get and a restart will not run it again. What remains is
+    /// the order section 11 asks of any answer: the operation runs, its answer is queued on the
+    /// upstream end, and the writer that establishes what reached the socket settles the resource.
+    ///
+    /// The operation holds one of this connection's [`MAX_REVERSE_IN_FLIGHT`] places until the
+    /// platform returns from it. A request that finds none is refused without running. One that
+    /// passes the deadline is answered at the deadline, and its outcome is recorded as unknown if
+    /// it could have changed a file.
+    ///
+    /// [`MAX_REVERSE_IN_FLIGHT`]: crate::broker::host::MAX_REVERSE_IN_FLIGHT
+    fn run_reverse(&self, admission: crate::broker::ReverseAdmission) {
+        let crate::broker::ReverseAdmission {
+            reverse,
+            plan,
+            shape,
+            ..
+        } = admission;
+        let operation = reverse.operation;
+        // The guard exists before anything can go wrong, so every path from here settles the
+        // resource: an answer that went, one that did not, and work that was dropped half way.
+        let answer = HostAnswer {
+            broker: Arc::clone(&self.broker),
+            request: Some(reverse.request.clone()),
+        };
+        let work = match plan {
+            crate::broker::host::Plan::Refuse(refusal) => Run::Answer(Performed {
+                answer: crate::broker::host::Answer::Refused(refusal),
+                certain: true,
             }),
+            crate::broker::host::Plan::Perform(performance) => {
+                match Arc::clone(&self.reverse_slots).try_acquire_owned() {
+                    Ok(slot) => Run::Perform(performance, slot),
+                    Err(_) => Run::Answer(Performed::not_run(format!(
+                        "this connection already has {} reverse operations running, so {} was \
+                         not started",
+                        crate::broker::host::MAX_REVERSE_IN_FLIGHT,
+                        operation.as_str()
+                    ))),
+                }
+            }
+        };
+        let deadline =
+            std::time::Duration::from_millis(self.reverse_deadline_ms.load(Ordering::Acquire));
+        let upstream = self.ends.upstream.clone();
+        let failing = Stopping {
+            stopping: Arc::clone(&self.stopping),
+            stopped: Arc::clone(&self.stopped),
+        };
+        #[cfg(feature = "testing")]
+        let pause = match &work {
+            Run::Perform(..) => self.take_reverse_pause(),
+            Run::Answer(_) => None,
+        };
+        let upstream_request_id = reverse.request.upstream;
+        tokio::spawn(async move {
+            let performed = match work {
+                Run::Answer(performed) => performed,
+                Run::Perform(performance, slot) => {
+                    let running = tokio::task::spawn_blocking(move || {
+                        // Held for as long as the platform has the operation, which can be past
+                        // the deadline: the place is what bounds the threads a stalled file holds.
+                        let _slot = slot;
+                        #[cfg(feature = "testing")]
+                        if let Some((arrived, go)) = pause {
+                            let _ = arrived.send(());
+                            if go.recv().is_err() {
+                                return Performed::not_run(
+                                    "this host stopped before the operation ran",
+                                );
+                            }
+                        }
+                        performance.perform()
+                    });
+                    match tokio::time::timeout(deadline, running).await {
+                        Ok(Ok(performed)) => performed,
+                        // The operation panicked part way. A read changed nothing; a write may
+                        // have, and the answer says so.
+                        Ok(Err(_)) => Performed::interrupted(operation),
+                        Err(_) => Performed::overran(operation, deadline),
+                    }
+                }
+            };
+            let frame =
+                crate::broker::host::answer_frame(&shape, &upstream_request_id, &performed.answer);
+            let certain = performed.certain;
+            let queued = upstream.queue_then(
+                &frame,
+                Some(Completion::new(move |delivery| {
+                    answer.settle(delivery, certain);
+                })),
+            );
+            if queued.is_err() {
+                // The refused frame's own work has settled the resource uncertain. The upstream
+                // is waiting on an answer this connection cannot carry, so the connection cannot
+                // safely go on.
+                failing.stop();
+            }
+        });
+    }
+
+    /// Sets how long this connection's reverse operations have before the upstream is told they
+    /// did not finish.
+    ///
+    /// It exists so that this host's own tests can reach the deadline without waiting out the
+    /// shipped one. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn set_reverse_deadline(&self, deadline: std::time::Duration) {
+        self.reverse_deadline_ms.store(
+            u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Release,
         );
-        let body = serde_json::to_vec(&serde_json::Value::Object(answer)).map_err(|error| {
-            BrokerError::invalid(format!("this answer will not encode: {error}"))
-        })?;
-        // Queued, not awaited: a refusal is not an effect, and this reader has other frames to
-        // read whether or not the upstream is draining.
-        self.ends.upstream.queue(&body)?;
-        Ok(false)
+    }
+
+    /// Stops the next reverse operation this connection performs immediately before it touches
+    /// the filesystem, for this host's own tests.
+    ///
+    /// The admission has been taken and the marker committed by then, and nothing of the
+    /// operation has happened, which is the interval section 24 divides. Returns the end that says
+    /// the operation has arrived there, and the end that lets it go. Dropping that end without
+    /// sending abandons the operation, as a process that ended there would. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_reverse_operation(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (arrived, watch) = std::sync::mpsc::sync_channel(1);
+        let (release, go) = std::sync::mpsc::sync_channel(1);
+        *self
+            .reverse_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Takes the armed pause, where one is armed.
+    #[cfg(feature = "testing")]
+    fn take_reverse_pause(&self) -> Option<ReversePause> {
+        self.reverse_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     /// Writes one upstream reply back to the client under the identifier the client used.
@@ -2243,6 +2380,53 @@ impl Drop for AdmittedAnswer {
         let _ = self
             .broker
             .native_answer_uncertain(&answer, kr_ipc::now_ms());
+    }
+}
+
+/// What one admitted reverse request comes to before its answer is written.
+enum Run {
+    /// Perform the operation, in the place it holds.
+    Perform(
+        crate::broker::host::Performance,
+        tokio::sync::OwnedSemaphorePermit,
+    ),
+    /// Answer without performing anything.
+    Answer(Performed),
+}
+
+/// This host's own answer to one reverse request, held until something says what happened to it.
+///
+/// Dropping it without saying leaves the resource uncertain. That covers the work being dropped
+/// before its answer was queued, a connection that ended first, and a writer that never reached the
+/// frame: the marker says an answer may have gone, and nothing establishes that it did not.
+struct HostAnswer {
+    broker: Arc<Broker>,
+    request: Option<kr_protocol::gateway::DownstreamRequestId>,
+}
+
+impl HostAnswer {
+    /// Settles the resource from what reached the upstream and what the operation established.
+    fn settle(mut self, delivery: Delivery, certain: bool) {
+        let Some(request) = self.request.take() else {
+            return;
+        };
+        let to = if delivery == Delivery::Transmitted && certain {
+            PendingState::Resolved
+        } else {
+            PendingState::Uncertain
+        };
+        let _ = self.broker.reverse_answered(&request, to, kr_ipc::now_ms());
+    }
+}
+
+impl Drop for HostAnswer {
+    fn drop(&mut self) {
+        let Some(request) = self.request.take() else {
+            return;
+        };
+        let _ = self
+            .broker
+            .reverse_answered(&request, PendingState::Uncertain, kr_ipc::now_ms());
     }
 }
 

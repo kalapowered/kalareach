@@ -43,10 +43,11 @@ pub struct Pending {
     pub dispatched: bool,
     /// Which writer holds the one admission to transmit an answer, once one does.
     ///
-    /// A resource has two possible writers: the rich answer a component encoded, and the native
-    /// client's own answer travelling the forwarding path. Both consume this, and there is one, so
-    /// the second one to arrive is refused *before* its bytes go rather than recorded as a
-    /// competing answer afterwards.
+    /// A resource has three possible writers: the rich answer a component encoded, the native
+    /// client's own answer travelling the forwarding path, and this host's own answer to a request
+    /// it performs itself. Each consumes this, and there is one, so the second one to arrive is
+    /// refused *before* its bytes go, or its operation runs, rather than recorded as a competing
+    /// answer afterwards.
     pub transmitter: Option<Transmitter>,
     /// The binding whose decoder produced it, where one did.
     pub decoder: Option<BrokerBindingId>,
@@ -61,19 +62,22 @@ pub struct Pending {
 /// Which writer holds the one admission to transmit an answer for a pending resource.
 ///
 /// Section 11 gives every pending resource one resolution, and a resolution is bytes reaching the
-/// upstream. Two writers can produce those bytes, so the admission is exclusive and named: a rich
-/// answer is admitted under the claim that encoded it, and the native client's own answer is
-/// admitted on the forwarding path it travels.
+/// upstream. Three writers can produce those bytes, so the admission is exclusive and named: a
+/// rich answer is admitted under the claim that encoded it, the native client's own answer is
+/// admitted on the forwarding path it travels, and this host's own answer to a request it
+/// performs itself is admitted with the request's record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transmitter {
     /// A rich answer, admitted under the claim named.
     Rich(Uuid),
     /// The native client's own answer, admitted as it was forwarded.
     Native,
+    /// This host's answer to a reverse request, admitted before the operation ran.
+    Host,
     /// An answer that went before this process started, read back from the dispatch marker.
     ///
     /// Which writer sent it is not recorded, because nothing needs it: what the marker says is
-    /// that the one admission is spent, and that is what stops either writer taking it again.
+    /// that the one admission is spent, and that is what stops any writer taking it again.
     Spent,
 }
 
@@ -84,6 +88,7 @@ impl Transmitter {
         match self {
             Self::Rich(_) => "a rich answer",
             Self::Native => "the native client's own answer",
+            Self::Host => "this host's own answer to a request it performs",
             Self::Spent => "an answer this host had already sent",
         }
     }
@@ -448,20 +453,40 @@ impl Arbitration {
         })
     }
 
-    /// Plans the exclusive admission of the native client's own answer, before its bytes go.
+    /// Plans the exclusive admission of a writer that answers on the forwarding path.
     ///
-    /// This is the other half of section 11's one resolution per resource. A native answer that
-    /// arrives while a rich answer is still encoding wins: the claim it beats has not taken the
-    /// admission, so this takes it and the rich answer is told the resolved state at its recheck.
-    /// A native answer that arrives after a rich answer has been admitted is refused **here**,
-    /// before it is forwarded, because forwarding it would be the second answer to one request.
+    /// This is the other half of section 11's one resolution per resource. Two writers take the
+    /// admission here rather than under a claim: the native client's own answer as it is
+    /// forwarded, and this host's own answer to a request it performs itself, which is admitted
+    /// with the request's record and before the operation runs.
+    ///
+    /// A native answer that arrives while a rich answer is still encoding wins: the claim it beats
+    /// has not taken the admission, so this takes it and the rich answer is told the resolved
+    /// state at its recheck. A writer that arrives after another has been admitted is refused
+    /// **here**, before anything is forwarded or performed, because that would be the second
+    /// answer to one request.
+    ///
+    /// The marker is set in the same transition. For these writers nothing sits between the
+    /// admission and the bytes that a caller could abandon: the admission is taken immediately
+    /// before the forwarding, or before the operation whose outcome the answer reports.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::UnknownSubject`] when nothing has that identifier,
     /// [`BrokerError::Arbitration`] when the resource has already ended, and
-    /// [`BrokerError::PermissionDenied`] when the one admission is already held.
-    pub fn plan_native_dispatch(&self, request: &DownstreamRequestId) -> Result<Transition> {
+    /// [`BrokerError::PermissionDenied`] when the one admission is already held. A rich answer is
+    /// admitted by [`Arbitration::plan_dispatch`] under its claim, never here.
+    pub fn plan_writer_dispatch(
+        &self,
+        request: &DownstreamRequestId,
+        writer: Transmitter,
+    ) -> Result<Transition> {
+        if !matches!(writer, Transmitter::Native | Transmitter::Host) {
+            return Err(BrokerError::denied(format!(
+                "{} is admitted under its own claim, not on the forwarding path",
+                writer.as_str()
+            )));
+        }
         let pending = self.require_request(request)?;
         if pending.resource.state.is_terminal() {
             return Err(BrokerError::Arbitration(
@@ -477,10 +502,10 @@ impl Arbitration {
                 pending.resource.resource_id
             )));
         }
-        // The native writer takes the resource's one claim, which is what the state machine
-        // already means by `claimed`: one answer is on its way and no other may start. A rich
-        // claim this beats is discharged, because its holder has nothing left to dispatch and the
-        // recheck tells it so.
+        // The writer takes the resource's one claim, which is what the state machine already
+        // means by `claimed`: one answer is on its way and no other may start. A rich claim this
+        // beats is discharged, because its holder has nothing left to dispatch and the recheck
+        // tells it so.
         let mut resource = pending.resource.clone();
         resource.state = PendingState::Claimed;
         Ok(Transition {
@@ -489,27 +514,29 @@ impl Arbitration {
             claim: None,
             holds_claim: false,
             dispatched: true,
-            transmitter: Some(Transmitter::Native),
+            transmitter: Some(writer),
             releases_transmitter: false,
         })
     }
 
-    /// Plans the end of a native answer this arbitration admitted.
+    /// Plans the end of an answer [`Arbitration::plan_writer_dispatch`] admitted.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::UnknownSubject`] when nothing has that identifier,
-    /// [`BrokerError::PermissionDenied`] when the native writer does not hold the admission, and
+    /// [`BrokerError::PermissionDenied`] when `writer` does not hold the admission, and
     /// [`BrokerError::Arbitration`] when the state cannot reach the one asked for.
-    pub fn plan_native_settled(
+    pub fn plan_writer_settled(
         &self,
         request: &DownstreamRequestId,
+        writer: Transmitter,
         to: PendingState,
     ) -> Result<Transition> {
         let pending = self.require_request(request)?;
-        if pending.transmitter != Some(Transmitter::Native) {
+        if pending.transmitter != Some(writer) {
             return Err(BrokerError::denied(format!(
-                "the native writer does not hold the admission on {}",
+                "{} does not hold the admission on {}",
+                writer.as_str(),
                 pending.resource.resource_id
             )));
         }

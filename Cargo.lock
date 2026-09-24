@@ -4689,6 +4689,7 @@ dependencies = [
  "kr-protocol",
  "kr-shell-integration",
  "kr-term",
+ "kr-transfer",
  "kr-transport",
  "kr-worker",
  "libc",

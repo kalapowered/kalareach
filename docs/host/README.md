@@ -3762,11 +3762,11 @@ travels with the turn it acts on. An approval's answer is written into the membe
 for that method, so an upstream that reads its decision from `behavior` is answered in `behavior`,
 and a method the table says nothing about answering is one this host will not answer at all.
 
-An upstream reverse request for a filesystem or terminal operation names the agent's own host
-environment and the user the agent runs as. The instance comes from the connection rather than from
-the request, so it cannot be pointed at another application; the environment and the user are the
-caller's arguments, and deriving them from the launch is work that lands with the transport.
-Performing the operation is the worker's file and terminal paths' and is not wired to this yet.
+An upstream reverse request for a filesystem or terminal operation is one this host performs
+itself, in the agent's own host environment and as the user the agent runs as. Where it runs comes
+from the connection and the launch behind it, never from the request, so a request cannot point it
+at another application, another environment or another user. How it is performed is described under
+[Reverse operations](#reverse-operations).
 
 Every action records how it actually reached the upstream: a typed remote procedure call, an
 authenticated hook response, or terminal input. Terminal input is never an authoritative typed
@@ -3842,6 +3842,47 @@ order the broker committed it: what changed, what it became, whether its record 
 binding revision it changed under, its place in the broker's stream and the event before it. It
 carries no output, so it costs no view its queue and never touches the screen. A consumer that
 wants to replay what it missed reads the outbox rather than the live stream.
+
+## Reverse operations
+
+An upstream can ask this host to read or write a file on its behalf. The worker performs such a
+request itself, through a directory granted to that instance, and through nothing else.
+
+The grant is a directory opened as the transfer service's handle-based file authority, held for one
+instance, for reading only or for reading and writing, with a byte bound for each. With no grant,
+every reverse file operation is refused with a reason and nothing is opened. A path in a request is
+a name, never a permission: an absolute path is read against the granted directory, a relative one
+from it, and what it names is resolved one component at a time through the directory's handle,
+following no link. A name that leaves the directory, a link on the way, an object that is not a
+regular file, a file that has a second name when it is to be written, and a grant whose handle
+belongs to another environment are each refused before anything is written. A file larger than a
+read may return is refused rather than cut short, a write over its bound is refused before anything
+is opened, and a read returns text. A write replaces the file's content; a file that does not exist
+is created, readable and writable by its owner only and never executable.
+
+The request is recorded, what to do about it is decided, and the one admission to answer it is taken
+with the dispatch marker committed, all under the broker's one lock and all before the operation
+runs. No native answer and no rich answer can take that admission afterwards, so this host's answer
+is the only one the upstream receives. A process that ends after the marker leaves the request
+uncertain when it restarts: a reconciliation keeps it uncertain rather than answerable, and the same
+request sent again on the restored connection is refused as the request it already is. Nothing
+performs it a second time.
+
+The operation runs away from the connection's readers, so a slow or stalled file holds its own
+thread and nothing the upstream or the terminal says behind it. It has a deadline, and at the
+deadline the upstream is told it did not finish; a write that overran is recorded as an outcome
+nobody can establish, and a read that overran changed nothing. A connection runs a bounded number of
+operations at once, and an operation holds its place until the platform returns from it, so a
+stalled filesystem cannot collect more threads than the bound however many requests arrive; a
+request that finds no place is refused without running. The answer goes out through the
+connection's writer, and what reached the socket settles the resource: `resolved` when the answer
+went and the operation's outcome is known, `uncertain` otherwise. Its event names this host's own
+answer as its cause.
+
+While the journal is faulted a reverse write is refused, because its marker cannot be recorded, and a
+read still runs under the in-memory arbitration. Terminal operations are not performed for an
+upstream at all: the session's terminal takes input through its own lease, and a reverse request is
+refused as an operation this host does not perform rather than given a second way in.
 
 ## Volatile-native mode
 

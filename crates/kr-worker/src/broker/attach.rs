@@ -270,6 +270,9 @@ fn map_cause(
         crate::broker::ledger::TransitionCause::NativeAnswer => {
             kr_protocol::projection::AgentResourceCause::NativeAnswer
         }
+        crate::broker::ledger::TransitionCause::HostAnswer => {
+            kr_protocol::projection::AgentResourceCause::HostAnswer
+        }
         crate::broker::ledger::TransitionCause::Upstream => {
             kr_protocol::projection::AgentResourceCause::Upstream
         }

@@ -158,6 +158,8 @@ pub enum TransitionCause {
     RichAnswer,
     /// The native terminal's own answer settled it.
     NativeAnswer,
+    /// This host's own answer to a request it performs itself settled it.
+    HostAnswer,
     /// The upstream answered or withdrew its own request.
     Upstream,
     /// A reconciliation after a reconnection or a recovery settled it.
@@ -205,6 +207,7 @@ impl TransitionCause {
         Self::Dispatched,
         Self::RichAnswer,
         Self::NativeAnswer,
+        Self::HostAnswer,
         Self::Upstream,
         Self::Reconciliation,
     ];
@@ -219,6 +222,7 @@ impl TransitionCause {
             Self::Dispatched => "dispatched",
             Self::RichAnswer => "rich_answer",
             Self::NativeAnswer => "native_answer",
+            Self::HostAnswer => "host_answer",
             Self::Upstream => "upstream",
             Self::Reconciliation => "reconciliation",
         }

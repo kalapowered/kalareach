@@ -24,7 +24,8 @@ use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
 #[cfg(unix)]
 use kr_worker::broker::BoundEndpoint;
 use kr_worker::broker::{
-    Broker, BrokerTransport, Carried, Credential, Duplex, Framing, ManagedProcess, TransportHandle,
+    Broker, BrokerTransport, Carried, Credential, Duplex, FileAccess, Framing, HostFiles,
+    ManagedProcess, TransportHandle,
 };
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
@@ -458,7 +459,7 @@ async fn duplex_watched_on(broker: &Arc<Broker>, connection: GatewayConnectionId
         framing,
         upstream_writes,
         tokio::io::split(client_here).1,
-        EnvironmentId::new(Uuid::from_bytes([4; 16])),
+        site(),
         "agent-user",
     );
     let drained = tokio::spawn(writes);
@@ -476,7 +477,8 @@ async fn duplex_watched_on(broker: &Arc<Broker>, connection: GatewayConnectionId
 ///
 /// The transport records a mutation as applied only when the upstream has answered it, so a test
 /// that sends one needs something on the other end that does. This is that, and it records what
-/// it was sent.
+/// it was sent. It answers requests only: an answer this host wrote to one of the upstream's own
+/// requests is recorded and not answered, as an upstream would not answer it.
 fn acknowledge(
     upstream: SocketStream,
     frames: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
@@ -494,10 +496,14 @@ fn acknowledge(
                 continue;
             };
             let identifier = frame["id"].clone();
+            let is_request = frame.get("method").is_some() && !identifier.is_null();
             frames
                 .lock()
                 .expect("the record is not poisoned")
                 .push(frame);
+            if !is_request {
+                continue;
+            }
             let reply = serde_json::json!({ "id": identifier, "result": {} });
             if writing
                 .write_all(format!("{reply}\n").as_bytes())
@@ -662,15 +668,128 @@ async fn kr_req_11_27_a_clients_own_answer_travels_the_transport_and_a_second_on
     drained.abort();
 }
 
-/// KR-REQ-12.16 and KR-REQ-11.23: a reverse request is answered on the connection it arrived on,
-/// and nothing of it touches the filesystem outside the host resources this session granted.
+/// The environment every connection in this suite runs in, which is where a grant has to be.
+fn site() -> EnvironmentId {
+    EnvironmentId::new(Uuid::from_bytes([4; 16]))
+}
+
+/// Grants the suite's instance one directory, opened as the file authority's handle.
+fn grant_files(broker: &Broker, directory: &std::path::Path, access: FileAccess) {
+    grant_files_in(broker, directory, access, site(), None);
+}
+
+/// The same, for a handle of a named environment and with the byte bounds named.
+fn grant_files_in(
+    broker: &Broker,
+    directory: &std::path::Path,
+    access: FileAccess,
+    environment: EnvironmentId,
+    bounds: Option<(u64, u64)>,
+) {
+    let root = kr_transfer::authority::AuthorisedDirectory::open_root(environment, directory)
+        .expect("the granted directory opens");
+    let mut files = HostFiles::new(root, access);
+    if let Some((read, write)) = bounds {
+        files = files.with_bounds(read, write);
+    }
+    broker
+        .grant_host_files(instance(), files)
+        .expect("the grant is recorded");
+}
+
+/// Sends one reverse request from the upstream and returns the resource it was recorded as.
+async fn ask(
+    owner: &Arc<Duplex>,
+    id: u32,
+    method: &str,
+    params: serde_json::Value,
+) -> kr_protocol::ids::PendingResourceId {
+    let frame = serde_json::json!({ "id": id, "method": method, "params": params }).to_string();
+    match owner
+        .from_upstream(frame.as_bytes(), TimestampMs::new(2))
+        .await
+        .expect("the reverse request is taken")
+    {
+        Carried::Reverse { resource_id, .. } => resource_id,
+        other => panic!("{method} is a reverse request, and it was carried as {other:?}"),
+    }
+}
+
+/// Reads the next frame off one socket, as JSON.
+async fn next_frame(reader: &mut tokio::io::BufReader<SocketStream>) -> serde_json::Value {
+    let line = next_line(reader).await;
+    serde_json::from_str(line.trim()).expect("a frame is readable")
+}
+
+/// Ends one owner, waits for its writers to finish, and reads everything its upstream was sent.
 ///
-/// Section 12 executes these "in the selected host environment with scoped broker resources", and
-/// a path in a request is not a scoped resource. Until one is resolved through the file authority
-/// under an exclusive execution admission, the request is refused with a qualified reason, and the
-/// refusal happens before anything could read or write.
+/// The writers are the only producer of the upstream's bytes, so once they have finished and the
+/// socket has reached its end, what was read is everything that will ever arrive there. A count of
+/// answers taken from it is a count and not a sample.
+async fn everything_sent_upstream(
+    owner: Arc<Duplex>,
+    drained: tokio::task::JoinHandle<()>,
+    mut upstream: tokio::io::BufReader<SocketStream>,
+) -> Vec<serde_json::Value> {
+    owner.shutdown();
+    drop(owner);
+    tokio::time::timeout(LIVENESS_DEADLINE, drained)
+        .await
+        .expect("the writers finish")
+        .expect("the writers are joined");
+    let mut rest = String::new();
+    tokio::time::timeout(
+        LIVENESS_DEADLINE,
+        tokio::io::AsyncReadExt::read_to_string(&mut upstream, &mut rest),
+    )
+    .await
+    .expect("the upstream's end reaches its end")
+    .expect("the upstream's end is readable");
+    rest.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line.trim()).expect("a frame is readable"))
+        .collect()
+}
+
+/// How many answers to one identifier are among `frames`.
+fn answers_for(frames: &[serde_json::Value], id: u32) -> usize {
+    frames
+        .iter()
+        .filter(|frame| frame.get("method").is_none() && frame["id"] == serde_json::json!(id))
+        .count()
+}
+
+/// Waits, away from the runtime's own threads, for an armed pause to be reached.
+async fn arrived_at(arrived: std::sync::mpsc::Receiver<()>) {
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(LIVENESS_DEADLINE))
+        .await
+        .expect("the wait is joined")
+        .expect("the operation reaches the pause");
+}
+
+/// Asserts that an answer is a refusal that says what it names.
+fn refused_saying(answer: &serde_json::Value, words: &str) {
+    assert!(
+        answer.get("result").is_none(),
+        "nothing was performed: {answer}"
+    );
+    assert!(
+        answer["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains(words)),
+        "the refusal says why ({words}): {answer}"
+    );
+}
+
+/// KR-REQ-12.16 and KR-REQ-11.23: with no granted host resource, every reverse request is refused
+/// before any effect and answered once on the connection it arrived on; a terminal operation is
+/// refused as one this host does not perform for an upstream.
+///
+/// Section 12 executes these "in the selected host environment with scoped broker resources", and a
+/// path in a request is not a scoped resource. The one admission to answer is still taken for each
+/// request, so each is resolved by this host's own answer and by nothing else.
 #[tokio::test]
-async fn kr_req_12_16_a_reverse_request_is_refused_before_any_effect_and_answered_in_place() {
+async fn kr_req_12_16_without_a_grant_a_reverse_request_is_refused_before_any_effect() {
     let broker = broker();
     let (owner, upstream, _client, drained) = duplex_over_sockets(&broker).await;
     let mut upstream_reader = tokio::io::BufReader::new(upstream);
@@ -679,57 +798,847 @@ async fn kr_req_12_16_a_reverse_request_is_refused_before_any_effect_and_answere
     let read_from = directory.join("note.txt");
     let write_to = directory.join("written.txt");
     std::fs::write(&read_from, "what the agent asked for").expect("the file is written");
-    for (id, method, params) in [
+    let mut resources = Vec::new();
+    for (id, method, params, reason) in [
         (
             13,
             "fs/read_text_file",
             serde_json::json!({ "path": read_from.to_string_lossy() }),
+            "no host directory is granted",
         ),
         (
             14,
             "fs/write_text_file",
             serde_json::json!({ "path": write_to.to_string_lossy(), "content": "anything" }),
+            "no host directory is granted",
         ),
-        (15, "terminal/create", serde_json::json!({})),
+        (
+            15,
+            "terminal/create",
+            serde_json::json!({}),
+            "does not run terminal operations",
+        ),
     ] {
-        let request =
-            serde_json::json!({ "id": id, "method": method, "params": params }).to_string();
-        let carried = owner
-            .from_upstream(request.as_bytes(), TimestampMs::new(2))
-            .await
-            .expect("the reverse request is carried");
-        let Carried::Reverse { performed, .. } = carried else {
-            panic!("a reverse request is what this was");
-        };
-        assert!(!performed, "{method} performs nothing without a grant");
-        let answer = next_line(&mut upstream_reader).await;
-        let answer: serde_json::Value = serde_json::from_str(answer.trim()).expect("readable");
+        let resource_id = ask(&owner, id, method, params).await;
+        let answer = next_frame(&mut upstream_reader).await;
         assert_eq!(
             answer["id"],
             serde_json::json!(id),
             "the answer goes back on the identifier it came in with"
         );
-        assert!(
-            answer["result"].is_null(),
-            "{method} produced no result to report"
-        );
-        assert!(
-            answer["error"]["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("granted none")),
-            "{method} says why rather than failing silently: {}",
-            answer["error"]
-        );
+        refused_saying(&answer, reason);
+        resources.push(resource_id);
     }
     assert!(
         !write_to.exists(),
         "a write with no granted resource wrote nothing"
     );
+    for resource_id in resources {
+        assert_eq!(
+            settled_within(&broker, resource_id, LIVENESS_DEADLINE).await,
+            Some(PendingState::Resolved),
+            "each refusal resolves its resource, as this host's own answer"
+        );
+    }
+    let recorded = outbox(&broker);
+    assert!(
+        recorded
+            .iter()
+            .any(|event| event.cause == kr_worker::broker::TransitionCause::HostAnswer),
+        "the settlement names this host's own answer as its cause"
+    );
 
-    drop(owner);
-    drop(upstream_reader);
-    drained.abort();
+    let sent = everything_sent_upstream(owner, drained, upstream_reader).await;
+    for id in [13, 14, 15] {
+        assert_eq!(
+            answers_for(&sent, id),
+            0,
+            "and nothing more followed for {id}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// KR-REQ-12.16: a granted read and a granted write run in the agent's own environment, through the
+/// directory the session granted and nowhere else, and each is answered once.
+#[tokio::test]
+async fn kr_req_12_16_a_granted_reverse_read_and_write_run_through_the_granted_directory() {
+    let broker = broker();
+    let (owner, upstream, _client, drained) = duplex_over_sockets(&broker).await;
+    let mut upstream_reader = tokio::io::BufReader::new(upstream);
+    let directory = private_directory();
+    std::fs::create_dir_all(directory.join("notes")).expect("a subdirectory is made");
+    std::fs::write(
+        directory.join("notes").join("today.md"),
+        "one\ntwo\nthree\n",
+    )
+    .expect("the file is written");
+    grant_files(&broker, &directory, FileAccess::ReadWrite);
+
+    // An absolute path beneath the granted directory, read whole and then from a line.
+    let whole = ask(
+        &owner,
+        31,
+        "fs/read_text_file",
+        serde_json::json!({ "path": directory.join("notes").join("today.md").to_string_lossy() }),
+    )
+    .await;
+    let answer = next_frame(&mut upstream_reader).await;
+    assert_eq!(answer["id"], serde_json::json!(31));
+    assert_eq!(answer["result"]["content"], "one\ntwo\nthree\n");
+    ask(
+        &owner,
+        32,
+        "fs/read_text_file",
+        serde_json::json!({ "path": "notes/today.md", "line": 2, "limit": 1 }),
+    )
+    .await;
+    let answer = next_frame(&mut upstream_reader).await;
+    assert_eq!(answer["result"]["content"], "two\n", "{answer}");
+
+    // A relative path is read from the granted directory. A new file is created; an existing one
+    // has its content replaced.
+    let written = ask(
+        &owner,
+        33,
+        "fs/write_text_file",
+        serde_json::json!({ "path": "notes/new.md", "content": "written" }),
+    )
+    .await;
+    let answer = next_frame(&mut upstream_reader).await;
+    assert_eq!(answer["id"], serde_json::json!(33));
+    assert_eq!(answer["result"], serde_json::json!({}), "{answer}");
+    assert_eq!(
+        std::fs::read_to_string(directory.join("notes").join("new.md")).expect("readable"),
+        "written"
+    );
+    ask(
+        &owner,
+        34,
+        "fs/write_text_file",
+        serde_json::json!({
+            "path": directory.join("notes").join("today.md").to_string_lossy(),
+            "content": "replaced",
+        }),
+    )
+    .await;
+    let answer = next_frame(&mut upstream_reader).await;
+    assert!(answer.get("error").is_none(), "{answer}");
+    assert_eq!(
+        std::fs::read_to_string(directory.join("notes").join("today.md")).expect("readable"),
+        "replaced"
+    );
+    for resource_id in [whole, written] {
+        assert_eq!(
+            settled_within(&broker, resource_id, LIVENESS_DEADLINE).await,
+            Some(PendingState::Resolved)
+        );
+    }
+
+    let sent = everything_sent_upstream(owner, drained, upstream_reader).await;
+    for id in [31, 32, 33, 34] {
+        assert_eq!(
+            answers_for(&sent, id),
+            0,
+            "each was answered once, already read"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// KR-REQ-11.23 and KR-REQ-11.28: a grant that does not cover the operation, a handle of another
+/// environment, a name that leaves the granted directory and an operation over its bound are each
+/// refused, and none of them changes any file.
+///
+/// Every case is a write, because a write is what an effect would be, and every one is also
+/// checked at the place it names.
+#[tokio::test]
+async fn kr_req_11_23_uncovered_foreign_escaping_and_oversized_operations_change_nothing() {
+    let broker = broker();
+    let (owner, upstream, _client, drained) = duplex_over_sockets(&broker).await;
+    let mut upstream_reader = tokio::io::BufReader::new(upstream);
+    let directory = private_directory();
+    let elsewhere = private_directory();
+    std::fs::write(elsewhere.join("kept.txt"), "untouched").expect("the file is written");
+
+    // A read-only grant does not cover a write.
+    grant_files(&broker, &directory, FileAccess::Read);
+    ask(
+        &owner,
+        41,
+        "fs/write_text_file",
+        serde_json::json!({ "path": "a.txt", "content": "x" }),
+    )
+    .await;
+    refused_saying(
+        &next_frame(&mut upstream_reader).await,
+        "permits reading only",
+    );
+    assert!(!directory.join("a.txt").exists());
+
+    // A handle held for another environment is not one this connection's requests may use.
+    grant_files_in(
+        &broker,
+        &directory,
+        FileAccess::ReadWrite,
+        EnvironmentId::new(Uuid::from_bytes([8; 16])),
+        None,
+    );
+    ask(
+        &owner,
+        42,
+        "fs/write_text_file",
+        serde_json::json!({ "path": "a.txt", "content": "x" }),
+    )
+    .await;
+    refused_saying(
+        &next_frame(&mut upstream_reader).await,
+        "belongs to environment",
+    );
+    ask(
+        &owner,
+        43,
+        "fs/read_text_file",
+        serde_json::json!({ "path": elsewhere.join("kept.txt").to_string_lossy() }),
+    )
+    .await;
+    refused_saying(
+        &next_frame(&mut upstream_reader).await,
+        "belongs to environment",
+    );
+    assert!(!directory.join("a.txt").exists());
+
+    // Names that leave the directory: an absolute path elsewhere, a parent segment, and (where the
+    // platform has them without a privilege) a link inside the directory that points out of it.
+    grant_files_in(
+        &broker,
+        &directory,
+        FileAccess::ReadWrite,
+        site(),
+        Some((64, 64)),
+    );
+    #[cfg_attr(
+        not(unix),
+        expect(
+            unused_mut,
+            reason = "only a platform with unprivileged links adds to this list"
+        )
+    )]
+    let mut escapes = vec![
+        elsewhere.join("kept.txt").to_string_lossy().into_owned(),
+        "../kept.txt".to_owned(),
+        format!(
+            "{}/../{}/kept.txt",
+            directory.to_string_lossy(),
+            elsewhere.file_name().expect("a name").to_string_lossy()
+        ),
+    ];
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&elsewhere, directory.join("out")).expect("a link is made");
+        std::os::unix::fs::symlink(elsewhere.join("kept.txt"), directory.join("kept-link"))
+            .expect("a link is made");
+        escapes.push("out/kept.txt".to_owned());
+        escapes.push("kept-link".to_owned());
+    }
+    let mut id = 50;
+    for path in &escapes {
+        id += 1;
+        ask(
+            &owner,
+            id,
+            "fs/write_text_file",
+            serde_json::json!({ "path": path, "content": "overwritten" }),
+        )
+        .await;
+        let answer = next_frame(&mut upstream_reader).await;
+        assert!(
+            answer.get("result").is_none(),
+            "{path} was not written: {answer}"
+        );
+        id += 1;
+        ask(
+            &owner,
+            id,
+            "fs/read_text_file",
+            serde_json::json!({ "path": path }),
+        )
+        .await;
+        let answer = next_frame(&mut upstream_reader).await;
+        assert!(
+            answer.get("result").is_none(),
+            "{path} was not read: {answer}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(elsewhere.join("kept.txt")).expect("readable"),
+        "untouched",
+        "nothing outside the granted directory changed"
+    );
+
+    // Over the bound: a write carrying more than the grant allows is refused before anything is
+    // opened, and a file larger than a read may return is refused without being read.
+    id += 1;
+    ask(
+        &owner,
+        id,
+        "fs/write_text_file",
+        serde_json::json!({ "path": "big.txt", "content": "x".repeat(65) }),
+    )
+    .await;
+    refused_saying(&next_frame(&mut upstream_reader).await, "at most 64");
+    assert!(
+        !directory.join("big.txt").exists(),
+        "an oversized write created nothing"
+    );
+    std::fs::write(directory.join("large.txt"), "y".repeat(65)).expect("the file is written");
+    id += 1;
+    ask(
+        &owner,
+        id,
+        "fs/read_text_file",
+        serde_json::json!({ "path": "large.txt" }),
+    )
+    .await;
+    refused_saying(&next_frame(&mut upstream_reader).await, "at most 64");
+
+    let _ = everything_sent_upstream(owner, drained, upstream_reader).await;
+    let _ = std::fs::remove_dir_all(&directory);
+    let _ = std::fs::remove_dir_all(&elsewhere);
+}
+
+/// KR-REQ-12.13 and KR-REQ-11.27: a reverse write sent twice under one identifier runs once, whether
+/// the second copy arrives while the first is running or after it has been answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_13_a_duplicate_reverse_write_runs_once() {
+    let broker = broker();
+    let (owner, upstream, _client, drained) = duplex_over_sockets(&broker).await;
+    let mut upstream_reader = tokio::io::BufReader::new(upstream);
+    let directory = private_directory();
+    grant_files(&broker, &directory, FileAccess::ReadWrite);
+
+    let (arrived, release) = owner.pause_before_reverse_operation();
+    let write = |content: &str| {
+        serde_json::json!({
+            "id": 61,
+            "method": "fs/write_text_file",
+            "params": { "path": "once.txt", "content": content },
+        })
+        .to_string()
+    };
+    let first = match owner
+        .from_upstream(write("first").as_bytes(), TimestampMs::new(2))
+        .await
+        .expect("the first copy is taken")
+    {
+        Carried::Reverse { resource_id, .. } => resource_id,
+        other => panic!("a reverse request is what this was: {other:?}"),
+    };
+    arrived_at(arrived).await;
+    // The first copy is admitted and has not run. The second is refused as the same identifier.
+    assert!(
+        owner
+            .from_upstream(write("second").as_bytes(), TimestampMs::new(3))
+            .await
+            .is_err(),
+        "one identifier names one request"
+    );
+    release.send(()).expect("the operation is released");
+    let answer = next_frame(&mut upstream_reader).await;
+    assert_eq!(answer["id"], serde_json::json!(61));
+    assert_eq!(
+        settled_within(&broker, first, LIVENESS_DEADLINE).await,
+        Some(PendingState::Resolved)
+    );
+    // Answered, and sent again: still refused, and still nothing runs.
+    assert!(
+        owner
+            .from_upstream(write("third").as_bytes(), TimestampMs::new(4))
+            .await
+            .is_err(),
+        "an answered identifier is not a new request"
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.join("once.txt")).expect("readable"),
+        "first",
+        "the write ran once, with what the first copy carried"
+    );
+
+    let sent = everything_sent_upstream(owner, drained, upstream_reader).await;
+    assert_eq!(
+        answers_for(&sent, 61),
+        0,
+        "the one answer was the one already read"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// KR-REQ-11.33 and KR-REQ-11.27: while this host is performing a reverse request, the native
+/// client's answer and a rich answer to it are both refused, and the upstream receives exactly one
+/// answer.
+///
+/// The host's admission is taken with the request's record, under one lock, so there is no moment
+/// at which another writer could take it first. The race is run both ways round: with the
+/// operation held at its pause, and with the three writers released together.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_33_native_and_rich_answers_lose_to_the_hosts_own_answer() {
+    let broker = broker();
+    let (owner, upstream, _client, drained) = duplex_over_sockets(&broker).await;
+    let upstream_reader = tokio::io::BufReader::new(upstream);
+    let directory = private_directory();
+    grant_files(&broker, &directory, FileAccess::ReadWrite);
+    broker.bind_connection_dispatch(
+        GatewayConnectionId::new(1),
+        owner.dispatch().expect("the connection carries operations"),
+    );
+    let caller = kr_worker::broker::Caller {
+        actor_id: ActorId::new("device-1").expect("valid"),
+        grant_id: None,
+    };
+
+    // Held at the pause: the admission is taken and the file has not been touched.
+    let (arrived, release) = owner.pause_before_reverse_operation();
+    let held = ask(
+        &owner,
+        71,
+        "fs/write_text_file",
+        serde_json::json!({ "path": "held.txt", "content": "the host's" }),
+    )
+    .await;
+    arrived_at(arrived).await;
+    assert!(!directory.join("held.txt").exists(), "nothing has run yet");
+    assert!(
+        owner
+            .from_client(br#"{"id":71,"result":{}}"#, TimestampMs::new(3))
+            .await
+            .is_err(),
+        "the native client's answer is refused before it is forwarded"
+    );
+    assert!(
+        broker
+            .interpret(binding(), held, projection(), None, TimestampMs::new(3))
+            .is_err(),
+        "a request this host performs is not something a person answers"
+    );
+    assert!(
+        broker
+            .agent_approval_respond(
+                &caller,
+                &kr_protocol::agent::AgentApprovalRespondParams {
+                    target: target(),
+                    resource_id: held,
+                    option_id: "allow".to_owned(),
+                },
+                TimestampMs::new(3),
+            )
+            .await
+            .is_err(),
+        "and a rich answer to it is refused"
+    );
+    release.send(()).expect("the operation is released");
+    assert_eq!(
+        settled_within(&broker, held, LIVENESS_DEADLINE).await,
+        Some(PendingState::Resolved)
+    );
+
+    // Released together, many times over.
+    for round in 0..16_u32 {
+        let id = 100 + round;
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+        let upstream_side = {
+            let owner = Arc::clone(&owner);
+            let start = Arc::clone(&start);
+            tokio::spawn(async move {
+                start.wait().await;
+                let frame = serde_json::json!({
+                    "id": id,
+                    "method": "fs/write_text_file",
+                    "params": { "path": format!("race-{id}.txt"), "content": "the host's" },
+                })
+                .to_string();
+                owner
+                    .from_upstream(frame.as_bytes(), TimestampMs::new(5))
+                    .await
+            })
+        };
+        let native_side = {
+            let owner = Arc::clone(&owner);
+            let start = Arc::clone(&start);
+            tokio::spawn(async move {
+                start.wait().await;
+                let frame = format!(r#"{{"id":{id},"result":{{}}}}"#);
+                owner
+                    .from_client(frame.as_bytes(), TimestampMs::new(5))
+                    .await
+            })
+        };
+        let rich_side = {
+            let broker = Arc::clone(&broker);
+            let caller = caller.clone();
+            let start = Arc::clone(&start);
+            tokio::spawn(async move {
+                start.wait().await;
+                let resource = broker
+                    .pending_resources()
+                    .into_iter()
+                    .find(|resource| resource.request.upstream.as_str() == id.to_string())?;
+                Some(
+                    broker
+                        .agent_approval_respond(
+                            &caller,
+                            &kr_protocol::agent::AgentApprovalRespondParams {
+                                target: target(),
+                                resource_id: resource.resource_id,
+                                option_id: "allow".to_owned(),
+                            },
+                            TimestampMs::new(5),
+                        )
+                        .await
+                        .is_ok(),
+                )
+            })
+        };
+        let carried = upstream_side
+            .await
+            .expect("joined")
+            .expect("the request is taken");
+        let Carried::Reverse { resource_id, .. } = carried else {
+            panic!("a reverse request is what this was");
+        };
+        assert!(
+            native_side.await.expect("joined").is_err(),
+            "round {round}: the native answer never wins"
+        );
+        assert_ne!(
+            rich_side.await.expect("joined"),
+            Some(true),
+            "round {round}: the rich answer never wins"
+        );
+        assert_eq!(
+            settled_within(&broker, resource_id, LIVENESS_DEADLINE).await,
+            Some(PendingState::Resolved)
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.join(format!("race-{id}.txt"))).expect("readable"),
+            "the host's"
+        );
+    }
+
+    let sent = everything_sent_upstream(owner, drained, upstream_reader).await;
+    assert_eq!(answers_for(&sent, 71), 1, "one answer reached the upstream");
+    for round in 0..16_u32 {
+        assert_eq!(
+            answers_for(&sent, 100 + round),
+            1,
+            "round {round}: exactly one answer reached the upstream"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(directory.join("held.txt")).expect("readable"),
+        "the host's"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// KR-REQ-11.32 and KR-REQ-11.31: a reverse operation that blocks does not stop the connection
+/// carrying everything else, and the upstream is answered at the deadline rather than when the
+/// operation returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_32_a_blocked_reverse_read_does_not_stop_forwarding() {
+    let broker = broker();
+    let (owner, upstream, client, drained) = duplex_over_sockets(&broker).await;
+    let mut upstream_reader = tokio::io::BufReader::new(upstream);
+    let mut client_reader = tokio::io::BufReader::new(client);
+    let directory = private_directory();
+    std::fs::write(directory.join("slow.txt"), "slow").expect("the file is written");
+    grant_files(&broker, &directory, FileAccess::Read);
+    owner.set_reverse_deadline(std::time::Duration::from_millis(300));
+
+    let (arrived, release) = owner.pause_before_reverse_operation();
+    let blocked = ask(
+        &owner,
+        81,
+        "fs/read_text_file",
+        serde_json::json!({ "path": "slow.txt" }),
+    )
+    .await;
+    arrived_at(arrived).await;
+
+    // The read is holding its thread. Everything else still moves, in both directions.
+    owner
+        .from_upstream(
+            br#"{"method":"session/update","params":{"n":1}}"#,
+            TimestampMs::new(3),
+        )
+        .await
+        .expect("a notification is carried");
+    owner
+        .from_upstream(
+            br#"{"id":82,"method":"session/request_permission","params":{}}"#,
+            TimestampMs::new(3),
+        )
+        .await
+        .expect("a request is carried");
+    assert!(
+        next_line(&mut client_reader)
+            .await
+            .contains("session/update")
+    );
+    assert!(
+        next_line(&mut client_reader)
+            .await
+            .contains("session/request_permission")
+    );
+    owner
+        .from_client(
+            br#"{"id":5,"method":"session/update","params":{"from":"the terminal"}}"#,
+            TimestampMs::new(3),
+        )
+        .await
+        .expect("the client's own request is carried");
+
+    // The upstream reads the client's request and, at the deadline, the read's answer, in
+    // whichever order they were written.
+    let mut read_answer = None;
+    let mut forwarded = false;
+    while read_answer.is_none() || !forwarded {
+        let frame = next_frame(&mut upstream_reader).await;
+        if frame.get("method").is_some() {
+            forwarded = true;
+        } else if frame["id"] == serde_json::json!(81) {
+            read_answer = Some(frame);
+        }
+    }
+    let read_answer = read_answer.expect("the read is answered");
+    refused_saying(&read_answer, "did not finish within 300 milliseconds");
+    assert_eq!(
+        settled_within(&broker, blocked, LIVENESS_DEADLINE).await,
+        Some(PendingState::Resolved),
+        "a read that overran changed nothing, so its answer resolves it"
+    );
+
+    // Letting the stalled read return sends nothing more.
+    release.send(()).expect("the operation is released");
+    let sent = everything_sent_upstream(owner, drained, upstream_reader).await;
+    assert_eq!(
+        answers_for(&sent, 81),
+        0,
+        "the deadline's answer was the only one"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// KR-REQ-11.32: one connection runs a bounded number of reverse operations at once. A place is
+/// held until the platform returns from the operation, so a stalled filesystem cannot collect more
+/// threads than the bound however many requests arrive, and a request that finds no place is
+/// refused without running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_32_a_connection_runs_a_bounded_number_of_reverse_operations() {
+    let broker = broker();
+    let (owner, upstream, _client, drained) = duplex_over_sockets(&broker).await;
+    let mut upstream_reader = tokio::io::BufReader::new(upstream);
+    let directory = private_directory();
+    std::fs::write(directory.join("f.txt"), "f").expect("the file is written");
+    grant_files(&broker, &directory, FileAccess::ReadWrite);
+    owner.set_reverse_deadline(std::time::Duration::from_millis(200));
+
+    let mut releases = Vec::new();
+    for slot in 0..kr_worker::broker::MAX_REVERSE_IN_FLIGHT {
+        let (arrived, release) = owner.pause_before_reverse_operation();
+        ask(
+            &owner,
+            u32::try_from(90 + slot).expect("small"),
+            "fs/read_text_file",
+            serde_json::json!({ "path": "f.txt" }),
+        )
+        .await;
+        arrived_at(arrived).await;
+        releases.push(release);
+    }
+    // Every place is held by an operation the platform has not returned from.
+    ask(
+        &owner,
+        99,
+        "fs/write_text_file",
+        serde_json::json!({ "path": "not-run.txt", "content": "x" }),
+    )
+    .await;
+    let mut refused = None;
+    while refused.is_none() {
+        let frame = next_frame(&mut upstream_reader).await;
+        if frame["id"] == serde_json::json!(99) {
+            refused = Some(frame);
+        }
+    }
+    refused_saying(
+        &refused.expect("answered"),
+        "reverse operations running, so filesystem_write was not started",
+    );
+    assert!(!directory.join("not-run.txt").exists(), "it did not run");
+    for release in releases {
+        release.send(()).expect("released");
+    }
+    let _ = everything_sent_upstream(owner, drained, upstream_reader).await;
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// KR-REQ-11.35 and KR-REQ-11.23: while the journal is faulted a reverse write is refused, because
+/// its marker cannot be recorded, and a reverse read still runs under the in-memory arbitration.
+#[tokio::test]
+async fn kr_req_11_35_a_faulted_journal_refuses_reverse_writes_and_keeps_reads() {
+    let broker = broker();
+    let (owner, upstream, _client, drained) = duplex_over_sockets(&broker).await;
+    let mut upstream_reader = tokio::io::BufReader::new(upstream);
+    let directory = private_directory();
+    std::fs::write(directory.join("r.txt"), "readable").expect("the file is written");
+    grant_files(&broker, &directory, FileAccess::ReadWrite);
+    broker
+        .enter_volatile("the journal could not be written", TimestampMs::new(2))
+        .expect("the gateway is fenced");
+
+    ask(
+        &owner,
+        111,
+        "fs/write_text_file",
+        serde_json::json!({ "path": "w.txt", "content": "x" }),
+    )
+    .await;
+    refused_saying(
+        &next_frame(&mut upstream_reader).await,
+        "cannot record that filesystem_write is about to run",
+    );
+    assert!(!directory.join("w.txt").exists());
+    ask(
+        &owner,
+        112,
+        "fs/read_text_file",
+        serde_json::json!({ "path": "r.txt" }),
+    )
+    .await;
+    assert_eq!(
+        next_frame(&mut upstream_reader).await["result"]["content"],
+        "readable"
+    );
+    let _ = everything_sent_upstream(owner, drained, upstream_reader).await;
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// KR-REQ-11.27, KR-REQ-12.16 and KR-REQ-24: a process that ends after the marker and before the
+/// operation leaves the request uncertain, and nothing after the restart runs it.
+///
+/// The journal is copied at the moment the process stops, which is what a crash leaves on the
+/// disk. The restarted broker reads that copy: the request comes back with its marker, a
+/// reconciliation leaves it uncertain rather than answerable, and the upstream sending the same
+/// request again on the restored connection is refused as the request it already is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_27_a_crash_after_the_marker_leaves_the_write_uncertain_and_never_runs_it_again()
+{
+    let scratch = private_directory();
+    let journal = scratch.join("journal.db");
+    let (broker, connection) = broker_at(&journal);
+    let served = duplex_watched_on(&broker, connection).await;
+    let directory = private_directory();
+    grant_files(&broker, &directory, FileAccess::ReadWrite);
+
+    let (arrived, release) = served.owner.pause_before_reverse_operation();
+    let request = serde_json::json!({
+        "id": 121,
+        "method": "fs/write_text_file",
+        "params": { "path": "out.txt", "content": "written before the crash" },
+    })
+    .to_string();
+    let Carried::Reverse { resource_id, .. } = served
+        .owner
+        .from_upstream(request.as_bytes(), TimestampMs::new(2))
+        .await
+        .expect("the request is taken")
+    else {
+        panic!("a reverse request is what this was");
+    };
+    arrived_at(arrived).await;
+
+    // The process stops here. What the disk holds is what the journal committed.
+    let copied = scratch.join("after-crash.db");
+    rusqlite::Connection::open(&journal)
+        .expect("the journal opens")
+        .execute(
+            "VACUUM INTO ?1",
+            [copied.to_str().expect("a test path is text")],
+        )
+        .expect("the journal is copied as the crash left it");
+
+    // The restart. Its own connection is numbered above the old one, and the old one is restored
+    // for the upstream that comes back to it.
+    let (restarted, _) = broker_at(&copied);
+    let recorded = restarted
+        .recorded(resource_id)
+        .expect("the ledger reads")
+        .expect("the request came back");
+    assert_eq!(
+        recorded.state,
+        PendingState::Claimed,
+        "claimed, with its marker"
+    );
+    restarted
+        .restore_native_connection(
+            connection,
+            instance(),
+            &CREDENTIAL,
+            &process_identity(),
+            &package(),
+            "1",
+        )
+        .expect("the old connection is restored");
+    grant_files(&restarted, &directory, FileAccess::ReadWrite);
+    let reconciled = restarted
+        .reconcile(
+            kr_worker::broker::ReconcileScope {
+                application_instance_id: instance(),
+                connection,
+            },
+            std::slice::from_ref(&recorded.request),
+            TimestampMs::new(3),
+        )
+        .expect("the upstream is reconciled");
+    assert_eq!(
+        reconciled.uncertain,
+        vec![resource_id],
+        "an operation that may have run is uncertain, never answerable again"
+    );
+    let replay = duplex_watched_on(&restarted, connection).await;
+    assert!(
+        replay
+            .owner
+            .from_upstream(request.as_bytes(), TimestampMs::new(4))
+            .await
+            .is_err(),
+        "the same request on the restored connection is the request it already is"
+    );
+
+    // The process that stopped never goes on. Its operation is abandoned where it stood, and the
+    // absence of the file is read once that operation has finished and its resource has settled,
+    // so nothing that could still write it is running.
+    drop(release);
+    assert!(
+        settled_within(&broker, resource_id, LIVENESS_DEADLINE)
+            .await
+            .is_some(),
+        "the stopped operation finished without running"
+    );
+    assert!(
+        !directory.join("out.txt").exists(),
+        "the write ran neither before the crash nor after the restart"
+    );
+    assert_eq!(
+        restarted
+            .pending(resource_id)
+            .map(|resource| resource.state),
+        Some(PendingState::Uncertain)
+    );
+    served.drained.abort();
+    replay.drained.abort();
+    let _ = std::fs::remove_dir_all(&directory);
+    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 /// KR-REQ-12.14 and KR-REQ-11.43: the endpoint the transport runs over is one the host bound, and
@@ -1511,12 +2420,15 @@ async fn kr_req_12_13_traffic_in_both_directions_keeps_identifiers_that_look_ali
         )
         .await
         .expect("a reverse request is carried");
-    assert_eq!(
-        reverse,
-        Carried::Reverse {
-            operation: ReverseOperation::FilesystemRead,
-            performed: false,
-        }
+    assert!(
+        matches!(
+            reverse,
+            Carried::Reverse {
+                operation: ReverseOperation::FilesystemRead,
+                ..
+            }
+        ),
+        "{reverse:?}"
     );
 
     // The native client asks the upstream for something of its own, also under raw seven. It goes
@@ -3402,7 +4314,7 @@ async fn kr_req_11_30_an_unclassified_client_request_suspends_rich_mutations_bef
         Framing::new(NativeFraming::JsonLines),
         upstream_here,
         tokio::io::split(client_here).1,
-        EnvironmentId::new(Uuid::from_bytes([4; 16])),
+        site(),
         "agent-user",
     );
     let drained = tokio::spawn(writes);
@@ -3581,7 +4493,7 @@ async fn kr_req_11_33_a_blocked_partial_or_unanswered_write_is_never_a_success()
         Framing::new(NativeFraming::JsonLines),
         upstream_here,
         tokio::io::split(client_here).1,
-        EnvironmentId::new(Uuid::from_bytes([4; 16])),
+        site(),
         "agent-user",
     );
     let drained = tokio::spawn(writes);

@@ -20,6 +20,10 @@ kr-ipc.workspace = true
 kr-protocol.workspace = true
 kr-shell-integration.workspace = true
 kr-term.workspace = true
+# A reverse file operation an upstream asks for runs through the transfer service's handle-based
+# file authority, never through a path of its own. The worker calls that authority and nothing
+# else of the crate: its previews and their image decoders are linked with it and never reached.
+kr-transfer.workspace = true
 kr-transport.workspace = true
 libc.workspace = true
 portable-pty.workspace = true
