@@ -122,6 +122,25 @@ jobs_left() {
   done
 }
 
+# Records every TextEdit this run started that no record names yet: one given this run's root as
+# its argument, read in one look. A record the session's shell wrote may never have arrived, and
+# the instance it describes is this run's to end all the same.
+record_marked_textedits() {
+  local pid line command
+  for pid in $(pgrep -u "$uid" -f "TextEdit.app/Contents/MacOS/TextEdit" 2>/dev/null); do
+    line="$(LC_ALL=C ps -o lstart=,command= -p "$pid" 2>/dev/null)"
+    command="$(printf '%s' "$line" | cut -c25- | sed 's/^ *//')"
+    case $command in
+      *" -KalaReachRun $run_root") ;;
+      *) continue ;;
+    esac
+    case " ${owned_processes[*]:-} " in
+      *" $pid|"*) ;;
+      *) record_process "$pid" "$(printf '%s' "$line" | cut -c1-24)" "$command" ;;
+    esac
+  done
+}
+
 cleanup() {
   local status=$?
   # Only what this script started, by the identifiers it recorded.
@@ -143,6 +162,7 @@ for entry in document.get("sessions", []):
     sleep 1
   done
   # Each by its record, and only while its number still names the process this run started.
+  record_marked_textedits
   end_owned_processes
   sleep 1
   local survivors keep=0
@@ -294,7 +314,8 @@ sleep 3
 /usr/bin/lsappinfo list > "$evidence/lsappinfo" 2>&1 || true
 # The instance this shell started, found by that argument: its number, when it started and what it
 # runs, read in one look, so the record describes this process and nothing that takes its number
-# later. The start time is the first 24 characters of what `ps` prints for it.
+# later. The start time is the first 24 characters of what `ps` prints for it. The records are
+# written aside and put in place whole, so whoever waits for them never reads half of them.
 for pid in $(/usr/bin/pgrep -u "$(id -u)" -f "TextEdit.app/Contents/MacOS/TextEdit" 2>/dev/null); do
   line="$(LC_ALL=C /bin/ps -o lstart=,command= -p "$pid" 2>/dev/null)"
   command="$(printf '%s' "$line" | cut -c25- | sed 's/^ *//')"
@@ -303,7 +324,8 @@ for pid in $(/usr/bin/pgrep -u "$(id -u)" -f "TextEdit.app/Contents/MacOS/TextEd
       printf '%s|%s|%s\n' "$pid" "$(printf '%s' "$line" | cut -c1-24)" "$command"
       ;;
   esac
-done > "$evidence/textedit-started"
+done > "$evidence/textedit-started.partial"
+mv "$evidence/textedit-started.partial" "$evidence/textedit-started"
 exec cat
 SCRIPT
 chmod +x "$run_root/bin/launch-gui.sh"
@@ -323,12 +345,15 @@ require "$(cat "$run_root/evidence/managername" 2>/dev/null || true)" "Aqua" \
   "the invisible session's shell is in the graphical login context"
 new_gui=""
 # Recorded as the session's shell saw each one start, so a number is not signalled once it names
-# something else, and no TextEdit this run did not start is ever recorded.
-while IFS='|' read -r pid started command; do
-  [ -n "$pid" ] || continue
-  record_process "$pid" "$started" "$command"
-  new_gui="$new_gui $pid"
-done <"$run_root/evidence/textedit-started"
+# something else, and no TextEdit this run did not start is ever recorded. A record that never
+# arrived is a failure here, and the instance is still found by its argument on the way out.
+if [ -e "$run_root/evidence/textedit-started" ]; then
+  while IFS='|' read -r pid started command; do
+    [ -n "$pid" ] || continue
+    record_process "$pid" "$started" "$command"
+    new_gui="$new_gui $pid"
+  done <"$run_root/evidence/textedit-started"
+fi
 if [ -z "$new_gui" ]; then
   fail "a graphical application started from the session's shell"
 else
