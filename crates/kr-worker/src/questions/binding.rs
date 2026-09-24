@@ -121,13 +121,18 @@ impl VerifiedSource {
     ///
     /// It is the process and its start value, which is what section 11 means by the verified
     /// originating application: a new execution under the same name is a different key, so it
-    /// cannot inherit the pending decisions of the one before it.
+    /// cannot inherit the pending decisions of the one before it. On Windows the start value is the
+    /// creation time in the hundreds of nanoseconds the kernel records, so a helper that takes the
+    /// identifier of one that exited within the same second is a new key too.
     #[must_use]
     pub fn key(&self) -> String {
         let source = match self.process.source {
             ProcessStartSource::LinuxProcStat => "linux",
             ProcessStartSource::MacosProcBsdInfo => "macos",
-            ProcessStartSource::WindowsProcessStartSeconds => "windows",
+            ProcessStartSource::WindowsProcessCreationTime => "windows",
+            // No source this worker binds is read in whole seconds. The name only keeps such an
+            // identity's key apart from every key this build makes, and goes with the source.
+            ProcessStartSource::WindowsProcessStartSeconds => "windows_seconds",
         };
         format!(
             "{}:{source}:{}",
@@ -2570,5 +2575,14 @@ mod tests {
             connection_id: ConnectionId::new(Uuid::from_bytes([3; 16])),
         };
         assert_eq!(source.key(), "42:linux:9");
+        let windows = VerifiedSource {
+            process: windows_process(42, CREATED),
+            ..source
+        };
+        assert_eq!(
+            windows.key(),
+            format!("42:windows:{}", CREATED - 116_444_736_000_000_000),
+            "a Windows key carries the creation time in hundreds of nanoseconds since 1970"
+        );
     }
 }

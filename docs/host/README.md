@@ -478,7 +478,7 @@ Boot and process-start identities come from the kernel:
 | --- | --- | --- |
 | Linux | `/proc/sys/kernel/random/boot_id` | `/proc/<pid>/stat` field 22 |
 | macOS | `kern.bootsessionuuid` | `proc_pidinfo(PROC_PIDTBSDINFO)` |
-| Windows | the recorded boot time | the process creation time in whole seconds |
+| Windows | the recorded boot time | `GetProcessTimes`: the creation time in hundreds of nanoseconds since 1970 |
 
 A process identifier alone is never enough. Every ownership check compares the start value as well,
 so a recycled identifier reads as a different process. A query the operating system refuses is
@@ -487,11 +487,19 @@ release a session identity while its worker was still running.
 
 A process query answers one of three things: the process and its start identity, gone, or cannot
 be established. Only an answer that no process holds the identifier is "gone": a missing
-`/proc/<pid>/stat` on Linux, `ESRCH` from `proc_pidinfo` on macOS, and on Windows a process table
-that was read and does not list the identifier. A Windows table read always lists the process
-reading it, so a reading that does not is a query that failed. A process listed with a start time
-of zero, or with one more than a day after the current time, is one whose start the operating
-system would not give; neither case can be established.
+`/proc/<pid>/stat` on Linux, `ESRCH` from `proc_pidinfo` on macOS, and on Windows the kernel's
+refusal to open an identifier no process holds. A refusal of access, or a process whose times cannot
+be read, is a query that failed. A creation time of zero, one before 1970, or one more than a day
+after the current time is one whose start the operating system would not give; none of these can
+be established. Windows describes a process that has exited for as long as anything holds it open,
+so a process whose identity matches is asked as well whether it has exited.
+
+Windows records a creation time in hundreds of nanoseconds, and the start value keeps them, so two
+processes created under one identifier within one second are two start identities. A worker of the
+previous release states its start in whole seconds, and so do the records it and its controller
+wrote. Such an identity names the process that holds the identifier now if that process was created
+in the same second, which is how that release read it. Whole seconds are read until the first
+release after one in which every running worker states the finer value.
 
 ### Where the daemon keeps its keys
 

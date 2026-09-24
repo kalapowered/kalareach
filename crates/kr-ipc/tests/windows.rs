@@ -233,15 +233,16 @@ Write-Output 'connected'
 Start-Sleep -Seconds 60
 ";
 
-/// Prints when the operating system says one process was created, in whole seconds since 1970.
+/// Prints when the operating system says one process was created, in hundreds of nanoseconds since
+/// 1970.
 ///
 /// The standard library of PowerShell reads it through its own process API, not through the reader
-/// under test.
+/// under test, and keeps the unit the kernel records.
 const CREATED_AT: &str = r"
 param([int]$Id)
 $ErrorActionPreference = 'Stop'
-$started = (Get-Process -Id $Id).StartTime
-Write-Output ([DateTimeOffset]::new($started.ToUniversalTime()).ToUnixTimeSeconds())
+$started = (Get-Process -Id $Id).StartTime.ToUniversalTime()
+Write-Output ($started.Ticks - [DateTime]::UnixEpoch.Ticks)
 ";
 
 /// Prints when the operating system says each of two processes was created, in hundreds of
@@ -423,16 +424,17 @@ async fn the_listener_names_the_process_at_the_other_end_of_the_pipe() {
     assert_eq!(identity.pid.get(), u64::from(client_id));
     assert_eq!(
         identity.source,
-        ProcessStartSource::WindowsProcessStartSeconds
+        ProcessStartSource::WindowsProcessCreationTime
     );
 }
 
 /// KR-REQ-11.52: what binds a caller to its own process and start time is the operating system's
 /// record of that process. The start identity this host reads for a process is the creation time
-/// the operating system gives for it, in whole seconds, read here through PowerShell's own process
-/// API rather than the reader under test; the identity reads as running while the process runs,
-/// another start value under the same identifier reads as another process, and once the process has
-/// gone the identity reads as ended.
+/// the operating system gives for it, in hundreds of nanoseconds since 1970, read here through
+/// PowerShell's own process API rather than the reader under test; the identity reads as running
+/// while the process runs, another start value under the same identifier - one interval of the
+/// kernel's later - reads as another process, and once the process has gone the identity reads as
+/// ended.
 #[test]
 fn a_process_start_identity_is_the_creation_time_the_system_records() {
     let host = TempHost::create();
@@ -472,7 +474,7 @@ fn a_process_start_identity_is_the_creation_time_the_system_records() {
         identity,
         ProcessStartIdentity::new(
             u64::from(pid),
-            ProcessStartSource::WindowsProcessStartSeconds,
+            ProcessStartSource::WindowsProcessCreationTime,
             recorded
         ),
         "the start identity is the process and the creation time the operating system records"
@@ -562,6 +564,15 @@ fn two_processes_started_within_one_second_carry_different_start_values() {
             "two processes created {} hundred-nanosecond intervals apart within one second carry \
              different start values: {first_identity:?} and {second_identity:?}",
             second_ticks.abs_diff(first_ticks)
+        );
+        // Each is the creation time PowerShell reads, in the same unit from the same epoch, which
+        // is what the shell bridge reports for itself.
+        assert_eq!(first_identity.start_value.get(), first_ticks);
+        assert_eq!(second_identity.start_value.get(), second_ticks);
+        // Control: in whole seconds, the unit the previous build read, the two are one value.
+        assert_eq!(
+            first_identity.start_value.get() / TICKS_PER_SECOND,
+            second_identity.start_value.get() / TICKS_PER_SECOND
         );
         return;
     }

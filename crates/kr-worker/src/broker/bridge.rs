@@ -1105,7 +1105,7 @@ mod tests {
         BridgeProcess {
             identity: ProcessStartIdentity::new(
                 pid,
-                kr_protocol::identity::ProcessStartSource::WindowsProcessStartSeconds,
+                kr_protocol::identity::ProcessStartSource::WindowsProcessCreationTime,
                 50,
             ),
             starter: Some(application(id)),

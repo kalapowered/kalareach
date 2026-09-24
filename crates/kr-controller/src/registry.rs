@@ -14,7 +14,7 @@
 //! * A **tombstone** is the record of a closed session, so a reader is answered rather than being
 //!   sent to an endpoint that might start something.
 
-use kr_protocol::identity::{ProcessStartIdentity, WorkerProfile};
+use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource, WorkerProfile};
 use kr_protocol::ids::{
     ActorId, AuthorityRevision, ControllerGeneration, EnvironmentId, SessionId,
 };
@@ -1287,23 +1287,26 @@ pub struct Admission {
     pub deduplicated: bool,
 }
 
-const fn source_name(source: kr_protocol::identity::ProcessStartSource) -> &'static str {
+/// Returns the stored form of where a process start value came from.
+const fn source_name(source: ProcessStartSource) -> &'static str {
     match source {
-        kr_protocol::identity::ProcessStartSource::LinuxProcStat => "linux_proc_stat",
-        kr_protocol::identity::ProcessStartSource::MacosProcBsdInfo => "macos_proc_bsd_info",
-        kr_protocol::identity::ProcessStartSource::WindowsProcessStartSeconds => {
-            "windows_process_start_seconds"
-        }
+        ProcessStartSource::LinuxProcStat => "linux_proc_stat",
+        ProcessStartSource::MacosProcBsdInfo => "macos_proc_bsd_info",
+        ProcessStartSource::WindowsProcessCreationTime => "windows_process_creation_time",
+        // What a worker of the previous build states, and what this registry recorded for one.
+        // It goes with the source itself: in the first release after one in which every running
+        // worker states the creation time.
+        ProcessStartSource::WindowsProcessStartSeconds => "windows_process_start_seconds",
     }
 }
 
-fn source_from(text: &str) -> Result<kr_protocol::identity::ProcessStartSource> {
+/// Reads back what [`source_name`] wrote, and refuses anything else.
+fn source_from(text: &str) -> Result<ProcessStartSource> {
     match text {
-        "linux_proc_stat" => Ok(kr_protocol::identity::ProcessStartSource::LinuxProcStat),
-        "macos_proc_bsd_info" => Ok(kr_protocol::identity::ProcessStartSource::MacosProcBsdInfo),
-        "windows_process_start_seconds" => {
-            Ok(kr_protocol::identity::ProcessStartSource::WindowsProcessStartSeconds)
-        }
+        "linux_proc_stat" => Ok(ProcessStartSource::LinuxProcStat),
+        "macos_proc_bsd_info" => Ok(ProcessStartSource::MacosProcBsdInfo),
+        "windows_process_creation_time" => Ok(ProcessStartSource::WindowsProcessCreationTime),
+        "windows_process_start_seconds" => Ok(ProcessStartSource::WindowsProcessStartSeconds),
         _ => Err(ControllerError::registry(
             "a stored process identity source is not known",
         )),

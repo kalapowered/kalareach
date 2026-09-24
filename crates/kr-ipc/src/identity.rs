@@ -8,7 +8,7 @@
 //! | --- | --- | --- |
 //! | Linux, Android | `/proc/sys/kernel/random/boot_id` | `/proc/<pid>/stat` field 22 |
 //! | macOS | `kern.bootsessionuuid` | `proc_pidinfo(PROC_PIDTBSDINFO)` |
-//! | Windows | the recorded boot time | the process creation time in whole seconds |
+//! | Windows | the recorded boot time | `GetProcessTimes`: the creation time in hundreds of nanoseconds |
 //! | iOS and the other Apple mobile systems | refused by name | refused by name |
 //!
 //! Android is Linux and reads the same two files. The Apple mobile systems are the one case where
@@ -18,9 +18,11 @@
 //! host that believes something nobody established.
 //!
 //! The Windows boot time comes from `sysinfo`, which reports it as the wall clock minus the uptime.
-//! A process's creation time comes from the kernel, through `GetProcessTimes`, which records it in
-//! hundreds of nanoseconds; the start value keeps its whole seconds. A Windows worker's per-session
-//! Job Object carries the ownership a recycled identifier could otherwise confuse.
+//! A process's creation time comes from the kernel, through `GetProcessTimes`, in the hundreds of
+//! nanoseconds the kernel records it in, so two processes created under one identifier within one
+//! second carry two start values. A worker of the previous build states its start in whole
+//! seconds, and [`process_state`] reads such an identity the way that build did, for as long as one
+//! can still be running.
 
 use kr_protocol::identity::{BootIdentity, ProcessStartIdentity, ProcessStartSource};
 // Only a platform that produces a boot identity names where it came from. The Apple mobile
@@ -160,10 +162,10 @@ pub fn current_process_start_identity() -> Result<ProcessStartIdentity> {
 /// The start value an identity carries when the kernel would not describe the process.
 ///
 /// No platform's start value can reach it. Linux counts clock ticks since the boot, macOS counts
-/// microseconds since the epoch and Windows counts whole seconds since the epoch; a machine that
-/// had been running for as many ticks as this, or a clock this far past 1970, is not a machine this
-/// host will meet. Reserving the value is what lets [`ended_process_identity`] name a process
-/// without claiming a reading nobody took.
+/// microseconds since the epoch and Windows counts hundreds of nanoseconds since the epoch; a
+/// machine that had been running for as many ticks as this, or a clock this far past 1970, is not a
+/// machine this host will meet. Reserving the value is what lets [`ended_process_identity`] name a
+/// process without claiming a reading nobody took.
 pub const START_VALUE_UNREAD: u64 = u64::MAX;
 
 /// Returns the identity of a process that had already ended before the kernel would describe it.
@@ -241,36 +243,97 @@ pub enum ProcessState {
 /// identifier reads as [`ProcessState::Ended`] rather than as the original process.
 #[must_use]
 pub fn process_state(identity: &ProcessStartIdentity) -> ProcessState {
+    current_process(identity).into()
+}
+
+/// What the kernel says now about a recorded process, with the identity this build reads for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CurrentProcess {
+    /// The process is running, and this is its identity as this build reads it.
+    Running(ProcessStartIdentity),
+    /// The process is gone, or its identifier now belongs to a different process.
+    Ended,
+    /// The operating system did not answer, so neither answer is established.
+    Unknown {
+        /// Why the query failed.
+        detail: String,
+    },
+}
+
+impl From<CurrentProcess> for ProcessState {
+    fn from(current: CurrentProcess) -> Self {
+        match current {
+            CurrentProcess::Running(_) => Self::Running,
+            CurrentProcess::Ended => Self::Ended,
+            CurrentProcess::Unknown { detail } => Self::Unknown { detail },
+        }
+    }
+}
+
+/// Asks the kernel about a recorded process, as [`process_state`] does, and names it as this build
+/// reads it when it is running.
+///
+/// For an identity this build read, the name is the identity itself. For one a worker of the
+/// previous build stated in whole seconds, it is the same process at the resolution this build
+/// reads, which is what lets a record of it be written at that resolution.
+#[must_use]
+pub fn current_process(identity: &ProcessStartIdentity) -> CurrentProcess {
     // An identity the kernel never described belongs to a process that had already ended when it
     // was made. Asking about the identifier now would be asking about whoever holds it next.
     if identity.start_value.get() == START_VALUE_UNREAD {
-        return ProcessState::Ended;
+        return CurrentProcess::Ended;
     }
     let Ok(pid) = u32::try_from(identity.pid.get()) else {
-        return ProcessState::Ended;
+        return CurrentProcess::Ended;
     };
-    state_from(identity, pid, query_process(pid))
+    current_from(identity, pid, query_process(pid))
 }
 
-/// What a query about `pid` says about the process `identity` recorded.
-fn state_from(identity: &ProcessStartIdentity, pid: u32, query: ProcessQuery) -> ProcessState {
+/// What a query about `pid` says about the process `identity` recorded, named as this build reads
+/// it.
+fn current_from(identity: &ProcessStartIdentity, pid: u32, query: ProcessQuery) -> CurrentProcess {
     match query {
         // The identifier and the start value are the process that was recorded. Whether it is
         // still running is a second question on a platform that describes a process after it has
-        // exited: Linux keeps the `/proc` entry of a process whose status nobody has collected, and
-        // a process waiting to be collected has ended. The recorded start value goes with the
-        // question, because a platform that has to look again has to know whether what it is
-        // looking at is still the same process.
-        ProcessQuery::Present(current) if current.matches(identity) => {
-            platform::liveness(pid, identity.start_value.get())
+        // exited: Linux keeps the `/proc` entry of a process whose status nobody has collected,
+        // Windows describes an exited process for as long as anything holds it open, and a process
+        // in either state has ended. The start value this build read goes with the question,
+        // because a platform that has to look again has to know whether what it is looking at is
+        // still the same process.
+        ProcessQuery::Present(current)
+            if current.matches(identity) || named_in_whole_seconds(identity, &current) =>
+        {
+            match platform::liveness(pid, current.start_value.get()) {
+                ProcessState::Running => CurrentProcess::Running(current),
+                ProcessState::Ended => CurrentProcess::Ended,
+                ProcessState::Unknown { detail } => CurrentProcess::Unknown { detail },
+            }
         }
         // Another process holds the identifier now, or none does: either way the recorded one has
         // gone.
-        ProcessQuery::Present(_) | ProcessQuery::Gone => ProcessState::Ended,
-        ProcessQuery::CannotEstablish(error) => ProcessState::Unknown {
+        ProcessQuery::Present(_) | ProcessQuery::Gone => CurrentProcess::Ended,
+        ProcessQuery::CannotEstablish(error) => CurrentProcess::Unknown {
             detail: error.to_string(),
         },
     }
+}
+
+/// Whether `current`, as this build reads a Windows process, is the process a worker of the
+/// previous build named as `recorded` in whole seconds.
+///
+/// A worker of the previous build keeps running across an upgrade and states its identity in whole
+/// seconds, signed, and so do the records it and its controller wrote. This is how the previous
+/// build read such an identity - the same identifier, and a creation time in the same second - so
+/// such a worker is judged exactly as it was before the upgrade: no worse, and no better, since two
+/// processes created under one identifier within one second are one identity this way.
+///
+/// Remove it with [`ProcessStartSource::WindowsProcessStartSeconds`], in the first release after
+/// one in which every running worker states [`ProcessStartSource::WindowsProcessCreationTime`].
+fn named_in_whole_seconds(recorded: &ProcessStartIdentity, current: &ProcessStartIdentity) -> bool {
+    recorded.source == ProcessStartSource::WindowsProcessStartSeconds
+        && current.source == ProcessStartSource::WindowsProcessCreationTime
+        && recorded.pid == current.pid
+        && current.start_value.get() / FILETIME_UNITS_PER_SECOND == recorded.start_value.get()
 }
 
 fn unavailable(what: &'static str, detail: impl Into<String>) -> IpcError {
@@ -1018,7 +1081,7 @@ mod process_times {
 }
 
 /// Where the start value of a Windows reading comes from.
-const WINDOWS_START_SOURCE: ProcessStartSource = ProcessStartSource::WindowsProcessStartSeconds;
+const WINDOWS_START_SOURCE: ProcessStartSource = ProcessStartSource::WindowsProcessCreationTime;
 
 /// The Unix epoch as a `FILETIME`: hundreds of nanoseconds from the start of 1601 to the start of
 /// 1970, UTC.
@@ -1093,13 +1156,18 @@ pub fn windows_answer(pid: u32, reading: WindowsReading, now: u64) -> ProcessQue
     ProcessQuery::Present(ProcessStartIdentity::new(
         u64::from(pid),
         WINDOWS_START_SOURCE,
-        since_epoch / FILETIME_UNITS_PER_SECOND,
+        since_epoch,
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a query about `pid` says about the process `identity` recorded.
+    fn state_from(identity: &ProcessStartIdentity, pid: u32, query: ProcessQuery) -> ProcessState {
+        current_from(identity, pid, query).into()
+    }
 
     #[test]
     fn the_host_reports_a_boot_identity() {
@@ -1331,6 +1399,87 @@ mod tests {
                 (later - UNIX_EPOCH_AS_FILETIME) / FILETIME_UNITS_PER_SECOND
             );
         }
+    }
+
+    /// The identity a worker of the previous build states for a Windows process: its creation time
+    /// in whole seconds since 1970.
+    fn in_whole_seconds(identity: &ProcessStartIdentity) -> ProcessStartIdentity {
+        ProcessStartIdentity::new(
+            identity.pid.get(),
+            ProcessStartSource::WindowsProcessStartSeconds,
+            identity.start_value.get() / FILETIME_UNITS_PER_SECOND,
+        )
+    }
+
+    #[test]
+    fn an_identity_stated_in_whole_seconds_names_the_process_created_in_that_second() {
+        let pid = 4242;
+        let now = filetime_at(1_800_000_000);
+        let read = |created| match windows_answer(pid, WindowsReading::Created(created), now) {
+            ProcessQuery::Present(identity) => identity,
+            other => panic!("a creation time is a start value: {other:?}"),
+        };
+        let current = read(filetime_at(1_758_700_000) + 1_000_000);
+        let stated = in_whole_seconds(&current);
+        assert!(named_in_whole_seconds(&stated, &current));
+        // Every creation in that second is named by it. That is the previous build's own reading,
+        // kept for the identities that build stated and for nothing this build reads.
+        assert!(named_in_whole_seconds(
+            &stated,
+            &read(filetime_at(1_758_700_001) - 1)
+        ));
+        assert!(!named_in_whole_seconds(
+            &stated,
+            &read(filetime_at(1_758_700_001))
+        ));
+        let mut elsewhere = current.clone();
+        elsewhere.pid = kr_protocol::scalars::U64::new(4243);
+        assert!(!named_in_whole_seconds(&stated, &elsewhere));
+        assert!(
+            !named_in_whole_seconds(&current, &current),
+            "an identity this build read is compared whole, never cut to seconds"
+        );
+        // A process created in another second that holds the identifier now is another process,
+        // one that holds nothing is gone, and a reading that failed says nothing.
+        assert_eq!(
+            current_from(
+                &stated,
+                pid,
+                ProcessQuery::Present(read(filetime_at(1_758_700_002)))
+            ),
+            CurrentProcess::Ended
+        );
+        assert_eq!(
+            current_from(&stated, pid, ProcessQuery::Gone),
+            CurrentProcess::Ended
+        );
+        assert!(matches!(
+            current_from(
+                &stated,
+                pid,
+                windows_answer(pid, WindowsReading::Failed("no".to_owned()), now)
+            ),
+            CurrentProcess::Unknown { .. }
+        ));
+    }
+
+    /// A worker of the previous build still running after an upgrade states its identity in whole
+    /// seconds; this process stands in for it.
+    #[cfg(windows)]
+    #[test]
+    fn a_running_process_stated_in_whole_seconds_is_read_as_running_under_its_finer_identity() {
+        let finer = current_process_start_identity().expect("the kernel answers");
+        assert_eq!(finer.source, ProcessStartSource::WindowsProcessCreationTime);
+        let stated = in_whole_seconds(&finer);
+        assert_eq!(
+            current_process(&stated),
+            CurrentProcess::Running(finer.clone())
+        );
+        assert_eq!(process_state(&stated), ProcessState::Running);
+        let mut another_second = stated.clone();
+        another_second.start_value = kr_protocol::scalars::U64::new(stated.start_value.get() - 1);
+        assert_eq!(process_state(&another_second), ProcessState::Ended);
+        assert_eq!(current_process(&finer), CurrentProcess::Running(finer));
     }
 
     #[test]

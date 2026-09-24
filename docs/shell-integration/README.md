@@ -69,7 +69,7 @@ The nested objects of the handshake:
 
 | Object | Fields |
 | --- | --- |
-| `shell_process`, `root_process` | `pid`, `source` (`linux_proc_stat`, `macos_proc_bsd_info`, `windows_process_start_seconds`), `start_value` |
+| `shell_process`, `root_process` | `pid`, `source` (`linux_proc_stat`, `macos_proc_bsd_info`, `windows_process_creation_time`), `start_value` |
 | `shell` | `kind`, `executable`, `upstream_version`, `editor_abi`, `integration_version`, `patches`, `modules` |
 | `patches[]` | `name`, `upstream_revision`, `revision` |
 | `modules[]` | `name`, `search_path`, `editor_abi` |
@@ -78,6 +78,15 @@ The nested objects of the handshake:
 | `refused.error` | `code`, `message`, `retry`, `diagnostic_id` |
 | `backend` | `session_id`, `prompt_generation`, `environment`, `launcher` (the absolute path of the installation's `kr-hook`), or null where the host establishes none |
 | `event_result` | `editor_entered`, `editor_left`, `detached`, `command_recorded`, `command_resolved`, `command_block_recorded`, `received`, or `refused` with an error |
+
+A `start_value` is in its source's own unit, and the bridge reports exactly what the worker reads
+from the kernel, or the handshake refuses it as a different process:
+
+| `source` | `start_value` |
+| --- | --- |
+| `linux_proc_stat` | clock ticks since the boot: field 22 of `/proc/<pid>/stat` |
+| `macos_proc_bsd_info` | microseconds since 1970-01-01 00:00:00 UTC |
+| `windows_process_creation_time` | hundreds of nanoseconds since 1970-01-01 00:00:00 UTC: the creation time `GetProcessTimes` gives, a `FILETIME`, less 116 444 736 000 000 000 |
 
 A bridge holds a fence only between a `published` and the `invalidated` that ends it: every reason
 the worker drops one, from a reader entry to a detach to a lost integration, reaches the bridge that

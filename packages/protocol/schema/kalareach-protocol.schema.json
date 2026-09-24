@@ -21458,8 +21458,13 @@
           "type": "string"
         },
         {
+          "const": "windows_process_creation_time",
+          "description": "Windows `GetProcessTimes`: the process creation time in hundreds of nanoseconds since the\nUnix epoch, 1970-01-01 00:00:00 UTC.\n\nThat is the unit the kernel records a creation time in, and the value is the kernel's own\nwith the epoch moved from 1601 to 1970: a `FILETIME` less 116 444 736 000 000 000. So a\nprocess created after another under the same identifier carries a different value, as it\ndoes on the other platforms, rather than one it would share for the rest of the second.",
+          "type": "string"
+        },
+        {
           "const": "windows_process_start_seconds",
-          "description": "Windows: the process creation time in whole seconds since the epoch.\n\nThe kernel records 100-nanosecond intervals, and the safe reader this host uses reports\nwhole seconds. Two processes that share an identifier within one second are therefore\nindistinguishable by this value alone, which is why a Windows worker also owns a per-session\nJob Object that a recycled identifier cannot join.",
+          "description": "Windows, as a worker of the previous build states its identity: the creation time in whole\nseconds since the epoch.\n\nNothing in this build reads a process into this source. It is here because a worker of the\nprevious build keeps running across an upgrade and signs its identity, in this source, into\nits rendezvous and its every verification answer, and the records that worker and its\ncontroller wrote carry it too. This build reads such an identity the way the previous build\ndid: the process holding the identifier now, with its creation time cut to whole seconds.\nTwo processes that share an identifier within one second are one identity this way, which\nis the weakness [`Self::WindowsProcessCreationTime`] removes.\n\nRemove this source, and every reader of it, in the first release after one in which every\nrunning worker states [`Self::WindowsProcessCreationTime`].",
           "type": "string"
         }
       ]

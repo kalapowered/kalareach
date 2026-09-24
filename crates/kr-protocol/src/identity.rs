@@ -66,12 +66,27 @@ pub enum ProcessStartSource {
     LinuxProcStat,
     /// macOS `proc_pidinfo(PROC_PIDTBSDINFO)`: start time in microseconds since the epoch.
     MacosProcBsdInfo,
-    /// Windows: the process creation time in whole seconds since the epoch.
+    /// Windows `GetProcessTimes`: the process creation time in hundreds of nanoseconds since the
+    /// Unix epoch, 1970-01-01 00:00:00 UTC.
     ///
-    /// The kernel records 100-nanosecond intervals, and the safe reader this host uses reports
-    /// whole seconds. Two processes that share an identifier within one second are therefore
-    /// indistinguishable by this value alone, which is why a Windows worker also owns a per-session
-    /// Job Object that a recycled identifier cannot join.
+    /// That is the unit the kernel records a creation time in, and the value is the kernel's own
+    /// with the epoch moved from 1601 to 1970: a `FILETIME` less 116 444 736 000 000 000. So a
+    /// process created after another under the same identifier carries a different value, as it
+    /// does on the other platforms, rather than one it would share for the rest of the second.
+    WindowsProcessCreationTime,
+    /// Windows, as a worker of the previous build states its identity: the creation time in whole
+    /// seconds since the epoch.
+    ///
+    /// Nothing in this build reads a process into this source. It is here because a worker of the
+    /// previous build keeps running across an upgrade and signs its identity, in this source, into
+    /// its rendezvous and its every verification answer, and the records that worker and its
+    /// controller wrote carry it too. This build reads such an identity the way the previous build
+    /// did: the process holding the identifier now, with its creation time cut to whole seconds.
+    /// Two processes that share an identifier within one second are one identity this way, which
+    /// is the weakness [`Self::WindowsProcessCreationTime`] removes.
+    ///
+    /// Remove this source, and every reader of it, in the first release after one in which every
+    /// running worker states [`Self::WindowsProcessCreationTime`].
     WindowsProcessStartSeconds,
 }
 

@@ -1028,7 +1028,7 @@ fn a_helper_created_under_the_previous_helpers_identifier_within_one_second_is_r
     let (read, _) = questions
         .read_own(&previous, &own, now(1_300))
         .expect("the helper that asked still reads its question");
-    assert_eq!(read.question.state, QuestionState::Pending);
+    assert_eq!(read.question.question_id, asked.question.question_id);
 
     // Control: in whole seconds since 1970, as the previous build read a Windows process, the two
     // helpers are one source, and the next one is served the previous one's question.

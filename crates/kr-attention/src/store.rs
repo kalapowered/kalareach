@@ -952,6 +952,10 @@ const fn source_text(source: ProcessStartSource) -> &'static str {
     match source {
         ProcessStartSource::LinuxProcStat => "linux_proc_stat",
         ProcessStartSource::MacosProcBsdInfo => "macos_proc_bsd_info",
+        ProcessStartSource::WindowsProcessCreationTime => "windows_process_creation_time",
+        // The claim a controller of the previous build wrote for itself. It goes with the source
+        // itself: in the first release after one in which every running worker states the
+        // creation time.
         ProcessStartSource::WindowsProcessStartSeconds => "windows_process_start_seconds",
     }
 }
@@ -961,6 +965,7 @@ fn start_source(stored: &str) -> Result<ProcessStartSource> {
     match stored {
         "linux_proc_stat" => Ok(ProcessStartSource::LinuxProcStat),
         "macos_proc_bsd_info" => Ok(ProcessStartSource::MacosProcBsdInfo),
+        "windows_process_creation_time" => Ok(ProcessStartSource::WindowsProcessCreationTime),
         "windows_process_start_seconds" => Ok(ProcessStartSource::WindowsProcessStartSeconds),
         _ => Err(unreadable("owner process start source")),
     }

@@ -402,8 +402,8 @@ fn ledger(hosted: &Hosted) -> kr_worker::questions::store::Store {
     .expect("a second connection to the journal")
 }
 
-/// Returns when Windows says one process was created, in whole seconds since 1970, read through
-/// PowerShell's own process API rather than the reader under test.
+/// Returns when Windows says one process was created, in hundreds of nanoseconds since 1970, read
+/// through PowerShell's own process API rather than the reader under test.
 fn created_at(pid: u32) -> u64 {
     let output = std::process::Command::new(kr_worker::testing::powershell())
         .args([
@@ -412,7 +412,7 @@ fn created_at(pid: u32) -> u64 {
             "-NonInteractive",
             "-Command",
             &format!(
-                "[DateTimeOffset]::new((Get-Process -Id {pid}).StartTime.ToUniversalTime()).ToUnixTimeSeconds()"
+                "(Get-Process -Id {pid}).StartTime.ToUniversalTime().Ticks - [DateTime]::UnixEpoch.Ticks"
             ),
         ])
         .stdin(std::process::Stdio::null())
@@ -483,7 +483,7 @@ async fn the_helper_is_bound_to_its_own_process_and_its_start_time() {
     );
     assert_eq!(
         source.process.source,
-        ProcessStartSource::WindowsProcessStartSeconds
+        ProcessStartSource::WindowsProcessCreationTime
     );
     assert_eq!(
         source.process.start_value.get(),

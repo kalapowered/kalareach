@@ -31,6 +31,7 @@ use kr_protocol::ids::{RequestId, SessionId};
 use kr_protocol::root::{DETACH_HINT, PromptGeneration};
 use kr_protocol::scalars::Uuid;
 use kr_shell_integration::contract::events::{BridgeEvent, EofGesture, HooksActivated};
+use kr_shell_integration::contract::qualification::QualificationReason;
 use kr_shell_integration::contract::transport::{EventOutcome, WorkerExpectation};
 use kr_shell_integration::host::endpoint::HostEndpoint;
 use kr_shell_integration::host::handshake::{admit, observe};
@@ -175,7 +176,10 @@ async fn accept_client(endpoint: &HostEndpoint) -> (BridgeReader, BridgeWriter, 
 ///
 /// The expectation names the process the kernel reports on the other end of the pipe, which is
 /// what a worker that launched the shell holds: the client computed its proof over its own
-/// identity, and a hello that claims another process is refused by name rather than accepted.
+/// identity, and a hello that claims another process is refused by name rather than accepted. The
+/// module names its start as the worker reads it, the creation time in hundreds of nanoseconds, so
+/// the same hello naming a start one of those intervals later is refused before the real one is
+/// answered.
 async fn register(
     endpoint: &HostEndpoint,
     reader: &mut BridgeReader,
@@ -216,6 +220,29 @@ async fn register(
         "the module's hello was refused: {outcome:?}\nthe kernel reported {observed:?}\nthe \
          client claimed {:?}",
         hello.shell_process
+    );
+    assert_eq!(
+        hello.shell_process.source,
+        kr_protocol::identity::ProcessStartSource::WindowsProcessCreationTime,
+        "the module names its start as the creation time, the source the worker reads"
+    );
+    // The same hello naming a start one interval of the kernel's later is another process, and is
+    // refused as one.
+    let mut later = hello.clone();
+    later.shell_process.start_value =
+        kr_protocol::scalars::U64::new(hello.shell_process.start_value.get() + 1);
+    let refused = admit(
+        endpoint.secret(),
+        &expectation,
+        endpoint.address(),
+        peer,
+        &later,
+    )
+    .expect("decides");
+    assert_eq!(
+        refused.refusal(),
+        Some(QualificationReason::ProcessMismatch),
+        "a hello naming another start is refused: {refused:?}"
     );
     within("the accept", writer.send_handshake(&outcome))
         .await

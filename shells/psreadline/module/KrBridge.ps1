@@ -121,17 +121,27 @@ function Get-KrProcessIdentity {
             start_value = [uint64]$fields[19]
         }
     }
+    if ($IsWindows) {
+        # The creation time the kernel records, in its own hundreds of nanoseconds, counted from
+        # 1970 rather than 1601. .NET reads it through GetProcessTimes as the worker does, and a
+        # DateTime tick is the same hundred nanoseconds, so nothing is divided and nothing rounds:
+        # the value is the one the worker reads, or the handshake refuses a different process.
+        $created = $process.StartTime.ToUniversalTime().Ticks - [DateTime]::UnixEpoch.Ticks
+        return @{
+            pid         = [uint64]$process.Id
+            source      = 'windows_process_creation_time'
+            start_value = [uint64]$created
+        }
+    }
     $ticks = ([System.DateTimeOffset]$process.StartTime).UtcTicks -
              [System.DateTimeOffset]::UnixEpoch.UtcTicks
-    $source = if ($IsWindows) { 'windows_process_start_seconds' } else { 'macos_proc_bsd_info' }
-    # Windows records whole seconds and this platform's kernel records microseconds; both report
-    # the value truncated. The truncation is written out because PowerShell divides whole numbers
-    # as doubles and a cast to an integer rounds the result: a shell started after the half unit
-    # would name a start one unit later than the one the worker read from the kernel, and the
-    # handshake would be refused as a different process.
-    $unit = if ($IsWindows) { [decimal]10000000 } else { [decimal]10 }
-    $start = [uint64][Math]::Floor([decimal]$ticks / $unit)
-    @{ pid = [uint64]$process.Id; source = $source; start_value = $start }
+    # This platform's kernel records microseconds, and reports the value truncated. The truncation
+    # is written out because PowerShell divides whole numbers as doubles and a cast to an integer
+    # rounds the result: a shell started after the half unit would name a start one unit later than
+    # the one the worker read from the kernel, and the handshake would be refused as a different
+    # process.
+    $start = [uint64][Math]::Floor([decimal]$ticks / [decimal]10)
+    @{ pid = [uint64]$process.Id; source = 'macos_proc_bsd_info'; start_value = $start }
 }
 
 function ConvertFrom-KrBase64Url {

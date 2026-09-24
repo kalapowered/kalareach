@@ -831,7 +831,7 @@ mod tests {
     fn an_agent_job_is_found_by_the_agent_it_was_started_for() {
         let agent = ProcessStartIdentity::new(
             0xF000_0003,
-            kr_protocol::identity::ProcessStartSource::WindowsProcessStartSeconds,
+            kr_protocol::identity::ProcessStartSource::WindowsProcessCreationTime,
             17,
         );
         assert!(agent_job(&agent).is_none(), "nothing was started for it");
@@ -848,7 +848,7 @@ mod tests {
 
     #[test]
     fn a_released_agent_is_placed_through_no_job_and_the_others_are_kept() {
-        let source = kr_protocol::identity::ProcessStartSource::WindowsProcessStartSeconds;
+        let source = kr_protocol::identity::ProcessStartSource::WindowsProcessCreationTime;
         let released = ProcessStartIdentity::new(0xF000_0004, source, 17);
         let kept = ProcessStartIdentity::new(0xF000_0005, source, 17);
         let released_job = Arc::new(AgentJob::create().expect("a job"));

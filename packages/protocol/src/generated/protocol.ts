@@ -4140,7 +4140,11 @@ export interface ProcessStartIdentity {
   /**
    * Where the start value came from.
    */
-  source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
+  source:
+    | 'linux_proc_stat'
+    | 'macos_proc_bsd_info'
+    | 'windows_process_creation_time'
+    | 'windows_process_start_seconds'
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -6109,7 +6113,11 @@ export interface ProcessStartIdentity1 {
   /**
    * Where the start value came from.
    */
-  source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
+  source:
+    | 'linux_proc_stat'
+    | 'macos_proc_bsd_info'
+    | 'windows_process_creation_time'
+    | 'windows_process_start_seconds'
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -6360,7 +6368,11 @@ export interface ProcessStartIdentity2 {
   /**
    * Where the start value came from.
    */
-  source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
+  source:
+    | 'linux_proc_stat'
+    | 'macos_proc_bsd_info'
+    | 'windows_process_creation_time'
+    | 'windows_process_start_seconds'
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -6427,7 +6439,11 @@ export interface ProcessStartIdentity3 {
   /**
    * Where the start value came from.
    */
-  source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
+  source:
+    | 'linux_proc_stat'
+    | 'macos_proc_bsd_info'
+    | 'windows_process_creation_time'
+    | 'windows_process_start_seconds'
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -8692,7 +8708,11 @@ export interface ProcessStartIdentity4 {
   /**
    * Where the start value came from.
    */
-  source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
+  source:
+    | 'linux_proc_stat'
+    | 'macos_proc_bsd_info'
+    | 'windows_process_creation_time'
+    | 'windows_process_start_seconds'
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -11799,7 +11819,11 @@ export interface ProcessStartIdentity5 {
   /**
    * Where the start value came from.
    */
-  source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
+  source:
+    | 'linux_proc_stat'
+    | 'macos_proc_bsd_info'
+    | 'windows_process_creation_time'
+    | 'windows_process_start_seconds'
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -21396,7 +21420,11 @@ export interface ProcessStartIdentity6 {
   /**
    * Where the start value came from.
    */
-  source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
+  source:
+    | 'linux_proc_stat'
+    | 'macos_proc_bsd_info'
+    | 'windows_process_creation_time'
+    | 'windows_process_start_seconds'
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -21458,7 +21486,11 @@ export interface ProcessStartIdentity7 {
   /**
    * Where the start value came from.
    */
-  source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
+  source:
+    | 'linux_proc_stat'
+    | 'macos_proc_bsd_info'
+    | 'windows_process_creation_time'
+    | 'windows_process_start_seconds'
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -25328,7 +25360,11 @@ export interface ProcessStartIdentity8 {
   /**
    * Where the start value came from.
    */
-  source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
+  source:
+    | 'linux_proc_stat'
+    | 'macos_proc_bsd_info'
+    | 'windows_process_creation_time'
+    | 'windows_process_start_seconds'
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
