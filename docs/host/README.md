@@ -3536,10 +3536,29 @@ undispatched actions it affects, or once it is confirmed ended. Anything else is
 answer says which worker and why. Already dispatched effects and content already copied cannot be
 undone.
 
-A revocation that withdrew nothing advances no revision. Retrying one is answered from the result
-the host recorded for that action rather than performed again, so a retry cannot fence the host a
-second time for one withdrawal, and an action identifier reused with different parameters is a
-conflict rather than a second revocation.
+A revocation that withdrew nothing advances no revision.
+
+Every authority change, and every voice change but a delegation, is claimed under its action
+identifier before its effect, and only the attempt that writes the claim performs it. A repeat of
+the action is answered from the claim before its freshness window is considered, so a caller whose
+window has closed, or whose daemon has restarted since, is still told what happened:
+
+* the result the change produced, once it has one;
+* the refusal it was given, when that refusal's code says the same request cannot succeed if it is
+  sent again (a refusal that says it might, such as a store that could not be written, is not kept);
+* `RESOURCE_UNAVAILABLE` while the first attempt is still running in this daemon, and the caller
+  asks again;
+* for an attempt that ended without recording what it did (the daemon stopped, or the attempt's
+  task ended, in between), what this host's own records prove it did, and otherwise
+  `OUTCOME_UNKNOWN`. A share is answered from the grant and the invitation it wrote, which take
+  identities derived from the action, and a preview-key registration from the device's record when
+  that holds the key at that revision. Nothing else this host keeps names the action that changed
+  it, so a revocation or a voice change in this state is `OUTCOME_UNKNOWN`.
+
+No attempt takes over a claim, however long ago it was written: an attempt that is still running is
+not known to have stopped, and one that stopped may already have reached its effect. So a retry
+cannot fence the host a second time for one withdrawal or start a second metered call, and an
+action identifier reused with different parameters is a conflict rather than a second change.
 
 The fence this daemon takes is host-wide: every registration is withdrawn and the connections that
 kept their authority are re-admitted at the revision now in force. Withdrawing one device's

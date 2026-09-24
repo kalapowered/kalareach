@@ -27,9 +27,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
+use std::sync::Arc;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use kr_protocol::error::ErrorCode;
 use kr_protocol::grant::Grant;
 use kr_protocol::ids::InvitationId;
 use kr_protocol::ids::{ActionId, ActorId, DeviceId, GrantId, SessionId};
@@ -104,25 +106,87 @@ impl GrantRecord {
 }
 
 /// What a claim on one action found.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// The attempt that writes an action's claim is the one attempt that may ever perform it. Section
+/// 9 never dispatches an identifier again because its receipt is incomplete, so no later attempt
+/// takes a claim over, however old it is: an attempt that is still running is not known to have
+/// stopped, and one that did stop may already have reached its effect.
+#[derive(Debug)]
 pub enum ActionClaim {
-    /// This caller now holds the claim, from the moment it was made.
+    /// This attempt wrote the claim, and holds it for as long as `hold` lives.
     Claimed {
-        /// When the claim was made. The effect builds its proposal from this, so a retry asks for
-        /// the same thing rather than one with a later deadline.
-        claimed_at_ms: u64,
+        /// This attempt's hold, which the result is recorded under.
+        hold: ClaimHold,
     },
-    /// Somebody else holds the claim and has not finished.
+    /// Another attempt wrote it first, and this is what the store holds about the action.
+    Recorded(ActionRecord),
+}
+
+/// What this host holds about one action whose claim an attempt wrote.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActionRecord {
+    /// The attempt that claimed it is still running in this daemon.
     ///
-    /// Two requests under one action identifier must not both reach the effect. The second is told
-    /// the work is under way rather than performing it again, because two `grant.revoke` calls
-    /// that both ran would advance the revision twice and fence the host twice for one withdrawal.
+    /// A second request under the identifier is told so rather than performing the action again:
+    /// two `grant.revoke` calls that both ran would advance the revision twice and fence the host
+    /// twice for one withdrawal, and two voice starts would be two metered calls.
     InFlight,
-    /// This action already happened, and here is what it produced.
+    /// The action happened, and this is what it produced.
     Answered {
         /// The encoded result.
         result: Vec<u8>,
     },
+    /// The action was refused, and this is the refusal it was given.
+    Refused {
+        /// The refusal's code.
+        code: ErrorCode,
+        /// What the refusal said.
+        detail: String,
+    },
+    /// The attempt that claimed it ended without recording what it did: this daemon stopped, or
+    /// the attempt's task ended, in between.
+    ///
+    /// It is never performed again. What it did is whatever this host's own records prove, and
+    /// otherwise not known.
+    Unfinished,
+}
+
+/// One claim's key: the actor, and the action as its sixteen bytes.
+type ClaimKey = (String, [u8; 16]);
+
+/// The claims whose attempts are running in this daemon.
+///
+/// In memory, because it describes this process: a claim written by a daemon that has since
+/// stopped belongs to an attempt that stopped with it.
+#[derive(Debug, Default)]
+struct LiveClaims(std::sync::Mutex<BTreeSet<ClaimKey>>);
+
+impl LiveClaims {
+    fn held(&self) -> std::sync::MutexGuard<'_, BTreeSet<ClaimKey>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// An attempt's hold on the claim it wrote, for as long as the attempt runs.
+///
+/// The hold is what tells a retry that the attempt is still running rather than ended, and it is
+/// released when it is dropped, however the attempt ends: it returned, it failed, its task was
+/// dropped part way through, or it panicked. Its result is recorded under it, so only the attempt
+/// that claimed an action records what the action did. Record before dropping it: a retry that
+/// finds neither a hold nor a result reads the action as unfinished.
+#[derive(Debug)]
+#[must_use = "a claim is released when its hold is dropped"]
+pub struct ClaimHold {
+    live: Arc<LiveClaims>,
+    key: ClaimKey,
+}
+
+impl Drop for ClaimHold {
+    fn drop(&mut self) {
+        self.live.held().remove(&self.key);
+    }
 }
 
 /// What one revocation did.
@@ -154,6 +218,8 @@ impl GrantRevocation {
 #[derive(Debug)]
 pub struct GrantDirectory {
     connection: std::sync::Mutex<Connection>,
+    /// The action claims whose attempts are running in this daemon.
+    live: Arc<LiveClaims>,
 }
 
 impl GrantDirectory {
@@ -209,9 +275,10 @@ impl GrantDirectory {
                      action_id      BLOB NOT NULL,
                      payload_digest BLOB NOT NULL,
                      claimed_at_ms  INTEGER NOT NULL,
-                     leased_at_ms   INTEGER NOT NULL,
                      result         BLOB,
                      recorded_at_ms INTEGER,
+                     refusal_code   TEXT,
+                     refusal_detail TEXT,
                      PRIMARY KEY (actor_id, action_id)
                  );
                  CREATE TABLE IF NOT EXISTS host_authority (
@@ -235,32 +302,10 @@ impl GrantDirectory {
                  );",
             )
             .map_err(ControllerError::registry)?;
-        // A store written by an earlier build has the receipts table without its lease column.
-        // `CREATE TABLE IF NOT EXISTS` leaves that table alone, so the column is added here and
-        // every existing claim's lease starts from the moment it was claimed. Without this a host
-        // that upgraded would fail on its first authority change, reading a column that is not
-        // there.
-        let has_lease = connection
-            .prepare("SELECT leased_at_ms FROM authority_receipts LIMIT 1")
-            .is_ok();
-        if !has_lease {
-            // One transaction, because the two statements are one change. An interruption between
-            // them would leave the column there and every existing lease at zero, and the next
-            // start would find the column and never run the backfill: every pending claim would
-            // read as stale for ever after.
-            connection
-                .execute_batch(
-                    "BEGIN IMMEDIATE;
-                     ALTER TABLE authority_receipts
-                         ADD COLUMN leased_at_ms INTEGER NOT NULL DEFAULT 0;
-                     UPDATE authority_receipts SET leased_at_ms = claimed_at_ms
-                      WHERE leased_at_ms = 0;
-                     COMMIT;",
-                )
-                .map_err(ControllerError::registry)?;
-        }
+        migrate_receipts(&connection)?;
         Ok(Self {
             connection: std::sync::Mutex::new(connection),
+            live: Arc::new(LiveClaims::default()),
         })
     }
 
@@ -961,7 +1006,7 @@ impl GrantDirectory {
 
     // --- Retained results -------------------------------------------------------------------
 
-    /// Returns the result this host already recorded for one actor's action, if it has one.
+    /// Returns what this host holds about one actor's action, if it holds anything.
     ///
     /// A read, with no claim. It answers a retry from what happened rather than performing
     /// anything, which is what lets a retry whose freshness window has gone still be told its
@@ -971,44 +1016,35 @@ impl GrantDirectory {
     ///
     /// Returns [`ControllerError::IdConflict`] when the identifier was reused with a different
     /// payload, and a storage error when the row cannot be read.
-    pub fn answered_action(
+    pub fn recorded_action(
         &self,
         actor_id: &ActorId,
         action_id: ActionId,
         payload_digest: &Digest256,
-    ) -> Result<Option<Vec<u8>>> {
-        let held: Option<(Vec<u8>, Option<Vec<u8>>)> = self.with(|connection| {
-            connection
-                .query_row(
-                    "SELECT payload_digest, result FROM authority_receipts
-                      WHERE actor_id = ?1 AND action_id = ?2",
-                    params![actor_id.as_str(), action_id.get().as_bytes().as_slice()],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()
-        })?;
-        let Some((digest, result)) = held else {
-            return Ok(None);
-        };
-        if digest.as_slice() != payload_digest.as_bytes() {
-            return Err(ControllerError::IdConflict {
-                token: action_id.to_string(),
-            });
-        }
-        Ok(result)
+    ) -> Result<Option<ActionRecord>> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Read and asked about under the store's own lock, which the attempt's result is written
+        // under too. The attempt records its result before it releases its hold, so a reader that
+        // found no result here and then no hold would otherwise read an action that had just been
+        // answered as unfinished.
+        let key = claim_key(actor_id, action_id);
+        read_claim(&connection, &key, payload_digest, &self.live)
     }
 
-    /// Claims one actor's action before its effect, or reports what already happened under it.
+    /// Claims one actor's action before its effect, or reports what this host holds about it.
     ///
     /// Section 9's de-duplication key is the actor and the action together, and the payload digest
     /// decides whether it is the same action or a reused identifier. The claim is written **first**,
-    /// in one statement whose `WHERE` clause carries the whole precondition, because a host that
-    /// recorded only afterwards would let two concurrent requests under one identifier both reach
-    /// their effects before either noticed the other.
+    /// in one transaction that reads the key and writes it, because a host that recorded only
+    /// afterwards would let two concurrent requests under one identifier both reach their effects
+    /// before either noticed the other.
     ///
-    /// The claim carries the moment it was made. A retry rebuilds its proposal from that moment
-    /// rather than from the clock, so the grant it asks for a second time is the grant it asked for
-    /// the first time rather than one with a later deadline.
+    /// Only the attempt that writes the claim may perform the action. A later request under the
+    /// identifier is answered from the record whatever has happened to the first attempt, and is
+    /// never given the claim: see [`ActionClaim`].
     ///
     /// # Errors
     ///
@@ -1021,103 +1057,91 @@ impl GrantDirectory {
         payload_digest: &Digest256,
         now_ms: u64,
     ) -> Result<ActionClaim> {
+        let key = claim_key(actor_id, action_id);
         self.in_transaction(|connection| {
-            let held: Option<HeldClaim> = connection
-                .query_row(
-                    "SELECT payload_digest, claimed_at_ms, leased_at_ms, result
-                       FROM authority_receipts
-                      WHERE actor_id = ?1 AND action_id = ?2",
-                    params![actor_id.as_str(), action_id.get().as_bytes().as_slice()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .optional()
-                .map_err(ControllerError::registry)?;
-            if let Some((digest, claimed_at_ms, leased_at_ms, result)) = held {
-                if digest.as_slice() != payload_digest.as_bytes() {
-                    return Err(ControllerError::IdConflict {
-                        token: action_id.to_string(),
-                    });
-                }
-                if let Some(result) = result {
-                    return Ok(ActionClaim::Answered { result });
-                }
-                // A claim with no result is somebody inside the effect. It is not a claim for
-                // ever: a lease older than the longest lifetime a mutation may be admitted for
-                // belongs to an attempt that is no longer being awaited, and this caller takes it
-                // over rather than finding the identifier wedged. What the lease does **not**
-                // establish is that the earlier holder stopped running; an executor that woke up
-                // afterwards could still reach its effect, and the record it would write is
-                // refused because a completed receipt is never replaced.
-                let claimed = u64::try_from(claimed_at_ms).unwrap_or_default();
-                let leased = u64::try_from(leased_at_ms).unwrap_or_default();
-                let stale =
-                    now_ms >= leased.saturating_add(kr_protocol::limits::MAX_MUTATION_TTL.get());
-                if !stale {
-                    return Ok(ActionClaim::InFlight);
-                }
-                // The lease is renewed; the moment the *proposal* was made is not. A takeover that
-                // moved it would make each retry ask for a grant with a later deadline than the
-                // one before it, which is the opposite of what a retry is for.
-                connection
-                    .execute(
-                        "UPDATE authority_receipts SET leased_at_ms = ?3
-                          WHERE actor_id = ?1 AND action_id = ?2 AND result IS NULL",
-                        params![
-                            actor_id.as_str(),
-                            action_id.get().as_bytes().as_slice(),
-                            i64::try_from(now_ms).unwrap_or(i64::MAX),
-                        ],
-                    )
-                    .map_err(ControllerError::registry)?;
-                return Ok(ActionClaim::Claimed {
-                    claimed_at_ms: claimed,
-                });
+            if let Some(record) = read_claim(connection, &key, payload_digest, &self.live)? {
+                return Ok(ActionClaim::Recorded(record));
             }
             connection
                 .execute(
                     "INSERT INTO authority_receipts
-                         (actor_id, action_id, payload_digest, claimed_at_ms, leased_at_ms,
-                          result, recorded_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?4, NULL, NULL)",
+                         (actor_id, action_id, payload_digest, claimed_at_ms, result,
+                          recorded_at_ms, refusal_code, refusal_detail)
+                     VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, NULL)",
                     params![
-                        actor_id.as_str(),
-                        action_id.get().as_bytes().as_slice(),
+                        key.0,
+                        key.1.as_slice(),
                         payload_digest.as_bytes().as_slice(),
                         i64::try_from(now_ms).unwrap_or(i64::MAX),
                     ],
                 )
                 .map_err(ControllerError::registry)?;
+            // Registered inside the transaction, which holds the store's lock: nothing can read
+            // the new row before its hold is there. A commit that then fails drops the hold with
+            // the claim it was returned in.
+            self.live.held().insert(key.clone());
             Ok(ActionClaim::Claimed {
-                claimed_at_ms: now_ms,
+                hold: ClaimHold {
+                    live: Arc::clone(&self.live),
+                    key: key.clone(),
+                },
             })
         })
     }
 
-    /// Records the result of a claimed action, once.
+    /// Records what the action `hold` claimed produced, once.
     ///
     /// A completed receipt is immutable: the `WHERE` clause writes only into a row that has no
-    /// result yet, so a second answer to one action cannot replace the first one a caller was
+    /// outcome yet, so a second answer to one action cannot replace the first one a caller was
     /// given.
     ///
     /// # Errors
     ///
     /// Returns a storage error when the row cannot be written.
-    pub fn retain_result(
+    pub fn retain_result(&self, hold: &ClaimHold, result: &[u8], now_ms: u64) -> Result<()> {
+        self.with(|connection| {
+            connection
+                .execute(
+                    "UPDATE authority_receipts SET result = ?3, recorded_at_ms = ?4
+                      WHERE actor_id = ?1 AND action_id = ?2
+                        AND result IS NULL AND refusal_code IS NULL",
+                    params![
+                        hold.key.0,
+                        hold.key.1.as_slice(),
+                        result,
+                        i64::try_from(now_ms).unwrap_or(i64::MAX),
+                    ],
+                )
+                .map(|_| ())
+        })
+    }
+
+    /// Records the refusal the action `hold` claimed was given, once.
+    ///
+    /// Immutable in the same way as a result, and for the same reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the row cannot be written.
+    pub fn retain_refusal(
         &self,
-        actor_id: &ActorId,
-        action_id: ActionId,
-        result: &[u8],
+        hold: &ClaimHold,
+        code: ErrorCode,
+        detail: &str,
         now_ms: u64,
     ) -> Result<()> {
         self.with(|connection| {
             connection
                 .execute(
-                    "UPDATE authority_receipts SET result = ?3, recorded_at_ms = ?4
-                      WHERE actor_id = ?1 AND action_id = ?2 AND result IS NULL",
+                    "UPDATE authority_receipts
+                        SET refusal_code = ?3, refusal_detail = ?4, recorded_at_ms = ?5
+                      WHERE actor_id = ?1 AND action_id = ?2
+                        AND result IS NULL AND refusal_code IS NULL",
                     params![
-                        actor_id.as_str(),
-                        action_id.get().as_bytes().as_slice(),
-                        result,
+                        hold.key.0,
+                        hold.key.1.as_slice(),
+                        code.as_str(),
+                        detail,
                         i64::try_from(now_ms).unwrap_or(i64::MAX),
                     ],
                 )
@@ -1306,9 +1330,98 @@ fn settle_invitation(
         .map_err(ControllerError::registry)
 }
 
-/// One claim row, as the store reads it back: the digest, when the proposal was made, when the
-/// lease was last renewed, and the result once there is one.
-type HeldClaim = (Vec<u8>, i64, i64, Option<Vec<u8>>);
+/// The key one actor's action is claimed under.
+fn claim_key(actor_id: &ActorId, action_id: ActionId) -> ClaimKey {
+    (actor_id.as_str().to_owned(), *action_id.get().as_bytes())
+}
+
+/// One claim row, as the store reads it back: the digest, the result once there is one, and the
+/// refusal's code and words once there is one of those.
+type ClaimRow = (Vec<u8>, Option<Vec<u8>>, Option<String>, Option<String>);
+
+/// What the store holds about one claimed action, on a connection the caller holds.
+///
+/// `live` is asked while the connection is held, which is the lock a result is recorded under, so
+/// an attempt that recorded its result and then released its hold is read as answered.
+fn read_claim(
+    connection: &Connection,
+    key: &ClaimKey,
+    payload_digest: &Digest256,
+    live: &LiveClaims,
+) -> Result<Option<ActionRecord>> {
+    let held: Option<ClaimRow> = connection
+        .query_row(
+            "SELECT payload_digest, result, refusal_code, refusal_detail
+               FROM authority_receipts
+              WHERE actor_id = ?1 AND action_id = ?2",
+            params![key.0, key.1.as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(ControllerError::registry)?;
+    let Some((digest, result, refusal_code, refusal_detail)) = held else {
+        return Ok(None);
+    };
+    if digest.as_slice() != payload_digest.as_bytes() {
+        return Err(ControllerError::IdConflict {
+            token: ActionId::new(kr_protocol::scalars::Uuid::from_bytes(key.1)).to_string(),
+        });
+    }
+    if let Some(result) = result {
+        return Ok(Some(ActionRecord::Answered { result }));
+    }
+    if let Some(code) = refusal_code {
+        let code = ErrorCode::from_wire(&code).ok_or_else(|| {
+            ControllerError::InvalidArgument("a stored refusal's code is malformed".to_owned())
+        })?;
+        return Ok(Some(ActionRecord::Refused {
+            code,
+            detail: refusal_detail.unwrap_or_default(),
+        }));
+    }
+    if live.held().contains(key) {
+        return Ok(Some(ActionRecord::InFlight));
+    }
+    Ok(Some(ActionRecord::Unfinished))
+}
+
+/// Brings a receipts table an earlier build wrote to the shape this one reads, once.
+///
+/// Two earlier shapes exist. One carried a lease column, from when a later attempt could take over
+/// a claim whose lease had run out; that column goes, and nothing reads it. Both lacked the columns
+/// a refusal is kept in, which are added empty. The rows stay as they were: a claim with no result
+/// in either shape belongs to an attempt that ended with the daemon that wrote it, which is what a
+/// row with no result and no hold reads as.
+///
+/// One immediate transaction, which reads the shape inside it, so two processes opening one store
+/// at once change it once.
+fn migrate_receipts(connection: &Connection) -> Result<()> {
+    let transaction =
+        rusqlite::Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)
+            .map_err(ControllerError::registry)?;
+    let columns: BTreeSet<String> = transaction
+        .prepare("SELECT name FROM pragma_table_info('authority_receipts')")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<BTreeSet<String>>>()
+        })
+        .map_err(ControllerError::registry)?;
+    if columns.contains("leased_at_ms") {
+        transaction
+            .execute_batch("ALTER TABLE authority_receipts DROP COLUMN leased_at_ms;")
+            .map_err(ControllerError::registry)?;
+    }
+    if !columns.contains("refusal_code") {
+        transaction
+            .execute_batch(
+                "ALTER TABLE authority_receipts ADD COLUMN refusal_code TEXT;
+                 ALTER TABLE authority_receipts ADD COLUMN refusal_detail TEXT;",
+            )
+            .map_err(ControllerError::registry)?;
+    }
+    transaction.commit().map_err(ControllerError::registry)
+}
 
 /// A refusal a transaction returns as a value, so its own writes still commit.
 fn refusal(detail: &str) -> ControllerError {

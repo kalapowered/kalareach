@@ -6,6 +6,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
+//! | KR-REQ-09.08 | `a_voice_start_is_performed_once_however_long_its_first_attempt_waits`, `a_retry_while_a_voice_start_runs_is_told_it_has_not_finished`, `a_voice_start_whose_attempt_ended_unrecorded_is_not_performed_again`, `a_voice_start_whose_record_was_never_written_is_not_performed_again_after_a_restart` |
 //! | KR-REQ-09.09, 09.12, 26.16 | `a_voice_change_is_not_written_while_a_fence_is_owed`, `a_voice_start_that_waited_writes_nothing_once_a_fence_is_owed` |
 //! | KR-REQ-15.01 | `a_start_refused_for_a_changed_rate_reaches_the_device_with_the_new_rate` |
 //! | KR-REQ-15.02 | `stopping_voice_leaves_the_session_running` |
@@ -76,6 +77,8 @@ impl WorkerSupervisor for RefusingSupervisor {
 #[derive(Debug, Default)]
 struct OfflineProvider {
     closed: std::sync::Mutex<Vec<String>>,
+    /// How many calls it has created, each of which a managed service would meter.
+    started: std::sync::atomic::AtomicUsize,
     /// Where a start waits before it answers, for a provider that holds its starts.
     gate: Option<BrokerGate>,
 }
@@ -100,6 +103,11 @@ impl OfflineProvider {
     /// The calls this provider was told to close.
     fn closed(&self) -> Vec<String> {
         self.closed.lock().expect("what was closed").clone()
+    }
+
+    /// How many calls this provider has created.
+    fn started(&self) -> usize {
+        self.started.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Waits until a start has arrived and is being held.
@@ -139,6 +147,8 @@ impl ManagedVoiceService for OfflineProvider {
                 gate.reached.notify_one();
                 gate.released.notified().await;
             }
+            self.started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(VoiceStart::Started(Box::new(VoiceSession {
                 call_id: "call-1".to_owned(),
                 attempt_id: "attempt-1".to_owned(),
@@ -1329,6 +1339,369 @@ async fn a_retry_is_not_answered_from_its_record_while_a_fence_is_owed() {
     clear_the_fault(&registry);
     raw.close();
     host.stop().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// One action, one call: the claim a voice start is performed under
+// ---------------------------------------------------------------------------------------------
+
+/// A paired device on a connection that sends its own frames, holding a standing voice grant over
+/// one session and the preparation a start of a call over it is bound to.
+struct RawVoice {
+    host: net_support::Host,
+    /// The device's own endpoint, which the connection below was dialled from and lives on.
+    device: net_support::Device,
+    record: kr_controller::service::net::devices::DeviceRecord,
+    raw: net_support::RawDevice,
+    device_id: DeviceId,
+    target: ActionTarget,
+    start: VoiceStartParams,
+}
+
+impl RawVoice {
+    /// Pairs a device with a fresh host whose broker is `broker`, and prepares one start.
+    async fn prepare(owner: &kr_crypto::keys::DeviceKeys, broker: Arc<OfflineProvider>) -> Self {
+        let host = net_support::Host::start(owner).await;
+        let device = net_support::Device::create().await;
+        let record = net_support::pair_with(
+            &host,
+            &device,
+            owner,
+            net_support::proposal(&[ActionRight::SessionView, ActionRight::AgentPrompt]),
+        )
+        .await;
+        let raw = net_support::RawDevice::connect(&host, &device, &record).await;
+        raw.claim();
+        host.controller()
+            .voice()
+            .attach_provider(Some(broker as Arc<dyn ManagedVoiceService>));
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let target = ActionTarget::environment(host.environment_id);
+        raw.mutate(
+            Method::VoiceGrant,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &VoiceGrantParams {
+                device_id: record.device_id,
+                session_ids: [session_id].into_iter().collect(),
+                actions: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the voice grant is written");
+        let prepared: VoicePrepareResult = raw
+            .read(
+                Method::VoicePrepare,
+                &VoicePrepareParams {
+                    session_ids: [session_id].into_iter().collect(),
+                    selected: CanonicalSet::from_iter([]),
+                },
+            )
+            .await
+            .expect("the host answers what a call would be")
+            .to_typed()
+            .expect("a preparation");
+        let start = VoiceStartParams {
+            session_ids: [session_id].into_iter().collect(),
+            offer_sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n".to_owned(),
+            duration_seconds: 600,
+            reasoning_budget_minor: Nullable::null(),
+            prepared: prepared.prepared,
+            expected_rate_version: Nullable::some("2026-09".to_owned()),
+        };
+        Self {
+            host,
+            device,
+            raw,
+            device_id: record.device_id,
+            record,
+            target,
+            start,
+        }
+    }
+
+    /// Stops the host and starts it again on the same records, the way a restart of the host
+    /// does, and connects the device again. `broker` is attached to the new daemon's voice
+    /// service, as an embedder attaches its provider at every start.
+    async fn restart(self, broker: Arc<OfflineProvider>) -> Self {
+        let Self {
+            host,
+            device,
+            record,
+            raw,
+            device_id,
+            target,
+            start,
+        } = self;
+        raw.close();
+        drop(raw);
+        let host = host.restart().await;
+        host.controller()
+            .voice()
+            .attach_provider(Some(broker as Arc<dyn ManagedVoiceService>));
+        let raw = net_support::RawDevice::connect(&host, &device, &record).await;
+        raw.claim();
+        Self {
+            host,
+            device,
+            record,
+            raw,
+            device_id,
+            target,
+            start,
+        }
+    }
+
+    /// The start under `action_id` exactly as this device sends it, which is what the host
+    /// digests and claims.
+    fn start_as_sent(&self, action_id: ActionId) -> kr_protocol::envelope::MutationRequest {
+        kr_protocol::envelope::MutationRequest {
+            request_id: kr_protocol::ids::RequestId::new(1),
+            method: Method::VoiceStart.into(),
+            method_version: Method::VoiceStart.entry().version,
+            action_id,
+            grant_id: Nullable::null(),
+            target: self.target.clone(),
+            expected: kr_protocol::envelope::ParamsValue::empty(),
+            action_window_id: self.raw.action_window_id(),
+            requested_ttl_ms: kr_protocol::scalars::DurationMs::new(120_000),
+            params: kr_protocol::envelope::ParamsValue::from_typed(&self.start)
+                .expect("the parameters encode"),
+        }
+    }
+
+    /// Claims `action_id` the way the host's own dispatch claims it, as a first attempt that did so
+    /// at `claimed_at_ms` and has not gone on to its effect.
+    fn claim_first_attempt(
+        &self,
+        action_id: ActionId,
+        claimed_at_ms: u64,
+    ) -> kr_controller::grants::ActionClaim {
+        let actor = kr_transport::listener::device_principal(&self.device_id);
+        let digest = kr_protocol::digest::mutation_digest(&self.start_as_sent(action_id), &actor)
+            .expect("a digest");
+        self.host
+            .controller()
+            .sharing()
+            .grants()
+            .claim_action(&actor, action_id, &digest, claimed_at_ms)
+            .expect("the first attempt claims its action")
+    }
+
+    /// The first attempt going on to its effect: the voice service's start, as the host's dispatch
+    /// performs it once the claim is held.
+    async fn perform_first_attempt(
+        &self,
+        action_id: ActionId,
+    ) -> kr_protocol::voice::VoiceStartResult {
+        self.host
+            .controller()
+            .voice()
+            .answer(
+                kr_controller::voice::VoiceActor::Device(self.device_id),
+                &self.start_as_sent(action_id),
+                Method::VoiceStart,
+                self.host.controller().policy().authority_revision(),
+                kr_ipc::now_ms().get(),
+                &kr_voice::Unbounded,
+            )
+            .await
+            .expect("the first attempt's start")
+            .to_typed()
+            .expect("a start result")
+    }
+}
+
+/// KR-REQ-09.08 and 15.01: one action identifier never makes two metered calls.
+///
+/// The first attempt at a start claims its action and stops before its effect, as a daemon task
+/// does when it is descheduled or waits on its store, and it stays stopped for longer than any
+/// mutation may be admitted for. A retry of the same action is told the first attempt has not
+/// finished and reaches no broker. When the first attempt goes on, its call is the only one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_voice_start_is_performed_once_however_long_its_first_attempt_waits() {
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let broker = Arc::new(OfflineProvider::default());
+    let voice = RawVoice::prepare(&owner, Arc::clone(&broker)).await;
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+
+    let stopped_since =
+        kr_ipc::now_ms().get() - kr_protocol::limits::MAX_MUTATION_TTL.get() - 1_000;
+    let first = voice.claim_first_attempt(action_id, stopped_since);
+    assert!(
+        matches!(first, kr_controller::grants::ActionClaim::Claimed { .. }),
+        "{first:?}"
+    );
+
+    let retried = voice
+        .raw
+        .mutate(
+            Method::VoiceStart,
+            action_id,
+            voice.target.clone(),
+            &voice.start,
+        )
+        .await;
+    let calls_after_the_retry = broker.started();
+    let performed = voice.perform_first_attempt(action_id).await;
+    drop(first);
+
+    assert_eq!(
+        calls_after_the_retry, 0,
+        "the retry reached no broker: {retried:?}"
+    );
+    let refusal = retried.expect_err("the retry is answered rather than performed");
+    assert_eq!(
+        refusal.code,
+        kr_protocol::error::ErrorCode::ResourceUnavailable,
+        "{refusal:?}"
+    );
+    assert!(
+        matches!(performed.outcome, VoiceStartOutcome::Started { .. }),
+        "{:?}",
+        performed.outcome
+    );
+    assert_eq!(broker.started(), 1, "one action, one metered call");
+    voice.raw.close();
+    voice.host.stop().await;
+}
+
+/// KR-REQ-09.08: a retry while the first attempt at a start is running is told the first attempt
+/// has not finished, and reaches no broker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_while_a_voice_start_runs_is_told_it_has_not_finished() {
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let broker = Arc::new(OfflineProvider::default());
+    let voice = RawVoice::prepare(&owner, Arc::clone(&broker)).await;
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+
+    let first = voice.claim_first_attempt(action_id, kr_ipc::now_ms().get());
+    assert!(
+        matches!(first, kr_controller::grants::ActionClaim::Claimed { .. }),
+        "{first:?}"
+    );
+    let refusal = voice
+        .raw
+        .mutate(
+            Method::VoiceStart,
+            action_id,
+            voice.target.clone(),
+            &voice.start,
+        )
+        .await
+        .expect_err("the retry is answered rather than performed");
+    assert_eq!(
+        refusal.code,
+        kr_protocol::error::ErrorCode::ResourceUnavailable,
+        "{refusal:?}"
+    );
+    assert_eq!(broker.started(), 0, "no call was made");
+    drop(first);
+    voice.raw.close();
+    voice.host.stop().await;
+}
+
+/// KR-REQ-09.08 and 15.01: a start whose attempt ended in this daemon without recording what it
+/// did is not performed again. A retry is told the outcome is not known, and reaches no broker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_voice_start_whose_attempt_ended_unrecorded_is_not_performed_again() {
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let broker = Arc::new(OfflineProvider::default());
+    let voice = RawVoice::prepare(&owner, Arc::clone(&broker)).await;
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+
+    let first = voice.claim_first_attempt(action_id, kr_ipc::now_ms().get());
+    assert!(
+        matches!(first, kr_controller::grants::ActionClaim::Claimed { .. }),
+        "{first:?}"
+    );
+    // The attempt ends, and records nothing.
+    drop(first);
+    let refusal = voice
+        .raw
+        .mutate(
+            Method::VoiceStart,
+            action_id,
+            voice.target.clone(),
+            &voice.start,
+        )
+        .await
+        .expect_err("the retry is answered rather than performed");
+    assert_eq!(
+        refusal.code,
+        kr_protocol::error::ErrorCode::OutcomeUnknown,
+        "{refusal:?}"
+    );
+    assert_eq!(broker.started(), 0, "no call was made");
+    voice.raw.close();
+    voice.host.stop().await;
+}
+
+/// KR-REQ-09.08 and 15.01: a start whose daemon stopped between its call and its record is never
+/// performed again. After a restart, and with the freshness window it was sent under long gone,
+/// its retry is told the outcome is not known, and the broker is not asked for a second call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_voice_start_whose_record_was_never_written_is_not_performed_again_after_a_restart() {
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let broker = Arc::new(OfflineProvider::default());
+    let voice = RawVoice::prepare(&owner, Arc::clone(&broker)).await;
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let window = voice.raw.action_window_id();
+    let started: kr_protocol::voice::VoiceStartResult = voice
+        .raw
+        .mutate(
+            Method::VoiceStart,
+            action_id,
+            voice.target.clone(),
+            &voice.start,
+        )
+        .await
+        .expect("the call is created")
+        .to_typed()
+        .expect("a start result");
+    assert!(
+        matches!(started.outcome, VoiceStartOutcome::Started { .. }),
+        "{:?}",
+        started.outcome
+    );
+    assert_eq!(broker.started(), 1);
+    // The daemon stopped between the call and the record of it.
+    {
+        let registry =
+            rusqlite::Connection::open(voice.host.registry_database()).expect("opens the registry");
+        registry
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .expect("waits for the daemon's writes");
+        let changed = registry
+            .execute(
+                "UPDATE authority_receipts SET result = NULL, recorded_at_ms = NULL
+                  WHERE action_id = ?1",
+                rusqlite::params![action_id.get().as_bytes().as_slice()],
+            )
+            .expect("the answer is taken out");
+        assert_eq!(changed, 1, "one action's answer");
+    }
+
+    let voice = voice.restart(Arc::clone(&broker)).await;
+    let refusal = voice
+        .raw
+        .mutate_in(
+            window,
+            Method::VoiceStart,
+            action_id,
+            voice.target.clone(),
+            &voice.start,
+        )
+        .await
+        .expect_err("an unfinished start is not performed again");
+    assert_eq!(
+        refusal.code,
+        kr_protocol::error::ErrorCode::OutcomeUnknown,
+        "{refusal:?}"
+    );
+    assert_eq!(broker.started(), 1, "no second call was made");
+    voice.raw.close();
+    voice.host.stop().await;
 }
 
 // ---------------------------------------------------------------------------------------------

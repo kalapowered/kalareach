@@ -8,6 +8,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
+//! | KR-REQ-09.08 | `a_device_revocation_is_performed_once_however_long_its_first_attempt_waits`, `a_retry_while_a_device_revocation_runs_is_told_it_has_not_finished`, `a_share_whose_record_was_never_written_is_answered_from_what_it_wrote_after_a_restart`, `a_revocation_whose_record_was_never_written_is_not_performed_again_after_a_restart`, `an_authority_change_whose_attempt_ended_unrecorded_is_not_performed_again`, `a_refused_authority_change_is_refused_the_same_way_when_it_is_sent_again`, `a_claim_excludes_every_other_attempt_and_is_never_taken_over`, `an_earlier_receipts_table_migrates_once_and_its_open_claims_are_unfinished` |
 //! | KR-REQ-10.40 | `a_grant_carries_every_field_section_ten_names`, `the_host_intersects_the_grant_with_policy_on_every_request`, `a_delegation_narrows_and_never_extends`, `revoking_a_parent_revokes_every_descendant` |
 //! | KR-REQ-10.41 | `a_method_is_decided_from_the_registry_table_and_never_from_a_capability` |
 //! | KR-REQ-10.43 | `an_owner_grant_stays_valid_until_it_is_revoked`, `an_invitation_is_view_only_for_an_hour_and_bounded_at_thirty_days` |
@@ -248,31 +249,45 @@ fn a_revocation_writes_its_fence_debt_down_before_the_fence_is_attempted() {
     assert!(directory.fence_owed().expect("readable").is_empty());
 }
 
-/// A claim excludes a second attempt, and a crashed attempt does not wedge the identifier.
+/// A claim excludes every other attempt, however long its own attempt runs, and an attempt that
+/// ends without recording what it did leaves the action unfinished: no later attempt is given the
+/// claim, however long after.
 #[test]
-fn a_claim_excludes_a_second_attempt_and_a_crashed_one_releases_it() {
-    use kr_controller::grants::ActionClaim;
+fn a_claim_excludes_every_other_attempt_and_is_never_taken_over() {
+    use kr_controller::grants::{ActionClaim, ActionRecord};
+    use kr_protocol::error::ErrorCode;
     use kr_protocol::ids::ActionId;
 
     let directory = GrantDirectory::in_memory().expect("a grant store");
     let actor = kr_protocol::ids::ActorId::new("device:phone").expect("a principal");
     let action = ActionId::new(Uuid::from_bytes([5; 16]));
     let digest = kr_protocol::scalars::Digest256::from_bytes([7; 32]);
+    let recorded = |action: ActionId, at_ms: u64| match directory
+        .claim_action(&actor, action, &digest, at_ms)
+        .expect("readable")
+    {
+        ActionClaim::Recorded(record) => record,
+        ActionClaim::Claimed { .. } => panic!("a later attempt was given the claim"),
+    };
 
+    let ActionClaim::Claimed { hold } = directory
+        .claim_action(&actor, action, &digest, 1_000)
+        .expect("claimed")
+    else {
+        panic!("the first attempt claims the action");
+    };
     assert_eq!(
-        directory
-            .claim_action(&actor, action, &digest, 1_000)
-            .expect("claimed"),
-        ActionClaim::Claimed {
-            claimed_at_ms: 1_000
-        }
+        recorded(action, 1_001),
+        ActionRecord::InFlight,
+        "a second attempt under one action identifier does not reach the effect"
     );
     assert_eq!(
-        directory
-            .claim_action(&actor, action, &digest, 1_001)
-            .expect("read"),
-        ActionClaim::InFlight,
-        "a second attempt under one action identifier does not reach the effect"
+        recorded(
+            action,
+            1_000 + kr_protocol::limits::MAX_MUTATION_TTL.get() + 1
+        ),
+        ActionRecord::InFlight,
+        "an attempt running for longer than any mutation is admitted for still holds its claim"
     );
 
     // A different payload under the same identifier is a conflict, not a second attempt.
@@ -281,30 +296,148 @@ fn a_claim_excludes_a_second_attempt_and_a_crashed_one_releases_it() {
         .claim_action(&actor, action, &other, 1_002)
         .expect_err("a reused identifier with a different payload");
 
-    // The first attempt crashed. Once a mutation could no longer be alive, the claim is takeable.
-    let past = 1_000 + kr_protocol::limits::MAX_MUTATION_TTL.get();
+    // The first attempt ends without recording what it did. It is never performed again.
+    drop(hold);
+    assert_eq!(recorded(action, u64::MAX / 2), ActionRecord::Unfinished);
     assert_eq!(
         directory
-            .claim_action(&actor, action, &digest, past)
-            .expect("reclaimed"),
-        ActionClaim::Claimed {
-            claimed_at_ms: 1_000
-        },
-        "the retry rebuilds its proposal from the moment the first claim was made"
+            .recorded_action(&actor, action, &digest)
+            .expect("readable"),
+        Some(ActionRecord::Unfinished)
     );
 
-    // And once it has a result, that is the answer, and it is never replaced.
+    // An action whose attempt recorded its result is answered with it, and the first answer is
+    // never replaced.
+    let answered = ActionId::new(Uuid::from_bytes([6; 16]));
+    let ActionClaim::Claimed { hold } = directory
+        .claim_action(&actor, answered, &digest, 2_000)
+        .expect("claimed")
+    else {
+        panic!("the first attempt claims the action");
+    };
     directory
-        .retain_result(&actor, action, b"first", past + 1)
+        .retain_result(&hold, b"first", 2_001)
         .expect("recorded");
     directory
-        .retain_result(&actor, action, b"second", past + 2)
+        .retain_result(&hold, b"second", 2_002)
         .expect("a completed receipt is not replaced");
+    directory
+        .retain_refusal(&hold, ErrorCode::PermissionDenied, "later", 2_003)
+        .expect("nor replaced by a refusal");
+    drop(hold);
+    assert_eq!(
+        recorded(answered, 2_004),
+        ActionRecord::Answered {
+            result: b"first".to_vec()
+        }
+    );
+
+    // A refusal the action was decided against is its answer from then on.
+    let refused = ActionId::new(Uuid::from_bytes([7; 16]));
+    let ActionClaim::Claimed { hold } = directory
+        .claim_action(&actor, refused, &digest, 3_000)
+        .expect("claimed")
+    else {
+        panic!("the first attempt claims the action");
+    };
+    directory
+        .retain_refusal(
+            &hold,
+            ErrorCode::PermissionDenied,
+            "the parent has been revoked",
+            3_001,
+        )
+        .expect("recorded");
+    drop(hold);
     assert_eq!(
         directory
-            .answered_action(&actor, action, &digest)
+            .recorded_action(&actor, refused, &digest)
             .expect("readable"),
-        Some(b"first".to_vec())
+        Some(ActionRecord::Refused {
+            code: ErrorCode::PermissionDenied,
+            detail: "the parent has been revoked".to_owned(),
+        })
+    );
+}
+
+/// A receipts table an earlier build wrote, with the lease column that let a later attempt take
+/// over an old claim, is brought to this build's shape once: the column goes, every row stays, and
+/// a claim that had no result is unfinished rather than one a later attempt can take.
+#[test]
+fn an_earlier_receipts_table_migrates_once_and_its_open_claims_are_unfinished() {
+    use kr_controller::grants::{ActionClaim, ActionRecord};
+    use kr_protocol::ids::ActionId;
+
+    let directory_path = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let path = directory_path.path().join("registry.sqlite3");
+    let actor = kr_protocol::ids::ActorId::new("local:501").expect("a principal");
+    let digest = kr_protocol::scalars::Digest256::from_bytes([9; 32]);
+    let answered = ActionId::new(Uuid::from_bytes([1; 16]));
+    let open = ActionId::new(Uuid::from_bytes([2; 16]));
+    {
+        let earlier = rusqlite::Connection::open(&path).expect("opens the store");
+        earlier
+            .execute_batch(
+                "CREATE TABLE authority_receipts (
+                     actor_id       TEXT NOT NULL,
+                     action_id      BLOB NOT NULL,
+                     payload_digest BLOB NOT NULL,
+                     claimed_at_ms  INTEGER NOT NULL,
+                     leased_at_ms   INTEGER NOT NULL,
+                     result         BLOB,
+                     recorded_at_ms INTEGER,
+                     PRIMARY KEY (actor_id, action_id)
+                 );",
+            )
+            .expect("the earlier shape");
+        for (action, result) in [(answered, Some(b"done".to_vec())), (open, None)] {
+            earlier
+                .execute(
+                    "INSERT INTO authority_receipts VALUES (?1, ?2, ?3, 1000, 1000, ?4, NULL)",
+                    rusqlite::params![
+                        actor.as_str(),
+                        action.get().as_bytes().as_slice(),
+                        digest.as_bytes().as_slice(),
+                        result,
+                    ],
+                )
+                .expect("a row an earlier build wrote");
+        }
+    }
+
+    for _ in 0..2 {
+        let directory = GrantDirectory::open(&path).expect("the store opens");
+        assert_eq!(
+            directory
+                .recorded_action(&actor, answered, &digest)
+                .expect("readable"),
+            Some(ActionRecord::Answered {
+                result: b"done".to_vec()
+            })
+        );
+        match directory
+            .claim_action(&actor, open, &digest, u64::MAX / 2)
+            .expect("readable")
+        {
+            ActionClaim::Recorded(record) => assert_eq!(record, ActionRecord::Unfinished),
+            ActionClaim::Claimed { .. } => panic!("an earlier build's open claim was taken over"),
+        }
+    }
+    let columns: Vec<String> = rusqlite::Connection::open(&path)
+        .expect("opens the store")
+        .prepare("SELECT name FROM pragma_table_info('authority_receipts') ORDER BY cid")
+        .expect("the columns")
+        .query_map([], |row| row.get(0))
+        .expect("the columns")
+        .collect::<rusqlite::Result<Vec<String>>>()
+        .expect("the columns");
+    assert!(
+        !columns.iter().any(|column| column == "leased_at_ms"),
+        "{columns:?}"
+    );
+    assert!(
+        columns.iter().any(|column| column == "refusal_code"),
+        "{columns:?}"
     );
 }
 
@@ -1860,10 +1993,16 @@ impl WorkerSupervisor for SilentSupervisor {
 
 async fn daemon() -> (kr_ipc::testing::TempHost, Arc<Controller>) {
     let temp = kr_ipc::testing::TempHost::create();
+    let controller = start_daemon(&temp).await;
+    (temp, controller)
+}
+
+/// Starts a daemon over an environment tree that may already hold another daemon's records.
+async fn start_daemon(temp: &kr_ipc::testing::TempHost) -> Arc<Controller> {
     let environment = temp.environment();
     let environment_id = temp.environment_id();
     let secrets = environment.secrets_dir();
-    let controller = Controller::start(ControllerSetup {
+    Controller::start(ControllerSetup {
         paths: environment.clone(),
         environment_id,
         identity: Box::new(move || {
@@ -1883,8 +2022,7 @@ async fn daemon() -> (kr_ipc::testing::TempHost, Arc<Controller>) {
         terminal: Box::new(kr_controller::supervision::NoTerminal),
     })
     .await
-    .expect("the daemon starts");
-    (temp, controller)
+    .expect("the daemon starts")
 }
 
 #[tokio::test]
@@ -2142,6 +2280,492 @@ async fn a_device_revocation_takes_every_grant_that_device_held() {
     .expect("succeeds");
     assert!(again.revoked_grants.is_empty());
     assert_eq!(again.authority_revision, result.authority_revision);
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-09.08: one action identifier, one withdrawal
+// ---------------------------------------------------------------------------------------------
+
+/// A daemon serving local clients on its own socket, for a test that submits an action the way a
+/// caller does and then submits the same action again.
+struct Serving {
+    temp: kr_ipc::testing::TempHost,
+    controller: Arc<Controller>,
+    clients: tokio::task::JoinHandle<kr_controller::error::Result<()>>,
+}
+
+impl Serving {
+    async fn start() -> Self {
+        Self::start_on(kr_ipc::testing::TempHost::create()).await
+    }
+
+    async fn start_on(temp: kr_ipc::testing::TempHost) -> Self {
+        let controller = start_daemon(&temp).await;
+        let endpoint = temp
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint");
+        let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
+        let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
+        Self {
+            temp,
+            controller,
+            clients,
+        }
+    }
+
+    /// Stops this daemon and starts another on the same environment tree, the way a restart of the
+    /// host does: every durable record stays, and nothing held in memory does.
+    async fn restart(self) -> Self {
+        let Self {
+            temp,
+            controller,
+            clients,
+        } = self;
+        clients.abort();
+        let _ = clients.await;
+        // Each connection's task holds the daemon, and the daemon holds its environment's lock
+        // until the last of them ends.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&controller) > 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stopped daemon is still held"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        drop(controller);
+        Self::start_on(temp).await
+    }
+
+    /// Takes one action's recorded answer back out of the store, as a daemon that stopped between
+    /// the action's effect and its record would have left it.
+    fn forget_answer(&self, action_id: kr_protocol::ids::ActionId) {
+        let registry = rusqlite::Connection::open(self.temp.environment().registry_database())
+            .expect("opens the registry");
+        registry
+            .busy_timeout(Duration::from_secs(5))
+            .expect("waits for the daemon's writes");
+        let changed = registry
+            .execute(
+                "UPDATE authority_receipts SET result = NULL, recorded_at_ms = NULL
+                  WHERE action_id = ?1",
+                rusqlite::params![action_id.get().as_bytes().as_slice()],
+            )
+            .expect("the answer is taken out");
+        assert_eq!(changed, 1, "one action's answer");
+    }
+
+    /// A local caller on the daemon's own socket.
+    async fn client(&self) -> kr_ipc::client::LocalClient {
+        kr_ipc::client::LocalClient::connect(
+            &self
+                .temp
+                .environment()
+                .controller_endpoint()
+                .expect("an endpoint"),
+            kr_protocol::local::LocalClientKind::Cli,
+            BuildId::new("kr-test/0").expect("a build identifier"),
+        )
+        .await
+        .expect("connects to the control endpoint")
+    }
+
+    /// The device revocation a local caller composes under `action_id`, and the claim the host's
+    /// own dispatch takes for it, taken as a first attempt that did so at `claimed_at_ms` and has
+    /// not gone on to its effect.
+    async fn claim_first_revocation(
+        &self,
+        client: &mut kr_ipc::client::LocalClient,
+        action_id: kr_protocol::ids::ActionId,
+        device: DeviceId,
+        claimed_at_ms: u64,
+    ) -> (
+        kr_protocol::envelope::MutationRequest,
+        kr_controller::grants::ActionClaim,
+    ) {
+        let mutation = client
+            .compose(
+                Method::DeviceRevoke,
+                action_id,
+                kr_protocol::envelope::ActionTarget::environment(self.temp.environment_id()),
+                &kr_protocol::sharing::DeviceRevokeParams { device_id: device },
+            )
+            .await
+            .expect("the revocation is composed");
+        // A caller on this machine acts as the operating-system account it runs under.
+        let actor =
+            kr_protocol::ids::ActorId::new(format!("local:{}", kr_ipc::paths::current_uid()))
+                .expect("a principal");
+        let digest =
+            kr_protocol::digest::mutation_digest(&mutation, &actor).expect("the payload digest");
+        let claim = self
+            .controller
+            .sharing()
+            .grants()
+            .claim_action(&actor, action_id, &digest, claimed_at_ms)
+            .expect("the first attempt claims its action");
+        (mutation, claim)
+    }
+}
+
+/// KR-REQ-09.08: one action identifier never withdraws authority twice.
+///
+/// The first attempt at a device revocation claims its action and stops before its effect, as a
+/// daemon task does when it is descheduled or waits on its store, and it stays stopped for longer
+/// than any mutation may be admitted for. A retry of the same action is told the first attempt has
+/// not finished and withdraws nothing. The device is granted something else meanwhile, and when
+/// the first attempt goes on it withdraws both grants in one withdrawal: the revision moves once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_revocation_is_performed_once_however_long_its_first_attempt_waits() {
+    let host = Serving::start().await;
+    let controller = &host.controller;
+    let recipient = device_id(0xf1);
+    let held = grant(1, None, &[ActionRight::SessionView], GrantExpiry::Never);
+    controller
+        .sharing()
+        .grants()
+        .issue(&record(held.clone()), || Ok(()))
+        .expect("written");
+    let before = controller.policy().authority_revision();
+    let mut client = host.client().await;
+    let action_id = kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x5a; 16]));
+
+    let stopped_since =
+        kr_ipc::now_ms().get() - kr_protocol::limits::MAX_MUTATION_TTL.get() - 1_000;
+    let (mutation, first) = host
+        .claim_first_revocation(&mut client, action_id, recipient, stopped_since)
+        .await;
+    assert!(
+        matches!(first, kr_controller::grants::ActionClaim::Claimed { .. }),
+        "{first:?}"
+    );
+
+    let retried = client
+        .repeat(&mutation)
+        .await
+        .expect("the daemon answers the retry");
+    let after_the_retry = controller
+        .sharing()
+        .grants()
+        .record(held.grant_id)
+        .expect("readable")
+        .expect("present");
+
+    // Authority the device is given while the first attempt waits.
+    let later = grant(2, None, &[ActionRight::FilesRead], GrantExpiry::Never);
+    controller
+        .sharing()
+        .grants()
+        .issue(&record(later.clone()), || Ok(()))
+        .expect("written");
+
+    // The first attempt goes on to its effect.
+    let performed = tokio::time::timeout(
+        Duration::from_secs(20),
+        controller.revoke_device_authority(recipient, None),
+    )
+    .await
+    .expect("the revocation completes")
+    .expect("it succeeds");
+    drop(first);
+
+    assert!(
+        after_the_retry.revoked_at_ms.is_none(),
+        "the retry withdrew nothing: {retried:?}"
+    );
+    let refusal = retried.expect_err("the retry is answered rather than performed");
+    assert_eq!(
+        refusal.code,
+        kr_protocol::error::ErrorCode::ResourceUnavailable,
+        "{refusal:?}"
+    );
+    assert!(performed.revoked_grants.contains(&held.grant_id));
+    assert!(performed.revoked_grants.contains(&later.grant_id));
+    assert_eq!(
+        controller.policy().authority_revision().get(),
+        before.get() + 1,
+        "one action, one withdrawal"
+    );
+}
+
+/// KR-REQ-09.08: a retry while the first attempt at a device revocation is running is told the
+/// first attempt has not finished, and withdraws nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_while_a_device_revocation_runs_is_told_it_has_not_finished() {
+    let host = Serving::start().await;
+    let controller = &host.controller;
+    let recipient = device_id(0xf1);
+    let held = grant(1, None, &[ActionRight::SessionView], GrantExpiry::Never);
+    controller
+        .sharing()
+        .grants()
+        .issue(&record(held.clone()), || Ok(()))
+        .expect("written");
+    let before = controller.policy().authority_revision();
+    let mut client = host.client().await;
+    let action_id = kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x5b; 16]));
+
+    let (mutation, first) = host
+        .claim_first_revocation(&mut client, action_id, recipient, kr_ipc::now_ms().get())
+        .await;
+    assert!(
+        matches!(first, kr_controller::grants::ActionClaim::Claimed { .. }),
+        "{first:?}"
+    );
+    let refusal = client
+        .repeat(&mutation)
+        .await
+        .expect("the daemon answers the retry")
+        .expect_err("the retry is answered rather than performed");
+    assert_eq!(
+        refusal.code,
+        kr_protocol::error::ErrorCode::ResourceUnavailable,
+        "{refusal:?}"
+    );
+    let stored = controller
+        .sharing()
+        .grants()
+        .record(held.grant_id)
+        .expect("readable")
+        .expect("present");
+    assert!(stored.revoked_at_ms.is_none(), "nothing was withdrawn");
+    assert_eq!(controller.policy().authority_revision(), before);
+    drop(first);
+}
+
+/// The target a share names: the session it shares, in this environment.
+fn shared_session(
+    environment: EnvironmentId,
+    session: SessionId,
+) -> kr_protocol::envelope::ActionTarget {
+    kr_protocol::envelope::ActionTarget {
+        environment_id: environment,
+        session_id: Nullable::some(session),
+        session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+        application_instance_id: Nullable::null(),
+        agent_binding_revision: Nullable::null(),
+    }
+}
+
+/// What a local caller asks to share one session with one device, under the viewer role.
+fn share_params(
+    session: SessionId,
+    recipient: DeviceId,
+    parent: Option<GrantId>,
+) -> kr_protocol::sharing::GrantCreateParams {
+    let selection =
+        kr_protocol::sharing::RoleSelection::plain(kr_protocol::sharing::SessionRole::Viewer);
+    kr_protocol::sharing::GrantCreateParams {
+        session_id: session,
+        recipient_device_id: recipient,
+        parent_grant_id: Nullable(parent),
+        accepted_notices: kr_protocol::sharing::AuthorityNotice::for_actions(&selection.actions()),
+        selection,
+        lifetime_ms: Nullable::null(),
+        owner_confirmation: Nullable::null(),
+    }
+}
+
+/// KR-REQ-09.08: a share whose daemon stopped between its effect and its record is answered, after
+/// a restart and with the freshness window it was sent under long gone, from the grant and the
+/// invitation it wrote, and nothing is written again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_share_whose_record_was_never_written_is_answered_from_what_it_wrote_after_a_restart() {
+    let host = Serving::start().await;
+    let mut client = host.client().await;
+    let action_id = kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x61; 16]));
+    let mutation = client
+        .compose(
+            Method::GrantCreate,
+            action_id,
+            shared_session(host.temp.environment_id(), session_id(0xa1)),
+            &share_params(session_id(0xa1), device_id(0xf3), None),
+        )
+        .await
+        .expect("the share is composed");
+    let first: kr_protocol::sharing::GrantCreateResult = client
+        .repeat(&mutation)
+        .await
+        .expect("the daemon answers")
+        .expect("the grant and its invitation are written")
+        .to_typed()
+        .expect("a share result");
+    drop(client);
+    host.forget_answer(action_id);
+    let written = host
+        .controller
+        .sharing()
+        .grants()
+        .records()
+        .expect("readable")
+        .len();
+
+    let host = host.restart().await;
+    let mut client = host.client().await;
+    let again: kr_protocol::sharing::GrantCreateResult = client
+        .repeat(&mutation)
+        .await
+        .expect("the daemon answers")
+        .expect("the share is answered from what it wrote, not refused as stale")
+        .to_typed()
+        .expect("a share result");
+    assert_eq!(
+        again, first,
+        "the answer the first attempt would have given"
+    );
+    assert_eq!(
+        host.controller
+            .sharing()
+            .grants()
+            .records()
+            .expect("readable")
+            .len(),
+        written,
+        "nothing was written again"
+    );
+}
+
+/// KR-REQ-09.08: a revocation whose daemon stopped between its effect and its record is never
+/// performed again. After a restart, and with the freshness window it was sent under long gone,
+/// its retry is told the outcome is not known, and the revision does not move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revocation_whose_record_was_never_written_is_not_performed_again_after_a_restart() {
+    let host = Serving::start().await;
+    let held = grant(1, None, &[ActionRight::SessionView], GrantExpiry::Never);
+    host.controller
+        .sharing()
+        .grants()
+        .issue(&record(held.clone()), || Ok(()))
+        .expect("written");
+    let mut client = host.client().await;
+    let action_id = kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x62; 16]));
+    let mutation = client
+        .compose(
+            Method::GrantRevoke,
+            action_id,
+            kr_protocol::envelope::ActionTarget::environment(host.temp.environment_id()),
+            &kr_protocol::sharing::GrantRevokeParams {
+                grant_id: held.grant_id,
+            },
+        )
+        .await
+        .expect("the revocation is composed");
+    let first: kr_protocol::sharing::RevocationResult = client
+        .repeat(&mutation)
+        .await
+        .expect("the daemon answers")
+        .expect("the grant is revoked")
+        .to_typed()
+        .expect("a revocation result");
+    drop(client);
+    host.forget_answer(action_id);
+
+    let host = host.restart().await;
+    let mut client = host.client().await;
+    let refusal = client
+        .repeat(&mutation)
+        .await
+        .expect("the daemon answers")
+        .expect_err("an unfinished revocation is not performed again");
+    assert_eq!(
+        refusal.code,
+        kr_protocol::error::ErrorCode::OutcomeUnknown,
+        "{refusal:?}"
+    );
+    assert_eq!(
+        host.controller.policy().authority_revision(),
+        first.authority_revision,
+        "the revision did not move again"
+    );
+}
+
+/// KR-REQ-09.08: an authority change whose attempt ended in this daemon without recording what it
+/// did is not performed again. A retry under a fresh window is told the outcome is not known, and
+/// nothing is withdrawn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_authority_change_whose_attempt_ended_unrecorded_is_not_performed_again() {
+    let host = Serving::start().await;
+    let controller = &host.controller;
+    let recipient = device_id(0xf1);
+    let held = grant(1, None, &[ActionRight::SessionView], GrantExpiry::Never);
+    controller
+        .sharing()
+        .grants()
+        .issue(&record(held.clone()), || Ok(()))
+        .expect("written");
+    let before = controller.policy().authority_revision();
+    let mut client = host.client().await;
+    let action_id = kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x63; 16]));
+    let (mutation, first) = host
+        .claim_first_revocation(&mut client, action_id, recipient, kr_ipc::now_ms().get())
+        .await;
+    assert!(
+        matches!(first, kr_controller::grants::ActionClaim::Claimed { .. }),
+        "{first:?}"
+    );
+    // The attempt ends, and records nothing.
+    drop(first);
+
+    let refusal = client
+        .repeat(&mutation)
+        .await
+        .expect("the daemon answers the retry")
+        .expect_err("the retry is answered rather than performed");
+    assert_eq!(
+        refusal.code,
+        kr_protocol::error::ErrorCode::OutcomeUnknown,
+        "{refusal:?}"
+    );
+    let stored = controller
+        .sharing()
+        .grants()
+        .record(held.grant_id)
+        .expect("readable")
+        .expect("present");
+    assert!(stored.revoked_at_ms.is_none(), "nothing was withdrawn");
+    assert_eq!(controller.policy().authority_revision(), before);
+}
+
+/// KR-REQ-09.08: an authority change refused before its effect is refused the same way when the
+/// same action is sent again, rather than performed or reported as running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_authority_change_is_refused_the_same_way_when_it_is_sent_again() {
+    let host = Serving::start().await;
+    let mut client = host.client().await;
+    let action_id = kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x64; 16]));
+    // A delegation from a grant this host does not hold.
+    let mutation = client
+        .compose(
+            Method::GrantCreate,
+            action_id,
+            shared_session(host.temp.environment_id(), session_id(0xa1)),
+            &share_params(session_id(0xa1), device_id(0xf3), Some(grant_id(0x77))),
+        )
+        .await
+        .expect("the share is composed");
+    let first = client
+        .repeat(&mutation)
+        .await
+        .expect("the daemon answers")
+        .expect_err("a delegation from nothing is refused");
+    assert_eq!(first.code, kr_protocol::error::ErrorCode::PermissionDenied);
+    let again = client
+        .repeat(&mutation)
+        .await
+        .expect("the daemon answers")
+        .expect_err("the same action is refused again");
+    assert_eq!(again.code, first.code, "{again:?}");
+    assert_eq!(again.message, first.message);
+    assert!(
+        host.controller
+            .sharing()
+            .grants()
+            .records()
+            .expect("readable")
+            .is_empty(),
+        "nothing was written"
+    );
 }
 
 /// Issuing and revoking the same subtree from two threads leaves a consistent store.

@@ -2229,10 +2229,12 @@ impl Controller {
                 .retained_installation(actor_id, mutation, connection_id)
                 .await;
         }
-        // An authority change this host already performed is answered from its record, here,
-        // before freshness is asked for. Section 9 keeps a receipt readable after the window that
-        // admitted it has expired, and a retry of a revocation that cannot reach its result would
-        // otherwise be told its window is gone rather than what happened.
+        // An authority change this host already holds a claim on is answered from it, here, before
+        // freshness is asked for: its result, its refusal, that it is still running, or what this
+        // host's records prove an attempt that ended unrecorded did. Section 9 keeps a receipt
+        // readable after the window that admitted it has expired, and a retry of a revocation that
+        // cannot reach its result would otherwise be told its window is gone rather than what
+        // happened.
         if matches!(
             method,
             Method::GrantCreate
@@ -2260,10 +2262,10 @@ impl Controller {
                 Err(error) => Some(respond(mutation.request_id, Err(error))),
             };
         }
-        // A voice change is one of those records: section 9 keeps a receipt readable after the
-        // window that admitted it has expired, and a retry that cannot reach its result would
-        // otherwise be told its window is gone rather than what happened. A delegation is not
-        // here, because it does not go through that store.
+        // A voice change is claimed in the same store and answered the same way: section 9 keeps
+        // a receipt readable after the window that admitted it has expired, and a retry that
+        // cannot reach its result would otherwise be told its window is gone rather than what
+        // happened. A delegation is not here, because it does not go through that store.
         if crate::voice::VoiceModule::serves(method) && method != Method::VoiceDelegate {
             return match self.voice_answered(actor_id, mutation).await {
                 Ok(Some(answered)) => Some(ControlFrame::Response(Response {
@@ -3393,8 +3395,9 @@ impl Controller {
                 .await
                 .map_err(|error| admission.refused_or(error));
         }
-        // What this action already produced, if it produced anything. Answered before the claim,
-        // so a retry of a completed change is its own result rather than a conflict.
+        // What this host already holds about this action, if anything. Answered before the claim,
+        // so a retry of a completed change is its own result rather than a conflict, and one whose
+        // first attempt is running or ended unrecorded is told so rather than performed.
         if let Some(answered) = self.voice_answered(actor_id, mutation).await? {
             return Ok(answered);
         }
@@ -3407,11 +3410,11 @@ impl Controller {
         if method != Method::VoiceStop {
             admission.check()?;
         }
-        match self.claim_voice_action(actor_id, mutation)? {
-            Ok(()) => {}
-            Err(answered) => return Ok(answered),
-        }
-        let result = self
+        let hold = match self.claim_voice_action(actor_id, mutation) {
+            Ok(hold) => hold,
+            Err(answer) => return answer,
+        };
+        let outcome = self
             .voice()
             .answer(
                 actor,
@@ -3422,9 +3425,12 @@ impl Controller {
                 &admission,
             )
             .await
-            .map_err(|error| admission.refused_or(error))?;
-        self.retain_authority_change(actor_id, mutation, &result)?;
-        Ok(result)
+            .map_err(|error| admission.refused_or(error));
+        // Recorded before the hold goes, so a retry finds the answer rather than a claim with
+        // neither an answer nor an attempt behind it.
+        self.settle_claim(&hold, &outcome)?;
+        drop(hold);
+        outcome
     }
 
     /// The digest one voice action is claimed and answered under.
@@ -3441,36 +3447,37 @@ impl Controller {
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }
 
-    /// Claims one voice action for this attempt, or answers with what it already produced.
+    /// Claims one voice action for this attempt, or gives the answer an earlier attempt's claim is
+    /// owed.
+    ///
+    /// `Ok` is this attempt's hold: it wrote the claim and is the one attempt that may perform the
+    /// change. `Err` is the answer to give instead ([`Self::recorded_voice_action`]), and nothing is
+    /// performed.
     fn claim_voice_action(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
-    ) -> Result<std::result::Result<(), ParamsValue>> {
-        let digest = self.voice_action_digest(actor_id, mutation)?;
-        match self.sharing.grants().claim_action(
-            actor_id,
-            mutation.action_id,
-            &digest,
-            kr_ipc::now_ms().get(),
-        )? {
-            crate::grants::ActionClaim::Claimed { .. } => Ok(Ok(())),
-            // Somebody else is inside this action. Performing it again would be two effects under
-            // one identity, and this is not a conflict: the payload is the same one, so the answer
-            // is transient and the caller retries for it.
-            crate::grants::ActionClaim::InFlight => Err(ControllerError::Refused {
-                code: ErrorCode::ResourceUnavailable,
-                detail: "that action is already running on this host".to_owned(),
-            }),
-            crate::grants::ActionClaim::Answered { result } => {
-                let value = kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
-                    .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-                Ok(Err(ParamsValue::new(value)))
+    ) -> std::result::Result<crate::grants::ClaimHold, Result<ParamsValue>> {
+        let digest = self.voice_action_digest(actor_id, mutation).map_err(Err)?;
+        match self
+            .sharing
+            .grants()
+            .claim_action(
+                actor_id,
+                mutation.action_id,
+                &digest,
+                kr_ipc::now_ms().get(),
+            )
+            .map_err(Err)?
+        {
+            crate::grants::ActionClaim::Claimed { hold } => Ok(hold),
+            crate::grants::ActionClaim::Recorded(record) => {
+                Err(Self::recorded_voice_action(record))
             }
         }
     }
 
-    /// What one voice action already produced, when this host has its answer.
+    /// What one voice action already came to, when this host holds a claim on it.
     ///
     /// The three voice changes this answers for name no session and carry no content about one:
     /// what each produced is the grant it wrote, the call it created or the call it ended. A
@@ -3482,16 +3489,36 @@ impl Controller {
         mutation: &MutationRequest,
     ) -> Result<Option<ParamsValue>> {
         let digest = self.voice_action_digest(actor_id, mutation)?;
-        let Some(result) =
-            self.sharing
-                .grants()
-                .answered_action(actor_id, mutation.action_id, &digest)?
-        else {
-            return Ok(None);
-        };
-        let value = kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        Ok(Some(ParamsValue::new(value)))
+        self.sharing
+            .grants()
+            .recorded_action(actor_id, mutation.action_id, &digest)?
+            .map(Self::recorded_voice_action)
+            .transpose()
+    }
+
+    /// The answer a voice change an earlier attempt claimed is owed.
+    ///
+    /// As an authority change's ([`Self::recorded_authority_change`]), with one difference: none of
+    /// the three leaves anything in this host's records that names the action. A voice grant takes
+    /// a fresh identity, a voice session is held in memory, and a started call is the broker's. So
+    /// a change whose attempt ended without recording what it did is an outcome this host does not
+    /// know, and it is never performed again: a second start would be a second metered call.
+    fn recorded_voice_action(record: crate::grants::ActionRecord) -> Result<ParamsValue> {
+        match record {
+            crate::grants::ActionRecord::Answered { result } => decoded(&result),
+            crate::grants::ActionRecord::Refused { code, detail } => {
+                Err(ControllerError::Refused { code, detail })
+            }
+            crate::grants::ActionRecord::InFlight => Err(ControllerError::Refused {
+                code: ErrorCode::ResourceUnavailable,
+                detail: "that action is already running on this host".to_owned(),
+            }),
+            crate::grants::ActionRecord::Unfinished => Err(ControllerError::Uncertain {
+                detail: "an earlier attempt at this voice change ended without recording what it \
+                         did, so a call or a grant it made may exist; it is not performed again"
+                    .to_owned(),
+            }),
+        }
     }
 
     /// Checks that the authority a voice proposal was admitted under still stands, now.
@@ -4851,11 +4878,13 @@ impl Controller {
         respond(mutation.request_id, outcome)
     }
 
-    /// Answers an authority change this host has already performed, before freshness is asked for.
+    /// Answers an authority change this host already holds a claim on, before freshness is asked
+    /// for.
     ///
-    /// Only a completed record answers here. A claim with no result is somebody inside the effect,
-    /// and this path says nothing about it: the claim is taken where the effect happens, under the
-    /// admission this mutation carries.
+    /// Section 9 keeps a receipt readable after the window that admitted it has gone, and a retry of
+    /// a revocation that could not reach its record would otherwise be told its window is gone
+    /// rather than what happened. What the answer is, for each state a claim can be in, is
+    /// [`Self::recorded_authority_change`].
     fn retained_authority_change(
         &self,
         actor_id: &ActorId,
@@ -4865,67 +4894,169 @@ impl Controller {
         match self
             .sharing
             .grants()
-            .answered_action(actor_id, mutation.action_id, &digest)
+            .recorded_action(actor_id, mutation.action_id, &digest)
         {
-            Ok(Some(result)) => {
-                let value = kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT).ok()?;
-                Some(ControlFrame::Response(Response {
-                    request_id: mutation.request_id,
-                    outcome: Outcome::Ok(ParamsValue::new(value)),
-                }))
-            }
+            Ok(Some(record)) => Some(respond(
+                mutation.request_id,
+                self.recorded_authority_change(mutation, record),
+            )),
             Ok(None) => None,
             Err(error) => Some(respond(mutation.request_id, Err(error))),
         }
     }
 
-    /// What a claim on one authority change found.
+    /// Claims one authority change for this attempt, or gives the answer an earlier attempt's claim
+    /// is owed.
     ///
-    /// Either this caller now holds the claim, with the moment it was made, or the change already
-    /// happened and this is what it produced.
+    /// `Ok` is this attempt's hold: it wrote the claim and is the one attempt that may perform the
+    /// change. `Err` is the answer to give instead, and nothing is performed.
     fn claim_authority_change(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
-    ) -> Result<std::result::Result<u64, ParamsValue>> {
+        now_ms: u64,
+    ) -> std::result::Result<crate::grants::ClaimHold, Result<ParamsValue>> {
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        match self.sharing.grants().claim_action(
-            actor_id,
-            mutation.action_id,
-            &digest,
-            kr_ipc::now_ms().get(),
-        )? {
-            crate::grants::ActionClaim::Claimed { claimed_at_ms } => Ok(Ok(claimed_at_ms)),
-            // Somebody else is inside this action. Performing it again would advance the revision
-            // twice for one withdrawal, and this is not a conflict: the payload is the same one,
-            // so the answer is transient and the caller retries for it. An attempt that crashed
-            // releases its claim once the mutation's own maximum lifetime has passed.
-            crate::grants::ActionClaim::InFlight => Err(ControllerError::Refused {
-                code: ErrorCode::ResourceUnavailable,
-                detail: "another attempt under this action identifier has not finished".to_owned(),
-            }),
-            crate::grants::ActionClaim::Answered { result } => {
-                let value = kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
-                    .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-                Ok(Err(ParamsValue::new(value)))
+            .map_err(|error| Err(ControllerError::InvalidArgument(error.to_string())))?;
+        match self
+            .sharing
+            .grants()
+            .claim_action(actor_id, mutation.action_id, &digest, now_ms)
+            .map_err(Err)?
+        {
+            crate::grants::ActionClaim::Claimed { hold } => Ok(hold),
+            crate::grants::ActionClaim::Recorded(record) => {
+                Err(self.recorded_authority_change(mutation, record))
             }
         }
     }
 
-    /// Records what a claimed authority change produced. A completed receipt is never replaced.
-    fn retain_authority_change(
+    /// The answer an authority change an earlier attempt claimed is owed.
+    ///
+    /// A change that happened is answered with what it produced, and one that was refused with its
+    /// refusal. One whose attempt is still running is told so, which is transient: the payload is
+    /// the same one, so this is not a conflict, and the caller asks again for the answer. One whose
+    /// attempt ended without recording what it did is never performed again, however long ago it
+    /// was claimed: an attempt is not known to have stopped short of its effect, and section 9 does
+    /// not dispatch an identifier again because its receipt is incomplete. It is answered from
+    /// what this host's own records prove the change did, and otherwise as an outcome this host
+    /// does not know.
+    fn recorded_authority_change(
         &self,
-        actor_id: &ActorId,
         mutation: &MutationRequest,
-        result: &ParamsValue,
+        record: crate::grants::ActionRecord,
+    ) -> Result<ParamsValue> {
+        match record {
+            crate::grants::ActionRecord::Answered { result } => decoded(&result),
+            crate::grants::ActionRecord::Refused { code, detail } => {
+                Err(ControllerError::Refused { code, detail })
+            }
+            crate::grants::ActionRecord::InFlight => Err(ControllerError::Refused {
+                code: ErrorCode::ResourceUnavailable,
+                detail: "another attempt under this action identifier has not finished".to_owned(),
+            }),
+            crate::grants::ActionRecord::Unfinished => self
+                .proven_authority_change(mutation)?
+                .ok_or_else(|| ControllerError::Uncertain {
+                    detail: "an earlier attempt at this action ended without recording what it \
+                             did, and this host's records do not show it; it is not performed \
+                             again, so read what it concerns before asking under a new action"
+                        .to_owned(),
+                }),
+        }
+    }
+
+    /// What this host's own records prove an unfinished authority change produced, when they
+    /// prove it.
+    ///
+    /// A grant and the invitation that carries it take identities derived from the action and are
+    /// written in one commit, so finding them is finding what the change wrote, and the answer is
+    /// rebuilt from what was written rather than proposed again. A preview-key registration's
+    /// answer is the registration itself, and it happened when the device's record holds that key
+    /// at that revision: the delivery journal takes it first, and a start copies the journal's
+    /// registration into the device's record. Nothing else this host keeps says what one
+    /// particular action did.
+    fn proven_authority_change(&self, mutation: &MutationRequest) -> Result<Option<ParamsValue>> {
+        match mutation.method.method() {
+            Some(Method::GrantCreate) => {
+                let action = mutation.action_id.get();
+                let shared = self.sharing.shared(
+                    kr_protocol::ids::GrantId::new(Self::derived_identity(action, b"grant")),
+                    kr_protocol::ids::InvitationId::new(Self::derived_identity(
+                        action,
+                        b"invitation",
+                    )),
+                )?;
+                shared.as_ref().map(encode).transpose()
+            }
+            Some(Method::DevicePreviewKeyUpdate) => {
+                let params: kr_protocol::sharing::DevicePreviewKeyUpdateParams =
+                    parse(&mutation.params)?;
+                let held = self
+                    .devices
+                    .record_for_device(params.device_id)?
+                    .is_some_and(|record| {
+                        record.device_key_revision == params.revision
+                            && record.notification_preview == Some(params.notification_preview)
+                    });
+                held.then(|| {
+                    encode(&kr_protocol::sharing::DevicePreviewKeyUpdateResult {
+                        device_id: params.device_id,
+                        revision: params.revision,
+                        notification_preview: params.notification_preview,
+                    })
+                })
+                .transpose()
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Keeps what a claimed action came to, under the hold that claimed it.
+    ///
+    /// A result is kept, and so is a refusal the action was decided against: one whose code says
+    /// the same request cannot succeed if it is sent again, which is the answer the action is owed
+    /// from then on. A failure that says the request might succeed later, a store that could not
+    /// be written or a resource that was busy, says nothing final about the action, so nothing is
+    /// kept for it: the claim stays unfinished, and a retry is answered from what this host's
+    /// records prove the action did.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when a result cannot be recorded. A refusal that cannot be recorded
+    /// is not an error of its own: the caller is given the refusal, and a retry reads the action
+    /// as unfinished.
+    fn settle_claim(
+        &self,
+        hold: &crate::grants::ClaimHold,
+        outcome: &Result<ParamsValue>,
     ) -> Result<()> {
-        self.sharing.grants().retain_result(
-            actor_id,
-            mutation.action_id,
-            &kr_cbor::encode(result.as_value()),
-            kr_ipc::now_ms().get(),
-        )
+        let now_ms = kr_ipc::now_ms().get();
+        match outcome {
+            Ok(result) => self.sharing.grants().retain_result(
+                hold,
+                &kr_cbor::encode(result.as_value()),
+                now_ms,
+            ),
+            Err(error)
+                if matches!(
+                    error.code().retry_category(),
+                    kr_protocol::error::RetryCategory::NoRetry
+                        | kr_protocol::error::RetryCategory::ConfigurationChange
+                ) =>
+            {
+                if let Err(unrecorded) = self.sharing.grants().retain_refusal(
+                    hold,
+                    error.code(),
+                    &error.to_string(),
+                    now_ms,
+                ) {
+                    eprintln!("kr-controller: could not record an action's refusal: {unrecorded}");
+                }
+                Ok(())
+            }
+            Err(_) => Ok(()),
+        }
     }
 
     /// Lists the grants this host's owner may see.
@@ -5099,12 +5230,13 @@ impl Controller {
         Ok(Ok(keys))
     }
 
-    /// Performs one authority change under a durable claim, and records what it produced.
+    /// Performs one authority change under a durable claim, and records what it came to.
     ///
     /// The claim comes first. An authority change is exactly the effect a retry must not repeat:
     /// two `grant.revoke` calls under one action identifier would otherwise advance the revision
-    /// twice and fence the host twice for one withdrawal. A claim this host already answered is
-    /// answered again from its record rather than performed a second time.
+    /// twice and fence the host twice for one withdrawal. Only the attempt that writes the claim
+    /// performs the change; any other is answered from the record
+    /// ([`Self::recorded_authority_change`]).
     async fn authority_change(
         &self,
         actor_id: &ActorId,
@@ -5112,30 +5244,32 @@ impl Controller {
         method: Method,
         carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
-        let claimed_at_ms = match self.claim_authority_change(actor_id, mutation)? {
-            Ok(claimed_at_ms) => claimed_at_ms,
-            Err(answered) => return Ok(answered),
+        let claimed_at_ms = kr_ipc::now_ms().get();
+        let hold = match self.claim_authority_change(actor_id, mutation, claimed_at_ms) {
+            Ok(hold) => hold,
+            Err(answer) => return answer,
         };
-        let result = match method {
-            Method::GrantCreate => self.grant_create(mutation, carried, claimed_at_ms).await?,
-            Method::GrantRevoke => self.grant_revoke(mutation, carried).await?,
-            Method::DeviceRevoke => self.device_revoke(mutation, carried).await?,
+        let outcome = match method {
+            Method::GrantCreate => self.grant_create(mutation, carried, claimed_at_ms).await,
+            Method::GrantRevoke => self.grant_revoke(mutation, carried).await,
+            Method::DeviceRevoke => self.device_revoke(mutation, carried).await,
             Method::DevicePreviewKeyUpdate => {
-                self.device_preview_key_update(actor_id, mutation).await?
+                self.device_preview_key_update(actor_id, mutation).await
             }
             Method::DeliveryDestinationSecretSet => {
                 self.delivery_destination_secret_set(mutation, carried)
-                    .await?
+                    .await
             }
-            _ => {
-                return Err(ControllerError::InvalidArgument(format!(
-                    "{} is not an authority change this daemon serves",
-                    method.as_str()
-                )));
-            }
+            _ => Err(ControllerError::InvalidArgument(format!(
+                "{} is not an authority change this daemon serves",
+                method.as_str()
+            ))),
         };
-        self.retain_authority_change(actor_id, mutation, &result)?;
-        Ok(result)
+        // Recorded before the hold goes, so a retry finds the answer rather than a claim with
+        // neither an answer nor an attempt behind it.
+        self.settle_claim(&hold, &outcome)?;
+        drop(hold);
+        outcome
     }
 
     /// Keeps the credential an external notification destination sends with.
@@ -5203,9 +5337,9 @@ impl Controller {
                     .to_owned(),
             ));
         }
-        // The identities are derived from the action the caller named, not minted fresh. A retry
-        // therefore asks for the same grant and the same invitation, and finds the ones it already
-        // created rather than making a second pair.
+        // The identities are derived from the action the caller named, not minted fresh. An attempt
+        // that ended before it recorded its answer therefore left a grant and an invitation this
+        // host can find by the action alone, and a retry is answered from them.
         let action = mutation.action_id.get();
         let request = crate::sharing::ShareRequest {
             invitation_id: kr_protocol::ids::InvitationId::new(Self::derived_identity(
@@ -5226,8 +5360,8 @@ impl Controller {
             named_approvals: Vec::new(),
             authority_revision: self.policy().authority_revision(),
             owner_confirmed: false,
-            // The moment the claim was made, not the moment this attempt reached here. A retry
-            // therefore proposes the same grant with the same deadline rather than a newer one.
+            // The moment the claim was written, which is when this host accepted the action: the
+            // invitation's lifetime runs from it.
             now_ms: claimed_at_ms,
         };
         // The admission is checked under the registry lock, and again inside the transaction that
@@ -5274,24 +5408,29 @@ impl Controller {
     /// the effect, recorded after it, and returned to a repeat of the same action whatever has
     /// happened since. A device whose answer was lost asks again with the same action and is told
     /// what it was told the first time, even after a later rotation or once the window this
-    /// action was admitted in has closed; a new action with an old revision is still refused.
+    /// action was admitted in has closed; a new action with an old revision is still refused. An
+    /// attempt that ended without recording its answer is not performed again: the repeat is told
+    /// the registration when the device's record holds it, and otherwise that the outcome is not
+    /// known.
     ///
     /// # Errors
     ///
     /// Returns what [`Self::device_preview_key_update`] refused with, a conflict when the action
-    /// identifier was used for a different registration, and a refusal while another attempt
-    /// under the same action has not finished.
+    /// identifier was used for a different registration, a refusal while another attempt under the
+    /// same action has not finished, and an unknown outcome for an attempt that ended unrecorded.
     pub async fn preview_key_update_action(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
     ) -> Result<ParamsValue> {
-        if let Err(answered) = self.claim_authority_change(actor_id, mutation)? {
-            return Ok(answered);
-        }
-        let result = self.device_preview_key_update(actor_id, mutation).await?;
-        self.retain_authority_change(actor_id, mutation, &result)?;
-        Ok(result)
+        let hold = match self.claim_authority_change(actor_id, mutation, kr_ipc::now_ms().get()) {
+            Ok(hold) => hold,
+            Err(answer) => return answer,
+        };
+        let outcome = self.device_preview_key_update(actor_id, mutation).await;
+        self.settle_claim(&hold, &outcome)?;
+        drop(hold);
+        outcome
     }
 
     /// Brings the device directory up to the preview keys the delivery journal holds.
@@ -8924,6 +9063,13 @@ fn parse<T: kr_protocol::wire::WireMessage>(params: &ParamsValue) -> Result<T> {
 
 fn encode<T: serde::Serialize>(value: &T) -> Result<ParamsValue> {
     ParamsValue::from_typed(value)
+        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+}
+
+/// Reads back a result the action store kept in its canonical encoding.
+fn decoded(result: &[u8]) -> Result<ParamsValue> {
+    kr_cbor::decode(result, &kr_cbor::Limits::DEFAULT)
+        .map(ParamsValue::new)
         .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
 }
 

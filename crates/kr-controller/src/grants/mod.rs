@@ -51,7 +51,9 @@ use kr_protocol::sharing::MembershipRefusal;
 pub use durable::{StoredFeed, StoredPolicy};
 pub use feed::{AuthorityFeed, FeedRefusal, RetainedRevocation};
 pub use policy::{HostPolicy, LeaseRefused, PolicyIntersection};
-pub use store::{ActionClaim, GrantDirectory, GrantRecord, GrantRevocation};
+pub use store::{
+    ActionClaim, ActionRecord, ClaimHold, GrantDirectory, GrantRecord, GrantRevocation,
+};
 pub use vocabulary::{rights_for, unconditional_rights_for};
 
 /// One request, as the intersection sees it.

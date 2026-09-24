@@ -364,20 +364,6 @@ impl SharingService {
             });
         }
 
-        // A retry that reaches here before its receipt was recorded finds the grant and the
-        // invitation it already wrote, rather than writing a second pair or being refused. That
-        // only works because the caller derives the identities from the action, which is why the
-        // daemon does, and because the two were one commit: finding one is finding both.
-        if let Some(existing) = self.grants.record(grant.grant_id)?
-            && existing.grant == grant
-            && let Some(kept) = self.grants.invitation(preview.invitation_id)?
-        {
-            return Ok(GrantCreateResult {
-                preview: kept.preview,
-                grant,
-                authority_revision: request.authority_revision,
-            });
-        }
         // The grant and its invitation are one commit. The grant is a **proposal**: it authorises
         // nothing until the device it names redeems the invitation that carries it.
         self.grants.issue_shared(
@@ -400,6 +386,37 @@ impl SharingService {
             preview,
             authority_revision: request.authority_revision,
         })
+    }
+
+    /// What a share that wrote `grant_id` and `invitation_id` produced, when both are here.
+    ///
+    /// This is how a retry of a share whose attempt ended before it recorded its answer is
+    /// answered: from what the attempt wrote, rather than by proposing the grant again. The two
+    /// are one commit, so finding both is finding the whole of what the share did, and a share
+    /// whose identities are derived from its action is found by the action alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot be read.
+    pub fn shared(
+        &self,
+        grant_id: GrantId,
+        invitation_id: InvitationId,
+    ) -> Result<Option<GrantCreateResult>> {
+        let Some(written) = self.grants.record(grant_id)? else {
+            return Ok(None);
+        };
+        let Some(invitation) = self.grants.invitation(invitation_id)? else {
+            return Ok(None);
+        };
+        if invitation.grant_id != grant_id {
+            return Ok(None);
+        }
+        Ok(Some(GrantCreateResult {
+            authority_revision: written.grant.authority_revision,
+            grant: written.grant,
+            preview: invitation.preview,
+        }))
     }
 
     /// Redeems an invitation and activates the grant it carries, once.
