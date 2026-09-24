@@ -263,8 +263,9 @@ struct Order {
 /// has gone. The first attachment is still subscribed in the session, so output the session is
 /// given then still reaches the delivery being replaced: one batch far larger than the transport
 /// holds, which that delivery begins and stops part way through, because the client is not
-/// reading. That is the state the replacement meets. The client then reads everything, and the
-/// session is given a line that only the new subscription can still carry.
+/// reading, and a line queued behind it. That is the state the replacement meets. The client reads
+/// again only once the replacement has happened, and reads until the line arrives through the new
+/// subscription: the old delivery has the line ready too, and must not send it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_subscription_replaced_part_way_through_a_frame_leaves_the_stream_whole() {
     let host = host().await;
@@ -289,7 +290,7 @@ async fn a_subscription_replaced_part_way_through_a_frame_leaves_the_stream_whol
 
     // The replacing request is answered, and the connection stops before it replaces the first
     // delivery.
-    let (arrived, release) = host.service.pause_before_replacing_delivery();
+    let pause = host.service.pause_before_replacing_delivery();
     let params = ParamsValue::from_typed(&subscription(&host, second)).expect("encodes");
     client
         .writer()
@@ -330,24 +331,27 @@ async fn a_subscription_replaced_part_way_through_a_frame_leaves_the_stream_whol
         .expect("the answer decodes")
         .from_cursor
         .get();
-    tokio::time::timeout(LIVENESS_DEADLINE, arrived)
+    tokio::time::timeout(LIVENESS_DEADLINE, pause.arrived)
         .await
         .unwrap_or_else(|_| panic!("waited {LIVENESS_DEADLINE:?} for the connection to answer"))
         .expect("the connection says it has answered");
 
-    // The client reads nothing more for now, and the delivery being replaced stops part way
-    // through the frame that carries the batch.
+    // The client reads nothing more for now. The delivery being replaced stops part way through
+    // the frame that carries the batch, with the line queued behind it.
     write_output(&host, &vec![b'x'; BATCH_BYTES]);
+    write_output(&host, b"\r\nkr-after-the-replacement\r\n");
     until(
         "the delivery being replaced to stop part way through a frame",
         || host.service.part_way_through_a_frame(first),
     )
     .await;
-    drop(release);
+    drop(pause.release);
+    tokio::time::timeout(LIVENESS_DEADLINE, pause.replaced)
+        .await
+        .unwrap_or_else(|_| panic!("waited {LIVENESS_DEADLINE:?} for the replacement"))
+        .expect("the connection says it has replaced the first delivery");
 
-    // The client reads everything, until a line the session is given after the replacement
-    // arrives through the new subscription.
-    write_output(&host, b"\r\nkr-after-the-replacement\r\n");
+    // The client reads everything, until the line arrives through the new subscription.
     let mut order = Order {
         old_next,
         old_after: 0,

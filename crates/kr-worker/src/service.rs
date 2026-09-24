@@ -223,12 +223,7 @@ pub struct WorkerService {
     /// own tests arm to make that replacement meet a frame part way to its peer. It is compiled
     /// away in every shipped build.
     #[cfg(feature = "testing")]
-    replacement_pause: Mutex<
-        Option<(
-            tokio::sync::oneshot::Sender<()>,
-            tokio::sync::oneshot::Receiver<()>,
-        )>,
-    >,
+    replacement_pause: Mutex<Option<ArmedReplacement>>,
 }
 
 impl WorkerService {
@@ -453,36 +448,39 @@ impl WorkerService {
     /// being replaced goes on writing what it was sent before, so a test can let it begin a frame
     /// its peer does not take and replace it part way through that frame.
     ///
-    /// Returns the end that says the connection has arrived, and the end that lets it go; dropping
-    /// the second lets it go too. The pause fires once.
+    /// The pause fires once.
     #[cfg(feature = "testing")]
-    pub fn pause_before_replacing_delivery(
-        &self,
-    ) -> (
-        tokio::sync::oneshot::Receiver<()>,
-        tokio::sync::oneshot::Sender<()>,
-    ) {
-        let (arrived, watch) = tokio::sync::oneshot::channel();
+    pub fn pause_before_replacing_delivery(&self) -> ReplacementPause {
+        let (arrived, arrival) = tokio::sync::oneshot::channel();
         let (release, go) = tokio::sync::oneshot::channel();
+        let (replaced, replacement) = tokio::sync::oneshot::channel();
         *self
             .replacement_pause
             .lock()
-            .expect("the pause is not poisoned") = Some((arrived, go));
-        (watch, release)
+            .expect("the pause is not poisoned") = Some(ArmedReplacement {
+            arrived,
+            go,
+            replaced,
+        });
+        ReplacementPause {
+            arrived: arrival,
+            release,
+            replaced: replacement,
+        }
     }
 
-    /// Waits at the pause above, where one is armed. Compiled away in every shipped build.
+    /// Waits at the pause above, where one is armed, and returns what says the replacement has
+    /// happened. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
-    async fn wait_before_replacing_delivery(&self) {
+    async fn wait_before_replacing_delivery(&self) -> Option<tokio::sync::oneshot::Sender<()>> {
         let armed = self
             .replacement_pause
             .lock()
             .expect("the pause is not poisoned")
-            .take();
-        if let Some((arrived, go)) = armed {
-            let _ = arrived.send(());
-            let _ = go.await;
-        }
+            .take()?;
+        let _ = armed.arrived.send(());
+        let _ = armed.go.await;
+        Some(armed.replaced)
     }
 
     /// Returns whether the connection that owns `attachment_id` has sent its peer part of a frame
@@ -954,13 +952,19 @@ impl WorkerService {
                 // begins its first frame only once the old one has stopped, so the peer is sent
                 // the old stream's last frame whole and then the new stream.
                 #[cfg(feature = "testing")]
-                if state.delivery.is_some() {
-                    self.wait_before_replacing_delivery().await;
-                }
+                let watched = if state.delivery.is_some() {
+                    self.wait_before_replacing_delivery().await
+                } else {
+                    None
+                };
                 let previous = state
                     .delivery
                     .take()
                     .map(|previous| previous.replace(&writer));
+                #[cfg(feature = "testing")]
+                if let Some(replaced) = watched {
+                    let _ = replaced.send(());
+                }
                 let (replacement, replaced) = tokio::sync::oneshot::channel::<()>();
                 // And a withdrawn connection starts none at all. The task is created holding a
                 // permit it has to be given before it does anything, and the permit is only sent
@@ -5811,6 +5815,29 @@ impl Drop for Predecessor {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+/// A test's hold on the next connection that replaces a running delivery.
+///
+/// Returned by [`WorkerService::pause_before_replacing_delivery`], for this host's own tests.
+#[cfg(feature = "testing")]
+#[derive(Debug)]
+pub struct ReplacementPause {
+    /// Says the connection has answered the replacing request and stands before the replacement.
+    pub arrived: tokio::sync::oneshot::Receiver<()>,
+    /// Lets the connection go on; dropping it does too.
+    pub release: tokio::sync::oneshot::Sender<()>,
+    /// Says the connection has told the running delivery that it was replaced.
+    pub replaced: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// The connection's ends of a [`ReplacementPause`].
+#[cfg(feature = "testing")]
+#[derive(Debug)]
+struct ArmedReplacement {
+    arrived: tokio::sync::oneshot::Sender<()>,
+    go: tokio::sync::oneshot::Receiver<()>,
+    replaced: tokio::sync::oneshot::Sender<()>,
 }
 
 /// One connection's registration in the worker's authority store.
