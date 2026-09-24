@@ -525,7 +525,7 @@ A worker's lifetime belongs to the platform, not to the control daemon.
 | Platform | How a worker starts | Where its identity comes from |
 | --- | --- | --- |
 | macOS | a per-session launchd job, bootstrapped into `gui/<uid>` and started once with `launchctl kickstart -p` | the kickstart output's process identifier, then `proc_pidinfo` |
-| Linux with systemd | a transient user *service*, `systemd-run --user --unit=... -p Type=exec -p Restart=no` | `systemctl --user show -p MainPID`, then `/proc/<pid>/stat` |
+| Linux with systemd | a transient user *service*, `systemd-run --user --unit=... --collect -p Type=exec -p Restart=no` | `systemctl --user show -p MainPID`, then `/proc/<pid>/stat` |
 | other Unix | a child in its own process group, reparented to init when the daemon exits | the spawned child |
 | Windows | the spawned child, outside the daemon's kill-on-close Job | the child's identifier and creation time |
 
@@ -540,6 +540,12 @@ for and removes each one whose process has ended: a worker that ended while no d
 leaves nothing loaded either. A job whose process is still running is never removed, because
 removing it would end that worker. The job's definition under `jobs/` goes with it, and its
 `.diagnostics` file stays.
+
+systemd drops a transient unit once its process has ended, and `--collect` makes that so for a
+unit whose process failed as well, which would otherwise stay listed as failed until somebody
+reset it. Every command put to launchd or to the user manager, whether it asks, loads, starts or
+removes, is given ten seconds to answer; one that does not is ended and counted as a failure of a
+command that may have reached the manager.
 
 The service manager reports a process identifier as soon as it has spawned the process, which can
 be before the kernel will describe it. The daemon retries briefly rather than refusing a worker

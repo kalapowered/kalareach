@@ -7,7 +7,7 @@
 //! | Platform | How the worker is started | Where its identity comes from |
 //! | --- | --- | --- |
 //! | macOS | a per-session launchd job, bootstrapped into the domain the profile names and started once with `launchctl kickstart -p` | the kickstart output's process identifier, then `proc_pidinfo` |
-//! | Linux with systemd | a transient user *service*, `systemd-run --user --unit=... -p Type=exec -p Restart=no` | `systemctl --user show -p MainPID`, then `/proc/<pid>/stat` |
+//! | Linux with systemd | a transient user *service*, `systemd-run --user --unit=... --collect -p Type=exec -p Restart=no` | `systemctl --user show -p MainPID`, then `/proc/<pid>/stat` |
 //! | other Unix | a `setsid` launch, reparented to init | the spawned child's identifier, then `/proc` or `proc_pidinfo` |
 //! | Windows | the spawned child, outside the daemon's kill-on-close Job | the child's identifier and creation time |
 //!
@@ -19,8 +19,9 @@
 //! recorded and the kernel then says the worker's process has gone, and, for every job this
 //! environment still has defined, when the daemon starts. A job whose process is still running is
 //! never removed, because removing it would end that process. The other supervisors leave no job
-//! of this kind behind: a systemd transient service is dropped when its process ends, unless that
-//! process failed, and the fallback supervisor defines no job at all.
+//! of this kind behind: a systemd transient service is started with `--collect`, so the manager
+//! drops it once its process has ended, whether that process succeeded or failed, and the fallback
+//! supervisor defines no job at all.
 //!
 //! The identity the launcher reports is recorded against the reservation before the worker
 //! connects, and the rendezvous compares it with the connecting peer. That is what stops another
@@ -356,15 +357,13 @@ impl LaunchdSupervisor {
     }
 
     /// Returns true when this host has a GUI bootstrap domain to put a job in.
+    ///
+    /// Asked within [`SERVICE_MANAGER_BOUND`]: a launchd that does not answer is not one this
+    /// host can start a worker through either.
     #[must_use]
     pub fn available() -> bool {
-        std::process::Command::new("/bin/launchctl")
-            .arg("print")
-            .arg(format!("gui/{}", kr_ipc::paths::current_uid()))
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
+        launchctl_within(&["print", &format!("gui/{}", kr_ipc::paths::current_uid())])
+            .is_ok_and(|output| output.status.success())
     }
 
     /// Returns the bootstrap domain a worker of this profile belongs in.
@@ -539,13 +538,21 @@ impl LaunchdSupervisor {
 
     /// Removes one job this environment defined, once its process has ended, from whichever of
     /// this user's two domains has it, and then its definition.
+    ///
+    /// What a removal said where it failed and the job went all the same is reported here, apart
+    /// from the answer: the job is gone, and a launchctl that could not be ended or collected is
+    /// still something a person reading this daemon's log should see.
     fn retire(jobs_directory: &Path, label: &str) -> JobRetirement {
         let uid = kr_ipc::paths::current_uid();
-        Self::retire_from(
+        let (retirement, said) = Self::retire_from(
             jobs_directory,
             label,
             &[format!("gui/{uid}"), format!("user/{uid}")],
-        )
+        );
+        for failure in said {
+            eprintln!("kr-controller: {failure}");
+        }
+        retirement
     }
 
     /// Removes one job this environment defined, once its process has ended, from whichever of
@@ -558,45 +565,85 @@ impl LaunchdSupervisor {
     /// job left loaded rather than a process ended. A domain that does not exist, such as the
     /// graphical domain of a user who has logged out, has nothing loaded in it, and the next domain
     /// is looked at all the same.
-    fn retire_from(jobs_directory: &Path, label: &str, domains: &[String]) -> JobRetirement {
+    ///
+    /// Returns the answer, and beside it what each removal said where it failed and the job was
+    /// gone afterwards all the same: a removal that did not answer, or a launchctl that could not
+    /// be ended or collected, is reported rather than dropped because the job went anyway.
+    fn retire_from(
+        jobs_directory: &Path,
+        label: &str,
+        domains: &[String],
+    ) -> (JobRetirement, Vec<String>) {
         let definition = job_definition(jobs_directory, label);
         match std::fs::symlink_metadata(&definition) {
             Ok(_) => {}
             // Written before a job is loaded and removed only once it has gone, so a job with no
             // definition here is not one this environment has loaded.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return JobRetirement::Gone;
+                return (JobRetirement::Gone, Vec::new());
             }
             Err(error) => {
-                return JobRetirement::Unsettled(format!("{}: {error}", definition.display()));
+                return (
+                    JobRetirement::Unsettled(format!("{}: {error}", definition.display())),
+                    Vec::new(),
+                );
             }
         }
+        let mut said = Vec::new();
         for domain in domains {
             let target = format!("{domain}/{label}");
             match job_state(&target) {
                 JobState::NotLoaded => continue,
-                JobState::Running => return JobRetirement::StillRunning,
-                JobState::Unknown(detail) => return JobRetirement::Unsettled(detail),
+                JobState::Running => return (JobRetirement::StillRunning, said),
+                JobState::Unknown(detail) => return (JobRetirement::Unsettled(detail), said),
                 JobState::Ended => {}
             }
             // Whether the removal took is read back from launchd rather than from this command's
             // own answer: a job something else removed a moment earlier is gone all the same.
-            let _ = launchctl_within(&["bootout", &target]);
+            let failure = removal_failure(&target, &launchctl_within(&["bootout", &target]));
             match job_state(&target) {
-                JobState::NotLoaded => {}
-                JobState::Unknown(detail) => return JobRetirement::Unsettled(detail),
+                JobState::NotLoaded => {
+                    said.extend(failure.map(|failure| {
+                        format!("{target} is gone, and removing it said: {failure}")
+                    }))
+                }
+                JobState::Unknown(detail) => return (JobRetirement::Unsettled(detail), said),
                 JobState::Running | JobState::Ended => {
-                    return JobRetirement::Unsettled(format!(
-                        "{target} is still loaded after it was removed"
-                    ));
+                    return (
+                        JobRetirement::Unsettled(format!(
+                            "{target} is still loaded after it was removed{}",
+                            failure.map_or_else(String::new, |failure| format!(
+                                "; removing it said: {failure}"
+                            ))
+                        )),
+                        said,
+                    );
                 }
             }
         }
-        match std::fs::remove_file(&definition) {
+        let retirement = match std::fs::remove_file(&definition) {
             Ok(()) => JobRetirement::Gone,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => JobRetirement::Gone,
             Err(error) => JobRetirement::Unsettled(format!("{}: {error}", definition.display())),
-        }
+        };
+        (retirement, said)
+    }
+}
+
+/// What removing a job said, where it said anything but that it removed it.
+#[cfg(target_os = "macos")]
+fn removal_failure(
+    target: &str,
+    removal: &std::result::Result<std::process::Output, String>,
+) -> Option<String> {
+    match removal {
+        Ok(output) if output.status.success() => None,
+        Ok(output) => Some(format!(
+            "launchctl bootout {target} answered {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Err(detail) => Some(detail.clone()),
     }
 }
 
@@ -614,48 +661,63 @@ enum JobState {
     Unknown(String),
 }
 
-/// How long one question or removal put to launchd is given to answer.
-#[cfg(target_os = "macos")]
-const LAUNCHCTL_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long one command put to a service manager is given to answer: a question, a removal, a
+/// load or a start.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const SERVICE_MANAGER_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How long a launchctl that did not answer is given to be collected once it has been ended.
-#[cfg(target_os = "macos")]
+/// How long a command that did not answer is given to be collected once it has been ended.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const COLLECT_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Runs `launchctl`, gives it [`LAUNCHCTL_BOUND`] to answer, and returns its answer or why there was
-/// none.
+/// Runs `launchctl` within [`SERVICE_MANAGER_BOUND`], and returns its answer or why there was none.
+#[cfg(target_os = "macos")]
+fn launchctl_within(arguments: &[&str]) -> std::result::Result<std::process::Output, String> {
+    command_within("/bin/launchctl", arguments, SERVICE_MANAGER_BOUND)
+        .map_err(|failure| failure.detail())
+}
+
+/// Runs one service-manager command, gives it `bound` to answer, and returns its answer or why there
+/// was none.
 ///
 /// What it prints is read while it runs, so an answer of any size cannot stall it. It is this
 /// process's own child: one that did not answer, could not be waited for, or whose output could not
 /// be read is ended and given [`COLLECT_BOUND`] to be collected. The two are deadlines on the
 /// command and on its collection; starting it and its readers, and taking in what a collected one
 /// left in its pipes, come on top of them. A failure to end or collect it is part of what this
-/// returns, and the readers of a launchctl that was not collected are left to finish by themselves.
-#[cfg(target_os = "macos")]
-fn launchctl_within(arguments: &[&str]) -> std::result::Result<std::process::Output, String> {
-    let asked = arguments.join(" ");
-    let mut child = std::process::Command::new("/bin/launchctl")
+/// returns, and the readers of a command that was not collected are left to finish by themselves.
+///
+/// A command that could not be started at all is [`RunFailure::NotRun`]; every failure after it
+/// started is [`RunFailure::Failed`], because it may have reached the service manager first.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn command_within(
+    program: &str,
+    arguments: &[&str],
+    bound: std::time::Duration,
+) -> std::result::Result<std::process::Output, RunFailure> {
+    let asked = format!("{program} {}", arguments.join(" "));
+    let mut child = std::process::Command::new(program)
         .args(arguments)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|error| format!("/bin/launchctl: {error}"))?;
+        .map_err(|error| RunFailure::NotRun(format!("{program}: {error}")))?;
     let printed = match child.stdout.take().map(read_to_the_end_aside).transpose() {
         Ok(reader) => reader,
         Err(error) => {
-            let detail = format!("launchctl {asked}: its answer could not be read: {error}");
-            return Err(end_and_collect(&mut child, detail).0);
+            let detail = format!("{asked}: its answer could not be read: {error}");
+            return Err(RunFailure::Failed(end_and_collect(&mut child, detail).0));
         }
     };
     let said = match child.stderr.take().map(read_to_the_end_aside).transpose() {
         Ok(reader) => reader,
         Err(error) => {
-            let detail = format!("launchctl {asked}: what it said could not be read: {error}");
-            return Err(end_and_collect(&mut child, detail).0);
+            let detail = format!("{asked}: what it said could not be read: {error}");
+            return Err(RunFailure::Failed(end_and_collect(&mut child, detail).0));
         }
     };
-    let deadline = std::time::Instant::now() + LAUNCHCTL_BOUND;
+    let deadline = std::time::Instant::now() + bound;
     let ended = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
@@ -663,14 +725,10 @@ fn launchctl_within(arguments: &[&str]) -> std::result::Result<std::process::Out
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             Ok(None) => {
-                break Err(format!(
-                    "launchctl {asked} did not answer within {LAUNCHCTL_BOUND:?}"
-                ));
+                break Err(format!("{asked} did not answer within {bound:?}"));
             }
             Err(error) => {
-                break Err(format!(
-                    "launchctl {asked} could not be waited for: {error}"
-                ));
+                break Err(format!("{asked} could not be waited for: {error}"));
             }
         }
     };
@@ -678,10 +736,10 @@ fn launchctl_within(arguments: &[&str]) -> std::result::Result<std::process::Out
         Ok(status) => (Ok(status), true),
         Err(detail) => {
             let (detail, collected) = end_and_collect(&mut child, detail);
-            (Err(detail), collected)
+            (Err(RunFailure::Failed(detail)), collected)
         }
     };
-    // A collected launchctl has closed its pipes, so both readers have finished or are about to.
+    // A collected command has closed its pipes, so both readers have finished or are about to.
     let read = |reader: Option<std::thread::JoinHandle<Vec<u8>>>| {
         reader
             .filter(|_| collected)
@@ -696,10 +754,10 @@ fn launchctl_within(arguments: &[&str]) -> std::result::Result<std::process::Out
     })
 }
 
-/// Ends a launchctl this process started and has not collected, and collects it within
+/// Ends a command this process started and has not collected, and collects it within
 /// [`COLLECT_BOUND`]. Returns `detail` with whatever of that failed added to it, and whether the
-/// launchctl was collected.
-#[cfg(target_os = "macos")]
+/// command was collected.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn end_and_collect(child: &mut std::process::Child, mut detail: String) -> (String, bool) {
     if let Err(error) = child.kill() {
         detail.push_str(&format!("; ending it failed: {error}"));
@@ -726,12 +784,12 @@ fn end_and_collect(child: &mut std::process::Child, mut detail: String) -> (Stri
 }
 
 /// Reads a pipe to its end on a thread of its own, or says why no thread could be made for it.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn read_to_the_end_aside(
     mut pipe: impl std::io::Read + Send + 'static,
 ) -> std::io::Result<std::thread::JoinHandle<Vec<u8>>> {
     std::thread::Builder::new()
-        .name("launchctl output".to_owned())
+        .name("service manager output".to_owned())
         .spawn(move || {
             let mut bytes = Vec::new();
             let _ = pipe.read_to_end(&mut bytes);
@@ -804,17 +862,20 @@ impl SystemdSupervisor {
     }
 
     /// Returns true when this host has a user service manager to ask.
+    ///
+    /// Asked within [`SERVICE_MANAGER_BOUND`]: a manager that does not answer is not one this host
+    /// can start a worker through either.
     #[must_use]
     pub fn available() -> bool {
         // A user manager that answers a property query is a user manager that exists. Running
         // `systemctl` successfully proves only that the binary is installed, which a host with no
         // user manager also has.
-        std::process::Command::new("systemctl")
-            .args(["--user", "show", "--property=Version", "--value"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
+        command_within(
+            "systemctl",
+            &["--user", "show", "--property=Version", "--value"],
+            SERVICE_MANAGER_BOUND,
+        )
+        .is_ok_and(|output| output.status.success())
     }
 }
 
@@ -842,9 +903,13 @@ impl SystemdSupervisor {
         let unit = launch.label.clone();
         // A transient *service*, not a scope: `MainPID` is defined for a service, so the launcher
         // has an identity to record. A scope would leave the controller guessing.
+        // `--collect`, so the manager drops the unit once its process has ended however it ended.
+        // Without it a unit whose process failed stays listed, failed, until somebody resets it,
+        // and nothing here ever would.
         let mut arguments = vec![
             "--user".to_owned(),
             format!("--unit={unit}"),
+            "--collect".to_owned(),
             "-p".to_owned(),
             "Type=exec".to_owned(),
             "-p".to_owned(),
@@ -1097,13 +1162,10 @@ impl RunFailure {
     }
 }
 
-/// Runs a service manager's command and returns what it printed.
+/// Runs a service manager's command within [`SERVICE_MANAGER_BOUND`] and returns what it printed.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn run(program: &str, arguments: &[&str]) -> std::result::Result<String, RunFailure> {
-    let output = std::process::Command::new(program)
-        .args(arguments)
-        .output()
-        .map_err(|error| RunFailure::NotRun(format!("{program}: {error}")))?;
+    let output = command_within(program, arguments, SERVICE_MANAGER_BOUND)?;
     if !output.status.success() {
         return Err(RunFailure::Failed(format!(
             "{program} {}: {}",
@@ -1581,7 +1643,7 @@ mod tests {
         let domains = [absent, format!("user/{}", kr_ipc::paths::current_uid())];
         assert_eq!(
             LaunchdSupervisor::retire_from(&jobs, &label, &domains),
-            JobRetirement::Gone
+            (JobRetirement::Gone, Vec::new())
         );
         assert!(
             matches!(job_state(&target), JobState::NotLoaded),
@@ -1670,6 +1732,152 @@ mod tests {
                 "the process of this test's own job outlived its removal"
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// A service-manager command that does not answer is ended and collected within its bound,
+    /// and one that could not be started at all is told apart from one that ran and failed.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_service_manager_command_is_given_a_bound_and_told_apart_by_how_it_failed() {
+        let started = std::time::Instant::now();
+        let Err(RunFailure::Failed(detail)) =
+            command_within("/bin/sleep", &["30"], std::time::Duration::from_millis(200))
+        else {
+            panic!("a command that does not answer within its bound is a failure of one that ran");
+        };
+        assert!(detail.contains("did not answer within"), "{detail}");
+        assert!(
+            !detail.contains("still running") && !detail.contains("collecting it failed"),
+            "it was ended and collected: {detail}"
+        );
+        assert!(
+            started.elapsed() < COLLECT_BOUND,
+            "it was ended long before the thirty seconds it asked for: {:?}",
+            started.elapsed()
+        );
+
+        assert!(
+            matches!(
+                command_within(
+                    "/nonexistent/service-manager",
+                    &[],
+                    std::time::Duration::from_secs(1)
+                ),
+                Err(RunFailure::NotRun(_))
+            ),
+            "a command that could not be started never reached anything"
+        );
+
+        let Err(RunFailure::Failed(detail)) = run("/bin/sh", &["-c", "echo refused >&2; exit 3"])
+        else {
+            panic!("a command that answered with a failure is a failure of one that ran");
+        };
+        assert!(
+            detail.contains("refused"),
+            "it says what it was told: {detail}"
+        );
+        assert_eq!(
+            run("/bin/sh", &["-c", "echo answered"]).expect("a command that answers"),
+            "answered\n"
+        );
+    }
+
+    /// What a removal said is kept wherever it said anything but that it removed the job.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn what_a_removal_said_is_kept_where_it_failed() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let answered =
+            |raw: i32, said: &str| -> std::result::Result<std::process::Output, String> {
+                Ok(std::process::Output {
+                    status: std::process::ExitStatus::from_raw(raw),
+                    stdout: Vec::new(),
+                    stderr: said.as_bytes().to_vec(),
+                })
+            };
+        let target = "gui/501/kr-worker-x";
+        assert_eq!(removal_failure(target, &answered(0, "")), None);
+        let failed = removal_failure(target, &answered(36 << 8, "Operation now in progress"))
+            .expect("a removal that answered a failure");
+        assert!(
+            failed.contains("Some(36)") && failed.contains("Operation now in progress"),
+            "{failed}"
+        );
+        let unanswered = "launchctl bootout gui/501/kr-worker-x did not answer within 10s; it was \
+                          still running 5s after it was ended";
+        assert_eq!(
+            removal_failure(target, &Err(unanswered.to_owned())).as_deref(),
+            Some(unanswered),
+            "a launchctl that could not be collected is part of what is reported"
+        );
+    }
+
+    /// A transient unit whose process failed is collected by the user manager rather than kept
+    /// listed as failed.
+    ///
+    /// It needs a user service manager for this account, which a Linux login session or an
+    /// account with lingering enabled has and a hosted CI runner's account does not, so an
+    /// ordinary run leaves it out. It runs with `--ignored` on a Linux host whose account has one,
+    /// as a developer's workstation or a build host where the account lingers; where there is
+    /// none it fails and says so.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs a user service manager for this account (`systemctl --user`), which a hosted CI runner's account does not have; it runs with --ignored on a Linux host whose account has one"]
+    fn a_transient_unit_whose_process_failed_is_collected() {
+        assert!(
+            SystemdSupervisor::available(),
+            "this account has no user service manager to ask, so this check cannot run here"
+        );
+        let host = kr_ipc::testing::TempHost::create();
+        let unit = format!("kr-test-collect-{}", kr_ipc::new_uuid());
+        // A unit this test made, reset when the test ends however it ends, so a manager that kept
+        // it keeps nothing of this test's afterwards.
+        struct OwnUnit(String);
+        impl Drop for OwnUnit {
+            fn drop(&mut self) {
+                let _ = command_within(
+                    "systemctl",
+                    &["--user", "reset-failed", &format!("{}.service", self.0)],
+                    SERVICE_MANAGER_BOUND,
+                );
+            }
+        }
+        let _own = OwnUnit(unit.clone());
+        let outcome = SystemdSupervisor::new().start_service(&ServiceLaunch {
+            label: unit.clone(),
+            program: PathBuf::from("/bin/sh"),
+            arguments: vec!["-c".to_owned(), "exit 3".to_owned()],
+            jobs_directory: host.environment().jobs_dir(),
+            working_directory: host.root().to_path_buf(),
+        });
+        assert!(
+            !matches!(outcome, LaunchOutcome::NotStarted { .. }),
+            "the unit was started: {outcome:?}"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let shown = command_within(
+                "systemctl",
+                &[
+                    "--user",
+                    "show",
+                    "--property=LoadState,ActiveState",
+                    &format!("{unit}.service"),
+                ],
+                SERVICE_MANAGER_BOUND,
+            )
+            .expect("the user manager answers");
+            let said = String::from_utf8_lossy(&shown.stdout).into_owned();
+            if said.contains("LoadState=not-found") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the unit whose process failed is still listed 30 s after it started: {said}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
 }
