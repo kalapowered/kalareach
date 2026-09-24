@@ -771,6 +771,14 @@ async fn relay_loop(
             // next one from the cursor it holds.
             () = remote.link_lost() => return,
         };
+        // Decided before it is written, like the request that opened the subscription: the grant,
+        // the policy and the ceiling as they stand now. A batch they no longer allow is not
+        // written, and the connection goes with it.
+        if !remote.may_relay().await {
+            remote.output().withdraw();
+            remote.release().await;
+            return;
+        }
         // The registration and the grant are read inside the write boundary itself, and watched
         // for as long as the write waits, so a revocation that lands while this frame is queued
         // stops it there. The item holds its charge against the connection's queue until it has
@@ -1568,6 +1576,30 @@ mod tests {
         }
     }
 
+    /// Makes every write of the host's policy fail from here, as it would on a full disk.
+    fn refuse_policy_writes(temp: &kr_ipc::testing::TempHost) -> rusqlite::Connection {
+        let registry = rusqlite::Connection::open(temp.environment().registry_database())
+            .expect("opens the registry");
+        registry
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .expect("waits for the daemon's writes");
+        registry
+            .execute_batch(
+                "CREATE TRIGGER refuse_policy BEFORE INSERT ON host_authority
+                 WHEN NEW.key = 'policy'
+                 BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+            )
+            .expect("the fault is in place");
+        registry
+    }
+
+    /// Lets the host's policy be written again.
+    fn allow_policy_writes(registry: &rusqlite::Connection) {
+        registry
+            .execute_batch("DROP TRIGGER refuse_policy;")
+            .expect("the fault is cleared");
+    }
+
     /// The clock floor this environment has written down.
     fn written_floor(controller: &Controller) -> u64 {
         controller
@@ -1603,18 +1635,7 @@ mod tests {
             .expect("the grant stands before it expires");
 
         // From here every write of the host's policy fails, as it would on a full disk.
-        let registry = rusqlite::Connection::open(temp.environment().registry_database())
-            .expect("opens the registry");
-        registry
-            .busy_timeout(std::time::Duration::from_secs(5))
-            .expect("waits for the daemon's writes");
-        registry
-            .execute_batch(
-                "CREATE TRIGGER refuse_policy BEFORE INSERT ON host_authority
-                 WHEN NEW.key = 'policy'
-                 BEGIN SELECT RAISE(ABORT, 'no room'); END;",
-            )
-            .expect("the fault is in place");
+        let registry = refuse_policy_writes(&temp);
 
         // The wall clock steps past the expiry. The grant is refused, and the floor it was refused
         // on cannot be written.
@@ -1633,9 +1654,7 @@ mod tests {
 
         // Storage recovers. The next decision is a permission for another grant, which owes no
         // record of its own, and it writes the floor the refusal stood on before it answers.
-        registry
-            .execute_batch("DROP TRIGGER refuse_policy;")
-            .expect("the fault is cleared");
+        allow_policy_writes(&registry);
         controller
             .decide_for_device(&lasting, &lasting_record, listing(&temp, now))
             .expect("a grant that does not expire is served");
@@ -1653,6 +1672,67 @@ mod tests {
             .expect_err("the refusal outlives the daemon that made it");
         assert!(
             matches!(refused, CeilingRefusal::Refused(Refusal::Expired { .. })),
+            "{refused:?}"
+        );
+        drop(controller);
+    }
+
+    /// A lapsed offline bound is decided on the clock floor as well, and has no expiry record of
+    /// its own: the floor is all that keeps it lapsed across a restart. With no decision after the
+    /// failed write, the network's record task writes the floor once storage takes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lapsed_offline_bound_whose_floor_write_failed_is_written_by_the_record_task() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = daemon(&temp).await;
+        let revision = controller.policy().authority_revision();
+        let now = kr_ipc::now_ms().get();
+        let hour = 60 * 60 * 1000;
+        controller
+            .update_policy(|policy| {
+                policy.set_offline_validity(Some(kr_protocol::sharing::OfflineValidityPolicy {
+                    maximum_offline_ms: kr_protocol::scalars::DurationMs::new(hour),
+                    last_synchronised_at_ms: Nullable::some(TimestampMs::new(now)),
+                }));
+            })
+            .expect("the owner chooses an offline bound of an hour");
+        let (lasting, lasting_record) = granted(GrantExpiry::Never, revision);
+        controller
+            .decide_for_device(&lasting, &lasting_record, listing(&temp, now))
+            .expect("inside the bound");
+
+        let registry = refuse_policy_writes(&temp);
+        let refused = controller
+            .decide_for_device(&lasting, &lasting_record, listing(&temp, now + 2 * hour))
+            .expect_err("the wall clock steps past the bound");
+        assert!(
+            matches!(
+                refused,
+                CeilingRefusal::Refused(Refusal::OfflineValidityLapsed { .. })
+            ),
+            "{refused:?}"
+        );
+        assert!(written_floor(&controller) < now + hour, "the write failed");
+
+        // Storage recovers and nothing asks for a decision. The record task's own pass writes the
+        // floor the refusal stood on.
+        allow_policy_writes(&registry);
+        controller.settle_floor();
+        assert!(
+            written_floor(&controller) >= now + 2 * hour,
+            "the floor the refusal stood on is written down"
+        );
+
+        drop(controller);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let controller = daemon(&temp).await;
+        let refused = controller
+            .decide_for_device(&lasting, &lasting_record, listing(&temp, now))
+            .expect_err("a clock wound back before the restart does not bring the bound back");
+        assert!(
+            matches!(
+                refused,
+                CeilingRefusal::Refused(Refusal::OfflineValidityLapsed { .. })
+            ),
             "{refused:?}"
         );
         drop(controller);

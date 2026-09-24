@@ -401,7 +401,9 @@ is admitted at the new revision, and its requests are decided under the narrower
 on. The fence answers for the ceiling devices are served under as well as for the document this
 host last finished accepting. The two differ after an edit whose ceiling went into force while
 another of its effects failed, and a later edit that withdraws what that ceiling allowed is fenced
-like any other. The host policy moves to that revision with the registry, so a device paired after the edit is
+like any other. A fence that could not be raised, because the revision could not be written, stays
+owed: every later reading raises it, whether or not anything in the document moved, and only a
+fence that was raised settles it. The host policy moves to that revision with the registry, so a device paired after the edit is
 issued a grant this host recognises as its own.
 
 A secret is never in the document. `secrets` holds named references: what this configuration calls
@@ -1658,6 +1660,13 @@ What the grant decides, for every request:
   buffer alone, and the rows of the buffer that is not showing are counted among what its
   restoration did not carry. The exception section 10 names is the visible screen, and never the
   inactive buffer, the scrollback or the backing transcript.
+
+What a subscription carries is a read that goes on after it was answered, so the same decision is
+taken again, as a subscription to the attached session, before each batch the host writes to it.
+A batch the grant, the policy or the ceiling no longer allows is not written, and the connection
+ends with it. Only an expired grant is written to the device's record; any other refusal leaves
+the grant alone. A lapsed offline bound, for one, holds again once the authority feed
+synchronises, and the device learns why from the next request it makes.
 
 What the subject decides stays the subject's, and the conditional requirements the daemon cannot
 evaluate are exactly those: whose subject it is. A device detaches the attachment its own

@@ -2142,6 +2142,31 @@ impl RemoteConnection {
         self.authorised().await.is_ok()
     }
 
+    /// Decides again whether this connection may be written what its subscription carries.
+    ///
+    /// What a subscription carries is a read that goes on after it was answered, and a continued
+    /// read still needs valid authority. So every batch the relay writes is decided through the
+    /// same intersection a request is, as a subscription to the session this connection is
+    /// attached to: its grant, this host's policy and the configured ceiling as they stand at that
+    /// moment. A grant this finds expired is latched and written down, as a request's is. Any
+    /// other refusal ends the connection and leaves the grant alone, because nothing about the
+    /// grant has ended: a lapsed offline bound, for one, holds again once the authority feed
+    /// synchronises, and the device is told why by the next request it makes.
+    pub async fn may_relay(&self) -> bool {
+        let attached = self
+            .proxy
+            .lock()
+            .await
+            .as_ref()
+            .map(|proxy| proxy.session_id());
+        // Only a link relays anything, so a batch with none behind it is not one to write.
+        let Some(session_id) = attached else {
+            return false;
+        };
+        self.check_grant(Some(session_id), Method::EventsSubscribe.entry(), false)
+            .is_ok()
+    }
+
     /// Refuses a request on a connection whose registration has been withdrawn.
     async fn authorised(&self) -> std::result::Result<(), ProtocolError> {
         self.controller

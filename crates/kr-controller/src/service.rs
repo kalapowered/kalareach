@@ -338,10 +338,11 @@ pub struct Controller {
     /// that could not be raised has to stop dispatch rather than be reported and passed over. The
     /// revision did not advance, which is exactly why every connection admitted under the old one
     /// still looks admitted: nothing in the registry says otherwise, so this does, and admission
-    /// refuses while it is set.
+    /// refuses while it is set. Every acceptance raises the fence again while it is set, whatever
+    /// its reading moved, and only a fence that was raised clears it.
     ///
-    /// In this process and no longer. A daemon that stops here comes back, reads the same
-    /// document, finds the same fence owed and raises it or refuses to serve.
+    /// In this process and no longer, because the connections it stands for end with the process.
+    /// A daemon that starts again accepts any document it has not accepted before it serves.
     fence_unraised: std::sync::atomic::AtomicBool,
     /// The environment's transfer service, whose methods this daemon admits and dispatches.
     transfer: Arc<crate::transfer::TransferModule>,
@@ -5742,7 +5743,15 @@ impl Controller {
         // later document that matches the old one then moves nothing against it, and it still
         // withdraws what the ceiling in force allowed, so the work admitted under that ceiling is
         // fenced like any other.
-        owed.fences_dispatch |= ceiling_moved;
+        //
+        // And a fence an earlier reading owed and could not raise is owed until one is raised.
+        // Nothing else settles it: once the ceiling it answered for is in force, no reading moves
+        // anything, and a reading that let the debt go would leave the work admitted under the
+        // withdrawn ceiling admitted.
+        owed.fences_dispatch |= ceiling_moved
+            || self
+                .fence_unraised
+                .load(std::sync::atomic::Ordering::SeqCst);
         let (sessions, mut failure) = self.apply_session_limit(&resolver, &state).await;
         if sessions.from_document {
             // Recorded the moment the registry took it, separately from everything below. A later
@@ -5789,16 +5798,6 @@ impl Controller {
                     });
                 }
             }
-        } else if failure.is_none() && resolver.loaded().document.is_some() {
-            // This reading asks for no fence, so a fence an earlier reading could not raise is no
-            // longer owed: the document that asked for it has moved on.
-            //
-            // Only a reading that produced a document may say so. A file that is absent, damaged
-            // or at a version this build does not know decides nothing, which is why it lifts no
-            // ceiling; it cannot lift the refusal a withdrawal owes either. The refusal stands
-            // until a reading raises the fence or a readable document says the withdrawal is over.
-            self.fence_unraised
-                .store(false, std::sync::atomic::Ordering::SeqCst);
         }
         if failure.is_none() && !owed.fences_dispatch && owed_before.is_some() {
             // A fence this environment raised earlier that a worker had not acknowledged. The debt

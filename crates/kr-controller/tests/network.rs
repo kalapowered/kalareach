@@ -1230,27 +1230,30 @@ fn without_viewing() -> Vec<String> {
     .collect()
 }
 
-/// KR-REQ-26.15: a narrowing is measured against the rights ceiling in force, not only against
-/// the document this host last finished accepting.
+/// A device subscribed under a rights ceiling that went into force while an effect after it failed.
 ///
-/// The two part when an edit's ceiling went into force and an effect after it failed. Here the
-/// accepted document withholds viewing, a wider ceiling goes into force through an edit whose
-/// profile change cannot be applied, and a device connects and subscribes under it. Narrowing back
-/// to exactly what the accepted document said then withdraws viewing from that device, so the
-/// connection and its subscription are fenced before the narrowing is acknowledged.
-#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_narrowing_after_a_failed_widening_fences_the_subscription_the_widening_admitted() {
-    let Some(host) = Host::create() else {
-        return;
-    };
-    let owner = DeviceKeys::generate().expect("owner keys");
-    let daemon = host.start(loopback(), &owner).await;
+/// The accepted document withholds viewing. A wider ceiling goes into force through an edit whose
+/// profile change cannot be applied, so the document this host last finished accepting is still
+/// the one that withholds viewing, and a device connects and subscribes under the wider ceiling.
+/// Then the fault clears.
+struct SubscribedUnderAFailedWidening {
+    local: LocalClient,
+    session_id: SessionId,
+    device: Device,
+    record: DeviceRecord,
+    session: Session,
+}
+
+async fn subscribed_under_a_failed_widening(
+    host: &Host,
+    daemon: &RunningDaemon,
+    owner: &DeviceKeys,
+) -> SubscribedUnderAFailedWidening {
     let mut local = host.client().await;
-    let created = create(&mut local, &host).await;
+    let created = create(&mut local, host).await;
     let session_id = created.session.session_id;
     let device = Device::create(&loopback()).await;
-    let record = pair(&daemon, &device, &owner).await;
+    let record = pair(daemon, &device, owner).await;
 
     daemon
         .controller
@@ -1292,7 +1295,7 @@ async fn a_narrowing_after_a_failed_widening_fences_the_subscription_the_widenin
     );
 
     // A device connects under the wider ceiling, and its subscription runs.
-    let session = connect(&daemon, &device, &record).await;
+    let session = connect(daemon, &device, &record).await;
     let attached = attach(&session, host.environment_id, session_id).await;
     let seen = type_and_observe(
         &session,
@@ -1304,9 +1307,47 @@ async fn a_narrowing_after_a_failed_widening_fences_the_subscription_the_widenin
     .await;
     assert!(seen.contains(MARKER));
 
-    // The fault clears, and the owner narrows the ceiling to exactly what the accepted document
-    // says.
     std::fs::remove_dir(&blocked).expect("the fault is cleared");
+    SubscribedUnderAFailedWidening {
+        local,
+        session_id,
+        device,
+        record,
+        session,
+    }
+}
+
+/// Asserts that a device's connection has been ended rather than answered.
+async fn ended(session: &Session, session_id: SessionId, why: &str) {
+    let refused = session
+        .read::<_, SessionReadResult>(Method::SessionRead, &SessionReadParams { session_id })
+        .await
+        .expect_err(why);
+    assert_eq!(
+        refused.code(),
+        ErrorCode::ResourceUnavailable,
+        "{why}: the connection is ended rather than answered: {refused}"
+    );
+}
+
+/// KR-REQ-26.15: a narrowing is measured against the rights ceiling in force, not only against
+/// the document this host last finished accepting.
+///
+/// The two part after an edit whose ceiling went into force while an effect after it failed.
+/// Narrowing back to exactly what the accepted document said still withdraws viewing from the
+/// device that subscribed under the wider ceiling, so its connection and subscription are fenced
+/// before the narrowing is acknowledged.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_narrowing_after_a_failed_widening_fences_the_subscription_the_widening_admitted() {
+    let Some(host) = Host::create() else {
+        return;
+    };
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let daemon = host.start(loopback(), &owner).await;
+    let widened = subscribed_under_a_failed_widening(&host, &daemon, &owner).await;
+    let session_id = widened.session_id;
+
     let applied = daemon
         .controller
         .apply_configuration(&Change::GrantRights(Some(without_viewing())))
@@ -1317,22 +1358,17 @@ async fn a_narrowing_after_a_failed_widening_fences_the_subscription_the_widenin
         "withdrawing what the ceiling in force allowed owes a fence"
     );
     assert!(applied.barrier_holds);
-
-    // Acknowledged means fenced: the connection admitted under the wider ceiling, and the
-    // subscription on it, are ended rather than answered.
-    let refused = session
-        .read::<_, SessionReadResult>(Method::SessionRead, &SessionReadParams { session_id })
-        .await
-        .expect_err("the connection admitted under the wider ceiling is fenced");
-    assert_eq!(
-        refused.code(),
-        ErrorCode::ResourceUnavailable,
-        "the connection is ended rather than answered: {refused}"
-    );
-    session.close();
+    // Acknowledged means fenced.
+    ended(
+        &widened.session,
+        session_id,
+        "the connection admitted under the wider ceiling is fenced",
+    )
+    .await;
+    widened.session.close();
 
     // A new connection is decided under the narrow ceiling.
-    let session = connect(&daemon, &device, &record).await;
+    let session = connect(&daemon, &widened.device, &widened.record).await;
     let refused = session
         .read::<_, SessionReadResult>(Method::SessionRead, &SessionReadParams { session_id })
         .await
@@ -1347,7 +1383,79 @@ async fn a_narrowing_after_a_failed_widening_fences_the_subscription_the_widenin
 
     // The fence withdrew the owner's connection as well, like every connection admitted under
     // the revision it replaced, so the owner closes the session on a new one.
-    drop(local);
+    drop(widened.local);
+    let mut local = host.client().await;
+    close_session(&mut local, &host, session_id).await;
+    daemon.stop().await;
+}
+
+/// KR-REQ-26.15: a fence a narrowing owed and could not raise stays owed until one is raised.
+///
+/// The narrowing comes while another writer holds the registry, so the revision cannot advance
+/// and the edit is not acknowledged. Once the writer finishes, the same document read again moves
+/// nothing, against the document accepted or against the ceiling in force, and the fence it owes
+/// is raised all the same: the revision advances and the subscription admitted under the wider
+/// ceiling ends.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_a_narrowing_could_not_raise_is_raised_by_the_next_reading() {
+    let Some(host) = Host::create() else {
+        return;
+    };
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let daemon = host.start(loopback(), &owner).await;
+    let widened = subscribed_under_a_failed_widening(&host, &daemon, &owner).await;
+    let session_id = widened.session_id;
+    let before = daemon
+        .controller
+        .authority_revision()
+        .await
+        .expect("the revision in force");
+
+    // Another writer takes the registry's write lock and keeps it. Reads go on, because the
+    // registry is a write-ahead log, and the revision cannot advance.
+    let blocker = rusqlite::Connection::open(host.paths().registry_database())
+        .expect("a second connection to this environment's registry");
+    blocker
+        .execute_batch("BEGIN EXCLUSIVE")
+        .expect("another writer holds the registry");
+    let unfenced = daemon
+        .controller
+        .apply_configuration(&Change::GrantRights(Some(without_viewing())))
+        .await
+        .expect_err("a narrowing whose fence cannot be raised is not acknowledged");
+    assert!(
+        unfenced
+            .to_string()
+            .contains("dispatch could not be fenced"),
+        "{unfenced}"
+    );
+
+    blocker
+        .execute_batch("COMMIT")
+        .expect("the other writer finishes");
+    drop(blocker);
+    let effective = daemon.controller.effective_configuration().await;
+    assert!(
+        effective.not_in_force.0.is_none(),
+        "the next reading raised the fence: {:?}",
+        effective.not_in_force
+    );
+    let after = daemon
+        .controller
+        .authority_revision()
+        .await
+        .expect("the revision in force");
+    assert!(after > before, "the revision advanced once it could");
+    ended(
+        &widened.session,
+        session_id,
+        "the connection admitted under the wider ceiling is fenced",
+    )
+    .await;
+    widened.session.close();
+
+    drop(widened.local);
     let mut local = host.client().await;
     close_session(&mut local, &host, session_id).await;
     daemon.stop().await;
@@ -1430,6 +1538,124 @@ async fn a_grant_the_clock_floor_expired_ends_the_subscription_and_stays_expired
     );
 
     session.close();
+    close_session(&mut local, &host, session_id).await;
+    daemon.stop().await;
+}
+
+/// What the shell prints every fifth of a second once `TICKING_COMMAND` runs.
+const TICK: &str = "kalareach-tick";
+
+/// A loop in the shell's foreground, so its output keeps arriving and closing the session ends it.
+/// Printed through a format string, so the echo of the command itself does not match `TICK`.
+const TICKING_COMMAND: &str = "while :; do printf 'kala%s-tick\\n' reach; sleep 0.2; done\n";
+
+/// A subscription is decided again before each batch this host writes to it, so a bounded
+/// offline policy that lapses stops the output of one that is running.
+///
+/// The connection ends and the grant is left as it was: no expiry is written, the device connects
+/// again, and the request it makes there is refused and told why.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lapsed_offline_bound_stops_a_running_subscription_and_leaves_the_grant() {
+    let Some(host) = Host::create() else {
+        return;
+    };
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let daemon = host.start(loopback(), &owner).await;
+    let mut local = host.client().await;
+    let created = create(&mut local, &host).await;
+    let session_id = created.session.session_id;
+    let device = Device::create(&loopback()).await;
+    let record = pair(&daemon, &device, &owner).await;
+
+    let session = connect(&daemon, &device, &record).await;
+    let attached = attach(&session, host.environment_id, session_id).await;
+    let seen = type_and_observe(
+        &session,
+        host.environment_id,
+        session_id,
+        attached.typing,
+        MARKER_COMMAND,
+    )
+    .await;
+    assert!(seen.contains(MARKER));
+    let mut events = session.events();
+    session
+        .write_input(&InputWriteParams {
+            session_id,
+            attachment_id: attached.typing,
+            epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
+            sequence: kr_protocol::ids::InputSequence::new(1),
+            bytes: kr_protocol::scalars::Bytes::new(TICKING_COMMAND.as_bytes().to_vec()),
+        })
+        .await
+        .expect("the loop is typed");
+    received_without_applying(&mut events, TICK).await;
+
+    // The owner chooses a bounded offline policy with no synchronisation to measure from, so
+    // personal remote access is outside its bound at once.
+    daemon
+        .controller
+        .update_policy(|policy| {
+            policy.set_offline_validity(Some(kr_protocol::sharing::OfflineValidityPolicy {
+                maximum_offline_ms: DurationMs::new(60_000),
+                last_synchronised_at_ms: Nullable::null(),
+            }));
+        })
+        .expect("the owner's choice is recorded");
+
+    // The next batch the loop prints is not written, and the connection goes with it. Until
+    // then a request on it is refused and told why.
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        let refused = session
+            .read::<_, SessionReadResult>(Method::SessionRead, &SessionReadParams { session_id })
+            .await
+            .expect_err("nothing is served outside the offline bound");
+        if refused.code() == ErrorCode::ResourceUnavailable {
+            break;
+        }
+        assert!(
+            refused
+                .to_string()
+                .contains("offline-validity policy has lapsed"),
+            "{refused}"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the running subscription's output was never stopped"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    session.close();
+
+    // Nothing about the grant ended.
+    let stored = daemon
+        .controller
+        .devices()
+        .devices()
+        .expect("reads the devices")
+        .into_iter()
+        .find(|stored| stored.device_id == record.device_id)
+        .expect("the device's record");
+    assert!(
+        stored.is_paired(),
+        "no expiry and no revocation is written for a lapsed bound: {stored:?}"
+    );
+    let session = connect(&daemon, &device, &record).await;
+    let refused = session
+        .read::<_, SessionReadResult>(Method::SessionRead, &SessionReadParams { session_id })
+        .await
+        .expect_err("still outside the bound");
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+    assert!(
+        refused
+            .to_string()
+            .contains("offline-validity policy has lapsed"),
+        "the device is told why: {refused}"
+    );
+    session.close();
+
     close_session(&mut local, &host, session_id).await;
     daemon.stop().await;
 }
