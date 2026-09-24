@@ -22,6 +22,8 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde_json::Value;
 
 mod support;
+#[path = "../../kr-controller/tests/teardown/mod.rs"]
+mod teardown;
 
 use support::kr;
 
@@ -39,82 +41,24 @@ fn beside_this_test(name: &str) -> Option<PathBuf> {
 
 /// A host tree with a running daemon, and the `kr` that talks to it.
 ///
-/// However a test ends, what it started ends with it and before its tree goes: the daemon, every
-/// worker a session of this host started that is still running, and on macOS every launchd job
-/// defined inside this host's own state directory.
+/// However a test ends, what it started ends with it and before its tree goes: the daemon here,
+/// and then, through the tree, every worker the daemon recorded that is still running and on macOS
+/// every launchd job defined inside this host's own state directory.
 struct Host {
     daemon: Option<std::process::Child>,
-    workers: std::sync::Mutex<Vec<kr_protocol::identity::ProcessStartIdentity>>,
-    temp: kr_ipc::testing::TempHost,
+    temp: teardown::Tree,
 }
 
 impl Drop for Host {
     fn drop(&mut self) {
-        if let Some(mut daemon) = self.daemon.take() {
-            let _ = daemon.kill();
-            let _ = daemon.wait();
-        }
-        let workers = self
-            .workers
-            .lock()
-            .map(|workers| workers.clone())
-            .unwrap_or_default();
-        for worker in workers {
-            // Signalled only while the kernel agrees it is still the process this host started, so
-            // a reused process identifier is never signalled.
-            if kr_ipc::identity::process_state(&worker) == kr_ipc::identity::ProcessState::Running {
-                let _ = std::process::Command::new("/bin/kill")
-                    .arg("-KILL")
-                    .arg(worker.pid.get().to_string())
-                    .status();
-            }
-        }
-        #[cfg(target_os = "macos")]
-        remove_launchd_jobs_defined_in(self.temp.root());
-    }
-}
-
-/// Removes every launchd job whose definition is a file inside `root`, from both of this user's
-/// domains. They are this test's own: the daemon writes each worker's definition into its host's
-/// state directory, and that directory is inside `root`.
-#[cfg(target_os = "macos")]
-fn remove_launchd_jobs_defined_in(root: &Path) {
-    fn definitions(directory: &Path, found: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(directory) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                definitions(&path, found);
-            } else if path
-                .extension()
-                .is_some_and(|extension| extension == "plist")
-            {
-                found.push(path);
-            }
-        }
-    }
-    let mut found = Vec::new();
-    definitions(root, &mut found);
-    let uid = kr_ipc::paths::current_uid();
-    for definition in found {
-        let Ok(label) = std::process::Command::new("/usr/bin/plutil")
-            .args(["-extract", "Label", "raw", "-o", "-"])
-            .arg(&definition)
-            .output()
-        else {
-            continue;
-        };
-        let label = String::from_utf8_lossy(&label.stdout).trim().to_owned();
-        if !label.starts_with("kr-worker-") {
-            continue;
-        }
-        for domain in [format!("gui/{uid}"), format!("user/{uid}")] {
-            let _ = std::process::Command::new("/bin/launchctl")
-                .arg("bootout")
-                .arg(format!("{domain}/{label}"))
-                .output();
+        // The daemon first, so nothing it launches can follow the tree's count; a daemon that
+        // cannot be established as ended keeps the tree instead.
+        if let Some(mut daemon) = self.daemon.take()
+            && let Err(error) = daemon.kill().and_then(|()| daemon.wait().map(|_| ()))
+        {
+            self.temp.hold(format!(
+                "the daemon this test started could not be established as ended: {error}"
+            ));
         }
     }
 }
@@ -132,7 +76,7 @@ impl Host {
             );
             return None;
         };
-        let temp = kr_ipc::testing::TempHost::create();
+        let temp = teardown::Tree::create();
         let bin = temp.root().join("bin");
         std::fs::create_dir_all(&bin).expect("a directory for the executables");
         let controller = copy_into(&controller, &bin);
@@ -155,7 +99,6 @@ impl Host {
             .expect("the daemon starts");
         let host = Self {
             daemon: Some(child),
-            workers: std::sync::Mutex::new(Vec::new()),
             temp,
         };
         let endpoint = host
@@ -209,9 +152,9 @@ impl Host {
         serde_json::from_slice(&output.stdout).expect("kr printed JSON")
     }
 
-    /// Records the worker this host started for a session, so the test ends it however it ends,
-    /// and returns its process identifier.
-    fn record_worker(&self, session_id: SessionId) -> u64 {
+    /// Returns the process identifier of the worker this host started for a session.
+    #[cfg(target_os = "macos")]
+    fn worker_of(&self, session_id: SessionId) -> u64 {
         let worker = kr_ipc::descriptor::read_all(&self.temp.environment())
             .expect("reads the runtime directory")
             .into_iter()
@@ -219,12 +162,7 @@ impl Host {
             .find(|descriptor| descriptor.session_id == session_id)
             .expect("the session's descriptor is published")
             .process_start_identity;
-        let pid = worker.pid.get();
-        self.workers
-            .lock()
-            .expect("the worker records")
-            .push(worker);
-        pid
+        worker.pid.get()
     }
 
     /// Returns the attachments this session's worker holds, by identity.
@@ -455,7 +393,6 @@ async fn new_attach_detach_and_close_work_in_full_and_in_one_letter() {
             .expect("a session identifier")
             .parse()
             .expect("parses");
-        host.record_worker(session_id);
 
         let terminal = Attached::open(&host, attach, &display);
         terminal.types(&format!("printf 'kr-%s-%s\\n' attached {form}\r"));
@@ -574,7 +511,7 @@ async fn a_worker_on_macos_is_a_per_user_launchd_job_in_its_own_directory() {
             .expect("a session identifier")
             .parse()
             .expect("parses");
-        let pid = host.record_worker(session_id);
+        let pid = host.worker_of(session_id);
 
         let printed = launchd_job_of(&domain, pid)
             .unwrap_or_else(|| panic!("the {execution} worker {pid} is a job in {domain}"));

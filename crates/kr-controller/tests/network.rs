@@ -34,7 +34,7 @@ use kr_client::cursors::{Restoration, RestorationStep};
 use kr_client::ipc::IpcTransport;
 use kr_client::session::Session;
 use kr_client::transport::NetworkTransport;
-use kr_controller::registry::{LaunchPhase, Registry};
+use kr_controller::registry::Registry;
 use kr_controller::service::net::devices::DeviceRecord;
 use kr_controller::service::net::{self, Network, NetworkSetup};
 use kr_controller::service::{Controller, ControllerSetup};
@@ -75,11 +75,10 @@ use kr_transport::config::EndpointConfig;
 use kr_transport::handshake::LocalIdentity;
 use kr_transport::scheduler::SendLimits;
 
+mod teardown;
+
 /// How long a test waits for something the machine has to do before it calls it a failure.
 const PATIENCE: Duration = Duration::from_secs(30);
-
-/// How long the fixture waits for a worker it signalled to go, before it stops it outright.
-const STRAY_PATIENCE: Duration = Duration::from_secs(5);
 
 /// What the shell prints when it has actually run what was typed.
 ///
@@ -111,13 +110,9 @@ const SECOND_MARKER_COMMAND: &str = "printf 'kala%s-again\n' reach\n";
 
 /// A host tree on the internal disk, with the worker beside it.
 struct Host {
-    /// The tree, held in an option so cleanup can keep it rather than remove it.
-    ///
-    /// Removing it is the ordinary end. A worker this fixture started and could not confirm had
-    /// exited is the other one: the tree stays, because a live worker reading a directory that had
-    /// been removed underneath it is a worse state to leave the machine in than a directory the
-    /// operator has to remove.
-    temp: Option<kr_ipc::testing::TempHost>,
+    /// The host tree, which ends every worker its daemon started before it goes, and is kept
+    /// instead when one of them cannot be established as ended.
+    temp: teardown::Tree,
     worker: PathBuf,
     environment_id: EnvironmentId,
 }
@@ -130,12 +125,12 @@ impl Host {
     /// build rather than a failure of anything this suite checks, so it says so and stops.
     fn create() -> Option<Self> {
         let worker_build = worker_program()?;
-        let temp = kr_ipc::testing::TempHost::create();
+        let temp = teardown::Tree::create();
         let environment_id = temp.environment_id();
         let worker = temp.root().join("kr-worker");
         kr_ipc::testing::place_program(&worker_build, &worker);
         Some(Self {
-            temp: Some(temp),
+            temp,
             worker,
             environment_id,
         })
@@ -146,136 +141,7 @@ impl Host {
     }
 
     fn tree(&self) -> &kr_ipc::testing::TempHost {
-        self.temp.as_ref().expect("the host tree is still held")
-    }
-
-    /// Ends every worker this host started that is still running, and waits for it to go.
-    ///
-    /// A worker is deliberately not a child of whatever created it, so a test that panicked before
-    /// it could close its session would leave one running until the machine was restarted. Two
-    /// records find them. The worker table holds the workers that reported themselves ready; the
-    /// launch records hold the process identity of everything that was started, which is the only
-    /// thing that can find a worker whose ready report failed or stalled - and losing that report
-    /// is something a worker survives on purpose.
-    ///
-    /// A process is signalled only when the kernel agrees it is still the process that identity
-    /// names, so a reused identifier is never signalled. Then this waits: the host's tree goes
-    /// when it returns, and a worker still inside it would be reading a directory that had been
-    /// removed.
-    fn end_stray_workers(&self) -> Vec<String> {
-        let Ok(registry) = Registry::open(self.paths().registry_database(), self.environment_id)
-        else {
-            // The records cannot be read, so what this host started cannot be established. The
-            // tree stays: it is the only thing that could still be found by hand.
-            return vec!["this host's records could not be read".to_owned()];
-        };
-        let mut started: Vec<(kr_protocol::identity::ProcessStartIdentity, String)> = Vec::new();
-        let mut unreadable = Vec::new();
-        match registry.workers() {
-            Ok(workers) => started.extend(workers.into_iter().map(|worker| {
-                (
-                    worker.process_identity,
-                    format!("session {}", worker.session_id),
-                )
-            })),
-            Err(error) => unreadable.push(format!("the worker records could not be read: {error}")),
-        }
-        // Every phase in which something may be running. `Reserved` has nothing started yet, and
-        // `Failed` and `Closed` are the phases that say the process is gone.
-        for phase in [
-            LaunchPhase::Spawned,
-            LaunchPhase::Claimed,
-            LaunchPhase::Live,
-            LaunchPhase::Fenced,
-        ] {
-            match registry.reservations_in(phase) {
-                Ok(reservations) => {
-                    started.extend(reservations.into_iter().filter_map(|reservation| {
-                        reservation.launcher_identity.map(|identity| {
-                            (
-                                identity,
-                                format!("the launch for session {}", reservation.session_id),
-                            )
-                        })
-                    }))
-                }
-                Err(error) => unreadable.push(format!(
-                    "the {phase:?} launch records could not be read: {error}"
-                )),
-            }
-        }
-        started.sort_by_key(|(identity, _)| identity.pid.get());
-        started.dedup_by_key(|(identity, _)| identity.pid.get());
-
-        // Every identity this host started is followed until the kernel says it has ended, whether
-        // the request to stop reached it or not. A signal that failed, and a query the operating
-        // system refused, both establish nothing: treating either as death is what would remove a
-        // tree from under a live worker.
-        let mut signalled = unreadable;
-        let mut following = Vec::new();
-        for (identity, what) in started {
-            if matches!(
-                kr_ipc::identity::process_state(&identity),
-                kr_ipc::identity::ProcessState::Ended
-            ) {
-                continue;
-            }
-            eprintln!("ending a worker this test started and did not close: {what}");
-            Self::signal(&identity, rustix::process::Signal::TERM);
-            following.push((identity, what));
-        }
-        // Nothing is released until the kernel says every one of them has ended.
-        let deadline = std::time::Instant::now() + STRAY_PATIENCE;
-        let insist_at = deadline - STRAY_PATIENCE / 2;
-        let mut insisted = false;
-        while !following.is_empty() {
-            following.retain(|(identity, _)| {
-                !matches!(
-                    kr_ipc::identity::process_state(identity),
-                    kr_ipc::identity::ProcessState::Ended
-                )
-            });
-            let now = std::time::Instant::now();
-            if following.is_empty() || now >= deadline {
-                break;
-            }
-            // A worker that will not stop for the request is stopped outright. Leaving it running
-            // while its tree is removed is worse than ending it abruptly. The identity is checked
-            // again first, inside `signal`: by now the identifier may belong to somebody else.
-            if !insisted && now >= insist_at {
-                for (identity, _) in &following {
-                    Self::signal(identity, rustix::process::Signal::KILL);
-                }
-                insisted = true;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        signalled.extend(following.into_iter().map(|(_, what)| what));
-        signalled
-    }
-
-    /// Signals one process, and only while the kernel agrees it is the one that identity names.
-    ///
-    /// A process identifier is reused. Checking the start identity immediately before the signal
-    /// is what keeps this from ending somebody else's process, and it is checked again before an
-    /// escalation for the same reason.
-    fn signal(
-        identity: &kr_protocol::identity::ProcessStartIdentity,
-        signal: rustix::process::Signal,
-    ) {
-        if !matches!(
-            kr_ipc::identity::process_state(identity),
-            kr_ipc::identity::ProcessState::Running
-        ) {
-            return;
-        }
-        let Ok(raw) = i32::try_from(identity.pid.get()) else {
-            return;
-        };
-        let Some(pid) = rustix::process::Pid::from_raw(raw) else {
-            return;
-        };
-        let _ = rustix::process::kill_process(pid, signal);
+        &self.temp
     }
 
     /// Starts the daemon and puts it on the network with the endpoint configuration given.
@@ -297,7 +163,7 @@ impl Host {
             }),
             secret_store: StoreSelection::File,
             boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-            supervisor: Box::new(DetachedSupervisor::new()),
+            supervisor: self.temp.supervisor(Box::new(DetachedSupervisor::new())),
             worker_program: self.worker.clone(),
             build_id: build(),
             release: "0".to_owned(),
@@ -374,31 +240,6 @@ fn worker_program() -> Option<PathBuf> {
         worker.display()
     );
     Some(worker)
-}
-
-impl Drop for Host {
-    fn drop(&mut self) {
-        // The successful paths close their sessions and wait for the record. This is the failing
-        // path: unwinding cannot await, so what it can do is end the processes this host started,
-        // and establish that they have ended, before its tree goes.
-        let unresolved = self.end_stray_workers();
-        if unresolved.is_empty() {
-            return;
-        }
-        // Not established as ended. The tree is kept, and where it is is printed, because the
-        // alternative is removing the directories a live worker is reading.
-        let kept = self.temp.take().map(|temp| {
-            let root = temp.root().to_path_buf();
-            std::mem::forget(temp);
-            root
-        });
-        for what in unresolved {
-            eprintln!("could not establish that a worker this test started has ended: {what}");
-        }
-        if let Some(root) = kept {
-            eprintln!("the host tree has been kept at {}", root.display());
-        }
-    }
 }
 
 struct RunningDaemon {

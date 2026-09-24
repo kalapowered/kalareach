@@ -36,6 +36,8 @@ use kr_shell_integration::host::terminal::{
 };
 use kr_worker::environment::{ExecutionContext, build as build_environment};
 
+mod teardown;
+
 /// A supervisor that starts nothing. Every test here is about what happens before a worker runs.
 #[derive(Debug)]
 struct NoWorkers;
@@ -618,7 +620,9 @@ impl kr_controller::supervision::TerminalPresenter for RefusingTerminal {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_terminal_that_cannot_be_opened_leaves_one_live_session_and_a_presentation_error() {
     let worker_build = worker_beside_this_test();
-    let temp = kr_ipc::testing::TempHost::create();
+    // This test's daemon starts a real worker through the platform's own supervisor, so the tree
+    // ends whatever it started, and removes its job, however the test ends.
+    let temp = teardown::Tree::create();
     // On the internal disk, and never the copy in the workspace: a worker a service manager starts
     // is its own privacy identity, and one that opened a path on the external volume would stop
     // for a dialog.
@@ -640,7 +644,7 @@ async fn a_terminal_that_cannot_be_opened_leaves_one_live_session_and_a_presenta
         }),
         secret_store: StoreSelection::File,
         boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-        supervisor: kr_controller::supervision::detect(),
+        supervisor: temp.supervisor(kr_controller::supervision::detect()),
         worker_program: worker,
         build_id: build(),
         release: "0".to_owned(),

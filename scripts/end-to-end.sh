@@ -31,9 +31,10 @@ echo "  host: $(uname -sr) $(uname -m)"
 echo "  taken at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 echo "  secret store: a directory inside each suite's own temporary host"
 echo
-# Nothing this script started may outlive it. A worker is deliberately not a child of whatever
-# created it, which is what makes a session survive a control daemon's restart, so a suite that
-# failed to close a session leaves a worker running until the machine is restarted.
+# Nothing this script started may outlive it, and the check at its end fails when something does.
+# A worker is deliberately not a child of whatever created it, which is what makes a session survive
+# a control daemon's restart, so a suite that failed to close a session leaves a worker running
+# until the machine is restarted.
 #
 # This run gets a temporary root of its own and every process it starts lives under it: the suites
 # put their runtime directories, state directories and copied binaries there, so a process whose
@@ -47,21 +48,67 @@ echo
 # disk, so those directories, the copied binaries, the sockets and the journals all are.
 run_base="${TMPDIR:-/tmp}"; run_root="$(mktemp -d "${run_base%/}/kalareach-run.XXXXXX")"
 export TMPDIR="$run_root"
+# The same directory as the kernel resolves it. A daemon resolves the paths it hands a worker, and
+# resolving can change the spelling (on macOS the temporary directory is reached through a symbolic
+# link), so a process belongs to this run when its command line names either spelling.
+run_root_resolved="$(cd "$run_root" && pwd -P)"
 
+# Every process of this user whose command line names this run's root, in either spelling, as a
+# whole path: a worker names it in its own path and in every directory it is given, and so does
+# anything else a suite started there. The root is compared as text, so no character in it is read
+# as a pattern, and it counts only when what follows it ends the path. When the process list cannot
+# be read, this fails rather than answer that nothing is running.
 survivors() {
-  pgrep -u "$(id -u)" -f "$run_root" 2>/dev/null | grep -v "^$$\$" || true
+  local listing
+  listing="$(ps -U "$(id -u)" -ww -o pid= -o command=)" || return 1
+  printf '%s\n' "$listing" |
+    ROOT="$run_root" RESOLVED="$run_root_resolved" SELF="$$" awk '
+      function names(text, root,   at, next_char) {
+        if (root == "") return 0
+        while ((at = index(text, root)) > 0) {
+          next_char = substr(text, at + length(root), 1)
+          if (next_char == "" || next_char == "/" || next_char == " ") return 1
+          text = substr(text, at + 1)
+        }
+        return 0
+      }
+      {
+        pid = $1
+        command = $0
+        sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", command)
+        if (pid != ENVIRON["SELF"] && (names(command, ENVIRON["ROOT"]) || names(command, ENVIRON["RESOLVED"]))) print pid
+      }'
 }
 
+# However the run ends, having passed, failed part way, been interrupted or been told to stop, its
+# root goes when nothing it started is running. Anything still running is not signalled from here:
+# the list names processes by numbers, which another process could hold by the time a signal went.
+# Each suite ends the workers it started by the means it holds, and what is left is reported, with
+# the root kept for whoever looks.
+finish() {
+  local left
+  if left="$(survivors)" && [ -z "$left" ]; then
+    rm -rf "${run_root:?}"
+  fi
+}
+trap finish EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# The check this script ends with: it fails when any process this run started, a worker above all,
+# is still running once the suites are done, or when that cannot be established.
 check_no_survivors() {
   local deadline left
   # Closure is a sequence (a grace period, a forced stop and a drain), so a worker that is on its
   # way out is given time to finish going rather than reported as a leak.
   deadline=$(( $(date +%s) + 60 ))
   while :; do
-    left="$(survivors)"
+    if ! left="$(survivors)"; then
+      echo "FAILED: the process list could not be read, so nothing this run started can be said to have ended"
+      return 1
+    fi
     if [ -z "$left" ]; then
       echo "no process this run started is still running"
-      rm -rf "$run_root"
       return 0
     fi
     if [ "$(date +%s)" -ge "$deadline" ]; then
@@ -69,9 +116,8 @@ check_no_survivors() {
     fi
     sleep 1
   done
-  echo "FAILED: these processes outlived the script"
-  # shellcheck disable=SC2086
-  ps -o pid=,command= -p $(printf '%s' "$left" | tr '\n' ' ') || true
+  echo "FAILED: these processes outlived the script; $run_root is kept"
+  ps -o pid=,command= -p "$(printf '%s\n' "$left" | paste -sd, -)" || true
   return 1
 }
 

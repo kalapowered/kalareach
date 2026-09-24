@@ -22,7 +22,6 @@ use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::envelope::ActionTarget;
-use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{ActionId, AttachmentId, BuildId, EnvironmentId, SessionId};
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
@@ -32,6 +31,9 @@ use kr_protocol::session::{
     SessionListParams, SessionListResult, SessionReadParams, SessionReadResult, SessionState,
     ShellMode,
 };
+
+#[path = "../../kr-controller/tests/teardown/mod.rs"]
+mod teardown;
 
 /// Where the daemon half finds the host it serves.
 const ROOT: &str = "KR_KILL_TEST_ROOT";
@@ -115,36 +117,45 @@ fn serve_a_control_daemon_for_the_kill_test() {
         });
 }
 
-/// The processes this test started, ended however the test ends.
+/// The daemon process this test started, ended however the test ends.
+///
+/// The workers that daemon started are the host tree's to end: its registry records every one.
+/// Declared after the tree, this is dropped first, so no launch can follow the tree's count; a
+/// daemon that cannot be established as ended keeps the tree instead.
 struct Started {
     daemon: Option<std::process::Child>,
-    worker: Option<ProcessStartIdentity>,
+    tree: teardown::Holder,
 }
 
 impl Started {
     /// Kills the daemon where it stands, and waits for the kernel to report it gone.
-    fn kill_daemon(&mut self) {
-        if let Some(mut daemon) = self.daemon.take() {
-            daemon
-                .kill()
-                .expect("the daemon this test started is killed");
-            daemon.wait().expect("and reaped");
+    ///
+    /// The daemon is let go of only once it is established as ended. Until then the tree is held,
+    /// so a failure here keeps the tree however the test goes on to end.
+    fn kill_daemon(&mut self) -> std::io::Result<()> {
+        let Some(daemon) = self.daemon.as_mut() else {
+            return Ok(());
+        };
+        match daemon.kill().and_then(|()| daemon.wait().map(|_| ())) {
+            Ok(()) => {
+                self.daemon = None;
+                Ok(())
+            }
+            Err(error) => {
+                self.tree.hold(format!(
+                    "the daemon this test started could not be established as ended: {error}"
+                ));
+                Err(error)
+            }
         }
     }
 }
 
 impl Drop for Started {
     fn drop(&mut self) {
-        self.kill_daemon();
-        // A worker this test's daemon started, if a failure left it running. Its terminal goes
-        // with it, and everything in the session's process group with that.
-        if let Some(worker) = self.worker.take()
-            && kr_ipc::identity::process_state(&worker) == kr_ipc::identity::ProcessState::Running
-            && let Ok(pid) = i32::try_from(worker.pid.get())
-            && let Some(pid) = rustix::process::Pid::from_raw(pid)
-        {
-            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-        }
+        // Nothing here may panic: this can run while a test is already failing. A failure has
+        // already held the tree.
+        let _ = self.kill_daemon();
     }
 }
 
@@ -410,7 +421,7 @@ impl LocalTerminal {
 /// as it now is, with the line written before the kill still on it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_killed_during_output_leaves_local_work_running_and_a_reconnect_finds_it() {
-    let host = kr_ipc::testing::TempHost::create();
+    let host = teardown::Tree::create();
     let environment_id = host.environment_id();
     let worker = host.root().join("kr-worker");
     std::fs::copy(env!("CARGO_BIN_EXE_kr-worker"), &worker).expect("copies the worker");
@@ -422,7 +433,7 @@ async fn a_daemon_killed_during_output_leaves_local_work_running_and_a_reconnect
     .expect("copies the daemon half");
     let mut started = Started {
         daemon: Some(start_daemon(&program, &host, &worker)),
-        worker: None,
+        tree: host.holder(),
     };
 
     let mut local = daemon_client(&host).await;
@@ -461,12 +472,6 @@ async fn a_daemon_killed_during_output_leaves_local_work_running_and_a_reconnect
         .expect("decodes");
     let session_id = created.session.session_id;
     let dimensions = created.session.dimensions;
-    started.worker = kr_ipc::descriptor::read_all(&host.environment())
-        .expect("reads the runtime directory")
-        .into_iter()
-        .filter_map(|entry| entry.descriptor.ok())
-        .find(|descriptor| descriptor.session_id == session_id)
-        .map(|descriptor| descriptor.process_start_identity);
     drop(local);
 
     // A terminal on this machine writes a line of the screen before anything else happens, and
@@ -488,7 +493,9 @@ async fn a_daemon_killed_during_output_leaves_local_work_running_and_a_reconnect
     watching.shown("kr-tick-", 3).await;
 
     // The daemon is killed while the ticker is writing.
-    started.kill_daemon();
+    started
+        .kill_daemon()
+        .expect("the daemon this test started is killed and collected");
     let before_the_kill = watching.ticks().len();
     let shown = watching.count("kr-tick-");
     watching.shown("kr-tick-", shown + 5).await;

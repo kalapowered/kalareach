@@ -35,6 +35,9 @@ use kr_protocol::session::{
     SessionListParams, SessionListResult, SessionState, ShellMode,
 };
 
+#[path = "../../kr-controller/tests/teardown/mod.rs"]
+mod teardown;
+
 /// A host tree on the internal disk, with the worker beside it.
 /// Starts the worker the way this host's own supervisor does, and names its package root.
 ///
@@ -169,7 +172,8 @@ impl WorkerSupervisor for RecordingSupervisor {
 }
 
 struct Host {
-    temp: kr_ipc::testing::TempHost,
+    /// The host tree, which ends every worker its daemon started before it goes.
+    temp: teardown::Tree,
     worker: PathBuf,
     environment_id: EnvironmentId,
     /// Where this daemon looks for qualified shell packages, when a test gives it an installation.
@@ -182,7 +186,7 @@ struct Host {
 
 impl Host {
     fn create() -> Self {
-        let temp = kr_ipc::testing::TempHost::create();
+        let temp = teardown::Tree::create();
         let environment_id = temp.environment_id();
         // The worker is copied to the internal disk before it is started. The build tree may live
         // on a removable volume, and a launched process that reaches one prompts the person at the
@@ -325,14 +329,16 @@ impl Host {
                 }),
                 secret_store: StoreSelection::File,
                 boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-                supervisor: match (self.worker_packages.clone(), self.launched.clone()) {
-                    (Some(packages), _) => Box::new(WorkerWithPackageRoot { packages }),
-                    (None, Some(launched)) => Box::new(RecordingSupervisor {
-                        launched,
-                        registry: environment.registry_database(),
-                    }),
-                    (None, None) => Box::new(DetachedSupervisor::new()),
-                },
+                supervisor: self.temp.supervisor(
+                    match (self.worker_packages.clone(), self.launched.clone()) {
+                        (Some(packages), _) => Box::new(WorkerWithPackageRoot { packages }),
+                        (None, Some(launched)) => Box::new(RecordingSupervisor {
+                            launched,
+                            registry: environment.registry_database(),
+                        }),
+                        (None, None) => Box::new(DetachedSupervisor::new()),
+                    },
+                ),
                 worker_program: self.worker.clone(),
                 build_id: build(),
                 release: "0".to_owned(),

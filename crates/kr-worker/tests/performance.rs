@@ -29,6 +29,9 @@ use kr_protocol::session::{
     Dimensions, Presentation, SessionCreateParams, SessionCreateResult, ShellMode,
 };
 
+#[path = "../../kr-controller/tests/teardown/mod.rs"]
+mod teardown;
+
 /// How many idle sessions the memory requirement names.
 const IDLE_SESSIONS: usize = 20;
 
@@ -48,14 +51,15 @@ const IDLE_WINDOW: Duration = Duration::from_secs(5 * 60);
 const ATTACH_BOUND: Duration = Duration::from_millis(500);
 
 struct Host {
-    temp: kr_ipc::testing::TempHost,
+    /// The host tree, which ends every worker its daemon started before it goes.
+    temp: teardown::Tree,
     worker: PathBuf,
     environment_id: EnvironmentId,
     controller: Arc<Controller>,
 }
 
 async fn host() -> Host {
-    let temp = kr_ipc::testing::TempHost::create();
+    let temp = teardown::Tree::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
     // On the internal disk, because a process a service manager launches is its own identity to
@@ -83,7 +87,7 @@ async fn host() -> Host {
         }),
         secret_store: StoreSelection::File,
         boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-        supervisor: Box::new(DetachedSupervisor::new()),
+        supervisor: temp.supervisor(Box::new(DetachedSupervisor::new())),
         worker_program: worker.clone(),
         build_id: build(),
         release: "0".to_owned(),

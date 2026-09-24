@@ -47,6 +47,9 @@ use kr_worker::desktop;
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::session::{Session, SessionConfig};
 
+#[path = "../../kr-controller/tests/teardown/mod.rs"]
+mod teardown;
+
 /// Moves this test process out of the checkout, once.
 ///
 /// A worker is launched with the daemon's working directory, and here that daemon is this test
@@ -76,7 +79,8 @@ fn power_document(setting: SleepInhibitionSetting) -> String {
 }
 
 struct Host {
-    temp: kr_ipc::testing::TempHost,
+    /// The host tree, which ends every worker its daemon started before it goes.
+    temp: teardown::Tree,
     worker: PathBuf,
     environment_id: EnvironmentId,
 }
@@ -84,7 +88,7 @@ struct Host {
 impl Host {
     fn create() -> Self {
         start_outside_the_workspace();
-        let temp = kr_ipc::testing::TempHost::create();
+        let temp = teardown::Tree::create();
         let environment_id = temp.environment_id();
         let worker = temp.root().join(if cfg!(windows) {
             "kr-worker.exe"
@@ -127,7 +131,7 @@ impl Host {
                 // this machine would queue behind.
                 secret_store: StoreSelection::File,
                 boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-                supervisor: Box::new(DetachedSupervisor::new()),
+                supervisor: self.temp.supervisor(Box::new(DetachedSupervisor::new())),
                 worker_program: self.worker.clone(),
                 build_id: build(),
                 release: "0".to_owned(),
