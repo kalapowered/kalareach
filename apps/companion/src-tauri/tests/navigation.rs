@@ -6,9 +6,14 @@
 //! production handlers, as two checks with a control each.
 //!
 //! * Navigation: the page asks to go to the website. With the production handler it stays on the
-//!   bundled interface; the control, a window with no navigation handler, leaves.
-//! * Popups: the page asks for a new window at the website. With the production handler no second
-//!   web view exists; the control, a handler that creates the window, produces one.
+//!   bundled interface and the handler reports the refusal; the control, a window with no
+//!   navigation handler, leaves.
+//! * Popups: the page asks for a new window at the website. The production handler reports that
+//!   it was asked and refused, and no second web view exists; the control, a handler that creates
+//!   the window, produces one.
+//!
+//! The handlers' reports are the application's own log lines, read through a subscriber this test
+//! installs.
 //!
 //! It opens real windows, so it has its own main thread (`harness = false`) and runs on macOS,
 //! where the Mac lists run it. Windows and Linux run the same handlers without this check.
@@ -27,14 +32,71 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use tauri::webview::NewWindowResponse;
     use tauri::{AppHandle, Manager as _, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
     const WEBSITE: &str = "https://reach.kala.to/";
+    const NAVIGATION_REFUSED: &str = "a navigation away from the interface was refused";
+    const WINDOW_REFUSED: &str = "a new window was refused";
+
+    /// Every message the application logs while the check runs.
+    #[derive(Clone, Default)]
+    struct Messages(Arc<Mutex<Vec<String>>>);
+
+    impl Messages {
+        fn count(&self, message: &str) -> usize {
+            self.0
+                .lock()
+                .expect("the record")
+                .iter()
+                .filter(|logged| logged.as_str() == message)
+                .count()
+        }
+    }
+
+    impl tracing::Subscriber for Messages {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            self.0.lock().expect("the record").push(message.0);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
 
     pub fn run() -> i32 {
+        let messages = Messages::default();
+        tracing::subscriber::set_global_default(messages.clone())
+            .expect("the check's subscriber is the first");
         // A test context: the library already embeds the application's Info.plist, and a second
         // copy is a duplicate symbol.
         let app = tauri::Builder::default()
@@ -48,8 +110,9 @@ mod macos {
             if matches!(event, tauri::RunEvent::Ready) && !started {
                 started = true;
                 let handle = handle.clone();
+                let messages = messages.clone();
                 std::thread::spawn(move || {
-                    let code = match check(&handle) {
+                    let code = match check(&handle, &messages) {
                         Ok(()) => {
                             println!("navigation: every check held");
                             0
@@ -116,13 +179,19 @@ mod macos {
         Ok(window)
     }
 
-    fn check(app: &AppHandle) -> Result<(), String> {
-        // Navigation, with the production handler: the window stays on the bundled interface.
+    fn check(app: &AppHandle, messages: &Messages) -> Result<(), String> {
+        // Navigation, with the production handler: the handler refuses it and the window stays on
+        // the bundled interface.
         let guarded = open(app, "guarded", true)?;
         guarded
             .eval(format!("location.assign('{WEBSITE}')"))
             .map_err(|error| error.to_string())?;
-        std::thread::sleep(Duration::from_secs(3));
+        wait_for(
+            "the production handler refusing the navigation",
+            Duration::from_secs(10),
+            || messages.count(NAVIGATION_REFUSED) == 1,
+        )?;
+        std::thread::sleep(Duration::from_secs(2));
         if !bundled(&guarded) {
             return Err(format!(
                 "the guarded window left the bundle for {}",
@@ -130,11 +199,17 @@ mod macos {
             ));
         }
 
-        // Popups, with the production handler: no second web view exists.
+        // Popups, with the production handler: it is asked and refuses, and no second web view
+        // exists.
         guarded
             .eval(format!("window.open('{WEBSITE}')"))
             .map_err(|error| error.to_string())?;
-        std::thread::sleep(Duration::from_secs(3));
+        wait_for(
+            "the production handler refusing the popup",
+            Duration::from_secs(10),
+            || messages.count(WINDOW_REFUSED) == 1,
+        )?;
+        std::thread::sleep(Duration::from_secs(2));
         let held = app.webview_windows().len();
         if held != 1 {
             return Err(format!("the guarded window's popup made {held} web views"));
@@ -160,6 +235,10 @@ mod macos {
             Duration::from_secs(20),
             || address(&control).starts_with(WEBSITE),
         )?;
+        // The control's windows have no production handler, so nothing more was refused.
+        if messages.count(NAVIGATION_REFUSED) != 1 || messages.count(WINDOW_REFUSED) != 1 {
+            return Err("a window without the production handlers reported a refusal".to_owned());
+        }
         Ok(())
     }
 }
