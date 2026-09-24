@@ -475,6 +475,17 @@ pub fn forms_the_root_shell_does_not_start_itself_never_ask(kind: ShellKind) {
                 .to_owned(),
         ));
     }
+    if kind == ShellKind::Zsh {
+        // With MULTIOS, zsh's default, a pipe and a redirection of the same descriptor are joined
+        // through a copier, so the group still reads a pipe. Without it the redirection replaces
+        // the pipe, and the group's command reads a file while it is still part of the pipeline.
+        forms.push((
+            "a redirected group at the end of a pipeline, without MULTIOS",
+            "setopt nomultios; printf x | { kr-probe in-a-plain-redirected-group; } </dev/null; \
+             setopt multios"
+                .to_owned(),
+        ));
+    }
     for (form, command) in forms {
         let runs = probes.runs().len();
         let asked = session.run_asking(&command, "probe-ran");
