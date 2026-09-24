@@ -5863,6 +5863,47 @@ async fn a_store_directory_that_is_a_link_is_refused_before_anything_is_written_
     assert!(written_through.is_empty(), "{written_through:#?}");
 }
 
+/// A catalogue directory that is a link is refused however its name is spelt: a separator or a
+/// `.` after the link's name would have the platform resolve the link before a check of the name
+/// could see it. Neither the catalogue nor a repository's store opens through it, and the
+/// directory it points at is left as it was.
+#[test]
+fn a_catalogue_directory_that_is_a_link_is_refused_however_it_is_spelt() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let elsewhere = home.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).expect("a directory");
+    std::fs::write(elsewhere.join("unrelated.txt"), b"not the catalogue's").expect("writable");
+    let link = home.path().join("catalogue");
+    link_directory(&elsewhere, &link);
+    let before = tree_of(&elsewhere);
+    let key = kr_plugin_catalogue::EnrolmentKey::generate().expect("a key");
+    for spelling in [
+        link.clone(),
+        std::path::PathBuf::from(format!("{}/", link.display())),
+        std::path::PathBuf::from(format!("{}/.", link.display())),
+    ] {
+        for (what, refusal) in [
+            (
+                "the catalogue",
+                Catalogue::open(&spelling).expect_err("a catalogue through a link"),
+            ),
+            (
+                "a repository's store",
+                kr_plugin_catalogue::Store::open(&spelling, &key)
+                    .expect_err("a store through a link"),
+            ),
+        ] {
+            assert!(
+                matches!(&refusal, CatalogueError::StorageUnavailable { detail }
+                    if detail.contains("is a link")),
+                "{}: {what}: {refusal:?}",
+                spelling.display()
+            );
+        }
+    }
+    assert_eq!(tree_of(&elsewhere), before);
+}
+
 /// Reads the local repository, and the first time it fetches a location whose path contains `at`,
 /// runs one step of the test's own first: after the operation fetching it took the store, and
 /// before it writes anything the fetch leads to.

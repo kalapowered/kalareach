@@ -4453,6 +4453,8 @@ name = "kr-plugin-catalogue"
 version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
+ "cap-fs-ext",
+ "cap-std",
  "futures",
  "jiff",
  "kr-crypto",

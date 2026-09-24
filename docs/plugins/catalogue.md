@@ -164,17 +164,26 @@ the installed package usable.
 The catalogue's records live in its own directory, and each enrolment's files in a directory of its
 own under `repositories/`, with five directories inside: the trust checkpoint (`datastore`), the
 index documents (`index`), the payload cache (`payloads`), the extracted packages (`packages`) and
-the work in progress (`staging`). Every one of them, from the catalogue's own directory down, has to
-be a directory and not a link. A link to a directory elsewhere would have what the store writes land
-there, outside every check and budget the store keeps, so it is refused: when the catalogue opens,
-when a repository's directory is opened or locked, and again just before each write, so a link put
-in place while an operation runs is refused at that operation's next write. A directory symbolic
-link and a Windows junction are both links. The directories above the catalogue's own are the
-host's, and are not checked.
+the work in progress (`staging`).
 
-One writer is outside that rule: the update client writes its private working copy of the trust
-checkpoint by path while it verifies. A link put in place of `staging` during a verification is
-refused at the next write the store makes, after the client has written its documents through it.
+The store holds these directories open. Each is opened inside the one above it without following
+a link, from the catalogue's own directory down, and everything the store writes, renames or
+removes, it does through those handles rather than through a name again. A directory that is a link,
+or not a directory, fails the open itself, so it is refused before anything is written through it,
+however its name is spelt; one that becomes a link after it was opened redirects nothing, because
+the handle holds the directory itself. Every write opens the directories again first, so a link put
+in place while an operation runs is refused at that operation's next write, and what an operation
+that waited for the repository's lock clears from staging is the staging directory it opened, not
+whatever the name reaches by then. A directory symbolic link and a Windows junction are both links.
+The directories above the catalogue's own are the host's, and are opened as the host names them.
+
+Two writers reach the catalogue's files by name. The update client writes its private working copy
+of the trust checkpoint by path while it verifies, and what it verified is read back through the
+copy's own handle; a link put in place of `staging` during a verification is refused at the store's
+next write, after the client has written its documents through it. The records' database is opened
+by its name once the catalogue's directory has been checked. A process that can replace the
+catalogue's directories while it runs already controls the catalogue's files, and nothing this host
+can do defeats that.
 
 ## A signature is provenance, not safety
 

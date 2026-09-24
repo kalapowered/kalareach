@@ -11,6 +11,10 @@ publish.workspace = true
 # Verification, storage and network code, and no component engine: the control daemon links this
 # crate, and neither the daemon nor a worker may link a Wasm engine.
 [dependencies]
+# The store's directories are held open, each opened without following a link, and everything the
+# store writes, renames or removes goes through those handles rather than through a name again.
+cap-fs-ext.workspace = true
+cap-std.workspace = true
 futures.workspace = true
 jiff.workspace = true
 kr-crypto.workspace = true
