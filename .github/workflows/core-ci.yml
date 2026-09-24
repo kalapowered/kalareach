@@ -841,7 +841,8 @@ jobs:
 
       # The host runs the first Git on PATH, and on this runner that is Homebrew's. These steps run
       # the Git of Apple's command-line developer tools instead, the Git of a Mac with nothing else
-      # installed, reached by a path with no symbolic link in it.
+      # installed. The entry put on PATH is a symbolic link, which the host resolves to the Git it
+      # names; that Git and the helper directory it reports have no symbolic link in their paths.
       - name: Put the developer tools' Git first
         timeout-minutes: 2
         run: |
@@ -969,7 +970,8 @@ jobs:
       #   switch. The companion job's macOS leg runs it with the switch set.
       # - The two cases that launch a built shell package, which do nothing unless
       #   KR_SHELL_PACKAGES names one, and this job builds none. The shell-packages job builds the
-      #   packages and drives them through the contract and the qualification.
+      #   packages and drives them through the contract and qualification suites; these two cases
+      #   run where KR_SHELL_PACKAGES names a built package.
       # - The cases that need another filesystem, which the step after this one runs where one is.
       - name: Test
         if: ${{ !cancelled() }}
@@ -1018,10 +1020,17 @@ jobs:
           volume="$RUNNER_TEMP/another-filesystem"
           log="$RUNNER_TEMP/another-filesystem.log"
           device=""
+          # The volume goes whatever the cases did. A volume that could not be deleted is said, and
+          # fails a step that would otherwise have passed; a step that failed keeps its own status.
           take_it_away() {
-            if [ -n "$device" ]; then
-              sudo diskutil apfs deleteVolume "$device" > /dev/null 2>&1 || true
+            status=$?
+            if [ -n "$device" ] && ! sudo diskutil apfs deleteVolume "$device"; then
+              echo "the volume $device could not be deleted" >&2
+              if [ "$status" -eq 0 ]; then
+                status=1
+              fi
             fi
+            exit "$status"
           }
           trap take_it_away EXIT
           mkdir -p "$volume"
@@ -1052,13 +1061,16 @@ jobs:
         timeout-minutes: 45
         run: bash scripts/end-to-end.sh
 
-      # The release build the measurements run in, which the script below would otherwise start
-      # with. Built here, so the machine can then be let settle: a figure taken while a build is
-      # still winding down is a figure about the build.
-      - name: Build the release profile the measurements use
+      # Everything the script below builds before it measures: the release profile of the
+      # workspace, and the measurement suite and the input benchmark with their test dependencies.
+      # Built here, so the machine can then be let settle and the script's own builds find nothing
+      # to do: a figure taken while a build is still winding down is a figure about the build.
+      - name: Build what the measurements run
         if: ${{ !cancelled() }}
         timeout-minutes: 60
-        run: cargo build --locked --release --workspace
+        run: |
+          cargo build --locked --release --workspace
+          cargo test --locked --release -p kr-worker --test performance --bench input_latency --no-run
 
       # Until the load average over the last minute is under one and a half, or ten minutes have
       # passed; the script records the load at the edges of every measurement either way.
