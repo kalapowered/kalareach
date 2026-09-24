@@ -18,8 +18,8 @@ use kr_client::services::account::{
     AccountToken, AccountTokenSource, AccountUsage, Answer, AnswerFault, AuthorisationGrant,
     AuthorisationRequest, Carrier, Client, Exchanged, ISSUER, IdentityRead, IssuedGrant,
     LEASE_SCOPE, ManagedAccountService, PendingAuthorisation, RELYING_PARTY_ID, REQUESTED_SCOPES,
-    Redirect, RefreshToken, Refreshed, SignedInAccount, StoredGrant, TOKEN_PATH, USAGE_SCOPE,
-    code_challenge,
+    Redirect, RefreshToken, Refreshed, SignedInAccount, StoredGrant, TOKEN_PATH, USAGE_PATH,
+    USAGE_SCOPE, UsageLine, UsageResource, code_challenge,
 };
 use kr_client::services::{ServiceFuture, ServiceHttpAnswer};
 use kr_crypto::store::{MemoryStore, SecretName, SecretStore};
@@ -844,6 +844,9 @@ struct Stub {
     held: Option<tokio::sync::Semaphore>,
     refresh_answer: Mutex<Option<RefreshAnswer>>,
     identity: Mutex<Option<std::result::Result<AccountIdentity, ErrorCode>>>,
+    /// When set, an identity read waits for a permit before it answers.
+    identity_held: Option<tokio::sync::Semaphore>,
+    identity_reads: AtomicUsize,
     revoke_works: std::sync::atomic::AtomicBool,
     revoked: Mutex<Vec<String>>,
 }
@@ -854,6 +857,90 @@ struct RefreshAnswer(Box<dyn Fn(usize) -> Result<Refreshed> + Send + Sync>);
 impl std::fmt::Debug for RefreshAnswer {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RefreshAnswer")
+    }
+}
+
+/// The billing summary as the service sends it: its response envelope around the summary, with
+/// every figure a decimal string. Only the allowances are read.
+fn billing_summary(allowances: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "ok": true,
+        "data": {
+            "principal": "account:acct_1",
+            "currency": "usd",
+            "entitlement": { "kind": "free" },
+            "balance": "0",
+            "allowances": allowances,
+            "reservations": [],
+            "grace": null,
+            "notices": [],
+            "catalogue": [],
+            "awaitingConfirmation": false
+        }
+    })
+}
+
+/// KR-REQ-17.32: usage is read from the summary the service answers, inside its envelope, and
+/// becomes figures with nothing about money.
+#[tokio::test]
+async fn usage_is_read_from_the_summary_inside_the_services_envelope() {
+    let allowances = serde_json::json!([
+        {
+            "resource": "relay_bytes", "allowance": "10000000000", "used": "1234000000",
+            "reserved": "0", "count": "0", "reservedCount": "0", "period": "2026-09",
+            "exhausted": false
+        },
+        {
+            "resource": "sync_bytes", "allowance": "100000000", "used": "12345678",
+            "reserved": "0", "count": "3", "reservedCount": "0", "period": null,
+            "exhausted": false
+        }
+    ]);
+    let http = Scripted::answering(vec![(200, billing_summary(allowances.clone()))]);
+    let access = AccountToken::new("an-access-token").expect("a token");
+    let usage = service(&http, Client::Desktop)
+        .usage(&access)
+        .await
+        .expect("the summary reads");
+    assert_eq!(
+        usage.lines,
+        vec![
+            UsageLine {
+                resource: UsageResource::Relay,
+                used_bytes: 1_234_000_000,
+                allowance_bytes: 10_000_000_000,
+                period: Some("2026-09".to_owned()),
+            },
+            UsageLine {
+                resource: UsageResource::Sync,
+                used_bytes: 12_345_678,
+                allowance_bytes: 100_000_000,
+                period: None,
+            },
+        ]
+    );
+    let seen = http.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0, "GET");
+    assert_eq!(seen[0].1, format!("{ACCOUNT_ORIGIN}{USAGE_PATH}"));
+
+    // The controls: the summary without its envelope, and a refusal in the envelope, are errors
+    // rather than empty usage.
+    for body in [
+        serde_json::json!({ "allowances": allowances }),
+        serde_json::json!({
+            "ok": false,
+            "error": { "code": "UNAUTHENTICATED", "message": "Sign in to read billing." }
+        }),
+    ] {
+        let http = Scripted::answering(vec![(200, body.clone())]);
+        assert!(
+            service(&http, Client::Desktop)
+                .usage(&access)
+                .await
+                .is_err(),
+            "{body}"
+        );
     }
 }
 
@@ -884,6 +971,13 @@ impl Stub {
     fn holding() -> Self {
         Self {
             held: Some(tokio::sync::Semaphore::new(0)),
+            ..Self::new()
+        }
+    }
+
+    fn holding_identity() -> Self {
+        Self {
+            identity_held: Some(tokio::sync::Semaphore::new(0)),
             ..Self::new()
         }
     }
@@ -938,6 +1032,10 @@ impl AccountService for Stub {
     fn identity<'a>(&'a self, _access: &'a AccountToken) -> ServiceFuture<'a, AccountIdentity> {
         let answer = self.identity.lock().expect("the identity").clone();
         Box::pin(async move {
+            self.identity_reads.fetch_add(1, Ordering::SeqCst);
+            if let Some(held) = &self.identity_held {
+                held.acquire().await.expect("a permit").forget();
+            }
             match answer.expect("an identity answer") {
                 Ok(identity) => Ok(identity),
                 Err(code) => Err(ClientError::Host(ProtocolError::new(
@@ -1405,6 +1503,95 @@ async fn the_identity_read_after_a_sign_in_is_held_to_the_sign_ins_subject() {
         AccountStatus::SignedOut
     );
     assert_eq!(stub.revoked(), ["grant"]);
+}
+
+/// An identity read that disagrees ends only the grant it was read for: a sign-in that replaced
+/// that grant while the read was out stays, with nothing of it revoked.
+#[tokio::test]
+async fn a_disagreeing_identity_ends_only_the_grant_it_was_read_for() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::holding_identity());
+    *stub.identity.lock().expect("the identity") = Some(Ok(AccountIdentity {
+        subject: "someone-else".to_owned(),
+        email: None,
+        name: None,
+    }));
+    let store = Arc::new(MemoryStore::new());
+    let signed_in = account(&stub, &store);
+    signed_in
+        .commit(issued_for("account-1", "grant-a", &["openid"]), "a-nonce")
+        .await
+        .expect("the first sign-in");
+
+    let reading = {
+        let signed_in = Arc::clone(&signed_in);
+        tokio::spawn(async move { signed_in.complete_identity().await })
+    };
+    while stub.identity_reads.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+    signed_in
+        .commit(issued_for("account-2", "grant-b", &["openid"]), "b-nonce")
+        .await
+        .expect("the second sign-in");
+    stub.identity_held
+        .as_ref()
+        .expect("a held read")
+        .add_permits(1);
+
+    let read = reading.await.expect("the read runs").expect("a read");
+    assert_eq!(
+        read,
+        IdentityRead::Unread,
+        "the read was for a grant no longer here"
+    );
+    assert_eq!(stored_refresh(&store).as_deref(), Some("grant-b"));
+    assert!(
+        !stub.revoked().contains(&"grant-b".to_owned()),
+        "{:?}",
+        stub.revoked()
+    );
+}
+
+/// A refresh that narrows the grant is kept, and the token is refused for the scope the grant no
+/// longer carries.
+#[tokio::test]
+async fn a_refresh_that_drops_the_asked_for_scope_is_kept_and_the_token_refused() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    stub.answer_refresh(|count| {
+        Ok(Refreshed::Rotated(issued_for(
+            "account-1",
+            &format!("narrowed-{count}"),
+            &["openid", "voice"],
+        )))
+    });
+    let store = Arc::new(MemoryStore::new());
+    let signed_in = account(&stub, &store);
+    signed_in
+        .commit(
+            issued_for("account-1", "grant", &["openid", "voice", LEASE_SCOPE]),
+            "a-nonce",
+        )
+        .await
+        .expect("a sign-in");
+    expire();
+
+    let refused = signed_in
+        .token(LEASE_SCOPE)
+        .await
+        .expect_err("the narrowed grant has no lease scope");
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied);
+    assert_eq!(stored_refresh(&store).as_deref(), Some("narrowed-1"));
+    let voice = signed_in
+        .token("voice")
+        .await
+        .expect("the narrowed grant still serves voice");
+    assert_eq!(voice.expose(), "narrowed-1-access");
+    assert_eq!(stub.refreshes.load(Ordering::SeqCst), 1);
+    rewind();
 }
 
 /// The scoped source on a host: an imported token is refused for a scope it was not issued with,

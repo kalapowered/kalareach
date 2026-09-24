@@ -1248,8 +1248,13 @@ impl AccountService for ManagedAccountService {
                 return Err(upstream("the usage read", answer.status));
             }
             let value = Self::json(&answer).ok_or_else(|| upstream("the usage read", 200))?;
+            // The service answers `{ok, data}` around the summary; a refusal is `ok: false`.
+            if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+                return Err(upstream("the usage read", 200));
+            }
             let allowances = value
-                .get("allowances")
+                .get("data")
+                .and_then(|summary| summary.get("allowances"))
                 .and_then(serde_json::Value::as_array)
                 .ok_or_else(|| upstream("the usage read", 200))?;
             let bytes = |entry: &serde_json::Value, name: &str| {
@@ -1887,13 +1892,29 @@ impl SignedInAccount {
     /// Returns an error when no account is signed in or the store cannot be read.
     pub async fn complete_identity(&self) -> Result<IdentityRead> {
         let access = self.token("openid").await?;
-        let Some(grant) = self.read_grant()? else {
-            return Err(signed_out());
+        // The token and the grant it belongs to are taken together under the lock: a grant that
+        // another sign-in, here or in another process, put in its place meanwhile is not the one
+        // this read is about, and is left for its own read.
+        let grant = {
+            let _held = self.hold().await?;
+            match self.read_grant()? {
+                None => return Err(signed_out()),
+                Some(grant) if grant.access_token.expose() == access.expose() => grant,
+                Some(_) => return Ok(IdentityRead::Unread),
+            }
         };
         match self.service.identity(&access).await {
             Ok(identity) if identity.subject != grant.subject => {
-                self.sign_out().await?;
-                Ok(IdentityRead::Disagreed)
+                // Only the grant the read was for is undone, and only while it is still here.
+                if self
+                    .remove_grant(Some(&grant.grant_id))
+                    .await?
+                    .was_signed_in
+                {
+                    Ok(IdentityRead::Disagreed)
+                } else {
+                    Ok(IdentityRead::Unread)
+                }
             }
             Ok(identity) => {
                 let _held = self.hold().await?;
@@ -1918,17 +1939,23 @@ impl SignedInAccount {
     ///
     /// Returns an error when the store cannot be changed; the device is then still signed in.
     pub async fn sign_out(&self) -> Result<SignOut> {
+        self.remove_grant(None).await
+    }
+
+    /// Removes the grant, or only the grant `only` names while it is still the one here, queues
+    /// its revocation, then sends every queued revocation.
+    async fn remove_grant(&self, only: Option<&str>) -> Result<SignOut> {
         let was_signed_in = {
             let _held = self.hold().await?;
             match self.read_grant()? {
-                None => false,
-                Some(grant) => {
+                Some(grant) if only.is_none_or(|id| id == grant.grant_id) => {
                     self.queue(&grant.grant_id, grant.refresh_token.clone())?;
                     self.delete_grant()?;
                     self.ended.store(false, Ordering::SeqCst);
                     self.publish();
                     true
                 }
+                Some(_) | None => false,
             }
         };
         let remaining = self.send_pending().await?;
@@ -2007,6 +2034,14 @@ impl SignedInAccount {
     }
 }
 
+/// The refusal for a scope this sign-in does not carry.
+fn not_granted(scope: &str) -> ClientError {
+    ClientError::Host(ProtocolError::new(
+        ErrorCode::PermissionDenied,
+        format!("this sign-in was not granted the {scope} scope"),
+    ))
+}
+
 impl AccountTokenSource for SignedInAccount {
     fn token<'a>(&'a self, scope: &'a str) -> ServiceFuture<'a, AccountToken> {
         Box::pin(async move {
@@ -2020,10 +2055,7 @@ impl AccountTokenSource for SignedInAccount {
                     });
                 };
                 if !stored.carries(scope) {
-                    return Err(ClientError::Host(ProtocolError::new(
-                        ErrorCode::PermissionDenied,
-                        format!("this sign-in was not granted the {scope} scope"),
-                    )));
+                    return Err(not_granted(scope));
                 }
                 let now = (self.clock_ms)();
                 if stored.access_expires_at_ms > now.saturating_add(ACCESS_MARGIN_MS) {
@@ -2034,6 +2066,11 @@ impl AccountTokenSource for SignedInAccount {
                         let rotated = stored.rotated(issued, now);
                         self.write_grant(&rotated)?;
                         self.publish();
+                        // A refresh may narrow the grant, which is kept as issued; its token goes
+                        // out only for a scope it still carries.
+                        if !rotated.carries(scope) {
+                            return Err(not_granted(scope));
+                        }
                         return Ok(rotated.access_token.clone());
                     }
                     Refreshed::Ended => {
