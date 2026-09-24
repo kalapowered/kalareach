@@ -24,9 +24,11 @@
 pub mod account;
 pub mod commands;
 pub mod connection;
+pub mod device;
 pub mod error;
 pub mod export;
 pub mod links;
+pub mod owner;
 pub mod pairing;
 pub mod remote;
 pub mod setup;
@@ -57,6 +59,9 @@ pub fn run() {
     use tauri::Manager as _;
 
     tauri::Builder::default()
+        // The page holds no permission for the pasteboard: native code reads an invitation there
+        // itself, so its text never reaches the page.
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(companion_platform::init())
@@ -80,6 +85,7 @@ pub fn run() {
                 }
             });
             watch_drops(app.handle());
+            open_pairing(app.handle());
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -230,6 +236,45 @@ fn watch_drops(app: &tauri::AppHandle) {
             let _ = handle.emit(DROPPED_EVENT, named);
         });
     }
+}
+
+/// Opens this computer as a device that pairs, and as an owner device of the hosts it owns, and
+/// starts telling the page about both.
+///
+/// A computer whose keys or records cannot be opened still runs: the pairing commands say so, and
+/// everything else works as it did.
+fn open_pairing(app: &tauri::AppHandle) {
+    use std::sync::Arc;
+
+    use tauri::{Emitter as _, Manager as _};
+
+    let Ok(data) = app.path().app_data_dir() else {
+        tracing::warn!("no application data directory, so this computer cannot pair");
+        return;
+    };
+    let emitter = app.clone();
+    let device = match device::Device::open(&data, move || {
+        if let Ok(device) = emitter.state::<AppState>().device() {
+            let _ = emitter.emit(pairing::PAIRING_EVENT, device.view());
+        }
+    }) {
+        Ok(device) => device,
+        Err(error) => {
+            tracing::warn!(%error, "this computer's pairing records could not be opened");
+            return;
+        }
+    };
+    let ceremony = verify::platform_ceremony(app.get_webview_window("main"));
+    let emitter = app.clone();
+    let owner = owner::Owner::new(Arc::clone(&device), ceremony, move || {
+        if let Ok(owner) = emitter.state::<AppState>().owner() {
+            let _ = emitter.emit(pairing::CONFIRMATIONS_EVENT, owner.view());
+        }
+    });
+    app.state::<AppState>()
+        .opened(Arc::clone(&device), Arc::clone(&owner));
+    device.start();
+    owner.start();
 }
 
 /// The event the backend publishes the paths of dropped files on.

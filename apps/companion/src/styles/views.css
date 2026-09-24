@@ -865,3 +865,166 @@
     height: 72px;
   }
 }
+
+/* ---- Pairing -------------------------------------------------------------------------------- */
+
+/*
+ * One column of at most 34rem, like the other forms: how to pair, then the attempt, then the hosts
+ * this computer is paired with. Every size is in rem, so a larger system text size scales it.
+ */
+.pairing-column {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-6);
+  max-width: 34rem;
+}
+
+.pairing-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-3);
+}
+
+.pairing-section p {
+  line-height: 1.55;
+}
+
+.pairing-settings {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-2);
+  border-top: 1px solid var(--line);
+  padding-top: var(--gap-4);
+}
+
+.pairing-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--gap-2);
+}
+
+.pairing-column .danger-text {
+  color: var(--danger);
+}
+
+.pairing-column .tabular,
+.confirmations .tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * The value both devices show. Large, monospace, tabular, selectable; it wraps between its two
+ * groups and never inside one. It arrives from the network, so it arrives with a 200ms fade and a
+ * 4px rise; with reduced motion, the fade alone.
+ */
+.verification-value {
+  margin: var(--gap-2) 0;
+  font-family: var(--font-mono);
+  font-size: 2rem;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+  user-select: text;
+  opacity: 1;
+  transform: translateY(0);
+  transition:
+    opacity var(--surface-in) var(--ease-out),
+    transform var(--surface-in) var(--ease-out);
+}
+
+@starting-style {
+  .verification-value {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+
+.verification-groups {
+  display: inline-flex;
+  flex-wrap: wrap;
+  column-gap: 0.6em;
+}
+
+.verification-group {
+  white-space: nowrap;
+}
+
+.paired-hosts {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* ---- The owner's confirmations -------------------------------------------------------------- */
+
+.confirmations {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-3);
+  margin-bottom: var(--gap-5);
+}
+
+.confirmation-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* A new request arrives with a 200ms fade and leaves with a 120ms one. Nothing animates its height:
+   the rows below move without a transition. */
+.confirmation-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--gap-3);
+  border: 1px solid var(--warning-line);
+  border-radius: 10px;
+  background: var(--warning-soft);
+  padding: 14px 16px;
+  opacity: 1;
+  transition: opacity var(--surface-in) var(--ease-out);
+}
+
+@starting-style {
+  .confirmation-row {
+    opacity: 0;
+  }
+}
+
+.confirmation-row[data-leaving='true'] {
+  opacity: 0;
+  transition: opacity var(--press) ease;
+}
+
+.confirmation-title {
+  margin-bottom: var(--gap-1);
+}
+
+.confirmation-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--gap-2);
+  margin-left: auto;
+}
+
+.confirmations .warning-text {
+  color: var(--warning);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .verification-value {
+    transform: none;
+    transition: opacity var(--surface-in) ease;
+  }
+
+  @starting-style {
+    .verification-value {
+      transform: none;
+      opacity: 0;
+    }
+  }
+}

@@ -1,25 +1,27 @@
 //! What the backend holds between commands.
 //!
-//! One connection, one rendezvous origin, one draft store, and one record of where the last export
-//! was allowed to be written. Nothing here is reachable from the WebView except through the
+//! One connection, this computer as a device that pairs, its owner confirmations, one draft store,
+//! and one record of where the last export was allowed to be written. Nothing here is reachable from the WebView except through the
 //! commands, and a command returns protocol values rather than handles: there is nothing the page
 //! can keep and use later.
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use kr_client::Session;
 use kr_protocol::ids::EnvironmentId;
 
 use crate::connection::{Connection, ConnectionState};
+use crate::device::Device;
 use crate::error::{CommandError, Result};
-use crate::pairing::{self, Origin};
+use crate::owner::Owner;
 
 /// The backend's long-lived state.
 #[derive(Debug)]
 pub struct AppState {
     connection: RwLock<Option<Connection>>,
     reason: RwLock<Option<String>>,
-    origin: Mutex<Origin>,
+    device: OnceLock<Arc<Device>>,
+    owner: OnceLock<Arc<Owner>>,
     drafts: Mutex<Option<Arc<kr_client::drafts::DraftStore>>>,
     export_destinations: Mutex<Vec<std::path::PathBuf>>,
     dropped_files: Mutex<Vec<std::path::PathBuf>>,
@@ -27,11 +29,6 @@ pub struct AppState {
 
 impl AppState {
     /// Builds the state of an application that has not connected to anything yet.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the shipped rendezvous origin does not parse, which is a build-time mistake
-    /// rather than a runtime condition.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -39,10 +36,8 @@ impl AppState {
             reason: RwLock::new(Some(
                 "this application has not reached a host yet".to_owned(),
             )),
-            origin: Mutex::new(
-                pairing::parse_origin(pairing::DEFAULT_RENDEZVOUS_ORIGIN)
-                    .expect("the shipped rendezvous origin parses"),
-            ),
+            device: OnceLock::new(),
+            owner: OnceLock::new(),
             drafts: Mutex::new(None),
             export_destinations: Mutex::new(Vec::new()),
             dropped_files: Mutex::new(Vec::new()),
@@ -121,24 +116,32 @@ impl AppState {
         }
     }
 
-    /// The rendezvous origin this device is configured with.
-    #[must_use]
-    pub fn origin(&self) -> Origin {
-        self.origin
-            .lock()
-            .expect("the origin lock is not poisoned")
-            .clone()
+    /// Records this computer as a device that pairs, once it has been opened.
+    pub fn opened(&self, device: Arc<Device>, owner: Arc<Owner>) {
+        let _ = self.device.set(device);
+        let _ = self.owner.set(owner);
     }
 
-    /// Changes the rendezvous origin.
+    /// This computer as a device that pairs.
     ///
     /// # Errors
     ///
-    /// Returns `INVALID_ARGUMENT` when the value is not an https origin.
-    pub fn set_origin(&self, value: &str) -> Result<Origin> {
-        let parsed = pairing::parse_origin(value)?;
-        *self.origin.lock().expect("the origin lock is not poisoned") = parsed.clone();
-        Ok(parsed)
+    /// Returns a local failure when its keys or records could not be opened.
+    pub fn device(&self) -> Result<Arc<Device>> {
+        self.device.get().cloned().ok_or_else(|| {
+            CommandError::local_failure("this computer's pairing records could not be opened")
+        })
+    }
+
+    /// This computer's owner confirmations.
+    ///
+    /// # Errors
+    ///
+    /// Returns a local failure when its keys or records could not be opened.
+    pub fn owner(&self) -> Result<Arc<Owner>> {
+        self.owner.get().cloned().ok_or_else(|| {
+            CommandError::local_failure("this computer's pairing records could not be opened")
+        })
     }
 
     /// Remembers that the person chose this destination in a save dialog.
@@ -262,24 +265,10 @@ mod tests {
         assert!(!connection.connected);
         assert!(connection.reason.is_some());
         assert!(state.session().is_err());
-        assert!(state.origin().is_default);
-    }
-
-    #[test]
-    fn the_origin_can_be_changed_before_an_attempt_and_the_change_is_what_is_read_back() {
-        let state = AppState::new();
-        let changed = state
-            .set_origin("https://pair.example.org")
-            .expect("a valid origin");
-        assert!(!changed.is_default);
-        assert_eq!(state.origin().origin, "https://pair.example.org");
-    }
-
-    #[test]
-    fn an_origin_that_is_not_an_https_origin_leaves_the_configured_one_alone() {
-        let state = AppState::new();
-        assert!(state.set_origin("http://pair.example.org").is_err());
-        assert!(state.origin().is_default);
+        assert!(
+            state.device().is_err(),
+            "nothing pairs before the device is opened"
+        );
     }
 
     /// KR-REQ-13.21: an export is written only where a save dialog put it; a path the page names
