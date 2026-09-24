@@ -1183,7 +1183,11 @@ async fn a_voice_start_that_waited_writes_nothing_once_a_fence_is_owed() {
         .devices()
         .expect("the device directory answers")
         .into_iter()
-        .find(|record| record.is_paired())
+        // The host's own owner device is paired too; this is the device the test paired.
+        .find(|record| {
+            let owner = host.owner.as_ref().map(|owner| owner.device_id);
+            record.is_paired() && owner != Some(record.device_id)
+        })
         .expect("the paired device")
         .device_id;
     let session_id = SessionId::new(kr_ipc::new_uuid());
