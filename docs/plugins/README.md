@@ -195,7 +195,8 @@ owns:
 | --- | --- | --- |
 | `presentation` | Redraws the package's own document | `observe` |
 | `component` | Runs `prepare-action` and checks the plan it returns | any |
-| `upstream_method` | Sends one routed method with the bound parameters | `upstream.prompt`, `upstream.attachment`, `approval.respond` |
+| `upstream_method` | Sends one routed method with the bound parameters | `upstream.prompt`, `upstream.attachment` |
+| `decision_destination` | Answers the pending request the call names, through the connector table's decision destination | `approval.respond` |
 | `upstream_cancel` | Requests cancellation of the current turn | `upstream.cancel` |
 | `terminal_text` | Writes a bounded template into the terminal | `terminal.input` |
 
@@ -217,6 +218,9 @@ and a package supplies no quoting of its own.
 
 An implementation that cannot produce the class its action declares is a finding, as is one that
 names a component the package does not ship or a method its connector table does not route.
+
+How a package with no component answers an approval, from the connector table to the call, is in
+[Answering approvals from a declarative package](sdk.md).
 
 ### Parameters
 
@@ -302,8 +306,9 @@ A control states when it is visible and when it is enabled as a predicate:
 ```
 
 The grammar is `always`, `never`, `not`, `all`, `any`, `capability`, `grant`, `binding`,
-`node_present` and `flag`. There is no variable, no arithmetic, no string matching and no
-expression form. Nesting is bounded at 4 levels and 8 terms per combinator.
+`node_present`, `flag` and `pending_approval_for`. There is no variable, no arithmetic, no string
+matching and no expression form: `node_present` and `pending_approval_for` compare one identifier
+exactly. Nesting is bounded at 4 levels and 8 terms per combinator.
 
 Two reasons for the bound. The host rechecks visibility when a control is invoked, so evaluation
 has to be cheap and total. And a reviewer reads a predicate to decide whether a package is honest
@@ -331,6 +336,10 @@ component fault disables rich meaning without stalling or discarding valid nativ
 - **Routes:** the method name in the table and its exact wire spelling.
 - **Method classification:** `observation`, `mutation`, `credential` or `unsupported` per method,
   each with the evidence the publisher qualified it against.
+- **Decision destination:** for a table that answers approvals, the method that carries an answer,
+  the method whose requests it answers, where the answer repeats the request's identifier and puts
+  the decision, and the application's own value for each decision. A table that answers none says
+  `null`.
 - **Protocol pin:** the upstream protocol name, the versions the table was qualified against and
   the exact version the publisher tested.
 
