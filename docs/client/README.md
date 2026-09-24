@@ -630,9 +630,15 @@ answer can be the service's, and both stay errors.
 The service answers a comparison sixty-four objects at a time and names every object the
 collection holds. `compare_shared` takes what the reader holds, each object at the revision it
 holds it at, which the service leaves out, and follows the pages until nothing the collection names
-is missing, naming at each page what the ones before brought. It stops at a page that brings
-nothing while something is missing, and after `MAX_COMPARISON_PAGES` pages of a collection that
-keeps moving.
+is missing. It reads each page whole and folds them into one answer: the objects the reader lacks,
+and the objects it named that the collection no longer holds, each with the place its removal
+took. What a later page says of an object replaces what an earlier page said, so an object removed
+between two pages comes back removed, and one written again after that comes back as the object.
+Each request names every object the reader holds once, and after the first page only those the
+collection lists, which keeps it within what the service reads. It stops at a page that brings
+nothing while something is missing, at an object a page brought that the collection stops listing
+without any page saying it went, and after `MAX_COMPARISON_PAGES` pages of a collection that keeps
+moving.
 
 `ManagedSyncService` is also the membership's `KeyRecordService`. A read of key records names the
 home and follows every page to the newest, handing the records over as the service answered them,
@@ -649,8 +655,8 @@ nobody.
 object, and its copies of refused writes, page by page. A collection keeps copies until a person
 chooses about them, including copies of objects it no longer holds, so their number has no bound
 this client can state, and each page carries the copies' content. A read therefore stops at the
-number of pages its caller gives it and names the cursor it stopped at; the caller continues from
-there, handing back what it has, until the read reaches the end. That is what a member reads before
+number of pages its caller gives it, at least one, and names the cursor it stopped at; the caller
+continues from there, handing back what it has, until the read reaches the end. That is what a member reads before
 it forgets an old epoch's key, and only a read that reached the end can show that nothing is sealed
 under one.
 
