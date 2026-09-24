@@ -792,3 +792,201 @@ jobs:
         run: |
           pnpm -C apps/companion build
           cargo build --locked -p companion-tauri --release --features custom-protocol
+
+  # The whole workspace on macOS: the lint, every test, the end-to-end demonstrations and the
+  # performance measurements, on the platform whose service manager, process table, disk images
+  # and pseudo-terminals the host's macOS paths are written against. It runs beside the companion's
+  # macOS leg rather than inside it, so neither waits for the other.
+  #
+  # What it leaves to the other jobs, because they run it natively and nothing in it differs on
+  # macOS: formatting and the generated-file checks (rust), the TypeScript packages (typescript),
+  # and compiling for Linux and Windows (rust and windows).
+  macos:
+    name: macos
+    runs-on: macos-15
+    # Each long step below has a limit of its own, so a step that hangs ends and the steps after it
+    # still report. This one bounds the whole job.
+    timeout-minutes: 340
+    env:
+      # As in the rust job: no debug information in the profiles this job builds, and no
+      # incremental artefacts, which nothing here reads and the disk has to hold.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # What this runner is, printed before anything asserts on it, so a pass or a failure below
+      # names the system, the login session and the disk it happened on.
+      - name: What this runner is
+        run: |
+          sw_vers
+          uname -srm
+          echo "processors: $(sysctl -n hw.logicalcpu) logical, $(sysctl -n machdep.cpu.brand_string)"
+          echo "memory: $(( $(sysctl -n hw.memsize) / 1073741824 )) GiB"
+          echo "account: $(id -un), uid $(id -u); launchd session: $(launchctl managername)"
+          security show-keychain-info "$HOME/Library/Keychains/login.keychain-db" 2>&1 || true
+          df -h /System/Volumes/Data
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      # The plugin runtime's test components, which KR_REQUIRE_PLUGIN_FIXTURES makes a failure to
+      # leave out rather than a skip.
+      - name: Install the component target
+        run: rustup target add wasm32-wasip2
+
+      # The worker's pseudo-terminal suite starts each shell section 3 names as a session's root
+      # shell. The runner has Bash and Zsh; Fish is installed here, and the test step names all
+      # three as required, so a shell that is missing fails rather than being skipped.
+      - name: Install the shells the worker's suite drives
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          brew install fish
+          for shell in bash zsh fish; do
+            echo "$shell: $(command -v "$shell")"
+          done
+          fish --version
+
+      # The registry and the dependencies' build output, never this workspace's own crates, and
+      # saved from main alone: the repository's cache is shared by every job, and a whole target
+      # directory from here would push the others out of it. The last steps of this job reduce the
+      # target directory to what this key describes before it is saved.
+      - name: Restore the cargo registry and dependency builds
+        id: cargo-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: macos-cargo-${{ runner.os }}-${{ runner.arch }}-dependencies-nodebuginfo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      - name: Build the test components
+        run: bash scripts/build-plugin-fixtures.sh
+
+      # A graphical login domain in which this account can bootstrap and start a job, in the
+      # background domain as well, done here the way the host starts a worker for a desktop-bound
+      # and for a headless session: a definition that starts nothing when it is loaded, bootstrapped
+      # into the domain, started once and then booted out. Several suites below take a different
+      # branch on a host without that domain (a supervisor that is not launchd, or a case that has
+      # nothing to observe), so the job states the domain before them rather than let those cases
+      # pass without running.
+      - name: This account can start per-user launchd jobs
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          uid="$(id -u)"
+          if ! launchctl print "gui/$uid" > /dev/null; then
+            echo "gui/$uid: this account has no graphical login domain" >&2
+            exit 1
+          fi
+          echo "gui/$uid: this account has a graphical login domain"
+          definitions="$(mktemp -d)"
+          loaded=""
+          take_them_away() {
+            for target in $loaded; do
+              launchctl bootout "$target" 2>/dev/null || true
+            done
+            rm -rf -- "${definitions:?}"
+          }
+          trap take_them_away EXIT
+          start() {
+            domain="$1" session="$2"
+            label="kr-launchd-check-$session-$$"
+            definition="$definitions/$label.plist"
+            printf '%s\n' \
+              '<?xml version="1.0" encoding="UTF-8"?>' \
+              '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+              '<plist version="1.0"><dict>' \
+              "<key>Label</key><string>$label</string>" \
+              '<key>ProgramArguments</key><array><string>/bin/sleep</string><string>120</string></array>' \
+              '<key>RunAtLoad</key><false/><key>KeepAlive</key><false/>' \
+              '<key>ProcessType</key><string>Interactive</string>' \
+              "<key>LimitLoadToSessionType</key><string>$session</string>" \
+              '</dict></plist>' > "$definition"
+            launchctl bootstrap "$domain" "$definition"
+            loaded="$loaded $domain/$label"
+            spawned="$(launchctl kickstart -p "$domain/$label")"
+            pid="$(printf '%s\n' "$spawned" | grep -Eo '[0-9]+' | tail -n 1)"
+            if [ -z "$pid" ] || ! ps -p "$pid" -o pid=,command=; then
+              echo "$domain: the $session job reported no running process: $spawned" >&2
+              exit 1
+            fi
+            launchctl bootout "$domain/$label"
+            echo "$domain: a $session job was bootstrapped, started as process $pid and booted out"
+          }
+          start "gui/$uid" Aqua
+          start "user/$uid" Background
+
+      # From here every step runs whatever the one before it did, so each reports its own result,
+      # and any one of them failing fails the job.
+      - name: Clippy
+        if: ${{ !cancelled() }}
+        timeout-minutes: 90
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Test
+        if: ${{ !cancelled() }}
+        timeout-minutes: 200
+        env:
+          KR_REQUIRE_SHELLS: bash,zsh,fish
+        run: cargo test --locked --workspace --no-fail-fast
+
+      # Real processes, real sockets and real terminals, the suites the script names and nothing
+      # else, each of which must demonstrate something, and no process of the run left behind.
+      - name: End-to-end demonstrations
+        if: ${{ !cancelled() }}
+        timeout-minutes: 120
+        run: bash scripts/end-to-end.sh
+
+      # The idle-resource and attach targets (KR-PERF-003, KR-PERF-004) and the input measurements,
+      # in a release build, each figure printed with the conditions it was taken under and asserted
+      # against its bound.
+      - name: Performance measurements
+        if: ${{ !cancelled() }}
+        timeout-minutes: 90
+        run: bash scripts/performance.sh
+
+      - name: What the disk has left
+        if: ${{ !cancelled() }}
+        run: df -h /System/Volumes/Data
+
+      # The workspace's own crates change from one commit to the next, so their artefacts would be
+      # rebuilt anyway; the dependencies' change only with the lock. Every workspace package is
+      # cleaned from both profiles, along with the tests' scratch space, and what is left is
+      # measured, because that is what the save below would store.
+      - name: Keep only the dependencies' build output
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          du -sh target/debug target/release 2>/dev/null || true
+          packages=""
+          for package in $(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[].name'); do
+            packages="$packages -p $package"
+          done
+          # shellcheck disable=SC2086
+          cargo clean --locked $packages
+          # shellcheck disable=SC2086
+          cargo clean --locked --release $packages
+          rm -rf target/tmp
+          du -sh ~/.cargo/registry/index ~/.cargo/registry/cache ~/.cargo/git/db target/debug target/release 2>/dev/null || true
+          du -sh target
+
+      - name: Save the cargo registry and dependency builds
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
