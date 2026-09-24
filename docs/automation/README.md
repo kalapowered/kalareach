@@ -243,9 +243,15 @@ the unit it derives them for. Nothing a caller sends names any of them.
   transaction as the pause. The record outlives a restart and is settled only once the host's
   attention state has written its own, so a chain that ran out owes one item however many
   refusals follow and whatever restarts intervene.
-* **Re-arming.** Only an authorised re-arm establishes a new budget. It advances the chain's
-  generation and resets its counters without anybody raising a ceiling, and a descendant of a run
-  from the previous generation carries that earlier generation and is refused as late.
+* **Re-arming.** Only an authorised re-arm establishes a new budget: one made under a grant this
+  host holds as live, for this environment, with the right to manage automation, which no event
+  carries. It advances the chain's generation and resets its counters without anybody raising a
+  ceiling, and it continues the chain in the same transaction: every descendant the exhausted
+  budget refused, which the journal kept with the refusal, is admitted once as a run of the same
+  chain in the new generation, under its own workflow's grant and limits, and the record of it is
+  spent whatever that admission decides. A descendant of a run from the previous generation that
+  arrives afterwards carries that earlier generation and is refused as late, and a replay of a
+  continued trigger is a duplicate.
 * **External triggers.** A trigger with no verifiable causal parent, an unauthenticated callback
   among them, is a new external trigger: the host mints its root and host-wide admission bounds
   it. It can never adopt a causal root of its choosing. The host does not claim to recover
@@ -377,8 +383,12 @@ The source workflow registers what a run reported against the exact version it w
 * **Immutable change-set binding.** A test result and a review result are recorded against one
   immutable change-set version (`kr_changeset`). A later edit in the workspace produces a later
   version; it never changes evidence already recorded against an earlier one.
-* **Quiescence reservations.** A workspace can be reserved for the length of a capture, and a
-  second reservation on the same workspace is refused until the first is released or expires.
+* **No quiesced captures yet.** A capture a workflow runs asks the host to hold its workspace
+  still, and the host refuses, naming why: a shared existing checkout is written by the user's own
+  tools, a workspace live sessions hold is written by their shells, and this host's own writers do
+  not yet ask for a reservation before they write. The capture records the per-file consistency it
+  performs and never claims a quiesced or point-in-time tree, and a capture node that requires a
+  quiesced capture fails with the reason.
 * **Separate identities.** The agent, the test run and the reviewer each carry their own session
   and agent identity, and a review is recorded against the reviewer who gave it.
 * **A review is its turn's completion.** A review result names the reviewer's turn that produced
