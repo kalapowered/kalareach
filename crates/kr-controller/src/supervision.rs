@@ -627,9 +627,10 @@ const COLLECT_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 ///
 /// What it prints is read while it runs, so an answer of any size cannot stall it. It is this
 /// process's own child: one that did not answer, could not be waited for, or whose output could not
-/// be read is ended and given [`COLLECT_BOUND`] to be collected, so this returns within the two
-/// bounds together. A failure to end or collect it is part of what this returns, and the readers of
-/// a launchctl that was not collected are left to finish by themselves.
+/// be read is ended and given [`COLLECT_BOUND`] to be collected. The two are deadlines on the
+/// command and on its collection; starting it and its readers, and taking in what a collected one
+/// left in its pipes, come on top of them. A failure to end or collect it is part of what this
+/// returns, and the readers of a launchctl that was not collected are left to finish by themselves.
 #[cfg(target_os = "macos")]
 fn launchctl_within(arguments: &[&str]) -> std::result::Result<std::process::Output, String> {
     let asked = arguments.join(" ");
