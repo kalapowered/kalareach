@@ -20,9 +20,13 @@ use kr_project::identity::OpenedRepository;
 use support::Fixture;
 
 /// Returns every descriptor this process holds, and what each one is.
+///
+/// Not the one the listing is read through, which is open only while this reads it: its number is
+/// free again afterwards, and a descriptor the service opens later may take it.
 fn descriptors() -> BTreeMap<i32, String> {
+    let listing = std::fs::canonicalize("/proc/self/fd").expect("this process's descriptor list");
     let mut held = BTreeMap::new();
-    for entry in std::fs::read_dir("/proc/self/fd").expect("this process's descriptors") {
+    for entry in std::fs::read_dir(&listing).expect("this process's descriptors") {
         let entry = entry.expect("a descriptor entry");
         let Ok(number) = entry.file_name().to_string_lossy().parse::<i32>() else {
             continue;
@@ -30,6 +34,9 @@ fn descriptors() -> BTreeMap<i32, String> {
         let target = std::fs::read_link(entry.path())
             .map(|target| target.display().to_string())
             .unwrap_or_default();
+        if std::path::Path::new(&target) == listing {
+            continue;
+        }
         held.insert(number, target);
     }
     held
@@ -52,6 +59,23 @@ fn closes_on_execution(number: i32) -> Option<bool> {
 
 #[test]
 fn every_descriptor_the_project_service_opens_is_closed_when_a_child_executes() {
+    // The control first: a descriptor opened the ordinary way is marked, and the same descriptor
+    // with the mark taken away is one this check reports.
+    let probe = std::fs::File::open("/proc/self/status").expect("a file to hold open");
+    let number = std::os::fd::AsRawFd::as_raw_fd(&probe);
+    assert_eq!(
+        closes_on_execution(number),
+        Some(true),
+        "opened with the mark"
+    );
+    rustix::io::fcntl_setfd(&probe, rustix::io::FdFlags::empty()).expect("the mark is taken away");
+    assert_eq!(
+        closes_on_execution(number),
+        Some(false),
+        "and without it the check sees a descriptor a child would inherit"
+    );
+    drop(probe);
+
     let before = descriptors();
     // The service opened on a host tree: its store, its journal, its profile and the handles it
     // keeps. Then a repository opened and cloned through it, which holds handles of its own.
@@ -81,9 +105,11 @@ fn every_descriptor_the_project_service_opens_is_closed_when_a_child_executes() 
         .expect("the clone starts");
     assert!(cloned.success, "the clone runs: {}", cloned.stderr);
 
+    // New, or a number that now holds something else: a descriptor closed and reopened between
+    // the two readings is a descriptor the service opened.
     let opened: Vec<(i32, String)> = descriptors()
         .into_iter()
-        .filter(|(number, _)| !before.contains_key(number))
+        .filter(|(number, target)| before.get(number) != Some(target))
         .collect();
     assert!(
         !opened.is_empty(),
