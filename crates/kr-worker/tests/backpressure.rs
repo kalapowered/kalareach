@@ -146,9 +146,18 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
     tokio::spawn(Arc::clone(&service).serve(listener));
 
     // Two clients over the real endpoint. Neither knows about the other. Both are attached and
-    // subscribed while the application is still waiting to write.
-    let (slow, slow_id) = attached(&endpoint, environment_id, session_id).await;
-    let (quick, _) = attached(&endpoint, environment_id, session_id).await;
+    // subscribed while the application is still waiting to write, each under the same liveness
+    // bound as every other wait here: connecting, the handshake and the answers are waits too.
+    let attach = || async {
+        tokio::time::timeout(
+            LIVENESS_DEADLINE,
+            attached(&endpoint, environment_id, session_id),
+        )
+        .await
+        .expect("a client connects, attaches and subscribes within the liveness bound")
+    };
+    let (slow, slow_id) = attach().await;
+    let (quick, _) = attach().await;
     let before = runtime.session().output_cursor();
     stages.reached("both clients attached and subscribed");
     std::fs::write(&go, b"").expect("the application is let go");
