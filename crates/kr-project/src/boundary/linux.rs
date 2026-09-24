@@ -569,6 +569,10 @@ const MAX_LOADER_NAME: u64 = 4096;
 /// passed over: a script's interpreter is either one of the programs given or not executed at
 /// all. One object reached by several names is read once.
 ///
+/// Asking runs the loader, outside any boundary. So only the loaders the programs given name for
+/// themselves are ever run, and a program in the helper directory that names another loader is a
+/// refusal rather than a loader this host starts because a file said so.
+///
 /// # Errors
 ///
 /// Returns [`ProjectError::GitFailed`] naming the object that could not be named.
@@ -602,6 +606,19 @@ pub fn support_set(
         let Some(loader) = interpreter(candidate)? else {
             continue;
         };
+        let resolved = std::fs::canonicalize(&loader).map_err(|error| unnamed(&loader, &error))?;
+        if !required && !loaders.contains(&resolved) {
+            return Err(ProjectError::GitFailed {
+                detail: format!(
+                    "{} names the loader {}, which neither Git nor its connection shell is started \
+                     through, so the support set of an invocation for a caller bounded by a grant \
+                     cannot be named",
+                    crate::git::redact(&candidate.display().to_string()),
+                    crate::git::redact(&loader.display().to_string())
+                )
+                .into(),
+            });
+        }
         for library in listed(&loader, candidate)? {
             let resolved =
                 std::fs::canonicalize(&library).map_err(|error| unnamed(&library, &error))?;
@@ -609,7 +626,7 @@ pub fn support_set(
                 libraries.insert(directory.to_owned());
             }
         }
-        loaders.insert(std::fs::canonicalize(&loader).map_err(|error| unnamed(&loader, &error))?);
+        loaders.insert(resolved);
     }
     Ok((
         loaders.into_iter().collect(),
@@ -1057,6 +1074,65 @@ mod tests {
         let script = root.path().join("script");
         std::fs::write(&script, "#!/bin/sh\nexit 0\n").expect("a script");
         assert_eq!(interpreter(&script).expect("the script reads"), None);
+    }
+
+    #[test]
+    fn a_helper_that_names_another_loader_is_refused_and_that_loader_never_runs() {
+        let shell = Path::new("/bin/sh");
+        let Some(loader) = interpreter(shell).expect("the shell's headers read") else {
+            println!("not exercised: this host's shell is not dynamically linked");
+            return;
+        };
+        // A program that records its own run, at a name no longer than the loader's, so it can be
+        // written into a copy of the shell in the loader's place.
+        let marker = PathBuf::from(format!("/tmp/krl-{}", std::process::id()));
+        let sentinel = PathBuf::from(format!("/tmp/krl-{}-ran", std::process::id()));
+        if marker.as_os_str().len() > loader.as_os_str().len() {
+            println!("not exercised: this host's loader has too short a name to write over");
+            return;
+        }
+        std::fs::write(
+            &marker,
+            format!("#!/bin/sh\necho ran > {}\n", sentinel.display()),
+        )
+        .expect("a program that records its run");
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o700))
+                .expect("it is marked executable");
+        }
+        let helpers = tempfile::TempDir::new().expect("a helper directory");
+        let bytes = std::fs::read(shell).expect("the shell reads");
+        // The control: an ordinary copy of the shell names the shell's own loader, and the set is
+        // named.
+        std::fs::write(helpers.path().join("git-ordinary"), &bytes).expect("a copy of the shell");
+        support_set(&[shell], helpers.path()).expect("an ordinary helper is named");
+        // The same copy, naming the recording program as its loader.
+        let named = loader.as_os_str().as_bytes();
+        let at = bytes
+            .windows(named.len())
+            .position(|window| window == named)
+            .expect("the loader's name is in the program");
+        let mut planted = bytes.clone();
+        planted[at..at + named.len()].fill(0);
+        planted[at..at + marker.as_os_str().len()].copy_from_slice(marker.as_os_str().as_bytes());
+        std::fs::write(helpers.path().join("git-planted"), &planted).expect("a planted helper");
+        assert_eq!(
+            interpreter(&helpers.path().join("git-planted")).expect("the planted headers read"),
+            Some(marker.clone()),
+            "the planted helper names the recording program as its loader"
+        );
+        let refusal = support_set(&[shell], helpers.path())
+            .expect_err("a helper naming another loader is refused");
+        std::fs::remove_file(&marker).expect("the recording program goes");
+        assert!(
+            refusal.to_string().contains("git-planted"),
+            "the refusal names the helper: {refusal}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&sentinel).is_err(),
+            "and the loader it named was never run"
+        );
     }
 
     #[test]
