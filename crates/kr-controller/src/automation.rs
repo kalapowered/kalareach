@@ -10,11 +10,12 @@
 //!   part way through.
 //! * The admission the daemon accepted a mutation under is carried into the workflow journal and
 //!   asked inside the transaction that performs the action, immediately before its first write.
-//! * **The grant a definition names is this host's own, as its policy stands.** The engine never
-//!   sees a grant a request carried. It asks [`HostGrants`], which reads the daemon's grant store
-//!   and intersects the grant with the host's policy: revocation and a revoked ancestor, the clock
-//!   floor, expiry, the organisation leases and the bounded offline validity. It decides that
-//!   again before every node a run dispatches, and a paired device's grant runs no change-set
+//! * **The grant a definition names is this host's own, decided as a device's request is.** The
+//!   engine never sees a grant a request carried. It asks [`HostGrants`], which reads the daemon's
+//!   grant store and has the daemon decide the grant under its own model: the rights ceiling its
+//!   configuration put in force, revocation and a revoked ancestor, the clock floor, expiry, the
+//!   organisation leases, and the bounded offline validity on the continuous clock. It decides
+//!   that again before every node a run dispatches, and a paired device's grant runs no change-set
 //!   node, because the device's own door serves it no change-set write.
 //! * **An action is a real effect or it is a refusal.** [`HostActions`] carries out the change-set
 //!   nodes against the environment's own change-set service, binding each result to the run that
@@ -26,7 +27,7 @@
 //! requires a causal budget to survive a restart and a reboot, and a runtime directory does not
 //! survive a reboot on every platform this host runs on.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use kr_automation::{
     ActionKey, ActionOutcome, ActionRunner, Answer as Recorded, AuthoritySource, AutomationService,
@@ -51,62 +52,69 @@ use kr_protocol::method::{Method, MethodGroup};
 use kr_protocol::scalars::Nullable;
 
 use crate::error::{ControllerError, Result};
-use crate::grants::HostPolicy;
-use crate::sharing::SharingService;
+use crate::service::Controller;
 
 /// What an automation call answers with: the method's result, or the refusal the service decided.
 pub type Answer<T> = std::result::Result<T, ProtocolError>;
 
+/// The daemon this module decides authority under.
+///
+/// The module is opened before the daemon that holds it is built, so the daemon is bound to it
+/// once it exists, and from then on every grant is decided under the daemon's own model. Until
+/// then, and after the daemon has gone, nothing is decided: an answer about a grant needs the
+/// daemon that owns it.
+#[derive(Debug, Default)]
+struct Daemon(std::sync::OnceLock<Weak<Controller>>);
+
+impl Daemon {
+    /// The daemon, while it is serving.
+    fn get(&self) -> kr_automation::Result<Arc<Controller>> {
+        self.0.get().and_then(Weak::upgrade).ok_or_else(|| {
+            kr_automation::AutomationError::AuthorityUnavailable(
+                "this host's daemon is not serving".to_owned(),
+            )
+        })
+    }
+}
+
 /// This host's grants, as the automation engine reads them.
 ///
 /// A definition names a grant identifier and nothing more. Whether that grant still authorises
-/// anything is the grant store's and the host policy's to say: the store holds the expiry, the
-/// revocation and the cascade a revoked ancestor causes, and the policy holds the clock floor, the
-/// organisation leases and the bounded offline validity. Asking both here, rather than trusting a
-/// grant a request carried, is what stops a workflow from acting under authority nobody holds.
-///
-/// The policy is the daemon's own, shared rather than copied: it is built once when the daemon
-/// starts, and every change the daemon accepts to it is what this reads the next time it is asked.
+/// anything is the grant store's and the daemon's to say: the store holds the expiry, the
+/// revocation and the cascade a revoked ancestor causes, and the daemon decides the grant as it
+/// decides a paired device's request, under the rights ceiling its configuration put in force, its
+/// policy's clock floor and organisation leases, and the bounded offline validity held on the
+/// continuous clock. Asking both here, rather than trusting a grant a request carried, is what
+/// stops a workflow from acting under authority nobody holds.
 #[derive(Debug)]
 pub struct HostGrants {
-    sharing: Arc<SharingService>,
-    devices: Arc<crate::service::net::devices::DeviceDirectory>,
-    policy: Arc<std::sync::Mutex<HostPolicy>>,
-    environment_id: EnvironmentId,
-    /// The clock floor as this module last wrote it down, and `None` before its first write.
-    ///
-    /// Read and changed only while the policy's lock is held.
-    written_floor: std::sync::Mutex<Option<u64>>,
+    daemon: Arc<Daemon>,
 }
 
 impl HostGrants {
-    /// Reads grants from the daemon's own stores, under the daemon's own policy.
-    ///
-    /// A grant lives in one of two places: the grant store, for a grant the host issued or shared,
-    /// and a paired device's own record, for the grant its pairing committed.
+    /// Reads grants from `daemon`'s own stores and decides them under its own model.
     #[must_use]
-    pub const fn new(
-        sharing: Arc<SharingService>,
-        devices: Arc<crate::service::net::devices::DeviceDirectory>,
-        policy: Arc<std::sync::Mutex<HostPolicy>>,
-        environment_id: EnvironmentId,
-    ) -> Self {
+    pub fn for_daemon(daemon: &Arc<Controller>) -> Self {
+        let bound = Daemon::default();
+        let _ = bound.0.set(Arc::downgrade(daemon));
         Self {
-            sharing,
-            devices,
-            policy,
-            environment_id,
-            written_floor: std::sync::Mutex::new(None),
+            daemon: Arc::new(bound),
         }
     }
 
-    /// Finds the record a grant stands on, in whichever store holds it.
-    fn record(&self, grant_id: GrantId) -> kr_automation::Result<crate::grants::GrantRecord> {
+    /// Finds the record a grant stands on, in whichever of the daemon's stores holds it.
+    ///
+    /// A grant lives in one of two places: the grant store, for a grant the host issued or shared,
+    /// and a paired device's own record, for the grant its pairing committed.
+    fn record(
+        daemon: &Controller,
+        grant_id: GrantId,
+    ) -> kr_automation::Result<crate::grants::GrantRecord> {
         let unavailable = |error: ControllerError| {
             kr_automation::AutomationError::AuthorityUnavailable(error.to_string())
         };
-        if let Some(record) = self
-            .sharing
+        if let Some(record) = daemon
+            .sharing()
             .grants()
             .record(grant_id)
             .map_err(unavailable)?
@@ -116,8 +124,8 @@ impl HostGrants {
         // A paired device's grant is the one its pairing committed, and the device's record is
         // where its revocation and its expiry are written. A recorded expiry is a decision the host
         // already took, and it stands whatever the clock says now.
-        let paired = self
-            .devices
+        let paired = daemon
+            .devices()
             .devices()
             .map_err(unavailable)?
             .into_iter()
@@ -146,8 +154,8 @@ impl HostGrants {
     ///
     /// A grant this host holds for itself is the owner's own authority at this machine; any other
     /// recipient is a device that reached the host over the network.
-    fn ingress(&self, grant: &Grant) -> ActorIngress {
-        if grant.recipient_device_id == self.sharing.host_device_id() {
+    fn ingress(daemon: &Controller, grant: &Grant) -> ActorIngress {
+        if grant.recipient_device_id == daemon.sharing().host_device_id() {
             ActorIngress::LocalIpc
         } else {
             ActorIngress::PairedDevice
@@ -157,57 +165,14 @@ impl HostGrants {
 
 impl AuthoritySource for HostGrants {
     fn grant(&self, grant_id: GrantId, now_ms: u64) -> kr_automation::Result<Grant> {
-        let record = self.record(grant_id)?;
-        // The bounded offline validity is about a device's access over the network, so the policy
+        let daemon = self.daemon.get()?;
+        let record = Self::record(&daemon, grant_id)?;
+        // The bounded offline validity is about a device's access over the network, so the daemon
         // is asked about the door the holder comes through.
-        let ingress = self.ingress(&record.grant);
-        let rights = {
-            let mut policy = self
-                .policy
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let decided = crate::grants::standing_at_dispatch(
-                &record,
-                &mut policy,
-                self.environment_id,
-                ingress,
-                now_ms,
-            );
-            // A decision stands on the floor in memory, so that floor is written down before the
-            // decision is used, while the lock is held, as the daemon writes every other raise of
-            // it. A decision on a floor that is not on disk is one this host could not stand on
-            // after a restart: a clock wound back before the next start would find the old floor
-            // and revive what was refused. The write stays owed until it succeeds, whoever raised
-            // the floor and however many decisions come in between, and until then nothing is
-            // dispatched. The raised floor stays in memory meanwhile, which is the stricter answer
-            // while this daemon runs.
-            let floor = policy.utc_floor_ms();
-            let mut written = self
-                .written_floor
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if *written != Some(floor) {
-                self.sharing
-                    .grants()
-                    .store_policy(&policy.snapshot())
-                    .map_err(|error| {
-                        kr_automation::AutomationError::AuthorityUnavailable(format!(
-                            "the clock floor this decision stands on could not be written down: \
-                             {error}"
-                        ))
-                    })?;
-                *written = Some(floor);
-            }
-            decided
-        }
-        .map_err(|refusal| {
-            kr_automation::AutomationError::PermissionDenied(format!(
-                "grant {grant_id}: {}",
-                refusal.detail()
-            ))
-        })?;
-        // The grant as this host's policy leaves it: an organisation lease that narrows a role
-        // narrows what the workflow may do, and the node is checked against the result.
+        let ingress = Self::ingress(&daemon, &record.grant);
+        let rights = daemon.decide_for_workflow(&record, ingress, now_ms)?;
+        // The grant as this host leaves it: a configured ceiling or an organisation lease that
+        // narrows it narrows what the workflow may do, and the node is checked against the result.
         Ok(Grant {
             actions: rights,
             ..record.grant
@@ -224,9 +189,12 @@ impl AuthoritySource for HostGrants {
     /// door, whatever rights the grant carries. The owner's own grant is served as the owner's
     /// own client is at its door.
     fn refusal(&self, grant: &Grant, action_kind: &str) -> Option<String> {
-        (self.ingress(grant) == ActorIngress::PairedDevice
-            && kr_automation::authority::writes_change_set(action_kind))
-        .then(|| {
+        // Without its daemon this host cannot tell whose grant this is, and refuses as it would a
+        // device's.
+        let paired = self.daemon.get().map_or(true, |daemon| {
+            Self::ingress(&daemon, grant) == ActorIngress::PairedDevice
+        });
+        (paired && kr_automation::authority::writes_change_set(action_kind)).then(|| {
             "this host carries out no change-set write under a paired device's grant, because \
              it cannot refuse one whose grant is withdrawn while the write prepares"
                 .to_owned()
@@ -468,13 +436,16 @@ const DISPATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2)
 
 /// The automation service, as the daemon holds it.
 ///
-/// Opening it recovers the journal and executes nothing. Execution waits for
+/// Opening it recovers the journal and executes nothing. It decides nothing either until it is
+/// bound to the daemon that owns it ([`AutomationModule::bind`]). Execution waits for
 /// [`AutomationModule::start`], which the daemon calls once its own start has passed every gate it
 /// has. From then on the module owns the task that starts the runs derived triggers ask for, which
 /// lives exactly as long as the module does.
 #[derive(Debug)]
 pub struct AutomationModule {
     service: Arc<AutomationService>,
+    /// The daemon every grant is decided under.
+    daemon: Arc<Daemon>,
     /// The runs recovery resumed, held until execution starts.
     resumed: std::sync::Mutex<Option<Vec<kr_automation::StartedRun>>>,
     /// The trigger dispatcher, once execution has started.
@@ -548,10 +519,8 @@ impl AutomationModule {
     /// Opens the environment's automation service on its own journal, and recovers it.
     ///
     /// Recovery settles what a stopped daemon left running and decides which runs resume. It
-    /// executes none of them: nothing runs until [`Self::start`].
-    ///
-    /// `policy` is the daemon's own host policy, shared rather than copied, so a grant is decided
-    /// under the policy as it stands when each node is dispatched.
+    /// executes none of them: nothing runs until [`Self::start`], and no grant is decided until
+    /// the module is bound to its daemon ([`Self::bind`]).
     ///
     /// # Errors
     ///
@@ -559,16 +528,15 @@ impl AutomationModule {
     pub async fn open(
         paths: &kr_ipc::paths::EnvironmentPaths,
         environment_id: EnvironmentId,
-        sharing: Arc<SharingService>,
-        devices: Arc<crate::service::net::devices::DeviceDirectory>,
-        policy: Arc<std::sync::Mutex<HostPolicy>>,
         changesets: Arc<ChangeSetService>,
     ) -> Result<Self> {
         // The state directory, not the runtime one: a causal budget has to survive a reboot, and
         // a runtime directory is cleared by one.
         let state_dir = paths.state_dir().to_path_buf();
-        let grants: Arc<dyn AuthoritySource> =
-            Arc::new(HostGrants::new(sharing, devices, policy, environment_id));
+        let daemon = Arc::new(Daemon::default());
+        let grants: Arc<dyn AuthoritySource> = Arc::new(HostGrants {
+            daemon: Arc::clone(&daemon),
+        });
         let host = Host {
             environment_id,
             runner: Arc::new(HostActions::new(
@@ -605,9 +573,19 @@ impl AutomationModule {
         };
         Ok(Self {
             service,
+            daemon,
             resumed: std::sync::Mutex::new(Some(resumed)),
             dispatcher: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Binds this module to the daemon that owns it.
+    ///
+    /// From here on every grant a workflow names is decided under that daemon's own model. The
+    /// daemon binds the module as it is built, before it serves anything; binding again changes
+    /// nothing.
+    pub fn bind(&self, daemon: Weak<Controller>) {
+        let _ = self.daemon.0.set(daemon);
     }
 
     /// Starts executing: the runs recovery resumed, then the runs derived triggers ask for.

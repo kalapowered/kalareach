@@ -736,18 +736,14 @@ impl Controller {
         {
             eprintln!("kr-controller: could not forget stale offline bound records: {error}");
         }
-        // The automation service reads the grant each definition names from the stores this
-        // daemon already holds (the grant store, and a paired device's own record), under this
-        // daemon's own policy, and carries out its change-set nodes through the change-set
-        // service, so it takes all of them rather than opening anything of its own beside its
-        // journal.
+        // The automation service carries out its change-set nodes through the change-set service,
+        // so it takes that rather than opening anything of its own beside its journal. The grant
+        // each definition names is read from the stores this daemon holds and decided under this
+        // daemon's own model once the daemon exists, which is where it is bound below.
         let automation = Arc::new(
             crate::automation::AutomationModule::open(
                 &setup.paths,
                 setup.environment_id,
-                Arc::clone(&sharing),
-                Arc::clone(&devices),
-                Arc::clone(&policy),
                 Arc::clone(changesets.service()),
             )
             .await?,
@@ -855,6 +851,9 @@ impl Controller {
             finalising: Mutex::new(()),
             _lock: lock,
         });
+        // Bound before anything can reach the module: from here on a workflow's grant is decided
+        // under this daemon's policy, its configured ceiling and its clock model.
+        controller.automation.bind(Arc::downgrade(&controller));
         // Reconnecting is not only verifying. A replacement daemon has to present the generation it
         // advanced to, because that is what fences the daemon it replaced.
         let directory = {
@@ -2035,6 +2034,108 @@ impl Controller {
         {
             self.write_offline_time(&policy);
         }
+    }
+
+    /// Decides whether the grant a workflow names stands for one of its dispatches, the way a
+    /// paired device's request is decided.
+    ///
+    /// The grant is narrowed to the rights this host's configuration lets a grant carry before
+    /// anything else is decided, then intersected with this host's policy
+    /// ([`crate::grants::standing_at_dispatch`]). A holder that reaches this host over the network
+    /// under a personal grant is held to the bounded offline validity on the continuous clock the
+    /// bound was anchored on as well as in UTC, so a wall clock wound back after the bound ran out
+    /// does not bring it back, and a lapse found there is written down as a device's is.
+    ///
+    /// A workflow runs unattended, so a decision is used only once the clock floor it stands on is
+    /// written down. Every decision owes that record to the one this daemon keeps, and a write that
+    /// fails leaves it owed for whichever step writes the floor next.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`kr_automation::AutomationError::PermissionDenied`] naming the rule that refused,
+    /// and [`kr_automation::AutomationError::AuthorityUnavailable`] while the floor the decision
+    /// stands on cannot be written down.
+    pub(crate) fn decide_for_workflow(
+        &self,
+        record: &crate::grants::GrantRecord,
+        ingress: kr_protocol::actor::ActorIngress,
+        now_ms: u64,
+    ) -> kr_automation::Result<CanonicalSet<kr_protocol::rights::ActionRight>> {
+        let grant_id = record.grant.grant_id;
+        let ceiling = self
+            .rights_ceiling
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        // The ceiling narrows the grant itself, as it does before a device's request is decided: a
+        // right this host's configuration removed is not one the workflow may use, whatever the
+        // grant was issued with.
+        let narrowed = ceiling.map(|ceiling| crate::grants::GrantRecord {
+            grant: kr_protocol::grant::Grant {
+                actions: record
+                    .grant
+                    .actions
+                    .iter()
+                    .copied()
+                    .filter(|right| ceiling.contains(right))
+                    .collect(),
+                ..record.grant.clone()
+            },
+            ..record.clone()
+        });
+        let record = narrowed.as_ref().unwrap_or(record);
+        let mut policy = self
+            .policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The bound a remote holder under a personal grant is held to, which is the policy's own
+        // rule for when it applies.
+        let offline = (ingress != kr_protocol::actor::ActorIngress::LocalIpc
+            && record.grant.organisation.as_ref().is_none())
+        .then(|| policy.offline_validity().copied())
+        .flatten();
+        let decided = crate::grants::standing_at_dispatch(
+            record,
+            &mut policy,
+            self.paths.environment_id(),
+            ingress,
+            now_ms,
+        );
+        let decided = match (decided, offline) {
+            (Ok(rights), Some(offline)) => {
+                let lapsed = crate::grants::Refusal::OfflineValidityLapsed {
+                    last_synchronised_at_ms: offline
+                        .last_synchronised_at_ms
+                        .as_ref()
+                        .map(|at| at.get()),
+                };
+                match self.offline_until(&offline) {
+                    // The anchor is taken with the bound, so a bound without one is one this host
+                    // cannot show to be holding.
+                    Err(net::NoAnchor) => Err(lapsed),
+                    // Run out on the clock that cannot be wound back.
+                    Ok(Some(until)) if self.clock.now() >= until => {
+                        self.write_offline_time(&policy);
+                        Err(lapsed)
+                    }
+                    Ok(_) => Ok(rights),
+                }
+            }
+            (decided, _) => decided,
+        };
+        let floor = policy.utc_floor_ms();
+        self.owe_floor(&policy);
+        if self.floor_written.load(std::sync::atomic::Ordering::SeqCst) < floor {
+            return Err(kr_automation::AutomationError::AuthorityUnavailable(
+                "the clock floor this decision stands on could not be written down".to_owned(),
+            ));
+        }
+        decided.map_err(|refusal| {
+            kr_automation::AutomationError::PermissionDenied(format!(
+                "grant {grant_id}: {}",
+                refusal.detail()
+            ))
+        })
     }
 
     /// Returns which workers have not yet acknowledged the environment's authority revision.

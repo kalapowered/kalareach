@@ -78,16 +78,6 @@ impl Host {
         self.work.path()
     }
 
-    fn destination(&self, name: &str) -> DestinationRequest {
-        DestinationRequest {
-            environment_id: self.environment_id,
-            parent: DestinationParent::Host {
-                path: self.work().display().to_string(),
-            },
-            name: name.to_owned(),
-        }
-    }
-
     /// Writes one live grant into this daemon's own grant store.
     ///
     /// A definition names a grant and the host reads it from here, so a test that installs one
@@ -391,23 +381,33 @@ async fn start(
 async fn an_automation_run_captures_a_change_set_and_the_version_names_the_run() {
     let host = host().await;
     let mut control = client(&host).await;
-    let workspace = adopted_workspace(&mut control, &host).await;
+    let workspace = adopted_workspace(&mut control, host.environment_id, host.work()).await;
     an_automation_run_captures_a_change_set_in(&mut control, &host, workspace).await;
     host.clients.abort();
 }
 
-/// Adopts a repository with an edit in it and returns the workspace over it.
-async fn adopted_workspace(control: &mut LocalClient, host: &Host) -> WorkspaceId {
-    let _source = repository(host.work(), "source");
+/// Adopts a repository with an edit in it, built under `work`, and returns the workspace over it.
+async fn adopted_workspace(
+    control: &mut LocalClient,
+    environment_id: EnvironmentId,
+    work: &Path,
+) -> WorkspaceId {
+    let _source = repository(work, "source");
 
     let adopted: ProjectAdoptResult = typed(
         &control
             .mutate(
                 Method::ProjectAdopt,
                 ActionId::new(kr_ipc::new_uuid()),
-                ActionTarget::environment(host.environment_id),
+                ActionTarget::environment(environment_id),
                 &ProjectAdoptParams {
-                    destination: host.destination("source"),
+                    destination: DestinationRequest {
+                        environment_id,
+                        parent: DestinationParent::Host {
+                            path: work.display().to_string(),
+                        },
+                        name: "source".to_owned(),
+                    },
                     label: "source".to_owned(),
                     flow: AdoptionFlow::ExistingCheckout,
                 },
@@ -421,7 +421,7 @@ async fn adopted_workspace(control: &mut LocalClient, host: &Host) -> WorkspaceI
             .mutate(
                 Method::WorkspaceCreate,
                 ActionId::new(kr_ipc::new_uuid()),
-                ActionTarget::environment(host.environment_id),
+                ActionTarget::environment(environment_id),
                 &WorkspaceCreateParams {
                     project_repository_id: adopted.project.project_repository_id,
                     label: "the user's own tree".to_owned(),
@@ -1013,7 +1013,7 @@ async fn first_run_of(
 async fn a_triggered_workflow_descends_from_the_node_that_triggered_it() {
     let host = host().await;
     let mut control = client(&host).await;
-    let workspace = adopted_workspace(&mut control, &host).await;
+    let workspace = adopted_workspace(&mut control, host.environment_id, host.work()).await;
 
     host.issue(grant_id(8), &[ActionRight::ChangesetCreate]);
     let capturing = definition(
@@ -1216,12 +1216,7 @@ async fn a_clock_floor_that_could_not_be_written_down_stays_owed_until_it_is() {
             || Ok(()),
         )
         .expect("the grant is written");
-    let grants = HostGrants::new(
-        Arc::clone(host.controller.sharing()),
-        Arc::clone(host.controller.devices()),
-        Arc::new(std::sync::Mutex::new(host.controller.policy())),
-        host.environment_id,
-    );
+    let grants = HostGrants::for_daemon(&host.controller);
     grants
         .grant(grant.grant_id, now)
         .expect("the grant stands before it expires");
@@ -1401,13 +1396,11 @@ async fn an_open_automation_module_dispatches_nothing_until_it_is_started() {
     let module = kr_controller::automation::AutomationModule::open(
         &paths,
         host.environment_id,
-        Arc::clone(host.controller.sharing()),
-        Arc::clone(host.controller.devices()),
-        Arc::new(std::sync::Mutex::new(host.controller.policy())),
         Arc::clone(host.controller.changesets().service()),
     )
     .await
     .expect("the module opens");
+    module.bind(Arc::downgrade(&host.controller));
     // Longer than the dispatcher's own interval: a module that dispatched on opening would have
     // read past the pending event by now.
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -1934,6 +1927,128 @@ async fn the_automation_group_is_served_at_every_ingress_the_registry_lists() {
     assert!(refused.message.contains("revoked"), "{refused:?}");
 
     host.stop().await;
+}
+
+/// Writes a grant carrying `rights` to a device other than this host, as a paired device's own
+/// grant is, into this daemon's grant store.
+fn issue_to_another_device(host: &Host, grant_id: GrantId, rights: &[ActionRight]) -> Grant {
+    let issuer = kr_protocol::ids::DeviceId::new(host.environment_id.get());
+    let grant = Grant {
+        grant_id,
+        parent_grant_id: Nullable::null(),
+        issuer_device_id: issuer,
+        recipient_device_id: kr_protocol::ids::DeviceId::new(Uuid::from_bytes([0x7d; 16])),
+        authority_revision: host.controller.policy().authority_revision(),
+        environment_selector: EnvironmentSelector::Any,
+        session_selector: SessionSelector::Any,
+        actions: rights.iter().copied().collect(),
+        history: HistoryScope {
+            lower_bound_ms: Nullable::null(),
+            include_live_screen: false,
+            named_questions: CanonicalSet::new(),
+            named_approvals: CanonicalSet::new(),
+        },
+        expiry: GrantExpiry::Never,
+        organisation: Nullable::null(),
+    };
+    host.controller
+        .sharing()
+        .grants()
+        .issue(
+            &GrantRecord {
+                grant: grant.clone(),
+                session_id: None,
+                issued_at_ms: 1_000,
+                activated_at_ms: Some(1_000),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
+            },
+            || Ok(()),
+        )
+        .expect("the grant is written");
+    grant
+}
+
+/// The bounded offline validity holds a workflow's grant on the continuous clock it was anchored
+/// on, as it holds a device's own request. A decision taken after the wall clock was wound back
+/// reads UTC inside the bound again, and is refused all the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workflow_grant_is_held_to_the_offline_bound_on_the_continuous_clock() {
+    use kr_automation::{AuthoritySource, AutomationError};
+    use kr_controller::automation::HostGrants;
+
+    let host = host().await;
+    let synchronised = kr_ipc::now_ms().get();
+    host.controller
+        .update_policy(|policy| {
+            policy.set_offline_validity(Some(kr_protocol::sharing::OfflineValidityPolicy {
+                maximum_offline_ms: kr_protocol::scalars::DurationMs::new(200),
+                last_synchronised_at_ms: Nullable::some(kr_protocol::scalars::TimestampMs::new(
+                    synchronised,
+                )),
+            }));
+        })
+        .expect("the owner chooses an offline bound of a fifth of a second");
+    let grant = issue_to_another_device(&host, grant_id(21), &[ActionRight::ChangesetCreate]);
+    let grants = HostGrants::for_daemon(&host.controller);
+    grants
+        .grant(grant.grant_id, synchronised)
+        .expect("inside the bound");
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // The wall clock has been wound back five seconds. With the floor this host holds, UTC is
+    // still inside the bound.
+    let refused = grants
+        .grant(grant.grant_id, synchronised - 5_000)
+        .expect_err("the bound ran out on the continuous clock");
+    assert!(
+        matches!(&refused, AutomationError::PermissionDenied(detail) if detail.contains("offline")),
+        "{refused}"
+    );
+
+    host.clients.abort();
+}
+
+/// A workflow's grant is decided as a device's request is: narrowed to the rights this host's
+/// configuration allows a grant to carry. A node that needs a right the configuration removed is
+/// refused, whatever the grant was issued with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workflow_grant_is_narrowed_by_the_configured_rights_ceiling() {
+    let host = host().await;
+    let environment = host._temp.environment();
+    let mut control = client(&host).await;
+    let workspace = adopted_workspace(&mut control, host.environment_id, host.work()).await;
+    host.issue(
+        grant_id(22),
+        &[ActionRight::ChangesetCreate, ActionRight::TerminalInput],
+    );
+    let document = definition(
+        workflow_id(22),
+        grant_id(22),
+        "a capture the configuration no longer allows",
+        capture_node(workspace),
+    );
+    install(&mut control, &host, &document).await;
+    enable(&mut control, &host, &document).await;
+
+    // The configuration allows grants terminal input and no longer the change-set right.
+    write_configuration(
+        &environment,
+        &narrowing_document(&[ActionRight::AutomationManage, ActionRight::TerminalInput]),
+    );
+    let effective = host.controller.effective_configuration().await;
+    assert!(
+        effective.not_in_force.0.is_none(),
+        "{:?}",
+        effective.not_in_force
+    );
+
+    let mut control = client(&host).await;
+    let refused = failure(start(&mut control, &host, &document, "evt-narrowed").await);
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(refused.message.contains("changeset.create"), "{refused:?}");
+
+    host.clients.abort();
 }
 
 /// KR-REQ-19.04 at the paired-device ingress: a workflow is not a way around the device's own

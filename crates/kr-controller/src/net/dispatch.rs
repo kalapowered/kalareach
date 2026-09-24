@@ -3440,12 +3440,7 @@ mod write_boundary {
                 stream.writer.add_permits(1);
             }
             let grant_id = a_paired_device(&controller);
-            let grants = crate::automation::HostGrants::new(
-                Arc::clone(controller.sharing()),
-                Arc::clone(controller.devices()),
-                Arc::clone(&controller.policy),
-                temp.environment_id(),
-            );
+            let grants = crate::automation::HostGrants::for_daemon(&controller);
             let lapses_at_ms = kr_ipc::now_ms().get() + 60 * 60 * 1000;
 
             // Another writer holds storage, so the write that decision owes waits with the lock
