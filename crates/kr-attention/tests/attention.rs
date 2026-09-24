@@ -4443,6 +4443,90 @@ fn a_store_whose_owner_has_gone_is_taken_at_once() {
     );
 }
 
+/// A controller of the previous build wrote its claim on Windows with its start in whole seconds.
+/// The next owner reads that claim as it was written, puts it to the host like any other, keeps
+/// off a store whose owner is still running, and takes one whose owner has gone; the claim it
+/// writes then names its start as the creation time.
+#[test]
+fn a_claim_the_previous_build_wrote_in_whole_seconds_is_read_and_replaced() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    let who = actor("device:phone");
+    let mut previous = Attention::open(&path, reading(0), &Claimant::new(process(1), UNKNOWN))
+        .expect("the feature store opens");
+    previous
+        .apply(&approval(1, 1_000, "req-1"), reading(0))
+        .expect("the store records the decision");
+    std::mem::forget(previous);
+    let written = ProcessStartIdentity::new(
+        4242,
+        ProcessStartSource::WindowsProcessStartSeconds,
+        1_758_700_000,
+    );
+    let connection = rusqlite::Connection::open(&path).expect("a second connection");
+    connection
+        .execute(
+            "UPDATE attention_owner
+                SET pid = 4242, start_source = 'windows_process_start_seconds',
+                    start_value = 1758700000
+              WHERE id = 0",
+            [],
+        )
+        .expect("the claim is the previous build's");
+    let this_build = |number: u64| {
+        ProcessStartIdentity::new(
+            number,
+            ProcessStartSource::WindowsProcessCreationTime,
+            17_587_000_001_234_567 + number,
+        )
+    };
+
+    let asked = std::sync::Mutex::new(Vec::new());
+    let running = |held: &ProcessStartIdentity| {
+        asked.lock().expect("the list").push(held.clone());
+        Liveness::Running
+    };
+    let refused = Attention::open(
+        &path,
+        reading(1_000),
+        &Claimant::new(this_build(2), &running),
+    );
+    assert!(
+        matches!(refused, Err(kr_attention::Error::StoreHeld { .. })),
+        "the previous owner is running, so its store is not taken: {refused:?}"
+    );
+    assert_eq!(
+        *asked.lock().expect("the list"),
+        [written],
+        "the host is asked about the claim as it was written"
+    );
+
+    let next = Attention::open(&path, reading(2_000), &Claimant::new(this_build(2), ENDED))
+        .expect("the store is taken from a previous owner that has gone");
+    assert_eq!(
+        next.inbox_as(&who, true, Content::Whole)
+            .expect("the store is this owner's")
+            .len(),
+        1,
+        "and everything the owner before it wrote down is there"
+    );
+    let claimed: (i64, String, i64) = connection
+        .query_row(
+            "SELECT pid, start_source, start_value FROM attention_owner WHERE id = 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("reads the claim");
+    assert_eq!(
+        claimed,
+        (
+            2,
+            "windows_process_creation_time".to_owned(),
+            17_587_000_001_234_569
+        )
+    );
+}
+
 #[test]
 fn a_claim_nobody_can_ask_about_stands_until_its_lease_runs_out() {
     // Where the platform will not say whether a process is alive, the claim's own lease decides.

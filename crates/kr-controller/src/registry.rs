@@ -13,7 +13,20 @@
 //!   verification is checked against.
 //! * A **tombstone** is the record of a closed session, so a reader is answered rather than being
 //!   sent to an endpoint that might start something.
+//!
+//! # Process identities in whole seconds
+//!
+//! The previous build recorded a Windows process's start in whole seconds, and a worker it started
+//! keeps running across an upgrade and keeps stating its identity that way, signed. So a record in
+//! whole seconds is still read, and every time this registry is opened each such record the kernel
+//! can settle is settled: a process still running is recorded at the resolution this build reads,
+//! and one that has gone is marked ended. A record the kernel will not describe is left as it is
+//! for the next opening. A worker row also keeps the source the worker itself states, which is how
+//! a host can tell whether any running worker still states whole seconds. All of it goes with the
+//! whole-seconds source, in the first release after one in which every running worker states the
+//! creation time.
 
+use kr_ipc::identity::CurrentProcess;
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource, WorkerProfile};
 use kr_protocol::ids::{
     ActorId, AuthorityRevision, ControllerGeneration, EnvironmentId, SessionId,
@@ -26,7 +39,7 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 use crate::error::{ControllerError, Result};
 
 /// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// How far a reservation has progressed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +165,11 @@ pub struct WorkerRecord {
 pub struct Registry {
     connection: Connection,
     environment_id: EnvironmentId,
+    /// Asks the kernel about a recorded process and names it as this build reads it.
+    ///
+    /// It settles the records the previous build made in whole seconds; a test states what the
+    /// kernel says instead.
+    current_process: fn(&ProcessStartIdentity) -> CurrentProcess,
 }
 
 impl Registry {
@@ -179,6 +197,20 @@ impl Registry {
     }
 
     fn prepare(connection: Connection, environment_id: EnvironmentId) -> Result<Self> {
+        Self::prepare_reading(
+            connection,
+            environment_id,
+            kr_ipc::identity::current_process,
+        )
+    }
+
+    /// Opens the registry as [`Self::prepare`] does, asking `current_process` about recorded
+    /// processes.
+    fn prepare_reading(
+        connection: Connection,
+        environment_id: EnvironmentId,
+        current_process: fn(&ProcessStartIdentity) -> CurrentProcess,
+    ) -> Result<Self> {
         connection
             .pragma_update(None, "journal_mode", "WAL")
             .map_err(ControllerError::registry)?;
@@ -188,8 +220,10 @@ impl Registry {
         let registry = Self {
             connection,
             environment_id,
+            current_process,
         };
         registry.migrate()?;
+        registry.settle_whole_seconds()?;
         Ok(registry)
     }
 
@@ -233,7 +267,8 @@ impl Registry {
                      endpoint         TEXT NOT NULL,
                      profile          TEXT NOT NULL,
                      state            TEXT NOT NULL,
-                     acknowledged_revision INTEGER NOT NULL DEFAULT 0
+                     acknowledged_revision INTEGER NOT NULL DEFAULT 0,
+                     stated_source    TEXT NOT NULL DEFAULT ''
                  );
                  CREATE TABLE IF NOT EXISTS tombstones (
                      session_id BLOB PRIMARY KEY,
@@ -260,8 +295,13 @@ impl Registry {
             Some(1) => {
                 self.migrate_1_to_2()?;
                 self.migrate_2_to_3()?;
+                self.migrate_3_to_4()?;
             }
-            Some(2) => self.migrate_2_to_3()?,
+            Some(2) => {
+                self.migrate_2_to_3()?;
+                self.migrate_3_to_4()?;
+            }
+            Some(3) => self.migrate_3_to_4()?,
             Some(version) => {
                 return Err(ControllerError::RegistryUnavailable {
                     detail: format!(
@@ -352,6 +392,136 @@ impl Registry {
             )
             .map_err(ControllerError::registry)?;
         Ok(())
+    }
+
+    /// Brings a version 3 registry forward.
+    ///
+    /// Version 3 recorded the process identity each worker stated and nothing beside it, so what
+    /// a worker states was what the row said. Version 4 keeps the two apart, because a worker of
+    /// the previous build states its start in whole seconds while its row is settled at the
+    /// resolution this build reads: each row comes forward stating the source it recorded.
+    ///
+    /// This migration goes when there can no longer be a version 3 registry to read, which is the
+    /// first release: nothing before it is installed anywhere it has to be read from again.
+    fn migrate_3_to_4(&self) -> Result<()> {
+        self.connection
+            .execute_batch(
+                "BEGIN;
+                 ALTER TABLE workers ADD COLUMN stated_source TEXT NOT NULL DEFAULT '';
+                 UPDATE workers SET stated_source = process_source;
+                 UPDATE schema_version SET version = 4;
+                 COMMIT;",
+            )
+            .map_err(ControllerError::registry)?;
+        Ok(())
+    }
+
+    /// Settles every record of a process in whole seconds that the kernel can settle.
+    ///
+    /// The previous build recorded a Windows process's start in whole seconds: a worker's launcher
+    /// in its reservation and the worker in its row. Each such record is put to the kernel the way
+    /// that build read it - the process holding the identifier now, if it was created in that
+    /// second - and a process that is still running is recorded at the resolution this build reads,
+    /// while one that has gone is marked ended, not rewritten. A record the kernel will not
+    /// describe is left in whole seconds, and is read the previous build's way until an opening
+    /// settles it. What a worker row says the worker states is left as it was.
+    ///
+    /// It goes with the whole-seconds source, in the first release after one in which every
+    /// running worker states the creation time.
+    fn settle_whole_seconds(&self) -> Result<()> {
+        let seconds = source_name(ProcessStartSource::WindowsProcessStartSeconds);
+        let workers: Vec<(Vec<u8>, i64, i64)> = {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT session_id, process_pid, process_start FROM workers
+                     WHERE process_source = ?1",
+                )
+                .map_err(ControllerError::registry)?;
+            let rows = statement
+                .query_map(params![seconds], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .map_err(ControllerError::registry)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(ControllerError::registry)?
+        };
+        for (session, pid, start) in workers {
+            if let Some(settled) = self.settled(&in_whole_seconds(pid, start)) {
+                self.connection
+                    .execute(
+                        "UPDATE workers SET process_source = ?2, process_start = ?3
+                         WHERE session_id = ?1 AND process_source = ?4",
+                        params![
+                            session,
+                            source_name(settled.source),
+                            start_column(settled.start_value.get()),
+                            seconds
+                        ],
+                    )
+                    .map_err(ControllerError::registry)?;
+            }
+        }
+        let launches: Vec<(Vec<u8>, i64, i64)> = {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT reservation_id, launcher_pid, launcher_start FROM reservations
+                     WHERE launcher_source = ?1
+                       AND launcher_pid IS NOT NULL AND launcher_start IS NOT NULL",
+                )
+                .map_err(ControllerError::registry)?;
+            let rows = statement
+                .query_map(params![seconds], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .map_err(ControllerError::registry)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(ControllerError::registry)?
+        };
+        for (reservation, pid, start) in launches {
+            if let Some(settled) = self.settled(&in_whole_seconds(pid, start)) {
+                self.connection
+                    .execute(
+                        "UPDATE reservations SET launcher_source = ?2, launcher_start = ?3
+                         WHERE reservation_id = ?1 AND launcher_source = ?4",
+                        params![
+                            reservation,
+                            source_name(settled.source),
+                            start_column(settled.start_value.get()),
+                            seconds
+                        ],
+                    )
+                    .map_err(ControllerError::registry)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// What a record of a process in whole seconds becomes, when the kernel says what it is: the
+    /// process at the resolution this build reads when it is still running, the ended marker when
+    /// it has gone, and nothing when the kernel will not say.
+    fn settled(&self, recorded: &ProcessStartIdentity) -> Option<ProcessStartIdentity> {
+        match (self.current_process)(recorded) {
+            CurrentProcess::Running(current) => Some(current),
+            CurrentProcess::Ended => u32::try_from(recorded.pid.get())
+                .ok()
+                .map(kr_ipc::identity::ended_process_identity),
+            CurrentProcess::Unknown { .. } => None,
+        }
+    }
+
+    /// Returns the identity this registry records for a process a worker states.
+    ///
+    /// The identity itself, unless it is in whole seconds and the kernel can settle it: a worker of
+    /// the previous build states that, and its row is kept at the resolution this build reads.
+    fn to_record(&self, stated: &ProcessStartIdentity) -> ProcessStartIdentity {
+        if stated.source == ProcessStartSource::WindowsProcessStartSeconds
+            && let Some(settled) = self.settled(stated)
+        {
+            return settled;
+        }
+        stated.clone()
     }
 
     /// Returns the environment this registry belongs to.
@@ -772,7 +942,7 @@ impl Registry {
                     reservation_id.get().as_bytes().as_slice(),
                     i64::try_from(identity.pid.get()).unwrap_or(i64::MAX),
                     source_name(identity.source),
-                    i64::try_from(identity.start_value.get()).unwrap_or(i64::MAX),
+                    start_column(identity.start_value.get()),
                 ],
             )
             .map_err(ControllerError::registry)?;
@@ -1024,6 +1194,7 @@ impl Registry {
         reservation_id: ReservationId,
         worker: &WorkerRecord,
     ) -> Result<()> {
+        let recorded = self.to_record(&worker.process_identity);
         let transaction = self
             .connection
             .transaction()
@@ -1031,25 +1202,27 @@ impl Registry {
         transaction
             .execute(
                 "INSERT INTO workers (session_id, display_number, public_key, process_pid,
-                     process_source, process_start, endpoint, profile, state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     process_source, process_start, endpoint, profile, state, stated_source)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT (session_id) DO UPDATE SET
                      public_key = excluded.public_key,
                      process_pid = excluded.process_pid,
                      process_source = excluded.process_source,
                      process_start = excluded.process_start,
                      endpoint = excluded.endpoint,
-                     state = excluded.state",
+                     state = excluded.state,
+                     stated_source = excluded.stated_source",
                 params![
                     worker.session_id.get().as_bytes().as_slice(),
                     i64::try_from(worker.display_number.get()).unwrap_or(i64::MAX),
                     worker.public_key.as_bytes().as_slice(),
-                    i64::try_from(worker.process_identity.pid.get()).unwrap_or(i64::MAX),
-                    source_name(worker.process_identity.source),
-                    i64::try_from(worker.process_identity.start_value.get()).unwrap_or(i64::MAX),
+                    i64::try_from(recorded.pid.get()).unwrap_or(i64::MAX),
+                    source_name(recorded.source),
+                    start_column(recorded.start_value.get()),
                     worker.endpoint,
                     worker.profile.as_str(),
                     worker.state.as_str(),
+                    source_name(worker.process_identity.source),
                 ],
             )
             .map_err(ControllerError::registry)?;
@@ -1084,28 +1257,31 @@ impl Registry {
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the write fails.
     pub fn adopt_worker(&mut self, worker: &WorkerRecord) -> Result<()> {
+        let recorded = self.to_record(&worker.process_identity);
         self.connection
             .execute(
                 "INSERT INTO workers (session_id, display_number, public_key, process_pid,
-                     process_source, process_start, endpoint, profile, state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     process_source, process_start, endpoint, profile, state, stated_source)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT (session_id) DO UPDATE SET
                      public_key = excluded.public_key,
                      process_pid = excluded.process_pid,
                      process_source = excluded.process_source,
                      process_start = excluded.process_start,
                      endpoint = excluded.endpoint,
-                     state = excluded.state",
+                     state = excluded.state,
+                     stated_source = excluded.stated_source",
                 params![
                     worker.session_id.get().as_bytes().as_slice(),
                     i64::try_from(worker.display_number.get()).unwrap_or(i64::MAX),
                     worker.public_key.as_bytes().as_slice(),
-                    i64::try_from(worker.process_identity.pid.get()).unwrap_or(i64::MAX),
-                    source_name(worker.process_identity.source),
-                    i64::try_from(worker.process_identity.start_value.get()).unwrap_or(i64::MAX),
+                    i64::try_from(recorded.pid.get()).unwrap_or(i64::MAX),
+                    source_name(recorded.source),
+                    start_column(recorded.start_value.get()),
                     worker.endpoint,
                     worker.profile.as_str(),
                     worker.state.as_str(),
+                    source_name(worker.process_identity.source),
                 ],
             )
             .map_err(ControllerError::registry)?;
@@ -1153,9 +1329,7 @@ impl Registry {
                 process_identity: ProcessStartIdentity {
                     pid: kr_protocol::scalars::U64::new(u64::try_from(pid).unwrap_or_default()),
                     source: source_from(&source)?,
-                    start_value: kr_protocol::scalars::U64::new(
-                        u64::try_from(start).unwrap_or_default(),
-                    ),
+                    start_value: kr_protocol::scalars::U64::new(start_from_column(start)),
                 },
                 endpoint,
                 profile: profile_from(&profile)?,
@@ -1266,9 +1440,7 @@ impl RawReservation {
                 (Some(pid), Some(source), Some(start)) => Some(ProcessStartIdentity {
                     pid: kr_protocol::scalars::U64::new(u64::try_from(pid).unwrap_or_default()),
                     source: source_from(&source)?,
-                    start_value: kr_protocol::scalars::U64::new(
-                        u64::try_from(start).unwrap_or_default(),
-                    ),
+                    start_value: kr_protocol::scalars::U64::new(start_from_column(start)),
                 }),
                 _ => None,
             },
@@ -1313,6 +1485,34 @@ fn source_from(text: &str) -> Result<ProcessStartSource> {
     }
 }
 
+/// Returns a start value as a column stores it.
+///
+/// A column holds a signed integer, and no platform's start value comes near the top of that range:
+/// the one value above it is the marker of a process that had ended before anything read it, which
+/// is stored as the largest value the column holds and read back by [`start_from_column`] as the
+/// marker.
+fn start_column(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+/// Reads back what [`start_column`] wrote.
+fn start_from_column(value: i64) -> u64 {
+    if value == i64::MAX {
+        kr_ipc::identity::START_VALUE_UNREAD
+    } else {
+        u64::try_from(value).unwrap_or_default()
+    }
+}
+
+/// A record the previous build made of a Windows process: its creation time in whole seconds.
+fn in_whole_seconds(pid: i64, start: i64) -> ProcessStartIdentity {
+    ProcessStartIdentity::new(
+        u64::try_from(pid).unwrap_or_default(),
+        ProcessStartSource::WindowsProcessStartSeconds,
+        start_from_column(start),
+    )
+}
+
 fn profile_from(text: &str) -> Result<WorkerProfile> {
     match text {
         "desktop_bound" => Ok(WorkerProfile::DesktopBound),
@@ -1347,4 +1547,359 @@ fn key_from(bytes: &[u8]) -> Result<AuthorisationKey> {
     <[u8; 32]>::try_from(bytes)
         .map(AuthorisationKey::from_bytes)
         .map_err(|_| ControllerError::registry("a stored public key is not 32 bytes"))
+}
+
+#[cfg(test)]
+mod tests {
+    use kr_ipc::identity::START_VALUE_UNREAD;
+    use kr_protocol::scalars::U64;
+
+    use super::*;
+
+    fn environment() -> EnvironmentId {
+        EnvironmentId::new(Uuid::from_bytes([7; 16]))
+    }
+
+    /// Hundreds of nanoseconds in one second.
+    const PER_SECOND: u64 = 10_000_000;
+
+    /// A second of September 2025, as the previous build recorded a Windows start.
+    const SECOND: u64 = 1_758_700_000;
+
+    /// What the kernel says about each process these tests recorded in whole seconds.
+    ///
+    /// 1001 and 1005 are running, created a moment into that second; 1002 has gone; the kernel will
+    /// not describe 1003. Any other process is not one a test recorded in whole seconds, and asking
+    /// about it fails the test.
+    fn kernel(recorded: &ProcessStartIdentity) -> CurrentProcess {
+        assert_eq!(
+            recorded.source,
+            ProcessStartSource::WindowsProcessStartSeconds,
+            "only a record in whole seconds is put to the kernel"
+        );
+        match recorded.pid.get() {
+            pid @ (1001 | 1005) => CurrentProcess::Running(finer(pid)),
+            1002 => CurrentProcess::Ended,
+            1003 => CurrentProcess::Unknown {
+                detail: "Access is denied.".to_owned(),
+            },
+            other => panic!("process {other} was never recorded in whole seconds"),
+        }
+    }
+
+    /// The same kernel once process 1003 can be described, and is running.
+    fn kernel_later(recorded: &ProcessStartIdentity) -> CurrentProcess {
+        match recorded.pid.get() {
+            1003 => CurrentProcess::Running(finer(1003)),
+            _ => kernel(recorded),
+        }
+    }
+
+    /// A process created a moment into [`SECOND`], at the resolution this build reads.
+    fn finer(pid: u64) -> ProcessStartIdentity {
+        ProcessStartIdentity::new(
+            pid,
+            ProcessStartSource::WindowsProcessCreationTime,
+            SECOND * PER_SECOND + 1_234_567,
+        )
+    }
+
+    fn in_seconds(pid: u64) -> ProcessStartIdentity {
+        ProcessStartIdentity::new(pid, ProcessStartSource::WindowsProcessStartSeconds, SECOND)
+    }
+
+    fn session(byte: u8) -> SessionId {
+        SessionId::new(Uuid::from_bytes([byte; 16]))
+    }
+
+    /// Writes a registry the way the previous build left it: schema version 3, with a worker and
+    /// its reservation for each of `workers`, and a spawned reservation with no worker yet for
+    /// each of `launches`, every process recorded as given.
+    fn previous_build_registry(
+        path: &std::path::Path,
+        workers: &[(u8, ProcessStartIdentity)],
+        launches: &[(u8, ProcessStartIdentity)],
+    ) {
+        let connection = Connection::open(path).expect("opens");
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version (version) VALUES (3);
+                 CREATE TABLE environment (
+                     environment_id      BLOB PRIMARY KEY,
+                     generation          INTEGER NOT NULL,
+                     next_display        INTEGER NOT NULL,
+                     session_limit       INTEGER NOT NULL,
+                     authority_revision  INTEGER NOT NULL DEFAULT 0,
+                     fence_owed_revision INTEGER NOT NULL DEFAULT 0,
+                     accepted_revision   INTEGER NOT NULL DEFAULT 0,
+                     accepted_document   TEXT
+                 );
+                 CREATE TABLE reservations (
+                     reservation_id    BLOB PRIMARY KEY,
+                     actor_id          TEXT NOT NULL,
+                     create_token      BLOB NOT NULL,
+                     payload_digest    BLOB NOT NULL,
+                     create_intent     BLOB,
+                     session_id        BLOB NOT NULL UNIQUE,
+                     display_number    INTEGER NOT NULL UNIQUE,
+                     phase             TEXT NOT NULL,
+                     launcher_pid      INTEGER,
+                     launcher_source   TEXT,
+                     launcher_start    INTEGER,
+                     claimed_key       BLOB,
+                     created_at_ms     INTEGER NOT NULL,
+                     UNIQUE (actor_id, create_token)
+                 );
+                 CREATE TABLE workers (
+                     session_id       BLOB PRIMARY KEY,
+                     display_number   INTEGER NOT NULL,
+                     public_key       BLOB NOT NULL,
+                     process_pid      INTEGER NOT NULL,
+                     process_source   TEXT NOT NULL,
+                     process_start    INTEGER NOT NULL,
+                     endpoint         TEXT NOT NULL,
+                     profile          TEXT NOT NULL,
+                     state            TEXT NOT NULL,
+                     acknowledged_revision INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE tombstones (
+                     session_id BLOB PRIMARY KEY,
+                     record     BLOB NOT NULL,
+                     closed_at_ms INTEGER NOT NULL
+                 );",
+            )
+            .expect("creates the previous schema");
+        let reserve = |byte: u8, phase: &str, process: &ProcessStartIdentity| {
+            connection
+                .execute(
+                    "INSERT INTO reservations (reservation_id, actor_id, create_token,
+                         payload_digest, session_id, display_number, phase, launcher_pid,
+                         launcher_source, launcher_start, created_at_ms)
+                     VALUES (?1, 'local:501', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 100)",
+                    params![
+                        vec![byte; 16],
+                        vec![byte.wrapping_add(100); 16],
+                        vec![3_u8; 32],
+                        session(byte).get().as_bytes().as_slice(),
+                        i64::from(byte),
+                        phase,
+                        i64::try_from(process.pid.get()).expect("a small identifier"),
+                        source_name(process.source),
+                        i64::try_from(process.start_value.get()).expect("a small start value"),
+                    ],
+                )
+                .expect("records a reservation the previous build made");
+        };
+        for (byte, process) in workers {
+            reserve(*byte, "live", process);
+            connection
+                .execute(
+                    "INSERT INTO workers (session_id, display_number, public_key, process_pid,
+                         process_source, process_start, endpoint, profile, state)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'worker', 'headless_user', 'live')",
+                    params![
+                        session(*byte).get().as_bytes().as_slice(),
+                        i64::from(*byte),
+                        vec![*byte; 32],
+                        i64::try_from(process.pid.get()).expect("a small identifier"),
+                        source_name(process.source),
+                        i64::try_from(process.start_value.get()).expect("a small start value"),
+                    ],
+                )
+                .expect("records a worker the previous build started");
+        }
+        for (byte, process) in launches {
+            reserve(*byte, "spawned", process);
+        }
+    }
+
+    fn opened(
+        path: &std::path::Path,
+        kernel: fn(&ProcessStartIdentity) -> CurrentProcess,
+    ) -> Registry {
+        Registry::prepare_reading(
+            Connection::open(path).expect("opens"),
+            environment(),
+            kernel,
+        )
+        .expect("brings the registry forward")
+    }
+
+    fn worker(registry: &Registry, byte: u8) -> ProcessStartIdentity {
+        registry
+            .workers()
+            .expect("reads the workers")
+            .into_iter()
+            .find(|worker| worker.session_id == session(byte))
+            .expect("the worker is recorded")
+            .process_identity
+    }
+
+    fn stated(registry: &Registry, byte: u8) -> String {
+        registry
+            .connection
+            .query_row(
+                "SELECT stated_source FROM workers WHERE session_id = ?1",
+                params![session(byte).get().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("reads what the worker states")
+    }
+
+    fn launcher(registry: &Registry, byte: u8) -> ProcessStartIdentity {
+        registry
+            .reservation_for_session(session(byte))
+            .expect("reads the reservation")
+            .expect("the reservation is recorded")
+            .launcher_identity
+            .expect("the launcher is recorded")
+    }
+
+    #[test]
+    fn records_the_previous_build_made_in_whole_seconds_are_settled_where_the_kernel_can_say() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        let elsewhere = ProcessStartIdentity::new(1004, ProcessStartSource::MacosProcBsdInfo, 9);
+        previous_build_registry(
+            &path,
+            &[
+                (1, in_seconds(1001)),
+                (2, in_seconds(1002)),
+                (3, in_seconds(1003)),
+                (4, elsewhere.clone()),
+            ],
+            &[(5, in_seconds(1005))],
+        );
+
+        let registry = opened(&path, kernel);
+        let version: i64 = registry
+            .connection
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .expect("reads the version");
+        assert_eq!(version, SCHEMA_VERSION);
+        // Running: recorded at the resolution this build reads, the worker and its launcher alike.
+        assert_eq!(worker(&registry, 1), finer(1001));
+        assert_eq!(launcher(&registry, 1), finer(1001));
+        assert_eq!(launcher(&registry, 5), finer(1005));
+        // Gone: marked ended, not rewritten, and read as ended without asking the kernel about
+        // whatever holds the identifier now.
+        for ended in [worker(&registry, 2), launcher(&registry, 2)] {
+            assert_eq!(ended.pid.get(), 1002);
+            assert_eq!(ended.start_value.get(), START_VALUE_UNREAD);
+            assert_eq!(
+                kr_ipc::identity::process_state(&ended),
+                kr_ipc::identity::ProcessState::Ended
+            );
+        }
+        // Not described: left as the previous build recorded it, for the next opening.
+        assert_eq!(worker(&registry, 3), in_seconds(1003));
+        assert_eq!(launcher(&registry, 3), in_seconds(1003));
+        // Never in whole seconds: never put to the kernel, and left alone.
+        assert_eq!(worker(&registry, 4), elsewhere);
+        // What each worker states is what the previous build recorded for it.
+        for byte in 1..=3 {
+            assert_eq!(stated(&registry, byte), "windows_process_start_seconds");
+        }
+        assert_eq!(stated(&registry, 4), "macos_proc_bsd_info");
+        drop(registry);
+
+        // The next opening asks again about the one record the kernel would not describe, and
+        // about nothing else.
+        let registry = opened(&path, kernel_later);
+        assert_eq!(worker(&registry, 3), finer(1003));
+        assert_eq!(launcher(&registry, 3), finer(1003));
+        assert_eq!(worker(&registry, 1), finer(1001));
+        assert_eq!(stated(&registry, 3), "windows_process_start_seconds");
+    }
+
+    #[test]
+    fn a_worker_that_states_whole_seconds_again_keeps_the_finer_record_and_what_it_states() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        previous_build_registry(&path, &[(1, in_seconds(1001))], &[]);
+        let mut registry = opened(&path, kernel);
+        let record = WorkerRecord {
+            session_id: session(1),
+            display_number: DisplayNumber::new(1),
+            public_key: AuthorisationKey::from_bytes([1; 32]),
+            process_identity: in_seconds(1001),
+            endpoint: "worker".to_owned(),
+            profile: WorkerProfile::HeadlessUser,
+            state: SessionState::Live,
+            acknowledged_revision: AuthorityRevision::new(0),
+        };
+        // A controller adopts a worker from its own signed answer, which states whole seconds.
+        registry.adopt_worker(&record).expect("adopts");
+        assert_eq!(worker(&registry, 1), finer(1001));
+        assert_eq!(stated(&registry, 1), "windows_process_start_seconds");
+        // One this build started states the creation time, which is recorded as it is.
+        let current = WorkerRecord {
+            session_id: session(9),
+            display_number: DisplayNumber::new(9),
+            process_identity: finer(1009),
+            ..record
+        };
+        registry.adopt_worker(&current).expect("adopts");
+        assert_eq!(worker(&registry, 9), finer(1009));
+        assert_eq!(stated(&registry, 9), "windows_process_creation_time");
+    }
+
+    #[test]
+    fn a_launcher_that_ended_unread_is_read_back_as_ended() {
+        let mut registry = Registry::in_memory(environment()).expect("a registry");
+        let reservation = registry
+            .reserve(
+                &ActorId::new("local:501").expect("a principal"),
+                Uuid::from_bytes([2; 16]),
+                Digest256::from_bytes([3; 32]),
+                b"intent",
+                TimestampMs::new(1),
+            )
+            .expect("reserves")
+            .reservation;
+        let ended = kr_ipc::identity::ended_process_identity(4242);
+        registry
+            .record_launch(reservation.reservation_id, &ended)
+            .expect("records the launcher");
+        let read = registry
+            .reservation(reservation.reservation_id)
+            .expect("reads")
+            .expect("the reservation")
+            .launcher_identity
+            .expect("the launcher");
+        assert_eq!(read, ended, "the ended marker survives the column");
+        assert_eq!(read.start_value, U64::new(START_VALUE_UNREAD));
+    }
+
+    /// A worker of the previous build still running after an upgrade: this process stands in for
+    /// it, recorded in whole seconds as that build recorded it, beside a record of the same
+    /// identifier created in another second.
+    #[cfg(windows)]
+    #[test]
+    fn this_process_recorded_in_whole_seconds_is_settled_at_its_creation_time() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        let current =
+            kr_ipc::identity::current_process_start_identity().expect("this process's identity");
+        let seconds = ProcessStartIdentity::new(
+            current.pid.get(),
+            ProcessStartSource::WindowsProcessStartSeconds,
+            current.start_value.get() / PER_SECOND,
+        );
+        let mut another_second = seconds.clone();
+        another_second.start_value = U64::new(seconds.start_value.get() - 1);
+        previous_build_registry(&path, &[(1, seconds), (2, another_second)], &[]);
+
+        let registry = Registry::open(&path, environment()).expect("brings the registry forward");
+        assert_eq!(worker(&registry, 1), current);
+        assert_eq!(launcher(&registry, 1), current);
+        assert_eq!(stated(&registry, 1), "windows_process_start_seconds");
+        let ended = worker(&registry, 2);
+        assert_eq!(ended.start_value.get(), START_VALUE_UNREAD);
+        assert_eq!(
+            kr_ipc::identity::process_state(&ended),
+            kr_ipc::identity::ProcessState::Ended
+        );
+    }
 }

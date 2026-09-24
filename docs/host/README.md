@@ -498,8 +498,11 @@ Windows records a creation time in hundreds of nanoseconds, and the start value 
 processes created under one identifier within one second are two start identities. A worker of the
 previous release states its start in whole seconds, and so do the records it and its controller
 wrote. Such an identity names the process that holds the identifier now if that process was created
-in the same second, which is how that release read it. Whole seconds are read until the first
-release after one in which every running worker states the finer value.
+in the same second, which is how that release read it. Each time the controller opens its
+registry, a record in whole seconds whose process is still running is rewritten at the finer value,
+one whose process has gone is marked ended, and one the kernel will not describe is left for the
+next opening; each worker's row keeps the source the worker itself states. Whole seconds are read
+until the first release after one in which every running worker states the finer value.
 
 ### Where the daemon keeps its keys
 
