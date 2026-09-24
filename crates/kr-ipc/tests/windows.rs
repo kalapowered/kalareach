@@ -353,8 +353,11 @@ async fn the_owner_arriving_over_the_network_is_refused() {
     let refused = tokio::task::spawn_blocking(move || over_the_network(name))
         .await
         .expect("the open finishes");
-    assert!(
-        refused.is_err(),
+    // An access denial, and not a name that was not found or a pipe that was busy: those would
+    // say nothing about whether the pipe refuses a network caller.
+    assert_eq!(
+        refused.err().map(|error| error.kind()),
+        Some(std::io::ErrorKind::PermissionDenied),
         "the worker's pipe refuses a caller that arrives over the network"
     );
 }
