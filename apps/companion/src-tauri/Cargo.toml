@@ -76,6 +76,8 @@ custom-protocol = ["tauri/custom-protocol"]
 
 [dev-dependencies]
 tempfile.workspace = true
+# Paused time, so the phone session's waits run in a test without taking that long.
+tokio = { workspace = true, features = ["test-util"] }
 # The mock runtime, so a test can call a command the way the page does: through the invoke path.
 tauri = { workspace = true, features = ["test"] }
 
