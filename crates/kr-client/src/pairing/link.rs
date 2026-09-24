@@ -23,7 +23,7 @@ use std::sync::Arc;
 use iroh::Endpoint;
 use iroh::endpoint::Connection;
 use kr_crypto::keys::TransportIdentityKeyPair;
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::ProtocolError;
 use kr_protocol::hello::{ALPN, HostSelection};
 use kr_protocol::method::Method;
 use kr_protocol::pairing::{NetworkConfig, PairFinishRequest};
@@ -58,36 +58,19 @@ pub enum LinkError {
 impl From<kr_transport::TransportError> for LinkError {
     /// Says what a transport failure is for the pairing flows.
     ///
-    /// The transport reports a host's own refusal as a handshake error, and it reports some of its
-    /// own conclusions the same way: a response stream that ended without an answer, or an answer
-    /// to another request. Those say nothing about what the host decided, and treating one as a
-    /// refusal would end an attempt the host may have accepted. So only the codes a host refuses
-    /// a pairing step with are a refusal; everything else is a connection lost.
+    /// Only an error the host sent is a refusal, whatever its code. The transport keeps it apart
+    /// from what it concluded itself, such as a response stream that ended without an answer or an
+    /// answer to another request; those say nothing about what the host decided, and treating one
+    /// as a refusal would end an attempt the host may have accepted, so they are a connection lost.
     fn from(error: kr_transport::TransportError) -> Self {
         match error {
-            kr_transport::TransportError::Handshake(refusal) if is_host_refusal(refusal.code) => {
-                Self::Refused(refusal)
-            }
+            kr_transport::TransportError::Refused(refusal) => Self::Refused(refusal),
             kr_transport::TransportError::Configuration { .. } => {
                 Self::Configuration(error.to_string())
             }
             other => Self::Lost(other.to_string()),
         }
     }
-}
-
-/// True for the codes a host refuses a pairing step or an unpaired offer with.
-const fn is_host_refusal(code: ErrorCode) -> bool {
-    matches!(
-        code,
-        ErrorCode::PairingAuthFailed
-            | ErrorCode::PairingExpired
-            | ErrorCode::PairingAttemptsExhausted
-            | ErrorCode::PairingRejected
-            | ErrorCode::PermissionDenied
-            | ErrorCode::OwnerConfirmationRequired
-            | ErrorCode::UnsupportedSchema
-    )
 }
 
 /// The bounded pre-authorisation surface of a host this device is pairing with.
@@ -637,32 +620,34 @@ mod tests {
         pool.close().await;
     }
 
-    /// A host's own refusal is a refusal; the transport's own conclusions, such as a response
-    /// stream that ended without an answer, are a connection lost.
+    /// An error the host sent is a refusal whatever its code, and what the transport concluded
+    /// itself is a connection lost whatever its code: the variant says where an error came from,
+    /// and the code does not.
     #[test]
-    fn only_a_hosts_own_refusal_is_a_refusal() {
+    fn only_an_error_the_host_sent_is_a_refusal() {
+        use kr_protocol::error::ErrorCode;
         for code in [
             ErrorCode::PairingAuthFailed,
-            ErrorCode::PairingExpired,
-            ErrorCode::PairingRejected,
-            ErrorCode::PermissionDenied,
+            ErrorCode::RateLimited,
+            ErrorCode::InvalidArgument,
+            ErrorCode::ResourceUnavailable,
         ] {
-            assert!(matches!(
-                LinkError::from(kr_transport::TransportError::handshake(code, "refused")),
-                LinkError::Refused(_)
-            ));
-        }
-        for (code, detail) in [
-            (ErrorCode::ResourceUnavailable, "the host answered nothing"),
-            (
-                ErrorCode::InvalidArgument,
-                "the host answered another request",
-            ),
-        ] {
-            assert!(matches!(
-                LinkError::from(kr_transport::TransportError::handshake(code, detail)),
-                LinkError::Lost(_)
-            ));
+            assert!(
+                matches!(
+                    LinkError::from(kr_transport::TransportError::Refused(ProtocolError::new(
+                        code, "sent"
+                    ))),
+                    LinkError::Refused(_)
+                ),
+                "{code:?}"
+            );
+            assert!(
+                matches!(
+                    LinkError::from(kr_transport::TransportError::handshake(code, "concluded")),
+                    LinkError::Lost(_)
+                ),
+                "{code:?}"
+            );
         }
     }
 }
