@@ -2612,10 +2612,11 @@ const EXIT_ALLOWANCE: Duration = Duration::from_secs(2);
 /// cannot place shows nothing either way, and the watch's own liveness bound still fails a worker
 /// that never ends.
 ///
-/// The bound itself is checked exactly in the worker's own closure tests
-/// (`crates/kr-worker/tests/closure.rs`). They start the same wait the worker makes before it
-/// exits, so they know when it began, and they measure it from there. This test keeps what only a
-/// real worker process shows: that it waits, and that it ends.
+/// The bound itself is measured in the worker's own closure tests
+/// (`crates/kr-worker/tests/closure.rs`, Unix only). They start the same wait the worker makes
+/// before it exits, so they know when it began: it holds for the whole bound, and it ends when a
+/// timer set to that bound from the same moment fires. This test keeps what only a real worker
+/// process shows: that it waits, and that it ends.
 const EXIT_LIMIT: Duration = Duration::from_secs(10);
 
 /// How closely the readings of `kr status` have to place the moment the session became closed for

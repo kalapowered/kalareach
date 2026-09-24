@@ -390,6 +390,13 @@ const SEND_BUFFER: usize = 4 * 1024;
 #[cfg(unix)]
 const BATCH_BYTES: usize = 200 * 1024;
 
+/// How far apart two timers set to the same moment may end.
+///
+/// Their deadlines are microseconds apart and they wake the same task, so this is a little more
+/// than the timer's own tick and a scheduling moment.
+#[cfg(unix)]
+const TIMER_SLACK: Duration = Duration::from_millis(250);
+
 /// Gives the session `bytes` as its terminal would, and settles the screen as a quiet terminal
 /// does: the two steps the worker takes with a batch its read loop hands over.
 #[cfg(unix)]
@@ -423,7 +430,9 @@ async fn close(host: &Host) -> ClosureRecord {
 /// The transport each client holds is one this test sets, and each client stops part way through a
 /// frame far larger than it, so the notice queued behind that frame cannot be written until the
 /// client reads, on any platform. The wait is the one a worker makes before it exits, started
-/// here, so what is measured is its bound from its own beginning.
+/// here beside a timer set to the same bound from the same moment. So its start is known: it may
+/// not end before its bound, and it has to end when that timer fires, however busy the machine is,
+/// because the two wake together.
 ///
 /// Unix only, because the transport this sets is a Unix socket's buffer.
 #[cfg(unix)]
@@ -445,13 +454,20 @@ async fn a_client_that_stopped_reading_holds_the_worker_only_until_the_bound() {
     let record = close(&host).await;
 
     let started = tokio::time::Instant::now();
-    let delivered = tokio::time::timeout(
-        LIVENESS_DEADLINE,
-        host.runtime.closure_delivered(CLOSURE_NOTICE_TIMEOUT),
-    )
+    let ((delivered, waited), timed) = tokio::time::timeout(LIVENESS_DEADLINE, async {
+        tokio::join!(
+            async {
+                let delivered = host.runtime.closure_delivered(CLOSURE_NOTICE_TIMEOUT).await;
+                (delivered, started.elapsed())
+            },
+            async {
+                tokio::time::sleep_until(started + CLOSURE_NOTICE_TIMEOUT).await;
+                started.elapsed()
+            },
+        )
+    })
     .await
     .unwrap_or_else(|_| panic!("the wait was still going {LIVENESS_DEADLINE:?} after it began"));
-    let waited = started.elapsed();
     assert!(
         !delivered,
         "neither client that is not reading has been sent its notice"
@@ -460,11 +476,12 @@ async fn a_client_that_stopped_reading_holds_the_worker_only_until_the_bound() {
         waited >= CLOSURE_NOTICE_TIMEOUT,
         "the wait held for its bound of {CLOSURE_NOTICE_TIMEOUT:?}, and it ended after {waited:?}"
     );
-    // A timer's task runs a moment after the timer fires, and a busy machine makes that moment
-    // longer. A wait that went on for the clients would still be going, because neither reads.
+    // Both deadlines fall within a moment of each other and wake the one task that waits for both,
+    // so they end together whatever the machine is doing: a wait longer than its bound ends later.
     assert!(
-        waited < CLOSURE_NOTICE_TIMEOUT * 2,
-        "the wait ended at its bound of {CLOSURE_NOTICE_TIMEOUT:?}, not {waited:?}"
+        waited.abs_diff(timed) < TIMER_SLACK,
+        "the wait ended when a timer set to its bound of {CLOSURE_NOTICE_TIMEOUT:?} fired: it \
+         ended after {waited:?}, and the timer after {timed:?}"
     );
 
     let (output, sent) = until_the_closure(&mut resuming).await;
