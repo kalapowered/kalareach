@@ -1,6 +1,6 @@
 {
   "name": "@kalareach/plugin-sdk",
-  "version": "0.20.1",
+  "version": "0.21.0",
   "description": "KalaReach plugin package contract: manifest types, the package-contract table, the WIT package and the validating loader",
   "license": "BSD-3-Clause",
   "type": "module",
