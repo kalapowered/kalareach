@@ -698,14 +698,38 @@ fn an_ended_agents_record_hides_no_live_agent_that_holds_its_identifier() {
     }
 }
 
+/// An agent a test started in a job of its own, ended with everything in that job when the test
+/// ends, however it ends.
+///
+/// It exists from the moment the agent starts, before anything that can fail is read about the
+/// agent, so a reading that fails ends the agent and what it started rather than leaving them to
+/// run out their wait.
+#[cfg(windows)]
+struct Running {
+    agent: std::process::Child,
+    job: Arc<kr_worker::windows::job::AgentJob>,
+    /// The agent as the job registry keeps it, once it is kept there.
+    kept: Option<ProcessStartIdentity>,
+}
+
+#[cfg(windows)]
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.job.terminate(1);
+        let _ = self.agent.wait();
+        if let Some(kept) = self.kept.take() {
+            kr_worker::windows::job::release_agent(&kept);
+        }
+    }
+}
+
 /// An agent and the helper it started, as the broker's launch starts one on Windows: in a job of
 /// its own, joined before it ran, kept for the broker. The agent is `cmd.exe` and the helper the
 /// `ping` it runs, which waits far longer than the test takes; both end with the test.
 #[cfg(windows)]
 struct Started {
-    agent: std::process::Child,
+    running: Running,
     identity: ProcessStartIdentity,
-    job: Arc<kr_worker::windows::job::AgentJob>,
     helper: ProcessStartIdentity,
 }
 
@@ -713,22 +737,28 @@ struct Started {
 impl Started {
     fn new() -> Self {
         let job = Arc::new(kr_worker::windows::job::AgentJob::create().expect("a job"));
-        let agent = job
-            .start(
-                std::process::Command::new("cmd.exe")
-                    .args(["/d", "/c", "ping -n 600 127.0.0.1 > NUL"])
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null()),
-            )
-            .expect("the agent starts");
+        let mut running = Running {
+            agent: job
+                .start(
+                    std::process::Command::new("cmd.exe")
+                        .args(["/d", "/c", "ping -n 600 127.0.0.1 > NUL"])
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null()),
+                )
+                .expect("the agent starts"),
+            job: Arc::clone(&job),
+            kept: None,
+        };
+        let agent = running.agent.id();
         let identity =
-            kr_ipc::identity::started_process_identity(agent.id()).expect("the agent's identity");
+            kr_ipc::identity::started_process_identity(agent).expect("the agent's identity");
         kr_worker::windows::job::keep_agent(identity.clone(), Arc::clone(&job));
+        running.kept = Some(identity.clone());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let helper = loop {
             let held = job.process_ids().expect("the job's process list");
-            if let Some(helper) = held.into_iter().find(|pid| *pid != agent.id()) {
+            if let Some(helper) = held.into_iter().find(|pid| *pid != agent) {
                 break helper;
             }
             assert!(
@@ -740,23 +770,14 @@ impl Started {
         let helper =
             kr_ipc::identity::process_start_identity(helper).expect("the helper's identity");
         Self {
-            agent,
+            running,
             identity,
-            job,
             helper,
         }
     }
 
     fn helper_pid(&self) -> u32 {
         u32::try_from(self.helper.pid.get()).expect("a process identifier")
-    }
-}
-
-#[cfg(windows)]
-impl Drop for Started {
-    fn drop(&mut self) {
-        let _ = self.job.terminate(1);
-        let _ = self.agent.wait();
     }
 }
 
@@ -892,4 +913,51 @@ fn an_agent_started_in_no_job_places_nothing_below_it() {
         Some(&broker),
     )
     .expect("the agent itself is admitted");
+}
+
+/// On Windows, the job an agent was started in is let go of with the last of the broker's instances
+/// that names that agent, and not before: while another instance still names the agent, its helper
+/// is still bound through the job, and once none does, the job is found no more and the helper is
+/// under no agent this session's broker knows.
+#[cfg(windows)]
+#[test]
+fn an_agents_job_is_let_go_of_with_the_last_instance_that_names_it() {
+    let (_session_job, boundary) = an_empty_session(0xF000_0103);
+    let started = Started::new();
+    let broker = Broker::open(None, session()).expect("a broker");
+    let first = ApplicationInstanceId::new(Uuid::from_bytes([0x21; 16]));
+    let second = ApplicationInstanceId::new(Uuid::from_bytes([0x22; 16]));
+    launched(&broker, first, started.identity.clone());
+    launched(&broker, second, started.identity.clone());
+    let connection = ConnectionId::new(Uuid::from_bytes([4; 16]));
+    let verify = || {
+        kr_worker::questions::binding::verify(
+            Some(started.helper_pid()),
+            Some(&started.helper),
+            connection,
+            Some(&boundary),
+            Some(&broker as &dyn kr_worker::questions::AgentBindings),
+        )
+    };
+    verify().expect("admitted through the job the agent was started in");
+
+    assert!(broker.end(first, InstanceEnding::NativeExit).instance_ended);
+    assert!(
+        kr_worker::windows::job::agent_job(&started.identity)
+            .is_some_and(|job| Arc::ptr_eq(&job, &started.running.job)),
+        "another instance still names the agent, so its job is kept"
+    );
+    verify().expect("and the helper is still bound through it");
+
+    assert!(
+        broker
+            .end(second, InstanceEnding::NativeExit)
+            .instance_ended
+    );
+    assert!(
+        kr_worker::windows::job::agent_job(&started.identity).is_none(),
+        "no instance names the agent any more, so nothing keeps its job"
+    );
+    let refused = verify().expect_err("the helper is under no agent the broker knows");
+    assert_eq!(refused.code(), ErrorCode::NotInKrSession, "{refused}");
 }
