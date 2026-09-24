@@ -509,7 +509,7 @@ mod tests {
 
     /// Runs the signing tool on this test's own fixture, giving it the bound the product gives the
     /// tool, and fails the test rather than waiting past it. A tool that did not answer is ended
-    /// and collected before the failure is reported.
+    /// and given five seconds to be collected, and the failure says whether both happened.
     #[cfg(target_os = "macos")]
     fn signing_tool_within_its_bound(command: &mut std::process::Command) -> std::process::Output {
         let mut child = command
@@ -531,9 +531,25 @@ mod tests {
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 None => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!("the signing tool did not answer within {SIGNING_BOUND:?}");
+                    let ended = child.kill().map_or_else(
+                        |error| format!("ending it failed: {error}"),
+                        |()| "it was ended".to_owned(),
+                    );
+                    let collect_by = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let collected = loop {
+                        match child.try_wait() {
+                            Ok(Some(_)) => break "and collected".to_owned(),
+                            Ok(None) if std::time::Instant::now() < collect_by => {
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                            }
+                            Ok(None) => break "and was still running 5 s later".to_owned(),
+                            Err(error) => break format!("and collecting it failed: {error}"),
+                        }
+                    };
+                    panic!(
+                        "the signing tool did not answer within {SIGNING_BOUND:?}; {ended} \
+                         {collected}"
+                    );
                 }
             }
         }
