@@ -635,7 +635,12 @@ fn finish_bounded(command: &mut Command) -> Result<(ExitStatus, String), String>
                 let _ = child.wait();
                 return Err(format!("{command:?} did not finish within {TOOL_BOUND:?}"));
             }
-            Err(error) => return Err(format!("{command:?} could not be waited for: {error}")),
+            // This process's own child, so it is ended and collected here too.
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{command:?} could not be waited for: {error}"));
+            }
         }
     }
 }

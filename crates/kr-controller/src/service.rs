@@ -7193,8 +7193,9 @@ impl Controller {
     /// ended goes, and one whose process is still running is a live session's and is left exactly
     /// as it is. It is finished before the daemon serves anything, which is what keeps a job that
     /// a create of this daemon has defined and not yet started off the list. launchd is asked
-    /// about each job in a few milliseconds, and after this runs once the only jobs left defined
-    /// are those of workers that are still running.
+    /// about each job in a few milliseconds. A look that reaches every job leaves defined only the
+    /// jobs of workers that are still running and those whose removal launchd did not confirm; one
+    /// that [`JOB_SWEEP_BOUND`] cuts short leaves the jobs it did not reach for the next start.
     async fn retire_ended_jobs(&self) {
         let jobs = self.paths.jobs_dir();
         let _ = tokio::task::spawn_blocking(move || {
@@ -8061,31 +8062,36 @@ impl Controller {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
             }
+            // One look whatever the kernel said, then one each second, and none begun once the
+            // bound has passed.
+            let Some(mut left) = retire_worker_job_aside(jobs.clone(), reservation_id).await else {
+                return;
+            };
             loop {
-                let asked = jobs.clone();
-                let retired = tokio::task::spawn_blocking(move || {
-                    crate::supervision::retire_worker_job(&asked, reservation_id)
-                })
-                .await;
-                let left = match retired {
-                    Ok(JobRetirement::Gone) | Err(_) => return,
-                    Ok(left) => left,
-                };
-                let now = tokio::time::Instant::now();
-                if now >= deadline {
-                    if let JobRetirement::Unsettled(detail) = left {
-                        eprintln!(
-                            "kr-controller: the job of the worker started for reservation \
-                             {reservation_id} could not be removed: {detail}"
-                        );
-                    }
+                if matches!(left, JobRetirement::Gone) {
                     return;
                 }
-                // Never past the bound, so the last look is at it rather than after it.
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
                 tokio::time::sleep(
                     std::time::Duration::from_secs(1).min(deadline.saturating_duration_since(now)),
                 )
                 .await;
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                let Some(next) = retire_worker_job_aside(jobs.clone(), reservation_id).await else {
+                    return;
+                };
+                left = next;
+            }
+            if let JobRetirement::Unsettled(detail) = left {
+                eprintln!(
+                    "kr-controller: the job of the worker started for reservation {reservation_id} \
+                     could not be removed: {detail}"
+                );
             }
         });
     }
@@ -8440,6 +8446,19 @@ impl From<RecordedCreate> for SessionCreateParams {
             terminal: Nullable::null(),
         }
     }
+}
+
+/// Removes a worker's job on a thread that may block, since the platform is asked with commands
+/// of its own, and says what it found; `None` where that thread ended without saying.
+async fn retire_worker_job_aside(
+    jobs: PathBuf,
+    reservation_id: ReservationId,
+) -> Option<JobRetirement> {
+    tokio::task::spawn_blocking(move || {
+        crate::supervision::retire_worker_job(&jobs, reservation_id)
+    })
+    .await
+    .ok()
 }
 
 fn closed_summary(

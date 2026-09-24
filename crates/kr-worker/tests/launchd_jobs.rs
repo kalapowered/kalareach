@@ -51,6 +51,9 @@ const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
 /// How long a replacement daemon is given to take the environment over from the one before it.
 const ENVIRONMENT_HANDOVER_DEADLINE: Duration = Duration::from_secs(120);
 
+/// What `launchctl print` exits with for a domain that is not there.
+const NO_SUCH_DOMAIN: i32 = 112;
+
 /// What `launchctl print` exits with for a job the domain does not have.
 const NOT_LOADED: i32 = 113;
 
@@ -384,7 +387,7 @@ fn loaded(label: &str) -> Vec<String> {
             .expect("runs launchctl");
         match status.code() {
             Some(0) => found.push(target),
-            Some(NOT_LOADED) => {}
+            Some(NO_SUCH_DOMAIN | NOT_LOADED) => {}
             _ => panic!("launchctl could not say whether {target} is loaded: {status}"),
         }
     }
