@@ -59,14 +59,15 @@ require() {
 }
 
 # A graphical login session is what these permissions are about. Without one there is nothing to
-# demonstrate, and saying so is more useful than a failure that means "not applicable".
+# demonstrate, and a run that demonstrated nothing has not passed: it fails and says why. It runs
+# where a person is logged in at the console of a Mac.
 if [ "$(uname -s)" != "Darwin" ]; then
-  echo "the disclosed checks in this build are macOS operations, and this host is not macOS"
-  exit 0
+  echo "FAILED: the disclosed checks in this build are macOS operations, and this host is not macOS"
+  exit 1
 fi
 if ! /bin/launchctl print "gui/$uid" >/dev/null 2>&1; then
-  echo "this host has no graphical login session, so there are no desktop permissions to check"
-  exit 0
+  echo "FAILED: this host has no graphical login session, so there are no desktop permissions to check"
+  exit 1
 fi
 echo "graphical login session: $(/bin/launchctl print "gui/$uid" | awk '/^\thandle = /{print $3; exit}')"
 echo "this shell's login context: $(/bin/launchctl managername)"

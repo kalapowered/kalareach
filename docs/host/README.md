@@ -832,7 +832,9 @@ inside a build directory, which the next build overwrites. Install a signed buil
 daemon, a real worker in your own graphical login, what the host publishes through
 `kr doctor --json`, the four checks performed from that session's own shell and the records they
 produce, and the tools an agent reaches for on that desktop. It ends every process it started, it writes its artefacts under
-`KR_TEST_ARTIFACTS_DIR`, and it asks for no account of any kind.
+`KR_TEST_ARTIFACTS_DIR`, and it asks for no account of any kind. It needs macOS and a person
+logged in at the console; on a host without a graphical login it fails and says so, because a run
+that checked nothing has not passed.
 
 ## Sleep
 

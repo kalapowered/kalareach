@@ -54,10 +54,11 @@ require() {
 }
 
 # A graphical login session is what this demonstration is about. Without one there is nothing to
-# show, and saying so is more useful than a failure that means "not applicable".
+# show, and a run that showed nothing has not passed: it fails and says why. It runs where a person
+# is logged in at the console of a Mac.
 if ! /bin/launchctl print "gui/$uid" >/dev/null 2>&1; then
-  echo "this host has no graphical login session, so there is no desktop to demonstrate"
-  exit 0
+  echo "FAILED: this host has no graphical login session, so there is no desktop to demonstrate"
+  exit 1
 fi
 echo "graphical login session: $(/bin/launchctl print "gui/$uid" | awk '/^\thandle = /{print $3; exit}')"
 echo "this shell's login context: $(/bin/launchctl managername)"
