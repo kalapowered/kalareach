@@ -220,11 +220,18 @@ it is restoring.
 `may_back_up` and `may_restore` are one table, here rather than in each caller, so a device and a
 host cannot answer the question differently. Session data, device configuration, generation
 checkpoints and grant records may be carried. A reusable endpoint or control-signing private key,
-the notification extension's preview key, the recovery seed and this host's grant and revocation
-authority may not, and each refusal carries the reason; a restore refuses all of those and one
-more, a grant that had been revoked. `RestoreLimits` states what a restore cannot do whatever it
-put back: it always requires fresh owner-authorised pairing, and it never creates remote-control
-authority.
+the notification extension's preview key, the recovery seed, a settings collection's key and this
+host's grant and revocation authority may not, and each refusal carries the reason; a restore
+refuses all of those and one more, a grant that had been revoked. `RestoreLimits` states what a
+restore cannot do whatever it put back: it always requires fresh owner-authorised pairing, and it
+never creates remote-control authority.
+
+A settings collection's key is refused because of who can open a recovery-enabled archive. Every
+such archive wraps its manifest key for the recipient the recovery seed derives, so a collection key
+inside one would let anybody holding the seed read what the collection holds under that key's epoch.
+A device reads a collection only through its own wrap in a key record, after a member authorised
+it, and a restored device is no exception: its settings come back as device configuration, and its
+membership starts again from nothing.
 
 **It is the decision, not the gate.** The layer below carries opaque bytes: `stage_object` encrypts
 whatever it is handed, and `restore_object` returns whatever the manifest named. A caller that
@@ -388,6 +395,12 @@ secure store.
 The recovery recipient is an ordinary stored-envelope `crypto_box` recipient. It is not a fifth key
 purpose: what makes it different is that it is derived from the seed rather than generated on a
 device.
+
+What the seed opens is archives, and only archives: it is never a settings collection's key, and
+no collection key is inside anything it opens. A restore from the seed returns a device's settings
+and its data. It does not return a collection key, a key record, a membership or a device key, so
+the restored device joins its settings collection as a new device does, once the owner has paired
+it again and a member has authorised it.
 
 The seed's checksum is the first four bytes of its SHA-256, so a mistyped recovery kit fails before
 anything is decrypted.

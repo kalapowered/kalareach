@@ -347,7 +347,8 @@ member's side of that record: `SyncMembership` checks the records the service ke
 key it is given, and issues the next record when the owner adds or removes a device or a host
 reports one revoked.
 
-A device gets a collection key only by opening its own wrap in a record it accepted. It accepts a
+A device gets a collection key only by opening its own wrap in a record it accepted; a restore never
+brings one back (see [Settings after a restore](#settings-after-a-restore)). It accepts a
 record when its own entry names both of its keys; the record follows the one it holds, link by
 link, each signed by an issuer the record before it named; one of its hosts reports the issuer
 paired and able to manage it, with the same stored-envelope key, and nothing it recorded from a
@@ -856,15 +857,46 @@ in a restore reads a writer key out of an archive at all.
 What a restore puts back is decided by `kr_crypto::backup`'s table, so a device and a host give the
 same answer: session data, device configuration and generation checkpoints come back, and reusable
 endpoint and control-signing private keys, the notification extension's preview key, the recovery
-seed, this host's grant and revocation authority and any grant that had been revoked do not, each
-with its reason rather than as a silent omission.
+seed, a settings collection's key, this host's grant and revocation authority and any grant that
+had been revoked do not, each with its reason rather than as a silent omission.
 
 The table classifies material a caller names. It is the decision, not the gate: the archive layer
 below it carries opaque bytes, so a caller that wrote a private key into a member object and never
-asked the table about it would get that object back. The gate is the caller's own export and import
-paths asking the table for every kind they carry, and this library supplies the answer rather than
-the paths. A restored device still has no host access either way: it requires fresh
-owner-authorised pairing, and it never creates remote-control authority.
+asked the table about it would get that object back. The gate is each export and import path
+asking the table for every kind it carries; the settings path below is one. A restored device
+still has no host access either way: it requires fresh owner-authorised pairing, and it never
+creates remote-control authority.
+
+### Settings after a restore
+
+`recovery::export_settings` and `recovery::import_settings` are how a device's settings go into a
+recovery-enabled archive and come back out of one. The export reads the settings object from the
+device's sync store, to be carried under `recovery::SETTINGS_FILENAME`. It is refused while privacy
+mode is on, because privacy mode stops backups as it stops sync, and it names the privacy generation
+it was read under, so the archive is published only while that generation holds. The import asks the
+table about whatever the archive says a member is, takes device configuration and nothing else, and
+reads the bytes as a settings object.
+
+A restore gives back the settings, with their values and pinned labels, as the restored device's
+own. It never gives back:
+
+* a settings collection's key, at any epoch. The recovery seed opens the archive, so a key inside
+  it would be a way into the collection for anybody holding the seed;
+* the collection's key records, or the old device's membership of the collection. Who may read the
+  collection is authority, and restored settings cannot overwrite authority;
+* a note of where the settings stood on the sync service. The restored device is a new
+  installation, so the note would describe a place its copy never reached; its first publication
+  compares against nothing and learns from the service where the settings stand.
+
+An import never writes over settings the device already holds, or beside a note of where they stood:
+choosing between two versions of the settings is the person's, not the last writer's.
+
+So a restored device syncs nothing until it is a member again, exactly as a new device would be.
+The owner pairs it with a host again under a grant that manages the host, a member shares the
+collection with it, and the owner confirms the join on the restored device. Its keys are new, since
+no reusable key is backed up, so the records that listed the device it replaces give it nothing. The
+lost device is revoked at the host and a member rotates it out. With no member left, the owner starts
+a new collection on the restored device, with the restored settings.
 
 The seed comes from the kit or from a device's secure store. Those are the two, and a service is
 not one of them, so an account password reset returns an account and nothing else.
@@ -888,6 +920,6 @@ not one of them, so an account password reset returns an account and nothing els
 | KR-REQ-20.14 | `a_kit_round_trips_through_its_printable_and_scanned_forms`, `the_printed_kit_is_the_document_the_fixture_publishes`, `a_mistyped_kit_fails_on_its_checksum_before_anything_is_derived`, `a_kit_read_by_hand_forgives_the_letters_the_alphabet_leaves_out` and `a_kit_value_whose_spacing_would_change_when_read_is_refused` in `crates/kr-client/tests/recovery.rs`, with `fixtures/crypto/kdf.json` and `fixtures/crypto/recovery-kit.json` |
 | KR-REQ-20.15 | `a_writer_is_declared_recovery_enabled_only_after_its_bundle_has_landed`, `a_writer_whose_bundle_did_not_commit_is_not_declared`, `rotating_a_writers_key_replaces_it_in_one_commit` and `a_verified_generation_never_moves_backwards` in `crates/kr-client/tests/recovery.rs`. They establish the ordering and what the bundle holds; nothing here declares a writer to a *service*, because that declaration belongs to the collection's enrolment record |
 | KR-REQ-20.16 | `a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bundles_writers` in `crates/kr-client/tests/recovery.rs`, which drops every producer value before the restore and takes the producer key out of the authenticated bundle |
-| KR-REQ-20.17 | `a_backup_never_carries_a_reusable_key_and_a_restore_never_gives_back_a_revoked_grant` and `a_restore_puts_back_data_and_configuration_and_still_needs_fresh_owner_pairing` in `crates/kr-client/tests/recovery.rs`. They establish the decision the table gives, not an export path that consults it: no such path exists in this library yet |
+| KR-REQ-20.17 | The table's answers: `the_material_table_refuses_a_reusable_key_and_a_revoked_grant` and `the_admitted_set_is_data_and_configuration_and_the_limits_still_require_owner_pairing` in `crates/kr-client/tests/recovery.rs`. The settings part, through the export and import paths that ask the table: `a_collection_key_is_neither_backed_up_nor_restored`, `a_restore_returns_settings_without_a_key_a_membership_or_a_sync_checkpoint` and `a_restored_device_joins_only_after_a_fresh_authorisation` in `crates/kr-client/tests/membership.rs`, which carry the settings through an archive only the recovery recipient opens. Producing and uploading the device's archive is the backup producer's; this library supplies what goes into it and takes back what comes out |
 | KR-REQ-20.18 | `a_migration_produces_an_updated_kit_and_a_verified_record` and `one_kit_serves_several_services` in `crates/kr-client/tests/recovery.rs`. The offline-export half is `the_encrypted_bundle_and_selected_archives_export_offline` in the same file, over the library's own `OfflineExport`: the encrypted bundle and the selected archives' ciphertext in one canonical document, which restores without a service |
 | KR-REQ-20.19 | `service_access_alone_does_not_decrypt_the_bundle` and `substituting_the_origin_or_the_locator_fails_authentication` in `crates/kr-client/tests/recovery.rs` |
