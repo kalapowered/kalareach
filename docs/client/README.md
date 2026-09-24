@@ -567,8 +567,10 @@ can establish that no receipt of a run has ever been removed, keeping the fence 
 nothing the caller signed can become fresh again.
 
 `services::sync` is settings sync's client, `ManagedSyncService`, the implementation of that trait
-this crate carries. It speaks the five members of `sync.compare_exchange` over `services::signed`:
-an exchange, a comparison, a resolution, the status of a request identity and a fence of one.
+this crate carries. It speaks the eight members of `sync.compare_exchange` over `services::signed`:
+an exchange, a comparison, a resolution, the status of a request identity, a fence of one, a read
+of a collection's key records, the offer of the record that follows its newest, and the list of
+shared collections that name this installation.
 
 - It keeps nothing. Every position, receipt and statement about whether a request ran is passed
   through as the service stated it, including a removal's place and a place of nought, which the
@@ -588,13 +590,48 @@ an exchange, a comparison, a resolution, the status of a request identity and a 
   compares exactly.
 - `REQUEST_FENCED` is reported as the refusal of that identity with nothing for a person to do,
   `ID_CONFLICT` as a reused identity and `INVALID_ARGUMENT` as a value this client should not have
-  sent. A fetch reads the object through a comparison for its kind, and a collection holding none
-  is reported as such.
+  sent. Where a shared collection's two refusals reach a caller as errors, `COLLECTION_ABSENT` is
+  an unknown object and `KEY_EPOCH_RETIRED` a view to bring up to date. A fetch reads the object
+  through a comparison for its kind, and a collection holding none is reported as such.
 - An answer may carry members this client does not read, because the service and this client are
   deployed on their own schedules; every member it does read is required and typed. A sealed object
-  is the exception and stays a closed schema. One path carries every member, and a comparison page
-  holds sixty-four objects and sixty-four copies, so `services::managed_response_limits` gives that
-  path a bound of its own.
+  and a key record are the exceptions and stay closed schemas. One path carries every member, and a
+  comparison page holds sixty-four objects and sixty-four copies, so
+  `services::managed_response_limits` gives that path a bound of its own.
+
+A collection two or more devices share is named by a `sync::membership::CollectionRef`: the
+installation that started it, its home, and the collection. The `_shared` calls address one:
+`exchange_shared`, `status_shared`, `fence_shared`, `compare_shared` and `resolve_shared`. Every one
+names the home, every write names the key epoch its object is sealed under, and the per-object
+name this crate gives an object names it inside the collection. They answer with
+`services::Keyed`, which adds the two answers a shared collection gives beside the usual ones:
+
+- `Retired`, for a write sealed under an epoch the collection has retired. Nothing was stored or
+  held, the refusal names the collection's epoch and revision, and it is the request's receipt, so
+  a status query and a fence answer the same. It ends the attempt that met it and says nothing of an
+  earlier one.
+- `Absent`, for a collection that does not exist or whose newest key record does not list this
+  installation; the service answers both the same way. A member removed after it sent a request
+  is still answered about that request.
+
+Every other answer names where the collection's key records stood, `services::KeyHead`, so a
+device holding an older record knows to fetch the ones after it. The epoch is part of what a write
+asks, so a retry names the epoch the first attempt named and is answered from the receipt, whatever
+the collection's epoch has become; a write under a new identity and the retired epoch meets the
+refusal. For a collection only its home writes, neither answer can be the service's, and both
+stay errors.
+
+`ManagedSyncService` is also the membership's `KeyRecordService`. A read of key records names the
+home and follows every page to the newest, handing the records over as the service answered them,
+because whether they form a chain is for the reader to establish; it stops following a page that
+does not move on, and at `MAX_KEY_RECORDS_READ` records. The offer of a record carries its request
+identity, its home and the record exactly as it was signed, and a record the service would refuse
+for its collection, its home or its structure never leaves the device; its status and fence read
+the receipt of the offer, and one that names a write is an answer about another request.
+`memberships` lists the shared collections whose newest record names this installation, page by
+page, from an index that can be behind and admits nobody. `inventory` reads every object and every
+copy a shared collection holds, each with the epoch it is sealed under, page by page to the end,
+which is what a member reads before it forgets an old epoch's key.
 
 A field left `None` is a service this client does not use, and nothing degrades. Direct connections,
 local sessions, drafts, plugins, local descriptions and user-operated alternatives need none of
