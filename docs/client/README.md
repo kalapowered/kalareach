@@ -120,7 +120,9 @@ note under one hold of the lock, so a caller cannot publish text this device doe
 cannot send an older revision against a position another publisher has just advanced. A note that
 already names a later write stands, so an answer that arrives late does not undo what a fetch
 has already learnt, and so does a note naming the same place in the service's order under another
-name, which is a second history rather than a later write. A refused comparison is an answer rather
+name, which is a second history rather than a later write. Both compare places within one history
+of the collection; a collection put back from an archive is followed instead (see
+[A collection put back](#a-collection-put-back)). A refused comparison is an answer rather
 than a failure: what the service holds comes down **beside** the local draft under a fresh identity,
 never over it, and the person chooses. Reconnecting never replaces their text.
 
@@ -140,10 +142,12 @@ and a draft publication is accounted for and settled there by the same rules as 
   identity is presented again only while every attempt under it is signed within one freshness
   window of every other. Section 9 keeps a receipt for thirty days from the reading that admitted
   its attempt, and a replay inside that span could then run twice only if the service's clock went
-  back by nearly all of those thirty days. Past the span, the first publication keeps its own
-  account and publishing again is new work under a new identity. Nothing makes an attempt by
-  itself, and an attempt under an identity whose call is still out is refused rather than sent
-  beside it.
+  back by nearly all of those thirty days, which is what the service's cutoff below closes. Past
+  the span, the first publication keeps its own account and publishing again is new work under a
+  new identity. So it is once the collection has been put back since the first attempt, and once
+  the service has refused an attempt as signed before its cutoff: the identity is never presented
+  again. Nothing makes an attempt by itself, and an attempt under an identity whose call is still
+  out is refused rather than sent beside it.
 - `DraftSync::reconcile_unsettled` settles a publication whose answer was lost the way the settings
   client settles its own. It asks about the request's identity: an applied receipt moves the note
   beside the draft unless the note already names a later write, and a refused one brings the other
@@ -227,11 +231,13 @@ in one `sync::SyncStore`.
 - A note naming a write a reset or replaced service no longer holds does not resolve itself.
   `SyncStore::forget_checkpoint` is the explicit recovery, and nothing does it automatically,
   because a note that looks stale and is not is a note whose object another device has just written.
-  Two answers are provably wrong rather than merely surprising, and the refusal says which: a
-  service answering with a write sequence *below* the one the note names has gone back behind what
-  this device already saw, and one answering with another name for the same place in the order
-  holds a history that forked. One this device could not reach at all is reported as it came,
-  because absence and unreachability are not the same answer.
+  Within one history of the collection, two answers are provably wrong rather than merely
+  surprising, and the refusal says which: a service answering with a write sequence *below* the one
+  the note names has gone back behind what this device already saw, and one answering with another
+  name for the same place in the order holds a history that forked. A collection put back from an
+  archive is neither: its answers name another history, and this client follows it (see
+  [A collection put back](#a-collection-put-back)). One this device could not reach at all is
+  reported as it came, because absence and unreachability are not the same answer.
 - Everything this device knows about one publication is in one record, named by the request's own
   identity, and every step of that request replaces the whole of it: admitted, sent, and then what
   the service answered. A device that stops part way through a settlement comes back to one record
@@ -263,26 +269,26 @@ in one `sync::SyncStore`.
   refuses anything that arrives under that identity afterwards. Only applied, refused and fenced
   release the barrier. A service that cannot be asked, for either call, leaves the work counted, so
   a cleanup reports what is still outstanding rather than assuming it is finished.
-- Two answers can claim one place in the service's order, which is a service whose history forked
-  rather than a later state of this one. The object's own publication record can name only one of
-  them, so the request that lost keeps its own record as the account of the ciphertext that left
-  under it, and `exported` names both. Which of the two it is is decided in the same replacement
-  that ends the request, and never again: deciding it later would leave a stop between the two, and
-  a publication that moved the object's record on in between would make the account look like
-  ordinary older news and drop it. A publication or a fetch that meets the same disagreement in its
-  note is told, because the note is compared inside the hold that writes it and the next comparison
-  may never meet it: the service can reach a later write, which follows from either history. A
-  reconciliation counts them instead of refusing, because it is ending a barrier rather than
-  answering one caller. `SyncStore::forget_checkpoint` is the recovery, and nothing does it
-  automatically.
+- Two answers can claim one place in one history of the service's order, which is a service whose
+  history forked rather than a later state of this one. The object's own publication record can
+  name only one of them, so the request that lost keeps its own record as the account of the
+  ciphertext that left under it, and `exported` names both. Which of the two it is is decided in
+  the same replacement that ends the request, and never again: deciding it later would leave a
+  stop between the two, and a publication that moved the object's record on in between would make
+  the account look like ordinary older news and drop it. A publication or a fetch that meets the
+  same disagreement in its note is told, because the note is compared inside the hold that writes
+  it and the next comparison may never meet it: the service can reach a later write, which follows
+  from either history. A reconciliation counts them instead of refusing, because it is ending a
+  barrier rather than answering one caller. `SyncStore::forget_checkpoint` is the recovery, and
+  nothing does it automatically.
 - A write takes the next place in the order after the one it replaced, so an accepted answer at that
-  place or behind it is not a later state of the history the request was made against. The
-  settlement records such a write as one that went into another history, never as applied: the
-  request's own record keeps the account of what left, no note moves and no publication record
-  claims it, and the caller is told which it was, a service that went back (a smaller write
-  sequence) or two histories claiming one place (the same one). Only a write's own answer is held to
-  this; a read may name the very place this device already holds, which is the same write said
-  again.
+  place or behind it, in the same history, is not a later state of the history the request was
+  made against. The settlement records such a write as one that went into another history, never
+  as applied: the request's own record keeps the account of what left, no note moves and no
+  publication record claims it, and the caller is told which it was, a service that went back (a
+  smaller write sequence) or two histories claiming one place (the same one). Only a write's own
+  answer is held to this; a read may name the very place this device already holds, which is the
+  same write said again.
 - An answer this device cannot read is declined rather than guessed at. A place in the order counts
   from one, and a write that produced content is named by a revision, so a position with neither is
   the removal of the object and not somewhere a write of it landed. This client publishes writes and
@@ -320,11 +326,66 @@ in one `sync::SyncStore`.
   never produced, and one sealing per piece of work is what makes the refusal safe to read that
   way: every attempt sends the same bytes, so an identity refused for carrying different content is
   refused for content this device never sent under it.
+- A service keeps a receipt for thirty days and no longer, so it keeps a cutoff too: it refuses,
+  running nothing and recording nothing, an attempt signed so long ago that the receipt of an
+  earlier run of the same request could be gone, which a service clock gone back would otherwise
+  admit as a first run. An exchange reads that refusal as an answer about the attempt
+  (`SyncExchanged::SignedBeforeCutoff`), and the caller is told `SyncError::SignedBeforeCutoff`.
+  Nothing is attempted under the identity again, signed now or otherwise, and the record stays as
+  the account of what left, since an earlier attempt may have run. The cutoff only rises, so where
+  every attempt the record names was signed no later than the refused one, none of them can ever
+  run and the request ends at once. Where one was signed later, which only a clock corrected
+  backwards between two attempts produces, it could still be on its way, so the request stays
+  counted and the next reconciliation fences it at once, whatever the generation; the account
+  stays whatever that fence says. Publishing again is new work under an identity of its own.
 
 `sync::StorageFeature` names the three parts of what section 18 offers: encrypted settings sync,
 which is this module; history backups; and recovery material, which is what a restore without
 another device needs. The last two are optional, which is what sections 18 and 20 call them, and
 each part carries what a person does without it.
+
+### A collection put back
+
+A service restored from an archive puts every collection back as the archive held it, under a
+recovery identity of its own (`services::SyncRecoveryId`). Every answer names that identity: beside
+each place in a collection's order it states, and on an answer that states none, a refusal about an
+object the collection never held, a status query that finds no receipt, a fence. A deployment never
+put back names none. An answer without the member is declined as unreadable. Places compare only
+within one history, so a place under another identity is a collection put back, never a service
+that went back or forked.
+
+- Every stored position keeps its history: a note, a request's comparison, a publication record, a
+  conflict copy, and the recovery bundle's write record. A record stored before histories were
+  recorded names none, which is how this client read the collection then, and a record in a
+  history never put back is written without the member, so either reads as it always did.
+- The store keeps, for each object, the history it reads the object's collection in and every
+  history it has seen that collection put back from, and each request records the history its
+  attempts were made in. Every call carries the history that was current when it left, and every
+  answer is read against it, under the store's lock. An answer in the current history is read as
+  above. An answer in a new history, to a call that left in the current one, is the collection put
+  back: the new history becomes current and the old one never is again, and the note moves to the
+  place the answer names, or goes where the answer says the restored collection holds nothing of
+  the object. The object itself is never replaced. An answer from a history the collection was put
+  back from, or from a new one to a call that left before the history this device reads now, moves
+  nothing: an applied write is recorded as one that went into another history, its record the
+  account of what left, and the caller is told `SyncError::UnfollowedHistory`.
+- Nothing this device wrote is written again automatically. A write the restore lost keeps its
+  account, and the next fetch or publication brings what the restored collection holds down
+  beside this device's own content where the two differ, for the person to choose; both versions
+  stay readable.
+- A request attempted in a history the collection has since been put back from is never attempted
+  again. Where the current history holds no receipt of it, a reconciliation fences it at once,
+  whatever the privacy generation, and the account stays, since a restored collection's fence
+  cannot say for thirty days that anything signed before the restore never ran. A draft
+  publication is attempted again only in the history its attempts were made in. A draft whose
+  collection was put back stays the person's own: what the restored collection holds comes down
+  beside it, and nothing is submitted.
+- A read of several pages, a comparison, an inventory or the key records, holds every page to one
+  history, and a read that meets a restore between its pages is declined and asked again.
+- One case is left open. A fetch of an object the restored collection does not hold is reported as
+  unknown, as before, and records nothing about the history; the next publication's refusal names
+  the history and moves the note. Until something does, a draft publication can still be attempted
+  under its identity in the history this device last read.
 
 ### The key a collection is sealed under
 
@@ -383,6 +444,21 @@ when a later record lists it again: it forgets the collection's keys and reads t
 again only after the owner confirms a join on it. So does a service that answers the collection
 as absent, or with a chain this device cannot follow; that answer is recorded at once.
 
+A collection put back from an archive names its history on every key-record answer, and the
+membership file records the history its records were read in: the one its first record applied
+in, for a collection this device starts; the one of the chain a join verified; and none for a
+collection never put back. An answer from another history changes nothing until this device reads
+the collection again there, in the same step: the record at its head and the records after it,
+both in that history. Its own head found there, with the same bytes, proves that the records up to
+it are the ones it holds, since each names the digest of the one before it, and the device follows
+the collection there. Missing, or another record in its place, the head is one the archive did not
+keep, and a record the restore lost may have removed a device, so this device is out at once, as for
+a chain it cannot follow, and reads the collection again only after the owner confirms a join; a
+candidate it dispatched is settled first, as always. Two reads answered from two histories record
+nothing (`MembershipError::PutBackWhileRead`), and the step is asked again. A membership listing
+entry is news to this device when it names another history, whatever its revision, or a later
+revision in the same one (`MembershipListing::names_news`): a reason to refresh, and nothing more.
+
 Every record this device issues takes the next epoch and a freshly drawn key, an addition
 included. It wraps the key in use only for the devices its installed record lists, so a record
 that is sent and never applies, whose wraps a service could still hand out, carries no key anybody
@@ -397,8 +473,9 @@ long as the membership; a new join starts with none.
 The membership file keeps ten facts: the join record, the installed record, the head, the host
 answers, the pending removals, at most one pending addition, at most one candidate record with its
 request identity and dispatch mark, the keys withdrawn since the join, whether a join awaits the
-owner, and the outcomes not yet shown. `SyncMembership::step` runs one row of the reconciler at a time and makes at most one
-durable write, so a restart resumes where the file says; the module documentation has the rows.
+owner, and the outcomes not yet shown; and beside them the history its records were read in.
+`SyncMembership::step` runs one row of the reconciler at a time and makes at most one durable
+write, so a restart resumes where the file says; the module documentation has the rows.
 Publication into the collection is open only while no removal is pending, no candidate stands, no
 join awaits the owner and the newest record this device has is the one it installed
 (`SyncMembership::publishes`). A candidate is sent once, after its dispatch mark is written; an
@@ -433,7 +510,9 @@ revocations, lost requests and answers, expired receipts, a service that answers
 collection were gone, and crashes, with every state checked against the invariants and every state
 settling once events stop. Its nine configurations run with
 `cargo test --release -p kr-client --lib membership::exhaustive -- --ignored`; the two smallest,
-and one run for each rule the test can weaken, run with the rest of the suite.
+and one run for each rule the test can weaken, run with the rest of the suite. Its service is never
+put back; what a device does with a collection put back is tested over the same reconciler by the
+scripted tests under "A collection put back" in `crates/kr-client/tests/membership.rs`.
 
 ### Privacy mode
 
@@ -854,7 +933,9 @@ counts from one and a write that produced content is named by a revision, so a r
 nought are not where a write of the bundle can be. A place behind one this device has already read
 is a service that has gone back, and one place under two names is a history that forked. So is one
 place read twice with different content: a place names one content, so the store refuses the second
-reading and keeps the bundle it authenticated there. An applied
+reading and keeps the bundle it authenticated there. A place in another history than the one the
+store holds is refused before any place in it is compared (`RecoveryError::BundlePutBack`): after a
+restore, a place further on need not hold what this device wrote before it. An applied
 write is held to one thing more: it has to move the bundle on, because every applied write takes
 the next place in the order, so an answer that stands still is a service saying it wrote and did
 not write. A read of that same place is ordinary, which is why the two are checked apart. Each is
@@ -994,10 +1075,10 @@ not one of them, so an account password reset returns an account and nothing els
 | KR-REQ-17.14 | A session, a draft and a control need no managed service, and none of them changes when one is configured |
 | KR-REQ-17.40 | The report of an exhausted relay: a new connection that a relay on its route turned this device away from fails as that refusal, with the relay's kind of refusal, its words and what may still work, while established and direct connections carry on (`an_exhausted_relay_is_the_reported_reason_a_new_connection_fails` in `crates/kr-controller/tests/network.rs`; each kind, the route and the direct paths in `crates/kr-transport/tests/relay_refusal.rs`) |
 | KR-REQ-23.57 | The retry rules: which classes of request may be retried automatically, and what a person is offered for the rest |
-| KR-REQ-24.13 | A draft outlives its attachment, its connection and another device's write, and is never replaced by remote content. A draft settled after its answer was lost is still never submitted |
-| KR-REQ-20.13 | Per-object revisions and compare-and-swap writes, a lost comparison kept beside rather than resolved by a clock, the person's choice leaving no copy on the device or the service, the settlement of a write whose answer was lost through the request's own identity, for a draft as for a setting, the closed kind set that no restore can reach host authority through, and drafts that stay drafts. The legs in `tests/integration/sync/tests/sync.rs` hold a live deployment to the same rules through `services::sync`, with two client stores under one installation |
-| §24 privacy | The fence, the cancellation, the removal, the pinned-label rule, a publication in flight when privacy mode is enabled, a draft's as well as a setting's, work whose caller walked away staying outstanding, and the settlement of a dispatch whose answer was lost: applied, refused, and a request the service holds no receipt for, which stays counted under the generation in force and is ended at the service once privacy mode has moved past it, keeping the account of what left wherever the service cannot establish that nothing ran. A client fenced by privacy mode sends a live deployment nothing (`kr_req_24_28_a_client_fenced_by_privacy_mode_publishes_nothing_and_keeps_its_pinned_labels`). Turning the generation on is the host's, and this client is one subsystem of it |
-| KR-REQ-18.05 | The encrypted settings sync part only: the service holds ciphertext in a declared size bucket and never a setting, against a live deployment as well as the suite's own service (`kr_req_18_05_a_setting_is_stored_sealed_in_a_declared_bucket`), and the feature names its three parts and which of them are optional. A device receives a collection key only through its own wrap in a record it accepted, and only after its hosts committed its pairing and the owner confirmed the addition and the join (`a_production_device_receives_its_key_through_its_own_wrap_and_keeps_it_in_its_store`, `nothing_is_sealed_to_a_device_its_host_has_not_committed` in `crates/kr-client/tests/membership.rs`, against the suite's own service and hosts). Nothing here performs a history backup or produces recovery material |
+| KR-REQ-24.13 | A draft outlives its attachment, its connection and another device's write, and is never replaced by remote content. A draft settled after its answer was lost is still never submitted, and neither is a draft whose collection was put back, which is kept beside the restored one (`a_draft_outlives_its_attachment_its_connection_and_another_devices_write` and `a_draft_whose_collection_was_put_back_is_kept_beside_and_never_submitted` in `crates/kr-client/tests/session.rs`) |
+| KR-REQ-20.13 | Per-object revisions and compare-and-swap writes, a lost comparison kept beside rather than resolved by a clock, the person's choice leaving no copy on the device or the service, the settlement of a write whose answer was lost through the request's own identity, for a draft as for a setting, the closed kind set that no restore can reach host authority through, and drafts that stay drafts. Across a restore: a note in one history meets its collection put back in another and follows it, while a service that went back within one history is still refused (`a_note_in_one_history_meets_its_collection_put_back_in_another_and_follows_it`, `a_service_that_went_back_in_its_own_history_is_still_refused`); a fetch from a collection put back keeps both versions and writes nothing away (`a_fetch_from_a_collection_put_back_keeps_both_versions_and_writes_nothing_away`); an answer from a history the collection was put back from moves nothing (`an_answer_from_a_history_the_collection_was_put_back_from_moves_nothing`), all in `crates/kr-client/tests/sync.rs`; and every answer's recovery identity is read and required (`every_answer_names_the_history_its_places_are_in` in `crates/kr-client/src/services/sync/tests.rs`). The legs in `tests/integration/sync/tests/sync.rs` hold a live deployment to the same rules through `services::sync`, with two client stores under one installation, and hold a deployment never put back to naming no history |
+| §24 privacy | The fence, the cancellation, the removal, the pinned-label rule, a publication in flight when privacy mode is enabled, a draft's as well as a setting's, work whose caller walked away staying outstanding, and the settlement of a dispatch whose answer was lost: applied, refused, and a request the service holds no receipt for, which stays counted under the generation in force and is ended at the service once privacy mode has moved past it, keeping the account of what left wherever the service cannot establish that nothing ran. Across a restore, a request attempted before its collection was put back is ended at once with its account kept (`a_request_attempted_before_its_collection_was_put_back_is_ended_at_once_and_keeps_its_account`), and a refusal before the service's cutoff ends the attempt with its account kept and holds the barrier while an attempt signed later could still run (`a_refusal_before_the_cutoff_holds_the_barrier_while_an_attempt_signed_later_is_on_its_way`). A client fenced by privacy mode sends a live deployment nothing (`kr_req_24_28_a_client_fenced_by_privacy_mode_publishes_nothing_and_keeps_its_pinned_labels`). Turning the generation on is the host's, and this client is one subsystem of it |
+| KR-REQ-18.05 | The encrypted settings sync part only: the service holds ciphertext in a declared size bucket and never a setting, against a live deployment as well as the suite's own service (`kr_req_18_05_a_setting_is_stored_sealed_in_a_declared_bucket`), and the feature names its three parts and which of them are optional. A device receives a collection key only through its own wrap in a record it accepted, and only after its hosts committed its pairing and the owner confirmed the addition and the join (`a_production_device_receives_its_key_through_its_own_wrap_and_keeps_it_in_its_store`, `nothing_is_sealed_to_a_device_its_host_has_not_committed` in `crates/kr-client/tests/membership.rs`, against the suite's own service and hosts). Across a restore, a device follows a collection put back only from the head it holds and is otherwise out until the owner confirms a join (`a_collection_put_back_without_the_head_this_device_holds_leaves_it_out_until_a_join`, with its control `an_older_revision_in_the_same_history_leaves_the_head_standing`, in the same file). Nothing here performs a history backup or produces recovery material |
 | KR-REQ-20.11 | The sync-collection half: removing a device gives the members that stay a fresh key at the next epoch that the removed device has no wrap of, and publication stays fenced until that record is installed (`removing_a_device_gives_the_rest_a_key_it_cannot_open`, `every_new_epoch_has_a_freshly_drawn_key`, `publication_stays_fenced_from_a_recorded_removal_until_its_record_is_installed` in `crates/kr-client/tests/membership.rs`, and the reconciler's exhaustive test in `crates/kr-client/src/sync/membership/exhaustive.rs`) |
 | KR-REQ-20.14 | `a_kit_round_trips_through_its_printable_and_scanned_forms`, `the_printed_kit_is_the_document_the_fixture_publishes`, `a_mistyped_kit_fails_on_its_checksum_before_anything_is_derived`, `a_kit_read_by_hand_forgives_the_letters_the_alphabet_leaves_out` and `a_kit_value_whose_spacing_would_change_when_read_is_refused` in `crates/kr-client/tests/recovery.rs`, with `fixtures/crypto/kdf.json` and `fixtures/crypto/recovery-kit.json` |
 | KR-REQ-20.15 | `a_writer_is_declared_recovery_enabled_only_after_its_bundle_has_landed`, `a_writer_whose_bundle_did_not_commit_is_not_declared`, `rotating_a_writers_key_replaces_it_in_one_commit` and `a_verified_generation_never_moves_backwards` in `crates/kr-client/tests/recovery.rs`. They establish the ordering and what the bundle holds; nothing here declares a writer to a *service*, because that declaration belongs to the collection's enrolment record |
