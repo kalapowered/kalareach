@@ -39,11 +39,11 @@ use kr_plugin_sdk::catalogue::CatalogueIndex;
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::plugin::PluginManifest;
 
-use crate::catalogue::authority::Permit;
-use crate::catalogue::budget::{BudgetLedger, Resource, ResourceLimit, Stage};
-use crate::catalogue::db::ActiveGeneration;
-use crate::catalogue::error::{CatalogueError, CatalogueResult};
-use crate::catalogue::repository::EnrolmentKey;
+use crate::authority::Permit;
+use crate::budget::{BudgetLedger, Resource, ResourceLimit, Stage};
+use crate::db::ActiveGeneration;
+use crate::error::{CatalogueError, CatalogueResult};
+use crate::repository::EnrolmentKey;
 
 /// The directory every enrolment's own directory sits in.
 const REPOSITORIES: &str = "repositories";
@@ -1228,7 +1228,7 @@ fn flush_tree(path: &Path) -> CatalogueResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalogue::authority::{Effect, Owner, committed};
+    use crate::authority::{Effect, Owner, committed};
     use kr_plugin_sdk::limits::RepositoryBudgets;
     use kr_protocol::ids::RepositoryGeneration;
     use kr_protocol::scalars::{TimestampMs, U64};
@@ -1254,7 +1254,7 @@ mod tests {
             index_digest,
             index_bytes,
             entries: 0,
-            versions: crate::catalogue::trust::MetadataVersions::default(),
+            versions: crate::trust::MetadataVersions::default(),
         }
     }
 

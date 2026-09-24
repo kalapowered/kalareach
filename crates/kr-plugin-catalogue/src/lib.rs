@@ -6,6 +6,10 @@
 //! decision needs is in that snapshot, so catalogue search works with no network at all. Payloads
 //! stay behind their content hashes until something explicitly asks for them.
 //!
+//! This crate verifies, stores and fetches, and it hosts no component. The control daemon links it
+//! to serve the catalogue and plugin methods, and neither the daemon nor a session's worker links a
+//! Wasm engine, so a component runs only in the plugin runtime's own process.
+//!
 //! | Module | What it owns |
 //! | --- | --- |
 //! | [`repository`] | Enrolment: the adopted root, the budgets, the ceiling and what needs the owner's confirmation |
@@ -74,29 +78,29 @@ use kr_plugin_sdk::package::MANIFEST_FILE;
 use kr_plugin_sdk::version::PackageVersion;
 use kr_protocol::ids::{EnvironmentId, RepositoryGeneration};
 
-pub use crate::catalogue::authority::{Authority, Committed, Effect, Failure, Owner, Recording};
-pub use crate::catalogue::broker::{BrokerBridge, UnboundBroker};
-pub use crate::catalogue::budget::{BudgetLedger, Resource, ResourceLimit, Stage};
-pub use crate::catalogue::ceiling::{
+pub use crate::authority::{Authority, Committed, Effect, Failure, Owner, Recording};
+pub use crate::broker::{BrokerBridge, UnboundBroker};
+pub use crate::budget::{BudgetLedger, Resource, ResourceLimit, Stage};
+pub use crate::ceiling::{
     CapabilityDecision, GrantRequirement, InstallationGrant, capability_from_str,
 };
-pub use crate::catalogue::db::{
+pub use crate::db::{
     ActiveGeneration, Claimed, Durability, Enrolled, ReceiptClaim, ReceiptKey, ReceiptRecord,
 };
-pub use crate::catalogue::error::{CatalogueError, CatalogueResult};
-pub use crate::catalogue::install::{
+pub use crate::error::{CatalogueError, CatalogueResult};
+pub use crate::install::{
     Binding, BindingId, Bindings, DisablePolicy, Installation, RevocationNotice,
 };
-pub use crate::catalogue::repository::{
+pub use crate::repository::{
     CapabilityCeiling, Enrolment, EnrolmentKey, RepositoryId, RepositoryKind,
 };
-pub use crate::catalogue::search::{Candidate, MatchIndex, Observation, Resolution};
-pub use crate::catalogue::store::{PackageCheck, ReadyPackage, Store};
-pub use crate::catalogue::trust::{MetadataVersions, VerifiedGeneration};
+pub use crate::search::{Candidate, MatchIndex, Observation, Resolution};
+pub use crate::store::{PackageCheck, ReadyPackage, Store};
+pub use crate::trust::{MetadataVersions, VerifiedGeneration};
 
-use crate::catalogue::authority::committed;
-use crate::catalogue::db::{Changes, Db, Records};
-use crate::catalogue::trust::{PACKAGE_PREFIX, TargetRecord};
+use crate::authority::committed;
+use crate::db::{Changes, Db, Records};
+use crate::trust::{PACKAGE_PREFIX, TargetRecord};
 
 /// Why a payload is being fetched.
 ///
@@ -2275,7 +2279,7 @@ fn not_installed(plugin_id: &PluginId) -> CatalogueError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalogue::store::flush_fault;
+    use crate::store::flush_fault;
     use kr_plugin_sdk::limits::RepositoryBudgets;
     use kr_protocol::error::{ErrorCode, ProtocolError};
     use kr_protocol::receipt::ReceiptState;
@@ -2352,7 +2356,7 @@ mod tests {
             "a later root that changes nothing does not clear it"
         );
 
-        let floors = |working: &crate::catalogue::store::WorkingDatastore| {
+        let floors = |working: &crate::store::WorkingDatastore| {
             ["timestamp.json", "snapshot.json", "targets.json"]
                 .map(|role| working.path().join(role).is_file())
         };

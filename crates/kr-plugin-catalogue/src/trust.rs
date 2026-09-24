@@ -34,9 +34,9 @@ use kr_protocol::ids::RepositoryGeneration;
 use tough::schema::{PathSet, Targets};
 use tough::{ExpirationEnforcement, IntoVec as _, Repository, RepositoryLoader, TargetName};
 
-use crate::catalogue::budget::{BudgetLedger, Stage};
-use crate::catalogue::error::{CatalogueError, CatalogueResult};
-use crate::catalogue::repository::Enrolment;
+use crate::budget::{BudgetLedger, Stage};
+use crate::error::{CatalogueError, CatalogueResult};
+use crate::repository::Enrolment;
 
 /// The target name of the catalogue index.
 pub const INDEX_TARGET: &str = "index.json";
@@ -506,7 +506,7 @@ pub async fn verify(
     // package whose declared layout is unsafe is refused for that, rather than for whichever of
     // its consequences the comparison happens to notice first.
     for entry in &index.entries {
-        crate::catalogue::extract::check_declared(entry, ledger)?;
+        crate::extract::check_declared(entry, ledger)?;
     }
     for name in declared_target_names(&index) {
         let record =
@@ -882,8 +882,8 @@ fn classify_transport(error: &tough::TransportError) -> CatalogueError {
 /// repository sending what it did not sign.
 fn past_a_length(max_size: u64, specifier: &str) -> CatalogueError {
     if specifier.ends_with(" argument") || specifier.ends_with(" parameter") {
-        return CatalogueError::ResourceLimit(crate::catalogue::budget::ResourceLimit {
-            resource: crate::catalogue::budget::Resource::MetadataBytes,
+        return CatalogueError::ResourceLimit(crate::budget::ResourceLimit {
+            resource: crate::budget::Resource::MetadataBytes,
             limit: max_size,
             requested: max_size.saturating_add(1),
             stage: Stage::Actual,
@@ -899,7 +899,7 @@ fn past_a_length(max_size: u64, specifier: &str) -> CatalogueError {
 
 /// The budget refusal the budgeted transport stops a stream with, carried as the error's cause.
 #[derive(Debug)]
-struct BudgetExceeded(crate::catalogue::budget::ResourceLimit);
+struct BudgetExceeded(crate::budget::ResourceLimit);
 
 impl core::fmt::Display for BudgetExceeded {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -968,8 +968,8 @@ impl tough::Transport for BudgetedTransport {
                     return Err(tough::TransportError::new_with_cause(
                         tough::TransportErrorKind::Other,
                         named.clone(),
-                        BudgetExceeded(crate::catalogue::budget::ResourceLimit {
-                            resource: crate::catalogue::budget::Resource::MetadataBytes,
+                        BudgetExceeded(crate::budget::ResourceLimit {
+                            resource: crate::budget::Resource::MetadataBytes,
                             limit: budget,
                             requested: total,
                             stage: Stage::Actual,

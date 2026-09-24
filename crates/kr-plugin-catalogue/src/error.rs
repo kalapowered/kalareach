@@ -8,7 +8,7 @@
 use kr_plugin_sdk::capability::PluginCapability;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 
-use crate::catalogue::budget::ResourceLimit;
+use crate::budget::ResourceLimit;
 
 /// The result of a catalogue operation.
 pub type CatalogueResult<T> = Result<T, CatalogueError>;

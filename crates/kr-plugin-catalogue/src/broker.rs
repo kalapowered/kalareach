@@ -23,7 +23,7 @@ use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::ids::PluginId;
 use kr_protocol::ids::EnvironmentId;
 
-use crate::catalogue::error::{CatalogueError, CatalogueResult};
+use crate::error::{CatalogueError, CatalogueResult};
 
 /// What the catalogue asks the broker about.
 #[derive(Clone, Debug, PartialEq, Eq)]

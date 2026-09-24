@@ -5,7 +5,7 @@
 //!
 //! * it is **installed** in this environment, at one exact package hash;
 //! * it is **enabled** there, which is a separate decision from installing it;
-//! * its rules **recognise** what is running, which [`crate::catalogue::search`] answers.
+//! * its rules **recognise** what is running, which [`crate::search`] answers.
 //!
 //! A binding records the hash it was made against. An upgrade moves the installation and leaves
 //! every live binding where it is, because a running process was qualified against the bytes it
@@ -22,10 +22,10 @@ use kr_plugin_sdk::ids::{PluginId, PluginName, PublisherId};
 use kr_plugin_sdk::version::PackageVersion;
 use kr_protocol::ids::EnvironmentId;
 
-use crate::catalogue::ceiling::InstallationGrant;
-use crate::catalogue::error::{CatalogueError, CatalogueResult};
-use crate::catalogue::repository::{CapabilityCeiling, EnrolmentKey, RepositoryId};
-use crate::catalogue::store::ReadyPackage;
+use crate::ceiling::InstallationGrant;
+use crate::error::{CatalogueError, CatalogueResult};
+use crate::repository::{CapabilityCeiling, EnrolmentKey, RepositoryId};
+use crate::store::ReadyPackage;
 
 /// What an administrator has said should happen to a live binding whose package is revoked.
 ///
@@ -504,7 +504,7 @@ mod tests {
         let mut manifest = example_manifest();
         manifest.version = entry.version.clone();
         let mut installation = Installation::from_package(
-            &crate::catalogue::store::ReadyPackage::unchecked(entry.manifest_digest, manifest),
+            &crate::store::ReadyPackage::unchecked(entry.manifest_digest, manifest),
             EnrolmentKey::generate().expect("a key"),
             RepositoryId::new("official").expect("a valid identifier"),
             environment(),

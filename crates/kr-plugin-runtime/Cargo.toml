@@ -11,10 +11,8 @@ publish.workspace = true
 [dependencies]
 cap-fs-ext.workspace = true
 cap-std.workspace = true
-futures.workspace = true
 kr-cbor.workspace = true
 kr-crypto.workspace = true
-jiff.workspace = true
 kr-ipc.workspace = true
 kr-plugin-sdk.workspace = true
 kr-protocol.workspace = true
@@ -24,12 +22,7 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 thread-priority.workspace = true
-rustix = { workspace = true, features = ["fs"] }
-# The catalogue's records and receipts: one transactional owner, written with full durability.
-rusqlite = { workspace = true, features = ["bundled"] }
-tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
-tough.workspace = true
-url.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 wasmtime.workspace = true
 
 # The open flag that stops a name replaced by a named pipe from holding a read open until somebody
@@ -39,9 +32,7 @@ wasmtime.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
-aws-lc-rs.workspace = true
 kr-ipc = { workspace = true, features = ["testing"] }
-serde_json.workspace = true
 tempfile.workspace = true
 
 # The workspace forbids unsafe code, which a crate that reads a compiled artefact back cannot

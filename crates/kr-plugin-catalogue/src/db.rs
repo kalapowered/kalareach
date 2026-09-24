@@ -37,14 +37,12 @@ use kr_protocol::ids::{EnvironmentId, RepositoryGeneration};
 use kr_protocol::receipt::ReceiptState;
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 
-use crate::catalogue::authority::{Failure, Permit};
-use crate::catalogue::ceiling::{InstallationGrant, capability_from_str};
-use crate::catalogue::error::{CatalogueError, CatalogueResult};
-use crate::catalogue::install::{DisablePolicy, Installation};
-use crate::catalogue::repository::{
-    CapabilityCeiling, Enrolment, EnrolmentKey, RepositoryId, RepositoryKind,
-};
-use crate::catalogue::trust::{AcceptedTarget, MetadataVersions, TargetRecord};
+use crate::authority::{Failure, Permit};
+use crate::ceiling::{InstallationGrant, capability_from_str};
+use crate::error::{CatalogueError, CatalogueResult};
+use crate::install::{DisablePolicy, Installation};
+use crate::repository::{CapabilityCeiling, Enrolment, EnrolmentKey, RepositoryId, RepositoryKind};
+use crate::trust::{AcceptedTarget, MetadataVersions, TargetRecord};
 
 /// The database file, beside the repositories' directories.
 pub const DATABASE_FILE: &str = "catalogue.sqlite3";

@@ -12,7 +12,7 @@
 //!   setting. [`ResourceLimit`] carries which allowance ran out, what it is and what was asked
 //!   for, so the message says which number to raise.
 //!
-//! Nothing here evicts anything. Reclaiming space is [`crate::catalogue::store`]'s, and it never
+//! Nothing here evicts anything. Reclaiming space is [`crate::store`]'s, and it never
 //! removes a payload a live binding or a pinned generation still needs.
 
 use kr_plugin_sdk::limits::RepositoryBudgets;

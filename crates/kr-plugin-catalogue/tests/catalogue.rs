@@ -15,8 +15,8 @@ mod support;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use kr_plugin_runtime::catalogue::budget::{Resource, Stage};
-use kr_plugin_runtime::catalogue::{
+use kr_plugin_catalogue::budget::{Resource, Stage};
+use kr_plugin_catalogue::{
     Authority, BudgetLedger, CapabilityCeiling, Catalogue, CatalogueError, CatalogueResult, Change,
     Claimed, Committed, DisablePolicy, Effect, Enrolment, FetchReason, Installation,
     InstallationGrant, MatchIndex, Observation, Owner, ReceiptClaim, ReceiptKey, Recording,
@@ -52,18 +52,18 @@ fn repository() -> RepositoryId {
 }
 
 /// Returns true when the package is here and every file its manifest declares checks out.
-fn complete(store: &kr_plugin_runtime::catalogue::Store, digest: PayloadDigest) -> bool {
+fn complete(store: &kr_plugin_catalogue::Store, digest: PayloadDigest) -> bool {
     matches!(
         store.check_package(digest).expect("a readable store"),
-        kr_plugin_runtime::catalogue::PackageCheck::Complete(_)
+        kr_plugin_catalogue::PackageCheck::Complete(_)
     )
 }
 
 /// Returns true when nothing of the package was activated here.
-fn absent(store: &kr_plugin_runtime::catalogue::Store, digest: PayloadDigest) -> bool {
+fn absent(store: &kr_plugin_catalogue::Store, digest: PayloadDigest) -> bool {
     matches!(
         store.check_package(digest).expect("a readable store"),
-        kr_plugin_runtime::catalogue::PackageCheck::Missing { .. }
+        kr_plugin_catalogue::PackageCheck::Missing { .. }
     )
 }
 
@@ -1178,7 +1178,7 @@ fn kr_req_11_10_an_unsafe_path_never_reaches_an_index_or_a_target_name() {
         "packages/other/tool/0.1.0/plugin.json",
     ] {
         assert!(
-            kr_plugin_runtime::catalogue::extract::relative_target(prefix, name).is_err(),
+            kr_plugin_catalogue::extract::relative_target(prefix, name).is_err(),
             "{name} should be refused"
         );
     }
@@ -1344,14 +1344,14 @@ async fn kr_req_11_11_the_default_ceiling_permits_the_three_passive_capabilities
         .find(&plugin(), &version())
         .expect("the package")
         .clone();
-    let decisions = kr_plugin_runtime::catalogue::ceiling::decide(
+    let decisions = kr_plugin_catalogue::ceiling::decide(
         &entry.capabilities,
         &CapabilityCeiling::default_ceiling(),
         &grant,
     );
     assert_eq!(decisions.len(), 6);
     for decision in &decisions {
-        use kr_plugin_runtime::catalogue::GrantRequirement as Requirement;
+        use kr_plugin_catalogue::GrantRequirement as Requirement;
         let expected = match decision.capability {
             PluginCapability::MetadataMatch
             | PluginCapability::DeclarativePresentation
@@ -2003,7 +2003,7 @@ fn kr_req_11_15_the_runtime_state_vocabulary_is_one_vocabulary() {
 
 #[test]
 fn kr_req_11_18_a_qualification_creates_no_effect_and_raises_no_grant() {
-    use kr_plugin_runtime::catalogue::evidence;
+    use kr_plugin_catalogue::evidence;
 
     let entry = support::example_entry();
     // An installation of the package this entry describes, recorded with what its manifest asks
@@ -2014,7 +2014,7 @@ fn kr_req_11_18_a_qualification_creates_no_effect_and_raises_no_grant() {
         plugin_name: entry.plugin_name.clone(),
         version: entry.version.clone(),
         package_digest: entry.manifest_digest,
-        enrolment: kr_plugin_runtime::catalogue::EnrolmentKey::generate().expect("a key"),
+        enrolment: kr_plugin_catalogue::EnrolmentKey::generate().expect("a key"),
         repository: repository(),
         environment_id: environment(),
         enabled: false,
@@ -2326,11 +2326,11 @@ fn an_explicit_selection_wins_a_conflict() {
     });
     assert_eq!(found.len(), 2);
     assert!(matches!(
-        kr_plugin_runtime::catalogue::search::resolve(found.clone(), None),
+        kr_plugin_catalogue::search::resolve(found.clone(), None),
         Resolution::Conflict(_)
     ));
     let chosen = index.entries[1].plugin_id.clone();
-    match kr_plugin_runtime::catalogue::search::resolve(found, Some(&chosen)) {
+    match kr_plugin_catalogue::search::resolve(found, Some(&chosen)) {
         Resolution::Selected(candidate) => assert_eq!(candidate.plugin_id, chosen),
         other => panic!("the selection should win: {other:?}"),
     }
@@ -3590,11 +3590,11 @@ async fn an_action_is_claimed_once_settled_with_its_effect_and_recovered_as_unkn
         Claimed::Fresh
     );
     let mut rendered = 0u32;
-    let mut render = |transition: &kr_plugin_runtime::catalogue::Transition| {
+    let mut render = |transition: &kr_plugin_catalogue::Transition| {
         rendered += 1;
         assert!(matches!(
             transition,
-            kr_plugin_runtime::catalogue::Transition::Changed(_)
+            kr_plugin_catalogue::Transition::Changed(_)
         ));
         Ok(b"the answer".to_vec())
     };

@@ -1,6 +1,6 @@
 //! The plugin catalogue and plugin method groups, hosted by the control daemon.
 //!
-//! The daemon owns the admission and the environment; `kr-plugin-runtime` owns the trust roots,
+//! The daemon owns the admission and the environment; `kr-plugin-catalogue` owns the trust roots,
 //! the budgets, the signed snapshot, the packages, what an installed package may do and the
 //! receipts of the actions performed on them. What this module adds is the part that has to be
 //! the daemon's.
@@ -28,7 +28,7 @@
 
 use std::sync::Arc;
 
-use kr_plugin_runtime::catalogue::{
+use kr_plugin_catalogue::{
     Authority, CapabilityCeiling, Catalogue, CatalogueError, CatalogueResult, Change, Claimed,
     Effect, Enrolment, Installation, InstallationGrant, InstallationView, Owner, ReceiptClaim,
     ReceiptKey, ReceiptRecord, Recording, RepositoryId, RepositoryKind, RepositoryView, Transition,
@@ -1050,7 +1050,7 @@ fn fallback_evidence(
 
 fn grants(
     requested: &[kr_plugin_sdk::capability::CapabilityRequest],
-    decisions: &[kr_plugin_runtime::catalogue::CapabilityDecision],
+    decisions: &[kr_plugin_catalogue::CapabilityDecision],
 ) -> Answer<Vec<wire::PluginCapabilityGrant>> {
     decisions
         .iter()
@@ -1084,7 +1084,7 @@ fn evidence(
     let revision = kr_protocol::ids::CapabilityRevision::new(generation.max(1));
     let mut records = Vec::new();
     for qualification in &entry.qualification {
-        match kr_plugin_runtime::catalogue::evidence::from_qualification(
+        match kr_plugin_catalogue::evidence::from_qualification(
             entry,
             installation,
             qualification,
@@ -1124,7 +1124,7 @@ fn evidence(
         if records.iter().any(|record| record.capability == id) {
             continue;
         }
-        let record = kr_plugin_runtime::catalogue::evidence::untested(
+        let record = kr_plugin_catalogue::evidence::untested(
             installation,
             request.capability,
             revision,
@@ -1239,13 +1239,13 @@ fn wire_evidence(
 }
 
 fn capability_id(capability: PluginCapability) -> Answer<kr_protocol::ids::CapabilityId> {
-    kr_plugin_runtime::catalogue::evidence::capability_id(capability).map_err(ProtocolError::from)
+    kr_plugin_catalogue::evidence::capability_id(capability).map_err(ProtocolError::from)
 }
 
 const fn requirement_of(
-    requirement: kr_plugin_runtime::catalogue::GrantRequirement,
+    requirement: kr_plugin_catalogue::GrantRequirement,
 ) -> wire::PluginGrantRequirement {
-    use kr_plugin_runtime::catalogue::GrantRequirement as Source;
+    use kr_plugin_catalogue::GrantRequirement as Source;
     match requirement {
         Source::WithinCeiling => wire::PluginGrantRequirement::WithinCeiling,
         Source::RepositoryGrant => wire::PluginGrantRequirement::RepositoryGrant,
@@ -1533,7 +1533,7 @@ mod tests {
 
     #[test]
     fn a_catalogue_refusal_keeps_its_own_code() {
-        use kr_plugin_runtime::catalogue::CatalogueError;
+        use kr_plugin_catalogue::CatalogueError;
         assert_eq!(
             ProtocolError::from(CatalogueError::UnavailableOffline {
                 detail: "component.wasm is not cached here".to_owned(),

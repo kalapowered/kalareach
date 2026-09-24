@@ -24,8 +24,8 @@ use std::collections::BTreeSet;
 
 use kr_plugin_sdk::capability::{CapabilityRequest, PluginCapability};
 
-use crate::catalogue::error::{CatalogueError, CatalogueResult};
-use crate::catalogue::repository::CapabilityCeiling;
+use crate::error::{CatalogueError, CatalogueResult};
+use crate::repository::CapabilityCeiling;
 
 /// Returns the capability one wire name spells.
 ///

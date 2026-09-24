@@ -21,7 +21,7 @@ use std::path::Path;
 use kr_client::session::Session;
 use kr_controller::sharing::{CatalogueTrustPlan, PluginGrantPlan};
 use kr_crypto::keys::DeviceKeys;
-use kr_plugin_runtime::catalogue::{CapabilityCeiling, Enrolment, RepositoryId, RepositoryKind};
+use kr_plugin_catalogue::{CapabilityCeiling, Enrolment, RepositoryId, RepositoryKind};
 use kr_protocol::catalogue as wire;
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};

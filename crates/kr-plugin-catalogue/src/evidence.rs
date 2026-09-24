@@ -35,8 +35,8 @@ use kr_plugin_sdk::text::DisabledReason;
 use kr_protocol::ids::{CapabilityRevision, EnvironmentId};
 use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs};
 
-use crate::catalogue::error::{CatalogueError, CatalogueResult};
-use crate::catalogue::install::Installation;
+use crate::error::{CatalogueError, CatalogueResult};
+use crate::install::Installation;
 
 /// The capability namespace prefix a plugin capability lives under.
 ///
@@ -343,8 +343,8 @@ mod tests {
     use kr_plugin_sdk::version::PackageVersion;
     use kr_protocol::scalars::Uuid;
 
-    use crate::catalogue::ceiling::InstallationGrant;
-    use crate::catalogue::repository::RepositoryId;
+    use crate::ceiling::InstallationGrant;
+    use crate::repository::RepositoryId;
 
     fn now() -> TimestampMs {
         TimestampMs::new(1_760_000_000_000)
@@ -356,15 +356,12 @@ mod tests {
 
     fn installation(entry: &IndexEntry) -> Installation {
         Installation::from_package(
-            &crate::catalogue::store::ReadyPackage::unchecked(
-                entry.manifest_digest,
-                example_manifest(),
-            ),
-            crate::catalogue::repository::EnrolmentKey::generate().expect("a key"),
+            &crate::store::ReadyPackage::unchecked(entry.manifest_digest, example_manifest()),
+            crate::repository::EnrolmentKey::generate().expect("a key"),
             RepositoryId::new("official").expect("a valid identifier"),
             EnvironmentId::new(Uuid::NIL),
             InstallationGrant::none(),
-            crate::catalogue::repository::CapabilityCeiling::default_ceiling(),
+            crate::repository::CapabilityCeiling::default_ceiling(),
         )
     }
 

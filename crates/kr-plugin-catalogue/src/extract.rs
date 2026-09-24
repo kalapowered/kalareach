@@ -30,8 +30,8 @@ use kr_plugin_sdk::paths::{CollisionKind, PackagePath, find_collisions};
 use kr_plugin_sdk::plugin::PluginManifest;
 use kr_plugin_sdk::validate::{Validated, validate_package_directory};
 
-use crate::catalogue::budget::{BudgetLedger, Stage};
-use crate::catalogue::error::{CatalogueError, CatalogueResult};
+use crate::budget::{BudgetLedger, Stage};
+use crate::error::{CatalogueError, CatalogueResult};
 
 /// Checks what an index entry declares, before a single byte is fetched.
 ///

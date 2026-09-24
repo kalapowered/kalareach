@@ -770,7 +770,7 @@ pub fn conflicting_index() -> CatalogueIndex {
 /// Returns how many entries an offline search finds.
 #[must_use]
 pub fn search_len(index: &CatalogueIndex, query: &str) -> usize {
-    kr_plugin_runtime::catalogue::search::search(index, query, usize::MAX).len()
+    kr_plugin_catalogue::search::search(index, query, usize::MAX).len()
 }
 
 /// Returns the directory URL the client reads a local repository through.

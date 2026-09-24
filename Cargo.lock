@@ -4193,7 +4193,7 @@ dependencies = [
  "kr-delivery",
  "kr-ipc",
  "kr-pairing",
- "kr-plugin-runtime",
+ "kr-plugin-catalogue",
  "kr-plugin-sdk",
  "kr-project",
  "kr-protocol",
@@ -4314,6 +4314,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-plugin-catalogue"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "futures",
+ "jiff",
+ "kr-crypto",
+ "kr-ipc",
+ "kr-plugin-sdk",
+ "kr-protocol",
+ "rusqlite",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tough",
+ "url",
+]
+
+[[package]]
 name = "kr-plugin-host"
 version = "0.1.0"
 dependencies = [
@@ -4336,19 +4358,14 @@ dependencies = [
 name = "kr-plugin-runtime"
 version = "0.1.0"
 dependencies = [
- "aws-lc-rs",
  "cap-fs-ext",
  "cap-std",
- "futures",
- "jiff",
  "kr-cbor",
  "kr-crypto",
  "kr-ipc",
  "kr-plugin-sdk",
  "kr-protocol",
  "libc",
- "rusqlite",
- "rustix",
  "schemars 1.2.2",
  "serde",
  "serde_json",
@@ -4357,8 +4374,6 @@ dependencies = [
  "thiserror 2.0.20",
  "thread-priority",
  "tokio",
- "tough",
- "url",
  "wasmtime",
 ]
 

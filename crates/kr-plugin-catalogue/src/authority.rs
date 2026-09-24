@@ -24,8 +24,8 @@ use kr_plugin_sdk::digest::PayloadDigest;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::receipt::ReceiptState;
 
-use crate::catalogue::error::{CatalogueError, CatalogueResult};
-use crate::catalogue::repository::RepositoryId;
+use crate::error::{CatalogueError, CatalogueResult};
+use crate::repository::RepositoryId;
 
 /// Whoever admitted a catalogue change.
 pub trait Authority: Send + Sync {

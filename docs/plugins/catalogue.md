@@ -16,6 +16,11 @@ repository ──signed metadata──▶ index (held whole, searched offline)
                 └──payload, by content hash──▶ cache ──verify──▶ package ──▶ binding
 ```
 
+The client is its own crate, `crates/kr-plugin-catalogue`. It verifies, stores and fetches, and it
+hosts no component, so the control daemon that serves the catalogue and plugin methods links no
+Wasm engine. Components run in the plugin runtime's own process, as `docs/plugins/runtime.md`
+describes.
+
 ## Enrolment comes first
 
 Nothing is fetched before a repository is enrolled, and enrolment fixes four things.
@@ -233,5 +238,5 @@ and a host may supply another. Which transport carried the bytes changes nothing
 never trusted the transport, only the signatures over what it delivered.
 
 Capability evidence from a live binding, and admission of a package's declarative proxy, come from
-the trusted broker through a trait this crate defines. Where no broker is bound, there is no live
-evidence and no proxy is admitted, and both say so rather than guessing.
+the trusted broker through a trait the catalogue client defines. Where no broker is bound, there
+is no live evidence and no proxy is admitted, and both say so rather than guessing.

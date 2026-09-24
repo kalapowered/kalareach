@@ -26,7 +26,9 @@ kr-crypto.workspace = true
 kr-delivery.workspace = true
 kr-ipc.workspace = true
 kr-pairing.workspace = true
-kr-plugin-runtime.workspace = true
+# The catalogue client: verification, storage and network, and no component engine, so this
+# daemon links no Wasm engine.
+kr-plugin-catalogue.workspace = true
 kr-plugin-sdk.workspace = true
 kr-protocol.workspace = true
 kr-project.workspace = true

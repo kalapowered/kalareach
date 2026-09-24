@@ -1,0 +1,39 @@
+[package]
+name = "kr-plugin-catalogue"
+description = "KalaReach plugin catalogue client: repository enrolment and budgets, the signed metadata snapshot and its verification, offline search, package activation and what an installed package may do"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Verification, storage and network code, and no component engine: the control daemon links this
+# crate, and neither the daemon nor a worker may link a Wasm engine.
+[dependencies]
+futures.workspace = true
+jiff.workspace = true
+kr-crypto.workspace = true
+kr-plugin-sdk.workspace = true
+kr-protocol.workspace = true
+# The catalogue's records and receipts: one transactional owner, written with full durability.
+rusqlite = { workspace = true, features = ["bundled"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tough.workspace = true
+url.workspace = true
+
+# The advisory lock that keeps a second process from writing into the same repository store. On
+# Windows the same exclusion is the open itself, with no sharing.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["fs"] }
+
+[dev-dependencies]
+aws-lc-rs.workspace = true
+kr-ipc.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

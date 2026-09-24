@@ -13,7 +13,7 @@ use kr_controller::catalogue::{Admission, CatalogueModule};
 use kr_controller::sharing::{
     CatalogueTrustPlan, ConfirmedAction, OwnerConfirmations, PluginGrantPlan,
 };
-use kr_plugin_runtime::catalogue::{
+use kr_plugin_catalogue::{
     Authority, CapabilityCeiling, CatalogueError, CatalogueResult, Effect, Enrolment, Owner,
     RepositoryId, RepositoryKind,
 };
@@ -604,8 +604,7 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
 
     let digest = {
         let catalogue = host.module.catalogue().lock().await;
-        let id = kr_plugin_runtime::catalogue::RepositoryId::new("development")
-            .expect("a valid identifier");
+        let id = kr_plugin_catalogue::RepositoryId::new("development").expect("a valid identifier");
         let index = catalogue.index(&id).expect("an activated index");
         index
             .find(
@@ -872,8 +871,7 @@ async fn kr_req_23_29_removing_a_catalogue_does_not_uninstall_what_came_from_it(
         .await);
     let digest = {
         let catalogue = host.module.catalogue().lock().await;
-        let id = kr_plugin_runtime::catalogue::RepositoryId::new("development")
-            .expect("a valid identifier");
+        let id = kr_plugin_catalogue::RepositoryId::new("development").expect("a valid identifier");
         catalogue
             .index(&id)
             .expect("activated")
@@ -1953,7 +1951,7 @@ async fn database_of(host: &Host) -> std::path::PathBuf {
         .lock()
         .await
         .root()
-        .join(kr_plugin_runtime::catalogue::db::DATABASE_FILE)
+        .join(kr_plugin_catalogue::db::DATABASE_FILE)
 }
 
 /// A deadline that passes while a change waits for another writer's lock changes nothing.

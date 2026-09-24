@@ -26,7 +26,7 @@ use kr_plugin_sdk::limits::RepositoryBudgets;
 use kr_protocol::ids::RepositoryGeneration;
 use url::Url;
 
-use crate::catalogue::error::{CatalogueError, CatalogueResult};
+use crate::error::{CatalogueError, CatalogueResult};
 
 /// How much a repository is trusted before any package asks for anything.
 ///
@@ -381,9 +381,9 @@ impl Enrolment {
                     .to_owned(),
             });
         }
-        crate::catalogue::budget::BudgetLedger::new(budgets).check_metadata_bytes(
+        crate::budget::BudgetLedger::new(budgets).check_metadata_bytes(
             root.len() as u64,
-            crate::catalogue::budget::Stage::Actual,
+            crate::budget::Stage::Actual,
             "root.json",
         )?;
         Ok(Self {
