@@ -2611,6 +2611,11 @@ const EXIT_ALLOWANCE: Duration = Duration::from_secs(2);
 /// limit applies only to an attempt whose readings of `kr status` place the closure. One they
 /// cannot place shows nothing either way, and the watch's own liveness bound still fails a worker
 /// that never ends.
+///
+/// The bound itself is checked exactly in the worker's own closure tests
+/// (`crates/kr-worker/tests/closure.rs`). They start the same wait the worker makes before it
+/// exits, so they know when it began, and they measure it from there. This test keeps what only a
+/// real worker process shows: that it waits, and that it ends.
 const EXIT_LIMIT: Duration = Duration::from_secs(10);
 
 /// How closely the readings of `kr status` have to place the moment the session became closed for
@@ -2637,7 +2642,10 @@ const PLACEMENT: Duration = Duration::from_secs(1);
 /// on holds: two megabytes, where a socket or a pipe takes a few hundred kilobytes at the most. A
 /// transport that took it all would let a correct worker send both closures and end at once, and
 /// the check that the worker is still waiting would then fail rather than pass: a wrong premise
-/// shows as a failure here, never as a pass.
+/// shows as a failure here, never as a pass. How much a stalled connection holds is set on the
+/// worker's side, which a separate worker process keeps to itself. The worker's own closure tests
+/// serve on a transport whose buffer they set and watch the delivery stop part way through a frame
+/// before they rely on it.
 fn stalled_attachments(host: &Host) -> (SessionId, Result<(), String>) {
     let created = host.create_invisible();
     let gate = host.work.join("flood");
