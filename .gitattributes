@@ -1,0 +1,10 @@
+# Every file is checked out exactly as it was committed, on every platform.
+#
+# Much of this repository is bytes that something pins: vectors the code regenerates and compares,
+# signed documents such as the model profiles and the plugin catalogue, payloads a lock names by
+# digest such as the bundled plugins and the contact skill, generated schemas, and the shell
+# packages, startup files and scripts a test runs. A checkout that rewrote line endings, as Git does
+# on Windows with core.autocrlf set, would hand each of them bytes other than those that were
+# signed, hashed or run. Every text file here is committed with LF endings and none needs another,
+# so one rule for every file is the rule that still holds when the next pinned file is added.
+* -text

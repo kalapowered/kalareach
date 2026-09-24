@@ -1,5 +1,0 @@
-# A catalogue generation is signed bytes: its timestamp and snapshot metadata pin each document's
-# exact length and hash, and the targets metadata pins every payload's. A checkout that rewrote
-# line endings would hand the client a generation that no longer verifies, so every file of one is
-# checked out exactly as it was committed, on every platform.
-development/** -text
