@@ -818,8 +818,15 @@ async fn a_query_flood_is_degraded_rather_than_forwarded_and_the_keys_still_arri
     // A background loop asks the host what it is as fast as the shell can print, while the
     // application waits for a line from the person. The line it reads carries the host's answers
     // in front of what the person typed, so it says only whether the typing was at the end.
+    //
+    // The loop starts only when this test releases it, once its terminal is attached and holds the
+    // keys. Attaching and taking the lease are mutations, and a mutation has a deadline: sent while
+    // the flood was already running, each would wait on a session the flood keeps busy for as long
+    // as the machine is slow, and the test would be racing that deadline rather than watching the
+    // lane degrade. Nothing after the release has a deadline of its own.
     let host = host(
-        "stty raw -echo || exit 1; (while :; do printf '\\033[c'; done) & flood=$!; \
+        "stty raw -echo || exit 1; printf 'kr-ready.'; IFS= read -r _; \
+         (while :; do printf '\\033[c'; done) & flood=$!; \
          printf 'kr-flooding.'; IFS= read -r line; kill $flood; \
          case \"$line\" in *kr-typed) printf 'kr-typed:kr-end' ;; *) printf 'kr-lost:kr-end' ;; esac; \
          read -r _",
@@ -827,6 +834,8 @@ async fn a_query_flood_is_degraded_rather_than_forwarded_and_the_keys_still_arri
     .await;
     let (mut client, _, mut keys) =
         attached_holding_the_keys(&host, Dimensions::new(CANONICAL.0, CANONICAL.1)).await;
+    produced(&host.runtime, b"kr-ready.").await;
+    keys.release(&host.runtime);
     produced(&host.runtime, b"kr-flooding.").await;
     // The flood has outrun the lane's budget, and the host says so out of band, before the person
     // types anything.
