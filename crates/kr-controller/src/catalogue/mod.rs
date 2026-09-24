@@ -671,8 +671,8 @@ impl CatalogueModule {
                 // The confirmation names the repository and its ceiling with the release, the hash
                 // and the grant, and is spent the way `plugin.grant` spends one: accepted and
                 // consumed here, and asked again inside the commit.
-                let confirmed = match params.owner_confirmation.as_ref() {
-                    None => None,
+                let (confirmed, decided_under) = match params.owner_confirmation.as_ref() {
+                    None => (None, None),
                     Some(proof) => {
                         let enrolment = catalogue
                             .repository(&id)
@@ -707,13 +707,18 @@ impl CatalogueModule {
                             proof,
                             "installation",
                         )?;
-                        Some(Confirmed {
-                            admission,
-                            confirmed,
-                            action_digest,
-                            confirmations,
-                            subject: "installation",
-                        })
+                        (
+                            Some(Confirmed {
+                                admission,
+                                confirmed,
+                                action_digest,
+                                confirmations,
+                                subject: "installation",
+                            }),
+                            // The ceiling the owner was shown, which the catalogue holds the
+                            // installation to once the repository is held and inside the commit.
+                            Some(enrolment.ceiling),
+                        )
                     }
                 };
                 let authority: &dyn Authority = match &confirmed {
@@ -735,6 +740,7 @@ impl CatalogueModule {
                         &version,
                         digest,
                         grant,
+                        decided_under.as_ref(),
                         &mut Change::settling(authority, key, now, &mut render),
                     )
                     .await

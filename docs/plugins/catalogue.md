@@ -301,7 +301,9 @@ every release that installs a native bridge. What the replaced installation coul
 the ceiling it was installed under, so a move to a repository that permits more is an increase
 too. The confirmation names the repository and its ceiling, as `catalogue.list` reports them, the
 release, the package hash and the grant; it is accepted and consumed the way `plugin.grant`'s is,
-and asked again when the installation is recorded. An installation that widens nothing needs none,
+and asked again when the installation is recorded. The installation is held to the ceiling the
+owner was shown: a repository whose ceiling changed after the confirmation, before the installation
+holds it or before the installation is recorded, refuses it, and a new confirmation is needed. An installation that widens nothing needs none,
 and one that is given is spent all the same. `plugin.grant` takes the same confirmation for every
 widening of an installed package, so removing a package and installing it again is not a way
 around it.

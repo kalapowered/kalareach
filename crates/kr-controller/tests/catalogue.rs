@@ -94,6 +94,9 @@ struct Ceremony {
     clock: Clock,
     device_id: kr_protocol::ids::DeviceId,
     endpoint_id: kr_protocol::scalars::EndpointKey,
+    /// A step of a test's own, run once just after this host accepts a confirmation: after the
+    /// daemon built what the owner confirmed, and before the change it confirms holds anything.
+    after_accept: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Ceremony {
@@ -104,6 +107,7 @@ impl Ceremony {
             clock: Clock::default(),
             device_id: kr_protocol::ids::DeviceId::new(kr_ipc::new_uuid()),
             endpoint_id: kr_protocol::scalars::EndpointKey::from_bytes([7u8; 32]),
+            after_accept: std::sync::Mutex::new(None),
         }
     }
 
@@ -139,7 +143,7 @@ impl OwnerConfirmations for Ceremony {
         action_digest: Digest256,
         proof: &OwnerConfirmationProof,
     ) -> kr_controller::Result<ConfirmedAction> {
-        ConfirmedAction::verify(
+        let accepted = ConfirmedAction::verify(
             &kr_pairing::confirm::ConfirmationExpectation {
                 action,
                 action_digest,
@@ -154,7 +158,12 @@ impl OwnerConfirmations for Ceremony {
             proof,
             self.owner.public(),
             kr_pairing::confirm::HostEnrolment::Enrolled,
-        )
+        );
+        let then = self.after_accept.lock().expect("the step").take();
+        if let Some(then) = then {
+            then();
+        }
+        accepted
     }
 
     fn host_device_id(&self) -> kr_protocol::ids::DeviceId {
@@ -1859,6 +1868,55 @@ async fn kr_req_10_05_and_11_11_a_confirmation_for_a_narrow_repository_is_not_on
         )
         .await);
     assert_eq!(installed.plugin.catalogue_id, "wide");
+}
+
+/// A confirmation spent on an installation holds it to the ceiling the owner was shown. A ceiling
+/// widened by another catalogue on the same directory after the confirmation was accepted, and
+/// before the installation holds the repository, refuses the installation and installs nothing.
+#[tokio::test]
+async fn kr_req_10_05_and_11_11_a_ceiling_widened_after_the_confirmation_refuses_the_installation()
+{
+    let host = host();
+    let digest = synchronised(&host).await;
+    let ceiling = listed_ceiling(&host, "development").await;
+    let root = host.module.catalogue().lock().await.root().to_path_buf();
+    *host.ceremony.after_accept.lock().expect("the step") = Some(Box::new(move || {
+        let mut other = kr_plugin_catalogue::Catalogue::open(&root).expect("a second catalogue");
+        let id = RepositoryId::new("development").expect("a valid identifier");
+        let mut enrolment = other.repository(&id).expect("readable").expect("enrolled");
+        enrolment.ceiling =
+            CapabilityCeiling::with([kr_plugin_sdk::capability::PluginCapability::TranscriptTail]);
+        other
+            .update_enrolment(enrolment, true)
+            .expect("the owner widened it");
+    }));
+
+    let shown = install_plan(&host, "development", &ceiling, &digest, &[]);
+    let refused = refusal(
+        host.module
+            .write_frame_admitted(
+                &mutation(
+                    Method::PluginInstall,
+                    host.environment_id,
+                    &confirmed_install(&host, "development", &digest, &shown),
+                ),
+                Method::PluginInstall,
+                Some(host.confirmations()),
+            )
+            .await,
+    );
+    assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
+    assert!(refused.message.contains("ceiling"), "{refused:?}");
+    assert!(
+        host.module
+            .catalogue()
+            .lock()
+            .await
+            .installation(host.environment_id, &plugin())
+            .expect("readable")
+            .is_none(),
+        "nothing was installed"
+    );
 }
 
 /// Enrols and synchronises the development catalogue as the owner, and returns the example

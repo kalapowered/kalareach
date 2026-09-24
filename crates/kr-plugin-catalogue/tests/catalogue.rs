@@ -1627,6 +1627,7 @@ async fn install_as(
             &PackageVersion::parse(version).expect("a valid version"),
             digest,
             InstallationGrant::with(grant.iter().copied()),
+            None,
             &mut Change::new(&owner),
         )
         .await
@@ -1980,6 +1981,101 @@ async fn kr_req_11_11_installing_again_after_a_removal_needs_the_owners_confirma
             .expect("readable")
             .is_none()
     );
+}
+
+/// An installation decided under one ceiling is refused where its repository has another by the
+/// time the installation holds the repository, or by the time it commits: an owner's confirmation
+/// was shown the first, and what the installation may do depends on it. Decided again under the
+/// ceiling the repository has now, it installs.
+#[tokio::test]
+async fn kr_req_11_11_an_installation_decided_under_one_ceiling_is_refused_under_another() {
+    for moment in [
+        "before the repository is held",
+        "while a payload is fetched",
+    ] {
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let generation = Generation::build(
+            home.path(),
+            GenerationSpec {
+                capabilities: passive_and(&[PluginCapability::TranscriptTail]),
+                ..GenerationSpec::default()
+            },
+        )
+        .await;
+        let mut catalogue = enrolled(
+            home.path(),
+            &generation,
+            RepositoryBudgets::defaults(),
+            CapabilityCeiling::default_ceiling(),
+        )
+        .await;
+        catalogue.sync(&repository()).await.expect("a generation");
+        let shown = CapabilityCeiling::default_ceiling();
+        let wider = CapabilityCeiling::with([PluginCapability::TranscriptTail]);
+        // Another catalogue on the same directory widens the repository's ceiling, as the owner
+        // may.
+        let root = home.path().join("catalogue");
+        let widen = move || {
+            let mut other = Catalogue::open(&root).expect("a second catalogue");
+            let mut enrolment = other
+                .repository(&repository())
+                .expect("readable")
+                .expect("enrolled");
+            enrolment.ceiling = CapabilityCeiling::with([PluginCapability::TranscriptTail]);
+            other
+                .update_enrolment(enrolment, true)
+                .expect("the owner widened it");
+        };
+        if moment == "before the repository is held" {
+            widen();
+        } else {
+            catalogue.set_transport(Arc::new(Interrupting {
+                at: "/packages/",
+                then: Arc::new(std::sync::Mutex::new(Some(Box::new(widen)))),
+            }));
+        }
+        let digest = generation.manifest_digest();
+        let refusal = install_decided_under(&mut catalogue, digest, &shown)
+            .await
+            .expect_err("decided under another ceiling");
+        assert!(
+            matches!(&refusal, CatalogueError::InvalidArgument { detail }
+                if detail.contains("ceiling")),
+            "{moment}: {refusal:?}"
+        );
+        assert!(
+            catalogue
+                .installation(environment(), &plugin())
+                .expect("readable")
+                .is_none(),
+            "{moment}: nothing was installed"
+        );
+        let installed = install_decided_under(&mut catalogue, digest, &wider)
+            .await
+            .unwrap_or_else(|refusal| panic!("{moment}: {refusal}"));
+        assert_eq!(installed.installation.package_digest, digest);
+    }
+}
+
+/// Installs the example package at `digest`, granted a transcript tail, as the owner confirmed it
+/// under `decided_under`.
+async fn install_decided_under(
+    catalogue: &mut Catalogue,
+    digest: PayloadDigest,
+    decided_under: &CapabilityCeiling,
+) -> CatalogueResult<kr_plugin_catalogue::InstallationView> {
+    catalogue
+        .install_with(
+            &repository(),
+            environment(),
+            &plugin(),
+            &version(),
+            digest,
+            InstallationGrant::with([PluginCapability::TranscriptTail]),
+            Some(decided_under),
+            &mut Change::new(&Owner::confirming()),
+        )
+        .await
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4908,6 +5004,7 @@ async fn a_sync_and_an_install_refused_at_their_commit_leave_no_trace_on_disk() 
             &version(),
             generation.manifest_digest(),
             InstallationGrant::none(),
+            None,
             &mut Change::new(&withdrawn),
         )
         .await;

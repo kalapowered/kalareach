@@ -1862,6 +1862,7 @@ impl Catalogue {
             version,
             expected_digest,
             grant,
+            None,
             &mut Change::new(&Owner::acting()),
         )
         .await
@@ -1879,11 +1880,18 @@ impl Catalogue {
     /// installs a native bridge, needs the owner's confirmation, which the change's authority
     /// carries: it is asked before anything is fetched and again inside the commit.
     ///
+    /// `decided_under` is the repository ceiling the caller's decision was made against, where one
+    /// was: the ceiling an owner's confirmation was shown. What an installation may do depends on
+    /// that ceiling, so an installation whose repository has another one by the time it is held,
+    /// or by the time the installation commits, is refused rather than decided under a ceiling
+    /// nobody was shown.
+    ///
     /// # Errors
     ///
     /// Returns the refusal verification, the budgets, the admission, the package rules or the
-    /// ceiling decided, and [`CatalogueError::OwnerConfirmationRequired`] when the installation
-    /// needs the owner's confirmation and the authority does not carry it.
+    /// ceiling decided, [`CatalogueError::OwnerConfirmationRequired`] when the installation
+    /// needs the owner's confirmation and the authority does not carry it, and
+    /// [`CatalogueError::InvalidArgument`] when the repository's ceiling is not `decided_under`.
     // The package identity, the environment, the grant and the change each have to be named
     // separately here, because an installation is authorised against all four.
     #[allow(clippy::too_many_arguments)]
@@ -1895,11 +1903,13 @@ impl Catalogue {
         version: &PackageVersion,
         expected_digest: PayloadDigest,
         grant: InstallationGrant,
+        decided_under: Option<&CapabilityCeiling>,
         change: &mut Change<'_>,
     ) -> CatalogueResult<InstallationView> {
         let authority = change.authority;
         authority.check()?;
         let (store, _lock, enrolled) = self.locked(&self.enrolled(id)?)?;
+        check_decided_under(id, &enrolled.enrolment.ceiling, decided_under)?;
         let active = enrolled.active.ok_or_else(|| CatalogueError::NotFound {
             detail: format!("{id} has no activated generation yet"),
         })?;
@@ -1973,6 +1983,7 @@ impl Catalogue {
                     .ok_or_else(|| CatalogueError::NotFound {
                         detail: format!("{id} was removed while {plugin_id} was installed"),
                     })?;
+            check_decided_under(id, &current.enrolment.ceiling, decided_under)?;
             let previous = changes.installation(environment_id, plugin_id)?;
             check_installation(
                 &entry,
@@ -2496,6 +2507,23 @@ fn check_installation(
         });
     }
     Ok(())
+}
+
+/// Refuses an installation decided under another ceiling than the one its repository has now.
+fn check_decided_under(
+    id: &RepositoryId,
+    ceiling: &CapabilityCeiling,
+    decided_under: Option<&CapabilityCeiling>,
+) -> CatalogueResult<()> {
+    match decided_under {
+        Some(decided) if decided != ceiling => Err(CatalogueError::InvalidArgument {
+            detail: format!(
+                "{id}'s ceiling is not the one this installation was decided under; it changed \
+                 since, and the installation is decided again under the ceiling it has now"
+            ),
+        }),
+        _ => Ok(()),
+    }
 }
 
 /// Returns what a sync or a fetch measures against: the enrolment's budgets and what its
@@ -3343,6 +3371,7 @@ mod tests {
                 &entry.version,
                 entry.manifest_digest,
                 InstallationGrant::none(),
+                None,
                 &mut Change::settling(&recording, key.clone(), 2, &mut never),
             )
             .await;
@@ -3806,6 +3835,7 @@ mod tests {
                 &entry.version,
                 entry.manifest_digest,
                 InstallationGrant::none(),
+                None,
                 &mut Change::settling(
                     &recording,
                     ReceiptKey::new("kr:local", "install"),
