@@ -9,10 +9,13 @@
 //! | KR-REQ-07.62 | The per-session job object: kill-on-close, breakaway disabled, joined before execution |
 //! | KR-REQ-07.63 | A process started outside the job is not held by it and survives its closure; the broker that records it as an external resource is not in this build |
 //! | KR-ACC-010 | Resize, draining, the text the console carries, the interrupt, the process tree, and PowerShell itself |
+//! | KR-REQ-02.04, KR-REQ-05.02 | Each worker keeps a write-ahead-logged SQLite journal of its own and is reached on a named pipe of its own, whose list is protected and its owner's |
+//! | KR-REQ-02.07 | A local caller on a worker's pipe is served as the owner the pipe admits, and the worker still holds it to its own session |
 //!
-//! These drive the terminal directly rather than through a session, because what is under test is
-//! the platform half: the console, the job and the interrupt. The session's own behaviour on top
-//! of them is the same code on every platform and is covered by the suites beside this one.
+//! Most of these drive the terminal directly rather than through a session, because what is under
+//! test is the platform half: the console, the job and the interrupt. The session's own behaviour on
+//! top of them is the same code on every platform and is covered by the suites beside this one. The
+//! last two host a worker, because what they are about is the worker's own endpoint and journal.
 
 #![cfg(windows)]
 
@@ -476,4 +479,291 @@ fn a_resource_started_outside_the_job_is_not_held_by_it(/* KR-REQ-07.63 */) {
     );
     let _ = outside.kill();
     let _ = outside.wait();
+}
+
+/// A worker this test hosts: a session whose root shell is PowerShell, served on the environment's
+/// endpoint for its display number, and the descriptor a local caller finds it by.
+struct Worker {
+    service: std::sync::Arc<kr_worker::service::WorkerService>,
+    session_id: kr_protocol::ids::SessionId,
+    environment_id: kr_protocol::ids::EnvironmentId,
+    endpoint: kr_ipc::paths::Endpoint,
+    descriptor: kr_protocol::worker::WorkerDescriptor,
+    journal: std::path::PathBuf,
+}
+
+fn build() -> kr_protocol::ids::BuildId {
+    kr_protocol::ids::BuildId::new("kr-test/0").expect("a build identifier")
+}
+
+/// Starts a worker for a new session in `temp`'s environment, under `display`.
+async fn worker(temp: &kr_ipc::testing::TempHost, display: u64) -> Worker {
+    use kr_protocol::ids::{ControllerGeneration, SessionEpoch, SessionId};
+
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let display = kr_protocol::session::DisplayNumber::new(display);
+    let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+    let process = kr_ipc::identity::current_process_start_identity().expect("a process identity");
+    let identity = std::sync::Arc::new(
+        kr_ipc::verify::WorkerIdentity::generate(
+            session_id,
+            SessionEpoch::V1,
+            boot.clone(),
+            process.clone(),
+            kr_protocol::hello::PROTOCOL_VERSION,
+        )
+        .expect("a session key"),
+    );
+    // An in-memory store rather than the platform's credential store: all this needs is a
+    // controller key the worker checks a generation token against.
+    let store = kr_crypto::store::MemoryStore::new();
+    let controller = kr_ipc::verify::ControllerIdentity::initialise(&store, environment_id)
+        .expect("a controller identity");
+    let journal = environment.journal_database(session_id);
+    let config = kr_worker::session::SessionConfig {
+        session_id,
+        session_epoch: SessionEpoch::V1,
+        environment_id,
+        display_number: display,
+        shell: powershell_command("Start-Sleep -Seconds 300"),
+        shell_mode: kr_protocol::session::ShellMode::NativeCompat,
+        worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+        desktop: kr_protocol::identity::DesktopBinding::none(),
+        dimensions: Dimensions::new(80, 24),
+        journal_path: Some(journal.clone()),
+        spool_directory: Some(environment.session_spool(session_id)),
+        worker_endpoint: None,
+        send_queue_bytes: 1024 * 1024,
+        resident_bytes: 64 * 1024,
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
+    };
+    let mut session = kr_worker::session::Session::open(config).expect("opens the session");
+    session.launch().expect("launches the root shell");
+    let runtime = std::sync::Arc::new(
+        kr_worker::runtime::SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts the runtime"),
+    );
+    let endpoint = environment.worker_endpoint(display).expect("an endpoint");
+    let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
+    let service = std::sync::Arc::new(
+        kr_worker::service::WorkerService::new(
+            std::sync::Arc::clone(&runtime),
+            std::sync::Arc::clone(&identity),
+            endpoint.clone(),
+            kr_worker::service::ServiceBinding {
+                environment_id,
+                boot_identity: boot.clone(),
+                controller_public_key: *controller.public_key(),
+                controller_generation: ControllerGeneration::new(1),
+                build_id: build(),
+                journal_path: Some(journal.clone()),
+            },
+        )
+        .expect("a worker service"),
+    );
+    tokio::spawn(std::sync::Arc::clone(&service).serve(listener));
+    let descriptor = kr_protocol::worker::WorkerDescriptor {
+        session_id,
+        session_epoch: SessionEpoch::V1,
+        environment_id,
+        display_number: display,
+        boot_identity: boot,
+        process_start_identity: process,
+        protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+        endpoint: endpoint.as_text(),
+        worker_public_key: *identity.public_key(),
+        worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+        published_at_ms: kr_protocol::scalars::TimestampMs::new(0),
+    };
+    Worker {
+        service,
+        session_id,
+        environment_id,
+        endpoint,
+        descriptor,
+        journal,
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        // The root shell waits for minutes; the session's job ends it, and with it everything the
+        // test left running in the console.
+        let root = self.service.runtime().session().root_identity();
+        if let Some(job) = root
+            .and_then(|root| u32::try_from(root.pid.get()).ok())
+            .and_then(kr_worker::windows::job::holding)
+        {
+            let _ = job.terminate(1);
+        }
+    }
+}
+
+/// Opens a worker's pipe as a client, waiting while every instance of it is taken.
+fn open_pipe(endpoint: &kr_ipc::paths::Endpoint) -> std::fs::File {
+    /// The operating system's answer when every instance of a pipe is connected.
+    const ERROR_PIPE_BUSY: i32 = 231;
+
+    let name = format!(r"\\.\pipe\{}", endpoint.as_text());
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&name)
+        {
+            Ok(pipe) => return pipe,
+            Err(error)
+                if error.raw_os_error() == Some(ERROR_PIPE_BUSY) && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => panic!("the owner opens {name}: {error}"),
+        }
+    }
+}
+
+/// KR-REQ-02.04: each worker keeps its receipts in a SQLite journal of its own, written ahead, and
+/// is reached on an endpoint of its own; no two sessions share either.
+/// KR-REQ-05.02: a worker's endpoint carries the operating system's access control. On this
+/// platform it is a named pipe, which carries its own list: read back from a handle to the pipe the
+/// worker serves, the list is protected, owned by this account and grants nobody the machine does
+/// not already trust, and the worker behind it answers the challenge of the descriptor it is
+/// published under.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_worker_keeps_a_journal_of_its_own_and_is_reached_on_a_pipe_of_its_own() {
+    use std::os::windows::io::AsHandle as _;
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let workers = [worker(&temp, 1).await, worker(&temp, 2).await];
+    assert_ne!(
+        workers[0].journal, workers[1].journal,
+        "one journal per worker"
+    );
+    assert_ne!(
+        workers[0].endpoint, workers[1].endpoint,
+        "one endpoint per worker"
+    );
+
+    for hosted in &workers {
+        let header = std::fs::read(&hosted.journal)
+            .unwrap_or_else(|error| panic!("reads {}: {error}", hosted.journal.display()));
+        assert!(
+            header.starts_with(b"SQLite format 3\0"),
+            "{} is a SQLite database",
+            hosted.journal.display()
+        );
+        let journal = kr_worker::journal::Journal::open_read_only(&hosted.journal)
+            .expect("a second connection to the journal");
+        assert_eq!(
+            journal
+                .pragma_string("journal_mode")
+                .expect("the mode")
+                .to_lowercase(),
+            "wal",
+            "the journal is written ahead"
+        );
+
+        let pipe = open_pipe(&hosted.endpoint);
+        kr_ipc::paths::check_access_list(pipe.as_handle(), "the worker's pipe", true)
+            .expect("the pipe's list is protected and its owner's");
+        drop(pipe);
+
+        let mut client = kr_ipc::client::LocalClient::connect(
+            &hosted.endpoint,
+            kr_protocol::local::LocalClientKind::Cli,
+            build(),
+        )
+        .await
+        .expect("the owner reaches the worker on its pipe");
+        client
+            .verify_worker(&hosted.descriptor)
+            .await
+            .expect("the worker answers the challenge of the descriptor it is published under");
+    }
+}
+
+/// KR-REQ-02.07: a command line on this machine is authenticated by the operating system: the
+/// worker's pipe admits its owner and nobody else, and the process on the other end is named by
+/// the pipe rather than by anything it sends. What it does is recorded under the local owner, and
+/// nothing it sends names anyone else. The worker still checks the scope of every request itself,
+/// so a mutation aimed at another session is refused rather than served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_caller_on_a_workers_pipe_is_served_as_its_owner_and_held_to_its_session() {
+    use kr_protocol::scalars::Nullable;
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let hosted = worker(&temp, 1).await;
+    let mut client = kr_ipc::client::LocalClient::connect(
+        &hosted.endpoint,
+        kr_protocol::local::LocalClientKind::Cli,
+        build(),
+    )
+    .await
+    .expect("the owner reaches the worker on its pipe");
+    let target = |session_id| kr_protocol::envelope::ActionTarget {
+        environment_id: hosted.environment_id,
+        session_id: Nullable::some(session_id),
+        session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+        application_instance_id: Nullable::null(),
+        agent_binding_revision: Nullable::null(),
+    };
+    let mut requested = kr_protocol::scalars::CanonicalSet::new();
+    requested.insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
+    let action_id = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+    client
+        .mutate(
+            kr_protocol::method::Method::SessionAttach,
+            action_id,
+            target(hosted.session_id),
+            &kr_protocol::attachment::SessionAttachParams {
+                session_id: hosted.session_id,
+                mode: kr_protocol::attachment::AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(Dimensions::new(80, 24)),
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                requested,
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the attach succeeds");
+    let owner = kr_protocol::ids::ActorId::new(format!("local:{}", kr_ipc::paths::current_uid()))
+        .expect("a principal");
+    assert!(
+        hosted
+            .service
+            .runtime()
+            .session()
+            .journal()
+            .expect("a journal")
+            .read(owner, action_id)
+            .expect("reads the journal")
+            .is_some(),
+        "the attach is recorded under the local owner the pipe admitted"
+    );
+
+    let elsewhere = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid());
+    let outcome = client
+        .mutate(
+            kr_protocol::method::Method::SessionClose,
+            kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+            target(elsewhere),
+            &kr_protocol::session::SessionCloseParams {
+                session_id: elsewhere,
+            },
+        )
+        .await
+        .expect("the call reaches the worker");
+    assert_eq!(
+        outcome.err().map(|error| error.code),
+        Some(kr_protocol::error::ErrorCode::StaleSession),
+        "an authenticated local caller is still held to the scope of this session"
+    );
+    assert_eq!(hosted.service.runtime().state().as_str(), "live");
 }
