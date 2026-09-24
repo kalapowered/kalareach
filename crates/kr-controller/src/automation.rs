@@ -65,31 +65,77 @@ pub type Answer<T> = std::result::Result<T, ProtocolError>;
 /// change-set write is held under its registry. Until then, and after the daemon has gone, nothing
 /// is decided: an answer about a grant needs the daemon that owns it.
 #[derive(Debug, Default)]
-struct Daemon(std::sync::OnceLock<Weak<Controller>>);
+struct Daemon {
+    /// The daemon, once it is bound.
+    bound: std::sync::OnceLock<Weak<Controller>>,
+    /// The reading of UTC automation's clock last took from the daemon, when that reading was
+    /// ahead of the clock's own count, and the continuous instant it was taken at.
+    anchor: std::sync::Mutex<Option<(u64, kr_transport::clock::ContinuousInstant)>>,
+}
 
 impl Daemon {
+    /// A handle bound to `daemon` from the start.
+    fn bound_to(daemon: &Arc<Controller>) -> Self {
+        let handle = Self::default();
+        let _ = handle.bound.set(Arc::downgrade(daemon));
+        handle
+    }
+
     /// The daemon, while it is serving.
     fn get(&self) -> kr_automation::Result<Arc<Controller>> {
-        self.0.get().and_then(Weak::upgrade).ok_or_else(|| {
+        self.bound.get().and_then(Weak::upgrade).ok_or_else(|| {
             kr_automation::AutomationError::AuthorityUnavailable(
                 "this host's daemon is not serving".to_owned(),
             )
         })
     }
 
-    /// This host's reading of UTC: the later of the wall clock and the daemon's clock floor, so a
-    /// wall clock wound back does not move it backwards. The wall clock alone before the daemon
-    /// is bound and after it has gone.
+    /// This host's reading of UTC for automation, which never runs slower than time does.
+    ///
+    /// It is the later of two readings: the daemon's own reading of UTC, which is the later of the
+    /// wall clock and its clock floor, and the last such reading this clock took advanced by the
+    /// time the suspend-aware continuous clock has counted since. A wall clock wound back
+    /// therefore neither moves it backwards nor stops it: a run's deadline and an action's wait
+    /// keep running through the hour a clock was set back by, and through a suspension. A wall
+    /// clock that moves forwards is followed. The wall clock alone before the daemon is bound and
+    /// after it has gone.
     fn now_ms(&self) -> u64 {
-        self.get().map_or_else(
-            |_| kr_ipc::now_ms().get(),
-            |daemon| daemon.settled_utc_now(),
-        )
+        let Ok(daemon) = self.get() else {
+            return kr_ipc::now_ms().get();
+        };
+        let mut anchor = self
+            .anchor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (now, kept) = reading_at(*anchor, daemon.settled_utc_now(), daemon.continuous_now());
+        *anchor = Some(kept);
+        now
     }
 }
 
+/// Automation's reading of UTC, from the daemon's reading `settled` taken at the continuous
+/// instant `at` and the anchor the last reading kept: the later of `settled` and the anchor
+/// advanced by the continuous time counted since it. Answers the reading and the anchor to keep,
+/// which moves only when the daemon's reading is ahead, so no rounding of the count adds up.
+fn reading_at(
+    anchor: Option<(u64, kr_transport::clock::ContinuousInstant)>,
+    settled: u64,
+    at: kr_transport::clock::ContinuousInstant,
+) -> (u64, (u64, kr_transport::clock::ContinuousInstant)) {
+    if let Some((anchored_ms, anchored_at)) = anchor {
+        let counted = u64::try_from(at.saturating_duration_since(anchored_at).as_millis())
+            .unwrap_or(u64::MAX);
+        let advanced = anchored_ms.saturating_add(counted);
+        if advanced > settled {
+            return (advanced, (anchored_ms, anchored_at));
+        }
+    }
+    (settled, (settled, at))
+}
+
 /// The clock a workflow's deadlines, its action waits and its chain's lifetime are measured on:
-/// the daemon's own reading of UTC, which a wall clock wound back does not move backwards.
+/// the daemon's own reading of UTC, advanced by the continuous clock whenever that is further on,
+/// so a wall clock wound back neither moves it backwards nor holds it still.
 #[derive(Debug)]
 struct DaemonClock(Arc<Daemon>);
 
@@ -133,10 +179,8 @@ impl HostGrants {
     /// Reads grants from `daemon`'s own stores and decides them under its own model.
     #[must_use]
     pub fn for_daemon(daemon: &Arc<Controller>) -> Self {
-        let bound = Daemon::default();
-        let _ = bound.0.set(Arc::downgrade(daemon));
         Self {
-            daemon: Arc::new(bound),
+            daemon: Arc::new(Daemon::bound_to(daemon)),
         }
     }
 
@@ -728,7 +772,7 @@ impl AutomationModule {
     /// every change-set write a node makes is held under its registry. The daemon binds the module
     /// as it is built, before it serves anything; binding again changes nothing.
     pub fn bind(&self, daemon: Weak<Controller>) {
-        let _ = self.daemon.0.set(daemon);
+        let _ = self.daemon.bound.set(daemon);
     }
 
     /// Starts executing: the runs recovery resumed, then the runs derived triggers ask for.
@@ -1065,6 +1109,33 @@ fn encode<T: serde::Serialize>(value: &T) -> Answer<ParamsValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Automation's clock counts on through a wall clock wound back, which the daemon's own
+    /// reading holds at its floor, and follows a wall clock that moves ahead.
+    #[test]
+    fn automation_time_runs_on_through_a_wall_clock_wound_back() {
+        use kr_transport::clock::ContinuousClock;
+        let continuous = kr_transport::clock::ManualClock::new();
+        let (first, anchor) = reading_at(None, 10_000, continuous.now());
+        assert_eq!(first, 10_000, "the first reading is the daemon's");
+
+        // The wall clock is wound back an hour, so the daemon's reading stays at its floor while
+        // a minute passes.
+        continuous.advance(std::time::Duration::from_secs(60));
+        let (held, anchor) = reading_at(Some(anchor), 10_000, continuous.now());
+        assert_eq!(held, 70_000, "the minute counts");
+        continuous.advance(std::time::Duration::from_millis(400));
+        let (on, anchor) = reading_at(Some(anchor), 10_000, continuous.now());
+        assert_eq!(on, 70_400, "and so does every part of the next one");
+
+        // A wall clock set ahead is followed, and the count goes on from it.
+        continuous.advance(std::time::Duration::from_secs(1));
+        let (ahead, anchor) = reading_at(Some(anchor), 500_000, continuous.now());
+        assert_eq!(ahead, 500_000);
+        continuous.advance(std::time::Duration::from_secs(2));
+        let (after, _) = reading_at(Some(anchor), 400_000, continuous.now());
+        assert_eq!(after, 502_000, "never backwards");
+    }
 
     #[test]
     fn the_daemon_serves_the_whole_automation_group() {
