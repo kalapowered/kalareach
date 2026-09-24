@@ -22,7 +22,7 @@ use tauri::State;
 use crate::error::{CommandError, Result};
 use crate::state::AppState;
 use crate::target::Subject;
-use crate::{export, links, pairing, remote, setup, verify};
+use crate::{export, links, pairing, remote, setup};
 
 /// How long a mutation this application submits may stay acceptable.
 ///
@@ -82,11 +82,15 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("question_read", Some(Method::QuestionRead)),
     ("question_answer", Some(Method::QuestionAnswer)),
     // Pairing.
-    ("pairing_origin", None),
     ("pairing_set_origin", None),
-    ("pairing_scan", None),
-    ("pairing_verify_owner", None),
-    ("pair_status", Some(Method::PairStatus)),
+    ("pairing_view", None),
+    ("pairing_start_code", None),
+    ("pairing_paste", None),
+    ("pairing_start_read", None),
+    ("pairing_stop", None),
+    // The owner's confirmations of this computer's hosts.
+    ("owner_confirmations", None),
+    ("owner_confirmation_review", None),
     // Voice.
     ("voice_prepare", Some(Method::VoicePrepare)),
     ("voice_start", Some(Method::VoiceStart)),
@@ -105,6 +109,41 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("export_semantic_json", None),
     ("export_asciicast", None),
     ("connection_state", None),
+];
+
+/// The commands whose native code performs protocol methods of its own, and which.
+///
+/// Every one is a `None` entry in [`NAMED_COMMANDS`]: the page supplies none of these methods'
+/// parameters. What reaches the host is built in native code from this computer's own state, its
+/// keys, its records and what the host listed, and none of it is handed back to the page.
+/// `owner.confirmation.complete` appears only under `owner_confirmation_review`, and `pair.finish`
+/// and `pair.redeem` only under the two starts.
+pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
+    (
+        "pairing_start_code",
+        &[
+            Method::PairFinish,
+            Method::PairStatus,
+            Method::EnvironmentList,
+        ],
+    ),
+    (
+        "pairing_start_read",
+        &[
+            Method::PairRedeem,
+            Method::PairFinish,
+            Method::PairStatus,
+            Method::EnvironmentList,
+        ],
+    ),
+    ("owner_confirmations", &[Method::OwnerConfirmationPending]),
+    (
+        "owner_confirmation_review",
+        &[
+            Method::OwnerConfirmationPending,
+            Method::OwnerConfirmationComplete,
+        ],
+    ),
 ];
 
 /// The command handlers, in the form Tauri registers.
@@ -145,11 +184,14 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         action_cancel,
         question_read,
         question_answer,
-        pairing_origin,
         pairing_set_origin,
-        pairing_scan,
-        pairing_verify_owner,
-        pair_status,
+        pairing_view,
+        pairing_start_code,
+        pairing_paste,
+        pairing_start_read,
+        pairing_stop,
+        owner_confirmations,
+        owner_confirmation_review,
         voice_prepare,
         voice_start,
         voice_stop,
@@ -335,11 +377,6 @@ read_command!(
     /// Reads one page of retained history above the live screen.
     history_page, Method::HistoryPage,
     kr_protocol::recovery::HistoryPageParams => kr_protocol::recovery::HistoryPageResult
-);
-read_command!(
-    /// Reads a pairing attempt's state.
-    pair_status, Method::PairStatus,
-    kr_protocol::preauth::PairStatusParams => kr_protocol::preauth::PairStatusResult
 );
 read_command!(
     /// Reads how much of an upload the host already holds.
@@ -834,41 +871,69 @@ pub async fn input_write(state: State<'_, AppState>, params: Value) -> Result<Va
     encode(&answer)
 }
 
-/// The rendezvous origin this device is configured with.
-///
-/// The interface shows it on manual code entry and on the issuing screen, which is why it is a
-/// command rather than a value the page holds.
+/// Changes the origin, before an attempt starts.
 #[tauri::command]
-pub fn pairing_origin(state: State<'_, AppState>) -> pairing::Origin {
-    state.origin()
+pub fn pairing_set_origin(
+    state: State<'_, AppState>,
+    origin: String,
+) -> Result<crate::device::OriginView> {
+    state.device()?.set_origin(&origin)
 }
 
-/// Changes the rendezvous origin, before an attempt starts.
+/// Everything the pairing screen shows: the origin, this computer's name, where the attempt has
+/// got to, a pasted invitation's summary and the paired hosts. None of it is a secret.
 #[tauri::command]
-pub fn pairing_set_origin(state: State<'_, AppState>, origin: String) -> Result<pairing::Origin> {
-    state.set_origin(&origin)
+pub fn pairing_view(state: State<'_, AppState>) -> Result<crate::device::PairingView> {
+    Ok(state.device()?.view())
 }
 
-/// Reads a scanned QR payload against the configured origin.
-///
-/// A code QR that names another origin comes back marked as needing confirmation; the interface
-/// shows the hostname and waits for the person before anything is sent to it.
+/// Starts pairing with a code the person typed. The code is the one secret the page ever holds, in
+/// its own field; native code parses it here and never hands it back.
 #[tauri::command]
-pub fn pairing_scan(state: State<'_, AppState>, payload: String) -> Result<pairing::Scanned> {
-    pairing::scan(&payload, &state.origin())
+pub fn pairing_start_code(state: State<'_, AppState>, code: String) -> Result<()> {
+    state.device()?.start_code(&code)
 }
 
-/// Runs the platform's user-verification ceremony on this device.
-///
-/// The ceremony is the platform's own window and a person may take a while over it, so it runs on
-/// a blocking worker rather than holding a command thread.
+/// Reads an invitation from the pasteboard in native code, and holds it for the person to use.
+/// The page is told what it is, never what it says.
 #[tauri::command]
-pub async fn pairing_verify_owner(reason: String) -> Result<verify::Presence> {
-    tauri::async_runtime::spawn_blocking(move || verify::verify_owner_presence(&reason))
-        .await
-        .map_err(|error| {
-            CommandError::local_failure(format!("the ceremony did not finish: {error}"))
-        })?
+pub async fn pairing_paste(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::device::PasteView> {
+    let device = state.device()?;
+    Ok(pairing::paste(&app, &device).await)
+}
+
+/// Starts pairing with the invitation read from the pasteboard.
+#[tauri::command]
+pub fn pairing_start_read(state: State<'_, AppState>) -> Result<()> {
+    state.device()?.start_held()
+}
+
+/// Ends the attempt on this computer, or drops a pasted invitation, and returns to the start.
+#[tauri::command]
+pub async fn pairing_stop(state: State<'_, AppState>) -> Result<()> {
+    state.device()?.stop().await;
+    Ok(())
+}
+
+/// The confirmations this computer's hosts ask for, as descriptions, and the ceremony this
+/// computer offers.
+#[tauri::command]
+pub fn owner_confirmations(state: State<'_, AppState>) -> Result<crate::owner::OwnerView> {
+    Ok(state.owner()?.view())
+}
+
+/// Reviews one confirmation by its reference: native code checks it, the platform's ceremony asks
+/// the person, and only a confirmed ceremony in time signs it and completes it. The page names a
+/// reference and nothing else; a request with any other member is refused.
+#[tauri::command]
+pub async fn owner_confirmation_review(
+    state: State<'_, AppState>,
+    request: crate::owner::ReviewRequest,
+) -> Result<kr_client::pairing::owner::ReviewOutcome> {
+    state.owner()?.review(&request.reference).await
 }
 
 /// Opens an external link, after checking its scheme.
@@ -1300,10 +1365,14 @@ mod tests {
                 "export_semantic_json",
                 "import_remote_image",
                 "open_external",
-                "pairing_origin",
-                "pairing_scan",
                 "pairing_set_origin",
-                "pairing_verify_owner",
+                "pairing_view",
+                "pairing_start_code",
+                "pairing_paste",
+                "pairing_start_read",
+                "pairing_stop",
+                "owner_confirmations",
+                "owner_confirmation_review",
                 // Setup's own two. Neither performs a protocol operation: one reads this
                 // application's identity and one opens a settings pane by name.
                 "setup_identity",
@@ -1315,6 +1384,83 @@ mod tests {
                 "voice_call_state",
                 "voice_set_muted",
             ])
+        );
+    }
+
+    /// KR-REQ-10.06: the commands that perform protocol methods from native state are named in
+    /// `NATIVE_METHODS`, each is a registered command the page supplies no method's parameters to,
+    /// `owner.confirmation.complete` is performed only by the review, and `pair.finish` and
+    /// `pair.redeem` only by the two starts. None of the pairing or confirmation methods is a page
+    /// method.
+    #[test]
+    fn the_methods_native_code_performs_are_named_and_none_is_the_pages() {
+        let local: BTreeSet<&str> = NAMED_COMMANDS
+            .iter()
+            .filter(|(_, method)| method.is_none())
+            .map(|(command, _)| *command)
+            .collect();
+        let page: BTreeSet<Method> = NAMED_COMMANDS
+            .iter()
+            .filter_map(|(_, method)| *method)
+            .collect();
+        for (command, _) in NATIVE_METHODS {
+            assert!(
+                local.contains(command),
+                "{command} is a registered command the page names no method through"
+            );
+        }
+        // What only this computer's own state may drive is no page method at all.
+        for method in [
+            Method::PairFinish,
+            Method::PairRedeem,
+            Method::PairStatus,
+            Method::OwnerConfirmationPending,
+            Method::OwnerConfirmationComplete,
+        ] {
+            assert!(!page.contains(&method), "{method} is a page method");
+        }
+        let performing = |method: Method| -> BTreeSet<&str> {
+            NATIVE_METHODS
+                .iter()
+                .filter(|(_, methods)| methods.contains(&method))
+                .map(|(command, _)| *command)
+                .collect()
+        };
+        assert_eq!(
+            performing(Method::OwnerConfirmationComplete),
+            BTreeSet::from(["owner_confirmation_review"])
+        );
+        assert_eq!(
+            performing(Method::PairFinish),
+            BTreeSet::from(["pairing_start_code", "pairing_start_read"])
+        );
+        assert_eq!(
+            performing(Method::PairRedeem),
+            BTreeSet::from(["pairing_start_read"])
+        );
+    }
+
+    /// KR-REQ-10.06: a review names a reference and nothing else. A request that also carries a
+    /// proof, a challenge or a channel is refused before anything runs.
+    #[test]
+    fn a_review_that_carries_anything_but_a_reference_is_refused() {
+        let (_app, window) = page_with(tauri::generate_handler![owner_confirmation_review]);
+        for extra in ["proof", "request", "channel"] {
+            let mut body = serde_json::json!({ "request": { "reference": "a" } });
+            body["request"][extra] = serde_json::json!("from the page");
+            let refusal = refusal_of(&window, "owner_confirmation_review", body)
+                .expect("the review is refused");
+            assert!(refusal.contains("unknown field"), "{extra}: {refusal}");
+        }
+        assert_eq!(
+            refusal_of(
+                &window,
+                "owner_confirmation_review",
+                serde_json::json!({ "request": { "reference": "a" } })
+            )
+            .as_deref(),
+            Some("RESOURCE_UNAVAILABLE"),
+            "a well-formed review reaches the service, which this window has not opened"
         );
     }
 
@@ -1388,7 +1534,6 @@ mod tests {
             action_cancel,
             question_read,
             question_answer,
-            pair_status,
             voice_prepare,
             voice_start,
             voice_stop,

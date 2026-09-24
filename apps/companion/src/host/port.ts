@@ -124,28 +124,145 @@ export interface SettingsPane {
   readonly url: string
 }
 
-/** The rendezvous origin this device is configured with. */
-export interface RendezvousOrigin {
+/* ---- Pairing ------------------------------------------------------------------------------------
+ *
+ * This computer pairs with a host in native code. The page types a code or presses a button, and
+ * is told where the attempt has got to: never an invitation's text, a secret, a key, a transcript,
+ * a challenge or a proof. The one secret the page holds is a code a person types into its field.
+ */
+
+/** The service codes go through. */
+export interface PairingOrigin {
   readonly origin: string
   readonly host: string
   readonly is_default: boolean
 }
 
-/** What a scanned QR payload turned out to be. */
-export type ScannedCode =
+/** Which of the outcomes a person is told apart an attempt ended with. */
+export type FailureKind =
+  | 'malformed'
+  | 'device_tries_used'
+  | 'service_unreachable'
+  | 'service_not_pairing'
+  | 'no_host_answered'
+  | 'not_authenticated'
+  | 'host_tries_used'
+  | 'expired'
+  | 'timed_out'
+  | 'did_not_finish'
+  | 'declined'
+  | 'withdrawn'
+  | 'host_restarted'
+  | 'another_device_waiting'
+  | 'host_unreachable'
+  | 'host_mismatch'
+  | 'already_paired'
+  | 'not_an_invitation'
+  | 'newer_invitation'
+  | 'nothing_to_paste'
+  | 'store_failed'
+  | 'approval_unknown'
+
+/** How an attempt ended, with the tries this computer has left when it was charged. */
+export interface PairingFailure {
+  readonly kind: FailureKind
+  readonly tries_left: number | null
+}
+
+/** What a paired host is shown as. */
+export interface PairedHostView {
+  readonly name: string | null
+  readonly owner: boolean
+  /** What this computer may do there, in words. */
+  readonly authority: string
+  readonly grant_expires_at_ms: number | null
+}
+
+/** Where an attempt has got to. */
+export type AttemptState =
+  | { readonly state: 'idle' }
   | {
-      readonly mode: 'code'
-      readonly origin: RendezvousOrigin
-      readonly code: string
-      /** True when the QR names an origin other than the configured one. */
-      readonly needs_origin_confirmation: boolean
+      readonly state: 'working'
+      readonly stage: 'reaching_service' | 'checking_code' | 'reaching_host'
     }
   | {
-      readonly mode: 'direct'
-      readonly invitation_id: string
-      readonly endpoint_id: string
-      readonly expires_at_ms: string
+      readonly state: 'awaiting_approval'
+      readonly value: string
+      readonly expires_at_ms: number | null
+      readonly rights: readonly string[]
+      /** What those rights would let this computer do, in words. */
+      readonly authority: string
+      readonly grant_expires_at_ms: number | null
     }
+  | {
+      readonly state: 'reconnecting'
+      readonly value: string | null
+      readonly expires_at_ms: number | null
+    }
+  | { readonly state: 'paired'; readonly host: PairedHostView }
+  | { readonly state: 'ended'; readonly failure: PairingFailure }
+
+/** What a person is shown of an invitation read from the pasteboard. */
+export interface InvitationSummary {
+  readonly mode: 'code' | 'direct'
+  readonly origin_host: string | null
+  readonly names_another_origin: boolean
+  readonly rights: readonly string[] | null
+  /** What a direct invitation's rights would let this computer do, in words. */
+  readonly authority: string | null
+  readonly grant_expires_at_ms: number | null
+  readonly expires_at_ms: number | null
+}
+
+/** One host this computer is paired with. */
+export interface HostRow {
+  readonly name: string
+  readonly owner: boolean
+  /** What this computer may do there, in words. */
+  readonly authority: string
+  readonly grant_expires_at_ms: number | null
+  readonly in_contact: boolean | null
+}
+
+/** Everything the pairing screen shows. */
+export interface PairingView {
+  readonly origin: PairingOrigin
+  readonly device_name: string
+  readonly state: AttemptState
+  readonly invitation: InvitationSummary | null
+  readonly hosts: readonly HostRow[]
+}
+
+/** What reading the pasteboard found. */
+export interface PasteView {
+  readonly invitation: InvitationSummary | null
+  readonly failure: FailureKind | null
+  readonly cleared: boolean
+  readonly declined: boolean
+}
+
+/** The ceremony this computer offers an owner. */
+export type CeremonyKind = 'touch_id' | 'password' | 'windows_hello' | 'none'
+
+/** One confirmation a host this computer owns asks for. */
+export interface ConfirmationRequest {
+  readonly reference: string
+  readonly host_name: string
+  readonly title: string
+  readonly detail: string | null
+  readonly value: string | null
+  readonly expires_at_ms: number
+  readonly checkable: boolean
+}
+
+/** The confirmations this computer's hosts ask for. */
+export interface OwnerView {
+  readonly ceremony: CeremonyKind
+  readonly requests: readonly ConfirmationRequest[]
+}
+
+/** How a review ended. */
+export type ReviewOutcome = 'confirmed' | 'not_confirmed' | 'expired' | 'cannot_check' | 'no_ceremony'
 
 /* ---- Voice ------------------------------------------------------------------------------------
  *
@@ -213,13 +330,6 @@ export interface VoiceClosure {
   readonly settled: Settled<VoiceStopResult> | null
   /** Why the host could not be told, when it could not. */
   readonly host_failure: HostError | null
-}
-
-/** What the platform's user-verification ceremony reported. */
-export interface OwnerPresence {
-  readonly verified: boolean
-  readonly mechanism: string
-  readonly reason: string
 }
 
 /** A link the backend is willing to open. */
@@ -449,10 +559,30 @@ export interface HostPort {
   /** What the native call is doing right now. */
   voiceCallState(): Promise<VoiceCallState>
 
-  pairingOrigin(): Promise<RendezvousOrigin>
-  pairingSetOrigin(origin: string): Promise<RendezvousOrigin>
-  pairingScan(payload: string): Promise<ScannedCode>
-  pairingVerifyOwner(reason: string): Promise<OwnerPresence>
+  /** Everything the pairing screen shows. */
+  pairingView(): Promise<PairingView>
+  /** Changes the service codes go through, before an attempt starts. */
+  pairingSetOrigin(origin: string): Promise<PairingOrigin>
+  /** Starts pairing with a code the person typed. Native code parses it and never hands it back. */
+  pairingStartCode(code: string): Promise<void>
+  /** Reads an invitation from the pasteboard in native code, and holds it. */
+  pairingPaste(): Promise<PasteView>
+  /** Starts pairing with the invitation read from the pasteboard. */
+  pairingStartRead(): Promise<void>
+  /** Ends the attempt on this computer, or drops a pasted invitation. */
+  pairingStop(): Promise<void>
+  /** Tells `listener` each time the pairing screen's state changes. Returns the unsubscribe. */
+  onPairing(listener: (view: PairingView) => void): () => void
+
+  /** The confirmations this computer's hosts ask for. */
+  ownerConfirmations(): Promise<OwnerView>
+  /**
+   * Reviews one confirmation: native code checks it, the platform's own ceremony asks the person,
+   * and only a confirmed ceremony signs it. The page names the reference and nothing else.
+   */
+  ownerConfirmationReview(reference: string): Promise<ReviewOutcome>
+  /** Tells `listener` each time the confirmations change. Returns the unsubscribe. */
+  onConfirmations(listener: (view: OwnerView) => void): () => void
 
   openExternal(url: string): Promise<ApprovedLink>
   importRemoteImage(url: string): Promise<ImportedImage>

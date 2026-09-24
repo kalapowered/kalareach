@@ -325,8 +325,12 @@ describe('what setup costs a person', () => {
       expect(screen.getByTestId('setup-recheck').textContent).toBe('Check again')
     })
 
-    // The shell's own connection watch and event subscription are the application's, not setup's.
-    const own = calls.filter((name) => !['connectionState', 'subscribe'].includes(name))
+    // The shell's own connection watch, event subscription and watch for owner confirmations are
+    // the application's, not setup's.
+    const own = calls.filter(
+      (name) =>
+        !['connectionState', 'subscribe', 'ownerConfirmations', 'onConfirmations'].includes(name)
+    )
     expect(new Set(own)).toEqual(
       new Set(['setupIdentity', 'environmentCapabilities'])
     )

@@ -21,10 +21,12 @@ import type {
   HostEvent,
   HostPort,
   ImportedImage,
-  OwnerPresence,
+  OwnerView,
+  PairingOrigin,
+  PairingView,
+  PasteView,
   ProjectedScreen,
-  RendezvousOrigin,
-  ScannedCode,
+  ReviewOutcome,
   SessionSubject,
   Settled,
   SettingsPane,
@@ -42,6 +44,28 @@ export const CONNECTION_EVENT = 'kr://connection'
 
 /** The event the backend publishes the paths of dropped files on. */
 export const DROPPED_EVENT = 'kr://dropped'
+
+/** The event the backend publishes the pairing screen's state on. */
+export const PAIRING_EVENT = 'kr://pairing'
+
+/** The event the backend publishes the owner confirmations on. */
+export const CONFIRMATIONS_EVENT = 'kr://confirmations'
+
+/** Listens for one backend event until the returned function is called. */
+function listening<T>(event: string, listener: (payload: T) => void): () => void {
+  let stop: (() => void) | null = null
+  let cancelled = false
+  void listen<T>(event, (published) => {
+    listener(published.payload)
+  }).then((unlisten) => {
+    if (cancelled) unlisten()
+    else stop = unlisten
+  })
+  return () => {
+    cancelled = true
+    stop?.()
+  }
+}
 
 /**
  * The refusal for an operation this build has no agreed shape for.
@@ -164,10 +188,18 @@ export function tauriPort(): HostPort {
     voiceSetMuted: (what, muted) => call<VoiceCallState>('voice_set_muted', { what, muted }),
     voiceCallState: () => call<VoiceCallState>('voice_call_state', {}),
 
-    pairingOrigin: () => call<RendezvousOrigin>('pairing_origin', {}),
-    pairingSetOrigin: (origin) => call<RendezvousOrigin>('pairing_set_origin', { origin }),
-    pairingScan: (payload) => call<ScannedCode>('pairing_scan', { payload }),
-    pairingVerifyOwner: (reason) => call<OwnerPresence>('pairing_verify_owner', { reason }),
+    pairingView: () => call<PairingView>('pairing_view', {}),
+    pairingSetOrigin: (origin) => call<PairingOrigin>('pairing_set_origin', { origin }),
+    pairingStartCode: (code) => call<undefined>('pairing_start_code', { code }),
+    pairingPaste: () => call<PasteView>('pairing_paste', {}),
+    pairingStartRead: () => call<undefined>('pairing_start_read', {}),
+    pairingStop: () => call<undefined>('pairing_stop', {}),
+    onPairing: (listener) => listening<PairingView>(PAIRING_EVENT, listener),
+
+    ownerConfirmations: () => call<OwnerView>('owner_confirmations', {}),
+    ownerConfirmationReview: (reference) =>
+      call<ReviewOutcome>('owner_confirmation_review', { request: { reference } }),
+    onConfirmations: (listener) => listening<OwnerView>(CONFIRMATIONS_EVENT, listener),
 
     openExternal: (url) => call<ApprovedLink>('open_external', { url }),
     importRemoteImage: (url) => call<ImportedImage>('import_remote_image', { url }),

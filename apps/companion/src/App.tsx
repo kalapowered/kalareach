@@ -17,6 +17,7 @@ import { Plugins } from './views/Plugins'
 import { Session } from './views/Session'
 import { Setup } from './setup/Setup'
 import { failureMessage } from './host/port'
+import { useConfirmations } from './pairing/Confirmations'
 
 const NAVIGATION: readonly { readonly place: Place; readonly label: string }[] = [
   { place: { view: 'attention' }, label: 'Attention' },
@@ -29,6 +30,8 @@ const NAVIGATION: readonly { readonly place: Place; readonly label: string }[] =
 /** The application. */
 export function App(): ReactNode {
   const { place, go, toast, dismissToast, port } = useApp()
+  const confirmations = useConfirmations()
+  const waiting = confirmations?.requests.length ?? 0
   const [connected, setConnected] = useState(true)
   const [reason, setReason] = useState<string | null>(null)
 
@@ -97,6 +100,11 @@ export function App(): ReactNode {
               }}
             >
               {item.label}
+              {item.place.view === 'attention' && waiting > 0 ? (
+                <span className="count" aria-label={`${waiting} waiting for confirmation`}>
+                  {waiting}
+                </span>
+              ) : null}
             </button>
           ))}
         </nav>
@@ -109,7 +117,7 @@ export function App(): ReactNode {
               go({ view: 'pairing' })
             }}
           >
-            Add a device
+            Pair with a host
           </button>
           <button
             type="button"

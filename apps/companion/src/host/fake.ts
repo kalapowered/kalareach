@@ -45,16 +45,18 @@ import type {
   HostEvent,
   HostPort,
   ImportedImage,
-  OwnerPresence,
+  OwnerView,
+  PairingView,
+  PasteView,
   ProjectedScreen,
-  RendezvousOrigin,
-  ScannedCode,
+  ReviewOutcome,
   SettingsPane,
   SetupIdentity,
   VoiceCallState,
   VoiceStartRequest,
   Written
 } from './port'
+import { codeComplete } from '../pairing/words'
 
 const ENVIRONMENT = '3f1a2c40-11aa-4b2c-9d3e-000000000001'
 const VOICE_SESSION = '6c5d4e30-33cc-4d4e-9f5a-000000000201'
@@ -82,11 +84,6 @@ export class FakeHostError extends Error {
   toPayload(): { code: string; message: string; user_action: string } {
     return { code: this.code, message: this.message, user_action: this.user_action }
   }
-}
-
-/** One field of a scanned payload, as text. */
-function asText(value: unknown): string {
-  return typeof value === 'string' ? value : ''
 }
 
 /**
@@ -232,6 +229,18 @@ export interface FakeHostControls {
    * where in the call it happened, and the action it named, or none when `action` is null.
    */
   announceVoiceDelegation(delegationId: string, action?: string | null): void
+  /** Changes what the pairing screen shows, as native code would publish it. */
+  setPairing(change: Partial<PairingView>): void
+  /** What the next paste from the clipboard finds. */
+  setPasteboard(result: PasteView): void
+  /** The codes the page started pairing with, in order. */
+  readonly startedCodes: string[]
+  /** Sets the confirmations the hosts ask for, as native code would publish them. */
+  setConfirmations(view: OwnerView): void
+  /** What the next review answers. */
+  setReviewOutcome(outcome: ReviewOutcome): void
+  /** The references the page asked to review, in order. */
+  readonly reviewed: string[]
 }
 
 /** The fake host, and the controls a test drives it with. */
@@ -239,11 +248,33 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
   let connected = true
   let promptGeneration = 7
   let bufferRevision = 12
-  let rendezvous: RendezvousOrigin = {
-    origin: 'https://rendezvous.kala.to',
-    host: 'rendezvous.kala.to',
-    is_default: true
+  let pairing: PairingView = {
+    origin: { origin: 'https://reach.kala.to', host: 'reach.kala.to', is_default: true },
+    device_name: 'studio-mbp',
+    state: { state: 'idle' },
+    invitation: null,
+    hosts: []
   }
+  const pairingListeners = new Set<(view: PairingView) => void>()
+  const publishPairing = (change: Partial<PairingView>) => {
+    pairing = { ...pairing, ...change }
+    for (const listener of pairingListeners) listener(pairing)
+  }
+  let pasteboard: PasteView = {
+    invitation: null,
+    failure: 'nothing_to_paste',
+    cleared: false,
+    declined: false
+  }
+  const startedCodes: string[] = []
+  let owner: OwnerView = { ceremony: 'touch_id', requests: [] }
+  const ownerListeners = new Set<(view: OwnerView) => void>()
+  const publishOwner = (next: OwnerView) => {
+    owner = next
+    for (const listener of ownerListeners) listener(owner)
+  }
+  let reviewOutcome: ReviewOutcome = 'confirmed'
+  const reviewed: string[] = []
   const listeners = new Set<(event: HostEvent) => void>()
   const dropListeners = new Set<(files: readonly DroppedFile[]) => void>()
   const savedExports: Written[] = []
@@ -562,56 +593,63 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     attachmentViewport: () =>
       Promise.resolve(settledAs('attachment.viewport', 'applied')),
 
-    pairingOrigin: () => Promise.resolve(rendezvous),
+    pairingView: () => Promise.resolve(pairing),
     pairingSetOrigin: (origin) => {
-      if (!origin.startsWith('https://')) {
-        refuse('INVALID_ARGUMENT', 'A rendezvous origin is an https origin.')
+      const trimmed = origin.trim().replace(/\/$/, '')
+      if (!/^https:\/\/[a-z0-9.-]+(:[0-9]+)?$/.test(trimmed)) {
+        refuse('INVALID_ARGUMENT', 'That is not a service this device can use.')
       }
-      const host = origin.slice('https://'.length).split('/')[0] ?? ''
-      rendezvous = {
-        origin: `https://${host}`,
-        host: host.split(':')[0] ?? host,
-        is_default: `https://${host}` === 'https://rendezvous.kala.to'
-      }
-      return Promise.resolve(rendezvous)
+      const host = trimmed.slice('https://'.length).split(':')[0] ?? trimmed
+      publishPairing({
+        origin: { origin: trimmed, host, is_default: trimmed === 'https://reach.kala.to' }
+      })
+      return Promise.resolve(pairing.origin)
     },
-    pairingScan: (payload) => {
-      let parsed: Record<string, unknown>
-      try {
-        parsed = JSON.parse(payload) as Record<string, unknown>
-      } catch {
-        refuse('INVALID_ARGUMENT', 'That is not a pairing code.')
+    pairingStartCode: (code) => {
+      if (!codeComplete(code)) {
+        refuse('INVALID_ARGUMENT', 'A code has ten characters, and never contains 0, O, I or l.')
       }
-      if (parsed.mode === 'direct') {
-        return Promise.resolve({
-          mode: 'direct',
-          invitation_id: asText(parsed.invitation_id),
-          endpoint_id: asText(parsed.endpoint_id),
-          expires_at_ms: asText(parsed.expires_at_ms)
-        } satisfies ScannedCode)
-      }
-      if (parsed.mode !== 'code') {
-        refuse('INVALID_ARGUMENT', 'A QR without a supported pairing mode is not an invitation.')
-      }
-      const origin = asText(parsed.rendezvous_origin)
-      const host = origin.slice('https://'.length).split('/')[0] ?? ''
-      return Promise.resolve({
-        mode: 'code',
-        origin: {
-          origin,
-          host: host.split(':')[0] ?? host,
-          is_default: origin === 'https://rendezvous.kala.to'
-        },
-        code: asText(parsed.code).replace(/[\s-]/g, ''),
-        needs_origin_confirmation: origin !== rendezvous.origin
-      } satisfies ScannedCode)
+      startedCodes.push(code)
+      publishPairing({ state: { state: 'working', stage: 'reaching_service' } })
+      return Promise.resolve()
     },
-    pairingVerifyOwner: (reason) =>
-      Promise.resolve({
-        verified: true,
-        mechanism: 'test.platform_ceremony',
-        reason
-      } satisfies OwnerPresence),
+    pairingPaste: () => {
+      if (pasteboard.invitation !== null) publishPairing({ invitation: pasteboard.invitation })
+      return Promise.resolve(pasteboard)
+    },
+    pairingStartRead: () => {
+      if (pairing.invitation === null) refuse('PERMISSION_DENIED', 'No invitation is waiting.')
+      publishPairing({ invitation: null, state: { state: 'working', stage: 'reaching_host' } })
+      return Promise.resolve()
+    },
+    pairingStop: () => {
+      publishPairing({ invitation: null, state: { state: 'idle' } })
+      return Promise.resolve()
+    },
+    onPairing: (listener) => {
+      pairingListeners.add(listener)
+      return () => {
+        pairingListeners.delete(listener)
+      }
+    },
+    ownerConfirmations: () => Promise.resolve(owner),
+    ownerConfirmationReview: (reference) => {
+      reviewed.push(reference)
+      const outcome = reviewOutcome
+      if (outcome === 'confirmed') {
+        publishOwner({
+          ...owner,
+          requests: owner.requests.filter((request) => request.reference !== reference)
+        })
+      }
+      return Promise.resolve(outcome)
+    },
+    onConfirmations: (listener) => {
+      ownerListeners.add(listener)
+      return () => {
+        ownerListeners.delete(listener)
+      }
+    },
 
     openExternal: (url) => {
       if (!url.startsWith('https://') && !url.startsWith('mailto:')) {
@@ -939,7 +977,21 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
           ...(action === null ? {} : { action })
         }
       })
-    }
+    },
+    setPairing(change) {
+      publishPairing(change)
+    },
+    setPasteboard(result) {
+      pasteboard = result
+    },
+    startedCodes,
+    setConfirmations(view) {
+      publishOwner(view)
+    },
+    setReviewOutcome(outcome) {
+      reviewOutcome = outcome
+    },
+    reviewed
   }
 
   return { port, controls }

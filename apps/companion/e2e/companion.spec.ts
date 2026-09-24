@@ -316,39 +316,132 @@ test.describe('packages', () => {
 })
 
 test.describe('pairing', () => {
-  test('shows the origin, and confirms a hostname before switching to it', async ({ page }) => {
+  test('pairs from a typed code, shows the value, and names the service first', async ({
+    page
+  }) => {
     await open(page)
-    await page.getByRole('button', { name: 'Add a device' }).click()
-    await expect(page.getByTestId('rendezvous-origin')).toHaveText('https://rendezvous.kala.to')
-    await expect(page.getByTestId('change-origin')).toBeVisible()
+    await page.getByRole('button', { name: 'Pair with a host' }).click()
+    await expect(page.getByRole('heading', { name: 'Pair with a host' })).toBeVisible()
+    await expect(page.getByTestId('pairing-service')).toHaveText('reach.kala.to')
+    await expect(page.getByTestId('change-service')).toBeVisible()
     await page.screenshot({ path: shot('pairing-10.18'), fullPage: true })
 
-    // A scanned payload pasted into the code field is read the same way a camera scan is.
-    await page.getByTestId('code-input').fill(
-      JSON.stringify({
-        version: 1,
-        mode: 'code',
-        rendezvous_origin: 'https://pair.example.org',
-        code: 'KALA4821xy'
+    await page.getByLabel('Pairing code').fill('aB3x-Yz7-9Qw')
+    await page.getByTestId('pair').click()
+    await expect(page.getByTestId('pairing-status')).toHaveText('Reaching the pairing service')
+    await page.evaluate(() => {
+      window.krTestHost?.setPairing({
+        state: {
+          state: 'awaiting_approval',
+          value: 'f3c1 46fd',
+          expires_at_ms: Date.now() + 5 * 60_000,
+          rights: ['session.view'],
+          authority: 'view sessions',
+          grant_expires_at_ms: null
+        }
       })
-    )
-    await expect(page.getByTestId('scanned-origin-host')).toHaveText('pair.example.org')
-    await expect(page.getByTestId('rendezvous-origin')).toHaveText('https://rendezvous.kala.to')
+    })
+    await expect(page.getByRole('heading', { name: 'Check this value on the host' })).toBeFocused()
+    await expect(page.getByTestId('verification-value')).toContainText('f3c1')
+    await page.screenshot({ path: shot('pairing-value-10.37'), fullPage: true })
+  })
+
+  test('says a pasted text that is not an invitation is not one', async ({ page }) => {
+    await open(page)
+    await page.getByRole('button', { name: 'Pair with a host' }).click()
+    await page.evaluate(() => {
+      window.krTestHost?.setPasteboard({
+        invitation: null,
+        failure: 'not_an_invitation',
+        cleared: false,
+        declined: false
+      })
+    })
+    await page.getByTestId('paste-invitation').click()
+    await expect(page.getByTestId('paste-failure')).toHaveText('That is not a KalaReach invitation.')
     await page.screenshot({ path: shot('pairing-10.17'), fullPage: true })
+  })
+
+  test('an owner confirmation heads Attention and is left to this computer to review', async ({
+    page
+  }) => {
+    await open(page)
+    await page.evaluate(() => {
+      window.krTestHost?.setConfirmations({
+        ceremony: 'touch_id',
+        requests: [
+          {
+            reference: 'request-1',
+            host_name: 'studio',
+            title: 'Pair a new device',
+            detail: 'studio will let pixel-8 view sessions, for 1 hour.',
+            value: 'f3c1 46fd',
+            expires_at_ms: Date.now() + 120_000,
+            checkable: true
+          },
+          {
+            reference: 'request-2',
+            host_name: 'build-box',
+            title: 'Confirm a request from build-box',
+            detail: null,
+            value: null,
+            expires_at_ms: Date.now() + 90_000,
+            checkable: false
+          }
+        ]
+      })
+    })
+    const rows = page.getByTestId('confirmation-row')
+    await expect(rows).toHaveCount(2)
+    await expect(page.getByRole('heading', { name: 'Your hosts need your confirmation' })).toBeVisible()
+    await expect(rows.nth(0).getByTestId('confirm-request')).toHaveText('Confirm with Touch ID')
+    await expect(rows.nth(1).getByTestId('cannot-check')).toBeVisible()
+    await expect(rows.nth(1).getByTestId('confirm-request')).toHaveCount(0)
+    await page.screenshot({
+      path: shot('owner-confirmations-10.06'),
+      fullPage: true,
+      animations: 'disabled'
+    })
+
+    await rows.nth(0).getByTestId('confirm-request').click()
+    await expect(page.locator('.toast')).toContainText('Confirmed. studio can go ahead.')
+    await expect(rows).toHaveCount(1)
+    expect(await page.evaluate(() => window.krTestHost?.reviewed ?? [])).toEqual(['request-1'])
+
+    await rows.nth(0).getByTestId('not-now').click()
+    await expect(page.getByTestId('confirmations')).toHaveCount(0)
   })
 })
 
 test.describe('a control that commits on a completed action', () => {
-  // KR-REQ-13.07: in the engine, a key commits the owner confirmation on its release and no click
+  // KR-REQ-13.07: in the engine, a key commits an owner's confirmation on its release and no click
   // follows it, so nothing is left waiting for one; a click that counts no press, as WebKit's
   // accessibility activation and a script's `click()` send, then commits it; and the click the
-  // engine sends after a pointer's release counts that press. Every commit shows a toast of its
-  // own, so a new toast is a commit.
+  // engine sends after a pointer's release counts that press. Every commit asks native code for a
+  // review, which this host answers "not confirmed" with a toast of its own and the request left
+  // in place, so a new toast is a commit.
   test('a key commit leaves nothing behind that a click without a press meets', async ({ page }) => {
     for (const key of ['Enter', 'Space']) {
       await open(page)
-      await page.getByRole('button', { name: 'Add a device' }).click()
-      const confirm = page.getByTestId('verify-owner')
+      await page.evaluate(() => {
+        window.krTestHost?.setReviewOutcome('not_confirmed')
+        window.krTestHost?.setConfirmations({
+          ceremony: 'touch_id',
+          requests: [
+            {
+              reference: 'request-1',
+              host_name: 'studio',
+              title: 'Pair a new device',
+              detail: null,
+              value: 'f3c1 46fd',
+              expires_at_ms: Date.now() + 120_000,
+              checkable: true
+            }
+          ]
+        })
+      })
+      const confirm = page.getByTestId('confirm-request')
+      await expect(confirm).toHaveText('Confirm with Touch ID')
       await confirm.evaluate((element) => {
         const counts: number[] = []
         element.addEventListener('click', (event) => {
@@ -360,10 +453,11 @@ test.describe('a control that commits on a completed action', () => {
         page.evaluate(() => (window as unknown as { krClickCounts: number[] }).krClickCounts)
       const fresh = page.locator('.toast:not([data-kr-seen])')
       const committed = async (): Promise<void> => {
-        await expect(fresh).toContainText('Verified on this device.')
+        await expect(fresh).toContainText('Not confirmed. Nothing changed.')
         await fresh.evaluate((toast) => {
           toast.setAttribute('data-kr-seen', '')
         })
+        await expect(confirm).toBeEnabled()
       }
 
       await confirm.focus()
@@ -380,6 +474,13 @@ test.describe('a control that commits on a completed action', () => {
       await confirm.click()
       await committed()
       expect(await counts(), 'the click after a release counts the press').toEqual([0, 1])
+
+      const reviewed = await page.evaluate(() => window.krTestHost?.reviewed ?? [])
+      expect(reviewed, 'each commit asked for one review of the request').toEqual([
+        'request-1',
+        'request-1',
+        'request-1'
+      ])
     }
   })
 })
