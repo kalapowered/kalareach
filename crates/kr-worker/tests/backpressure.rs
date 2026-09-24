@@ -18,6 +18,13 @@
 //! ended its stream — a resynchronisation, a closed connection or a panic — instead of asserting
 //! only that something did. A client that was never told anything is the failure, and that is what
 //! these assertions distinguish.
+//!
+//! Both clients attach and subscribe before the application writes anything. An attachment is an
+//! action with a deadline, checked again inside the session's own boundary, and the application's
+//! output is what this test makes as much of as it can: an attachment made while the session was
+//! already busy with it would wait for the session behind that output, which on a loaded host is
+//! long enough for its deadline to pass. Attached first, it waits behind nothing, and every wait
+//! after it is for something the session reports, under a liveness bound of its own.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -80,17 +87,21 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
     // and never reach its bound. Roughly 140 KiB a second is many times one attachment's queue
     // while this test leaves a client not reading, and nothing at all for a client that reads.
     //
-    // Its `sleep 1` between runs of lines is the application's own pace and not a wait anything
-    // here depends on: every step below waits for something the session reports, and a slower
-    // application only means waiting longer for the same thing.
+    // It starts writing only once the file `go` exists, which this test makes when both clients
+    // are attached and subscribed, so neither attachment is made behind the output this test is
+    // about. Its `sleep 1` between runs of lines is the application's own pace and not a wait
+    // anything here depends on: every step below waits for something the session reports, and a
+    // slower application only means waiting longer for the same thing.
+    let go = temp.root().join("go");
     let config = SessionConfig {
         session_id,
         session_epoch: SessionEpoch::V1,
         environment_id,
         display_number: display,
-        shell: kr_worker::testing::posix_script(
-            "while true; do i=0; while [ $i -lt 2000 ]; do printf 'line-%s-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' $i; i=$((i+1)); done; sleep 1; done",
-        ),
+        shell: kr_worker::testing::posix_script(&format!(
+            "while [ ! -e '{}' ]; do sleep 0.05; done; while true; do i=0; while [ $i -lt 2000 ]; do printf 'line-%s-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' $i; i=$((i+1)); done; sleep 1; done",
+            go.display()
+        )),
         shell_mode: ShellMode::NativeCompat,
         worker_profile: WorkerProfile::HeadlessUser,
         desktop: DesktopBinding::none(),
@@ -132,9 +143,12 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
     );
     tokio::spawn(Arc::clone(&service).serve(listener));
 
-    // Two clients over the real endpoint. Neither knows about the other.
+    // Two clients over the real endpoint. Neither knows about the other. Both are attached and
+    // subscribed while the application is still waiting to write.
     let (slow, slow_id) = attached(&endpoint, environment_id, session_id).await;
     let (quick, _) = attached(&endpoint, environment_id, session_id).await;
+    let before = runtime.session().output_cursor();
+    std::fs::write(&go, b"").expect("the application is let go");
 
     // One of them reads as fast as it can, and says what ended its stream.
     let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -173,7 +187,6 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
     // it advances, the pseudo-terminal was read while a client was not reading, which is exactly
     // what section 9 promises. The other is the client that *is* reading, which shows the fan-out
     // reaching somebody while one peer is silent.
-    let before = runtime.session().output_cursor();
     let started = Instant::now();
     let deadline = started + LIVENESS_DEADLINE;
     let (after, counted) = loop {
