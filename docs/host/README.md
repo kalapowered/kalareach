@@ -3710,12 +3710,51 @@ credential, and neither does any address a diagnostic prints or any argument vec
 The credential itself travels in an owner-only file the launched process opens. On a platform where
 the host cannot read back the owning user and the mode bits of the directory it wrote into, that
 file is **not written at all**: a secret in a file whose protection cannot be proved is worse than
-no file. What replaces it there is an exchange over the endpoint's own access-controlled channel,
-which is planned and not built, so bridge registration is a Unix path today.
+no file. There a launch publishes no credential, so a bridge has nothing to present and none is
+admitted.
 
 An executable upgrade affects new launches. An existing binding keeps the binary identity, schema
 and adapter version it was bound to, because the identity is pinned when the process starts and
 nothing that happens on disk afterwards reaches it.
+
+### Native bridges an application starts
+
+Some applications cannot be proxied: they start their extension processes themselves, over their
+own standard streams. For those, a connector package installs a small registration in the
+application's own plugin or hook location, and the application starts the core forwarder, `kr-hook`,
+wherever that registration says. Each forwarder process connects to the launch's endpoint and
+declares which bridge it is: the application, and the registration that started it (a `hook` or a
+`channel`).
+
+None of those processes is the process this host launched, so a bridge is admitted by the launch
+binding it can prove: the kernel's parent chain from the connecting process reaches the launched
+application, with every link checked by its start identity. It must also present the launch's
+private exchange, present the process the kernel named, and be the installation this host recorded
+for the launch: the application and surface it declares must be ones the installed recipe
+registered, and the process must be running the forwarder the installation put in place. A
+session identifier in the environment is carried as a diagnostic and decides none of it. A refused
+bridge is closed without a word; an admitted one is answered with one admission line.
+
+An admitted hook sends one observation and waits for this host to apply it and close the
+connection. When that exchange completes, the host has the report before the hook answers the
+application. It does not when the hook reaches its deadline first, or when the application moves on
+without waiting, as Claude Code may while background `SessionStart` hooks still run; the report is
+then applied late, or, if the hook has already gone, not at all. A thread
+starting selects that thread and advances the binding revision; the selected thread ending leaves
+none selected. Reports are ordered by when each hook process started, by the kernel's start value
+and then by the boot-clock reading the forwarder took, never by when they arrived; a report older
+than the one in force changes nothing, and two reports that cannot be ordered move nothing and
+suspend rich mutations until one that can be ordered settles the thread. Every observation goes
+into the instance's observed history.
+
+A contact question records, when it is asked, the thread the bridge last reported selected and its
+revision. When the application's own hook reports that the call that asked it ran in that same
+thread, the question is bound to that revision, and a later switch of thread invalidates it. If the
+reports name another thread, or disagree, the question stays bound to the application alone.
+
+An admitted channel's connection is handed to whatever serves the application's own protocol on it,
+as JSON lines within the gateway's native frame bound. The Claude Code bridge is described in
+[`docs/bridges/claude-code/README.md`](../bridges/claude-code/README.md).
 
 ## Agent methods
 
