@@ -24,11 +24,11 @@ use kr_crypto::keys::TransportIdentityKeyPair;
 use kr_protocol::error::ProtocolError;
 use kr_protocol::hello::{ALPN, HostSelection};
 use kr_protocol::method::Method;
-use kr_protocol::pairing::{NetworkConfig, NetworkHint, PairFinishRequest};
+use kr_protocol::pairing::{NetworkConfig, PairFinishRequest};
 use kr_protocol::preauth::{
     PairFinishResult, PairRedeemParams, PairRedeemResult, PairStatusParams, PairStatusResult,
 };
-use kr_protocol::scalars::{EndpointKey, Nullable};
+use kr_protocol::scalars::EndpointKey;
 use kr_transport::config::EndpointConfig;
 use kr_transport::handshake::{CandidateConnection, LocalIdentity};
 use kr_transport::scheduler::SendLimits;
@@ -154,29 +154,24 @@ impl kr_pairing::platform::LivePeer for ConnectionPeer {
 /// What makes two configurations need two endpoints: the services an endpoint itself uses.
 ///
 /// Direct-address hints describe where a *peer* is, not what the endpoint is, so two hosts whose
-/// services agree share an endpoint whatever their hints.
+/// services agree share an endpoint whatever their hints. The services are compared as the
+/// transport parses them, so two spellings of one relay are one relay.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Services {
-    relays: Vec<String>,
-    resolver: Option<String>,
+    relays: Vec<iroh::RelayUrl>,
+    resolver: Option<url::Url>,
     dns_origin: Option<String>,
 }
 
 impl Services {
-    fn of(network: &NetworkConfig) -> Self {
-        let text =
-            |hint: &Nullable<NetworkHint>| hint.as_ref().map(|hint| hint.as_str().to_owned());
-        let mut relays: Vec<String> = network
-            .relay_urls
-            .iter()
-            .map(|hint| hint.as_str().to_owned())
-            .collect();
-        relays.sort();
+    fn of(config: &EndpointConfig) -> Self {
+        let mut relays = config.relay_urls.clone();
+        relays.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         relays.dedup();
         Self {
             relays,
-            resolver: text(&network.pkarr_resolver_url),
-            dns_origin: text(&network.dns_origin),
+            resolver: config.discovery.pkarr_resolver_url.clone(),
+            dns_origin: config.discovery.dns_origin.clone(),
         }
     }
 
@@ -231,35 +226,58 @@ impl EndpointPool {
     /// Returns [`LinkError::Configuration`] for a configuration that cannot be used, and
     /// [`LinkError::Lost`] when the endpoint cannot be bound.
     pub async fn endpoint(&self, network: &NetworkConfig) -> Result<Endpoint, LinkError> {
-        let services = Services::of(network);
+        let config = self.config(network)?;
+        let services = Services::of(&config);
         let mut open = self.open.lock().await;
         if let Some((_, endpoint)) = open.iter().find(|(held, _)| *held == services) {
             return Ok(endpoint.clone());
         }
-        let mut kept = Vec::with_capacity(open.len());
-        for (held, endpoint) in open.drain(..) {
-            if held.share_a_relay(&services) {
-                endpoint.close().await;
-            } else {
-                kept.push((held, endpoint));
-            }
-        }
+        // The pool's record changes before anything waits, so a caller that stops waiting leaves
+        // it whole: the endpoints kept are still recorded, and the ones being closed are closed by
+        // tasks of their own, which finish whether or not anyone still waits for them.
+        let (closing, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut *open)
+            .into_iter()
+            .partition(|(held, _)| held.share_a_relay(&services));
         *open = kept;
-        let endpoint =
-            kr_transport::endpoint::bind_dialer(&self.config(network)?, &self.transport).await?;
+        let closes: Vec<_> = closing
+            .into_iter()
+            .map(|(_, endpoint)| tokio::spawn(async move { endpoint.close().await }))
+            .collect();
+        for close in closes {
+            let _ = close.await;
+        }
+        let endpoint = kr_transport::endpoint::bind_dialer(&config, &self.transport).await?;
         open.push((services, endpoint.clone()));
         Ok(endpoint)
     }
 
-    /// How many endpoints are open, for the pool's own tests.
+    /// How many endpoints are open.
     pub async fn open_endpoints(&self) -> usize {
         self.open.lock().await.len()
     }
 
+    /// True when the pool holds an endpoint for `network`'s services.
+    pub async fn holds(&self, network: &NetworkConfig) -> bool {
+        let Ok(config) = self.config(network) else {
+            return false;
+        };
+        let services = Services::of(&config);
+        self.open
+            .lock()
+            .await
+            .iter()
+            .any(|(held, _)| *held == services)
+    }
+
     /// Closes every endpoint.
     pub async fn close(&self) {
-        for (_, endpoint) in self.open.lock().await.drain(..) {
-            endpoint.close().await;
+        let closing = std::mem::take(&mut *self.open.lock().await);
+        let closes: Vec<_> = closing
+            .into_iter()
+            .map(|(_, endpoint)| tokio::spawn(async move { endpoint.close().await }))
+            .collect();
+        for close in closes {
+            let _ = close.await;
         }
     }
 
@@ -381,6 +399,8 @@ impl Preauth for Unpaired {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kr_protocol::pairing::NetworkHint;
+    use kr_protocol::scalars::Nullable;
 
     fn network(relays: &[&str], resolver: Option<&str>, hints: &[&str]) -> NetworkConfig {
         let hint = |text: &str| NetworkHint::new(text).expect("a hint");
@@ -395,7 +415,8 @@ mod tests {
     }
 
     /// Two hosts whose services agree share one endpoint whatever their address hints; two whose
-    /// services differ get one each; and two that differ but share a relay are never open at once.
+    /// services differ get one each; and two that differ but share a relay are never open at once,
+    /// however the relay is spelled: the endpoint on it is closed before the other is bound.
     #[tokio::test]
     async fn one_endpoint_per_set_of_services_and_none_sharing_a_relay() {
         let pool = EndpointPool::new(TransportIdentityKeyPair::generate().expect("a key"))
@@ -410,21 +431,92 @@ mod tests {
         assert_eq!(pool.open_endpoints().await, 2);
 
         let relayed = network(&["https://relay.example.test"], None, &[]);
-        let relayed_elsewhere = network(
-            &["https://relay.example.test"],
+        let respelled = network(
+            &["https://relay.example.test/"],
             Some("http://127.0.0.1:11/pkarr"),
             &[],
         );
-        pool.endpoint(&relayed).await.expect("an endpoint");
+        let on_the_relay = pool.endpoint(&relayed).await.expect("an endpoint");
         assert_eq!(pool.open_endpoints().await, 3);
-        pool.endpoint(&relayed_elsewhere)
-            .await
-            .expect("an endpoint");
-        assert_eq!(
-            pool.open_endpoints().await,
-            3,
-            "the endpoint sharing the relay was closed first"
+        pool.endpoint(&respelled).await.expect("an endpoint");
+        assert!(
+            on_the_relay.is_closed(),
+            "the endpoint on the same relay, spelled another way, was closed first"
         );
+        assert!(!pool.holds(&relayed).await);
+        assert!(pool.holds(&respelled).await);
+        assert_eq!(pool.open_endpoints().await, 3);
         pool.close().await;
+        assert_eq!(pool.open_endpoints().await, 0);
+    }
+
+    /// A caller that stops waiting while an endpoint on a shared relay is being closed leaves the
+    /// pool whole: every endpoint that did not share the relay is still recorded, a connection
+    /// live on one of them stays up, and the endpoint that did share the relay is closed all the
+    /// same.
+    #[tokio::test]
+    async fn stopping_part_way_loses_no_endpoint_and_keeps_none_it_closed() {
+        let peer_key = TransportIdentityKeyPair::generate().expect("a key");
+        let mut peer_config =
+            EndpointConfig::from_network_config(&network(&[], None, &[])).expect("a config");
+        peer_config.bind_addr = Some("127.0.0.1:0".parse().expect("loopback"));
+        let peer = kr_transport::endpoint::bind_listener(&peer_config, &peer_key)
+            .await
+            .expect("a peer on loopback");
+        let accepting = peer.clone();
+        let accepted = tokio::spawn(async move {
+            let incoming = accepting.accept().await.expect("a connection arrives");
+            incoming.await.expect("the connection completes")
+        });
+        let peer_address = peer.bound_sockets()[0].to_string();
+
+        let pool = Arc::new(
+            EndpointPool::new(TransportIdentityKeyPair::generate().expect("a key"))
+                .bound_to("127.0.0.1:0".parse().expect("loopback")),
+        );
+        let unrelated = network(&[], None, &[peer_address.as_str()]);
+        let live = IrohLink::new(Arc::clone(&pool))
+            .dial(&unrelated, peer_key.public())
+            .await
+            .expect("a connection to the peer");
+        let held = accepted.await.expect("the peer's side");
+        let relayed = network(&["https://relay.example.test"], None, &[]);
+        let replacing = network(
+            &["https://relay.example.test"],
+            Some("http://127.0.0.1:13/pkarr"),
+            &[],
+        );
+        let kept = pool.endpoint(&unrelated).await.expect("an endpoint");
+        let closing = pool.endpoint(&relayed).await.expect("an endpoint");
+        // The caller stops waiting at the first point the replacement waits, which is while the
+        // endpoint on the shared relay is being closed.
+        let finished_at_once = {
+            let mut replacement = Box::pin(pool.endpoint(&replacing));
+            std::future::poll_fn(|context| {
+                std::task::Poll::Ready(replacement.as_mut().poll(context).is_ready())
+            })
+            .await
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !closing.is_closed() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the endpoint on the shared relay is closed whether or not anyone waited");
+        assert!(
+            pool.holds(&unrelated).await,
+            "the unrelated endpoint is still recorded"
+        );
+        assert!(!kept.is_closed());
+        assert!(
+            live.close_reason().is_none(),
+            "the live connection is still up"
+        );
+        assert!(held.close_reason().is_none());
+        assert!(!pool.holds(&relayed).await);
+        assert_eq!(pool.holds(&replacing).await, finished_at_once);
+        pool.close().await;
+        peer.close().await;
     }
 }
