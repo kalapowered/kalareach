@@ -857,6 +857,7 @@ async fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_prec
             plugin_id: PluginId::new("kalareach.codex").expect("valid"),
             action: ActionName::new(action).expect("valid"),
             draft_id: draft,
+            resource_id: Nullable::null(),
             parameters: Bytes::from(b"{}".to_vec()),
         };
         let effect = prepared(action, draft);
@@ -943,6 +944,7 @@ async fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_prec
                         plugin_id: PluginId::new("kalareach.codex").expect("valid"),
                         action: ActionName::new("prompt.submit").expect("valid"),
                         draft_id: Nullable::null(),
+                        resource_id: Nullable::null(),
                         parameters: Bytes::from(b"{}".to_vec()),
                     },
                     TimestampMs::new(25),
@@ -984,6 +986,7 @@ async fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_prec
                     plugin_id: PluginId::new("kalareach.codex").expect("valid"),
                     action: ActionName::new("prompt.submit").expect("valid"),
                     draft_id: Nullable::null(),
+                    resource_id: Nullable::null(),
                     parameters: Bytes::from(b"{}".to_vec()),
                 },
                 &kr_protocol::broker::PreparedEffect {
@@ -1253,6 +1256,7 @@ fn kr_req_11_31_a_disabled_provider_refuses_its_own_dispatch_beside_a_working_on
         plugin_id: PluginId::new("kalareach.codex").expect("valid"),
         action: ActionName::new("prompt.submit").expect("valid"),
         draft_id: Nullable::null(),
+        resource_id: Nullable::null(),
         parameters: Bytes::from(b"{}".to_vec()),
     };
     broker
@@ -1315,6 +1319,7 @@ fn kr_req_11_28_a_prepared_effect_may_use_only_what_its_invocation_permits() {
                 plugin_id: PluginId::new("kalareach.codex").expect("valid"),
                 action: ActionName::new("draft.attach").expect("valid"),
                 draft_id: Nullable::some(draft),
+                resource_id: Nullable::null(),
                 parameters: Bytes::from(b"{}".to_vec()),
             },
             TimestampMs::new(2),
@@ -1513,6 +1518,7 @@ fn kr_req_11_28_an_unvalidated_effect_transmits_on_neither_dispatch_route() {
         plugin_id: PluginId::new("kalareach.codex").expect("valid"),
         action: ActionName::new("prompt.submit").expect("valid"),
         draft_id: Nullable::null(),
+        resource_id: Nullable::null(),
         parameters: Bytes::from(b"{}".to_vec()),
     };
 
@@ -1592,6 +1598,7 @@ fn kr_req_23_30_a_replaced_declaration_refuses_the_plan_of_the_invocation_it_rep
         plugin_id: PluginId::new("kalareach.codex").expect("valid"),
         action: ActionName::new("prompt.submit").expect("valid"),
         draft_id: Nullable::null(),
+        resource_id: Nullable::null(),
         parameters: Bytes::from(b"{}".to_vec()),
     };
     let admitted = broker
@@ -1851,6 +1858,7 @@ fn kr_req_11_28_a_plan_is_refused_when_the_invocations_authority_has_moved() {
         plugin_id: PluginId::new("kalareach.codex").expect("valid"),
         action: ActionName::new("prompt.submit").expect("valid"),
         draft_id: Nullable::null(),
+        resource_id: Nullable::null(),
         parameters: Bytes::from(b"{}".to_vec()),
     };
     let plan = kr_protocol::broker::PreparedEffect {
@@ -2003,6 +2011,7 @@ fn a_fence_refuses_a_plan_that_arrives_after_it(recovered: bool) {
                 plugin_id: PluginId::new("kalareach.codex").expect("valid"),
                 action: ActionName::new("prompt.submit").expect("valid"),
                 draft_id: Nullable::null(),
+                resource_id: Nullable::null(),
                 parameters: Bytes::from(b"{}".to_vec()),
             },
             TimestampMs::new(2),
@@ -2259,6 +2268,7 @@ fn kr_req_23_30_a_draft_that_moved_while_the_plan_was_prepared_transmits_nothing
         plugin_id: PluginId::new("kalareach.codex").expect("valid"),
         action: ActionName::new("draft.attach").expect("valid"),
         draft_id: Nullable::some(draft_id),
+        resource_id: Nullable::null(),
         parameters: Bytes::from(b"{}".to_vec()),
     };
     let effect = kr_protocol::broker::PreparedEffect {
@@ -2321,6 +2331,7 @@ fn kr_req_11_28_arguments_that_name_a_member_twice_are_refused_before_the_marker
                 plugin_id: PluginId::new("kalareach.codex").expect("valid"),
                 action: ActionName::new("prompt.submit").expect("valid"),
                 draft_id: Nullable::null(),
+                resource_id: Nullable::null(),
                 parameters: Bytes::from(parameters.to_vec()),
             },
             TimestampMs::new(4),
@@ -2507,6 +2518,7 @@ fn kr_req_23_30_authority_that_moves_inside_plan_validation_refuses_the_plan() {
                     plugin_id: PluginId::new("kalareach.codex").expect("valid"),
                     action: ActionName::new("draft.attach").expect("valid"),
                     draft_id: Nullable::some(draft_id),
+                    resource_id: Nullable::null(),
                     parameters: Bytes::from(b"{}".to_vec()),
                 },
                 TimestampMs::new(4),

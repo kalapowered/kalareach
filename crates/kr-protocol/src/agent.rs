@@ -361,6 +361,13 @@ pub struct PluginActionInvokeParams {
     pub action: ActionName,
     /// The draft the action acts on, where it acts on one.
     pub draft_id: Nullable<DraftId>,
+    /// The pending resource this invocation answers.
+    ///
+    /// An action whose effect class is `approval.respond` answers exactly one pending request,
+    /// and this names it. Every other action names none. The caller never supplies the upstream's
+    /// own request identifier: an answer carries the identifier the named resource recorded when
+    /// the request arrived, so it can resolve only the request it names.
+    pub resource_id: Nullable<PendingResourceId>,
     /// The action's parameters, canonically encoded by the caller.
     ///
     /// The bytes are hashed into the action token, so what the component is asked to do and what
@@ -451,6 +458,66 @@ mod tests {
             text: Nullable::some(PromptText::new("hello").expect("valid")),
         };
         assert!(both.validate().is_err());
+    }
+
+    /// KR-REQ-12.18 and KR-REQ-11.47: a plugin action call names the pending resource it answers,
+    /// or says it answers none. The member is always present, so an older caller that knows
+    /// nothing of it is refused rather than read as answering nothing, and only a pending resource
+    /// identifier fills it.
+    #[test]
+    fn a_plugin_action_names_the_pending_resource_it_answers() {
+        let target = AgentMutationTarget {
+            subject: AgentSubject {
+                session_id: SessionId::new(Uuid::from_bytes([1; 16])),
+                application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([2; 16])),
+            },
+            binding_revision: AgentBindingRevision::new(7),
+        };
+        let resource = PendingResourceId::new(Uuid::from_bytes([9; 16]));
+        let answer = PluginActionInvokeParams {
+            target,
+            plugin_id: PluginId::new("kalareach/claude-code").expect("valid"),
+            action: ActionName::new("approval.answer").expect("valid"),
+            draft_id: Nullable::null(),
+            resource_id: Nullable::some(resource),
+            parameters: crate::scalars::Bytes::from(br#"{"decision":"allow"}"#.to_vec()),
+        };
+        let encoded = serde_json::to_value(&answer).expect("the call encodes");
+        assert_eq!(
+            encoded.get("resource_id"),
+            Some(&serde_json::to_value(resource).expect("the identifier encodes"))
+        );
+        assert_eq!(
+            serde_json::from_value::<PluginActionInvokeParams>(encoded.clone())
+                .expect("the call decodes"),
+            answer
+        );
+
+        // An action that answers nothing says so with null.
+        let mut none = encoded.clone();
+        none["resource_id"] = serde_json::Value::Null;
+        let decoded: PluginActionInvokeParams = serde_json::from_value(none).expect("null decodes");
+        assert!(!decoded.resource_id.is_present());
+
+        // Absent is not null, and only a pending resource identifier is one.
+        let mut absent = encoded.clone();
+        absent
+            .as_object_mut()
+            .expect("an object")
+            .remove("resource_id");
+        assert!(serde_json::from_value::<PluginActionInvokeParams>(absent).is_err());
+        for malformed in [
+            serde_json::json!("abcde"),
+            serde_json::json!(7),
+            serde_json::json!({"resource_id": "abcde"}),
+        ] {
+            let mut call = encoded.clone();
+            call["resource_id"] = malformed.clone();
+            assert!(
+                serde_json::from_value::<PluginActionInvokeParams>(call).is_err(),
+                "{malformed} was read as a pending resource"
+            );
+        }
     }
 
     #[test]

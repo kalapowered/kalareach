@@ -9,6 +9,7 @@
 //! here, in one table, rather than in each call site, so "what does this action need" has one
 //! answer.
 
+use kr_protocol::ids::PendingResourceId;
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 
 use crate::scalars::{Count, SafeInt, U64};
@@ -424,6 +425,79 @@ impl ActionDeclaration {
     pub fn required_rights(&self) -> CanonicalSet<ActionRight> {
         self.effect.required_rights().iter().copied().collect()
     }
+
+    /// Returns true when an invocation of this action names the pending resource it answers.
+    ///
+    /// An answer resolves one pending request, so its invocation says which. No other effect
+    /// class acts on a pending resource, so no other invocation names one.
+    #[must_use]
+    pub const fn answers_a_pending_resource(&self) -> bool {
+        matches!(self.effect, EffectClass::ApprovalRespond)
+    }
+
+    /// Checks one invocation against this declaration.
+    ///
+    /// The invocation must name this action, must name a pending resource exactly when the action
+    /// answers one, and must carry arguments the parameter schema accepts.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`InvocationError`] that applies.
+    pub fn check(&self, invocation: &ActionInvocation) -> Result<(), InvocationError> {
+        if invocation.action_id != self.id {
+            return Err(InvocationError::OtherAction {
+                expected: self.id.clone(),
+                found: invocation.action_id.clone(),
+            });
+        }
+        match (
+            self.answers_a_pending_resource(),
+            invocation.resource_id.is_present(),
+        ) {
+            (true, false) => {
+                return Err(InvocationError::ResourceMissing {
+                    action: self.id.clone(),
+                });
+            }
+            (false, true) => {
+                return Err(InvocationError::ResourceUnexpected {
+                    action: self.id.clone(),
+                });
+            }
+            _ => {}
+        }
+        self.parameters
+            .check(invocation)
+            .map_err(InvocationError::Arguments)
+    }
+}
+
+/// Why an invocation does not satisfy the action it names.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum InvocationError {
+    /// The invocation names a different action.
+    #[error("the invocation names {found}, not {expected}")]
+    OtherAction {
+        /// The action being checked.
+        expected: ActionName,
+        /// The action the invocation names.
+        found: ActionName,
+    },
+    /// The action answers a pending request and the invocation names none.
+    #[error("{action} answers a pending request and the invocation names none")]
+    ResourceMissing {
+        /// The action.
+        action: ActionName,
+    },
+    /// The action answers no pending request and the invocation names one.
+    #[error("{action} answers no pending request and the invocation names one")]
+    ResourceUnexpected {
+        /// The action.
+        action: ActionName,
+    },
+    /// The arguments do not satisfy the parameter schema.
+    #[error(transparent)]
+    Arguments(ArgumentError),
 }
 
 /// An action invocation the host has not yet checked.
@@ -436,6 +510,12 @@ impl ActionDeclaration {
 pub struct ActionInvocation {
     /// The action being invoked.
     pub action_id: ActionName,
+    /// The pending resource this invocation answers.
+    ///
+    /// Present exactly when the action's effect class is [`EffectClass::ApprovalRespond`]. The
+    /// upstream's own request identifier is not here: an answer carries the identifier the named
+    /// resource recorded, so it resolves only the request it names.
+    pub resource_id: Nullable<PendingResourceId>,
     /// The supplied parameter values, keyed by parameter name.
     pub arguments: Vec<ActionArgument>,
 }
@@ -729,6 +809,134 @@ mod tests {
         );
     }
 
+    fn answer_action(effect: EffectClass, label: &str) -> ActionDeclaration {
+        let choice = |id: &str, label: &str| ParameterChoice {
+            id: name(id),
+            label: Label::new(label).expect("a literal label"),
+        };
+        ActionDeclaration {
+            id: ActionName::new("approval.answer").expect("valid action"),
+            label: Label::new(label).expect("a literal label"),
+            effect,
+            implementation: ActionImplementation::Component {},
+            parameters: ParameterSchema {
+                parameters: vec![ParameterDeclaration {
+                    name: name("decision"),
+                    kind: ParameterKind::Choice {
+                        choices: vec![choice("allow", "Allow"), choice("deny", "Deny")],
+                    },
+                    label: Label::new("Decision").expect("a literal label"),
+                    required: true,
+                }],
+            },
+            description: Summary::new("Answer the request the session is waiting on")
+                .expect("a literal summary"),
+            confirmation_required: false,
+        }
+    }
+
+    fn decided(
+        action: &str,
+        resource_id: Nullable<PendingResourceId>,
+        decision: &str,
+    ) -> ActionInvocation {
+        ActionInvocation {
+            action_id: ActionName::new(action).expect("valid action"),
+            resource_id,
+            arguments: vec![ActionArgument {
+                name: name("decision"),
+                value: ArgumentValue::Choice {
+                    choice_id: name(decision),
+                },
+            }],
+        }
+    }
+
+    /// KR-REQ-12.18: an answer names the one pending resource it resolves. Without one it is
+    /// refused, and a decision the action does not offer is refused as well.
+    #[test]
+    fn kr_req_12_18_an_answer_names_the_pending_resource_it_resolves() {
+        let answer = answer_action(EffectClass::ApprovalRespond, "Answer");
+        assert!(answer.answers_a_pending_resource());
+        let resource = PendingResourceId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16]));
+
+        assert_eq!(
+            answer.check(&decided(
+                "approval.answer",
+                Nullable::some(resource),
+                "allow"
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            answer.check(&decided("approval.answer", Nullable::null(), "allow")),
+            Err(InvocationError::ResourceMissing {
+                action: answer.id.clone()
+            })
+        );
+        assert_eq!(
+            answer.check(&decided(
+                "approval.answer",
+                Nullable::some(resource),
+                "allow-always"
+            )),
+            Err(InvocationError::Arguments(ArgumentError::OutOfBounds {
+                name: name("decision")
+            }))
+        );
+        assert_eq!(
+            answer.check(&decided(
+                "approval.other",
+                Nullable::some(resource),
+                "allow"
+            )),
+            Err(InvocationError::OtherAction {
+                expected: answer.id.clone(),
+                found: ActionName::new("approval.other").expect("valid action"),
+            })
+        );
+    }
+
+    /// KR-REQ-11.47: only an answer names a pending resource, and what an answer needs is the
+    /// answer right and nothing its label suggests.
+    #[test]
+    fn kr_req_11_47_only_an_answer_names_a_resource_and_it_needs_the_answer_right() {
+        let resource = PendingResourceId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16]));
+        for effect in EffectClass::ALL
+            .iter()
+            .copied()
+            .filter(|effect| *effect != EffectClass::ApprovalRespond)
+        {
+            let other = answer_action(effect, "Answer");
+            assert!(!other.answers_a_pending_resource(), "{effect}");
+            assert_eq!(
+                other.check(&decided(
+                    "approval.answer",
+                    Nullable::some(resource),
+                    "allow"
+                )),
+                Err(InvocationError::ResourceUnexpected {
+                    action: other.id.clone()
+                }),
+                "{effect} accepted a pending resource"
+            );
+            assert_eq!(
+                other.check(&decided("approval.answer", Nullable::null(), "allow")),
+                Ok(()),
+                "{effect}"
+            );
+        }
+
+        for label in ["Answer", "Preview", "Read only"] {
+            let rights = answer_action(EffectClass::ApprovalRespond, label).required_rights();
+            assert_eq!(
+                rights.iter().copied().collect::<Vec<_>>(),
+                vec![ActionRight::AgentApprovalRespond],
+                "the label {label:?} changed the rights"
+            );
+        }
+    }
+
     #[test]
     fn decoding_never_answers() {
         assert!(EffectClass::ApprovalDecode.required_rights().is_empty());
@@ -804,6 +1012,7 @@ mod tests {
         };
         let ok = ActionInvocation {
             action_id: ActionName::new("send").expect("valid action"),
+            resource_id: Nullable(None),
             arguments: vec![ActionArgument {
                 name: name("prompt"),
                 value: ArgumentValue::Text {
@@ -815,6 +1024,7 @@ mod tests {
 
         let too_long = ActionInvocation {
             action_id: ActionName::new("send").expect("valid action"),
+            resource_id: Nullable(None),
             arguments: vec![ActionArgument {
                 name: name("prompt"),
                 value: ArgumentValue::Text {
@@ -831,6 +1041,7 @@ mod tests {
 
         let missing = ActionInvocation {
             action_id: ActionName::new("send").expect("valid action"),
+            resource_id: Nullable(None),
             arguments: Vec::new(),
         };
         assert_eq!(
@@ -842,6 +1053,7 @@ mod tests {
 
         let unknown = ActionInvocation {
             action_id: ActionName::new("send").expect("valid action"),
+            resource_id: Nullable(None),
             arguments: vec![
                 ActionArgument {
                     name: name("prompt"),
@@ -864,6 +1076,7 @@ mod tests {
 
         let wrong_kind = ActionInvocation {
             action_id: ActionName::new("send").expect("valid action"),
+            resource_id: Nullable(None),
             arguments: vec![ActionArgument {
                 name: name("prompt"),
                 value: ArgumentValue::Boolean { value: true },
