@@ -852,7 +852,8 @@ impl Controller {
             _lock: lock,
         });
         // Bound before anything can reach the module: from here on a workflow's grant is decided
-        // under this daemon's policy, its configured ceiling and its clock model.
+        // under this daemon's policy, its configured ceiling and its clock model, and a node's
+        // change-set write is held under this daemon's registry.
         controller.automation.bind(Arc::downgrade(&controller));
         // Reconnecting is not only verifying. A replacement daemon has to present the generation it
         // advanced to, because that is what fences the daemon it replaced.
@@ -2136,6 +2137,25 @@ impl Controller {
                 refusal.detail()
             ))
         })
+    }
+
+    /// Runs `effect` while this daemon's registry is held and no fence is owed, for work that
+    /// stands on a grant rather than on a connection's admission.
+    ///
+    /// A workflow node's effect is admitted by the grant its definition names, and the change-set
+    /// service asks for that admission around each transaction that commits the effect. A
+    /// revocation completes by advancing the authority revision, which takes the registry, so one
+    /// that begins while `effect` runs finishes after it; `effect` reads the grant as it stands, so
+    /// one that finished before is refused there. Nothing inside `effect` may wait on this daemon.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::PermissionDenied`] while a fence is owed, in which case `effect`
+    /// did not run.
+    pub(crate) async fn hold_registry<T>(&self, effect: impl FnOnce() -> T) -> Result<T> {
+        let _registry = self.registry.lock().await;
+        self.check_fence()?;
+        Ok(effect())
     }
 
     /// Returns which workers have not yet acknowledged the environment's authority revision.

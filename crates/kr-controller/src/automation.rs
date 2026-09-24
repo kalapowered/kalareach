@@ -15,13 +15,13 @@
 //!   grant store and has the daemon decide the grant under its own model: the rights ceiling its
 //!   configuration put in force, revocation and a revoked ancestor, the clock floor, expiry, the
 //!   organisation leases, and the bounded offline validity on the continuous clock. It decides
-//!   that again before every node a run dispatches, and a paired device's grant runs no change-set
-//!   node, because the device's own door serves it no change-set write.
+//!   that again before every node a run dispatches.
 //! * **An action is a real effect or it is a refusal.** [`HostActions`] carries out the change-set
 //!   nodes against the environment's own change-set service, binding each result to the run that
-//!   asked for it, and asks the grant once more inside the task that performs the effect. Every
-//!   other action kind is refused by name. Nothing here writes a success receipt for work that was
-//!   never done.
+//!   asked for it. The node's grant is held in force around every transaction that commits the
+//!   effect, so a grant withdrawn while the write waits for the store stops the write. Every other
+//!   action kind is refused by name. Nothing here writes a success receipt for work that was never
+//!   done.
 //!
 //! The journal lives in the environment's state directory beside the registry, because section 24
 //! requires a causal budget to survive a restart and a reboot, and a runtime directory does not
@@ -57,12 +57,12 @@ use crate::service::Controller;
 /// What an automation call answers with: the method's result, or the refusal the service decided.
 pub type Answer<T> = std::result::Result<T, ProtocolError>;
 
-/// The daemon this module decides authority under.
+/// The daemon this module decides and holds authority under.
 ///
 /// The module is opened before the daemon that holds it is built, so the daemon is bound to it
-/// once it exists, and from then on every grant is decided under the daemon's own model. Until
-/// then, and after the daemon has gone, nothing is decided: an answer about a grant needs the
-/// daemon that owns it.
+/// once it exists, and from then on every grant is decided under the daemon's own model and every
+/// change-set write is held under its registry. Until then, and after the daemon has gone, nothing
+/// is decided: an answer about a grant needs the daemon that owns it.
 #[derive(Debug, Default)]
 struct Daemon(std::sync::OnceLock<Weak<Controller>>);
 
@@ -149,27 +149,20 @@ impl HostGrants {
             revoked_by_parent: None,
         })
     }
-
-    /// The door a grant's holder reaches this host through.
-    ///
-    /// A grant this host holds for itself is the owner's own authority at this machine; any other
-    /// recipient is a device that reached the host over the network.
-    fn ingress(daemon: &Controller, grant: &Grant) -> ActorIngress {
-        if grant.recipient_device_id == daemon.sharing().host_device_id() {
-            ActorIngress::LocalIpc
-        } else {
-            ActorIngress::PairedDevice
-        }
-    }
 }
 
 impl AuthoritySource for HostGrants {
     fn grant(&self, grant_id: GrantId, now_ms: u64) -> kr_automation::Result<Grant> {
         let daemon = self.daemon.get()?;
         let record = Self::record(&daemon, grant_id)?;
-        // The bounded offline validity is about a device's access over the network, so the daemon
-        // is asked about the door the holder comes through.
-        let ingress = Self::ingress(&daemon, &record.grant);
+        // A grant this host holds for itself is the owner's own authority at this machine; any
+        // other recipient is a device that reached the host over the network, and the bounded
+        // offline validity is about exactly that access.
+        let ingress = if record.grant.recipient_device_id == daemon.sharing().host_device_id() {
+            ActorIngress::LocalIpc
+        } else {
+            ActorIngress::PairedDevice
+        };
         let rights = daemon.decide_for_workflow(&record, ingress, now_ms)?;
         // The grant as this host leaves it: a configured ceiling or an organisation lease that
         // narrows it narrows what the workflow may do, and the node is checked against the result.
@@ -178,35 +171,15 @@ impl AuthoritySource for HostGrants {
             ..record.grant
         })
     }
-
-    /// A paired device's grant runs no change-set node.
-    ///
-    /// The door a paired device reaches this host through serves it no change-set write: the
-    /// change-set service does not hold the device's grant inside its own transactions, so a grant
-    /// withdrawn while the write prepares would still reach the effect. A workflow node's write is
-    /// held no better, since its capture or materialisation reaches the same service with no
-    /// admission of its own. So a workflow under the device's grant is not a way around that
-    /// door, whatever rights the grant carries. The owner's own grant is served as the owner's
-    /// own client is at its door.
-    fn refusal(&self, grant: &Grant, action_kind: &str) -> Option<String> {
-        // Without its daemon this host cannot tell whose grant this is, and refuses as it would a
-        // device's.
-        let paired = self.daemon.get().map_or(true, |daemon| {
-            Self::ingress(&daemon, grant) == ActorIngress::PairedDevice
-        });
-        (paired && kr_automation::authority::writes_change_set(action_kind)).then(|| {
-            "this host carries out no change-set write under a paired device's grant, because \
-             it cannot refuse one whose grant is withdrawn while the write prepares"
-                .to_owned()
-        })
-    }
 }
 
 /// The actions this host carries out for a workflow node.
 ///
 /// The two change-set kinds are real: they reach the environment's change-set service, and the
 /// version each one produces records the run that asked for it, so the evidence a later node reads
-/// is bound to the execution that made it rather than to a claim about it.
+/// is bound to the execution that made it rather than to a claim about it. The node's grant is
+/// held in force around every transaction that commits the effect ([`HeldGrant`]), the way a
+/// caller's admission is held around a change-set method's own.
 ///
 /// Every other registered kind is refused by name. A refusal is not an uncertain outcome: nothing
 /// was dispatched, so the node failed and its dependants see a failure rather than a result
@@ -214,6 +187,7 @@ impl AuthoritySource for HostGrants {
 pub struct HostActions {
     changesets: Arc<ChangeSetService>,
     authority: Arc<dyn AuthoritySource>,
+    daemon: Arc<Daemon>,
     environment_id: EnvironmentId,
 }
 
@@ -226,22 +200,6 @@ impl std::fmt::Debug for HostActions {
     }
 }
 
-impl HostActions {
-    /// Carries out change-set nodes against `changesets`, asking `authority` before each effect.
-    #[must_use]
-    pub fn new(
-        changesets: Arc<ChangeSetService>,
-        authority: Arc<dyn AuthoritySource>,
-        environment_id: EnvironmentId,
-    ) -> Self {
-        Self {
-            changesets,
-            authority,
-            environment_id,
-        }
-    }
-}
-
 impl ActionRunner for HostActions {
     fn execute(
         &self,
@@ -250,28 +208,40 @@ impl ActionRunner for HostActions {
         Box<dyn std::future::Future<Output = kr_automation::Result<ActionOutcome>> + Send>,
     > {
         let changesets = Arc::clone(&self.changesets);
-        let authority = Arc::clone(&self.authority);
-        let environment_id = self.environment_id;
-        let definition = dispatch.definition.clone();
-        let node = dispatch.node.clone();
+        let held = HeldGrant {
+            daemon: Arc::clone(&self.daemon),
+            authority: Arc::clone(&self.authority),
+            definition: dispatch.definition.clone(),
+            node: dispatch.node.clone(),
+            environment_id: self.environment_id,
+            refused: std::sync::Mutex::new(None),
+        };
         let run_id = dispatch.run_id;
         Box::pin(async move {
-            match node.action_kind.as_str() {
+            match held.node.action_kind.as_str() {
                 "capture_changeset" => {
-                    let asked: ChangesetCaptureParams = serde_json::from_str(&node.action_params)?;
+                    let asked: ChangesetCaptureParams =
+                        serde_json::from_str(&held.node.action_params)?;
                     blocking(move || {
-                        still_authorised(&*authority, &definition, &node, environment_id)?;
-                        Ok(capture(&changesets, &asked, run_id))
+                        // Asked before the working tree is read, so a grant already gone costs no
+                        // read; the hold asks it again around each write.
+                        held.still_authorised()?;
+                        capture(&changesets, &asked, run_id, &held)
                     })
                     .await
                 }
                 "materialize_changeset" => {
                     let asked: ChangesetMaterializeParams =
-                        serde_json::from_str(&node.action_params)?;
+                        serde_json::from_str(&held.node.action_params)?;
                     blocking(move || {
-                        still_authorised(&*authority, &definition, &node, environment_id)?;
-                        version_in_scope(&changesets, &definition, &asked, environment_id)?;
-                        Ok(materialise_version(&changesets, &asked))
+                        held.still_authorised()?;
+                        version_in_scope(
+                            &changesets,
+                            &held.definition,
+                            &asked,
+                            held.environment_id,
+                        )?;
+                        materialise_version(&changesets, &asked, &held)
                     })
                     .await
                 }
@@ -283,21 +253,109 @@ impl ActionRunner for HostActions {
     }
 }
 
-/// Asks the grant once more, inside the task that performs the effect.
+/// A workflow node's grant, held in force while the change-set service commits the node's effect.
 ///
-/// The engine asked it immediately before calling this runner, and the effect still waited for a
-/// blocking thread after that. This is the last thing this host does before the change-set
-/// service's own work, so a revocation or an expiry that completed during that wait stops the
-/// effect here. What it cannot reach is the change-set service's own lock and preparation, which
-/// come after it: that service takes no admission into its own transaction.
-fn still_authorised(
-    authority: &dyn AuthoritySource,
-    definition: &WorkflowDefinition,
-    node: &WorkflowNode,
+/// The change-set service asks for this around every transaction that commits an effect of its
+/// own: the clone identity a capture fixes, a new change set and its version, the row a
+/// materialisation is written under. Everything before those transactions can wait, for a blocking
+/// thread, for the store's own lock, for a whole working tree to be read, and a grant withdrawn in
+/// any of those intervals must leave nothing behind. So each hold takes the daemon's registry,
+/// which is what a revocation takes to complete, refuses while a fence is owed, reads the grant as
+/// it stands and checks the node against it, and only then runs the effect. A revocation that
+/// begins while the effect commits finishes after it.
+struct HeldGrant {
+    daemon: Arc<Daemon>,
+    authority: Arc<dyn AuthoritySource>,
+    definition: WorkflowDefinition,
+    node: WorkflowNode,
     environment_id: EnvironmentId,
-) -> kr_automation::Result<()> {
-    let grant = authority.grant(definition.grant_reference, kr_ipc::now_ms().get())?;
-    kr_automation::authority::check_node(authority, &grant, definition, node, environment_id)
+    /// Why a hold refused, kept in the automation engine's own terms for the runner to answer
+    /// with once the change-set service has passed the refusal back.
+    refused: std::sync::Mutex<Option<kr_automation::AutomationError>>,
+}
+
+impl HeldGrant {
+    /// Reads the grant as it stands now and checks this node against it.
+    fn still_authorised(&self) -> kr_automation::Result<()> {
+        let grant = self
+            .authority
+            .grant(self.definition.grant_reference, kr_ipc::now_ms().get())?;
+        kr_automation::authority::check_node(
+            &grant,
+            &self.definition,
+            &self.node,
+            self.environment_id,
+        )
+    }
+
+    /// The refusal a hold recorded, in the engine's terms, when the change-set service reports
+    /// that its effect was not admitted.
+    ///
+    /// A refusal is not an outcome: the effect did not commit, so the engine pauses the node as it
+    /// would have if its own check had refused a moment earlier.
+    fn refusal_of(
+        &self,
+        error: kr_changeset::ChangeSetError,
+    ) -> kr_automation::Result<ActionOutcome> {
+        match error {
+            kr_changeset::ChangeSetError::NotAdmitted { code, detail } => Err(self
+                .refused
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .unwrap_or_else(|| {
+                    if code == ErrorCode::PermissionDenied {
+                        kr_automation::AutomationError::PermissionDenied(detail.to_string())
+                    } else {
+                        kr_automation::AutomationError::AuthorityUnavailable(detail.to_string())
+                    }
+                })),
+            other => Ok(ActionOutcome::Failed {
+                error: kr_project::git::redact(&other.to_string()),
+            }),
+        }
+    }
+
+    fn refuse(&self, refusal: kr_automation::AutomationError) -> kr_changeset::ChangeSetError {
+        let code = ProtocolError::from(&refusal).code;
+        let detail = refusal.to_string();
+        *self
+            .refused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(refusal);
+        kr_changeset::ChangeSetError::NotAdmitted {
+            code,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl kr_changeset::store::StillAdmitted for HeldGrant {
+    fn hold(
+        &self,
+        effect: &mut dyn FnMut() -> kr_changeset::Result<()>,
+    ) -> kr_changeset::Result<()> {
+        let daemon = self.daemon.get().map_err(|refusal| self.refuse(refusal))?;
+        // The effect runs on a blocking task of this daemon's own, so waiting here for the registry
+        // blocks nothing but this node.
+        let held = tokio::runtime::Handle::current().block_on(daemon.hold_registry(|| {
+            match self.still_authorised() {
+                Ok(()) => effect(),
+                Err(refusal) => Err(self.refuse(refusal)),
+            }
+        }));
+        match held {
+            Ok(inner) => inner,
+            Err(error) => {
+                let refusal = error.to_protocol_error();
+                Err(self.refuse(if refusal.code == ErrorCode::PermissionDenied {
+                    kr_automation::AutomationError::PermissionDenied(refusal.message)
+                } else {
+                    kr_automation::AutomationError::AuthorityUnavailable(refusal.message)
+                }))
+            }
+        }
+    }
 }
 
 /// Refuses a materialisation of a version the workflow's scope does not reach.
@@ -343,12 +401,13 @@ fn version_in_scope(
     Ok(())
 }
 
-/// Captures one version of a workspace, recorded as this run's work.
+/// Captures one version of a workspace, recorded as this run's work, under the node's held grant.
 fn capture(
     changesets: &ChangeSetService,
     asked: &ChangesetCaptureParams,
     run_id: kr_protocol::ids::WorkflowRunId,
-) -> ActionOutcome {
+    held: &HeldGrant,
+) -> kr_automation::Result<ActionOutcome> {
     let order = CaptureOrder {
         workspace_id: asked.workspace_id,
         change_set_id: asked.change_set_id.0,
@@ -377,40 +436,34 @@ fn capture(
             derivation: String::new(),
             note: asked.note.clone(),
         },
-        // The grant was asked for again on this task immediately before this call. The service's
-        // own transactions do not hold it: nothing here yet holds a workflow's grant in force
-        // while another thread could withdraw it.
-        admitted: None,
+        admitted: Some(held),
     };
     match changesets.capture(&order) {
-        Ok((version, _pinned)) => ActionOutcome::Success {
+        Ok((version, _pinned)) => Ok(ActionOutcome::Success {
             output: format!(
                 "captured change set {} version {}",
                 version.change_set_id, version.version
             ),
-        },
-        Err(error) => ActionOutcome::Failed {
-            error: kr_project::git::redact(&error.to_string()),
-        },
+        }),
+        Err(error) => held.refusal_of(error),
     }
 }
 
-/// Materialises one exact immutable version into a private directory.
+/// Materialises one exact immutable version into a private directory, under the node's held grant.
 fn materialise_version(
     changesets: &ChangeSetService,
     asked: &ChangesetMaterializeParams,
-) -> ActionOutcome {
+    held: &HeldGrant,
+) -> kr_automation::Result<ActionOutcome> {
     let named = kr_protocol::changeset::VersionRef {
         change_set_id: asked.change_set_id,
         version: asked.version,
     };
-    // As with a capture: the grant was asked for again immediately before this call, and nothing
-    // yet holds it in force inside the service's own transaction.
-    match materialise::materialise(changesets, named, asked.purpose, &asked.label, None) {
+    match materialise::materialise(changesets, named, asked.purpose, &asked.label, Some(held)) {
         // A materialisation that could not write every path the version holds is not the version.
         // A later node reading it on a success edge would be reading something else, so a partial
         // result fails and names how much is missing.
-        Ok(record) if !record.unapplied.is_empty() => ActionOutcome::Failed {
+        Ok(record) if !record.unapplied.is_empty() => Ok(ActionOutcome::Failed {
             error: format!(
                 "materialisation {} of change set {} version {} left {} of its paths unwritten",
                 record.materialisation_id,
@@ -418,16 +471,14 @@ fn materialise_version(
                 named.version,
                 record.unapplied.len()
             ),
-        },
-        Ok(record) => ActionOutcome::Success {
+        }),
+        Ok(record) => Ok(ActionOutcome::Success {
             output: format!(
                 "materialised change set {} version {} as {}",
                 named.change_set_id, named.version, record.materialisation_id
             ),
-        },
-        Err(error) => ActionOutcome::Failed {
-            error: kr_project::git::redact(&error.to_string()),
-        },
+        }),
+        Err(error) => held.refusal_of(error),
     }
 }
 
@@ -436,15 +487,15 @@ const DISPATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2)
 
 /// The automation service, as the daemon holds it.
 ///
-/// Opening it recovers the journal and executes nothing. It decides nothing either until it is
-/// bound to the daemon that owns it ([`AutomationModule::bind`]). Execution waits for
+/// Opening it recovers the journal and executes nothing. It decides and holds nothing either
+/// until it is bound to the daemon that owns it ([`AutomationModule::bind`]). Execution waits for
 /// [`AutomationModule::start`], which the daemon calls once its own start has passed every gate it
 /// has. From then on the module owns the task that starts the runs derived triggers ask for, which
 /// lives exactly as long as the module does.
 #[derive(Debug)]
 pub struct AutomationModule {
     service: Arc<AutomationService>,
-    /// The daemon every grant is decided under.
+    /// The daemon every grant is decided under and every change-set write is held under.
     daemon: Arc<Daemon>,
     /// The runs recovery resumed, held until execution starts.
     resumed: std::sync::Mutex<Option<Vec<kr_automation::StartedRun>>>,
@@ -539,11 +590,12 @@ impl AutomationModule {
         });
         let host = Host {
             environment_id,
-            runner: Arc::new(HostActions::new(
+            runner: Arc::new(HostActions {
                 changesets,
-                Arc::clone(&grants),
+                authority: Arc::clone(&grants),
+                daemon: Arc::clone(&daemon),
                 environment_id,
-            )),
+            }),
             authority: grants,
             clock: Arc::new(SystemClock),
         };
@@ -581,9 +633,9 @@ impl AutomationModule {
 
     /// Binds this module to the daemon that owns it.
     ///
-    /// From here on every grant a workflow names is decided under that daemon's own model. The
-    /// daemon binds the module as it is built, before it serves anything; binding again changes
-    /// nothing.
+    /// From here on every grant a workflow names is decided under that daemon's own model and
+    /// every change-set write a node makes is held under its registry. The daemon binds the module
+    /// as it is built, before it serves anything; binding again changes nothing.
     pub fn bind(&self, daemon: Weak<Controller>) {
         let _ = self.daemon.0.set(daemon);
     }

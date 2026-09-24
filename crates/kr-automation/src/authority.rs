@@ -5,7 +5,7 @@
 //! terminal input. Section 25 makes that grant explicit in the definition and names it in every
 //! later reference.
 //!
-//! Four rules follow, and this module holds all four.
+//! Three rules follow, and this module holds all three.
 //!
 //! **The grant is read, never supplied.** A definition names a grant identifier; the host reads
 //! that grant from its own store. Nothing a caller passes in decides what a run may do, so a
@@ -21,12 +21,6 @@
 //! `terminal.input`; a node that captures a change set needs `changeset.create`. The table below
 //! gives each registered action kind the right section 23 gives the method that performs the same
 //! effect, so a workflow is not a way around the method the person would otherwise have called.
-//!
-//! **A workflow gets no more than its grant's holder is served.** A host can refuse a grant's
-//! holder an effect whatever rights the grant names: it serves a paired device no change-set
-//! write, for one, because it cannot hold that write to the device's grant while the write
-//! prepares. The host's [`AuthoritySource`] names such a refusal, and every check of a node asks
-//! it beside the rights, so a workflow acting under the grant is not a way around the refusal.
 
 use kr_protocol::automation::{WorkflowDefinition, WorkflowNode};
 use kr_protocol::grant::Grant;
@@ -47,13 +41,6 @@ pub trait AuthoritySource: Send + Sync + std::fmt::Debug {
     /// Returns [`AutomationError::PermissionDenied`] when the grant is unknown to this host, has
     /// expired, has been revoked, or has never been redeemed.
     fn grant(&self, grant_id: GrantId, now_ms: u64) -> Result<Grant>;
-
-    /// Returns why this host does not carry out a node of `action_kind` under `grant`, whatever
-    /// rights the grant names, or `None` when the grant's rights decide alone.
-    ///
-    /// [`check_node`] asks this beside the rights, so a refusal here reaches an install, an
-    /// admission and every dispatch alike.
-    fn refusal(&self, grant: &Grant, action_kind: &str) -> Option<String>;
 }
 
 /// The rights one registered action kind needs before a node of that kind may be dispatched.
@@ -84,19 +71,6 @@ pub fn node_rights(action_kind: &str) -> Result<&'static [ActionRight]> {
             )));
         }
     })
-}
-
-/// Whether a node of `action_kind` writes through the change-set method group: a capture, a
-/// materialisation or a diff applied to a workspace.
-///
-/// A host that serves a grant's holder no change-set write refuses exactly these kinds, so it
-/// names them from here rather than keeping a list of its own beside the table above.
-#[must_use]
-pub fn writes_change_set(action_kind: &str) -> bool {
-    matches!(
-        action_kind,
-        "capture_changeset" | "materialize_changeset" | "apply_diff"
-    )
 }
 
 /// Checks that `grant` is the definition's own grant and covers the resources it names.
@@ -148,17 +122,14 @@ pub fn check_scope(
     Ok(())
 }
 
-/// Checks that `grant` admits one node's effect, immediately before that node is dispatched, and
-/// that `source`, the host the grant was read from, carries that effect out for the grant's
-/// holder.
+/// Checks that `grant` admits one node's effect, immediately before that node is dispatched.
 ///
 /// # Errors
 ///
 /// Returns [`AutomationError::PermissionDenied`] when the grant lacks a right the node's action
-/// kind needs, when the host refuses that kind to the grant's holder, when the grant does not
-/// admit this environment, or when it does not admit the environment a shell node declares.
+/// kind needs, when the grant does not admit this environment, or when it does not admit the
+/// environment a shell node declares.
 pub fn check_node(
-    source: &dyn AuthoritySource,
     grant: &Grant,
     definition: &WorkflowDefinition,
     node: &WorkflowNode,
@@ -174,14 +145,6 @@ pub fn check_node(
                 grant.grant_id
             )));
         }
-    }
-    // What the rights admit, the host may still refuse to the grant's holder, and a workflow
-    // acting under the grant is not a way around that.
-    if let Some(reason) = source.refusal(grant, &node.action_kind) {
-        return Err(AutomationError::PermissionDenied(format!(
-            "node {} is not carried out under grant {}: {reason}",
-            node.node_id, grant.grant_id
-        )));
     }
     // A shell node names the environment it runs in, and the grant has to admit that one rather
     // than merely admitting the workflow's own scope.
@@ -210,8 +173,7 @@ pub fn check_node(
     Ok(())
 }
 
-/// Checks that `grant` admits every node of a definition, and that `source` carries each node's
-/// effect out for the grant's holder.
+/// Checks that `grant` admits every node of a definition.
 ///
 /// This is what an install and an admission ask, so a definition nobody could ever run is refused
 /// when it is offered rather than half way through its first run. It does not replace
@@ -222,13 +184,12 @@ pub fn check_node(
 ///
 /// Returns the first refusal [`check_node`] produces.
 pub fn check_definition(
-    source: &dyn AuthoritySource,
     grant: &Grant,
     definition: &WorkflowDefinition,
     environment_id: EnvironmentId,
 ) -> Result<()> {
     for node in &definition.nodes {
-        check_node(source, grant, definition, node, environment_id)?;
+        check_node(grant, definition, node, environment_id)?;
     }
     Ok(())
 }
@@ -319,12 +280,6 @@ impl AuthoritySource for GrantTable {
             ))),
         }
     }
-
-    /// A table serves each grant's holder what the grant's rights admit: whoever put a grant in
-    /// decided what it may do.
-    fn refusal(&self, _grant: &Grant, _action_kind: &str) -> Option<String> {
-        None
-    }
 }
 
 /// A grant of `rights` over every environment and session, under `grant_id`.
@@ -411,12 +366,12 @@ mod tests {
         // Section 19 ¶1: a view-only invitation cannot obtain terminal input through a workflow.
         let view_only = grant_with(&[ActionRight::SessionView]);
         let definition = definition_with(node("shell_command"));
-        let refusal = check_definition(&GrantTable::new(), &view_only, &definition, here())
-            .expect_err("a shell node is refused");
+        let refusal =
+            check_definition(&view_only, &definition, here()).expect_err("a shell node is refused");
         assert!(refusal.to_string().contains("terminal.input"), "{refusal}");
 
         let with_terminal = grant_with(&[ActionRight::SessionView, ActionRight::TerminalInput]);
-        check_definition(&GrantTable::new(), &with_terminal, &definition, here())
+        check_definition(&with_terminal, &definition, here())
             .expect("a broad shell grant admits it");
     }
 
@@ -430,8 +385,8 @@ mod tests {
             session_id: Nullable::some(session_id),
             ..WorkflowResourceScope::default()
         };
-        let refusal = check_definition(&GrantTable::new(), &grant, &definition, here())
-            .expect_err("the session is not covered");
+        let refusal =
+            check_definition(&grant, &definition, here()).expect_err("the session is not covered");
         assert!(refusal.to_string().contains("session"), "{refusal}");
     }
 
@@ -447,7 +402,7 @@ mod tests {
         let mut shell = node("shell_command");
         shell.declared_environment = Nullable::some(environment_id);
         let definition = definition_with(shell);
-        let refusal = check_definition(&GrantTable::new(), &grant, &definition, here())
+        let refusal = check_definition(&grant, &definition, here())
             .expect_err("the environment is not admitted");
         assert!(refusal.to_string().contains("environment"), "{refusal}");
     }
@@ -463,7 +418,7 @@ mod tests {
                 .collect(),
         };
         let definition = definition_with(node("request_review"));
-        let refusal = check_definition(&GrantTable::new(), &grant, &definition, here())
+        let refusal = check_definition(&grant, &definition, here())
             .expect_err("this environment is not covered");
         assert!(refusal.to_string().contains("environment"), "{refusal}");
     }
@@ -476,7 +431,7 @@ mod tests {
             environment_id: Nullable::some(EnvironmentId::new(Uuid::from_bytes([6; 16]))),
             ..WorkflowResourceScope::default()
         };
-        let refusal = check_definition(&GrantTable::new(), &grant, &definition, here())
+        let refusal = check_definition(&grant, &definition, here())
             .expect_err("another environment's workflow does not run here");
         assert!(refusal.to_string().contains("scoped"), "{refusal}");
     }
@@ -508,63 +463,5 @@ mod tests {
     fn an_unregistered_action_kind_has_no_rights_to_fall_through() {
         let refusal = node_rights("anything_at_all").expect_err("an unregistered kind is refused");
         assert!(refusal.to_string().contains("anything_at_all"), "{refusal}");
-    }
-
-    /// A host that serves a grant's holder no change-set write, whatever the grant's rights.
-    #[derive(Debug)]
-    struct NoChangeSetWrites;
-
-    impl AuthoritySource for NoChangeSetWrites {
-        fn grant(&self, grant_id: GrantId, _now_ms: u64) -> Result<Grant> {
-            Err(AutomationError::PermissionDenied(format!(
-                "grant {grant_id} is not read in this case"
-            )))
-        }
-
-        fn refusal(&self, _grant: &Grant, action_kind: &str) -> Option<String> {
-            writes_change_set(action_kind).then(|| "this holder is served no such write".to_owned())
-        }
-    }
-
-    /// Section 19 ¶1: a workflow gives its grant's holder no more than the host serves that holder.
-    /// A grant carrying every right still installs no change-set node on a host that refuses the
-    /// holder a change-set write, because the check an install, an admission and a dispatch all
-    /// ask puts the host's refusal beside the rights. The same grant is served every other kind,
-    /// and the same nodes are admitted where the rights alone decide.
-    #[test]
-    fn a_node_the_host_refuses_the_holder_is_refused_whatever_the_rights() {
-        let grant = grant_with(ActionRight::ALL);
-        for kind in ["capture_changeset", "materialize_changeset", "apply_diff"] {
-            assert!(writes_change_set(kind), "{kind} writes a change set");
-            let definition = definition_with(node(kind));
-            let refusal = check_definition(&NoChangeSetWrites, &grant, &definition, here())
-                .expect_err("the host refuses the holder this kind");
-            assert!(
-                matches!(refusal, AutomationError::PermissionDenied(_)),
-                "{refusal:?}"
-            );
-            assert!(
-                refusal.to_string().contains("served no such write"),
-                "{refusal}"
-            );
-            check_definition(&GrantTable::new(), &grant, &definition, here())
-                .expect("the rights alone admit it");
-        }
-        for kind in [
-            "shell_command",
-            "run_tests",
-            "request_review",
-            "create_session",
-            "attention_notice",
-        ] {
-            assert!(!writes_change_set(kind), "{kind} writes no change set");
-            check_definition(
-                &NoChangeSetWrites,
-                &grant,
-                &definition_with(node(kind)),
-                here(),
-            )
-            .expect("a kind the host serves the holder");
-        }
     }
 }

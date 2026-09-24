@@ -320,12 +320,7 @@ impl AutomationService {
             .authority
             .grant(params.definition.grant_reference, now_ms)?;
         validate_definition(&params.definition, &grant)?;
-        authority::check_definition(
-            &*self.authority,
-            &grant,
-            &params.definition,
-            self.environment_id,
-        )?;
+        authority::check_definition(&grant, &params.definition, self.environment_id)?;
 
         // The request and the document it carries must name the same workflow, the same
         // revision and the same grant. Anything else lets one revision be installed under
@@ -535,7 +530,7 @@ impl AutomationService {
     ) -> Result<StartedRun> {
         let grant = self.authority.grant(definition.grant_reference, now_ms)?;
         validate_definition(definition, &grant)?;
-        authority::check_definition(&*self.authority, &grant, definition, self.environment_id)?;
+        authority::check_definition(&grant, definition, self.environment_id)?;
 
         if journal.trigger_is_recorded(
             definition.workflow_id,

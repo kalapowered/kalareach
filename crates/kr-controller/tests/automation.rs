@@ -1929,6 +1929,231 @@ async fn the_automation_group_is_served_at_every_ingress_the_registry_lists() {
     host.stop().await;
 }
 
+/// KR-REQ-19.04 and KR-REQ-18.04 at the paired-device ingress: a workflow under a device's own
+/// grant carries out the change-set node that grant allows, and the version it writes names the
+/// run that asked for it. The write is held under the device's grant inside the change-set
+/// service's own transaction, so the workflow reaches no further than the grant does while the
+/// write prepares.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workflow_under_a_paired_devices_grant_captures_under_that_grant() {
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner).await;
+    let device = net_support::Device::create().await;
+    let record = net_support::pair_with(
+        &host,
+        &device,
+        &owner,
+        net_support::proposal(&[ActionRight::AutomationManage, ActionRight::ChangesetCreate]),
+    )
+    .await;
+    let session = net_support::connect(&host, &device, &record).await;
+    let own_grant = record.grant.grant_id;
+
+    // The owner adopts the workspace the device's workflow reads.
+    let mut control = host.client().await;
+    let workspace = adopted_workspace(&mut control, host.environment_id, host.work()).await;
+
+    let document = definition(
+        workflow_id(40),
+        own_grant,
+        "a device's capture",
+        capture_node(workspace),
+    );
+    device_mutation(
+        &session,
+        host.environment_id,
+        Method::WorkflowInstall,
+        &WorkflowInstallParams {
+            workflow_id: document.workflow_id,
+            revision: document.revision,
+            definition: document.clone(),
+            grant_reference: document.grant_reference,
+        },
+    )
+    .await
+    .expect("a device installs a capture under its own grant");
+    device_mutation(
+        &session,
+        host.environment_id,
+        Method::WorkflowEnable,
+        &WorkflowEnableParams {
+            workflow_id: document.workflow_id,
+            revision: document.revision,
+        },
+    )
+    .await
+    .expect("a device enables its own workflow");
+    let run: WorkflowRunResult = typed(
+        &device_mutation(
+            &session,
+            host.environment_id,
+            Method::WorkflowRun,
+            &WorkflowRunParams {
+                workflow_id: document.workflow_id,
+                revision: document.revision,
+                event_id: "evt-device-capture".to_owned(),
+                event_type: "manual".to_owned(),
+                event_payload: Nullable::null(),
+            },
+        )
+        .await
+        .expect("a device runs its own capture"),
+    );
+    assert_eq!(run.status, WorkflowRunStatus::Completed, "{run:?}");
+
+    let read: WorkflowReadResult = session
+        .read(
+            Method::WorkflowRead,
+            &WorkflowReadParams {
+                workflow_id: Nullable::some(document.workflow_id),
+                revision: Nullable::some(document.revision),
+                run_id: Nullable::some(run.run_id),
+                causal_root_id: Nullable::null(),
+            },
+        )
+        .await
+        .expect("a device reads its own run");
+    assert_eq!(read.node_receipts.len(), 1);
+    assert_eq!(read.node_receipts[0].status, NodeStatus::Success);
+    let captured = read.node_receipts[0]
+        .output
+        .0
+        .as_ref()
+        .expect("the receipt carries what the capture produced");
+    let version: ChangesetReadResult = typed(
+        &control
+            .request(
+                Method::ChangesetRead,
+                &ChangesetReadParams {
+                    change_set_id: first_change_set(captured),
+                    version: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("changeset.read succeeds"),
+    );
+    assert_eq!(
+        version.version.provenance.workflow_run_id.0,
+        Some(run.run_id),
+        "the version records the device's run"
+    );
+
+    host.stop().await;
+}
+
+/// The versions the environment's change-set store holds, read from the store itself.
+fn versions_in(environment: &kr_ipc::paths::EnvironmentPaths) -> i64 {
+    let store = rusqlite::Connection::open(
+        environment
+            .state_dir()
+            .join(kr_changeset::store::CHANGESETS_DIRECTORY)
+            .join(kr_changeset::store::STORE_FILE_NAME),
+    )
+    .expect("opens the change-set store");
+    store
+        .query_row("SELECT COUNT(*) FROM versions", [], |row| row.get(0))
+        .expect("counts the versions")
+}
+
+/// KR-REQ-19.04: a grant withdrawn while a node's change-set write waits for the change-set store
+/// stops the write. The node passed every check before its effect began; the grant is asked again
+/// inside the store's own transaction, under the daemon's hold, so the capture writes nothing once
+/// the grant is gone, and the node pauses on the refusal rather than failing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_withdrawn_while_the_change_set_write_waits_writes_nothing() {
+    let host = host().await;
+    let environment = host._temp.environment();
+    let mut control = client(&host).await;
+    let workspace = adopted_workspace(&mut control, host.environment_id, host.work()).await;
+    host.issue(grant_id(19), &[ActionRight::ChangesetCreate]);
+    let document = definition(
+        workflow_id(19),
+        grant_id(19),
+        "a capture that waits for the store",
+        capture_node(workspace),
+    );
+    install(&mut control, &host, &document).await;
+    enable(&mut control, &host, &document).await;
+    assert_eq!(versions_in(&environment), 0);
+
+    // Another writer holds the change-set store's write lock. The run passes every check the
+    // engine and the runner make, reads the working tree, and then waits for the store.
+    let store = rusqlite::Connection::open(
+        environment
+            .state_dir()
+            .join(kr_changeset::store::CHANGESETS_DIRECTORY)
+            .join(kr_changeset::store::STORE_FILE_NAME),
+    )
+    .expect("opens the change-set store");
+    store
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("another writer holds the store");
+    let running = {
+        let host_environment = host.environment_id;
+        let endpoint = host.endpoint.clone();
+        let document = document.clone();
+        tokio::spawn(async move {
+            let mut control = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+                .await
+                .expect("connects to the control endpoint");
+            control
+                .mutate(
+                    Method::WorkflowRun,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    ActionTarget::environment(host_environment),
+                    &WorkflowRunParams {
+                        workflow_id: document.workflow_id,
+                        revision: document.revision,
+                        event_id: "evt-while-busy".to_owned(),
+                        event_type: "manual".to_owned(),
+                        event_payload: Nullable::null(),
+                    },
+                )
+                .await
+                .expect("the call reaches the daemon")
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    // The grant is withdrawn while the write waits, and then the store is free again.
+    host.controller
+        .sharing()
+        .grants()
+        .revoke(grant_id(19), kr_ipc::now_ms().get(), || Ok(()))
+        .expect("the grant is withdrawn");
+    store
+        .execute_batch("COMMIT")
+        .expect("the other writer finishes");
+
+    let refused = running
+        .await
+        .expect("the run answers")
+        .expect_err("the withdrawn grant stops the write");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(refused.message.contains("revoked"), "{refused:?}");
+    assert_eq!(versions_in(&environment), 0, "nothing was captured");
+    let read: WorkflowReadResult = typed(
+        &control
+            .request(
+                Method::WorkflowRead,
+                &WorkflowReadParams {
+                    workflow_id: Nullable::some(document.workflow_id),
+                    revision: Nullable::some(document.revision),
+                    run_id: Nullable::null(),
+                    causal_root_id: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("workflow.read succeeds"),
+    );
+    assert_eq!(read.runs.len(), 1);
+    assert_eq!(read.runs[0].status, WorkflowRunStatus::Paused);
+
+    host.clients.abort();
+}
+
 /// Writes a grant carrying `rights` to a device other than this host, as a paired device's own
 /// grant is, into this daemon's grant store.
 fn issue_to_another_device(host: &Host, grant_id: GrantId, rights: &[ActionRight]) -> Grant {
@@ -2049,110 +2274,4 @@ async fn a_workflow_grant_is_narrowed_by_the_configured_rights_ceiling() {
     assert!(refused.message.contains("changeset.create"), "{refused:?}");
 
     host.clients.abort();
-}
-
-/// KR-REQ-19.04 at the paired-device ingress: a workflow is not a way around the device's own
-/// door. That door serves a paired device no change-set write, so a workflow under the device's
-/// grant installs no capture or materialisation node, whatever rights the grant carries. The same
-/// device still installs a workflow of another kind under that grant.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_workflow_under_a_paired_devices_grant_writes_no_change_set() {
-    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
-    let host = net_support::Host::start(&owner).await;
-    let device = net_support::Device::create().await;
-    let record = net_support::pair_with(
-        &host,
-        &device,
-        &owner,
-        net_support::proposal(&[
-            ActionRight::AutomationManage,
-            ActionRight::ChangesetCreate,
-            ActionRight::WorkspaceManage,
-            ActionRight::TerminalInput,
-        ]),
-    )
-    .await;
-    let session = net_support::connect(&host, &device, &record).await;
-    let own_grant = record.grant.grant_id;
-
-    let materialise = kr_protocol::changeset::ChangesetMaterializeParams {
-        change_set_id: kr_protocol::ids::ChangeSetId::new(Uuid::from_bytes([0x6e; 16])),
-        version: kr_protocol::ids::ChangeSetVersion::new(1),
-        purpose: kr_protocol::changeset::MaterialisationPurpose::Test,
-        label: "a device's copy".to_owned(),
-    };
-    let writes = [
-        capture_node(WorkspaceId::new(Uuid::from_bytes([0x6f; 16]))),
-        WorkflowNode {
-            node_id: "materialise".to_owned(),
-            action_kind: "materialize_changeset".to_owned(),
-            action_params: serde_json::to_string(&materialise).expect("typed parameters"),
-            declared_environment: Nullable::null(),
-        },
-    ];
-    for (number, node) in (40_u8..).zip(writes) {
-        let kind = node.action_kind.clone();
-        let document = definition(
-            workflow_id(number),
-            own_grant,
-            "a device's change set",
-            node,
-        );
-        let refused = device_mutation(
-            &session,
-            host.environment_id,
-            Method::WorkflowInstall,
-            &WorkflowInstallParams {
-                workflow_id: document.workflow_id,
-                revision: document.revision,
-                definition: document.clone(),
-                grant_reference: document.grant_reference,
-            },
-        )
-        .await
-        .expect_err("a change-set node under a device's grant is refused");
-        assert_eq!(
-            refused.code,
-            ErrorCode::PermissionDenied,
-            "{kind}: {refused:?}"
-        );
-        assert!(
-            refused.message.contains("paired device's grant"),
-            "{kind}: {refused:?}"
-        );
-    }
-    let read: WorkflowReadResult = session
-        .read(Method::WorkflowRead, &WorkflowReadParams::default())
-        .await
-        .expect("a device reads its workflows");
-    assert!(read.definitions.is_empty(), "nothing was installed");
-
-    // The refusal is about change-set writes, not about the device's workflows: another kind
-    // under the same grant installs.
-    let tests = definition(
-        workflow_id(42),
-        own_grant,
-        "a device's tests",
-        WorkflowNode {
-            node_id: "tests".to_owned(),
-            action_kind: "run_tests".to_owned(),
-            action_params: r#"{"suite": "unit"}"#.to_owned(),
-            declared_environment: Nullable::null(),
-        },
-    );
-    device_mutation(
-        &session,
-        host.environment_id,
-        Method::WorkflowInstall,
-        &WorkflowInstallParams {
-            workflow_id: tests.workflow_id,
-            revision: tests.revision,
-            definition: tests.clone(),
-            grant_reference: tests.grant_reference,
-        },
-    )
-    .await
-    .expect("a device installs another kind under its own grant");
-
-    host.stop().await;
 }

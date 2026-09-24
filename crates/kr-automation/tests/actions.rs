@@ -573,10 +573,6 @@ impl kr_automation::AuthoritySource for UnreadableFor {
         }
         self.table.grant(grant_id, now_ms)
     }
-
-    fn refusal(&self, grant: &kr_protocol::grant::Grant, action_kind: &str) -> Option<String> {
-        self.table.refusal(grant, action_kind)
-    }
 }
 
 /// A dispatcher pass that stops at a later event still hands back the run it committed for an
