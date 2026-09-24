@@ -92,7 +92,11 @@ It refuses the connection, without a word, unless every one of these holds:
    on a private socket it is the process the kernel named.
 3. The launched application started it. The worker walks the kernel's parent chain from the
    connecting process to the process it launched, and checks every link by its start identity, so
-   an identifier recycled since the application started does not complete the chain.
+   an identifier recycled since the application started does not complete the chain. Each parent is
+   read between two readings of its child that both name it: a child's recorded parent changes when
+   that parent exits and never changes back, so the process read was still its parent. No wall-clock
+   start is compared, so setting the clock back cannot break a real chain. A bridge whose start the
+   platform records on a clock that only moves forward is refused when that record cannot be read.
 4. It is the installation. The worker recorded, for the launch, which package's bridge is installed,
    the application name its registration invokes the forwarder for, the surfaces it registered and
    the forwarder executable it points Claude Code at. The hello's declaration must name that
@@ -108,7 +112,9 @@ A line past the bound ends the connection. So does a line the connection cuts sh
 Whatever happens, a hook writes exactly `{}` to standard output and exits 0 within 500
 milliseconds. Diagnostics go to standard error, which Claude Code writes to its debug log for an
 exit-0 hook and shows to nobody. If the worker does not answer in time, the hook answers anyway. It
-never waits for a person.
+never waits for a person. A report counts only if the worker admits its hook while the hook is
+still running: the worker checks the hook's process as it admits it, so a report whose hook has
+already answered and gone is lost, and nothing tells the worker it was sent.
 
 Inside a launch, the forwarder turns Claude Code's payload into one observation and sends it
 straight behind the hello. It reads only what it reports and skips the rest, including a tool's
@@ -139,24 +145,26 @@ Every hook is its own process on its own connection, so reports can arrive in an
 places each by when the kernel recorded Claude Code starting its hook, on a clock that only moves
 forward: on Linux the start time in clock ticks since boot, and on macOS the host's absolute time
 at the fork rather than the wall-clock start, which a change of the clock can move back. Two hooks
-from one tick of that clock are placed in the order their reports were applied. That order is
-right because Claude Code waits for the hooks of one thread event before it raises the next, and a
-hook answers only once its report is applied, or after its 500-millisecond deadline, which is many
-ticks.
+from one tick of that clock are not placed against each other, because nothing the worker can
+verify says which came first. To keep that rare, a hook that reports a session starting or ending
+answers no sooner than 20 milliseconds, two Linux ticks, after it started. A hook Claude Code
+starts only once that one has answered, as it does after a session ends, then falls in a later
+tick.
 
 The newest report decides the thread. A `SessionStart` for a resume, a clear or a fork is a new
 selection even of the thread already selected, so the binding advances; one for a compaction
-continues the thread and changes nothing. An older report still matters when its hook started after
-the report that began the binding's current revision: a thread starting or ending there, or another
-thread going on, is a switch the worker learned of late, and a question bound to that revision may
-have been asked across it. So the binding advances to a new revision of what the newest report
-says, and the thread stays as it is. A report whose hook started before the current revision began
-changes nothing.
+continues the thread and changes nothing. An older report still matters when its hook started after,
+or in the same tick as, the report that began the binding's current revision: a thread starting or
+ending there, or another thread going on, is a switch the worker learned of late, and a question
+bound to that revision may have been asked across it. So the binding advances to a new revision of
+what the newest report says, and the thread stays as it is. A report whose hook started before the
+current revision began changes nothing.
 
-Where the kernel's record of a hook's start could not be read, its report cannot be placed. One
-that leaves the binding as it is whichever came first changes nothing. Any other leaves no thread
-vouched for, leaves the thread the binding had so nothing bound to it survives, and suspends rich
-mutations.
+A report that cannot be placed against the newest, because the two hooks fall in one tick, changes
+nothing if it leaves the binding as it is whichever came first: an end when no thread is selected,
+or the selected thread going on. Any other, a start included, leaves no thread vouched for, leaves
+the thread the binding had so nothing bound to it survives, and suspends rich mutations until a
+report whose hook started in a later tick settles it.
 
 ### Which thread asked a question
 

@@ -36,14 +36,24 @@ pub const MAX_HOOK_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 /// The answer every hook run writes: a JSON object that sets nothing.
 pub const NEUTRAL_ANSWER: &str = "{}";
 
+/// How soon after it started a hook that reported a thread starting, going on or ending answers,
+/// at the earliest.
+///
+/// The worker places those reports by the kernel's record of when each hook started, which counts
+/// ten-millisecond ticks on Linux, and it does not place two from one tick against each other.
+/// Answering two ticks after the start means a hook the application starts only once this one has
+/// answered, as Claude Code does after a session ends, falls in a later tick.
+pub const THREAD_REPORT_LINGER: Duration = Duration::from_millis(20);
+
 /// Runs one hook and answers neutrally.
 #[must_use]
 pub fn run() -> std::process::ExitCode {
+    let started = std::time::Instant::now();
     let (finished, outcome) = std::sync::mpsc::channel();
     // The work runs on its own thread so the deadline is kept whatever it is waiting on. When the
     // deadline passes, the answer is written and the process ends, which ends that thread too.
     std::thread::spawn(move || {
-        let _ = finished.send(observe());
+        let _ = finished.send(observe(started));
     });
     match outcome.recv_timeout(HOOK_DEADLINE) {
         Ok(Ok(())) => {}
@@ -68,8 +78,9 @@ pub const REGISTRATION_WAIT: Duration = Duration::from_millis(250);
 /// it has admitted the connection, and then reads the observation, applies it and closes the
 /// connection. This waits for that close, so an observation that selects a thread has been applied
 /// before the hook returns to Claude Code, which holds a session's first response until its
-/// `SessionStart` hooks have finished.
-fn observe() -> Result<(), String> {
+/// `SessionStart` hooks have finished. A thread's report is then held until
+/// [`THREAD_REPORT_LINGER`] after `started`.
+fn observe(started: std::time::Instant) -> Result<(), String> {
     let input = read_input(std::io::stdin().lock())?;
     // Outside a launch there is nobody to tell, and the answer is the same neutral one.
     let Some(paths) = Paths::from_environment().map_err(|error| error.to_string())? else {
@@ -93,7 +104,19 @@ fn observe() -> Result<(), String> {
             while exchange.receive().await?.is_some() {}
             Ok::<(), crate::exchange::ExchangeError>(())
         })
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    if reports_thread(&input) {
+        std::thread::sleep(THREAD_REPORT_LINGER.saturating_sub(started.elapsed()));
+    }
+    Ok(())
+}
+
+/// Whether the event is one the worker decides the thread by: a session starting or ending.
+fn reports_thread(input: &HookInput) -> bool {
+    matches!(
+        input.hook_event_name.as_str(),
+        "SessionStart" | "SessionEnd"
+    )
 }
 
 /// The longest detail an observation carries, which is the host's own bound.
@@ -424,6 +447,27 @@ mod tests {
                 asked(tool, input.clone(), server).is_null(),
                 "{tool} {input} {server:?}"
             );
+        }
+    }
+
+    /// Only a session starting or ending is held back, and never past the deadline.
+    #[test]
+    fn a_thread_report_is_held_two_ticks_and_inside_the_deadline() {
+        assert!(THREAD_REPORT_LINGER < HOOK_DEADLINE);
+        for (event, held) in [
+            ("SessionStart", true),
+            ("SessionEnd", true),
+            ("PostToolUse", false),
+            ("PostToolUseFailure", false),
+            ("Notification", false),
+        ] {
+            let input = read_input(
+                serde_json::json!({"session_id": "t", "hook_event_name": event})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .expect("a hook's input");
+            assert_eq!(reports_thread(&input), held, "{event}");
         }
     }
 

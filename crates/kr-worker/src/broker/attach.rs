@@ -836,11 +836,14 @@ impl NativeGateway {
             presented.credential.expose(),
         )?;
         let identity = peer.process().unwrap_or(&presented.process).clone();
-        // Read while the bridge is known to be running, so the record is its own. A reading that
-        // failed places the bridge's reports nowhere, as a platform that keeps no record does.
-        let started = crate::questions::binding::monotonic_start(&identity)
-            .ok()
-            .flatten();
+        // Read while the bridge is known to be running, so the record is its own. Where the
+        // platform keeps the record and it cannot be read, the bridge is not admitted: what it
+        // reports could not be placed.
+        let started = crate::questions::binding::monotonic_start(&identity).map_err(|why| {
+            BrokerError::denied(format!(
+                "the kernel's record of when this bridge started cannot be read: {why}"
+            ))
+        })?;
         let mut stream =
             crate::broker::bridge::BridgeStream::new(reader, writer, held, self.launch.framing);
         stream
