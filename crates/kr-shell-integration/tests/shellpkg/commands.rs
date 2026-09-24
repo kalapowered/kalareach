@@ -14,12 +14,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use kr_protocol::root::{
-    CommandBypassReason, DETACH_HINT, FENCE_EXCHANGE_TIMEOUT, FenceCause, FenceRefusalReason,
-    RootCommandResolveParams, RootEditorFenceParams, RootEditorFenceResult,
+    CommandBypassReason, DETACH_HINT, LAUNCH_READER_BUDGET, LaunchCommand, RootCommandResolveParams,
 };
 use kr_protocol::session::{CommandIntegration, EnvironmentVariable};
 use kr_shell_integration::contract::events::ConsumeReason;
 use kr_shell_integration::contract::qualification::ShellKind;
+use kr_shell_integration::contract::requests::{
+    LaunchMailboxRequest, LaunchRejectionReason, LaunchTransactionId,
+};
 
 use super::*;
 
@@ -968,9 +970,14 @@ pub fn a_line_exports_the_capability_minted_for_it(kind: ShellKind) {
 }
 
 /// KR-REQ-07.34, KR-REQ-07.35: what the worker sends while a shell waits for an answer before a
-/// command starts reaches the next reader in the order it came, once, and with nothing more from
-/// the worker: each request is answered once, a detach's answer is acted on once, and the
-/// publication sent last is the one in force.
+/// command starts reaches the next reader in the order it came, each frame once, and with nothing
+/// more from the worker.
+///
+/// Launches that cannot install anything are the probes: the reader refuses each one, and it
+/// refuses one as `fence_invalid` exactly when the fence the probe names is not the one it holds
+/// at that point. A probe between each pair of frames reads the fence at that point, so a frame
+/// that was lost, applied early, applied twice or taken out of order shows as a probe answered
+/// the other way.
 pub fn frames_that_arrive_while_a_command_waits_reach_the_reader_once(kind: ShellKind) {
     let Some(package) = Package::found(kind) else {
         return;
@@ -979,50 +986,61 @@ pub fn frames_that_arrive_while_a_command_waits_reach_the_reader_once(kind: Shel
     let mut session = a_session_with_probes(&package, &probes);
 
     // A gesture at a fenced prompt leaves a detach waiting for the worker's answer, which comes
-    // only after the next line has been typed.
-    let (reader, _) = session.fenced_prompt(4);
+    // only after the next line has been typed. The fence stays held until the answer arrives.
+    let (reader, held) = session.fenced_prompt(4);
     session.type_bytes(CTRL_D);
     let (detach, _) = session.expect_event("eof_detach", |event| {
         matches!(event, BridgeEvent::EofDetach(_))
     });
 
-    let fence = fence_for(&reader, fence_id(9), attachment_id(9), epoch(1));
-    let ask = |session: &mut Session| {
+    let published = fence_for(&reader, fence_id(9), attachment_id(9), epoch(1));
+    let probe = |session: &mut Session, fence: FenceId, index: u8| {
         let id = RequestId::new(session.next_request);
         session.next_request += 1;
         let request = BridgeFrame::Request {
             id,
-            request: WorkerRequest::Fence(RootEditorFenceParams {
+            request: WorkerRequest::Launch(LaunchMailboxRequest {
                 session_id: session.session_id,
-                fence_id: fence.fence_id,
-                prompt_generation: reader.prompt_generation,
-                reader_revision: reader.reader_revision,
-                deadline_ms: FENCE_EXCHANGE_TIMEOUT,
-                cause: FenceCause::EditorEntry,
+                transaction: LaunchTransactionId::new(Uuid::from_bytes([0x90 + index; 16])),
+                fence_id: fence,
+                command: LaunchCommand::Arguments(vec![
+                    "echo".to_owned(),
+                    "kr-never-installed".to_owned(),
+                ]),
+                // The prompt the line was typed at, which is never the reader's by the time the
+                // probe is read: whatever else holds, nothing is installed.
+                expected_prompt_generation: reader.prompt_generation,
+                expected_buffer_revision: reader.editor.buffer_revision,
+                expected_cwd_revision: reader.cwd_revision,
+                deadline_ms: LAUNCH_READER_BUDGET,
             }),
         };
         (id, request)
     };
-    // Ahead of the acceptance's answer: a request, the detach's refusal and a fence's withdrawal.
-    // Ahead of the resolve's: another request and that fence published. Taken in order, that
-    // leaves the fence held, about the reader the line was typed at.
-    let (first, request) = ask(&mut session);
+    // Ahead of the acceptance's answer: the held fence probed, the detach's refusal, the held
+    // fence probed again. Ahead of the resolve's: another fence published, probed, withdrawn and
+    // probed again.
+    let (before_refusal, first) = probe(&mut session, held.fence_id, 1);
+    let (after_refusal, second) = probe(&mut session, held.fence_id, 2);
     session.commands.before_acceptance_answer = vec![
-        request,
+        first,
         BridgeFrame::EventResult {
             id: detach,
             result: detach_refusal(),
         },
+        second,
+    ];
+    let (after_publication, third) = probe(&mut session, published.fence_id, 3);
+    let (after_withdrawal, fourth) = probe(&mut session, published.fence_id, 4);
+    session.commands.before_resolve_answer = vec![
+        BridgeFrame::FencePublished(FencePublication::Published(published.clone())),
+        third,
         BridgeFrame::FencePublished(FencePublication::Invalidated {
-            fence_id: fence.fence_id,
+            fence_id: published.fence_id,
             reason: WithheldReason::ReaderMoved,
             state: FenceState::Unfenced,
         }),
-    ];
-    let (second, request) = ask(&mut session);
-    session.commands.before_resolve_answer = vec![
-        request,
-        BridgeFrame::FencePublished(FencePublication::Published(fence.clone())),
+        fourth,
     ];
     // Nothing is answered after the resolve, so what the next reader does with those frames
     // depends on nothing more arriving.
@@ -1031,13 +1049,26 @@ pub fn frames_that_arrive_while_a_command_waits_reach_the_reader_once(kind: Shel
     let asked = session.run_asking("kr-probe amid-traffic", "probe-ran");
     assert_eq!(asked.len(), 1, "one command asks once: {asked:?}");
     assert_eq!(last_run(&probes).arguments, ["amid-traffic"]);
-    for id in [first, second] {
-        match session.answer(id) {
-            BridgeAnswer::Fence(RootEditorFenceResult::Refused(refusal)) => {
-                assert_eq!(refusal.reason, FenceRefusalReason::ReaderMoved);
-            }
-            other => panic!("a request about a reader that had gone was answered with {other:?}"),
-        }
+
+    // Each probe reads the fence as the frames before it, and only those, left it.
+    for (id, fence_held, point) in [
+        (before_refusal, true, "before the detach's refusal"),
+        (after_refusal, false, "after the detach's refusal"),
+        (after_publication, true, "after the publication"),
+        (after_withdrawal, false, "after the withdrawal"),
+    ] {
+        let BridgeAnswer::Launch(decision) = session.answer(id) else {
+            panic!("the reader answered a launch with something else")
+        };
+        let reason = decision
+            .rejection()
+            .unwrap_or_else(|| panic!("a probe {point} installed a command"));
+        assert_eq!(
+            reason != LaunchRejectionReason::FenceInvalid,
+            fence_held,
+            "{point}, the fence probed was {} held: {reason:?}",
+            if fence_held { "still" } else { "no longer" }
+        );
     }
 
     // The refused detach is consumed with the hint, once, by the reader that took the refusal.
@@ -1056,9 +1087,7 @@ pub fn frames_that_arrive_while_a_command_waits_reach_the_reader_once(kind: Shel
         "a refused detach was acted on more than once"
     );
 
-    // The fence the bridge holds is the one published last, which names the reader the line was
-    // typed at, so a gesture here is consumed as a stale fence's. Had the publication been lost,
-    // or taken before what came ahead of it, there would be no fence at all.
+    // The last of those frames was the withdrawal, so a gesture now finds no fence at all.
     session.type_bytes(CTRL_D);
     let (_, consumed) = session.expect_event("pre_eof_consumed", |event| {
         matches!(event, BridgeEvent::PreEofConsumed(_))
@@ -1066,20 +1095,25 @@ pub fn frames_that_arrive_while_a_command_waits_reach_the_reader_once(kind: Shel
     let BridgeEvent::PreEofConsumed(consumed) = consumed else {
         unreachable!()
     };
-    assert_eq!(consumed.reason, ConsumeReason::FenceStale);
+    assert_eq!(consumed.reason, ConsumeReason::FenceMissing);
 
     session.commands.stuck = false;
     assert!(session.answered("kr-after-traffic"));
+    let probed = [
+        before_refusal,
+        after_refusal,
+        after_publication,
+        after_withdrawal,
+    ];
     let answered: Vec<RequestId> = session
         .commands
         .answer_ids
         .iter()
         .copied()
-        .filter(|id| *id == first || *id == second)
+        .filter(|id| probed.contains(id))
         .collect();
     assert_eq!(
-        answered,
-        [first, second],
+        answered, probed,
         "each request the reader held was answered once, in the order it came"
     );
 }
