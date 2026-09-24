@@ -50,6 +50,11 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "
 # A webhook's address is parsed once to find the origin it is delivered through.
 url.workspace = true
 
+[features]
+# The pause the host's own tests use to stand between an attention action's admission and its
+# store write. It compiles to nothing without this feature, and no shipped build enables it.
+testing = []
+
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["fs", "process"] }
 
@@ -57,6 +62,8 @@ rustix = { workspace = true, features = ["fs", "process"] }
 exacl.workspace = true
 
 [dev-dependencies]
+# This crate's own tests, with the pause above compiled in.
+kr-controller = { path = ".", features = ["testing"] }
 iroh-relay = { workspace = true, features = ["server", "test-utils"] }
 kr-cbor.workspace = true
 kr-client = { workspace = true, features = ["terminal"] }

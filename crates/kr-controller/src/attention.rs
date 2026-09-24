@@ -349,6 +349,51 @@ impl Read {
     }
 }
 
+/// A point in this module's work that a test can stop it at: the work says it has arrived and
+/// waits there until the test lets it go. Armed once, it fires once.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Debug, Default)]
+struct Pause(
+    std::sync::Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
+);
+
+#[cfg(any(test, feature = "testing"))]
+impl Pause {
+    /// Arms the pause. Returns the end that says the work has arrived, and the end that lets it go.
+    fn arm(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (arrived, watch) = std::sync::mpsc::sync_channel(1);
+        let (release, go) = std::sync::mpsc::sync_channel(1);
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Waits here when the pause is armed.
+    fn wait(&self) {
+        let armed = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.recv();
+        }
+    }
+}
+
 /// The environment's attention store, as the daemon holds it.
 pub struct AttentionModule {
     /// Each session's privacy fence, and the lock every release of session text is made under:
@@ -367,6 +412,14 @@ pub struct AttentionModule {
     origins: std::sync::Mutex<Origins>,
     /// Wakes the maintenance loop when a timer may have moved.
     wake: Arc<tokio::sync::Notify>,
+    /// Where this host's own tests stop an action once its admission has been asked and stood,
+    /// before it takes the store. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    before_store: Pause,
+    /// Where this module's own tests stop a save of the time contract, between reading what it
+    /// keeps and writing it.
+    #[cfg(test)]
+    in_save: Pause,
 }
 
 impl std::fmt::Debug for AttentionModule {
@@ -439,6 +492,10 @@ impl AttentionModule {
             time_saving: std::sync::Mutex::new(()),
             origins: std::sync::Mutex::new(Origins::default()),
             wake: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(feature = "testing")]
+            before_store: Pause::default(),
+            #[cfg(test)]
+            in_save: Pause::default(),
         };
         module.keep_time();
         Ok(module)
@@ -535,6 +592,8 @@ impl AttentionModule {
             return;
         }
         let (state, generation) = self.time.durable_state();
+        #[cfg(test)]
+        self.in_save.wait();
         let Ok(bytes) = kr_cbor::to_canonical_vec(&state) else {
             return;
         };
@@ -1279,6 +1338,8 @@ impl AttentionModule {
         let performed = controller
             .enter_admitted(carried, |registry| {
                 let registry: &crate::registry::Registry = registry;
+                #[cfg(feature = "testing")]
+                self.before_store.wait();
                 let mut store = self
                     .store()
                     .map_err(|refused| ControllerError::refused(&refused))?;
@@ -1382,6 +1443,22 @@ impl AttentionModule {
             Performed::Done(answer) => result_of(&answer, reading),
             Performed::Retained(record) => decode_answer(&record.answer),
         }
+    }
+
+    /// Stops the next action of this group once its admission has been asked and stood, before
+    /// it takes the store, for this host's own tests.
+    ///
+    /// The action holds the daemon's registry there, as it does across its whole write. Returns
+    /// the end that says the action has arrived, and the end that lets it go. The pause fires
+    /// once.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_store(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.before_store.arm()
     }
 
     /// Performs one mutation of this group and returns the frame it answers with.
@@ -3643,6 +3720,29 @@ mod tests {
             .await
             .expect("answers");
         let released = reading.await.expect("the read finishes");
+        // The answer reached the read in time: the response holds its text, bound by the
+        // answer's own lease, and what withholds it is that lease, not a request left unanswered.
+        let ControlFrame::Response(assembled) = &released.frame else {
+            panic!("a response");
+        };
+        let Outcome::Ok(value) = &assembled.outcome else {
+            panic!("the read was refused");
+        };
+        let assembled: AttentionReadResult = value.to_typed().expect("decodes");
+        assert!(
+            assembled.items.iter().any(|item| item.summary.is_present()),
+            "the response was assembled with the answer's text"
+        );
+        assert!(released.withheld.is_some());
+        assert!(!released.ticket.is_empty());
+        assert!(
+            released
+                .ticket
+                .entries
+                .iter()
+                .all(|entry| entry.release_until == until),
+            "the ticket carries the answer's own lease"
+        );
         let fence = fence_of(&module, session_id).await;
         assert!(!fence.barrier);
         assert_eq!(fence.recorded, Some(0));
@@ -3898,9 +3998,13 @@ mod tests {
         );
     }
 
-    /// A rollback of the wall clock the store's time contract saw is written beside the store,
-    /// one save at a time however many readings save at once, and a store opened again reads it
-    /// back.
+    /// What the store's time contract must keep is written beside the store, one save at a time,
+    /// and a store opened again reads it back.
+    ///
+    /// Two saves are made to cross. The first is stopped between reading what it keeps and writing
+    /// it; the wall clock is then set back, and a second save starts with the rollback to keep.
+    /// The second waits for the first, so the rollback is what is written last and what a restart
+    /// reads: had the first written after it, a restart would trust the clock again.
     #[tokio::test(flavor = "multi_thread")]
     async fn what_the_time_contract_must_keep_is_written_beside_the_store() {
         use kr_worker::action::adapter::{
@@ -3932,6 +4036,15 @@ mod tests {
             wall: Arc::new(wall.clone()),
             adapter: Arc::new(adapter.clone()),
         };
+        let written = |module: &AttentionModule| {
+            let bytes = std::fs::read(&module.time_file).expect("the record is written");
+            kr_cbor::from_canonical_slice::<kr_protocol::action::HostTimeState>(
+                &bytes,
+                &kr_cbor::Limits::DEFAULT,
+            )
+            .expect("what was written reads back")
+            .trust
+        };
         let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
         let first = Arc::new(
             AttentionModule::open_over(&temp.environment(), boot.clone(), sources())
@@ -3943,35 +4056,49 @@ mod tests {
             kr_protocol::action::WallClockTrust::Trusted
         );
 
-        // The wall clock is set back a minute, and several readings observe it and save at once.
-        wall.set(WALL - 60_000);
-        let readers: Vec<_> = (0..8)
-            .map(|_| {
-                let first = Arc::clone(&first);
-                std::thread::spawn(move || {
-                    for _ in 0..20 {
-                        let _ = first.reading();
-                    }
-                })
+        // A step of a day forward is worth keeping; its save is stopped once it has read it.
+        let (arrived, release) = first.in_save.arm();
+        wall.advance(Duration::from_secs(86_400));
+        let stepping = {
+            let first = Arc::clone(&first);
+            std::thread::spawn(move || {
+                let _ = first.reading();
             })
-            .collect();
-        for reader in readers {
-            reader.join().expect("the readings finish");
-        }
+        };
+        arrived
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the first save has read what it keeps");
+
+        // The clock is set back while that save is stopped, and a second save starts.
+        wall.set(WALL);
+        let rolling_back = {
+            let first = Arc::clone(&first);
+            std::thread::spawn(move || {
+                let _ = first.reading();
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !rolling_back.is_finished(),
+            "the second save waits for the first"
+        );
+        release.send(()).expect("the first save is let go");
+        stepping.join().expect("the first save finishes");
+        rolling_back.join().expect("the second save finishes");
+
         assert_eq!(
             first.time.trust(),
             kr_protocol::action::WallClockTrust::Unresolved
+        );
+        assert_eq!(
+            written(&first),
+            kr_protocol::action::WallClockTrust::Unresolved,
+            "the rollback is what was written last"
         );
         assert!(
             !first.time.unsaved(),
             "nothing it must keep is left unwritten"
         );
-        let bytes = std::fs::read(&first.time_file).expect("the record is written");
-        kr_cbor::from_canonical_slice::<kr_protocol::action::HostTimeState>(
-            &bytes,
-            &kr_cbor::Limits::DEFAULT,
-        )
-        .expect("what was written reads back");
         drop(first);
         let again = AttentionModule::open_over(&temp.environment(), boot, sources())
             .expect("the store opens again");

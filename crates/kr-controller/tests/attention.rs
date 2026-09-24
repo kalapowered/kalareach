@@ -2146,19 +2146,18 @@ async fn an_action_the_store_can_no_longer_record_is_refused() {
     host.stop().await;
 }
 
-/// An acknowledgement admitted while its deadline stood, whose store transaction begins only after
-/// the deadline passed, is refused inside that transaction and writes nothing: the admission is
-/// asked again there, before the store's first write.
+/// An acknowledgement whose admission was asked and stood, and whose deadline then passes while it
+/// waits for the store, is refused inside the store's transaction and writes nothing: the
+/// admission is asked again there, before the store's first write.
 ///
-/// The order is made, not hoped for. Another guarded write holds the daemon's registry while the
-/// acknowledgement's own checks pass, then sets the store to work on a long batch and lets the
-/// registry go: the acknowledgement's admission is asked and stands, and its transaction then waits
-/// for the store until the deadline has passed.
+/// The order is made, not hoped for. The action is stopped once its admission has been asked and
+/// stood, where it takes the store (where a busy store keeps it waiting), and let go only once its
+/// deadline has passed; the check inside the transaction is the only one left to refuse it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_deadline_that_passes_while_the_store_is_busy_refuses_the_action() {
+async fn a_deadline_that_passes_while_the_action_waits_for_the_store_refuses_it() {
     let owner_keys = DeviceKeys::generate().expect("owner keys");
     let host = net_support::Host::start(&owner_keys).await;
-    let controller = host.controller();
+    let controller = Arc::clone(host.controller());
     let session_id = SessionId::new(kr_ipc::new_uuid());
     controller
         .attention()
@@ -2183,50 +2182,51 @@ async fn a_deadline_that_passes_while_the_store_is_busy_refuses_the_action() {
     let admitted_revision = controller.authority_revision().await.expect("the revision");
     let connection_id = control.acknowledgement().connection_id;
 
-    // A long call on another thread holds the store: many records of another session, applied in
-    // one call.
-    let module = Arc::clone(controller.attention());
-    let busy_session = SessionId::new(kr_ipc::new_uuid());
-    let burden: Vec<_> = (1..=1_000)
-        .map(|sequence| approval_at(busy_session, sequence, &format!("busy-{sequence}")))
-        .collect();
-    let busy = std::thread::spawn(move || {
-        let started = Instant::now();
-        module.observe(&burden).expect("the records are applied");
-        started.elapsed()
-    });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    // Admitted with half a second to spare, so its first check passes at once; the deadline then
-    // passes while it waits for the store.
-    let bound = Duration::from_millis(500);
+    let deadline = controller
+        .continuous_now()
+        .checked_add(Duration::from_millis(500))
+        .expect("a deadline");
     let admission = AdmittedMutation {
         connection_id,
         admitted_revision,
-        deadline: controller.continuous_now().checked_add(bound),
+        deadline: Some(deadline),
     };
-    let started = Instant::now();
-    let refused = controller
-        .attention()
-        .write(
-            controller,
-            &Caller::Owner,
-            &owner(),
-            &mutation,
-            Method::AttentionAcknowledge,
-            &admission,
-        )
-        .await;
-    let waited = started.elapsed();
-    let busy_for = busy.join().expect("the busy call finishes");
-    assert!(
-        busy_for > bound,
-        "the store was held past the deadline: {busy_for:?}"
-    );
-    assert!(
-        waited >= bound,
-        "the action passed its first check and waited for the store: {waited:?}"
-    );
-    let refused = refused.expect_err("the deadline passed while the action waited for the store");
+    let (arrived, release) = controller.attention().pause_before_store();
+    let writing = {
+        let controller = Arc::clone(&controller);
+        let mutation = mutation.clone();
+        tokio::spawn(async move {
+            controller
+                .attention()
+                .write(
+                    &controller,
+                    &Caller::Owner,
+                    &owner(),
+                    &mutation,
+                    Method::AttentionAcknowledge,
+                    &admission,
+                )
+                .await
+        })
+    };
+    // Bounded, because the module keeps the other end of this channel: an action that answered
+    // without reaching the pause would leave an unbounded wait rather than a failure.
+    tokio::task::spawn_blocking(move || {
+        arrived
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the action's admission stood and it reached the store")
+    })
+    .await
+    .expect("the wait finishes");
+    while controller.continuous_now() <= deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    release.send(()).expect("the action is let go");
+    let refused = tokio::time::timeout(Duration::from_secs(10), writing)
+        .await
+        .expect("the action answers")
+        .expect("the action finishes")
+        .expect_err("the deadline passed while the action waited for the store");
     assert_eq!(refused.code, ErrorCode::PermissionDenied);
     let reach = controller.attention_reach();
     let after: AttentionReadResult = controller
