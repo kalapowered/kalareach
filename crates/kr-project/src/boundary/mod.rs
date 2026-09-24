@@ -29,12 +29,20 @@
 //!    taken away again by the record this host wrote before it made it, and `README.md` in this
 //!    crate says what is left behind instead, and why.
 //!
-//! Reads are not confined on macOS or Linux, and this is deliberate: Git reads the system's shared
-//! libraries, its locale data and its certificate store, and a read confinement that missed one of
-//! those would fail an operation for a reason that has nothing to do with safety. What a repository
-//! can reach by reading is bounded by the account the service runs as, exactly as it was before.
-//! Windows is the exception, because the mechanism there confines reading with everything else, and
-//! what an invocation reads outside the directories the operation owns is granted by name.
+//! For the owner's own operations reads are not confined on macOS or Linux, and this is deliberate:
+//! the owner already holds the account's authority over the owner's own files, and Git reads the
+//! system's shared libraries, its locale data and its certificate store, so a read confinement
+//! that missed one of those would fail an operation for a reason that has nothing to do with
+//! safety. What such an operation can reach by reading is bounded by the account the service runs
+//! as, exactly as it was before.
+//!
+//! An operation performed for a caller bounded by a grant is different, because it may reach only
+//! what the owner named. On Linux its reads are confined to what the invocation is granted and to a
+//! support set named for this host's own Git ([`Reads::Bounded`]), and it is refused when a
+//! filesystem is mounted beneath a directory it would be granted. On a platform that does not
+//! confine reads it is refused outright: no macOS profile tried confined reads and still let the
+//! system's loader start Git. Windows confines reading with everything else, and what an invocation
+//! reads outside the directories the operation owns is granted by name.
 //!
 //! ## Directories, not names
 //!
@@ -72,11 +80,11 @@
 //!
 //! ## What enforces what
 //!
-//! | Platform | Execution | Network | Writes |
-//! | --- | --- | --- | --- |
-//! | macOS | A per-invocation sandbox profile, applied by the system's own launcher before it runs Git | The same profile | The same profile |
-//! | Linux | Landlock, with the execute right only on Git's own program and helper directory | Landlock's TCP rules for a remote operation, and a system-call filter that makes a socket only of what the boundary can account for | Landlock, from the opened directory handles |
-//! | Windows — **refused, and never run** | An application container whose grants on the repository carry no execute right | The container's capabilities: none at all for a local operation | The container's grants, inside a job object that ends every descendant |
+//! | Platform | Execution | Network | Writes | Reads for a caller bounded by a grant |
+//! | --- | --- | --- | --- | --- |
+//! | macOS | A per-invocation sandbox profile, applied by the system's own launcher before it runs Git | The same profile | The same profile | Not confined, so such an invocation is refused |
+//! | Linux | Landlock, with the execute right only on Git's own program and helper directory | Landlock's TCP rules for a remote operation, and a system-call filter that makes a socket only of what the boundary can account for | Landlock, from the opened directory handles | Landlock, with no rule on the whole filesystem: the granted objects and the named support set only |
+//! | Windows — **refused, and never run** | An application container whose grants on the repository carry no execute right | The container's capabilities: none at all for a local operation | The container's grants, inside a job object that ends every descendant | Refused, as every invocation is |
 //!
 //! The Windows row is what the code there would do. **It has never been executed, and this host
 //! runs no repository operation on that platform**: two of the three guarantees are not things an
@@ -86,6 +94,7 @@
 //! reading the configuration and hoping.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use kr_protocol::ids::EnvironmentId;
 use kr_protocol::project::RemoteTransport;
@@ -331,6 +340,89 @@ pub struct Confinement {
     pub readable: Vec<PathBuf>,
     /// What it may reach over the network.
     pub reach: Reach,
+    /// What it may read.
+    pub reads: Reads,
+}
+
+/// What one invocation may read.
+#[derive(Clone, Debug)]
+pub enum Reads {
+    /// Whatever the account this service runs as can read. The owner's own operations: the owner
+    /// already holds that authority over the owner's own files, so the boundary takes none of it
+    /// away.
+    Everywhere,
+    /// Only what the invocation is granted, for an operation performed for a caller bounded by a
+    /// grant: the directories the operation owns, the ones it is lent to read, Git's own program
+    /// and helper directory, the device nodes every process needs, and the support set named for
+    /// this host's Git. Nothing else the account can read is readable.
+    ///
+    /// A support set is named only where the platform confines what a process reads, so an
+    /// invocation bounded this way exists only there.
+    Bounded(Arc<SupportSet>),
+}
+
+/// The system objects this host's Git needs in order to run, named by object.
+///
+/// Found on the host rather than written down: the loader each of Git's programs names for
+/// itself, which the kernel opens for execution when it starts the program, and the directories
+/// the libraries that loader resolves for it are in, which are read and never executed. A library
+/// directory rather than each library, because Git and the libraries it links open further
+/// modules by name while running, and those resolve within the same directories.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupportSet {
+    loaders: Vec<PathBuf>,
+    libraries: Vec<PathBuf>,
+}
+
+impl SupportSet {
+    /// Returns the program loaders, each resolved to the object it is.
+    #[must_use]
+    pub fn loaders(&self) -> &[PathBuf] {
+        &self.loaders
+    }
+
+    /// Returns the library directories, each resolved to the object it is.
+    #[must_use]
+    pub fn libraries(&self) -> &[PathBuf] {
+        &self.libraries
+    }
+}
+
+/// Names the support set of the programs an invocation bounded by a grant may execute: the
+/// programs given, and every program in Git's own helper directory.
+///
+/// # Errors
+///
+/// Returns [`ProjectError::GitFailed`] when a program's loader, or a library its loader resolves
+/// for it, cannot be named, and on every platform that does not confine what a process reads,
+/// where a caller bounded by a grant is not served a Git invocation at all.
+pub fn support_set(programs: &[&Path], helper_directory: &Path) -> Result<SupportSet> {
+    #[cfg(target_os = "linux")]
+    {
+        let (loaders, libraries) = linux::support_set(programs, helper_directory)?;
+        Ok(SupportSet { loaders, libraries })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (programs, helper_directory);
+        Err(reads_not_confined())
+    }
+}
+
+/// The refusal a platform that does not confine what a process reads gives a caller bounded by a
+/// grant.
+///
+/// On macOS the sandbox profile reads everywhere, because no profile tried there confined reads and
+/// still let the system's loader start Git; on Windows no Git runs at all. So neither can bound
+/// what Git reads for such a caller, and the invocation is refused rather than run with the
+/// owner's reach.
+#[cfg(not(target_os = "linux"))]
+fn reads_not_confined() -> ProjectError {
+    ProjectError::GitFailed {
+        detail: "this platform does not confine what Git reads, so an invocation for a caller \
+                 bounded by a grant is not run here"
+            .into(),
+    }
 }
 
 impl Confinement {
@@ -495,6 +587,18 @@ mod tests {
         assert_eq!(
             Reach::for_transport(Some(RemoteTransport::Ssh), Some(2222)).ports(),
             &[22, 2222]
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_platform_that_does_not_confine_reads_names_no_support_set_and_says_why() {
+        let refusal = support_set(&[Path::new("/bin/sh")], Path::new("/usr/libexec/git-core"))
+            .expect_err("no support set is named where reads are not confined");
+        assert_eq!(
+            refusal.to_string(),
+            "this platform does not confine what Git reads, so an invocation for a caller \
+             bounded by a grant is not run here"
         );
     }
 

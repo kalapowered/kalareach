@@ -221,6 +221,7 @@ mod tests {
             temporary: opened(&temporary),
             readable: Vec::new(),
             reach,
+            reads: crate::boundary::Reads::Everywhere,
         }
     }
 

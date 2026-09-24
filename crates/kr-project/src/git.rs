@@ -49,13 +49,13 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use kr_protocol::ids::EnvironmentId;
 use kr_protocol::project::{GIT_READ_DEADLINE, MAX_GIT_OUTPUT_BYTES, RemoteTransport};
 
-use crate::boundary::{Confinement, ObjectIdentity, OpenedDirectory, Reach};
+use crate::boundary::{Confinement, ObjectIdentity, OpenedDirectory, Reach, Reads, SupportSet};
 use crate::error::{ProjectError, Result};
 
 /// The minimum Git version this host will use.
@@ -742,6 +742,10 @@ pub struct RestrictedProfile {
     /// one goes through this handle rather than through the path, so the directory an invocation
     /// gets is one this host made inside the object it opened.
     temporary_root: Arc<cap_std::fs::Dir>,
+    /// The support set an invocation bounded by a grant runs with, or why this host cannot name
+    /// one. Named the first time such an invocation asks, and kept: it is a property of the Git
+    /// this profile runs, which is resolved once.
+    support: Arc<OnceLock<std::result::Result<Arc<SupportSet>, String>>>,
     #[cfg(feature = "git-fixtures")]
     interposition: Option<Interposition>,
 }
@@ -1361,6 +1365,7 @@ impl RestrictedProfile {
             temporary,
             profile_root,
             temporary_root,
+            support: Arc::new(OnceLock::new()),
             #[cfg(feature = "git-fixtures")]
             interposition: None,
         })
@@ -1392,6 +1397,33 @@ impl RestrictedProfile {
     #[must_use]
     pub const fn git(&self) -> &GitProgram {
         &self.git
+    }
+
+    /// Returns the support set an invocation for a caller bounded by a grant runs with on this
+    /// host: the loaders and library directories of this Git, of every program in its helper
+    /// directory and of the shell it starts a connection through.
+    ///
+    /// Named once and kept, the answer and the refusal alike. A host that cannot name it serves
+    /// such a caller no Git invocation at all, and says why here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::GitFailed`] naming what could not be named, and on a platform that
+    /// does not confine what Git reads.
+    pub fn support_set(&self) -> Result<Arc<SupportSet>> {
+        self.support
+            .get_or_init(|| {
+                let shells = crate::boundary::connection_shell(self.git.exec_path());
+                let mut programs: Vec<&Path> = vec![self.git.executable()];
+                programs.extend(shells.iter().map(PathBuf::as_path));
+                crate::boundary::support_set(&programs, self.git.exec_path())
+                    .map(Arc::new)
+                    .map_err(|refusal| refusal.to_string())
+            })
+            .clone()
+            .map_err(|detail| ProjectError::GitFailed {
+                detail: detail.into(),
+            })
     }
 
     /// Returns the empty directory hooks are looked for in.
@@ -1599,6 +1631,13 @@ impl RestrictedProfile {
             temporary.path(),
             Some(temporary.identity()),
         )?;
+        // What it may read follows whose operation it is, which the admission it carries says: an
+        // operation performed for a caller bounded by a grant reaches every name through a location,
+        // and every invocation of it carries that location's admission.
+        let reads = match request.admission.as_ref() {
+            Some(admission) if admission.is_bounded() => Reads::Bounded(self.support_set()?),
+            _ => Reads::Everywhere,
+        };
         Ok(Confinement {
             program: self.git.executable().to_owned(),
             exec_path: self.git.exec_path().to_owned(),
@@ -1619,6 +1658,7 @@ impl RestrictedProfile {
             .chain(request.readable.iter().map(|path| (*path).to_owned()))
             .collect(),
             reach: Reach::for_transport(request.transport, request.remote_port),
+            reads,
         })
     }
 
@@ -2064,20 +2104,44 @@ pub struct GitRequest<'a> {
     pub admission: Option<ReadAdmission>,
 }
 
-/// The question one read through an authorised location asks immediately before it starts.
+/// The question one read through an authorised location asks immediately before it starts, and
+/// whose read it is.
 ///
 /// Every location the request reached a name through has to be the object the policy holds now,
 /// still admitting that use. A withdrawal that committed before this moment refuses the read; one
 /// that commits after it leaves the read to finish on the handle it was given, and no later read
 /// is admitted.
+///
+/// An admission for an operation performed for a caller bounded by a grant says so, and every
+/// invocation that asks it runs with its reads bounded to what it is granted. The admission is
+/// what each invocation of such an operation carries, so no invocation of one is left out.
 #[derive(Clone)]
-pub struct ReadAdmission(Arc<dyn Fn() -> Result<()> + Send + Sync>);
+pub struct ReadAdmission {
+    check: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+    bounded: bool,
+}
 
 impl ReadAdmission {
-    /// Wraps the question.
+    /// Wraps the question, for an operation the owner performs.
     #[must_use]
     pub fn new(check: impl Fn() -> Result<()> + Send + Sync + 'static) -> Self {
-        Self(Arc::new(check))
+        Self {
+            check: Arc::new(check),
+            bounded: false,
+        }
+    }
+
+    /// Returns the same admission for an operation performed for a caller bounded by a grant.
+    #[must_use]
+    pub fn bounded(mut self) -> Self {
+        self.bounded = true;
+        self
+    }
+
+    /// Returns whether it is an admission for a caller bounded by a grant.
+    #[must_use]
+    pub const fn is_bounded(&self) -> bool {
+        self.bounded
     }
 
     /// Asks it.
@@ -2086,13 +2150,16 @@ impl ReadAdmission {
     ///
     /// Returns the policy's refusal.
     pub fn admit(&self) -> Result<()> {
-        (self.0)()
+        (self.check)()
     }
 }
 
 impl std::fmt::Debug for ReadAdmission {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("ReadAdmission")
+        formatter
+            .debug_struct("ReadAdmission")
+            .field("bounded", &self.bounded)
+            .finish_non_exhaustive()
     }
 }
 
@@ -4061,6 +4128,7 @@ mod tests {
                 )
                 .expect("a directory for a profile whose own are never made"),
             ),
+            support: Arc::new(OnceLock::new()),
             #[cfg(feature = "git-fixtures")]
             interposition: None,
         }

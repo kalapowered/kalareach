@@ -50,7 +50,7 @@ use crate::operation::{
     Cleanup, Destination, Reconciliation, STAGED_TREE, STAGING_PREFIX, StagedWitness,
     StagingSibling, publish, reconcile, remove_staging_directory, stage_clone, stage_init,
 };
-use crate::policy::{Admitting, HeldLocation, LocationUse};
+use crate::policy::{Admitting, HeldLocation, LocationPolicy, LocationUse};
 use crate::store::{
     Action, LocatedName, OperationRow, OperationUpdate, Performed, PinnedRow, ProjectRow,
     RecordedAuthority, RetainedOutcome, RetainedRow, Store, WorkspaceRow, WorkspaceUpdate,
@@ -1134,9 +1134,7 @@ impl ProjectService {
             admitting,
         };
         let held = self.locations().admit(location_id, &wanted)?;
-        let admission = self
-            .locations()
-            .read_admission(vec![(Arc::clone(&held), wanted)]);
+        let admission = admission_for(self.locations(), vec![(Arc::clone(&held), wanted)]);
         let opened = self.open_through(&held, &relative, admission)?;
         if let Some(expected) = expected {
             opened.require_identity(expected)?;
@@ -1612,7 +1610,7 @@ impl ProjectService {
             } => Some(held.location_id()),
             _ => None,
         };
-        let admission = self.locations().read_admission(reach);
+        let admission = admission_for(self.locations(), reach);
         // The probe asks the destination's location first, as every read beneath it does.
         let state = destination.probe()?;
         check_destination(&plan, state, &destination)?;
@@ -2092,9 +2090,7 @@ impl ProjectService {
             &recorded.display().to_string(),
             subject,
         )?;
-        let admission = self
-            .locations()
-            .read_admission(vec![(Arc::clone(&held), wanted)]);
+        let admission = admission_for(self.locations(), vec![(Arc::clone(&held), wanted)]);
         Ok(TreeReach {
             through: Some((held, relative)),
             admission,
@@ -2255,7 +2251,7 @@ impl ProjectService {
                 let opened = self.open_through(
                     &source,
                     &RelativeName::parse(&bound.relative_path)?,
-                    self.locations().read_admission(reach.clone()),
+                    admission_for(self.locations(), reach.clone()),
                 )?;
                 opened.require_identity(project.identity)?;
                 opened
@@ -2267,7 +2263,7 @@ impl ProjectService {
                 project.identity,
             )?,
         };
-        let admission = self.locations().read_admission(reach);
+        let admission = admission_for(self.locations(), reach);
         let (head_revision, head_reference) = repository.head(&self.profile)?;
         let base_revision =
             match params.base_revision.0.as_deref() {
@@ -3034,9 +3030,7 @@ impl ProjectService {
             admitting,
         };
         let held = self.locations().admit(located.location_id, &wanted)?;
-        let admission = self
-            .locations()
-            .read_admission(vec![(Arc::clone(&held), wanted)]);
+        let admission = admission_for(self.locations(), vec![(Arc::clone(&held), wanted)]);
         Ok(TreeReach {
             through: Some((held, RelativeName::parse(&located.relative_path)?)),
             admission,
@@ -3620,6 +3614,28 @@ impl ProjectService {
             ended_at_ms: Nullable(row.ended_at_ms),
         }
     }
+}
+
+/// Returns the admission every read of one request asks, bounded when the request is a caller's
+/// bounded by a grant.
+///
+/// Every read and every effect of an operation performed for such a caller reaches its names
+/// through a location, and each carries this admission, so this is the one place that decides
+/// what each Git invocation of that operation may read. A request that reached no location asks
+/// nothing, and it is the owner's.
+pub(crate) fn admission_for(
+    policy: &LocationPolicy,
+    reach: Vec<(Arc<HeldLocation>, LocationUse)>,
+) -> Option<ReadAdmission> {
+    let bounded = reach
+        .iter()
+        .any(|(_, wanted)| matches!(wanted.admitting, Admitting::Caller(Some(_))));
+    let admission = policy.read_admission(reach)?;
+    Some(if bounded {
+        admission.bounded()
+    } else {
+        admission
+    })
 }
 
 /// Returns the location a repository was created through, and its name beneath it, when the

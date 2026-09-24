@@ -12,8 +12,19 @@
 //!   directory or in this invocation's own temporary directory cannot be executed however it came
 //!   to be there.
 //! * **Writes.** The write rights are granted on the objects this operation owns and never include
-//!   the execute right. Reads are granted on the whole filesystem, which the module documentation
-//!   in [`super`] explains.
+//!   the execute right.
+//! * **Reads.** For the owner's own operations, on the whole filesystem, which the module
+//!   documentation in [`super`] explains. For an operation performed for a caller bounded by a
+//!   grant, only on what the invocation is granted: the directories the operation owns, the ones
+//!   it is lent to read, Git's own program and helper directory, the four device nodes, and the
+//!   support set named for this host's Git. That is one ruleset without the whole-filesystem rule,
+//!   not a second ruleset over the first: rules in one ruleset add up, so a narrow read beside the
+//!   whole filesystem would take nothing away. Such an invocation reaches no remote, and it is
+//!   refused when a filesystem is mounted beneath a directory it would be granted.
+//! * **Descriptors.** Every descriptor the child holds from the fourth on is marked to close when
+//!   it executes Git, after the rules are applied, so a descriptor this service left open to
+//!   something outside them is not one Git inherits. A kernel rule on reading is judged when a file
+//!   is opened, and a descriptor opened before the rules is already open.
 //! * **Network.** A remote operation gets a connect rule per port its transport uses and no bind
 //!   rule at all, so nothing can listen.
 //!
@@ -85,19 +96,24 @@
 
 #![expect(
     unsafe_code,
-    reason = "installing a system-call filter is a raw prctl with a pointer argument and has no \
-              safe form; this module holds that one call and the constants it needs"
+    reason = "installing a system-call filter is a raw prctl with a pointer argument, and marking \
+              every descriptor to close on execution is a raw system call; neither has a safe \
+              form, and this module holds those calls and the constants they need"
 )]
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
+use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd};
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 
 use landlock::{
-    ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, NetPort, PathBeneath, PathFd,
-    Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus,
+    ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath,
+    PathFd, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus,
 };
 
-use super::{Confinement, Invocation, Reach};
+use super::{Confinement, Invocation, Reach, Reads, SupportSet};
 use crate::error::{ProjectError, Result};
 
 /// What the boundary is, for a person reading a record.
@@ -161,16 +177,23 @@ impl Prepared {
         )
     }
 
-    /// Applies the boundary to this process.
+    /// Applies the boundary to this process, and then marks its descriptors to close when it
+    /// executes Git.
     ///
-    /// Runs in the forked child. A failure returns an error rather than continuing, and the child
-    /// never reaches `exec`.
+    /// Runs in the forked child. A failure of either returns an error rather than continuing, and
+    /// the child never reaches `exec`.
     ///
     /// # Errors
     ///
     /// Returns the kernel's refusal, or a permission failure when the ruleset was applied without
     /// being fully enforced.
     pub fn apply(&mut self) -> std::io::Result<()> {
+        self.confine()?;
+        pin_descriptors()
+    }
+
+    /// Applies the rules and the filter to this process, and nothing else.
+    fn confine(&mut self) -> std::io::Result<()> {
         // Each of these refusals carries a different number, so the failure the parent reports
         // names the step it came from rather than leaving three possibilities.
         let ruleset = self
@@ -209,15 +232,50 @@ impl Prepared {
     }
 }
 
+/// Marks every descriptor from the fourth on to close when this process executes its program.
+///
+/// Runs in the forked child, after the rules and the filter. It marks rather than closes: the
+/// descriptor the standard library reports a failed execution on has to stay open until the
+/// execution, and it is already marked, as is every descriptor this service opens. What this
+/// catches is one that is not, which Git would otherwise inherit together with whatever it was
+/// opened on, rules or none. A kernel that cannot mark them fails the spawn, so Git never runs
+/// holding one.
+fn pin_descriptors() -> std::io::Result<()> {
+    // SAFETY: one system call on this process's own descriptor table, taking three scalars.
+    let marked = unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            libc::c_long::from(3_u32),
+            libc::c_long::from(u32::MAX),
+            libc::c_long::from(libc::CLOSE_RANGE_CLOEXEC),
+        )
+    };
+    if marked == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// Builds the boundary one invocation runs under.
 ///
 /// # Errors
 ///
 /// Returns [`ProjectError::GitFailed`] when this kernel cannot enforce the rights this boundary is
 /// made of, when a remote operation asks for rules a kernel this old does not have, or when an
-/// object the rules are attached to cannot be opened.
+/// object the rules are attached to cannot be opened. An invocation whose reads are bounded is
+/// also refused when it would reach a remote, when a support object is missing, and when a
+/// filesystem is mounted beneath a directory it would be granted.
 pub fn prepare(confinement: &Confinement) -> Result<Prepared> {
     let remote = !matches!(confinement.reach, Reach::Nothing);
+    if remote && matches!(confinement.reads, Reads::Bounded(_)) {
+        return Err(ProjectError::GitFailed {
+            detail: "an invocation for a caller bounded by a grant reaches no remote: a location \
+                     says nothing about which providers this host may reach for it, and its reads \
+                     name no certificate store and no resolver file"
+                .into(),
+        });
+    }
     // Nothing degrades quietly: a right this kernel does not have is a refusal here rather than a
     // ruleset that enforces less than it says.
     let mut ruleset = Ruleset::default()
@@ -239,14 +297,21 @@ pub fn prepare(confinement: &Confinement) -> Result<Prepared> {
             ))?;
     }
     let mut created = ruleset.create().map_err(rules)?;
-    // Reads everywhere, and the execute right nowhere: this rule is what makes every later rule an
-    // addition rather than the only thing that works.
-    created = created
-        .add_rule(PathBeneath::new(
-            opened(Path::new("/"))?,
-            AccessFs::ReadFile | AccessFs::ReadDir,
-        ))
-        .map_err(rules)?;
+    created = match &confinement.reads {
+        // Reads everywhere, and the execute right nowhere: this rule is what makes every later
+        // rule an addition rather than the only thing that works. The owner already holds that
+        // authority over the owner's own files, so the boundary takes none of it away.
+        Reads::Everywhere => created
+            .add_rule(PathBeneath::new(
+                opened(Path::new("/"))?,
+                AccessFs::ReadFile | AccessFs::ReadDir,
+            ))
+            .map_err(rules)?,
+        // No rule on the whole filesystem, rather than one with narrower rules beside it: rules
+        // in one ruleset add up, so a narrow read next to the whole filesystem would take nothing
+        // away.
+        Reads::Bounded(support) => bounded(created, confinement, support)?,
+    };
     for program in confinement.executables() {
         created = created
             .add_rule(PathBeneath::new(
@@ -268,20 +333,23 @@ pub fn prepare(confinement: &Confinement) -> Result<Prepared> {
         // reach it.
         created = created
             .add_rule(PathBeneath::new(
-                std::os::fd::AsFd::as_fd(directory.handle().handle()),
+                directory.handle().handle().as_fd(),
                 written,
             ))
             .map_err(rules)?;
     }
-    // The loader, so that a dynamically linked Git can be started at all.
-    for loader in LOADERS {
-        if let Ok(handle) = PathFd::new(Path::new(loader)) {
-            created = created
-                .add_rule(PathBeneath::new(
-                    handle,
-                    AccessFs::Execute | AccessFs::ReadFile,
-                ))
-                .map_err(rules)?;
+    if matches!(confinement.reads, Reads::Everywhere) {
+        // The loader, so that a dynamically linked Git can be started at all. An invocation whose
+        // reads are bounded has the loaders its own programs name, in its support set.
+        for loader in LOADERS {
+            if let Ok(handle) = PathFd::new(Path::new(loader)) {
+                created = created
+                    .add_rule(PathBeneath::new(
+                        handle,
+                        AccessFs::Execute | AccessFs::ReadFile,
+                    ))
+                    .map_err(rules)?;
+            }
         }
     }
     for device in DEVICES {
@@ -308,6 +376,366 @@ pub fn prepare(confinement: &Confinement) -> Result<Prepared> {
         ruleset: Some(created),
         filter: filter(remote)?,
     })
+}
+
+/// Adds what an invocation bounded by a grant may read: the directories it is lent to read, and
+/// the support set named for this host's Git.
+///
+/// The directories the operation owns are readable through their own rules, and Git's program and
+/// helper directory through theirs. Every object here is opened before any rule is made, and the
+/// mount check is made against those opened objects, so what is checked is what the rules are
+/// attached to.
+fn bounded(
+    mut created: RulesetCreated,
+    confinement: &Confinement,
+    support: &SupportSet,
+) -> Result<RulesetCreated> {
+    let mut reads: Vec<(PathFd, BitFlags<AccessFs>)> = Vec::new();
+    let mut directories: Vec<PathBuf> = Vec::new();
+    for path in &confinement.readable {
+        let handle = opened(path)?;
+        // A directory's rights on a file are refused by the kernel, so a file is lent the right to
+        // be read and nothing else.
+        if is_directory(&handle, path)? {
+            directories.push(current_path(handle.as_fd(), path)?);
+            reads.push((handle, AccessFs::ReadFile | AccessFs::ReadDir));
+        } else {
+            reads.push((handle, AccessFs::ReadFile.into()));
+        }
+    }
+    for loader in support.loaders() {
+        // The kernel opens a program's loader for execution when it starts the program, and that
+        // open is judged by the execute right.
+        reads.push((
+            support_object(loader)?,
+            AccessFs::Execute | AccessFs::ReadFile,
+        ));
+    }
+    for library in support.libraries() {
+        let handle = support_object(library)?;
+        directories.push(current_path(handle.as_fd(), library)?);
+        reads.push((handle, AccessFs::ReadFile | AccessFs::ReadDir));
+    }
+    let helpers = opened(&confinement.exec_path)?;
+    directories.push(current_path(helpers.as_fd(), &confinement.exec_path)?);
+    for directory in confinement.written() {
+        directories.push(current_path(
+            directory.handle().handle().as_fd(),
+            directory.path(),
+        )?);
+    }
+    refuse_mounts_beneath(&directories)?;
+    for (handle, access) in reads {
+        created = created
+            .add_rule(PathBeneath::new(handle, access))
+            .map_err(rules)?;
+    }
+    Ok(created)
+}
+
+/// Refuses when a filesystem is mounted beneath a directory an invocation bounded by a grant
+/// would be granted.
+///
+/// A rule on a directory reaches everything beneath it as the kernel presents it at each open,
+/// and that includes another filesystem mounted there and a second view of one bound there. So
+/// such an invocation is not run over a granted directory that has a mount point beneath it. It is
+/// read from this process's own mount table immediately before each invocation, and it narrows
+/// rather than closes: a mount made, or a directory holding one moved beneath a granted directory,
+/// after this reading and while Git runs is read as part of the tree, which is the limit
+/// `README.md` in this crate states in what such a caller is promised.
+fn refuse_mounts_beneath(directories: &[PathBuf]) -> Result<()> {
+    let table = std::fs::read("/proc/self/mountinfo").map_err(|error| {
+        refused(
+            "this host's mount table could not be read, so an invocation for a caller bounded \
+             by a grant is not run",
+            &error,
+        )
+    })?;
+    for line in table.split(|byte| *byte == b'\n') {
+        let Some(point) = mount_point(line) else {
+            continue;
+        };
+        for directory in directories {
+            if point != *directory && point.starts_with(directory) {
+                return Err(ProjectError::GitFailed {
+                    detail: format!(
+                        "a filesystem is mounted at {}, beneath {}, which this invocation would be \
+                         granted; an invocation for a caller bounded by a grant is not run over a \
+                         directory with another filesystem inside it",
+                        crate::git::redact(&point.display().to_string()),
+                        crate::git::redact(&directory.display().to_string())
+                    )
+                    .into(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Returns the mount point one line of the mount table names, with the table's escapes undone.
+///
+/// The fifth field, in which a space, a tab, a line break and a backslash are written as a
+/// backslash and three octal digits.
+fn mount_point(line: &[u8]) -> Option<PathBuf> {
+    let field = line.split(|byte| *byte == b' ').nth(4)?;
+    let mut bytes = Vec::with_capacity(field.len());
+    let mut at = 0;
+    while let Some(&byte) = field.get(at) {
+        if byte == b'\\'
+            && let Some(digits) = field.get(at + 1..at + 4)
+            && digits.iter().all(|digit| (b'0'..=b'7').contains(digit))
+            && let Ok(decoded) = u8::try_from(
+                digits
+                    .iter()
+                    .fold(0_u32, |value, digit| value * 8 + u32::from(digit - b'0')),
+            )
+        {
+            bytes.push(decoded);
+            at += 4;
+        } else {
+            bytes.push(byte);
+            at += 1;
+        }
+    }
+    Some(PathBuf::from(OsString::from_vec(bytes)))
+}
+
+/// Returns whether an opened object is a directory.
+fn is_directory(handle: &PathFd, path: &Path) -> Result<bool> {
+    let stat = rustix::fs::fstat(handle).map_err(|error| ProjectError::GitFailed {
+        detail: format!(
+            "{} could not be examined to build this invocation's boundary: {error}",
+            crate::git::redact(&path.display().to_string())
+        )
+        .into(),
+    })?;
+    Ok(rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::Directory)
+}
+
+/// Returns where an opened object is now, as the kernel names it.
+fn current_path(handle: BorrowedFd<'_>, path: &Path) -> Result<PathBuf> {
+    std::fs::read_link(format!("/proc/self/fd/{}", handle.as_raw_fd())).map_err(|error| {
+        ProjectError::GitFailed {
+            detail: format!(
+                "where {} is now could not be read, so an invocation for a caller bounded by a \
+                 grant is not run: {error}",
+                crate::git::redact(&path.display().to_string())
+            )
+            .into(),
+        }
+    })
+}
+
+/// Returns the handle a support rule is attached to, refusing the invocation by the object's
+/// name when it is missing.
+fn support_object(path: &Path) -> Result<PathFd> {
+    PathFd::new(path).map_err(|error| ProjectError::GitFailed {
+        detail: format!(
+            "the support object {} is missing or cannot be opened ({error}), so an invocation for \
+             a caller bounded by a grant is not run",
+            crate::git::redact(&path.display().to_string())
+        )
+        .into(),
+    })
+}
+
+/// The kind of program header that names the loader a program is started through.
+const PT_INTERP: u32 = 3;
+
+/// How long a program header of a sixty-four-bit program is, at the least.
+const PROGRAM_HEADER: usize = 56;
+
+/// How long a loader's name may be before this host stops believing it.
+const MAX_LOADER_NAME: u64 = 4096;
+
+/// Names the loaders and the library directories of the programs given and of every program in
+/// Git's helper directory, each resolved to the object it is.
+///
+/// Each program is read for the loader it names for itself, and that loader is asked which
+/// libraries it resolves for the program, with an environment of nothing so that no variable
+/// changes the answer. A file that is not a program, such as a script, names no loader and is
+/// passed over: a script's interpreter is either one of the programs given or not executed at
+/// all. One object reached by several names is read once.
+///
+/// # Errors
+///
+/// Returns [`ProjectError::GitFailed`] naming the object that could not be named.
+pub fn support_set(
+    programs: &[&Path],
+    helper_directory: &Path,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let mut candidates: Vec<(PathBuf, bool)> = programs
+        .iter()
+        .map(|program| ((*program).to_owned(), true))
+        .collect();
+    let entries =
+        std::fs::read_dir(helper_directory).map_err(|error| unnamed(helper_directory, &error))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| unnamed(helper_directory, &error))?;
+        candidates.push((entry.path(), false));
+    }
+    let mut seen = BTreeSet::new();
+    let mut loaders = BTreeSet::new();
+    let mut libraries = BTreeSet::new();
+    for (candidate, required) in &candidates {
+        let metadata = match std::fs::metadata(candidate) {
+            Ok(metadata) => metadata,
+            // A name in the helper directory that leads nowhere is nothing Git can start.
+            Err(_) if !required => continue,
+            Err(error) => return Err(unnamed(candidate, &error)),
+        };
+        if !metadata.is_file() || !seen.insert((metadata.dev(), metadata.ino())) {
+            continue;
+        }
+        let Some(loader) = interpreter(candidate)? else {
+            continue;
+        };
+        for library in listed(&loader, candidate)? {
+            let resolved =
+                std::fs::canonicalize(&library).map_err(|error| unnamed(&library, &error))?;
+            if let Some(directory) = resolved.parent() {
+                libraries.insert(directory.to_owned());
+            }
+        }
+        loaders.insert(std::fs::canonicalize(&loader).map_err(|error| unnamed(&loader, &error))?);
+    }
+    Ok((
+        loaders.into_iter().collect(),
+        libraries.into_iter().collect(),
+    ))
+}
+
+/// Returns the loader a program names for itself, or nothing for a file that is not a dynamically
+/// linked program.
+///
+/// Read from the program's own headers, which is where the kernel reads it when it starts the
+/// program. The kind of program this machine runs is the kind read: sixty-four bits, the low byte
+/// of each number first. A program of another kind is a refusal rather than a guess.
+fn interpreter(program: &Path) -> Result<Option<PathBuf>> {
+    let file = std::fs::File::open(program).map_err(|error| unnamed(program, &error))?;
+    let mut header = [0_u8; 64];
+    if file.read_exact_at(&mut header, 0).is_err() || header[..4] != *b"\x7fELF" {
+        return Ok(None);
+    }
+    let unread = |why: &str| ProjectError::GitFailed {
+        detail: format!(
+            "{} is {why}, so the support set of an invocation for a caller bounded by a grant \
+             cannot be named",
+            crate::git::redact(&program.display().to_string())
+        )
+        .into(),
+    };
+    if header[4] != 2 || header[5] != 1 {
+        return Err(unread("a program of a kind this host does not read"));
+    }
+    let table = le64(&header[0x20..0x28]);
+    let size = u16::from_le_bytes([header[0x36], header[0x37]]);
+    let count = u16::from_le_bytes([header[0x38], header[0x39]]);
+    if usize::from(size) < PROGRAM_HEADER {
+        return Err(unread("a program whose headers this host cannot read"));
+    }
+    for index in 0..u64::from(count) {
+        let mut entry = [0_u8; PROGRAM_HEADER];
+        let at = index
+            .checked_mul(u64::from(size))
+            .and_then(|offset| offset.checked_add(table))
+            .ok_or_else(|| unread("a program whose headers this host cannot read"))?;
+        file.read_exact_at(&mut entry, at)
+            .map_err(|error| unnamed(program, &error))?;
+        if u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]) != PT_INTERP {
+            continue;
+        }
+        let offset = le64(&entry[8..16]);
+        let length = le64(&entry[32..40]);
+        if length == 0 || length > MAX_LOADER_NAME {
+            return Err(unread("a program whose loader this host cannot read"));
+        }
+        let mut name = vec![0_u8; usize::try_from(length).unwrap_or(0)];
+        file.read_exact_at(&mut name, offset)
+            .map_err(|error| unnamed(program, &error))?;
+        while name.last() == Some(&0) {
+            name.pop();
+        }
+        let loader = PathBuf::from(OsString::from_vec(name));
+        if !loader.is_absolute() {
+            return Err(unread("a program whose loader is not named absolutely"));
+        }
+        return Ok(Some(loader));
+    }
+    Ok(None)
+}
+
+/// Returns the libraries a program's loader resolves for it, each by the path the loader gives.
+///
+/// The loader is asked with an environment of nothing, which is the environment every Git child
+/// has as far as a loader is concerned: nothing this host sets names a library.
+fn listed(loader: &Path, program: &Path) -> Result<Vec<PathBuf>> {
+    let output = std::process::Command::new(loader)
+        .arg("--list")
+        .arg(program)
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| unnamed(loader, &error))?;
+    if !output.status.success() {
+        return Err(ProjectError::GitFailed {
+            detail: format!(
+                "{} could not say which libraries {} loads, so the support set of an invocation \
+                 for a caller bounded by a grant cannot be named",
+                crate::git::redact(&loader.display().to_string()),
+                crate::git::redact(&program.display().to_string())
+            )
+            .into(),
+        });
+    }
+    let mut libraries = Vec::new();
+    for line in output.stdout.split(|byte| *byte == b'\n') {
+        // Each library is `name => path (address)`. The loader itself and the kernel's own shared
+        // object are named without an arrow, and neither is a library to read.
+        let line = line.trim_ascii();
+        let Some(arrow) = line.windows(4).position(|window| window == b" => ") else {
+            continue;
+        };
+        let target = &line[arrow + 4..];
+        let target = target
+            .windows(2)
+            .position(|window| window == b" (")
+            .map_or(target, |end| &target[..end]);
+        if target.first() != Some(&b'/') {
+            return Err(ProjectError::GitFailed {
+                detail: format!(
+                    "{} loads {}, which {} does not find, so the support set of an invocation for \
+                     a caller bounded by a grant cannot be named",
+                    crate::git::redact(&program.display().to_string()),
+                    crate::git::redact(&String::from_utf8_lossy(&line[..arrow])),
+                    crate::git::redact(&loader.display().to_string())
+                )
+                .into(),
+            });
+        }
+        libraries.push(PathBuf::from(std::ffi::OsStr::from_bytes(target)));
+    }
+    Ok(libraries)
+}
+
+/// Reads eight bytes as a number, the low byte first.
+fn le64(bytes: &[u8]) -> u64 {
+    let mut word = [0_u8; 8];
+    word.copy_from_slice(&bytes[..8]);
+    u64::from_le_bytes(word)
+}
+
+/// Returns a refusal naming the object that could not be named for a support set.
+fn unnamed(path: &Path, error: &std::io::Error) -> ProjectError {
+    ProjectError::GitFailed {
+        detail: format!(
+            "{} could not be read to name the support set of an invocation for a caller bounded by \
+             a grant: {error}",
+            crate::git::redact(&path.display().to_string())
+        )
+        .into(),
+    }
 }
 
 /// Returns the handle a rule is attached to, refusing a path that cannot be opened.
@@ -543,6 +971,251 @@ const fn instruction(code: u16, jt: u8, jf: u8, k: u32) -> libc::sock_filter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::io::Read as _;
+    use std::sync::Arc;
+
+    use crate::boundary::OpenedDirectory;
+
+    /// A confinement around one program, with its own working, temporary and helper directories.
+    fn confinement_in(root: &Path, program: &Path, reach: Reach, reads: Reads) -> Confinement {
+        let environment_id =
+            kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([5; 16]));
+        let working = root.join("working");
+        let temporary = root.join("temporary");
+        let helpers = root.join("helpers");
+        for directory in [&working, &temporary, &helpers] {
+            std::fs::create_dir_all(directory).expect("a directory for the test");
+        }
+        Confinement {
+            program: program.to_owned(),
+            exec_path: helpers,
+            helpers: Vec::new(),
+            working: OpenedDirectory::open(environment_id, &working, None)
+                .expect("the working directory opens"),
+            reserved: Vec::new(),
+            temporary: OpenedDirectory::open(environment_id, &temporary, None)
+                .expect("the temporary directory opens"),
+            readable: Vec::new(),
+            reach,
+            reads,
+        }
+    }
+
+    /// The support set of one program, named the way the profile names Git's.
+    fn support_of(program: &Path) -> SupportSet {
+        let nothing = tempfile::TempDir::new().expect("an empty helper directory");
+        let (loaders, libraries) =
+            support_set(&[program], nothing.path()).expect("the program's support set is named");
+        SupportSet { loaders, libraries }
+    }
+
+    #[test]
+    fn the_support_set_names_a_programs_own_loader_and_library_directories_and_nothing_broad() {
+        let shell = Path::new("/bin/sh");
+        let Some(loader) = interpreter(shell).expect("the shell's headers read") else {
+            println!("not exercised: this host's shell is not dynamically linked");
+            return;
+        };
+        let support = support_of(shell);
+        assert!(
+            support
+                .loaders()
+                .contains(&std::fs::canonicalize(&loader).expect("the loader resolves")),
+            "the loader the shell names for itself is in the set: {support:?}"
+        );
+        assert!(
+            !support.libraries().is_empty(),
+            "and its libraries' directories"
+        );
+        for directory in support.libraries() {
+            assert!(directory.is_dir(), "{} is a directory", directory.display());
+            for broad in [
+                "/", "/usr", "/etc", "/proc", "/sys", "/dev", "/dev/shm", "/tmp",
+            ] {
+                assert_ne!(
+                    directory,
+                    Path::new(broad),
+                    "the set names no broad system directory"
+                );
+            }
+        }
+        // A file that is not a program names no loader and is passed over.
+        let root = tempfile::TempDir::new().expect("a directory on the internal disk");
+        let script = root.path().join("script");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").expect("a script");
+        assert_eq!(interpreter(&script).expect("the script reads"), None);
+    }
+
+    #[test]
+    fn a_support_object_that_is_gone_refuses_the_invocation_by_its_name() {
+        let root = tempfile::TempDir::new().expect("a directory on the internal disk");
+        let shell = Path::new("/bin/sh");
+        let mut support = support_of(shell);
+        // The control first: the set as it was named builds a boundary.
+        prepare(&confinement_in(
+            root.path(),
+            shell,
+            Reach::Nothing,
+            Reads::Bounded(Arc::new(support.clone())),
+        ))
+        .expect("the named set builds a boundary");
+        support
+            .libraries
+            .push(root.path().join("a-library-directory-that-went"));
+        let refusal = prepare(&confinement_in(
+            root.path(),
+            shell,
+            Reach::Nothing,
+            Reads::Bounded(Arc::new(support)),
+        ))
+        .expect_err("a support object that is gone refuses the invocation");
+        let said = refusal.to_string();
+        assert!(
+            said.contains("the support object") && said.contains("a-library-directory-that-went"),
+            "the refusal names the object: {said}"
+        );
+    }
+
+    #[test]
+    fn an_invocation_whose_reads_are_bounded_reaches_no_remote() {
+        let root = tempfile::TempDir::new().expect("a directory on the internal disk");
+        let shell = Path::new("/bin/sh");
+        let refusal = prepare(&confinement_in(
+            root.path(),
+            shell,
+            Reach::Outbound(vec![443]),
+            Reads::Bounded(Arc::new(support_of(shell))),
+        ))
+        .expect_err("a bounded invocation that would reach a remote is refused");
+        assert!(
+            refusal.to_string().contains("reaches no remote"),
+            "and says why: {refusal}"
+        );
+    }
+
+    #[test]
+    fn a_mount_point_is_read_with_the_tables_escapes_undone() {
+        let line = |point: &str| {
+            format!("36 35 98:0 /root {point} rw,noatime master:1 - ext4 /dev/root rw").into_bytes()
+        };
+        assert_eq!(
+            mount_point(&line("/mnt/plain")),
+            Some(PathBuf::from("/mnt/plain"))
+        );
+        assert_eq!(
+            mount_point(&line("/mnt/a\\040space\\011tab\\012line\\134slash")),
+            Some(PathBuf::from("/mnt/a space\ttab\nline\\slash"))
+        );
+        // Something that only looks like an escape is kept as it is.
+        assert_eq!(
+            mount_point(&line("/mnt/not\\9an\\08escape")),
+            Some(PathBuf::from("/mnt/not\\9an\\08escape"))
+        );
+        assert_eq!(
+            mount_point(b"36 35 98:0"),
+            None,
+            "a line too short names none"
+        );
+    }
+
+    /// Runs one enclosed shell's output to its end.
+    fn output_of(mut spawned: crate::boundary::Spawned) -> (Option<i32>, String, String) {
+        let mut stdout = String::new();
+        spawned
+            .stdout()
+            .expect("the output")
+            .read_to_string(&mut stdout)
+            .expect("the output reads");
+        let mut stderr = String::new();
+        spawned
+            .stderr()
+            .expect("the error")
+            .read_to_string(&mut stderr)
+            .expect("the error reads");
+        let status = loop {
+            if let Some(status) = spawned.try_wait().expect("the child can be waited on") {
+                break status;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        (status.code(), stdout, stderr)
+    }
+
+    #[test]
+    fn a_descriptor_left_open_before_the_rules_is_not_one_the_child_inherits() {
+        let bash = Path::new("/bin/bash");
+        if !bash.is_file() {
+            println!("not exercised: this host has no bash to read a descriptor by its number");
+            return;
+        }
+        let root = tempfile::TempDir::new().expect("a directory on the internal disk");
+        let secret = root.path().join("secret");
+        std::fs::write(&secret, "read-through-a-descriptor\n").expect("a file outside every grant");
+        // Opened the way a library that forgot close-on-exec would leave it: inheritable.
+        let leaked = std::fs::File::open(&secret).expect("the file opens");
+        rustix::io::fcntl_setfd(&leaked, rustix::io::FdFlags::empty())
+            .expect("the descriptor is made inheritable");
+        let number = leaked.as_raw_fd();
+        let arguments = [
+            OsString::from("-c"),
+            OsString::from(format!(
+                "IFS= read -r line <&{number} && printf '%s' \"$line\""
+            )),
+        ];
+        let confinement = confinement_in(
+            root.path(),
+            bash,
+            Reach::Nothing,
+            Reads::Bounded(Arc::new(support_of(bash))),
+        );
+        // The launcher: the rules, the filter, and the descriptors pinned.
+        let (status, stdout, stderr) = output_of(
+            crate::boundary::start(
+                &Invocation {
+                    program: bash,
+                    arguments: &arguments,
+                    environment: &[],
+                    described: "a reader of one descriptor",
+                },
+                &confinement,
+            )
+            .expect("the reader starts"),
+        );
+        assert_ne!(status, Some(0), "the reader finds nothing to read");
+        assert!(
+            !stdout.contains("read-through-a-descriptor"),
+            "the file was not read through the descriptor"
+        );
+        assert!(
+            stderr.contains("Bad file descriptor"),
+            "because the descriptor was not there: {stderr}"
+        );
+        // The control: the same rules and the same filter with the pin lifted, and the file is read
+        // through the descriptor it inherited, although no rule grants it.
+        let mut prepared = prepare(&confinement).expect("the boundary is built");
+        let mut command = std::process::Command::new(bash);
+        command
+            .args(&arguments)
+            .env_clear()
+            .stdin(std::process::Stdio::null());
+        {
+            use std::os::unix::process::CommandExt as _;
+            // SAFETY: the hook applies a ruleset and a filter this process built, as the launcher's
+            // own hook does, and nothing else.
+            unsafe {
+                command.pre_exec(move || prepared.confine());
+            }
+        }
+        let output = command.output().expect("the reader starts");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "read-through-a-descriptor",
+            "without the pin the descriptor is inherited and read: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        drop(leaked);
+    }
 
     /// One call, as the kernel would hand it to the filter.
     #[derive(Clone, Copy)]
