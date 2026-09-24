@@ -8011,12 +8011,14 @@ impl Controller {
 
     /// Removes the job a worker was started as, once that worker has ended.
     ///
-    /// The job goes when the kernel says the worker's process has ended, not when the session's
-    /// closure is recorded: a worker hands its closure over before it exits, and removing a job
-    /// whose process is still running would end that process part way through its own closure. A
-    /// launch that never recorded a process is looked at straight away, because the removal itself
-    /// leaves a job with a running process alone. A worker still running after
-    /// [`CLOSURE_WATCH_TIMEOUT`] keeps its job until the next start of this daemon looks again.
+    /// The job goes when its process has ended, not when the session's closure is recorded: a
+    /// worker hands its closure over before it exits, and removing a job whose process is still
+    /// running would end that process part way through its own closure. The kernel is asked first
+    /// where the launch recorded a process, because asking it starts nothing; launchd is then asked
+    /// until it lets the job go, because it collects an ended process a moment after the kernel
+    /// says the process has ended, and a launch that recorded no process may still have one
+    /// running. A job still running after [`CLOSURE_WATCH_TIMEOUT`] keeps its job until the next
+    /// start of this daemon looks again.
     ///
     /// Nothing is waited for where this environment defined no job for the worker, which is every
     /// worker a platform other than macOS starts.
@@ -8030,27 +8032,36 @@ impl Controller {
             return;
         }
         tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + CLOSURE_WATCH_TIMEOUT;
             if let Some(identity) = launched {
-                let deadline = tokio::time::Instant::now() + CLOSURE_WATCH_TIMEOUT;
                 while !matches!(
                     kr_ipc::identity::process_state(&identity),
                     kr_ipc::identity::ProcessState::Ended
-                ) {
-                    if tokio::time::Instant::now() >= deadline {
-                        break;
-                    }
+                ) && tokio::time::Instant::now() < deadline
+                {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
             }
-            let retired = tokio::task::spawn_blocking(move || {
-                crate::supervision::retire_worker_job(&jobs, reservation_id)
-            })
-            .await;
-            if let Ok(JobRetirement::Unsettled(detail)) = retired {
-                eprintln!(
-                    "kr-controller: the job of the worker started for reservation {reservation_id} \
-                     could not be removed: {detail}"
-                );
+            loop {
+                let asked = jobs.clone();
+                let retired = tokio::task::spawn_blocking(move || {
+                    crate::supervision::retire_worker_job(&asked, reservation_id)
+                })
+                .await;
+                let left = match retired {
+                    Ok(JobRetirement::Gone) | Err(_) => return,
+                    Ok(left) => left,
+                };
+                if tokio::time::Instant::now() >= deadline {
+                    if let JobRetirement::Unsettled(detail) = left {
+                        eprintln!(
+                            "kr-controller: the job of the worker started for reservation \
+                             {reservation_id} could not be removed: {detail}"
+                        );
+                    }
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         });
     }

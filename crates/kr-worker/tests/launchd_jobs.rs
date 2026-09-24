@@ -3,8 +3,9 @@
 //! On macOS a worker runs as a launchd job of its own, and launchd keeps a job loaded after its
 //! process has exited until something removes it. Each test here starts real workers through the
 //! platform's own supervisor and asks launchd itself what it still has loaded: after a session is
-//! closed, after a worker is ended outright, and after a daemon starts on a host where one worker
-//! ended while no daemon was running and another is still running.
+//! closed, after a worker is ended outright, after a launch that could not say what it started, and
+//! after a daemon starts on a host where one worker ended while no daemon was running and another
+//! is still running.
 //!
 //! Every path these tests use is on the internal disk: the worker is copied there before it is
 //! started, and every session runs in the test's own tree. The one process a test ends itself is a
@@ -110,6 +111,14 @@ impl Host {
 
     /// Starts a daemon that starts its workers through launchd, as this platform's host does.
     async fn start(&self) -> RunningDaemon {
+        self.start_with(|| Box::new(LaunchdSupervisor::new())).await
+    }
+
+    /// Starts a daemon that starts its workers through the supervisor `supervisor` makes.
+    async fn start_with(
+        &self,
+        supervisor: impl Fn() -> Box<dyn WorkerSupervisor>,
+    ) -> RunningDaemon {
         assert!(
             LaunchdSupervisor::available(),
             "this user has no graphical launchd domain on this host, so a worker is not started as \
@@ -132,7 +141,7 @@ impl Host {
                 }),
                 secret_store: StoreSelection::File,
                 boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-                supervisor: self.temp.supervisor(Box::new(LaunchdSupervisor::new())),
+                supervisor: self.temp.supervisor(supervisor()),
                 worker_program: self.worker.clone(),
                 build_id: build(),
                 release: "0".to_owned(),
@@ -410,6 +419,41 @@ async fn until_ended(identity: &ProcessStartIdentity, what: &str) {
     }
 }
 
+/// Starts each worker's job through launchd as this host does, with the system's own `sleep` for a
+/// few seconds in place of a worker, and then says it cannot tell whether anything started, which
+/// is what a launch answers when its kickstart failed part way. The labels it started are kept for
+/// the test.
+#[derive(Debug)]
+struct NamesNoProcess {
+    started: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl WorkerSupervisor for NamesNoProcess {
+    fn start(&self, launch: &kr_controller::supervision::WorkerLaunch) -> LaunchOutcome {
+        let mut service = launch.service();
+        service.program = PathBuf::from("/bin/sleep");
+        service.arguments = vec!["3".to_owned()];
+        let outcome = LaunchdSupervisor::new().start_service(&service);
+        self.started
+            .lock()
+            .expect("the list of started jobs is not poisoned")
+            .push(service.label);
+        match outcome {
+            LaunchOutcome::NotStarted { detail } => LaunchOutcome::NotStarted { detail },
+            LaunchOutcome::Started(_) | LaunchOutcome::Uncertain { .. } => {
+                LaunchOutcome::Uncertain {
+                    detail: "the launch could not say what it started".to_owned(),
+                    pid: None,
+                }
+            }
+        }
+    }
+
+    fn describe(&self) -> &'static str {
+        "launchd, naming no process for what it starts"
+    }
+}
+
 /// A closed session leaves no job loaded, in either domain a worker is started in, and the job's
 /// definition goes with it while what the worker wrote to its diagnostics stays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -485,13 +529,75 @@ async fn a_worker_ended_outright_has_its_job_removed() {
     daemon.stop().await;
 }
 
+/// A launch that could not say what it started still has its job removed, once the process in it
+/// has ended: the job is asked about until launchd lets it go, not once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_that_named_no_process_has_its_job_removed_once_it_ends() {
+    let host = Host::create();
+    let started = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let daemon = host
+        .start_with(|| {
+            Box::new(NamesNoProcess {
+                started: Arc::clone(&started),
+            })
+        })
+        .await;
+    let mut client = host.client().await;
+    let params = SessionCreateParams {
+        environment_id: host.environment_id,
+        presentation: Presentation::Invisible,
+        shell: Nullable::some(kr_worker::testing::posix_shell()),
+        shell_mode: ShellMode::NativeCompat,
+        cwd: Nullable::some(host.temp.root().display().to_string()),
+        dimensions: Nullable::null(),
+        worker_profile: WorkerProfile::HeadlessUser,
+        palette: Nullable::null(),
+        environment_snapshot: Vec::new(),
+        launch_profile: LaunchProfile::default(),
+        terminal: Nullable::null(),
+    };
+    let refused = client
+        .mutate(
+            Method::SessionCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &params,
+        )
+        .await
+        .expect("the call reaches the daemon");
+    assert!(
+        refused.is_err(),
+        "a launch that could not say what it started fails the create: {refused:?}"
+    );
+    let job = started
+        .lock()
+        .expect("the list of started jobs is not poisoned")
+        .first()
+        .cloned()
+        .expect("the supervisor started a job");
+    assert_eq!(
+        loaded(&job),
+        vec![format!("gui/{}/{job}", kr_ipc::paths::current_uid())],
+        "the job is loaded while the process in it runs"
+    );
+    host.until_retired(&job, "the job of a launch that named no process")
+        .await;
+
+    // A restart settles the launch the daemon could not: no process was recorded for it, so it is
+    // resolved as failed and stops occupying the environment.
+    drop(client);
+    daemon.stop().await;
+    host.start().await.stop().await;
+}
+
 /// A daemon that starts removes the job of every worker that has ended, and leaves the job of a
 /// worker that is still running exactly as it is.
 ///
-/// Two jobs have ended with no daemon running to see it. One is a session's, closed as its daemon
-/// stopped. The other is a job this environment defined whose registry names no session at all,
-/// which only the start's own look at every job it has defined can find. Both are gone by the time
-/// the new daemon serves, and the live session keeps its job, its worker and its answer.
+/// Two jobs have ended with no daemon running to see it. One is a session's, whose worker was asked
+/// through its own endpoint to close while no daemon ran and ended itself. The other is a job this
+/// environment defined whose registry names no session at all, which only the start's own look at
+/// every job it has defined can find. Both are gone by the time the new daemon serves, and the live
+/// session keeps its job, its worker and its answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_starting_host_removes_ended_jobs_and_leaves_live_ones() {
     let host = Host::create();
@@ -508,11 +614,32 @@ async fn a_starting_host_removes_ended_jobs_and_leaves_live_ones() {
     let closed_job = host.job_of(closed);
     let closed_worker = host.worker_of(closed);
 
-    // The close is accepted and the daemon stops at once, before it can see the worker end.
-    host.close(&mut client, closed).await;
     drop(client);
     first.stop().await;
+
+    // With no daemon running, one worker is asked to close its session through its own endpoint,
+    // and ends itself. Nothing is left running to see it go, so its job stays loaded.
+    let descriptor = kr_ipc::descriptor::read_all(&host.paths())
+        .expect("the descriptors are readable")
+        .into_iter()
+        .filter_map(|entry| entry.descriptor.ok())
+        .find(|descriptor| descriptor.session_id == closed)
+        .expect("the session's worker published its descriptor");
+    assert!(
+        teardown::ask_one_to_close(descriptor, host.environment_id)
+            .await
+            .is_some(),
+        "the worker accepts the close through its own endpoint"
+    );
     until_ended(&closed_worker, "the worker of the closed session").await;
+    assert_eq!(
+        loaded(&closed_job),
+        vec![format!(
+            "{}/{closed_job}",
+            domain(WorkerProfile::HeadlessUser)
+        )],
+        "with no daemon running, the ended worker's job is still loaded"
+    );
 
     // A job this environment defined for a worker that has ended, which no registry row names.
     let orphan = label(ReservationId::new(kr_ipc::new_uuid()));

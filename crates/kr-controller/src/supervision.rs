@@ -539,13 +539,26 @@ impl LaunchdSupervisor {
 
     /// Removes one job this environment defined, once its process has ended, from whichever of
     /// this user's two domains has it, and then its definition.
+    fn retire(jobs_directory: &Path, label: &str) -> JobRetirement {
+        let uid = kr_ipc::paths::current_uid();
+        Self::retire_from(
+            jobs_directory,
+            label,
+            &[format!("gui/{uid}"), format!("user/{uid}")],
+        )
+    }
+
+    /// Removes one job this environment defined, once its process has ended, from whichever of
+    /// `domains` has it, and then its definition.
     ///
     /// Removing a job whose process has ended ends nothing, and nothing starts that job again
     /// between the look and the removal: it is neither run at load nor kept alive, and this host
     /// starts it once, before any of this. A job launchd describes as anything but not running is
     /// treated as running and left alone, so a description this build does not recognise costs a
-    /// job left loaded rather than a process ended.
-    fn retire(jobs_directory: &Path, label: &str) -> JobRetirement {
+    /// job left loaded rather than a process ended. A domain that does not exist, such as the
+    /// graphical domain of a user who has logged out, has nothing loaded in it, and the next domain
+    /// is looked at all the same.
+    fn retire_from(jobs_directory: &Path, label: &str, domains: &[String]) -> JobRetirement {
         let definition = job_definition(jobs_directory, label);
         match std::fs::symlink_metadata(&definition) {
             Ok(_) => {}
@@ -558,8 +571,7 @@ impl LaunchdSupervisor {
                 return JobRetirement::Unsettled(format!("{}: {error}", definition.display()));
             }
         }
-        let uid = kr_ipc::paths::current_uid();
-        for domain in [format!("gui/{uid}"), format!("user/{uid}")] {
+        for domain in domains {
             let target = format!("{domain}/{label}");
             match job_state(&target) {
                 JobState::NotLoaded => continue,
@@ -605,28 +617,38 @@ enum JobState {
 /// Asks launchd about one job, `<domain>/<label>`.
 #[cfg(target_os = "macos")]
 fn job_state(target: &str) -> JobState {
-    /// What `launchctl print` exits with for a job the domain does not have.
-    const NOT_LOADED: i32 = 113;
-
-    let output = match std::process::Command::new("/bin/launchctl")
+    match std::process::Command::new("/bin/launchctl")
         .args(["print", target])
         .output()
     {
-        Ok(output) => output,
-        Err(error) => return JobState::Unknown(format!("/bin/launchctl: {error}")),
-    };
-    match output.status.code() {
-        Some(0) => {}
-        Some(NOT_LOADED) => return JobState::NotLoaded,
-        _ => {
-            return JobState::Unknown(format!(
-                "launchctl print {target} answered {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
+        Ok(output) => job_state_answered(
+            target,
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        ),
+        Err(error) => JobState::Unknown(format!("/bin/launchctl: {error}")),
     }
-    job_state_described(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Reads what `launchctl print <domain>/<label>` answered: its exit code, its description of the
+/// job, and what it said when it would not describe one.
+#[cfg(target_os = "macos")]
+fn job_state_answered(target: &str, code: Option<i32>, printed: &str, said: &str) -> JobState {
+    /// What `launchctl print` exits with for a domain that does not exist.
+    const NO_SUCH_DOMAIN: i32 = 112;
+    /// What `launchctl print` exits with for a job the domain does not have.
+    const NOT_LOADED: i32 = 113;
+
+    match code {
+        Some(0) => job_state_described(printed),
+        // A job cannot be loaded in a domain that is not there.
+        Some(NO_SUCH_DOMAIN | NOT_LOADED) => JobState::NotLoaded,
+        _ => JobState::Unknown(format!(
+            "launchctl print {target} answered {code:?}: {}",
+            said.trim()
+        )),
+    }
 }
 
 /// Reads whether a loaded job has a process from launchd's description of it.
@@ -1349,6 +1371,35 @@ mod tests {
         }
     }
 
+    /// Starts a worker's job in this user's background domain whose process ends at once, and waits
+    /// until launchd describes it as loaded with no process.
+    ///
+    /// The program is the system's own, which ignores its arguments, and the job runs in `host`'s
+    /// own tree on the internal disk. Returns the job's reservation, its label, its target and the
+    /// guard that removes it when the test ends.
+    #[cfg(target_os = "macos")]
+    fn an_ended_worker_job(
+        host: &kr_ipc::testing::TempHost,
+    ) -> (ReservationId, String, String, OwnJob) {
+        let reservation_id = ReservationId::new(kr_ipc::new_uuid());
+        let mut launch = launch();
+        launch.reservation_id = reservation_id;
+        launch.program = PathBuf::from("/usr/bin/true");
+        launch.jobs_directory = host.environment().jobs_dir();
+        launch.working_directory = host.root().to_path_buf();
+        launch.profile = WorkerProfile::HeadlessUser;
+        let label = launch.label();
+        let own = OwnJob(label.clone());
+        let outcome = LaunchdSupervisor::new().start(&launch);
+        assert!(
+            !matches!(outcome, LaunchOutcome::NotStarted { .. }),
+            "the job was started: {outcome:?}"
+        );
+        let target = format!("user/{}/{label}", kr_ipc::paths::current_uid());
+        until_ended(&target);
+        (reservation_id, label, target, own)
+    }
+
     /// A worker's job whose process has ended is removed from launchd, and its definition with
     /// it, while what the job wrote stays.
     #[cfg(target_os = "macos")]
@@ -1357,24 +1408,7 @@ mod tests {
         launchd_domains_are_here();
         let host = kr_ipc::testing::TempHost::create();
         let jobs = host.environment().jobs_dir();
-        let reservation_id = ReservationId::new(kr_ipc::new_uuid());
-        let mut launch = launch();
-        launch.reservation_id = reservation_id;
-        // The system's own program that ignores its arguments and ends at once, run in this test's
-        // own tree on the internal disk, in the background domain a headless worker is started in.
-        launch.program = PathBuf::from("/usr/bin/true");
-        launch.jobs_directory.clone_from(&jobs);
-        launch.working_directory = host.root().to_path_buf();
-        launch.profile = WorkerProfile::HeadlessUser;
-        let label = launch.label();
-        let _own = OwnJob(label.clone());
-        let outcome = LaunchdSupervisor::new().start(&launch);
-        assert!(
-            !matches!(outcome, LaunchOutcome::NotStarted { .. }),
-            "the job was started: {outcome:?}"
-        );
-        let target = format!("user/{}/{label}", kr_ipc::paths::current_uid());
-        until_ended(&target);
+        let (reservation_id, label, target, _own) = an_ended_worker_job(&host);
 
         assert_eq!(
             retire_worker_job(&jobs, reservation_id),
@@ -1397,6 +1431,69 @@ mod tests {
             JobRetirement::Gone,
             "and a second look finds nothing left to remove"
         );
+    }
+
+    /// A domain that is not there has nothing loaded in it, and the domains after it are still
+    /// looked at: the graphical domain of a user who has logged out does not keep an ended
+    /// background job loaded.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_domain_that_is_not_there_does_not_stop_the_removal() {
+        launchd_domains_are_here();
+        // An account that never has a graphical login, so its graphical domain is never there.
+        let absent = "gui/1".to_owned();
+        let asked = std::process::Command::new("/bin/launchctl")
+            .args(["print", &absent])
+            .output()
+            .expect("runs launchctl");
+        assert_eq!(
+            asked.status.code(),
+            Some(112),
+            "launchd says {absent} is not there: {}",
+            String::from_utf8_lossy(&asked.stderr)
+        );
+        let host = kr_ipc::testing::TempHost::create();
+        let jobs = host.environment().jobs_dir();
+        let (_, label, target, _own) = an_ended_worker_job(&host);
+
+        let domains = [absent, format!("user/{}", kr_ipc::paths::current_uid())];
+        assert_eq!(
+            LaunchdSupervisor::retire_from(&jobs, &label, &domains),
+            JobRetirement::Gone
+        );
+        assert!(
+            matches!(job_state(&target), JobState::NotLoaded),
+            "the job in the domain after the absent one was removed"
+        );
+    }
+
+    /// What `launchctl print` answered is read by its exit code first: no domain and no job are
+    /// both nothing loaded, a description is read for its process, and anything else is unknown.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchds_answer_is_read_by_its_exit_code() {
+        let target = "gui/501/kr-worker-x";
+        let ended = "gui/501/kr-worker-x = {\n\tstate = not running\n}\n";
+        assert!(matches!(
+            job_state_answered(target, Some(112), "", "Could not find domain"),
+            JobState::NotLoaded
+        ));
+        assert!(matches!(
+            job_state_answered(target, Some(113), "", "Could not find service"),
+            JobState::NotLoaded
+        ));
+        assert!(matches!(
+            job_state_answered(target, Some(0), ended, ""),
+            JobState::Ended
+        ));
+        assert!(matches!(
+            job_state_answered(target, Some(1), "", "Bad request."),
+            JobState::Unknown(_)
+        ));
+        assert!(matches!(
+            job_state_answered(target, None, ended, ""),
+            JobState::Unknown(_)
+        ));
     }
 
     /// A worker's job whose process is still running is left loaded, with its process running and

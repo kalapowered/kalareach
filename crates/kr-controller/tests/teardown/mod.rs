@@ -519,7 +519,7 @@ fn ask_to_close(environment: &EnvironmentPaths) -> Vec<ProcessStartIdentity> {
 
 /// Asks one worker to close its session, once it has proved it is the worker its descriptor names,
 /// and returns its identity when it accepted.
-async fn ask_one_to_close(
+pub async fn ask_one_to_close(
     worker: kr_protocol::worker::WorkerDescriptor,
     environment_id: kr_protocol::ids::EnvironmentId,
 ) -> Option<ProcessStartIdentity> {
