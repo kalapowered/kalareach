@@ -69,6 +69,52 @@ impl Credential {
         }
     }
 
+    /// Returns a second holder of the same credential, inside the broker.
+    ///
+    /// A backend that authenticates its launch before the launch's record exists keeps one, and
+    /// the record takes the other; a launch that is given back leaves the backend its own, so a
+    /// retry of the same invocation still authenticates. It never leaves the broker.
+    #[must_use]
+    pub(crate) const fn duplicate(&self) -> Self {
+        Self {
+            secret: kr_crypto::secret::Secret::from_bytes(*self.secret.expose()),
+        }
+    }
+
+    /// Writes the credential to a new owner-only file inside an owner-only directory.
+    ///
+    /// **This is a Unix path, and it is refused everywhere else**, for the reason
+    /// [`ManagedProcess::write_registration`] gives.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnsupportedCapability`] on a platform without verifiable owner-only
+    /// files, and [`BrokerError::LedgerUnavailable`] when the directory is not private or the file
+    /// cannot be created or written.
+    pub(crate) fn write_file(&self, path: &std::path::Path) -> Result<()> {
+        if !ManagedProcess::publishes_credential_file() {
+            return Err(BrokerError::UnsupportedCapability {
+                detail: "this platform cannot prove a file is closed to other accounts, so the \
+                         launch credential is not published as a file here"
+                    .to_owned(),
+            });
+        }
+        let directory = path
+            .parent()
+            .ok_or_else(|| BrokerError::ledger(format!("{} names no directory", path.display())))?;
+        check_private_directory(directory)?;
+        let rendered = self.to_registration_bytes();
+        // The rendering is a copy of the secret, and it is wiped when it is dropped at the end of
+        // this function, because it is the host's own zeroising buffer.
+        let written = kr_ipc::paths::create_new_owner_only_file(path, rendered.expose());
+        written.map_err(|error| {
+            BrokerError::ledger(format!(
+                "could not write the credential file {}: {error}",
+                path.display()
+            ))
+        })
+    }
+
     /// Returns true when the presented value is this credential.
     ///
     /// The comparison is the host's own constant-time one, so how much of a wrong value was right
@@ -298,27 +344,7 @@ impl ManagedProcess {
     /// files, and [`BrokerError::LedgerUnavailable`] when the directory is not private or the file
     /// cannot be created or written.
     pub fn write_registration(&self, path: &std::path::Path) -> Result<()> {
-        if !Self::publishes_credential_file() {
-            return Err(BrokerError::UnsupportedCapability {
-                detail: "this platform cannot prove a file is closed to other accounts, so the \
-                         launch credential is not published as a file here"
-                    .to_owned(),
-            });
-        }
-        let directory = path
-            .parent()
-            .ok_or_else(|| BrokerError::ledger(format!("{} names no directory", path.display())))?;
-        check_private_directory(directory)?;
-        let rendered = self.credential.to_registration_bytes();
-        // The rendering is a copy of the secret, and it is wiped when it is dropped at the end of
-        // this function, because it is the host's own zeroising buffer.
-        let written = kr_ipc::paths::create_new_owner_only_file(path, rendered.expose());
-        written.map_err(|error| {
-            BrokerError::ledger(format!(
-                "could not write the registration file {}: {error}",
-                path.display()
-            ))
-        })
+        self.credential.write_file(path)
     }
 }
 

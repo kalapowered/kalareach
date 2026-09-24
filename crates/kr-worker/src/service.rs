@@ -271,6 +271,26 @@ impl WorkerService {
     pub fn broker(&self) -> &Arc<crate::broker::Broker> {
         &self.broker
     }
+
+    /// Sets up the backends an integrated invocation is given before it runs, on this session's
+    /// broker, and hands them to the session.
+    ///
+    /// Returns them, so the installation's connectors can be handed over to their sources. It must
+    /// be called from inside the runtime the backends serve their endpoints on.
+    pub fn install_command_backends(
+        &self,
+        config: crate::broker::commands::CommandBackendsConfig,
+    ) -> Arc<crate::broker::commands::CommandBackends> {
+        let backends = Arc::new(crate::broker::commands::CommandBackends::new(
+            Arc::clone(&self.broker),
+            config,
+            tokio::runtime::Handle::current(),
+        ));
+        self.runtime
+            .session()
+            .set_command_backends(Arc::clone(&backends));
+        backends
+    }
 }
 
 impl std::fmt::Debug for WorkerService {

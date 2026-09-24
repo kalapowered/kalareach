@@ -33,7 +33,7 @@ use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{ApplicationInstanceId, GatewayConnectionId, PluginId};
 
 use crate::broker::duplex::{Closure, Duplex, Observations, Observatory};
-use crate::broker::endpoint::{Accepted, BoundEndpoint, Stream};
+use crate::broker::endpoint::{Accepted, BoundEndpoint, PeerIdentity, Stream};
 use crate::broker::error::{BrokerError, Result};
 use crate::broker::framing::Framing;
 use crate::broker::listener::{BridgeHello, ListenerAddress, Registration, reject_browser_origin};
@@ -102,11 +102,6 @@ pub struct NativeLaunch {
 /// generated for the launch; on a private socket the process it names is compared with the one the
 /// kernel named, and the kernel wins. The session identifier is carried for diagnostics and
 /// section 11 is explicit that it authenticates nothing.
-#[derive(serde::Deserialize)]
-struct HelloFrame {
-    kr_hello: Hello,
-}
-
 #[derive(serde::Deserialize)]
 struct Hello {
     /// The credential the bridge read from its own owner-only file, as hexadecimal.
@@ -548,7 +543,11 @@ pub struct NativeGateway {
     endpoint: BoundEndpoint,
     observatory: Observatory,
     launch: NativeLaunch,
-    registration: Option<Registration>,
+    /// The registration this endpoint admits against, once a launch has published it.
+    ///
+    /// Set once: by [`NativeGateway::launch`], or by the command backend when the invocation that
+    /// presented itself is admitted. Admissions read it concurrently, so it is never replaced.
+    registration: std::sync::OnceLock<Registration>,
     /// The native bridge the launched application was installed with, where it has one.
     bridge: Option<crate::broker::bridge::InstalledBridge>,
     runtime_directory: std::path::PathBuf,
@@ -567,10 +566,12 @@ pub struct NativeGateway {
     last_started: Option<ProcessStartIdentity>,
     /// Where a failed launch stops before it undoes anything, for this host's own tests.
     #[cfg(feature = "testing")]
-    cleanup_pause: Option<(
-        std::sync::mpsc::SyncSender<()>,
-        std::sync::mpsc::Receiver<()>,
-    )>,
+    cleanup_pause: std::sync::Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
 }
 
 /// Stops a process a launch started, and waits for it, because the launch failed after it.
@@ -673,15 +674,16 @@ impl NativeGateway {
         // The registration is built from the address this host bound, never from one a caller
         // supplied. A launched process is told where to connect, and telling it anywhere but the
         // socket that exists is telling it nothing. Which process it will be is not known yet.
-        let registration = launch.expected_process.clone().map(|expected| {
-            Registration::new(
+        let registration = std::sync::OnceLock::new();
+        if let Some(expected) = launch.expected_process.clone() {
+            let _ = registration.set(Registration::new(
                 endpoint.address().clone(),
                 launch.profile_id.clone(),
                 launch.application_instance_id,
                 expected,
                 runtime_directory.join(CREDENTIAL_FILE),
-            )
-        });
+            ));
+        }
         Ok(Self {
             teardown: TEARDOWN_DEADLINE,
             broker,
@@ -694,7 +696,7 @@ impl NativeGateway {
             #[cfg(feature = "testing")]
             last_started: None,
             #[cfg(feature = "testing")]
-            cleanup_pause: None,
+            cleanup_pause: std::sync::Mutex::new(None),
         })
     }
 
@@ -712,7 +714,10 @@ impl NativeGateway {
     ) {
         let (arrived, watch) = std::sync::mpsc::sync_channel(1);
         let (release, go) = std::sync::mpsc::sync_channel(1);
-        self.cleanup_pause = Some((arrived, go));
+        *self
+            .cleanup_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
         (watch, release)
     }
 
@@ -794,7 +799,8 @@ impl NativeGateway {
         // One launch for one instance. A second one would replace the registration a running
         // process was told about, and a second one that failed would give back the instance the
         // first is still running as. Only a launch that never took the instance may take it now.
-        if self.registration.is_some() || self.broker.binding_state(application_instance_id).is_ok()
+        if self.registration.get().is_some()
+            || self.broker.binding_state(application_instance_id).is_ok()
         {
             return Err(BrokerError::invalid(format!(
                 "{application_instance_id} is already live on this gateway, and a second launch \
@@ -874,7 +880,7 @@ impl NativeGateway {
             Ok(registration) => {
                 let profile = registered.commit();
                 self.launch.expected_process = Some(started.clone());
-                self.registration = Some(registration);
+                let _ = self.registration.set(registration);
                 Ok(Launched {
                     child,
                     process: started,
@@ -906,7 +912,12 @@ impl NativeGateway {
         error: BrokerError,
     ) -> BrokerError {
         #[cfg(feature = "testing")]
-        if let Some((arrived, go)) = self.cleanup_pause.take() {
+        if let Some((arrived, go)) = self
+            .cleanup_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
             let _ = arrived.send(());
             let _ = go.recv();
         }
@@ -956,6 +967,12 @@ impl NativeGateway {
         Ok(registration)
     }
 
+    /// Returns the launch this endpoint was bound for.
+    #[must_use]
+    pub const fn native_launch(&self) -> &NativeLaunch {
+        &self.launch
+    }
+
     /// Returns the address a launched process is told to connect to.
     #[must_use]
     pub const fn address(&self) -> &ListenerAddress {
@@ -965,7 +982,7 @@ impl NativeGateway {
     /// Returns the registration file a launched process reads.
     #[must_use]
     pub fn registration(&self) -> Option<String> {
-        self.registration.as_ref().map(|registration| {
+        self.registration.get().map(|registration| {
             format!(
                 "{}framing={}\n",
                 registration.to_file(),
@@ -1018,9 +1035,90 @@ impl NativeGateway {
     /// without a word, and [`BrokerError::UpstreamUnavailable`] when the admission cannot be
     /// written.
     pub async fn accept_bridge(&self) -> Result<crate::broker::bridge::AdmittedBridge> {
-        let Accepted { peer, stream } = self.endpoint.accept().await?;
+        match self.open(self.accept_next().await?).await? {
+            Opening::Bridge(pending) => {
+                let registration = self.registration.get().ok_or_else(|| {
+                    BrokerError::denied(
+                        "this endpoint has not launched anything to authenticate against",
+                    )
+                })?;
+                self.admit_bridge(pending, registration).await
+            }
+            Opening::Launch(_) => Err(BrokerError::denied(
+                "this connection presents a launch, and this endpoint admits bridges here",
+            )),
+        }
+    }
+
+    /// Accepts the next connection, naming its peer as the kernel does, and reads nothing yet.
+    ///
+    /// An accept loop takes each connection here and reads its first frame in a task of the
+    /// connection's own, so one that connects and says nothing holds only its own task.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`BoundEndpoint`]'s accept refuses.
+    pub async fn accept_next(&self) -> Result<Accepted> {
+        self.endpoint.accept().await
+    }
+
+    /// Reads one accepted connection's first frame, under [`HELLO_DEADLINE`], and says what it is.
+    ///
+    /// Nothing past that frame is read. A bridge's hello goes on to [`NativeGateway::admit_bridge`];
+    /// an invocation presenting itself goes to the command backend that owns this endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::PermissionDenied`] for a connection that says nothing in time, closes
+    /// first, or opens with anything else.
+    pub async fn open(&self, accepted: Accepted) -> Result<Opening> {
+        let Accepted { peer, stream } = accepted;
         let (mut reader, writer) = split_stream(stream);
-        let (hello, credential, held) = self.hello(&mut reader).await?;
+        let (frame, held) = self.first_frame(&mut reader).await?;
+        match frame {
+            FirstFrame::Hello(hello, credential) => Ok(Opening::Bridge(PendingBridge {
+                peer,
+                reader,
+                writer,
+                hello,
+                credential,
+                held,
+            })),
+            FirstFrame::Launch(launch, credential) => Ok(Opening::Launch(PresentedLaunch {
+                peer,
+                credential,
+                launch,
+                stream: crate::broker::bridge::BridgeStream::new(
+                    reader,
+                    writer,
+                    held,
+                    self.launch.framing,
+                ),
+            })),
+        }
+    }
+
+    /// Authenticates and admits one bridge whose hello [`NativeGateway::open`] has read, against
+    /// the registration of the launch it claims to belong to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::PermissionDenied`] when any check fails, which closes the connection
+    /// without a word, and [`BrokerError::UpstreamUnavailable`] when the admission cannot be
+    /// written.
+    pub async fn admit_bridge(
+        &self,
+        pending: PendingBridge,
+        registration: &Registration,
+    ) -> Result<crate::broker::bridge::AdmittedBridge> {
+        let PendingBridge {
+            peer,
+            reader,
+            writer,
+            hello,
+            credential,
+            held,
+        } = pending;
         let credential = kr_crypto::secret::SecretVec::new(credential);
         reject_browser_origin(
             hello
@@ -1033,9 +1131,6 @@ impl NativeGateway {
         })?;
         let installed = self.bridge.as_ref().ok_or_else(|| {
             BrokerError::denied("no native bridge is installed for the application this launch is")
-        })?;
-        let registration = self.registration.as_ref().ok_or_else(|| {
-            BrokerError::denied("this endpoint has not launched anything to authenticate against")
         })?;
         let presented = BridgeHello {
             credential,
@@ -1135,7 +1230,12 @@ impl NativeGateway {
     {
         let Accepted { peer, stream } = accepted;
         let (mut upstream_reader, upstream_writer) = split_stream(stream);
-        let (hello, credential, held) = self.hello(&mut upstream_reader).await?;
+        let (frame, held) = self.first_frame(&mut upstream_reader).await?;
+        let FirstFrame::Hello(hello, credential) = frame else {
+            return Err(BrokerError::denied(
+                "this connection presents a launch, and this endpoint serves a launched backend",
+            ));
+        };
         // Anything a browser would have added disqualifies the connection before its credential is
         // even compared: section 12 serves no browser on this listener.
         reject_browser_origin(
@@ -1153,7 +1253,7 @@ impl NativeGateway {
             process: read,
             environment_session_id: hello.session.clone(),
         };
-        let registration = self.registration.as_ref().ok_or_else(|| {
+        let registration = self.registration.get().ok_or_else(|| {
             BrokerError::denied("this endpoint has not launched anything to authenticate against")
         })?;
         // The owner, the kernel's naming of the process and the process the launch started. The
@@ -1310,8 +1410,8 @@ impl NativeGateway {
         })
     }
 
-    /// Reads the one frame a bridge writes before it is authenticated.
-    async fn hello<R>(&self, reader: &mut R) -> Result<(Hello, Vec<u8>, Vec<u8>)>
+    /// Reads the one frame a connection writes before it is authenticated.
+    async fn first_frame<R>(&self, reader: &mut R) -> Result<(FirstFrame, Vec<u8>)>
     where
         R: tokio::io::AsyncRead + Unpin + Send,
     {
@@ -1319,7 +1419,7 @@ impl NativeGateway {
 
         let mut buffer = Vec::new();
         let mut chunk = [0_u8; 1024];
-        // One deadline for the whole hello. A deadline per read would let a peer that dribbles a
+        // One deadline for the whole frame. A deadline per read would let a peer that dribbles a
         // byte at a time hold the endpoint for as long as it liked.
         let deadline = tokio::time::Instant::now() + HELLO_DEADLINE;
         let body = loop {
@@ -1345,13 +1445,107 @@ impl NativeGateway {
             }
             buffer.extend_from_slice(&chunk[..read]);
         };
-        let frame: HelloFrame = serde_json::from_slice(&body).map_err(|error| {
+        let frame: FirstFrameWire = serde_json::from_slice(&body).map_err(|error| {
             BrokerError::denied(format!(
-                "this connection's first frame is not a bridge saying who it is: {error}"
+                "this connection's first frame is neither a bridge nor a launch saying who it is: \
+                 {error}"
             ))
         })?;
-        let credential = decode_credential(&frame.kr_hello.credential)?;
-        Ok((frame.kr_hello, credential, buffer))
+        let frame = match frame {
+            FirstFrameWire::Hello { kr_hello } => {
+                let credential = decode_credential(&kr_hello.credential)?;
+                FirstFrame::Hello(kr_hello, credential)
+            }
+            FirstFrameWire::Launch { kr_launch } => {
+                let credential = decode_credential(&kr_launch.credential)?;
+                FirstFrame::Launch(kr_launch, credential)
+            }
+        };
+        Ok((frame, buffer))
+    }
+}
+
+/// One connection's first frame on the wire: a bridge's hello or a launch presenting itself.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum FirstFrameWire {
+    Hello { kr_hello: Hello },
+    Launch { kr_launch: LaunchHello },
+}
+
+/// One connection's first frame, read, with its credential decoded.
+enum FirstFrame {
+    Hello(Hello, Vec<u8>),
+    Launch(LaunchHello, Vec<u8>),
+}
+
+/// What an invocation presents to the backend before it becomes the program it runs.
+///
+/// Nothing in it is authority. The command backend compares the process with what the kernel
+/// names, the credential with the one it generated, and the executable and arguments with the
+/// invocation it was established for.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchHello {
+    /// The credential the launcher read from the backend's owner-only file, as hexadecimal.
+    credential: String,
+    /// The process the launcher is, which the program it runs will be.
+    pub pid: u64,
+    /// That process's start value.
+    pub start: u64,
+    /// The executable the launcher will run.
+    pub executable: String,
+    /// The argument vector it will run it with, command name first.
+    pub arguments: Vec<String>,
+}
+
+/// One connection whose first frame said it is what it opened as.
+pub enum Opening {
+    /// A native bridge's hello, not yet authenticated.
+    Bridge(PendingBridge),
+    /// An invocation presenting itself to the backend, not yet authenticated.
+    Launch(PresentedLaunch),
+}
+
+/// A bridge that has said who it is and is waiting to be admitted.
+pub struct PendingBridge {
+    peer: PeerIdentity,
+    reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+    hello: Hello,
+    credential: Vec<u8>,
+    held: Vec<u8>,
+}
+
+impl std::fmt::Debug for PendingBridge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingBridge")
+            .field("peer", &self.peer)
+            .finish_non_exhaustive()
+    }
+}
+
+/// An invocation that has presented itself and is waiting for the backend's answer.
+pub struct PresentedLaunch {
+    /// Who the kernel says is on the other end.
+    pub peer: PeerIdentity,
+    /// The credential it presented, decoded.
+    pub credential: Vec<u8>,
+    /// What it presented.
+    pub launch: LaunchHello,
+    /// The connection, for the answer and what follows it.
+    pub stream: crate::broker::bridge::BridgeStream,
+}
+
+impl std::fmt::Debug for PresentedLaunch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PresentedLaunch")
+            .field("peer", &self.peer)
+            .field("pid", &self.launch.pid)
+            .field("executable", &self.launch.executable)
+            .finish_non_exhaustive()
     }
 }
 

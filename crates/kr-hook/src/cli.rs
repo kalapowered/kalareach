@@ -1,9 +1,11 @@
 //! What `kr-hook` accepts on its command line, and the exit codes it answers with.
 //!
-//! The command line is fixed by the files that register the forwarder. A plugin package installs
-//! them into an application's own configuration, and they name exactly one invocation each:
-//! `kr-hook claude-code channel` for the Channels server and `kr-hook claude-code hook` for every
-//! lifecycle and tool hook. Nothing else is accepted. An unknown application, an unknown surface, an
+//! The command line is fixed by the files that register the forwarder and by the shell that runs an
+//! integrated invocation. A plugin package installs the files into an application's own
+//! configuration, and they name exactly one invocation each: `kr-hook claude-code channel` for the
+//! Channels server and `kr-hook claude-code hook` for every lifecycle and tool hook. The shell runs
+//! `kr-hook launch -- <executable> <arguments...>` for an invocation the worker gave a backend.
+//! Nothing else is accepted. An unknown application, an unknown surface, an
 //! extra argument or a flag this forwarder does not declare is refused with a usage error on
 //! standard error, before anything is read or connected.
 //!
@@ -41,7 +43,7 @@ pub struct Cli {
 }
 
 /// The invocations this forwarder accepts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Subcommand)]
+#[derive(Clone, Debug, PartialEq, Eq, Subcommand)]
 pub enum Command {
     /// Claude Code's native bridge: its Channels server and its lifecycle and tool hooks.
     #[command(name = "claude-code")]
@@ -49,6 +51,19 @@ pub enum Command {
         /// Which of the bridge's two registrations started this process.
         #[command(subcommand)]
         surface: ClaudeCode,
+    },
+    /// Runs an integrated invocation's program, after presenting it to the backend the worker gave
+    /// it: the executable, then its argument vector, command name first, after `--`.
+    Launch {
+        /// Holds after the admission for this many milliseconds before the program runs.
+        ///
+        /// It exists for the host's own tests, which change the executable in that interval, and
+        /// it is named by nothing a shell runs.
+        #[arg(long, hide = true, value_name = "MILLISECONDS")]
+        hold_after_admission: Option<u64>,
+        /// The executable and its argument vector.
+        #[arg(last = true, required = true, num_args = 2.., value_name = "INVOCATION")]
+        invocation: Vec<std::ffi::OsString>,
     },
     /// Carries bytes between this process's standard streams and the endpoint of the launch that
     /// started it, after saying who it is.
@@ -107,6 +122,41 @@ mod tests {
                 close_after_hello: false
             }
         );
+        assert_eq!(
+            parse(&[
+                "launch",
+                "--",
+                "/usr/local/bin/claude",
+                "claude",
+                "--resume"
+            ])
+            .expect("the launcher"),
+            Command::Launch {
+                hold_after_admission: None,
+                invocation: ["/usr/local/bin/claude", "claude", "--resume"]
+                    .into_iter()
+                    .map(std::ffi::OsString::from)
+                    .collect(),
+            }
+        );
+        assert_eq!(
+            parse(&[
+                "launch",
+                "--",
+                "/usr/local/bin/claude",
+                "claude",
+                "--",
+                "--help"
+            ])
+            .expect("a separator in the invocation is the invocation's"),
+            Command::Launch {
+                hold_after_admission: None,
+                invocation: ["/usr/local/bin/claude", "claude", "--", "--help"]
+                    .into_iter()
+                    .map(std::ffi::OsString::from)
+                    .collect(),
+            }
+        );
     }
 
     #[test]
@@ -124,6 +174,10 @@ mod tests {
             &["codex", "hook"][..],
             &["relay", "extra"][..],
             &["--session=abc", "claude-code", "hook"][..],
+            &["launch"][..],
+            &["launch", "/usr/bin/true"][..],
+            &["launch", "--", "/usr/bin/true"][..],
+            &["launch", "--hold", "--", "/usr/bin/true", "true"][..],
         ] {
             let refused = parse(arguments).expect_err("refused");
             assert!(

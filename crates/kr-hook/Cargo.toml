@@ -37,7 +37,9 @@ kr-ipc = { workspace = true, features = ["testing"] }
 # The forwarder is proved against the worker's own listener: the endpoint it binds, the
 # registration it writes, the hello it reads and the authentication it performs. A second listener
 # written for the tests would prove only that the two agree with each other.
-kr-worker.workspace = true
+# The launcher is proved against the worker's own command backends, with the connector package
+# fixture and the test-only pauses the feature compiles in.
+kr-worker = { workspace = true, features = ["testing"] }
 # The bridge files the plugin package installs are pinned here by their SHA-256 digests.
 sha2.workspace = true
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }

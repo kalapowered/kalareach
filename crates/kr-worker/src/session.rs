@@ -226,6 +226,8 @@ pub struct Session {
     /// forwards like any application's, Ctrl-D is the shell's own and nothing is ever installed in
     /// an editor.
     fence: Option<crate::fence::FenceDriver>,
+    /// The backends an integrated invocation is given before it runs, where the worker set them up.
+    command_backends: Option<Arc<crate::broker::commands::CommandBackends>>,
     /// What the registered root integration is, recorded whole for diagnostics.
     root_integration: Option<kr_shell_integration::host::handshake::Registration>,
     /// The last takeover receipt the machine completed.
@@ -525,6 +527,7 @@ impl Session {
             desktop: watch,
             engine,
             fence: None,
+            command_backends: None,
             root_integration: None,
             takeover_receipt: None,
             launches: BTreeMap::new(),
@@ -758,6 +761,13 @@ impl Session {
             }
             crate::fence::CommandHook::Block(block) => {
                 let prompt_generation = block.prompt_generation;
+                // A block that reports its status is its line's own ending, so a backend no launch
+                // took for that line is not waited for any longer.
+                if block.finished()
+                    && let Some(backends) = self.command_backends.as_ref()
+                {
+                    backends.line_ended(prompt_generation);
+                }
                 self.record_command_block(*block);
                 EventOutcome::CommandBlockRecorded(kr_protocol::root::RootCommandBlockResult {
                     prompt_generation,
@@ -809,7 +819,7 @@ impl Session {
         if !resolution.establishes_backend() {
             return resolution.to_answer(None);
         }
-        match self.establish_command_backend(params.prompt_generation) {
+        match self.establish_command_backend(params, &resolution) {
             Some(backend) => resolution.to_answer(Some(backend)),
             None => Resolution::Bypassed {
                 command: params.argv.first().cloned().unwrap_or_default(),
@@ -820,23 +830,56 @@ impl Session {
         }
     }
 
-    /// Returns the worker-owned backend an integrated invocation would run behind.
+    /// Returns the worker-owned backend an integrated invocation runs behind, established now.
     ///
-    /// Section 12 requires the backend and its gateway to exist before the native program does.
-    /// This host establishes none: the gateway an integrated agent speaks to is supplied by the
-    /// agent's own plugin, not by the worker, so there is nothing here to bind an invocation to
-    /// and nothing to hand it. An invocation that would need one is therefore answered as a
-    /// bypass and runs exactly as it was typed, which is better for the person than an agent
-    /// started with integration flags and nothing behind them.
-    #[expect(
-        clippy::unused_self,
-        reason = "it is the session that would own a backend"
-    )]
-    const fn establish_command_backend(
+    /// Section 12 requires the backend to exist before the native program does, so it is
+    /// established here, before the answer the shell runs the program from. Where none can be (no
+    /// backends were set up, no installed connector integrates the command, the platform cannot
+    /// publish a credential file), the invocation is answered as a bypass and runs exactly as it
+    /// was typed, which is better for the person than an agent started with integration flags and
+    /// nothing behind them.
+    fn establish_command_backend(
         &self,
-        _prompt_generation: kr_protocol::root::PromptGeneration,
+        params: &kr_protocol::root::RootCommandResolveParams,
+        resolution: &kr_shell_integration::host::command::Resolution,
     ) -> Option<kr_protocol::root::CommandBackend> {
-        None
+        let backends = self.command_backends.as_ref()?;
+        let kr_shell_integration::host::command::Resolution::Integrated {
+            command,
+            arguments,
+            added,
+        } = resolution
+        else {
+            return None;
+        };
+        let integration = self
+            .config
+            .launch_profile
+            .command_integrations
+            .iter()
+            .find(|integration| &integration.command == command)?;
+        let root_shell = self.root_identity()?;
+        backends
+            .establish(&crate::broker::commands::EstablishRequest {
+                prompt_generation: params.prompt_generation,
+                typed: &params.argv,
+                arguments,
+                added,
+                integration,
+                executable: &params.executable,
+                cwd: &params.cwd,
+                cwd_revision: params.cwd_revision,
+                root_shell,
+            })
+            .ok()
+    }
+
+    /// Sets up the backends an integrated invocation is given before it runs.
+    pub fn set_command_backends(
+        &mut self,
+        backends: Arc<crate::broker::commands::CommandBackends>,
+    ) {
+        self.command_backends = Some(backends);
     }
 
     /// Records one command block, keeping the most recent [`Self::RETAINED_COMMAND_BLOCKS`].
@@ -3606,6 +3649,10 @@ impl Session {
                 // process group about to be stopped, and section 7 gives it its acceptance first.
                 self.state = SessionState::Closing;
                 self.closing_reason = Some(reason);
+                // Nothing new is started inside a closing session, so no backend waits for one.
+                if let Some(backends) = self.command_backends.as_ref() {
+                    backends.close();
+                }
                 // Input is rejected from here, and that has to reach bytes already handed to the
                 // writer as well as the ones not yet accepted. Releasing the lease moves the fence,
                 // so a keystroke queued a moment before the close is dropped rather than typed into

@@ -17,11 +17,13 @@
 //! | [`registration`] | Finding and reading the launch's registration, and the hello |
 //! | [`exchange`] | The private exchange with the worker: admission and bounded JSON lines |
 //! | [`claude_code`] | Claude Code's bridge: its Channels server and its hooks |
+//! | [`launch`] | The launcher an integrated invocation presents itself to its backend through |
 //! | [`relay`] | The byte relay a launched agent reaches its worker through |
 
 pub mod claude_code;
 pub mod cli;
 pub mod exchange;
+pub mod launch;
 pub mod registration;
 pub mod relay;
 
@@ -35,6 +37,13 @@ pub fn run(command: cli::Command) -> std::process::ExitCode {
         cli::Command::ClaudeCode {
             surface: cli::ClaudeCode::Channel,
         } => claude_code::channel::run(),
+        cli::Command::Launch {
+            hold_after_admission,
+            invocation,
+        } => launch::run(
+            &invocation,
+            hold_after_admission.map(std::time::Duration::from_millis),
+        ),
         cli::Command::Relay { close_after_hello } => match relay::run(close_after_hello) {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(failure) => {

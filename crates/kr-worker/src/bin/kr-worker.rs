@@ -279,6 +279,18 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             journal_path: Some(environment.journal_database(specification.session_id)),
         },
     )?);
+    // The backends an integrated invocation is given before it runs. The connectors they are
+    // established from arrive with the installation's hand-over; until one does, every resolve is
+    // answered as a bypass, and the invocation runs as typed.
+    let _command_backends =
+        service.install_command_backends(kr_worker::broker::commands::CommandBackendsConfig {
+            session_id,
+            environment_id,
+            os_user: kr_worker::desktop::os_user(),
+            root: command_backends_root(&environment, session_id),
+            sources: Arc::new(kr_worker::broker::connectors::ConnectorSources::new()),
+            launcher: installed_launcher(),
+        });
     let serving = tokio::spawn(Arc::clone(&service).serve(listener));
 
     // Section 7 paragraph 4: a managed create succeeds only after full post-profile qualification.
@@ -446,6 +458,38 @@ fn managed_package(specification: &WorkerLaunchSpec) -> Result<Option<ShellPacka
                     .to_owned(),
             })?;
     ShellPackage::read(std::path::Path::new(directory)).map(Some)
+}
+
+/// Returns the owner-only directory this session's command backends are made in.
+///
+/// It is inside the environment's runtime directory, which is owner-only and on the internal disk,
+/// and its name is short: a backend's socket lives two levels below it, and a socket path has a
+/// small fixed bound.
+fn command_backends_root(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    session_id: SessionId,
+) -> std::path::PathBuf {
+    let name: String = session_id
+        .to_string()
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .take(8)
+        .collect();
+    environment.runtime_dir().join(format!("c{name}"))
+}
+
+/// Returns this installation's launcher, the `kr-hook` beside this executable in every packaged
+/// layout, where it is there.
+fn installed_launcher() -> Option<std::path::PathBuf> {
+    let beside = std::env::current_exe()
+        .ok()?
+        .parent()?
+        .join(if cfg!(windows) {
+            "kr-hook.exe"
+        } else {
+            "kr-hook"
+        });
+    beside.is_file().then_some(beside)
 }
 
 /// Binds this session's root-integration endpoint inside its own owner-only directory.
