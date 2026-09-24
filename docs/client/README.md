@@ -67,6 +67,17 @@ precedes a subscription, and everything a real host spends answering.
 `OUTCOME_UNKNOWN` never yields a retry, whatever class asks for one. Section 9 forbids dispatching
 the identifier again, and inventing a new one would submit the same intent twice.
 
+A connection that a relay stood in the way of is not reported as a host that did not answer.
+`NetworkTransport::connect` returns `ClientError::Transport` holding
+`TransportError::RelayRefused` when a relay on the route turned this device away and nothing else
+reached the host: it names the relay, carries what the relay said, and lists the kinds of path that
+may still work. Its code comes from the kind token the relay's reason starts with: a spent
+allowance is `QUOTA_EXCEEDED`, a relay that is stopping is `SERVICE_CAPACITY`, and a reason with no
+known token is `RESOURCE_UNAVAILABLE`, like any other connection that could not be made. A device
+whose only path is the relay learns this as soon as the relay refuses it; one that can take a direct
+path learns it when its attempt ends without one. The transport reference has the token grammar and
+the alternatives.
+
 Two refusers know more than a code can carry. A managed service answers `PERMISSION_DENIED` both for
 a caller that is not signed in and for an account that may not do this, so it classifies its own
 refusal and `ClientError::Refused` carries the action. This device's draft store has its own answers
@@ -975,6 +986,7 @@ not one of them, so an account password reset returns an account and nothing els
 | KR-REQ-11.46 | The controls a client offers, and what each one does to a session |
 | KR-PERF-006 | The client's own share of a reconnect: it holds no work of its own between a host's answer and a screen a terminal can draw. What the attach and the host spend is theirs |
 | KR-REQ-17.14 | A session, a draft and a control need no managed service, and none of them changes when one is configured |
+| KR-REQ-17.40 | The report of an exhausted relay: a new connection that a relay on its route turned this device away from fails as that refusal, with the relay's kind of refusal, its words and what may still work, while established and direct connections carry on (`an_exhausted_relay_is_the_reported_reason_a_new_connection_fails` in `crates/kr-controller/tests/network.rs`; each kind, the route and the direct paths in `crates/kr-transport/tests/relay_refusal.rs`) |
 | KR-REQ-23.57 | The retry rules: which classes of request may be retried automatically, and what a person is offered for the rest |
 | KR-REQ-24.13 | A draft outlives its attachment, its connection and another device's write, and is never replaced by remote content. A draft settled after its answer was lost is still never submitted |
 | KR-REQ-20.13 | Per-object revisions and compare-and-swap writes, a lost comparison kept beside rather than resolved by a clock, the person's choice leaving no copy on the device or the service, the settlement of a write whose answer was lost through the request's own identity, for a draft as for a setting, the closed kind set that no restore can reach host authority through, and drafts that stay drafts. The legs in `tests/integration/sync/tests/sync.rs` hold a live deployment to the same rules through `services::sync`, with two client stores under one installation |

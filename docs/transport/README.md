@@ -91,6 +91,55 @@ The same selection travels in a pairing invitation and a host bundle as
 Local discovery and the Mainline DHT are deliberately absent from that object: they are each
 device's own choice, not something one device selects on another's behalf.
 
+## When a relay turns an endpoint away
+
+`endpoint::connect` dials a peer, and `NetworkTransport::connect` uses it. A connection that no
+path could open fails as `TransportError::Connect`, except in one case: a relay on the connection's
+route turned this endpoint away. Then it fails as `TransportError::RelayRefused`, which names the
+relay, the kind of refusal, what the relay said and what may still work. A managed relay turns an
+endpoint away when its relay allowance is spent, and section 17 requires that to be reported as
+what it is rather than as a host that did not answer.
+
+A KalaReach relay starts the reason it gives for a refusal with a kind token, then a colon and one
+space, then words for a person:
+
+```
+reason = token ": " text
+token  = "allowance_spent" / "stopping"
+```
+
+| Token | What the relay means | Code |
+| --- | --- | --- |
+| `allowance_spent` | The allowance this endpoint's traffic is paid from is spent or in its bounded grace, so the relay opens no new session for it | `QUOTA_EXCEEDED` |
+| `stopping` | The relay is stopping and admits nothing new; another relay, or this one once it is back, can | `SERVICE_CAPACITY` |
+| anything else | A reason with no token this build knows: an older relay, another operator's relay, or a kind added later | `RESOURCE_UNAVAILABLE`, as for any other connection that failed |
+
+The token is the contract and the words are not. A reason that does not start with a known token
+and its separator is kept whole and shown as it is, with no kind of its own.
+
+A refusal counts only when the relay that gave it is on the route: a relay the dialled address
+names, or one the endpoint already holds for the peer, both of which iroh tries. iroh keeps a
+relay's reason only for the endpoint's own home relay, so the status of that relay is followed for
+the whole attempt, and a refusal by a home relay that is not on the route says nothing about the
+connection. A route relay that is not the endpoint's home relay leaves no reason to read, and a
+failure through it is reported as `TransportError::Connect`.
+
+An endpoint with no IP transport, one built with `relay_only`, has nothing but relays to try, so
+once every relay on its route has refused it the attempt ends at once rather than at its 30-second
+deadline. An endpoint that can take a direct path lets the attempt run, because an address hint or
+local discovery can still open one; if none does, it fails as the refusal. Connections already
+established on a direct path are not affected by a relay's refusal at all.
+
+What may still work is named by kind, because which of them a person can use depends on
+configuration the failure does not carry:
+
+| Alternative | Offered when |
+| --- | --- |
+| The peer's current direct addresses, from pairing or an authenticated update | the endpoint has a direct transport |
+| Local network discovery the person selects | the endpoint has a direct transport |
+| Another configured relay | always |
+| A restored relay allowance | the relay said `allowance_spent` |
+
 ## The connection handshake
 
 The first bidirectional stream carries four frames, in this order:
