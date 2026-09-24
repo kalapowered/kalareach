@@ -532,6 +532,15 @@ A worker's lifetime belongs to the platform, not to the control daemon.
 `kickstart -p`, never `-k`: the second restarts a job that is already running, which for a session
 worker means killing a live shell to start another one.
 
+launchd keeps a job loaded after its process has exited until something removes it, so the daemon
+removes a worker's job once the worker has ended. After a session's closure is recorded, or a launch
+fails, it waits for the kernel to say the worker's process has gone and then removes the job. When
+it starts, before it serves anything, it looks at every job the environment still has a definition
+for and removes each one whose process has ended: a worker that ended while no daemon was running
+leaves nothing loaded either. A job whose process is still running is never removed, because
+removing it would end that worker. The job's definition under `jobs/` goes with it, and its
+`.diagnostics` file stays.
+
 The service manager reports a process identifier as soon as it has spawned the process, which can
 be before the kernel will describe it. The daemon retries briefly rather than refusing a worker
 that started perfectly well.

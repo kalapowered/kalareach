@@ -58,7 +58,7 @@ use crate::directory::{Directory, KnownWorker, Reconnect};
 use crate::error::{ControllerError, Result};
 use crate::registry::{LaunchPhase, Registry, WorkerRecord};
 use crate::singleton::SingletonLock;
-use crate::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
+use crate::supervision::{JobRetirement, LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 
 /// The daemon on the network.
 ///
@@ -862,6 +862,8 @@ impl Controller {
         // Recovery has settled every reservation it can, so what is left under the workers
         // directory that no session claims is nothing's.
         controller.sweep_worker_dirs().await?;
+        // Before this daemon serves anything, so no job a create of its own defines is looked at.
+        controller.retire_ended_jobs().await;
         // A fence this environment recorded and never saw answered is announced again, to the
         // workers this daemon has just reconnected to. The debt is durable, so a daemon that
         // stopped between raising a fence and hearing every answer comes back still owing it; the
@@ -6931,6 +6933,9 @@ impl Controller {
                 registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
                 drop(registry);
                 self.discard_worker_dir(reservation.session_id);
+                // A definition may have been written, and even loaded, before the platform
+                // refused; it goes with the launch.
+                self.retire_job_when_ended(reservation.reservation_id, None);
                 return Err(ControllerError::Supervision { detail });
             }
             // A process may be running. The create fails for the caller, and the reservation stays
@@ -6940,12 +6945,13 @@ impl Controller {
                     .lock()
                     .await
                     .remove(&reservation.reservation_id);
-                if let Some(pid) = pid
-                    && let Ok(identity) = kr_ipc::identity::process_start_identity(pid)
-                {
+                let launched =
+                    pid.and_then(|pid| kr_ipc::identity::process_start_identity(pid).ok());
+                if let Some(identity) = &launched {
                     let mut registry = self.registry.lock().await;
-                    registry.record_launch(reservation.reservation_id, &identity)?;
+                    registry.record_launch(reservation.reservation_id, identity)?;
                 }
+                self.retire_job_when_ended(reservation.reservation_id, launched);
                 return Err(ControllerError::Supervision { detail });
             }
         };
@@ -6956,7 +6962,10 @@ impl Controller {
 
         let ready = match tokio::time::timeout(RENDEZVOUS_TIMEOUT, receiver).await {
             Ok(Ok(Ok(ready))) => ready,
+            // A worker that failed its rendezvous, or never reported, has no session to close, so
+            // no closure removes its job. It goes once the worker has ended.
             Ok(Ok(Err(error))) => {
+                self.retire_job_when_ended(reservation.reservation_id, Some(identity));
                 return Err(ControllerError::Supervision {
                     detail: error.to_string(),
                 });
@@ -6966,6 +6975,7 @@ impl Controller {
                     .lock()
                     .await
                     .remove(&reservation.reservation_id);
+                self.retire_job_when_ended(reservation.reservation_id, Some(identity));
                 return Err(ControllerError::supervision(
                     "the worker did not report itself in time",
                 ));
@@ -7165,6 +7175,33 @@ impl Controller {
             }
         }
         Ok(())
+    }
+
+    /// Removes the job of every worker this environment defined one for that has ended.
+    ///
+    /// A daemon that was not running when a worker ended, or that stopped before that worker's job
+    /// was removed, leaves the job loaded, and nothing else would ever remove it. So every job this
+    /// environment still has defined is looked at when the daemon starts: one whose process has
+    /// ended goes, and one whose process is still running is a live session's and is left exactly
+    /// as it is. It is finished before the daemon serves anything, which is what keeps a job that
+    /// a create of this daemon has defined and not yet started off the list. launchd is asked
+    /// about each job in a few milliseconds, and after this runs once the only jobs left defined
+    /// are those of workers that are still running.
+    async fn retire_ended_jobs(&self) {
+        let jobs = self.paths.jobs_dir();
+        let _ = tokio::task::spawn_blocking(move || {
+            for reservation_id in crate::supervision::defined_worker_jobs(&jobs) {
+                if let JobRetirement::Unsettled(detail) =
+                    crate::supervision::retire_worker_job(&jobs, reservation_id)
+                {
+                    eprintln!(
+                        "kr-controller: the job of the worker started for reservation \
+                         {reservation_id} could not be removed: {detail}"
+                    );
+                }
+            }
+        })
+        .await;
     }
 
     async fn replay_create(
@@ -7920,7 +7957,17 @@ impl Controller {
     async fn write_closure(&self, record: &ClosureRecord) -> Result<()> {
         let mut registry = self.registry.lock().await;
         registry.record_closure(record)?;
+        // The reservation outlives the closure, and it names the job the worker was started as and
+        // the process that job ran. A read that fails here costs that job nothing but time: the next
+        // start of this daemon looks at every job it has defined.
+        let reservation = registry
+            .reservation_for_session(record.session_id)
+            .ok()
+            .flatten();
         drop(registry);
+        if let Some(reservation) = reservation {
+            self.retire_job_when_ended(reservation.reservation_id, reservation.launcher_identity);
+        }
         // This daemon's own view of the session goes as soon as the closure is recorded, before
         // the published descriptor is removed and whether or not that succeeds. The closure is
         // the fact; a worker kept in the directory after it would be a session this daemon still
@@ -7960,6 +8007,52 @@ impl Controller {
         let _ = std::fs::remove_dir_all(self.paths.worker_dir(record.session_id));
         kr_ipc::descriptor::retire(&self.paths, record.session_id)?;
         Ok(())
+    }
+
+    /// Removes the job a worker was started as, once that worker has ended.
+    ///
+    /// The job goes when the kernel says the worker's process has ended, not when the session's
+    /// closure is recorded: a worker hands its closure over before it exits, and removing a job
+    /// whose process is still running would end that process part way through its own closure. A
+    /// launch that never recorded a process is looked at straight away, because the removal itself
+    /// leaves a job with a running process alone. A worker still running after
+    /// [`CLOSURE_WATCH_TIMEOUT`] keeps its job until the next start of this daemon looks again.
+    ///
+    /// Nothing is waited for where this environment defined no job for the worker, which is every
+    /// worker a platform other than macOS starts.
+    fn retire_job_when_ended(
+        &self,
+        reservation_id: ReservationId,
+        launched: Option<kr_protocol::identity::ProcessStartIdentity>,
+    ) {
+        let jobs = self.paths.jobs_dir();
+        if !crate::supervision::defines_worker_job(&jobs, reservation_id) {
+            return;
+        }
+        tokio::spawn(async move {
+            if let Some(identity) = launched {
+                let deadline = tokio::time::Instant::now() + CLOSURE_WATCH_TIMEOUT;
+                while !matches!(
+                    kr_ipc::identity::process_state(&identity),
+                    kr_ipc::identity::ProcessState::Ended
+                ) {
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+            let retired = tokio::task::spawn_blocking(move || {
+                crate::supervision::retire_worker_job(&jobs, reservation_id)
+            })
+            .await;
+            if let Ok(JobRetirement::Unsettled(detail)) = retired {
+                eprintln!(
+                    "kr-controller: the job of the worker started for reservation {reservation_id} \
+                     could not be removed: {detail}"
+                );
+            }
+        });
     }
 
     async fn read_from_worker(&self, worker: &KnownWorker) -> Result<SessionReadResult> {

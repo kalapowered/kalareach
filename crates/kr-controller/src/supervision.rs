@@ -14,6 +14,14 @@
 //! `kickstart -p` and not `-k`: the second would restart a job that is already running, which for
 //! a session worker would mean killing a live shell to start another one.
 //!
+//! launchd keeps a job loaded after its process has exited, until something removes it. So a
+//! worker's job is removed once the worker has ended, by [`retire_worker_job`]: when a closure is
+//! recorded and the kernel then says the worker's process has gone, and, for every job this
+//! environment still has defined, when the daemon starts. A job whose process is still running is
+//! never removed, because removing it would end that process. The other supervisors leave no job
+//! of this kind behind: a systemd transient service is dropped when its process ends, unless that
+//! process failed, and the fallback supervisor defines no job at all.
+//!
 //! The identity the launcher reports is recorded against the reservation before the worker
 //! connects, and the rendezvous compares it with the connecting peer. That is what stops another
 //! process from claiming a reservation it was not started for.
@@ -121,7 +129,7 @@ impl WorkerLaunch {
     /// Returns the job label a per-session service uses.
     #[must_use]
     pub fn label(&self) -> String {
-        format!("kr-worker-{}", self.reservation_id)
+        worker_label(self.reservation_id)
     }
 
     /// Returns this launch as the job description a supervisor starts.
@@ -162,6 +170,88 @@ pub struct ServiceLaunch {
     /// claim on, and either can be a volume the person at the machine expects to be able to
     /// unmount.
     pub working_directory: PathBuf,
+}
+
+/// Returns the job label the worker started for `reservation_id` runs under.
+#[must_use]
+pub fn worker_label(reservation_id: ReservationId) -> String {
+    format!("kr-worker-{reservation_id}")
+}
+
+/// Where the definition of the job labelled `label` is written.
+fn job_definition(jobs_directory: &Path, label: &str) -> PathBuf {
+    jobs_directory.join(format!("{label}.plist"))
+}
+
+/// What removing an ended worker's job found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JobRetirement {
+    /// Nothing of the job is left: the service manager no longer has it, and its definition has
+    /// gone with it. A job this environment never defined, or never loaded, ends here too.
+    Gone,
+    /// The job's process is still running, so the job was left exactly as it was.
+    StillRunning,
+    /// What the service manager holds could not be established, or the removal did not take. The
+    /// definition is kept, so the next look finds the job again.
+    Unsettled(String),
+}
+
+/// Returns the reservation of every worker job this environment has a definition for.
+///
+/// A definition is written before its job is loaded and removed only once the job has gone, so
+/// this is every worker job this environment may still have loaded. A file whose name is not a
+/// worker job definition, spelt exactly as this host writes one, is not listed: this host does not
+/// remove what it did not write.
+#[must_use]
+pub fn defined_worker_jobs(jobs_directory: &Path) -> Vec<ReservationId> {
+    let Ok(entries) = std::fs::read_dir(jobs_directory) else {
+        return Vec::new();
+    };
+    let mut defined: Vec<ReservationId> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let label = name.to_str()?.strip_suffix(".plist")?;
+            let reservation_id: ReservationId = label.strip_prefix("kr-worker-")?.parse().ok()?;
+            (worker_label(reservation_id) == label).then_some(reservation_id)
+        })
+        .collect();
+    defined.sort();
+    defined
+}
+
+/// Whether this environment has a definition for the job of the worker started for
+/// `reservation_id`.
+#[must_use]
+pub fn defines_worker_job(jobs_directory: &Path, reservation_id: ReservationId) -> bool {
+    std::fs::symlink_metadata(job_definition(
+        jobs_directory,
+        &worker_label(reservation_id),
+    ))
+    .is_ok()
+}
+
+/// Removes what the service manager keeps of a worker's job, once that job's process has ended.
+///
+/// launchd keeps a job loaded after its process exits until something removes it, so without
+/// this every session would leave one behind for as long as the machine runs. A job whose process
+/// is still running is left exactly as it is: removing it would end that process, and a worker is
+/// ended by its own closure, never by taking its job away. Only a job this environment defined is
+/// looked at, and only the job itself and its definition are removed; the diagnostics the job wrote
+/// stay where a person can read them.
+///
+/// Only launchd keeps a job of this kind, so on every other platform there is nothing to remove.
+#[must_use]
+pub fn retire_worker_job(jobs_directory: &Path, reservation_id: ReservationId) -> JobRetirement {
+    #[cfg(target_os = "macos")]
+    {
+        LaunchdSupervisor::retire(jobs_directory, &worker_label(reservation_id))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (jobs_directory, reservation_id);
+        JobRetirement::Gone
+    }
 }
 
 /// What asking the platform to start a worker produced.
@@ -307,7 +397,7 @@ impl LaunchdSupervisor {
     /// wherever it is bootstrapped, which is this user's graphical domain.
     fn write_job(launch: &ServiceLaunch, session_type: Option<&str>) -> Result<PathBuf> {
         let label = launch.label.clone();
-        let path = launch.jobs_directory.join(format!("{label}.plist"));
+        let path = job_definition(&launch.jobs_directory, &label);
         let mut arguments = String::new();
         arguments.push_str(&plist_string(&launch.program.display().to_string()));
         for argument in launch.arguments.clone() {
@@ -445,6 +535,114 @@ impl LaunchdSupervisor {
             };
         };
         settle(pid)
+    }
+
+    /// Removes one job this environment defined, once its process has ended, from whichever of
+    /// this user's two domains has it, and then its definition.
+    ///
+    /// Removing a job whose process has ended ends nothing, and nothing starts that job again
+    /// between the look and the removal: it is neither run at load nor kept alive, and this host
+    /// starts it once, before any of this. A job launchd describes as anything but not running is
+    /// treated as running and left alone, so a description this build does not recognise costs a
+    /// job left loaded rather than a process ended.
+    fn retire(jobs_directory: &Path, label: &str) -> JobRetirement {
+        let definition = job_definition(jobs_directory, label);
+        match std::fs::symlink_metadata(&definition) {
+            Ok(_) => {}
+            // Written before a job is loaded and removed only once it has gone, so a job with no
+            // definition here is not one this environment has loaded.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return JobRetirement::Gone;
+            }
+            Err(error) => {
+                return JobRetirement::Unsettled(format!("{}: {error}", definition.display()));
+            }
+        }
+        let uid = kr_ipc::paths::current_uid();
+        for domain in [format!("gui/{uid}"), format!("user/{uid}")] {
+            let target = format!("{domain}/{label}");
+            match job_state(&target) {
+                JobState::NotLoaded => continue,
+                JobState::Running => return JobRetirement::StillRunning,
+                JobState::Unknown(detail) => return JobRetirement::Unsettled(detail),
+                JobState::Ended => {}
+            }
+            // Whether the removal took is read back from launchd rather than from this command's
+            // own answer: a job something else removed a moment earlier is gone all the same.
+            let _ = run("/bin/launchctl", &["bootout", &target]);
+            match job_state(&target) {
+                JobState::NotLoaded => {}
+                JobState::Unknown(detail) => return JobRetirement::Unsettled(detail),
+                JobState::Running | JobState::Ended => {
+                    return JobRetirement::Unsettled(format!(
+                        "{target} is still loaded after it was removed"
+                    ));
+                }
+            }
+        }
+        match std::fs::remove_file(&definition) {
+            Ok(()) => JobRetirement::Gone,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => JobRetirement::Gone,
+            Err(error) => JobRetirement::Unsettled(format!("{}: {error}", definition.display())),
+        }
+    }
+}
+
+/// What launchd says about one job.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+enum JobState {
+    /// launchd does not have the job in that domain.
+    NotLoaded,
+    /// The job is loaded and its process is running, or launchd describes it some other way.
+    Running,
+    /// The job is loaded and has no process.
+    Ended,
+    /// launchd's answer could not be read.
+    Unknown(String),
+}
+
+/// Asks launchd about one job, `<domain>/<label>`.
+#[cfg(target_os = "macos")]
+fn job_state(target: &str) -> JobState {
+    /// What `launchctl print` exits with for a job the domain does not have.
+    const NOT_LOADED: i32 = 113;
+
+    let output = match std::process::Command::new("/bin/launchctl")
+        .args(["print", target])
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => return JobState::Unknown(format!("/bin/launchctl: {error}")),
+    };
+    match output.status.code() {
+        Some(0) => {}
+        Some(NOT_LOADED) => return JobState::NotLoaded,
+        _ => {
+            return JobState::Unknown(format!(
+                "launchctl print {target} answered {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    job_state_described(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Reads whether a loaded job has a process from launchd's description of it.
+///
+/// The job's own state is at the first level of the description, one tab in. Sections nested
+/// inside it carry states of their own, which say nothing about the job's process.
+#[cfg(target_os = "macos")]
+fn job_state_described(description: &str) -> JobState {
+    let not_running = description
+        .lines()
+        .any(|line| line == "\tstate = not running");
+    let has_process = description.lines().any(|line| line.starts_with("\tpid = "));
+    if not_running && !has_process {
+        JobState::Ended
+    } else {
+        JobState::Running
     }
 }
 
@@ -1039,5 +1237,220 @@ mod tests {
         assert_eq!(parse_pid("service spawned with pid 4242"), Some(4242));
         assert_eq!(parse_pid("spawned process 17.\n"), Some(17));
         assert_eq!(parse_pid("no identifier here"), None);
+    }
+
+    /// A file in the jobs directory is listed as a worker job only where this host wrote it.
+    #[test]
+    fn only_a_worker_job_definition_this_host_writes_is_listed() {
+        let host = kr_ipc::testing::TempHost::create();
+        let jobs = host.environment().jobs_dir();
+        let defined = ReservationId::new(Uuid::from_bytes([4; 16]));
+        // Letters in it, so that its spelling in capitals is another spelling.
+        let other = ReservationId::new(Uuid::from_bytes([0xab; 16]));
+        for name in [
+            format!("{}.plist", worker_label(defined)),
+            // What a job wrote, rather than a job.
+            format!("{}.diagnostics", worker_label(other)),
+            // Another kind of service's job.
+            format!("kr-plugin-host-{other}.plist"),
+            // Names this host never writes.
+            "kr-worker-not-a-reservation.plist".to_owned(),
+            format!("kr-worker-{}.plist", other.to_string().to_uppercase()),
+        ] {
+            std::fs::write(jobs.join(name), b"").expect("writes a file");
+        }
+        assert_eq!(defined_worker_jobs(&jobs), vec![defined]);
+        assert!(defines_worker_job(&jobs, defined));
+        // Not `other`: a volume that ignores case holds its capitalised file under this name too.
+        assert!(!defines_worker_job(
+            &jobs,
+            ReservationId::new(Uuid::from_bytes([6; 16]))
+        ));
+    }
+
+    /// A job this environment never defined is gone as far as this environment is concerned.
+    #[test]
+    fn a_job_this_environment_never_defined_is_gone() {
+        let host = kr_ipc::testing::TempHost::create();
+        assert_eq!(
+            retire_worker_job(
+                &host.environment().jobs_dir(),
+                ReservationId::new(kr_ipc::new_uuid())
+            ),
+            JobRetirement::Gone
+        );
+    }
+
+    /// launchd's description of a job is read at its own level, and only a job it describes as not
+    /// running with no process counts as ended.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_job_has_ended_only_where_launchd_says_it_has_no_process() {
+        let ended = "gui/501/kr-worker-x = {\n\tactive count = 0\n\tstate = not running\n\n\
+                     \tendpoints = {\n\t\tstate = active\n\t}\n}\n";
+        assert!(matches!(job_state_described(ended), JobState::Ended));
+        let running = "gui/501/kr-worker-x = {\n\tactive count = 1\n\tstate = running\n\
+                       \tpid = 4242\n}\n";
+        assert!(matches!(job_state_described(running), JobState::Running));
+        // A nested section's state says nothing about the job's own process.
+        let nested = "gui/501/kr-worker-x = {\n\tendpoints = {\n\t\tstate = not running\n\t}\n}\n";
+        assert!(matches!(job_state_described(nested), JobState::Running));
+        // A description this build does not recognise leaves the job where it is.
+        let unknown = "gui/501/kr-worker-x = {\n\tstate = spawn scheduled\n}\n";
+        assert!(matches!(job_state_described(unknown), JobState::Running));
+        assert!(matches!(job_state_described(""), JobState::Running));
+    }
+
+    /// A launchd job this test defined, removed from both of this user's domains when the test
+    /// ends, however it ends.
+    #[cfg(target_os = "macos")]
+    struct OwnJob(String);
+
+    #[cfg(target_os = "macos")]
+    impl Drop for OwnJob {
+        fn drop(&mut self) {
+            let uid = kr_ipc::paths::current_uid();
+            for domain in ["gui", "user"] {
+                let _ = std::process::Command::new("/bin/launchctl")
+                    .args(["bootout", &format!("{domain}/{uid}/{}", self.0)])
+                    .output();
+            }
+        }
+    }
+
+    /// Requires this user's launchd domains, which a job is started into.
+    ///
+    /// A host without them starts no job of this kind, so there is nothing for these checks to
+    /// look at there, and a check that returned early would be counted as one that passed.
+    #[cfg(target_os = "macos")]
+    fn launchd_domains_are_here() {
+        assert!(
+            LaunchdSupervisor::available(),
+            "this user has no graphical launchd domain on this host, so no job can be started and \
+             this check cannot run"
+        );
+    }
+
+    /// Waits until launchd describes `target` as loaded with no process.
+    #[cfg(target_os = "macos")]
+    fn until_ended(target: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match job_state(target) {
+                JobState::Ended => return,
+                JobState::Running => {}
+                other => panic!("launchd does not describe {target} as loaded: {other:?}"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{target} still had a process 30 s after it was started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// A worker's job whose process has ended is removed from launchd, and its definition with
+    /// it, while what the job wrote stays.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_worker_job_whose_process_has_ended_goes_with_its_definition() {
+        launchd_domains_are_here();
+        let host = kr_ipc::testing::TempHost::create();
+        let jobs = host.environment().jobs_dir();
+        let reservation_id = ReservationId::new(kr_ipc::new_uuid());
+        let mut launch = launch();
+        launch.reservation_id = reservation_id;
+        // The system's own program that ignores its arguments and ends at once, run in this test's
+        // own tree on the internal disk, in the background domain a headless worker is started in.
+        launch.program = PathBuf::from("/usr/bin/true");
+        launch.jobs_directory.clone_from(&jobs);
+        launch.working_directory = host.root().to_path_buf();
+        launch.profile = WorkerProfile::HeadlessUser;
+        let label = launch.label();
+        let _own = OwnJob(label.clone());
+        let outcome = LaunchdSupervisor::new().start(&launch);
+        assert!(
+            !matches!(outcome, LaunchOutcome::NotStarted { .. }),
+            "the job was started: {outcome:?}"
+        );
+        let target = format!("user/{}/{label}", kr_ipc::paths::current_uid());
+        until_ended(&target);
+
+        assert_eq!(
+            retire_worker_job(&jobs, reservation_id),
+            JobRetirement::Gone
+        );
+        assert!(
+            matches!(job_state(&target), JobState::NotLoaded),
+            "launchd no longer has the job"
+        );
+        assert!(
+            !defines_worker_job(&jobs, reservation_id),
+            "its definition went with it"
+        );
+        assert!(
+            jobs.join(format!("{label}.diagnostics")).exists(),
+            "what the job wrote is kept"
+        );
+        assert_eq!(
+            retire_worker_job(&jobs, reservation_id),
+            JobRetirement::Gone,
+            "and a second look finds nothing left to remove"
+        );
+    }
+
+    /// A worker's job whose process is still running is left loaded, with its process running and
+    /// its definition in place.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_worker_job_whose_process_is_running_is_left_alone() {
+        launchd_domains_are_here();
+        let host = kr_ipc::testing::TempHost::create();
+        let jobs = host.environment().jobs_dir();
+        let reservation_id = ReservationId::new(kr_ipc::new_uuid());
+        let label = worker_label(reservation_id);
+        let own = OwnJob(label.clone());
+        // The system's own program that stays, under a worker's label in this user's graphical
+        // domain.
+        let outcome = LaunchdSupervisor::new().start_service(&ServiceLaunch {
+            label: label.clone(),
+            program: PathBuf::from("/bin/sleep"),
+            arguments: vec!["600".to_owned()],
+            jobs_directory: jobs.clone(),
+            working_directory: host.root().to_path_buf(),
+        });
+        let LaunchOutcome::Started(identity) = outcome else {
+            panic!("the job was started: {outcome:?}");
+        };
+        let target = format!("gui/{}/{label}", kr_ipc::paths::current_uid());
+
+        assert_eq!(
+            retire_worker_job(&jobs, reservation_id),
+            JobRetirement::StillRunning
+        );
+        assert!(
+            matches!(job_state(&target), JobState::Running),
+            "the job is still loaded"
+        );
+        assert_eq!(
+            kr_ipc::identity::process_state(&identity),
+            kr_ipc::identity::ProcessState::Running,
+            "and its process was not ended"
+        );
+        assert!(
+            defines_worker_job(&jobs, reservation_id),
+            "and its definition is kept for the next look"
+        );
+
+        // This test's own job goes, and launchd ends the process in it as it does.
+        drop(own);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while kr_ipc::identity::process_state(&identity) != kr_ipc::identity::ProcessState::Ended {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the process of this test's own job outlived its removal"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 }
