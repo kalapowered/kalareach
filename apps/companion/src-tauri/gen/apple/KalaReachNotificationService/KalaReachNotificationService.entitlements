@@ -4,7 +4,7 @@
 <dict>
 	<key>keychain-access-groups</key>
 	<array>
-		<string>$(AppIdentifierPrefix)to.kala.reach.companion.shared</string>
+		<string>$(AppIdentifierPrefix)to.kala.reach.shared</string>
 	</array>
 </dict>
 </plist>

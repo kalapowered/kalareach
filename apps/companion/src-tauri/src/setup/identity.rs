@@ -341,7 +341,7 @@ mod tests {
             read: true,
             authority: Some("Developer ID Application: Kala".to_owned()),
             team: Some("ABCDE12345".to_owned()),
-            identifier: Some("to.kala.reach.companion".to_owned()),
+            identifier: Some("to.kala.reach".to_owned()),
             ad_hoc: false,
             valid: true,
             refusal: None,

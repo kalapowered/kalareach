@@ -36,10 +36,10 @@ android {
     // refused. This is the first toolchain whose linker aligns to 16 KB by default, so it is named
     // rather than left to whichever one happens to be installed.
     ndkVersion = "28.2.13676358"
-    namespace = "to.kala.reach.companion"
+    namespace = "to.kala.reach"
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
-        applicationId = "to.kala.reach.companion"
+        applicationId = "to.kala.reach"
         minSdk = 24
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()

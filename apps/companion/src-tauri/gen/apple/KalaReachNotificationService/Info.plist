@@ -21,7 +21,7 @@
 	<key>CFBundleVersion</key>
 	<string>0.1.0</string>
 	<key>KRSharedKeychainGroup</key>
-	<string>$(AppIdentifierPrefix)to.kala.reach.companion.shared</string>
+	<string>$(AppIdentifierPrefix)to.kala.reach.shared</string>
 	<key>NSExtension</key>
 	<dict>
 		<key>NSExtensionPointIdentifier</key>

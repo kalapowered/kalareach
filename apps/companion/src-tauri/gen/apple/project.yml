@@ -1,6 +1,6 @@
 name: companion-tauri
 options:
-  bundleIdPrefix: to.kala.reach.companion
+  bundleIdPrefix: to.kala.reach
   deploymentTarget:
     iOS: 14.0
 fileGroups: [../../src]
@@ -20,7 +20,7 @@ settingGroups:
   app:
     base:
       PRODUCT_NAME: KalaReach
-      PRODUCT_BUNDLE_IDENTIFIER: to.kala.reach.companion
+      PRODUCT_BUNDLE_IDENTIFIER: to.kala.reach
 targetTemplates:
   app:
     type: application
@@ -53,7 +53,7 @@ targets:
         # An extension's version has to be its application's, or the system refuses to install it.
         CFBundleShortVersionString: 0.1.0
         CFBundleVersion: "0.1.0"
-        KRSharedKeychainGroup: $(AppIdentifierPrefix)to.kala.reach.companion.shared
+        KRSharedKeychainGroup: $(AppIdentifierPrefix)to.kala.reach.shared
         NSExtension:
           NSExtensionPointIdentifier: com.apple.usernotifications.service
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationService
@@ -65,11 +65,11 @@ targets:
       path: KalaReachNotificationService/KalaReachNotificationService.entitlements
       properties:
         keychain-access-groups:
-          - $(AppIdentifierPrefix)to.kala.reach.companion.shared
+          - $(AppIdentifierPrefix)to.kala.reach.shared
     settings:
       base:
         PRODUCT_NAME: KalaReachNotificationService
-        PRODUCT_BUNDLE_IDENTIFIER: to.kala.reach.companion.notifications
+        PRODUCT_BUNDLE_IDENTIFIER: to.kala.reach.notifications
         SKIP_INSTALL: true
 
   # The native decisions, built and run without the application, so the four cases the
@@ -89,7 +89,7 @@ targets:
     settings:
       base:
         PRODUCT_NAME: KalaReachNativeTests
-        PRODUCT_BUNDLE_IDENTIFIER: to.kala.reach.companion.native-tests
+        PRODUCT_BUNDLE_IDENTIFIER: to.kala.reach.native-tests
         GENERATE_INFOPLIST_FILE: true
     # Its own scheme, with no host application: these are decisions about a payload and a clock,
     # and running them must not need the whole application to link first.
@@ -147,11 +147,11 @@ targets:
         # The keychain group the extension shares with this application, with the team prefix the
         # build resolves. Swift does not expand build variables inside a string literal, so the
         # one place the expanded value exists is the description the build writes.
-        KRSharedKeychainGroup: $(AppIdentifierPrefix)to.kala.reach.companion.shared
+        KRSharedKeychainGroup: $(AppIdentifierPrefix)to.kala.reach.shared
         # The group nothing outside this application may reach, where the device authorisation key
         # goes. Named for the same reason as the shared one: Swift does not expand a build variable
         # inside a string literal, so the expanded value has to be written by the build.
-        KRPrivateKeychainGroup: $(AppIdentifierPrefix)to.kala.reach.companion
+        KRPrivateKeychainGroup: $(AppIdentifierPrefix)to.kala.reach
         UIBackgroundModes:
           - remote-notification
           # An explicitly started voice call keeps running when the screen locks. Section 15
@@ -172,8 +172,8 @@ targets:
         # the shared one, so a default write into it would put the device authorisation key where
         # the extension could read it.
         keychain-access-groups:
-          - $(AppIdentifierPrefix)to.kala.reach.companion
-          - $(AppIdentifierPrefix)to.kala.reach.companion.shared
+          - $(AppIdentifierPrefix)to.kala.reach
+          - $(AppIdentifierPrefix)to.kala.reach.shared
     scheme:
       environmentVariables:
         RUST_BACKTRACE: full

@@ -1,4 +1,4 @@
-package to.kala.reach.companion
+package to.kala.reach
 
 import android.os.Bundle
 import androidx.activity.enableEdgeToEdge

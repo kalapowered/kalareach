@@ -544,3 +544,101 @@ fn every_platform_builds_on_the_one_native_client_library() {
         "no platform has a client of its own"
     );
 }
+
+/// The application identifier on every platform is the one the website's association documents
+/// and the push service's registered apps name, so the phone's sign-in can come back to it.
+///
+/// Apple honours an HTTPS callback only for the bundle the domain's association names, and Android
+/// hands a verified link only to the package the domain's asset links name; both name
+/// `to.kala.reach`. The keychain groups and the extension's identifier follow from it.
+#[test]
+fn the_application_identifier_is_the_one_the_website_associates_on_every_platform() {
+    const IDENTIFIER: &str = "to.kala.reach";
+    let root = crate_root();
+    let text = |relative: &str| {
+        std::fs::read_to_string(root.join(relative))
+            .unwrap_or_else(|error| panic!("{relative} could not be read: {error}"))
+    };
+    assert_eq!(configuration()["identifier"], serde_json::json!(IDENTIFIER));
+
+    let project = text("gen/apple/project.yml");
+    for expected in [
+        "  bundleIdPrefix: to.kala.reach\n",
+        "      PRODUCT_BUNDLE_IDENTIFIER: to.kala.reach\n",
+        "        PRODUCT_BUNDLE_IDENTIFIER: to.kala.reach.notifications\n",
+        "        PRODUCT_BUNDLE_IDENTIFIER: to.kala.reach.native-tests\n",
+        "        KRPrivateKeychainGroup: $(AppIdentifierPrefix)to.kala.reach\n",
+        "        KRSharedKeychainGroup: $(AppIdentifierPrefix)to.kala.reach.shared\n",
+    ] {
+        assert!(project.contains(expected), "project.yml lacks {expected:?}");
+    }
+    // The application's own group first: the platform files an item written without a group
+    // under the first one, and the extension may read the shared one.
+    let application = project
+        .split("  companion-tauri_iOS:\n")
+        .nth(1)
+        .expect("project.yml describes the application target");
+    let groups = application
+        .split("keychain-access-groups:\n")
+        .nth(1)
+        .expect("the application declares its keychain groups");
+    let listed: Vec<&str> = groups.lines().take(2).map(str::trim).collect();
+    assert_eq!(
+        listed,
+        [
+            "- $(AppIdentifierPrefix)to.kala.reach",
+            "- $(AppIdentifierPrefix)to.kala.reach.shared"
+        ]
+    );
+
+    // What the project generator wrote from it agrees.
+    let pbxproj = text("gen/apple/companion-tauri.xcodeproj/project.pbxproj");
+    let identifiers: Vec<String> = pbxproj
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("PRODUCT_BUNDLE_IDENTIFIER = "))
+        .map(|value| value.trim_end_matches(';').trim_matches('"').to_owned())
+        .collect();
+    assert_eq!(identifiers.len(), 6, "{identifiers:?}");
+    for identifier in &identifiers {
+        assert!(
+            [
+                "to.kala.reach",
+                "to.kala.reach.notifications",
+                "to.kala.reach.native-tests"
+            ]
+            .contains(&identifier.as_str()),
+            "the generated project names {identifier}"
+        );
+    }
+    for generated in [
+        "gen/apple/companion-tauri_iOS/Info.plist",
+        "gen/apple/companion-tauri_iOS/companion-tauri_iOS.entitlements",
+        "gen/apple/KalaReachNotificationService/Info.plist",
+        "gen/apple/KalaReachNotificationService/KalaReachNotificationService.entitlements",
+    ] {
+        let content = text(generated);
+        assert!(
+            content.contains("$(AppIdentifierPrefix)to.kala.reach.shared</string>"),
+            "{generated} names the shared group"
+        );
+        assert!(
+            !content.contains("to.kala.reach.companion"),
+            "{generated} still names the old identifier"
+        );
+    }
+
+    let gradle = text("gen/android/app/build.gradle.kts");
+    assert!(gradle.contains("    namespace = \"to.kala.reach\"\n"));
+    assert!(gradle.contains("        applicationId = \"to.kala.reach\"\n"));
+    // The activity sits in the package the generated activity classes and the native entry
+    // points are derived into, which is the identifier itself.
+    assert!(
+        text("gen/android/app/src/main/java/to/kala/reach/MainActivity.kt")
+            .starts_with("package to.kala.reach\n")
+    );
+    assert!(
+        !root
+            .join("gen/android/app/src/main/java/to/kala/reach/companion/MainActivity.kt")
+            .exists()
+    );
+}

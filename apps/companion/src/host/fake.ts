@@ -1614,7 +1614,7 @@ function setupIdentity(stable: boolean, connected: boolean): SetupIdentity {
           read: true,
           authority: 'Developer ID Application: Kala',
           team: 'ABCDE12345',
-          identifier: 'to.kala.reach.companion',
+          identifier: 'to.kala.reach',
           ad_hoc: false,
           valid: true,
           refusal: null
