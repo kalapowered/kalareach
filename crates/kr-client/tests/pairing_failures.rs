@@ -6,6 +6,9 @@
 //! socket before any host has spoken, and a host that has spoken but whose confirmation tag has not
 //! verified are three phases, and each claims only what its evidence supports. A scripted room on
 //! loopback, behind TLS a test issues, plays each ending.
+//!
+//! The same socket and TLS, carried into a room a host answers in, pairs; that exchange needs a
+//! host, so it is in kr-controller's `tests/pairing_client.rs`.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
