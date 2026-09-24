@@ -1649,6 +1649,10 @@ impl RestrictedProfile {
         // the path afterwards is not what Git is working in.
         argv.push(OsString::from("-C"));
         argv.push(OsString::from("."));
+        if request.git_directory {
+            // The same object, named as the repository itself: nothing is discovered from it.
+            argv.push(OsString::from("--git-dir=."));
+        }
         if request.read_only {
             // No index write, no reference-log rewrite, no optional lock: a read leaves the
             // repository exactly as it found it.
@@ -2004,6 +2008,13 @@ pub struct GitRequest<'a> {
     /// would name something under it; a caller that has a relative path resolves it against the
     /// directory it means, which is a decision this host cannot make for it.
     pub directory: &'a Path,
+    /// True when the directory is a repository's Git directory rather than a working tree.
+    ///
+    /// Git is then told so, with `--git-dir=.` after `-C .`, and uses the directory the child moved
+    /// into as the repository without looking for one around it. Found by Git's own discovery
+    /// instead, a Git directory is a bare repository, which Git 2.38 to 2.43 refuse under the
+    /// profile's `safe.bareRepository=explicit`.
+    pub git_directory: bool,
     /// The arguments after the overrides.
     pub arguments: &'a [&'a OsStr],
     /// True when the invocation must leave the repository exactly as it found it.
@@ -2088,6 +2099,7 @@ impl<'a> GitRequest<'a> {
     pub fn read(directory: &'a Path, arguments: &'a [&'a OsStr]) -> Self {
         Self {
             directory,
+            git_directory: false,
             arguments,
             read_only: true,
             transport: None,
@@ -2114,6 +2126,14 @@ impl<'a> GitRequest<'a> {
             read_only: false,
             ..Self::read(directory, arguments)
         }
+    }
+
+    /// Names the directory to Git as a repository's Git directory, rather than as a working tree
+    /// Git finds the repository from.
+    #[must_use]
+    pub const fn in_git_directory(mut self) -> Self {
+        self.git_directory = true;
+        self
     }
 
     /// Sets the drivers the audit found, so each is blanked by name.
@@ -4100,6 +4120,43 @@ mod tests {
                 .overrides(&read)
                 .iter()
                 .any(|(key, _)| key.ends_with(".uploadpack"))
+        );
+    }
+
+    #[test]
+    fn a_git_directory_is_named_to_git_rather_than_found_by_it() {
+        // Found by Git's own discovery, a Git directory is a bare repository, and Git 2.38 to 2.43
+        // refuse one under `safe.bareRepository=explicit`. Named, it is the repository whatever the
+        // release: the profile says so itself, after the one directory argument it passes.
+        let profile = test_profile();
+        let arguments = [OsStr::new("rev-parse"), OsStr::new("--show-object-format")];
+        let named = GitRequest::read(Path::new("/repository/.git"), &arguments).in_git_directory();
+        assert_eq!(
+            profile.argument_vector(&named),
+            [
+                "--no-pager",
+                "-C",
+                ".",
+                "--git-dir=.",
+                "--no-optional-locks",
+                "rev-parse",
+                "--show-object-format",
+            ]
+            .map(OsString::from)
+        );
+        // A working tree is still one Git finds its repository from.
+        let found = GitRequest::read(Path::new("/repository"), &arguments);
+        assert!(
+            !profile
+                .argument_vector(&found)
+                .iter()
+                .any(|argument| argument.to_string_lossy().starts_with("--git-dir")),
+            "a working tree is not named as a Git directory"
+        );
+        // And a caller still cannot name one: the directories are the profile's.
+        assert!(
+            check_arguments(&[OsStr::new("rev-parse"), OsStr::new("--git-dir=/elsewhere")])
+                .is_err()
         );
     }
 

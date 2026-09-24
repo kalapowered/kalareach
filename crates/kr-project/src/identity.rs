@@ -545,7 +545,10 @@ impl OpenedRepository {
     /// that indirection can be rewritten to name another repository without the working tree or
     /// the Git directory this record opened becoming a different object. A reference update
     /// writes in the Git directory, so the format that decides how long a full object name is has
-    /// to be read from the same place.
+    /// to be read from the same place. Git is told that the directory is the repository's Git
+    /// directory rather than left to find one there, which is also what lets every Git this host
+    /// accepts answer: Git 2.38 to 2.43 refuse a Git directory found by discovery as a bare
+    /// repository under the profile's `safe.bareRepository=explicit`.
     ///
     /// # Errors
     ///
@@ -554,6 +557,7 @@ impl OpenedRepository {
     pub fn object_format(&self, profile: &RestrictedProfile) -> Result<ObjectFormat> {
         let arguments: [&OsStr; 2] = [OsStr::new("rev-parse"), OsStr::new("--show-object-format")];
         let request = GitRequest::read(&self.git_dir_path, &arguments)
+            .in_git_directory()
             .with_drivers(self.audit.drivers.clone())
             .expecting(self.identity.git_dir)
             .admitted(self.admission.clone());
@@ -597,6 +601,7 @@ impl OpenedRepository {
         arguments.push(OsStr::new(new_oid));
         arguments.push(OsStr::new(old_oid));
         let request = GitRequest::write(&self.git_dir_path, &arguments)
+            .in_git_directory()
             .with_drivers(self.audit.drivers.clone())
             .expecting(self.identity.git_dir)
             .admitted(self.admission.clone());
