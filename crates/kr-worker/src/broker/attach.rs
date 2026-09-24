@@ -595,8 +595,8 @@ impl NativeGateway {
     ///    Nothing the process says about itself is used.
     /// 4. The private exchange is generated, written to an owner-only file, and handed to the
     ///    broker as the launch's own record.
-    /// 5. The registration file is written last, so a forwarder that reads it reads a complete
-    ///    one and the credential it names already exists.
+    /// 5. The registration file is written last, and published whole by a rename, so a forwarder
+    ///    that reads it reads all of it or nothing, and the credential it names already exists.
     ///
     /// # Errors
     ///
@@ -671,12 +671,16 @@ impl NativeGateway {
             registration.to_file(),
             self.launch.framing.name()
         );
-        std::fs::write(&registration_path, published).map_err(|error| {
-            BrokerError::ledger(format!(
-                "could not write the registration file {}: {error}",
-                registration_path.display()
-            ))
-        })?;
+        // Whole or not at all: a forwarder that looks while it is being written must find nothing
+        // rather than an empty or partial record.
+        kr_ipc::paths::write_owner_only_file(&registration_path, published.as_bytes()).map_err(
+            |error| {
+                BrokerError::ledger(format!(
+                    "could not write the registration file {}: {error}",
+                    registration_path.display()
+                ))
+            },
+        )?;
         self.launch.expected_process = Some(started.clone());
         self.registration = Some(registration);
         Ok(Launched {

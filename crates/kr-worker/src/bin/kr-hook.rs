@@ -18,7 +18,9 @@
 //! * `KR_CREDENTIAL` — the owner-only file holding this launch's private exchange.
 //!
 //! Both are written after the process starts, because the registration names the process, so this
-//! waits for them for a bounded time rather than failing the instant it starts.
+//! waits for them for a bounded time rather than failing the instant it starts. The registration is
+//! written last and only a whole one is acted on: a read that finds it empty or partial is made
+//! again, until the deadline.
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -28,6 +30,11 @@ const REGISTRATION_APPEARS_WITHIN: std::time::Duration = std::time::Duration::fr
 
 /// How often the registration is looked for again.
 const LOOK_AGAIN: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Every field the worker's registration names, each on a line of its own; `framing` is written
+/// last.
+const REGISTRATION_FIELDS: [&str; 6] =
+    ["endpoint", "profile", "instance", "pid", "start", "framing"];
 
 fn main() -> std::process::ExitCode {
     match run() {
@@ -42,9 +49,9 @@ fn main() -> std::process::ExitCode {
 fn run() -> Result<(), String> {
     let registration_path = required("KR_REGISTRATION")?;
     let credential_path = required("KR_CREDENTIAL")?;
-    let registration = wait_for(&registration_path)?;
-    let credential = wait_for(&credential_path)?;
-    let fields = read_fields(&registration);
+    let deadline = std::time::Instant::now() + REGISTRATION_APPEARS_WITHIN;
+    let fields = wait_for_registration(&registration_path, deadline)?;
+    let credential = wait_for(&credential_path, deadline)?;
     let endpoint = fields
         .get("endpoint")
         .ok_or_else(|| "the registration names no endpoint".to_owned())?;
@@ -61,14 +68,63 @@ fn required(name: &str) -> Result<std::path::PathBuf, String> {
         .ok_or_else(|| format!("{name} names the file this forwarder reads, and it is not set"))
 }
 
-/// Waits for one file the worker writes after this process starts.
-fn wait_for(path: &std::path::Path) -> Result<String, String> {
-    let deadline = std::time::Instant::now() + REGISTRATION_APPEARS_WITHIN;
+/// Waits for the registration to be whole, and returns its fields.
+///
+/// The worker publishes it whole, by a rename. A read is still taken as final only when it is a
+/// whole record, so a registration written in place, which a read can find empty or cut short, is
+/// read again rather than acted on.
+fn wait_for_registration(
+    path: &std::path::Path,
+    deadline: std::time::Instant,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut seen = false;
     loop {
+        // Whether the deadline has passed is decided before the read, so the last read is taken
+        // after it: a registration published whole by then is found.
+        let expired = std::time::Instant::now() >= deadline;
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Some(fields) = whole(&text) {
+                return Ok(fields);
+            }
+            seen = true;
+        }
+        if expired {
+            let state = if seen {
+                "was not a whole registration"
+            } else {
+                "did not appear"
+            };
+            return Err(format!(
+                "{} {state} within {} seconds",
+                path.display(),
+                REGISTRATION_APPEARS_WITHIN.as_secs()
+            ));
+        }
+        std::thread::sleep(LOOK_AGAIN);
+    }
+}
+
+/// The registration's fields when the text is a whole record: every field the worker writes, and
+/// the line break that ends the last one.
+fn whole(text: &str) -> Option<BTreeMap<String, String>> {
+    if !text.ends_with('\n') {
+        return None;
+    }
+    let fields = read_fields(text);
+    REGISTRATION_FIELDS
+        .iter()
+        .all(|name| fields.contains_key(*name))
+        .then_some(fields)
+}
+
+/// Waits for one file the worker writes after this process starts.
+fn wait_for(path: &std::path::Path, deadline: std::time::Instant) -> Result<String, String> {
+    loop {
+        let expired = std::time::Instant::now() >= deadline;
         if let Ok(content) = std::fs::read_to_string(path) {
             return Ok(content);
         }
-        if std::time::Instant::now() >= deadline {
+        if expired {
             return Err(format!(
                 "{} did not appear within {} seconds",
                 path.display(),
