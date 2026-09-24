@@ -2375,6 +2375,191 @@ async fn past_the_receipts_reach_publishing_again_is_new_work_and_the_first_keep
     );
 }
 
+#[tokio::test]
+async fn a_note_the_draft_store_cannot_write_leaves_the_draft_publication_counted() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let draft = drafts
+        .create(draft_target(), "a prompt".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+    service.lose_the_next_answer().await;
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(NOW),
+    )
+    .await
+    .expect_err("the answer never came back");
+
+    // Something the draft store cannot write a note over is where the note belongs. The note is
+    // written before the record that ends the request, so the settlement stops with the request
+    // still waiting rather than ended without the note that goes with it.
+    let note_path = directory
+        .path()
+        .join("drafts")
+        .join(format!("{}.sync", draft.draft_id));
+    std::fs::create_dir(&note_path).expect("a name the note cannot be written under");
+    sync.reconcile_unsettled(&drafts, TimestampMs::new(NOW + 1))
+        .await
+        .expect_err("the note could not be written");
+    assert!(the_only_record(&client).dispatched());
+    assert_eq!(client.outstanding().expect("a count"), 1);
+    assert!(
+        client.store().publications().expect("records").is_empty(),
+        "nothing was ended without its note"
+    );
+
+    // Once the note can be written, the next pass settles the request once.
+    std::fs::remove_dir(&note_path).expect("cleared");
+    let reconciled = sync
+        .reconcile_unsettled(&drafts, TimestampMs::new(NOW + 2))
+        .await
+        .expect("reconciled");
+    assert_eq!(reconciled.settled, 1);
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    assert_eq!(accounts(&client), 1);
+    assert_eq!(
+        drafts.checkpoint(draft.draft_id).expect("a note"),
+        Some(DraftCheckpoint {
+            position: at(1),
+            published_revision: Nullable::some(draft.revision),
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_later_attempt_presents_its_own_comparison_after_the_note_has_moved() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let draft = drafts
+        .create(draft_target(), "mine".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+
+    // The first attempt never arrives. Another device then writes, and a fetch moves the note.
+    service.drop_the_next_request().await;
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(NOW),
+    )
+    .await
+    .expect_err("it never arrived");
+    let (theirs, sealed) = their_write_of(&draft);
+    service
+        .compare_exchange(
+            &draft_collection(draft.draft_id),
+            fresh_request_id(),
+            NOW,
+            None,
+            &sealed,
+        )
+        .await
+        .expect("the other device's write");
+    sync.fetch_beside(&drafts, draft.draft_id, TimestampMs::new(NOW + 1))
+        .await
+        .expect("fetched");
+
+    // The later attempt is the same request, comparison included, because a service compares a
+    // retry against its receipt by all of it. Against where the object now stands that comparison
+    // is refused, and the refusal settles the publication and brings the other content down.
+    let published = sync
+        .publish(
+            &drafts,
+            draft.draft_id,
+            draft.revision,
+            TimestampMs::new(NOW + 2),
+        )
+        .await
+        .expect("answered");
+    let sent = service.exchanges().await;
+    let mine: Vec<&Exchange> = sent
+        .iter()
+        .filter(|exchange| exchange.request_id == the_first_identity(&sent))
+        .collect();
+    assert_eq!(mine.len(), 2, "both attempts, one identity");
+    assert_eq!(
+        mine[1].expected, None,
+        "the comparison it was admitted with"
+    );
+    assert_eq!(mine[1].ciphertext, mine[0].ciphertext);
+    assert!(
+        matches!(published, DraftPublished::Conflicted { position, remote_revision, .. }
+            if position == at(1) && remote_revision == theirs.revision),
+        "{published:?}"
+    );
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    assert_eq!(drafts.load(draft.draft_id).expect("the draft"), draft);
+}
+
+/// The identity this device's first exchange presented.
+fn the_first_identity(sent: &[Exchange]) -> Uuid {
+    sent.first().expect("an exchange").request_id
+}
+
+#[tokio::test]
+async fn a_later_attempt_after_the_caller_dropped_the_first_call_presents_the_same_request() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(GatedService::new());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let sync = Arc::new(sync);
+    let draft = drafts
+        .create(draft_target(), "a prompt".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+
+    // The first call is held at the wire and its caller walks away. Dropping the call releases the
+    // dispatch; it says nothing about the request, which stays counted.
+    let first = tokio::spawn({
+        let (sync, drafts) = (Arc::clone(&sync), drafts.clone());
+        async move {
+            sync.publish(
+                &drafts,
+                draft.draft_id,
+                draft.revision,
+                TimestampMs::new(NOW),
+            )
+            .await
+        }
+    });
+    service.wait_for_a_publication().await;
+    let record = the_only_record(&client);
+    first.abort();
+    assert!(
+        first.await.expect_err("dropped").is_cancelled(),
+        "the call was dropped"
+    );
+    assert_eq!(client.outstanding().expect("a count"), 1);
+
+    // Asking again is a later attempt at the same publication, which nothing now holds.
+    let second = tokio::spawn({
+        let (sync, drafts) = (Arc::clone(&sync), drafts.clone());
+        async move {
+            sync.publish(
+                &drafts,
+                draft.draft_id,
+                draft.revision,
+                TimestampMs::new(NOW + 1),
+            )
+            .await
+        }
+    });
+    service.wait_for_a_publication().await;
+    service.let_it_go();
+    assert_eq!(
+        second.await.expect("the task finished").expect("answered"),
+        DraftPublished::Accepted { position: at(1) }
+    );
+    let sent = service.inner.exchanges().await;
+    assert_eq!(sent.len(), 1, "the dropped call never reached the service");
+    assert_eq!(sent[0].request_id, record.work_id);
+    assert_eq!(sent[0].signed_at_ms, NOW + 1);
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    assert_eq!(accounts(&client), 1);
+}
+
 // ---------------------------------------------------------------------------
 // KR-REQ-20.13 and KR-REQ-24.28: a draft publication whose answer was lost
 // ---------------------------------------------------------------------------
