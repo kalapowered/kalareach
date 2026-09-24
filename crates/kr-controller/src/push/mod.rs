@@ -84,10 +84,24 @@ pub const MAX_PASS: usize = 32;
 pub trait Clock {
     /// The current time, in UTC milliseconds.
     fn now_ms(&self) -> u64;
+
+    /// Milliseconds on a clock that only moves forward, from an origin of its own.
+    ///
+    /// Rates are counted on this reading and never on [`Clock::now_ms`]. A host's clock can be set
+    /// back or forward: an allowance counted on it would stop for as long as it read behind, and
+    /// fill again each time it was set forward.
+    fn steady_ms(&self) -> u64;
 }
 
+/// A closure is a test's clock. Its one reading is both the time and the steady reading, as on a
+/// clock nobody corrects; a test that sets the time apart from the steady reading gives a clock of
+/// its own.
 impl<F: Fn() -> u64> Clock for F {
     fn now_ms(&self) -> u64 {
+        self()
+    }
+
+    fn steady_ms(&self) -> u64 {
         self()
     }
 }
@@ -103,6 +117,19 @@ impl Clock for SystemClock {
             .map_or(0, |since| {
                 u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
             })
+    }
+
+    /// The time since this process first asked, on the monotonic clock. Every reading is measured
+    /// from that one origin, so however often it is read, no reading loses the time before it.
+    fn steady_ms(&self) -> u64 {
+        static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        u64::try_from(
+            ORIGIN
+                .get_or_init(std::time::Instant::now)
+                .elapsed()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX)
     }
 }
 
@@ -592,7 +619,7 @@ impl DeliveryModule {
         let Some(credential) = credentials.current(push.sender_record_id) else {
             return Ok(Considered::HadItsTurn(None));
         };
-        if !status.reserve(clock.now_ms()) {
+        if !status.reserve(clock.steady_ms()) {
             return Ok(Considered::KeepsItsTurn);
         }
         let answer = status.status(&credential, record.notification_id);
@@ -677,7 +704,7 @@ impl DeliveryModule {
             // holds for passes. One the share cannot cover yet is left as it is, due, for a later
             // pass: nothing is claimed, so no attempt is spent. Sends have places of their own in
             // the selection, so a question left here holds no send back.
-            if selection.next == NextAction::Receipt && !status.reserve(now_ms) {
+            if selection.next == NextAction::Receipt && !status.reserve(clock.steady_ms()) {
                 continue;
             }
             let claim = self.with(|producer| {

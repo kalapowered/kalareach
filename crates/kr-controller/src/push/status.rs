@@ -109,8 +109,12 @@ const _: () = assert!(
 /// A generic cell rate: every question moves a theoretical time on by one interval, and a question
 /// is refused while that time is further ahead of the clock than the burst allows. In any hour it
 /// therefore lets through at most [`StatusAllowance::most_in_an_hour`], wherever the hour starts,
-/// which is what a gateway counting in fixed windows needs. A clock that jumps forward gives back
-/// one burst at most; one that goes back refuses until it has caught up.
+/// which is what a gateway counting in fixed windows needs.
+///
+/// It counts on a steady clock ([`Clock::steady_ms`](super::Clock::steady_ms)), which only moves
+/// forward and only as time passes, and never on the host's time of day. Setting the host's clock
+/// back stops no question the allowance has earned, and setting it forward, however often, earns
+/// none.
 #[derive(Debug)]
 pub struct StatusBudget {
     interval_ms: u64,
@@ -135,14 +139,15 @@ impl StatusBudget {
         }
     }
 
-    /// Takes one question at `now_ms`, and says whether there was one to take.
+    /// Takes one question at `steady_ms`, a reading of the steady clock, and says whether there
+    /// was one to take.
     #[must_use]
-    pub fn take(&self, now_ms: u64) -> bool {
+    pub fn take(&self, steady_ms: u64) -> bool {
         let Ok(mut theoretical) = self.theoretical_ms.lock() else {
             return false;
         };
-        let from = (*theoretical).max(now_ms);
-        if from - now_ms > self.tolerance_ms {
+        let from = (*theoretical).max(steady_ms);
+        if from - steady_ms > self.tolerance_ms {
             return false;
         }
         *theoretical = from.saturating_add(self.interval_ms);
@@ -201,8 +206,8 @@ impl GatewayStatus {
 }
 
 impl DeliveryStatus for GatewayStatus {
-    fn reserve(&self, now_ms: u64) -> bool {
-        self.budget.take(now_ms)
+    fn reserve(&self, steady_ms: u64) -> bool {
+        self.budget.take(steady_ms)
     }
 
     fn status(
@@ -308,16 +313,29 @@ mod tests {
         );
     }
 
+    /// The steady reading a budget counts on is measured from one origin, so readings taken a
+    /// fraction of a millisecond apart, however many, add up to the time that passed.
     #[test]
-    fn a_clock_that_goes_back_is_refused_until_it_catches_up() {
-        let budget = StatusBudget::new(StatusAllowance {
-            burst: 1,
-            per_hour: 60,
-        });
-        let now = 1_700_000_000_000;
-        assert!(budget.take(now));
-        assert!(!budget.take(now - 1_000));
-        assert!(budget.take(now + 60_000));
+    fn the_steady_reading_loses_no_time_however_often_it_is_read() {
+        use crate::push::{Clock, SystemClock};
+
+        let first = SystemClock.steady_ms();
+        let started = std::time::Instant::now();
+        let mut last = first;
+        let mut readings = 0_u64;
+        while started.elapsed() < std::time::Duration::from_millis(20) {
+            let reading = SystemClock.steady_ms();
+            assert!(reading >= last, "a steady reading never goes back");
+            last = reading;
+            readings += 1;
+        }
+        let end = SystemClock.steady_ms();
+        assert!(readings > 20, "read more often than once a millisecond");
+        assert!(
+            end - first >= 19,
+            "20 ms passed and the steady clock moved {} ms",
+            end - first
+        );
     }
 
     /// The gateway counts in fixed windows of an hour that start wherever its first question falls,

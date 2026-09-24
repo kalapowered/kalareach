@@ -2099,7 +2099,7 @@ impl Deliveries {
                 &NoGateway,
                 senders,
                 &SessionGrant,
-                &|| kr_ipc::now_ms().get(),
+                &kr_controller::push::SystemClock,
             )
             .expect("a pass");
     }

@@ -5132,6 +5132,120 @@ fn the_sweep_is_asked_while_passes_use_their_whole_share() {
     );
 }
 
+/// A clock whose time of day a test corrects while its steady reading goes on, the way a host's
+/// clock is set back or forward while time passes.
+#[derive(Debug)]
+struct Corrected {
+    now_ms: std::sync::atomic::AtomicU64,
+    steady_ms: std::sync::atomic::AtomicU64,
+}
+
+impl Corrected {
+    fn at(now_ms: u64) -> Self {
+        Self {
+            now_ms: std::sync::atomic::AtomicU64::new(now_ms),
+            steady_ms: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Time passes, and both readings move on with it.
+    fn passes(&self, ms: u64) {
+        self.now_ms
+            .fetch_add(ms, std::sync::atomic::Ordering::Relaxed);
+        self.steady_ms
+            .fetch_add(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The time of day is set forward, and no time passes.
+    fn set_forward(&self, ms: u64) {
+        self.now_ms
+            .fetch_add(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The time of day is set back, and no time passes.
+    fn set_back(&self, ms: u64) {
+        self.now_ms
+            .fetch_sub(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl kr_controller::push::Clock for Corrected {
+    fn now_ms(&self) -> u64 {
+        self.now_ms.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn steady_ms(&self) -> u64 {
+        self.steady_ms.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// KR-REQ-24.12: a share of the gateway's status allowance is counted on the steady clock. The
+/// host's clock set forward an hour, and then an hour more, earns the sweep no question, which is
+/// what keeps both shares under the gateway's hourly limit. Set back behind where it started, it
+/// stops none: the share comes back at its own rate, one question a minute, while the clock still
+/// reads behind, however often the sweep was refused before that.
+#[test]
+fn setting_the_hosts_clock_forward_or_back_changes_no_share_of_status_questions() {
+    let environment = environment();
+    let destination = push_destination(&environment, true);
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    held_and_unknown(&environment, &destination, 0, 6, NOW);
+    let credentials = held(NOW + 30 * 24 * 60 * 60 * 1000);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let gateway = Arc::new(DeliveringGateway::retrying());
+    // Two at once, then one a minute.
+    let share = kr_controller::push::status::StatusAllowance {
+        burst: 2,
+        per_hour: 60,
+    };
+    let (_, sweep) = status_shares(&gateway, &runtime, share, share);
+    let clock = Corrected::at(NOW + 1_000);
+    let asked_after_a_sweep = || {
+        environment
+            .module
+            .resolve_unknown(
+                &sweep,
+                &credentials,
+                &clock,
+                64,
+                std::time::Duration::from_secs(60),
+            )
+            .expect("a sweep");
+        gateway.questions().len()
+    };
+    assert_eq!(asked_after_a_sweep(), 2, "the burst");
+
+    let hour = 60 * 60 * 1000;
+    for _ in 0..2 {
+        clock.set_forward(hour);
+        clock.passes(1_000);
+        assert_eq!(
+            asked_after_a_sweep(),
+            2,
+            "every outcome is due to be asked about, and the share has earned nothing"
+        );
+    }
+
+    clock.set_back(3 * hour);
+    for _ in 0..10 {
+        clock.passes(1);
+        assert_eq!(asked_after_a_sweep(), 2, "a millisecond apart, nothing yet");
+    }
+    clock.passes(60_000);
+    assert_eq!(
+        asked_after_a_sweep(),
+        3,
+        "a minute on, with the clock still behind, the share has one more"
+    );
+    assert_eq!(asked_after_a_sweep(), 3, "and only one");
+}
+
 /// KR-REQ-24.12: a status question has places of its own in a pass. A question that fell due first
 /// is asked however many sends are due after it, pass after pass.
 #[test]
