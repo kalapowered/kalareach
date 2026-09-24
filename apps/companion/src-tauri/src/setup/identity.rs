@@ -450,17 +450,17 @@ mod tests {
         let scratch = tempfile::tempdir().expect("a directory on the internal disk");
         let signed = scratch.path().join("signed-tool");
         std::fs::copy("/usr/bin/true", &signed).expect("a copy of a small executable");
-        let signing = std::process::Command::new(SIGNING_TOOL)
-            .args([
-                "--force",
-                "--sign",
-                "-",
-                "--identifier",
-                "to.kala.reach.signature-check",
-            ])
-            .arg(&signed)
-            .output()
-            .expect("the signing tool runs");
+        let signing = signing_tool_within_its_bound(
+            std::process::Command::new(SIGNING_TOOL)
+                .args([
+                    "--force",
+                    "--sign",
+                    "-",
+                    "--identifier",
+                    "to.kala.reach.signature-check",
+                ])
+                .arg(&signed),
+        );
         assert!(
             signing.status.success(),
             "the copy is signed: {}",
@@ -482,11 +482,11 @@ mod tests {
 
         let unsigned = scratch.path().join("unsigned-tool");
         std::fs::copy(&signed, &unsigned).expect("a second copy");
-        let stripping = std::process::Command::new(SIGNING_TOOL)
-            .arg("--remove-signature")
-            .arg(&unsigned)
-            .output()
-            .expect("the signing tool runs");
+        let stripping = signing_tool_within_its_bound(
+            std::process::Command::new(SIGNING_TOOL)
+                .arg("--remove-signature")
+                .arg(&unsigned),
+        );
         assert!(
             stripping.status.success(),
             "the second copy's signature is taken off: {}",
@@ -505,6 +505,38 @@ mod tests {
             "and the tool's refusal is what the report says: {:?}",
             signature.refusal
         );
+    }
+
+    /// Runs the signing tool on this test's own fixture, giving it the bound the product gives the
+    /// tool, and fails the test rather than waiting past it. A tool that did not answer is ended
+    /// and collected before the failure is reported.
+    #[cfg(target_os = "macos")]
+    fn signing_tool_within_its_bound(command: &mut std::process::Command) -> std::process::Output {
+        let mut child = command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("the signing tool runs");
+        let deadline = std::time::Instant::now() + SIGNING_BOUND;
+        loop {
+            match child
+                .try_wait()
+                .expect("the signing tool can be waited for")
+            {
+                // What it says for this small file is far less than a pipe holds, so it is read
+                // once it has ended.
+                Some(_) => return child.wait_with_output().expect("its answer is read"),
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("the signing tool did not answer within {SIGNING_BOUND:?}");
+                }
+            }
+        }
     }
 
     /// A platform with no signing tool reads no signature, and says why.
