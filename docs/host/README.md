@@ -2779,9 +2779,10 @@ fails executes nothing.
 
 Admission is decided from the workflow journal: four runs of a workflow at once, a hundred more
 waiting as pending, and host-wide and per-grant rates whose admissions the journal keeps, so a
-restart is not a way past them. A run's deadline and each action's wait are measured on the
-daemon's own reading of UTC, which the continuous clock counts on from when a wall clock set back
-holds it at the floor, and an action that outlives either is asked to stop and stops its run. A limit exceeded pauses the workflow and records one
+restart is not a way past them. A run's deadline and each action's wait are measured on a reading
+of UTC that follows the wall clock while it keeps pace with the continuous clock and runs on at all
+but a thousandth of continuous time when a wall clock is set back, and an action that outlives
+either is asked to stop and stops its run. A limit exceeded pauses the workflow and records one
 attention item. A new chain inherits the session
 number admission enforces as a ceiling on the sessions it creates. Breaching a causal budget pauses
 the chain with error code `CAUSAL_LIMIT`, rejects further descendants, and commits one attention

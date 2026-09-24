@@ -281,12 +281,14 @@ each of them as it stood and two admissions that arrive together cannot both tak
   run the host finds unfinished, with an outcome not known or a node waiting for review, after its
   deadline has passed is stopped the same way, which is what a restart finds when a run was
   interrupted and its deadline went by; a run whose every node settled finished its work.
-* **The host's clock.** Deadlines, waits and a chain's lifetime are measured on the daemon's own
-  reading of UTC, the later of the wall clock and its clock floor, which is followed while it keeps
-  pace with the suspend-aware continuous clock. When a wall clock set back holds that reading at
-  the floor, the continuous clock counts on from the last reading followed, after at most a second
-  held still, so the reading never moves backwards, a clock set back cannot stop a deadline, and a
-  suspension counts.
+* **The host's clock.** Deadlines, waits and a chain's lifetime are measured on automation's
+  reading of UTC. It starts from the daemon's own reading, the later of the wall clock and its
+  clock floor, and then follows the wall clock while that keeps pace with the suspend-aware
+  continuous clock, ordinary drift and suspensions included. A wall clock set back is not followed
+  down: the reading runs on at all but a thousandth of continuous time, closing on the wall clock
+  by a millisecond a second. It never moves backwards, and a clock set back holds a deadline back
+  by at most a thousandth of the time it runs. It does not read the clock floor after it starts,
+  so the grant decisions its readings feed into the floor are not read back as time passing.
 
 A limit exceeded, whether a full queue, a rate, a run deadline or an action's wait, pauses the
 workflow revision and records one attention item, in one transaction, so the workflow stops
