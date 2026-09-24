@@ -530,18 +530,22 @@ const fn invisible(character: char) -> bool {
     )
 }
 
-/// True for a character that breaks a line, which a dialog's line shows as a space.
-const fn breaking(character: char) -> bool {
-    character.is_control() || matches!(character, '\u{2028}' | '\u{2029}')
-}
-
 /// Display text as a dialog may show it: on one line, with the characters that reorder or hide
 /// text left out, runs of space as one, and at most `limit` characters.
+///
+/// A control character becomes a space, and splitting on Unicode white space turns every other
+/// break, the line and paragraph separators U+2028 and U+2029 among them, into single spaces.
 fn shown(text: &str, limit: usize) -> String {
     let spaced: String = text
         .chars()
         .filter(|character| !invisible(*character))
-        .map(|character| if breaking(character) { ' ' } else { character })
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
         .collect();
     let clean = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
     if clean.chars().count() <= limit {
@@ -804,9 +808,9 @@ mod tests {
             candidate: candidate("Pixel\u{2028}8\u{2029}Pro\u{202E}\u{2066}droid\u{FEFF}"),
             proposed_grant: grant(&[ActionRight::SessionView], an_hour()),
         };
-        let line = reason(&subject, "stu\u{2028}di\no\r", NOW).expect("a line");
+        let line = reason(&subject, "stu\u{2028}di\no\r\u{1b}", NOW).expect("a line");
         for hidden_character in [
-            '\n', '\r', '\u{2028}', '\u{2029}', '\u{202E}', '\u{2066}', '\u{FEFF}',
+            '\n', '\r', '\u{1b}', '\u{2028}', '\u{2029}', '\u{202E}', '\u{2066}', '\u{FEFF}',
         ] {
             assert!(!line.contains(hidden_character), "{line:?}");
         }
