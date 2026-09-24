@@ -229,6 +229,22 @@ pub struct ObservedUtc {
     pub behind_ms: u64,
 }
 
+/// How much of the bounded offline validity one boot had measured as spent.
+///
+/// The bound is measured from a synchronisation in UTC and runs on the continuous clock. Written
+/// against the boot it was measured in, as a grant deadline is, because a reading of the boot
+/// clock means nothing after the next boot: within this one, it says how long has passed since,
+/// across a restart of this daemon and a machine asleep alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoredOfflineAnchor {
+    /// The synchronisation the bound is measured from, in UTC milliseconds.
+    pub synchronised_at_ms: u64,
+    /// When the time below was measured, in milliseconds since this boot.
+    pub anchored_boot_ms: u64,
+    /// How long had passed since the synchronisation then.
+    pub elapsed_ms: u64,
+}
+
 /// Where one action went, as this host recorded it before dispatching it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RoutedAction {
@@ -485,6 +501,13 @@ impl DeviceDirectory {
                      id INTEGER PRIMARY KEY NOT NULL CHECK (id = 0),
                      observed_ms INTEGER NOT NULL,
                      untrusted_at_ms INTEGER
+                 );
+                 CREATE TABLE IF NOT EXISTS network_offline_anchor (
+                     id INTEGER PRIMARY KEY NOT NULL CHECK (id = 0),
+                     boot_value BLOB NOT NULL,
+                     synchronised_at_ms INTEGER NOT NULL,
+                     anchored_boot_ms INTEGER NOT NULL,
+                     elapsed_ms INTEGER NOT NULL
                  );",
             )
         })?;
@@ -968,6 +991,69 @@ impl DeviceDirectory {
             return Ok(None);
         }
         Ok(Some(u64::try_from(deadline).unwrap_or_default()))
+    }
+
+    /// Records how much of the offline bound this boot has measured as spent.
+    ///
+    /// One record, replaced by the next: the bound is measured from one synchronisation at a time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the row cannot be written.
+    pub fn record_offline_anchor(
+        &self,
+        boot: &BootIdentity,
+        anchor: &StoredOfflineAnchor,
+    ) -> Result<()> {
+        let stored = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+        self.with(|connection| {
+            connection.execute(
+                "INSERT INTO network_offline_anchor
+                     (id, boot_value, synchronised_at_ms, anchored_boot_ms, elapsed_ms)
+                 VALUES (0, ?1, ?2, ?3, ?4)
+                 ON CONFLICT (id) DO UPDATE SET boot_value = ?1, synchronised_at_ms = ?2,
+                     anchored_boot_ms = ?3, elapsed_ms = ?4",
+                params![
+                    boot.value.as_slice(),
+                    stored(anchor.synchronised_at_ms),
+                    stored(anchor.anchored_boot_ms),
+                    stored(anchor.elapsed_ms),
+                ],
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Returns what the boot this host is running in recorded of the offline bound, when it
+    /// recorded anything.
+    ///
+    /// A record from an earlier boot is not returned: the boot clock it was measured on has gone
+    /// with that boot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the table cannot be read.
+    pub fn offline_anchor_in(&self, boot: &BootIdentity) -> Result<Option<StoredOfflineAnchor>> {
+        let row: Option<(Vec<u8>, i64, i64, i64)> = self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT boot_value, synchronised_at_ms, anchored_boot_ms, elapsed_ms
+                     FROM network_offline_anchor WHERE id = 0",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+        })?;
+        let read = |value: i64| u64::try_from(value).unwrap_or_default();
+        Ok(row
+            .filter(|(recorded, ..)| recorded.as_slice() == boot.value.as_slice())
+            .map(
+                |(_, synchronised_at_ms, anchored_boot_ms, elapsed_ms)| StoredOfflineAnchor {
+                    synchronised_at_ms: read(synchronised_at_ms),
+                    anchored_boot_ms: read(anchored_boot_ms),
+                    elapsed_ms: read(elapsed_ms),
+                },
+            ))
     }
 
     /// Records that this host's wall clock could not be trusted to decide an expiry.

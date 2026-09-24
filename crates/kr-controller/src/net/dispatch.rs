@@ -194,23 +194,39 @@ impl FrameSink for ControlStream {
 /// continuous clock, which a wall clock wound back cannot lengthen; and the moment in UTC the
 /// decision stops holding, against this host's reading of UTC, so a clock stepped forward or a
 /// floor another decision raised ends it at once.
+///
+/// What the poll reads of time, it keeps. Its reading of UTC raises the floor every later decision
+/// stands on, and a lapse it finds, by UTC or on the continuous clock, is owed its record, which
+/// is written outside the poll by the relay, the next decision or the network's record task. A
+/// clock wound back after the poll refused therefore gives nothing back: not to the batch decided
+/// again, and not to a connection that comes after this one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RelayGrant {
     epoch: u64,
-    until: Option<kr_transport::clock::ContinuousInstant>,
+    offline: Option<super::OfflineEnd>,
     lapses_at_ms: Option<u64>,
 }
 
 impl RelayGrant {
     /// Returns whether the decision still holds at this instant.
     fn holds(&self, controller: &Controller) -> bool {
-        controller.authority_epoch() == self.epoch
-            && self
-                .until
-                .is_none_or(|until| controller.clock.now() < until)
-            && self
-                .lapses_at_ms
-                .is_none_or(|lapses_at_ms| controller.settled_utc_now() < lapses_at_ms)
+        if controller.authority_epoch() != self.epoch {
+            return false;
+        }
+        if let Some(offline) = self.offline
+            && offline.passed(controller.clock.now())
+        {
+            controller.keep_lapse(offline.lapsed_at_ms);
+            return false;
+        }
+        if let Some(lapses_at_ms) = self.lapses_at_ms {
+            let settled = controller.settled_utc_now();
+            if settled >= lapses_at_ms {
+                controller.keep_lapse(settled);
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -2333,7 +2349,7 @@ impl RemoteConnection {
         // lands on every attempt is not one this batch waits out.
         for _ in 0..RELAY_DECISIONS {
             let Some(grant) = self.relay_grant(session_id) else {
-                return false;
+                break;
             };
             let relaying = Relaying {
                 grant,
@@ -2342,9 +2358,13 @@ impl RemoteConnection {
             match self.output.write(frame, Some(relaying)).await {
                 Written::Sent => return true,
                 Written::Undecided => {}
-                Written::Withdrawn => return false,
+                Written::Withdrawn => break,
             }
         }
+        // However the batch was refused, a lapse the write boundary found on the way is owed its
+        // record, and the boundary could not write it: this is the first step outside the poll
+        // that can.
+        self.controller.settle_floor();
         false
     }
 
@@ -2361,7 +2381,7 @@ impl RemoteConnection {
             .ok()?;
         Some(RelayGrant {
             epoch,
-            until: decision.offline_until,
+            offline: decision.offline,
             lapses_at_ms: decision.decided.lapses_at_ms,
         })
     }
@@ -2560,9 +2580,6 @@ impl RemoteConnection {
             revoked_at_ms: self.device.revoked_at_ms.map(|at| at.get()),
             revoked_by_parent: None,
         };
-        // The continuous clock first, so a bound anchored from the wall-clock reading after it can
-        // only come early.
-        let sampled = self.controller.clock.now();
         let request = crate::grants::AccessRequest {
             method: entry.method,
             ingress: ActorIngress::PairedDevice,
@@ -2575,7 +2592,7 @@ impl RemoteConnection {
         };
         let decided = self
             .controller
-            .decide_for_device(&grant, &record, request, sampled)
+            .decide_for_device(&grant, &record, request)
             .map_err(|refusal| match refusal {
                 CeilingRefusal::Refused(crate::grants::Refusal::MissingRight {
                     right: ActionRight::VoiceUse,
@@ -3107,7 +3124,7 @@ mod write_boundary {
     fn decided_now(controller: &Controller) -> RelayGrant {
         RelayGrant {
             epoch: controller.authority_epoch(),
-            until: None,
+            offline: None,
             lapses_at_ms: None,
         }
     }
@@ -3271,10 +3288,13 @@ mod write_boundary {
         let relaying = Relaying {
             grant: RelayGrant {
                 epoch: controller.authority_epoch(),
-                until: controller
-                    .clock
-                    .now()
-                    .checked_add(Duration::from_millis(30)),
+                offline: Some(crate::service::net::OfflineEnd {
+                    until: controller
+                        .clock
+                        .now()
+                        .checked_add(Duration::from_millis(30)),
+                    lapsed_at_ms: kr_ipc::now_ms().get() + 30,
+                }),
                 lapses_at_ms: None,
             },
             redecide: &redecide,
@@ -3340,7 +3360,7 @@ mod write_boundary {
             let relaying = Relaying {
                 grant: RelayGrant {
                     epoch: controller.authority_epoch(),
-                    until: None,
+                    offline: None,
                     lapses_at_ms: Some(lapses_at_ms),
                 },
                 redecide: &redecide,
@@ -3353,7 +3373,6 @@ mod write_boundary {
                         &lasting,
                         &lasting_record,
                         super::super::tests::listing(&temp, lapses_at_ms + 1),
-                        controller.clock.now(),
                     )
                     .expect("a grant that does not expire");
                 if peer_stops_reading {
@@ -3373,5 +3392,175 @@ mod write_boundary {
             }
             drop(controller);
         }
+    }
+
+    /// Records a paired device whose grant does not expire, and returns the grant's identifier.
+    fn a_paired_device(controller: &Controller) -> kr_protocol::ids::GrantId {
+        let (grant, _) = super::super::tests::granted(
+            kr_protocol::grant::GrantExpiry::Never,
+            controller.policy().authority_revision(),
+        );
+        let record = crate::service::net::devices::DeviceRecord {
+            device_id: grant.recipient_device_id,
+            endpoint_id: kr_protocol::scalars::EndpointKey::from_bytes([7; 32]),
+            device_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
+            authorisation: kr_protocol::scalars::AuthorisationKey::from_bytes([8; 32]),
+            stored_envelope: None,
+            notification_preview: None,
+            device_name: kr_protocol::pairing::DeviceName::new("A phone").expect("a name"),
+            platform: kr_protocol::pairing::DevicePlatform::Ios,
+            grant: grant.clone(),
+            paired_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+            revoked_at_ms: None,
+            committed_invitation_id: None,
+            expired_at_ms: None,
+        };
+        controller
+            .devices()
+            .commit(&record)
+            .expect("the device is recorded");
+        grant.grant_id
+    }
+
+    /// A floor raised while the policy's lock is held stops a batch as surely as one a device's
+    /// decision raised. A workflow's grant is decided at a reading past the moment the batch's
+    /// decision runs out, and the lock is then held while that decision's write waits for storage.
+    /// The batch is not written, whether it waited for the writer or had started and waited for
+    /// the peer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_batch_is_not_written_once_a_floor_raised_under_the_lock_passes_its_decision() {
+        use kr_automation::authority::AuthoritySource as _;
+
+        for peer_stops_reading in [false, true] {
+            let temp = kr_ipc::testing::TempHost::create();
+            let controller = super::super::tests::daemon(&temp).await;
+            let stream = HeldStream::new(peer_stops_reading);
+            let output = output(&controller, &stream);
+            let frame = batch();
+            if peer_stops_reading {
+                stream.writer.add_permits(1);
+            }
+            let grant_id = a_paired_device(&controller);
+            let grants = crate::automation::HostGrants::new(
+                Arc::clone(controller.sharing()),
+                Arc::clone(controller.devices()),
+                Arc::clone(&controller.policy),
+                temp.environment_id(),
+            );
+            let lapses_at_ms = kr_ipc::now_ms().get() + 60 * 60 * 1000;
+
+            // Another writer holds storage, so the write that decision owes waits with the lock
+            // held.
+            let storage = rusqlite::Connection::open(temp.environment().registry_database())
+                .expect("opens the registry");
+            storage
+                .execute_batch("BEGIN IMMEDIATE;")
+                .expect("storage is held");
+
+            let redecide = || true;
+            let relaying = Relaying {
+                grant: RelayGrant {
+                    epoch: controller.authority_epoch(),
+                    offline: None,
+                    lapses_at_ms: Some(lapses_at_ms),
+                },
+                redecide: &redecide,
+            };
+            let mut deciding = None;
+            let (written, ()) = tokio::join!(output.write(&frame, Some(relaying)), async {
+                stream.waited(if peer_stops_reading { 2 } else { 1 }).await;
+                deciding = Some(std::thread::spawn(move || {
+                    grants.grant(grant_id, lapses_at_ms + 1)
+                }));
+                while controller.policy.try_lock().is_ok() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                if peer_stops_reading {
+                    stream.room.as_ref().expect("a slow peer").add_permits(1);
+                } else {
+                    stream.writer.add_permits(1);
+                }
+                // Long enough for the write to decide, and well inside what storage waits.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            });
+            storage.execute_batch("ROLLBACK;").expect("storage is free");
+            let _ = deciding.expect("the workflow's grant was decided").join();
+            if peer_stops_reading {
+                assert_eq!(written, Written::Withdrawn);
+                assert_eq!(stream.reached(), vec![Reached::Part]);
+                assert!(stream.closed());
+            } else {
+                assert_eq!(written, Written::Undecided);
+                assert!(stream.reached().is_empty());
+                assert!(!stream.closed());
+            }
+            drop(controller);
+        }
+    }
+
+    /// A moment in UTC the boundary reads for itself stays read. A grant runs out while its batch
+    /// waits and nothing but the boundary reads the clock; the floor that reading raised is written
+    /// down by the next step that may write, and a decision after the wall clock was wound back,
+    /// on this connection or on another after a restart, finds the grant run out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_moment_the_boundary_reads_holds_for_every_later_decision() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::super::tests::daemon(&temp).await;
+        let stream = HeldStream::new(false);
+        let output = output(&controller, &stream);
+        let frame = batch();
+        let lapses_at_ms = kr_ipc::now_ms().get() + 200;
+        let (expiring, expiring_record) = super::super::tests::granted(
+            kr_protocol::grant::GrantExpiry::At {
+                expires_at_ms: kr_protocol::scalars::TimestampMs::new(lapses_at_ms),
+            },
+            controller.policy().authority_revision(),
+        );
+
+        let redecide = || true;
+        let relaying = Relaying {
+            grant: RelayGrant {
+                epoch: controller.authority_epoch(),
+                offline: None,
+                lapses_at_ms: Some(lapses_at_ms),
+            },
+            redecide: &redecide,
+        };
+        let (written, ()) = tokio::join!(output.write(&frame, Some(relaying)), async {
+            stream.waited(1).await;
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            stream.writer.add_permits(1);
+        });
+        assert_eq!(written, Written::Undecided);
+        assert!(stream.reached().is_empty());
+
+        // What the relay and the record task do outside the poll.
+        controller.settle_floor();
+        assert!(
+            super::super::tests::written_floor(&controller) >= lapses_at_ms,
+            "the moment the boundary read is written down"
+        );
+        let wound_back = super::super::tests::listing(&temp, lapses_at_ms - 60_000);
+        let refused = controller
+            .decide_for_device(&expiring, &expiring_record, wound_back.clone())
+            .expect_err("the moment the boundary read holds for the retry");
+        assert!(
+            matches!(
+                refused,
+                crate::config::ceilings::CeilingRefusal::Refused(
+                    crate::grants::Refusal::Expired { .. }
+                )
+            ),
+            "{refused:?}"
+        );
+
+        drop(output);
+        drop(controller);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let controller = super::super::tests::daemon(&temp).await;
+        controller
+            .decide_for_device(&expiring, &expiring_record, wound_back)
+            .expect_err("and for another connection after a restart");
+        drop(controller);
     }
 }

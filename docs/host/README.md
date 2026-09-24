@@ -1668,9 +1668,14 @@ connection's writer, which the keepalive shares, or for a peer that has stopped 
 attempt to hand its bytes over checks that nothing the decision rests on has changed since (any
 change to this host's policy or rights ceiling moves an epoch the check reads) and that the
 decision's own time bound, the grant's expiry or the end of the offline bound, has not passed:
-by this host's reading of UTC, the later of the wall clock and the floor any decision has raised,
-and by the continuous clock the offline bound is anchored on. None of these waits for a lock or a
-disk. While the write waits, the whole decision is taken again every tenth of a second. A decision that
+by this host's reading of UTC, the later of the wall clock and the floor, and by the continuous
+clock the offline bound is anchored on. None of these waits for a lock or a disk. The floor is one
+value every holder of the policy shares, so a raise made under the policy's lock, a workflow's
+decision among them, reaches this check at once. The check also keeps what it reads: its reading
+of UTC raises the floor, and a lapse it finds is owed a record, which the relay, the next decision
+or the network's record task writes down. Winding the clock back after the check refused changes
+nothing, for the batch decided again or for a connection that comes later. While the write waits,
+the whole decision is taken again every tenth of a second. A decision that
 stops holding before the first byte goes has the batch decided again. One that stops holding once
 bytes are moving ends the connection, because a frame left in pieces ends the stream. A batch the
 decision no longer allows is not written, and the connection ends with it. Only an expired grant
@@ -1679,10 +1684,18 @@ bound, for one, holds again once the authority feed synchronises, and the device
 the next request it makes.
 
 The bounded offline validity is held on the continuous clock for every device decision, not only
-in UTC. The first decision under a bound and the synchronisation it is measured from anchors when
-the bound runs out, and every later decision, a relayed batch's retry among them, finds the same
-anchor: a wall clock wound back while the bound runs does not lengthen it, and once it has run out
-it stays out until the owner changes the bound or the authority feed synchronises.
+in UTC. The count starts when the policy that holds the bound is restored at start, accepted or
+synchronised, whether or not a device ever asks: the daemon notes how long has passed since the
+synchronisation, at an instant on the continuous clock. A new maximum keeps the time already spent,
+so a shorter bound never ends later than the one it replaces; only a new synchronisation starts the
+count again. The count is written down against the boot, as a device's grant deadline is, so a
+daemon restarted in the same boot finds the bound as far gone as it was. Once the continuous clock
+passes the bound's end, the moment in UTC that implies becomes the floor every decision stands on,
+a workflow's under a device's grant included, and it is written down like any other floor. A wall
+clock wound back does not bring the bound back, and neither does a restart, into the same boot or a
+new one: it stays out until the owner changes the bound or the authority feed synchronises. No
+grant's expiry is recorded for it. The network's record task notices the end too, when nothing
+asks.
 
 What the subject decides stays the subject's, and the conditional requirements the daemon cannot
 evaluate are exactly those: whose subject it is. A device detaches the attachment its own

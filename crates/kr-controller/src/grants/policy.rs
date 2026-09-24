@@ -25,6 +25,8 @@
 //! the loaded document for that reason, and it only ever goes up.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use kr_protocol::account::{MEMBERSHIP_LEASE_MAX_LIFETIME_MS, MembershipLease};
 use kr_protocol::actor::ActorIngress;
@@ -75,7 +77,58 @@ pub enum LeaseRefused {
     AboveRoleCeiling,
 }
 
+/// The highest UTC reading this host has decided anything from.
+///
+/// Expiry is decided from the later of this and the clock. Without it, a clock wound back past a
+/// deadline would revive a grant this host has already refused: section 24 asks for expiry to be
+/// revalidated after a wake, and a revalidation that trusts a smaller number than the last one is
+/// not a revalidation. It only ever rises.
+///
+/// There is one of it, shared by every holder of the policy and read without the policy's lock.
+/// A raise lands here at its source, whoever makes it and whatever lock it holds, and a reading
+/// is taken from here whoever takes it. So a reader that cannot wait for the lock, the write
+/// boundary deciding inside a poll whether a relayed batch may still go, reads the floor a
+/// decision raised a moment ago under the lock; and a reading that reader takes itself raises the
+/// same floor every later decision stands on. A copy kept beside the policy would fall behind
+/// whenever something raised the floor without updating the copy.
+#[derive(Debug, Default)]
+pub struct UtcFloor(AtomicU64);
+
+impl UtcFloor {
+    /// A floor at `floor_ms`.
+    #[must_use]
+    pub const fn at(floor_ms: u64) -> Self {
+        Self(AtomicU64::new(floor_ms))
+    }
+
+    /// Raises the floor to `now_ms` when that is later, and returns the reading this host decides
+    /// from: the later of the two.
+    ///
+    /// Only ever forward. A reading below the floor is a clock that went backwards, and section 9
+    /// already says what a host does about that; what this guarantees is that it does not become a
+    /// second chance for something already expired. It never waits, so a poll may call it.
+    pub fn observe(&self, now_ms: u64) -> u64 {
+        self.0.fetch_max(now_ms, Ordering::SeqCst).max(now_ms)
+    }
+
+    /// The reading this host decides from at `now_ms`, without raising the floor.
+    #[must_use]
+    pub fn settled(&self, now_ms: u64) -> u64 {
+        now_ms.max(self.get())
+    }
+
+    /// The floor.
+    #[must_use]
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 /// This host's policy.
+///
+/// A copy shares the clock floor with the policy it was copied from, because the floor is a fact
+/// about this host's clock rather than a setting of one policy: a candidate change that is never
+/// accepted cannot take back a reading this host has already decided from.
 #[derive(Clone, Debug)]
 pub struct HostPolicy {
     authority_revision: AuthorityRevision,
@@ -95,12 +148,7 @@ pub struct HostPolicy {
     /// When the host last woke or started, in UTC milliseconds.
     revalidated_at_ms: u64,
     /// The highest UTC reading this host has decided anything from.
-    ///
-    /// Expiry is decided from the later of this and the clock. Without it, a clock wound back past
-    /// a deadline would revive a grant this host has already refused: section 24 asks for expiry to
-    /// be revalidated after a wake, and a revalidation that trusts a smaller number than the last
-    /// one is not a revalidation.
-    utc_floor_ms: u64,
+    utc_floor: Arc<UtcFloor>,
 }
 
 impl HostPolicy {
@@ -114,35 +162,31 @@ impl HostPolicy {
             exclusively_managed: false,
             offline: None,
             revalidated_at_ms: 0,
-            utc_floor_ms: 0,
+            utc_floor: Arc::new(UtcFloor::default()),
         }
     }
 
     /// The reading this host decides expiry from: the later of `now_ms` and its own floor.
     #[must_use]
-    pub const fn settled_now(&self, now_ms: u64) -> u64 {
-        if now_ms > self.utc_floor_ms {
-            now_ms
-        } else {
-            self.utc_floor_ms
-        }
+    pub fn settled_now(&self, now_ms: u64) -> u64 {
+        self.utc_floor.settled(now_ms)
     }
 
-    /// Raises the floor to a reading this host has decided from.
-    ///
-    /// Only ever forward. A reading below the floor is a clock that went backwards, and section 9
-    /// already says what a host does about that; what this guarantees is that it does not become a
-    /// second chance for something already expired.
-    pub const fn observe_utc(&mut self, now_ms: u64) {
-        if now_ms > self.utc_floor_ms {
-            self.utc_floor_ms = now_ms;
-        }
+    /// Raises the floor to a reading this host has decided from ([`UtcFloor::observe`]).
+    pub fn observe_utc(&mut self, now_ms: u64) {
+        self.utc_floor.observe(now_ms);
     }
 
     /// The highest UTC reading this host has decided from.
     #[must_use]
-    pub const fn utc_floor_ms(&self) -> u64 {
-        self.utc_floor_ms
+    pub fn utc_floor_ms(&self) -> u64 {
+        self.utc_floor.get()
+    }
+
+    /// The floor itself, for a reader that holds it beside the policy rather than behind its lock.
+    #[must_use]
+    pub const fn utc_floor(&self) -> &Arc<UtcFloor> {
+        &self.utc_floor
     }
 
     /// The authority revision in force.
@@ -285,7 +329,7 @@ impl HostPolicy {
     pub fn snapshot(&self) -> StoredPolicy {
         StoredPolicy {
             accepted_floor: self.accepted_floor,
-            utc_floor_ms: kr_protocol::scalars::TimestampMs::new(self.utc_floor_ms),
+            utc_floor_ms: kr_protocol::scalars::TimestampMs::new(self.utc_floor.get()),
             exclusively_managed: self.exclusively_managed,
             offline: kr_protocol::scalars::Nullable(self.offline),
             enrolments: self
@@ -329,7 +373,7 @@ impl HostPolicy {
             exclusively_managed: stored.exclusively_managed,
             offline: stored.offline.0,
             revalidated_at_ms: 0,
-            utc_floor_ms: stored.utc_floor_ms.get(),
+            utc_floor: Arc::new(UtcFloor::at(stored.utc_floor_ms.get())),
         }
     }
 

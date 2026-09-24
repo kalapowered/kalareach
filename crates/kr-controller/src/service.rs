@@ -373,15 +373,18 @@ pub struct Controller {
     /// delivery runtime intersects an external destination's grant with the same policy at every
     /// question, and the automation service decides each node it dispatches under it.
     policy: Arc<std::sync::Mutex<crate::grants::HostPolicy>>,
-    /// True while a decision this daemon took on the policy's clock floor is owed that floor's
-    /// record.
+    /// The highest clock floor a decision this daemon took on it is owed the record of.
     ///
     /// A refusal the clock decided has to outlive this process: a clock wound back before the next
     /// start would otherwise find the floor as it was last written and allow what was refused. The
-    /// write can fail, so the debt is kept rather than dropped. It is read and changed only while
-    /// the policy's lock is held, and every later decision on the floor, and the network's record
-    /// task, writes the floor again until a write lands.
-    floor_owed: std::sync::atomic::AtomicBool,
+    /// write can fail, so the debt is kept rather than dropped: the record is owed while this is
+    /// above [`Self::floor_written`]. Both only rise, so a decision owes its floor from wherever it
+    /// was taken, a poll that cannot wait for the policy's lock included, and a write can only
+    /// settle the floor it carried. Every later decision on the floor, the relay once a batch is
+    /// refused, and the network's record task write the floor again until a write lands.
+    floor_owed: std::sync::atomic::AtomicU64,
+    /// The highest clock floor this daemon has written down.
+    floor_written: std::sync::atomic::AtomicU64,
     /// Moves whenever something a paired device's authority is decided from changes: this host's
     /// policy, or the rights ceiling in force.
     ///
@@ -390,21 +393,20 @@ pub struct Controller {
     /// hand bytes over, so a change that lands while a batch waits for the writer or for the peer
     /// stops it there: the batch is decided again, or, once bytes are moving, the connection ends.
     authority_epoch: std::sync::atomic::AtomicU64,
-    /// The policy's clock floor as this daemon last saw it, for a reader that cannot take the lock.
+    /// The policy's clock floor itself, which the policy shares with every holder of it.
     ///
     /// The write boundary decides at every attempt to hand bytes over whether a relayed batch's
-    /// decision has run out by this host's reading of UTC, and that reading is the later of the
-    /// wall clock and the floor. A poll cannot wait for the policy's lock, so it reads the floor
-    /// through the lock when nobody holds it and this copy when somebody does. Every decision this
-    /// daemon takes raises it, and it only ever rises.
-    utc_floor: std::sync::atomic::AtomicU64,
-    /// The bounded offline validity as it was anchored on the continuous clock, once for the bound
-    /// and the synchronisation it is measured from.
+    /// decision has run out by this host's reading of UTC, and a poll cannot wait for the policy's
+    /// lock. This is the same floor the lock guards, not a copy of it: whoever raises it under the
+    /// lock, the automation path included, raises what the poll reads, and the reading the poll
+    /// takes raises what every later decision stands on.
+    utc_floor: Arc<crate::grants::policy::UtcFloor>,
+    /// The time the bounded offline validity has spent, kept on the continuous clock
+    /// ([`net::OfflineAnchor`]).
     ///
-    /// Measured in UTC, the bound would be lengthened by a wall clock wound back while it runs: the
-    /// floor holds UTC still until the clock catches up. Anchored once, it runs on the clock that
-    /// cannot be wound back, and a lapse it records stays a lapse until the owner changes the bound
-    /// or the authority feed synchronises.
+    /// Measured in UTC alone, the bound would be lengthened by a wall clock wound back while it
+    /// runs: the floor holds UTC still until the clock catches up. Taken when the policy holding
+    /// the bound is restored, accepted or synchronised, and changed only under the policy's lock.
     offline_anchor: std::sync::Mutex<Option<net::OfflineAnchor>>,
     /// This host's half of the remote authority feed: the revisions only it issues, the revocation
     /// records it retains, and the synchronisation it owes before it serves remote work again.
@@ -677,7 +679,8 @@ impl Controller {
             None => crate::grants::HostPolicy::personal(authority_revision),
         };
         sharing.grants().store_policy(&policy.snapshot())?;
-        let utc_floor = policy.utc_floor_ms();
+        let utc_floor = Arc::clone(policy.utc_floor());
+        let floor_written = policy.utc_floor_ms();
         let policy = Arc::new(std::sync::Mutex::new(policy));
         let mut feed = match sharing.grants().stored_feed()? {
             Some(stored) => crate::grants::AuthorityFeed::restore(&stored),
@@ -695,6 +698,26 @@ impl Controller {
         let devices = Arc::new(net::devices::DeviceDirectory::open(
             setup.paths.registry_database(),
         )?);
+        // The offline bound's time, taken as the policy holding it is restored and before anything
+        // remote is decided under it: from what this boot recorded of it, advanced by the boot
+        // clock, and never less than this host's reading of UTC says.
+        let shared_clock: Arc<dyn kr_ipc::clock::SharedClock> =
+            Arc::new(kr_ipc::clock::SystemSharedClock);
+        let offline_anchor = net::offline_anchor(
+            policy
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .offline_validity(),
+            None,
+            &net::AnchorSources {
+                clock: &*clock,
+                boot_clock: &*shared_clock,
+                wall_clock: &net::wall_clock_now_ms,
+                boot: &setup.boot_identity,
+                devices: &devices,
+                floor: &utc_floor,
+            },
+        )?;
         // The automation service reads the grant each definition names from the stores this
         // daemon already holds (the grant store, and a paired device's own record), under this
         // daemon's own policy, and carries out its change-set nodes through the change-set
@@ -764,7 +787,7 @@ impl Controller {
             boot_identity: setup.boot_identity,
             boot_epoch,
             windows: ActionWindowIssuer::with_default_validity(Arc::clone(&clock) as Arc<_>),
-            shared_clock: Arc::new(kr_ipc::clock::SystemSharedClock),
+            shared_clock,
             leases: crate::authority::AuthorityBarrier::new(generation, authority_revision),
             clock,
             network: std::sync::OnceLock::new(),
@@ -779,10 +802,11 @@ impl Controller {
             delivery_runtime,
             devices,
             policy,
-            floor_owed: std::sync::atomic::AtomicBool::new(false),
+            floor_owed: std::sync::atomic::AtomicU64::new(0),
+            floor_written: std::sync::atomic::AtomicU64::new(floor_written),
             authority_epoch: std::sync::atomic::AtomicU64::new(0),
-            utc_floor: std::sync::atomic::AtomicU64::new(utc_floor),
-            offline_anchor: std::sync::Mutex::new(None),
+            utc_floor,
+            offline_anchor: std::sync::Mutex::new(offline_anchor),
             feed: std::sync::Mutex::new(feed),
             changesets,
             automation,
@@ -1839,11 +1863,49 @@ impl Controller {
         // an error the caller sees would be an error about something that happened.
         let mut candidate = held.clone();
         let value = change(&mut candidate);
-        self.sharing.grants().store_policy(&candidate.snapshot())?;
+        // The offline bound's time is taken with the policy that holds it: a change measured from
+        // another synchronisation starts it again, and any other change keeps the time already
+        // spent. Written down before the policy, and put back when the policy is not.
+        let mut anchor = self
+            .offline_anchor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = *anchor;
+        let next = net::offline_anchor(
+            candidate.offline_validity(),
+            previous,
+            &net::AnchorSources {
+                clock: &*self.clock,
+                boot_clock: &*self.shared_clock,
+                wall_clock: &net::wall_clock_now_ms,
+                boot: &self.boot_identity,
+                devices: &self.devices,
+                floor: &self.utc_floor,
+            },
+        )?;
+        let snapshot = candidate.snapshot();
+        if let Err(error) = self.sharing.grants().store_policy(&snapshot) {
+            if next != previous
+                && let Some(previous) = previous
+                && let Err(restore) = self
+                    .devices
+                    .record_offline_anchor(&self.boot_identity, &previous.stored())
+            {
+                eprintln!(
+                    "kr-controller: could not put back the offline bound's record after a failed \
+                     policy write: {restore}"
+                );
+            }
+            return Err(error);
+        }
+        self.floor_written.fetch_max(
+            snapshot.utc_floor_ms.get(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         *held = candidate;
+        *anchor = next;
         // Published with the policy, under its lock, so a decision that reads this epoch reads the
         // policy it names or a later one.
-        self.publish_floor(held.utc_floor_ms());
         self.advance_authority_epoch();
         Ok(value)
     }
@@ -1864,7 +1926,6 @@ impl Controller {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         policy.observe_utc(now_ms);
-        self.publish_floor(policy.utc_floor_ms());
         let settled = policy.settled_now(now_ms);
         // Whatever the caller decides from this reading stands on the floor, so the floor is owed
         // its record. A failure leaves the raised floor in memory, because a floor only moves
@@ -1880,7 +1941,7 @@ impl Controller {
     /// older floor on disk.
     pub(crate) fn owe_floor(&self, policy: &std::sync::MutexGuard<'_, crate::grants::HostPolicy>) {
         self.floor_owed
-            .store(true, std::sync::atomic::Ordering::Release);
+            .fetch_max(self.utc_floor.get(), std::sync::atomic::Ordering::SeqCst);
         self.write_owed_floor(policy);
     }
 
@@ -1893,35 +1954,46 @@ impl Controller {
         &self,
         policy: &std::sync::MutexGuard<'_, crate::grants::HostPolicy>,
     ) {
-        if !self.floor_owed.load(std::sync::atomic::Ordering::Acquire) {
+        let owed = self.floor_owed.load(std::sync::atomic::Ordering::SeqCst);
+        if owed <= self.floor_written.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
-        match self.sharing.grants().store_policy(&policy.snapshot()) {
-            Ok(()) => self
-                .floor_owed
-                .store(false, std::sync::atomic::Ordering::Release),
+        // The floor as it stands is never below what is owed: the debt was taken from it, and it
+        // only rises.
+        let snapshot = policy.snapshot();
+        match self.sharing.grants().store_policy(&snapshot) {
+            Ok(()) => {
+                self.floor_written.fetch_max(
+                    snapshot.utc_floor_ms.get(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }
             Err(error) => eprintln!(
                 "kr-controller: could not record the clock floor this host decided from: {error}"
             ),
         }
     }
 
-    /// Raises the published copy of the policy's clock floor to `floor`.
-    pub(crate) fn publish_floor(&self, floor: u64) {
-        self.utc_floor
-            .fetch_max(floor, std::sync::atomic::Ordering::SeqCst);
+    /// This host's reading of UTC for a caller that cannot wait: the later of the wall clock and
+    /// the policy's floor.
+    ///
+    /// The reading raises the floor, so whatever the caller decides from it holds for every later
+    /// decision. It never waits, so it may be called from inside a poll.
+    pub(crate) fn settled_utc_now(&self) -> u64 {
+        self.utc_floor.observe(kr_ipc::now_ms().get())
     }
 
-    /// This host's reading of UTC for a caller that cannot wait: the later of the wall clock and
-    /// the policy's floor, read through the lock when it is free and from the published copy when
-    /// it is not. It never waits, so it may be called from inside a poll.
-    pub(crate) fn settled_utc_now(&self) -> u64 {
-        if let Ok(policy) = self.policy.try_lock() {
-            self.publish_floor(policy.utc_floor_ms());
-        }
-        kr_ipc::now_ms()
-            .get()
-            .max(self.utc_floor.load(std::sync::atomic::Ordering::SeqCst))
+    /// Records a lapse found at `at_ms`: this host's reading of UTC is at least that from here
+    /// on, and a floor that says so is owed its record.
+    ///
+    /// It never waits, so a poll may call it. The record is written by the next caller that can
+    /// write: the relay once its batch is refused, the next decision, or the network's record
+    /// task. What is owed is the moment itself, so a lapse found again once it is written down
+    /// owes nothing more.
+    pub(crate) fn keep_lapse(&self, at_ms: u64) {
+        self.utc_floor.observe(at_ms);
+        self.floor_owed
+            .fetch_max(at_ms, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// The epoch a paired device's authority is decided at now.
