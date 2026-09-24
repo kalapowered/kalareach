@@ -215,14 +215,7 @@ fn worker() -> &'static Path {
             built.display()
         );
         let copied = support::command_binaries().join("kr-worker");
-        std::fs::copy(&built, &copied).expect("copies the worker to the internal disk");
-        let _ = std::process::Command::new(&copied)
-            .arg("--version")
-            .current_dir(support::command_binaries())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        kr_ipc::testing::place_and_start_once(&built, &copied, &["--version"]);
         copied
     })
 }

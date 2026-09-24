@@ -43,19 +43,11 @@ pub fn command_binaries() -> &'static Path {
             Path::new(env!("CARGO_BIN_EXE_kr-attach-guard")),
         ] {
             let name = source.file_name().expect("the binary has a name");
-            let destination = root.join(name);
-            kr_ipc::testing::place_program(source, &destination);
-            // Run it once, here, where nothing is being timed. The operating system checks a binary
-            // it has not seen before on its first run and remembers it afterwards, and that check
-            // takes seconds where the run itself takes milliseconds. A test that paid it inside a
-            // wait would be measuring the check.
-            let _ = std::process::Command::new(&destination)
-                .arg("--version")
-                .current_dir(&root)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+            // Run once, here, where nothing is being timed. The operating system checks each newly
+            // written executable on its first run, and that check takes seconds where the run
+            // itself takes milliseconds. A test that paid it inside a wait would be measuring the
+            // check.
+            kr_ipc::testing::place_and_start_once(source, &root.join(name), &["--version"]);
         }
         root
     })

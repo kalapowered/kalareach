@@ -95,9 +95,12 @@ impl Host {
         } else {
             "kr-worker"
         });
-        kr_ipc::testing::place_program(
+        // Started once here, where nothing is timed, so the operating system's check of a new
+        // executable is not paid inside a create's rendezvous.
+        kr_ipc::testing::place_and_start_once(
             std::path::Path::new(env!("CARGO_BIN_EXE_kr-worker")),
             &worker,
+            &["--version"],
         );
         Self {
             temp,

@@ -625,9 +625,10 @@ async fn a_terminal_that_cannot_be_opened_leaves_one_live_session_and_a_presenta
     let temp = teardown::Tree::create();
     // On the internal disk, and never the copy in the workspace: a worker a service manager starts
     // is its own privacy identity, and one that opened a path on the external volume would stop
-    // for a dialog.
+    // for a dialog. Started once here, where nothing is timed, so the operating system's check of
+    // a new executable is not paid inside the create's rendezvous.
     let worker = temp.root().join("kr-worker");
-    kr_ipc::testing::place_program(&worker_build, &worker);
+    kr_ipc::testing::place_and_start_once(&worker_build, &worker, &["--version"]);
     let environment = temp.environment();
     let environment_id = temp.environment_id();
     let secrets = environment.secrets_dir();

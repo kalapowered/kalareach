@@ -147,6 +147,13 @@ suites=(
 # own binary. Building it first is what makes the suite run rather than say it could not.
 echo "building the worker the suites launch"
 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo build -p kr-worker --bin kr-worker
+# The build is started once, now, and waited for, before any suite's deadline counts. The operating
+# system checks a newly written executable the first time it starts, which on a loaded machine can
+# take long enough to spend a create's rendezvous. The check is made again for every new copy, so
+# each suite also starts its own copy once, before it times anything.
+first_start=$SECONDS
+"${CARGO_TARGET_DIR:-$root/target}/debug/kr-worker" --version >/dev/null
+echo "the new worker's first start took $((SECONDS - first_start)) s"
 
 failed=0
 for entry in "${suites[@]}"; do

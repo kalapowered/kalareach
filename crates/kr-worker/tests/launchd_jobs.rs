@@ -88,9 +88,15 @@ impl Host {
         let environment_id = temp.environment_id();
         // Copied to the internal disk before it is started: a process launchd starts is its own
         // identity to the operating system, and one that reached a removable volume would ask the
-        // person at the machine for permission.
+        // person at the machine for permission. The copy is started once here, where nothing is
+        // timed, so the operating system's check of a new executable is not paid inside a
+        // create's rendezvous.
         let worker = temp.root().join("kr-worker");
-        kr_ipc::testing::place_program(Path::new(env!("CARGO_BIN_EXE_kr-worker")), &worker);
+        kr_ipc::testing::place_and_start_once(
+            Path::new(env!("CARGO_BIN_EXE_kr-worker")),
+            &worker,
+            &["--version"],
+        );
         Self {
             temp,
             worker,

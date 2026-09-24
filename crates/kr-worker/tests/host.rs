@@ -190,15 +190,17 @@ impl Host {
         let environment_id = temp.environment_id();
         // The worker is copied to the internal disk before it is started. The build tree may live
         // on a removable volume, and a launched process that reaches one prompts the person at the
-        // machine for permission.
+        // machine for permission. The copy is started once here, where nothing is timed, so the
+        // operating system's check of a new executable is not paid inside a create's rendezvous.
         let worker = temp.root().join(if cfg!(windows) {
             "kr-worker.exe"
         } else {
             "kr-worker"
         });
-        kr_ipc::testing::place_program(
+        kr_ipc::testing::place_and_start_once(
             std::path::Path::new(env!("CARGO_BIN_EXE_kr-worker")),
             &worker,
+            &["--version"],
         );
         Self {
             temp,

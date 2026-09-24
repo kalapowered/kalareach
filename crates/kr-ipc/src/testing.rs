@@ -184,3 +184,81 @@ pub fn place_program(source: &Path, destination: &Path) {
         });
     }
 }
+
+/// How long the first start of a placed program is given to end.
+///
+/// A bound on what the operating system does before the program runs at all, and a wide one: a
+/// start that has not ended in five minutes is a machine that cannot run the test, and the
+/// caller's own deadlines are what measure the program.
+const FIRST_START_BOUND: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Places a program as [`place_program`] does, starts the placed copy once with `arguments`, and
+/// waits for that start to end before it returns how long the start took.
+///
+/// The operating system checks an executable the first time it is started from a newly written
+/// file. That is paid once per file rather than once per build: every copy pays it, and a copy
+/// that has been started once starts in milliseconds afterwards. On macOS a copy of the debug
+/// worker takes about a second for it on a quiet machine and several times that on a loaded one,
+/// which is enough to spend a deadline the product holds its first real start to, such as a
+/// worker's rendezvous. Paid here, where nothing is timed, it stays out of every test's deadline,
+/// and the product's deadlines stay what they are.
+///
+/// `arguments` must make the program end at once and touch nothing, such as `--version`. The start
+/// runs in the directory the program was placed in, with nothing to read and nowhere to write.
+///
+/// # Panics
+///
+/// Panics when the program cannot be placed or started, or when its first start does not end
+/// successfully within five minutes.
+pub fn place_and_start_once(
+    source: &Path,
+    destination: &Path,
+    arguments: &[&str],
+) -> std::time::Duration {
+    place_program(source, destination);
+    let started = std::time::Instant::now();
+    let mut command = std::process::Command::new(destination);
+    command
+        .args(arguments)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(directory) = destination.parent() {
+        command.current_dir(directory);
+    }
+    let mut child = command.spawn().unwrap_or_else(|error| {
+        panic!(
+            "the program placed at {} could not be started: {error}",
+            destination.display()
+        )
+    });
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                assert!(
+                    status.success(),
+                    "the first start of the program placed at {} ended with {status}",
+                    destination.display()
+                );
+                return started.elapsed();
+            }
+            Ok(None) if started.elapsed() < FIRST_START_BOUND => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(None) => {
+                // This process's own child, which it has not collected, so the number is still its.
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "the first start of the program placed at {} did not end within \
+                     {FIRST_START_BOUND:?}",
+                    destination.display()
+                );
+            }
+            Err(error) => panic!(
+                "the first start of the program placed at {} could not be waited for: {error}",
+                destination.display()
+            ),
+        }
+    }
+}

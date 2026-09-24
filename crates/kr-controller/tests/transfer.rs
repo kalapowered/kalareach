@@ -1149,9 +1149,12 @@ async fn a_daemon_killed_mid_upload_is_replaced_and_the_upload_resumes() {
     let environment = host.environment();
     let environment_id = host.environment_id();
     let program = host.root().join("kr-controller");
-    kr_ipc::testing::place_program(
+    // Started once here, where nothing is timed, so the operating system's check of a new
+    // executable is not paid inside the wait for the daemon.
+    kr_ipc::testing::place_and_start_once(
         std::path::Path::new(env!("CARGO_BIN_EXE_kr-controller")),
         &program,
+        &["--version"],
     );
     let endpoint = environment.controller_endpoint().expect("an endpoint");
     let chunk_address = chunk_endpoint(&environment).expect("an addressable chunk endpoint");
@@ -1620,9 +1623,12 @@ async fn a_daemon_given_relative_directories_binds_the_endpoints_this_test_deriv
     let environment = host.environment();
     let environment_id = host.environment_id();
     let program = host.root().join("kr-controller");
-    kr_ipc::testing::place_program(
+    // Started once here, where nothing is timed, so the operating system's check of a new
+    // executable is not paid inside the wait for the daemon.
+    kr_ipc::testing::place_and_start_once(
         std::path::Path::new(env!("CARGO_BIN_EXE_kr-controller")),
         &program,
+        &["--version"],
     );
     let endpoint = environment.controller_endpoint().expect("an endpoint");
 

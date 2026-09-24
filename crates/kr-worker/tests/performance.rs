@@ -64,15 +64,17 @@ async fn host() -> Host {
     let environment_id = temp.environment_id();
     // On the internal disk, because a process a service manager launches is its own identity to
     // the operating system and one that reaches a removable volume prompts the person at the
-    // machine.
+    // machine. Started once here, where nothing is measured, so the operating system's check of a
+    // new executable is in no timing below.
     let worker = temp.root().join(if cfg!(windows) {
         "kr-worker.exe"
     } else {
         "kr-worker"
     });
-    kr_ipc::testing::place_program(
+    kr_ipc::testing::place_and_start_once(
         std::path::Path::new(env!("CARGO_BIN_EXE_kr-worker")),
         &worker,
+        &["--version"],
     );
     let secrets = environment.secrets_dir();
     let controller = Controller::start(ControllerSetup {

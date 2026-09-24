@@ -207,9 +207,12 @@ fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
 }
 
+/// Copies an executable into `directory` and starts the copy once, where nothing is timed, so the
+/// operating system's check of a newly written executable is paid here rather than inside the
+/// daemon's start or a create's rendezvous.
 fn copy_into(source: &Path, directory: &Path) -> PathBuf {
     let destination = directory.join(source.file_name().expect("an executable has a name"));
-    std::fs::copy(source, &destination).expect("copies an executable to the internal disk");
+    kr_ipc::testing::place_and_start_once(source, &destination, &["--version"]);
     destination
 }
 

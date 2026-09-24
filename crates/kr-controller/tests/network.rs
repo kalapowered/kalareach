@@ -130,7 +130,9 @@ impl Host {
         let temp = teardown::Tree::create();
         let environment_id = temp.environment_id();
         let worker = temp.root().join("kr-worker");
-        kr_ipc::testing::place_program(&worker_build, &worker);
+        // Started once here, where nothing is timed, so the operating system's check of a new
+        // executable is not paid inside a create's rendezvous.
+        kr_ipc::testing::place_and_start_once(&worker_build, &worker, &["--version"]);
         Some(Self {
             temp,
             worker,

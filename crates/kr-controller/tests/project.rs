@@ -950,9 +950,12 @@ async fn a_daemon_killed_mid_clone_is_replaced_and_the_destination_is_untouched(
     let environment = host.environment();
     let environment_id = host.environment_id();
     let program = host.root().join("kr-controller");
-    kr_ipc::testing::place_program(
+    // Started once here, where nothing is timed, so the operating system's check of a new
+    // executable is not paid inside the wait for the daemon.
+    kr_ipc::testing::place_and_start_once(
         std::path::Path::new(env!("CARGO_BIN_EXE_kr-controller")),
         &program,
+        &["--version"],
     );
     let endpoint = environment.controller_endpoint().expect("an endpoint");
     let work = tempfile::TempDir::new().expect("a working directory on the internal disk");

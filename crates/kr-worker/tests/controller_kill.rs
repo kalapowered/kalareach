@@ -424,7 +424,13 @@ async fn a_daemon_killed_during_output_leaves_local_work_running_and_a_reconnect
     let host = teardown::Tree::create();
     let environment_id = host.environment_id();
     let worker = host.root().join("kr-worker");
-    std::fs::copy(env!("CARGO_BIN_EXE_kr-worker"), &worker).expect("copies the worker");
+    // Started once here, where nothing is timed, so the operating system's check of a new
+    // executable is not paid inside a create's rendezvous.
+    kr_ipc::testing::place_and_start_once(
+        std::path::Path::new(env!("CARGO_BIN_EXE_kr-worker")),
+        &worker,
+        &["--version"],
+    );
     let program = host.root().join("kill-test-daemon");
     std::fs::copy(
         std::env::current_exe().expect("this test's own executable"),
