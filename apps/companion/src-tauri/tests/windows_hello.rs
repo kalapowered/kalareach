@@ -5,12 +5,15 @@
 //! sends the person to another owner device. The first test reads that from the running system,
 //! through the types the application uses, and runs on any Windows machine.
 //!
-//! The others raise Windows Hello's own dialog for a window of this process, so they need what a
-//! person's computer has: a signed-in desktop, and Windows Hello set up for the account. They are
-//! ignored, and run on purpose from a terminal on that desktop. The first command needs nobody at
-//! the keyboard, because UI Automation presses the dialog's buttons, as desktop automation could,
-//! and no credential is ever entered. The second needs the person, who enters the account's
-//! Windows Hello PIN when the dialog asks.
+//! The others make this computer the owner device of kr-controller's in-process host, which asks
+//! its owner to confirm an invitation, and review that request through Windows Hello for a window
+//! of this process, as the application reviews one for its own window. Windows Hello's dialog
+//! needs what a person's computer has: a signed-in desktop, and Windows Hello set up for the
+//! account. So those tests are ignored, and run on purpose from a terminal on that desktop. The
+//! first command below needs nobody at the keyboard, because UI Automation presses the dialog's
+//! buttons, as desktop automation could, and no credential is ever entered; it takes about three
+//! minutes, because one test waits out a challenge's two-minute lifetime. The second needs the
+//! person, who enters the account's Windows Hello PIN when the dialog asks.
 //!
 //! ```text
 //! cargo test -p companion-tauri --test windows_hello -- --include-ignored --test-threads 1 --skip a_person_who_enters_the_pin_confirms
@@ -19,21 +22,33 @@
 
 #![cfg(windows)]
 
+#[path = "../../../../crates/kr-controller/tests/net_support/mod.rs"]
+mod net_support;
+mod support;
+
 use std::io::Read as _;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use companion_tauri::device::{Device, Parts};
-use companion_tauri::owner::Owner;
+use companion_tauri::owner::{Owner, RequestView};
 use companion_tauri::verify::hello::WindowsHello;
 use kr_client::pairing::BoxFuture;
 use kr_client::pairing::candidate::CandidateRoom;
 use kr_client::pairing::clock::DeviceClock;
-use kr_client::pairing::owner::{Ceremony as _, CeremonyKind, CeremonyOutcome};
+use kr_client::pairing::owner::{Ceremony as _, CeremonyKind, ReviewOutcome};
 use kr_client::pairing::room::{RoomError, RoomSocket};
+use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::MemoryStore;
-use kr_protocol::pairing::{Locator, RendezvousOrigin};
+use kr_ipc::client::LocalClient;
+use kr_protocol::confirmation::ConfirmationSubject;
+use kr_protocol::invitation::{InviteGrantKind, InviteModeKind};
+use kr_protocol::pairing::{Locator, OwnerConfirmationRequest, RendezvousOrigin};
+use kr_protocol::rights::ActionRight;
+use kr_protocol::scalars::Nullable;
+use net_support::pairing as calls;
+use net_support::{Host, proposal};
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::platform::run_return::EventLoopExtRunReturn as _;
@@ -41,9 +56,6 @@ use tao::platform::windows::{EventLoopBuilderExtWindows as _, WindowExtWindows a
 use tao::window::WindowBuilder;
 use windows::Security::Credentials::UI::{UserConsentVerifier, UserConsentVerifierAvailability};
 use windows::Win32::Foundation::HWND;
-
-/// The sentence the dialogs print, as a confirmation's description would read.
-const REASON: &str = "Confirm that the test host may pair a new device that can view sessions.";
 
 /// What Windows calls each availability, for the record a run leaves.
 fn availability_name(availability: UserConsentVerifierAvailability) -> &'static str {
@@ -164,8 +176,9 @@ impl Drop for TestWindow {
 
 /// UI Automation on Windows Hello's dialog, in Windows PowerShell. It waits for the dialog,
 /// records its texts and buttons, and then either presses every button but Cancel and then
-/// Cancel (`press`), or presses nothing (`watch`); either way it records when the dialog goes.
-const AUTOMATION: &str = r#"param([string]$mode)
+/// Cancel (`press`), or presses nothing (`watch`); either way it records when the dialog goes,
+/// waiting at most `$seconds` after it appeared.
+const AUTOMATION: &str = r#"param([string]$mode, [int]$seconds)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
@@ -221,11 +234,11 @@ if ($mode -eq 'press') {
   $cancel.GetCurrentPattern($invoke).Invoke()
   '== pressed Cancel'
 }
-while ($clock.ElapsedMilliseconds - $seen -lt 60000) {
+while ($clock.ElapsedMilliseconds - $seen -lt $seconds * 1000) {
   if (-not (Find-Dialog)) { "== gone $($clock.ElapsedMilliseconds - $seen) ms after it was seen"; exit 0 }
   Start-Sleep -Milliseconds 200
 }
-'== still up after a minute'
+"== still up after $seconds seconds"
 exit 4
 "#;
 
@@ -237,7 +250,7 @@ struct Automation {
 }
 
 impl Automation {
-    fn start(mode: &str) -> Self {
+    fn start(mode: &str, seconds: u64) -> Self {
         let script = tempfile::tempdir().expect("a directory");
         let path = script.path().join("dialog.ps1");
         std::fs::write(&path, AUTOMATION).expect("the script is written");
@@ -251,6 +264,7 @@ impl Automation {
             ])
             .arg(&path)
             .arg(mode)
+            .arg(seconds.to_string())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -291,89 +305,191 @@ impl Automation {
     }
 }
 
-/// KR-REQ-10.06: Windows Hello's dialog belongs to this computer's window and prints the
-/// confirmation's sentence. Pressing its buttons through UI Automation, as desktop automation
-/// could, with no credential entered, confirms nothing: the dialog closes on its own Cancel
-/// button, and the answer is "not confirmed", well before the challenge's time runs out.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// This computer as the owner device of an in-process host, reviewing with Windows Hello for a
+/// window of its own, with the request the host has just asked its owner to confirm listed.
+struct Asked {
+    host: Host,
+    client: LocalClient,
+    owner: Arc<Owner>,
+    request: RequestView,
+    challenge: OwnerConfirmationRequest,
+    _data: tempfile::TempDir,
+}
+
+impl Asked {
+    async fn new(window: &TestWindow) -> Self {
+        let owner_keys = DeviceKeys::generate().expect("keys");
+        let host = Host::start(&owner_keys).await;
+        let mut client = host.client().await;
+        let data = tempfile::tempdir().expect("a directory");
+        let device: Arc<Device> = support::owner_device(&host, &owner_keys, data.path());
+        let owner = Owner::new(device, Arc::new(window.ceremony()), || {});
+        owner.start();
+        let challenge = calls::request(
+            host.environment_id,
+            &mut client,
+            ConfirmationSubject::IssueInvitation {
+                mode: InviteModeKind::Direct,
+                rendezvous_origin: Nullable::null(),
+                grant_kind: InviteGrantKind::SessionInvitation,
+                proposed_grant: proposal(&[ActionRight::SessionView]),
+            },
+        )
+        .await
+        .expect("the local owner asks")
+        .request;
+        let request = support::listed(&owner, |request| request.checkable).await;
+        Self {
+            host,
+            client,
+            owner,
+            request,
+            challenge,
+            _data: data,
+        }
+    }
+
+    /// The sentence the dialog prints: what the request would authorise, in one line.
+    fn sentence(&self) -> String {
+        self.request
+            .detail
+            .clone()
+            .expect("a request this computer checked has its sentence")
+    }
+
+    /// Whether the host recorded an answer to its challenge.
+    fn answered(&self) -> bool {
+        self.host
+            .network()
+            .pairing()
+            .rows()
+            .acceptance(self.challenge.confirmation_id)
+            .expect("readable")
+            .is_some()
+    }
+
+    /// Whether the host still holds its challenge open for an answer.
+    async fn still_asking(&mut self) -> bool {
+        calls::pending(&mut self.client)
+            .await
+            .expect("readable")
+            .pending
+            .iter()
+            .any(|pending| {
+                pending.request.confirmation_id == self.challenge.confirmation_id
+                    && !pending.answered
+            })
+    }
+}
+
+/// A window, and Windows Hello for it, which has to be set up here.
+fn windows_hello() -> TestWindow {
+    let window = TestWindow::open();
+    assert_eq!(
+        window.ceremony().kind(),
+        CeremonyKind::WindowsHello,
+        "Windows Hello is set up for this account"
+    );
+    window
+}
+
+/// KR-REQ-10.06: reviewing a host's request raises Windows Hello's dialog, which belongs to this
+/// computer's window and prints the request's sentence. Pressing the dialog's buttons through UI
+/// Automation, as desktop automation could, with no credential entered, confirms nothing: the
+/// dialog closes on its own buttons, Cancel last, the review answers "not confirmed" well before
+/// the challenge runs out, the host records no answer, and its challenge is still waiting for one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "raises Windows Hello's dialog: needs a signed-in desktop with Windows Hello set up"]
 async fn pressing_the_dialogs_buttons_without_a_credential_confirms_nothing() {
-    const WITHIN: Duration = Duration::from_secs(60);
-    let window = TestWindow::open();
-    let ceremony = window.ceremony();
-    assert_eq!(
-        ceremony.kind(),
-        CeremonyKind::WindowsHello,
-        "Windows Hello is set up"
-    );
-    let automation = Automation::start("press");
+    let window = windows_hello();
+    let mut asked = Asked::new(&window).await;
+    let automation = Automation::start("press", 30);
     let started = Instant::now();
-    let outcome = ceremony.verify(REASON, WITHIN).await;
-    let answered = started.elapsed();
-    let record = automation.finish(Duration::from_secs(30));
+    let outcome = asked
+        .owner
+        .review(&asked.request.reference)
+        .await
+        .expect("reviewed");
+    let answered_in = started.elapsed();
+    let record = automation.finish(Duration::from_secs(60));
     println!("{record}");
-    assert_eq!(outcome, CeremonyOutcome::NotConfirmed);
+    assert_eq!(outcome, ReviewOutcome::NotConfirmed);
     assert!(
-        answered < WITHIN,
-        "the dialog answered, not the time: {answered:?}"
+        answered_in < Duration::from_secs(60),
+        "the dialog answered, not the time: {answered_in:?}"
     );
     assert!(record.contains("== dialog "), "the dialog was raised");
+    let sentence = asked.sentence();
     assert!(
         record
             .lines()
-            .any(|line| line.starts_with("== text ") && line.contains(REASON)),
-        "the dialog prints the sentence"
+            .any(|line| line.starts_with("== text ") && line.contains(&sentence)),
+        "the dialog prints {sentence:?}"
+    );
+    assert!(
+        record.contains("== pressed Cancel") || record.contains("== gone after "),
+        "one of its own buttons closed it"
     );
     assert!(record.contains("== gone "), "the dialog closed");
+    assert!(!asked.answered(), "no completion reached the host");
+    assert!(asked.still_asking().await, "the challenge is unanswered");
+    asked.host.stop().await;
 }
 
-/// KR-REQ-10.06: a dialog nobody answers is cancelled when the challenge's time runs out, the
-/// answer is "not confirmed", and the dialog goes with it, so no late answer can reach a signature.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// KR-REQ-10.06: a dialog nobody answers is cancelled when the challenge's time runs out: the
+/// review answers "not confirmed" at that moment, the dialog goes with it, so no late answer can
+/// reach a signature, and the host records no answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "raises Windows Hello's dialog: needs a signed-in desktop with Windows Hello set up"]
 async fn a_dialog_left_past_the_challenges_time_is_cancelled_and_not_confirmed() {
-    const WITHIN: Duration = Duration::from_secs(8);
-    let window = TestWindow::open();
-    let ceremony = window.ceremony();
-    assert_eq!(
-        ceremony.kind(),
-        CeremonyKind::WindowsHello,
-        "Windows Hello is set up"
-    );
-    let automation = Automation::start("watch");
-    let started = Instant::now();
-    let outcome = ceremony.verify(REASON, WITHIN).await;
-    let answered = started.elapsed();
-    let record = automation.finish(Duration::from_secs(30));
+    let window = windows_hello();
+    let asked = Asked::new(&window).await;
+    let automation = Automation::start("watch", 180);
+    let outcome = asked
+        .owner
+        .review(&asked.request.reference)
+        .await
+        .expect("reviewed");
+    let answered_at = kr_ipc::now_ms().get();
+    let record = automation.finish(Duration::from_secs(60));
     println!("{record}");
-    assert_eq!(outcome, CeremonyOutcome::NotConfirmed);
+    assert_eq!(outcome, ReviewOutcome::NotConfirmed);
+    let expires_at = asked.challenge.expires_at_ms.get();
     assert!(
-        answered >= WITHIN && answered < WITHIN + Duration::from_secs(5),
-        "answered when the time ran out: {answered:?}"
+        answered_at >= expires_at && answered_at < expires_at + 5_000,
+        "answered when the challenge ran out: {answered_at} against {expires_at}"
     );
     assert!(record.contains("== dialog "), "the dialog was raised");
     assert!(!record.contains("== pressed"), "nothing pressed it");
     assert!(record.contains("== gone "), "the dialog was cancelled");
+    assert!(!asked.answered(), "no completion reached the host");
+    asked.host.stop().await;
 }
 
 /// KR-REQ-10.06: the person at this computer enters the account's Windows Hello PIN in the
-/// dialog, and the answer is "confirmed", the one answer that lets this computer sign.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// dialog, the review answers "confirmed", and the host records exactly that answer, from this
+/// owner device's presence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the person at this computer to enter the account's Windows Hello PIN"]
 async fn a_person_who_enters_the_pin_confirms() {
-    let window = TestWindow::open();
-    let ceremony = window.ceremony();
-    assert_eq!(
-        ceremony.kind(),
-        CeremonyKind::WindowsHello,
-        "Windows Hello is set up"
-    );
+    let window = windows_hello();
+    let mut asked = Asked::new(&window).await;
     println!("== enter this account's Windows Hello PIN in the dialog");
-    let outcome = ceremony
-        .verify(
-            "Enter your PIN to confirm this test of KalaReach.",
-            Duration::from_secs(120),
-        )
-        .await;
-    assert_eq!(outcome, CeremonyOutcome::Confirmed);
+    let outcome = asked
+        .owner
+        .review(&asked.request.reference)
+        .await
+        .expect("reviewed");
+    assert_eq!(outcome, ReviewOutcome::Confirmed);
+    let acceptance = asked
+        .host
+        .network()
+        .pairing()
+        .rows()
+        .acceptance(asked.challenge.confirmation_id)
+        .expect("readable")
+        .expect("the host recorded the answer");
+    assert_eq!(acceptance.channel, "owner_device_presence");
+    assert!(!asked.still_asking().await, "the challenge is answered");
+    asked.host.stop().await;
 }
