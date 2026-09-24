@@ -3,6 +3,9 @@
 
 #![allow(dead_code)]
 
+#[cfg(unix)]
+pub mod launched;
+
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
