@@ -23,10 +23,13 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::agent::PromptText;
+use crate::changeset::{ApplyOutcomeClass, DestinationClass, VersionRef};
 use crate::ids::{
-    ActionId, CausalRootId, EnvironmentId, GrantId, SessionId, WorkflowId, WorkflowRunId,
-    WorkspaceId,
+    ActionId, AgentTurnId, CausalRootId, EnvironmentId, GrantId, MaterialisationId, PluginId,
+    SessionId, WorkflowId, WorkflowRunId, WorkspaceId,
 };
+use crate::project::WorkspaceKind;
 use crate::scalars::{Nullable, TimestampMs, U64};
 
 /// Default maximum causal chain depth.
@@ -48,6 +51,13 @@ pub const DEFAULT_WORKFLOW_PENDING_RUNS: u64 = 100;
 pub const DEFAULT_WORKFLOW_RUN_DEADLINE_MS: u64 = 1_800_000;
 /// Default maximum wait time per action node (10 minutes in milliseconds).
 pub const DEFAULT_WORKFLOW_ACTION_WAIT_MS: u64 = 600_000;
+
+/// The longest command line a `shell_command` node carries, in bytes.
+pub const MAX_SHELL_COMMAND_BYTES: usize = 16 * 1024;
+/// The longest test suite name a `run_tests` node carries, in bytes.
+pub const MAX_TEST_SUITE_BYTES: usize = 256;
+/// The longest summary an `attention_notice` node carries, in bytes.
+pub const MAX_NOTICE_SUMMARY_BYTES: usize = 1024;
 
 macro_rules! wire_enum {
     ($(#[doc = $doc:literal])* $name:ident { $($variant:ident => $wire:literal, $variant_doc:literal;)+ }) => {
@@ -134,6 +144,149 @@ wire_enum! {
     }
 }
 
+wire_enum! {
+    /// The action kinds a workflow node can name.
+    ///
+    /// Each kind takes one parameter type, needs the rights the method that performs the same
+    /// effect needs, and produces one output type ([`NodeOutput`]). A node naming anything else is
+    /// refused when the definition is read.
+    WorkflowActionKind {
+        ShellCommand => "shell_command", "Runs a command line in a shell in the node's declared execution environment.";
+        RunTests => "run_tests", "Runs a named test suite against one immutable change-set version.";
+        RequestReview => "request_review", "Asks an agent in a separate reviewer session to review one immutable change-set version.";
+        CreateSession => "create_session", "Creates a session, taking `session.create`'s own parameters.";
+        AttentionNotice => "attention_notice", "Raises an attention notice.";
+        MaterializeChangeset => "materialize_changeset", "Writes one immutable change-set version into a private directory, taking `changeset.materialize`'s own parameters.";
+        ApplyDiff => "apply_diff", "Applies one immutable change-set version to a destination, taking `diff.apply`'s own parameters.";
+        CaptureChangeset => "capture_changeset", "Captures one workspace into an immutable change-set version, taking `changeset.capture`'s own parameters.";
+    }
+}
+
+/// Parameters of a `shell_command` node.
+///
+/// The command runs in the node's declared execution environment, and only under a broad shell
+/// grant that admits that environment.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ShellCommandParams {
+    /// The command line the shell runs: 1 to [`MAX_SHELL_COMMAND_BYTES`] bytes.
+    pub command: String,
+}
+
+/// Parameters of a `run_tests` node.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RunTestsParams {
+    /// The test suite to run, by the name the environment's test configuration gives it: 1 to
+    /// [`MAX_TEST_SUITE_BYTES`] bytes.
+    pub suite: String,
+    /// The immutable change-set version the tests run against, which their result binds to.
+    pub version: VersionRef,
+}
+
+/// Parameters of a `request_review` node.
+///
+/// Everything the review stands on is explicit: the agent that reviews, the immutable version it
+/// reads, and the workspace policy its separate session runs under.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RequestReviewParams {
+    /// The agent that reviews, by the identifier of the connector that runs it.
+    pub reviewer_id: PluginId,
+    /// The immutable change-set version the review reads, which its result binds to.
+    pub version: VersionRef,
+    /// The kind of workspace the separate reviewer session works in.
+    pub workspace: WorkspaceKind,
+    /// What the reviewer is asked.
+    pub instructions: PromptText,
+}
+
+/// Parameters of an `attention_notice` node.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionNoticeParams {
+    /// What the notice says: 1 to [`MAX_NOTICE_SUMMARY_BYTES`] bytes.
+    pub summary: String,
+}
+
+/// What a node's action produced, as this host observed it.
+///
+/// One shape per action kind, named by the kind itself, so a receipt says what it is a receipt
+/// of. An output holds identifiers and states, never text a node, a terminal or a model produced:
+/// a reader that needs more reads the session or the change set it names, under its own authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum NodeOutput {
+    /// A `shell_command` node's command ran to completion.
+    ShellCommand {
+        /// The session the command ran in.
+        session_id: SessionId,
+    },
+    /// A `run_tests` node's suite passed against the version.
+    RunTests {
+        /// The suite that ran.
+        suite: String,
+        /// The version it ran against.
+        version: VersionRef,
+    },
+    /// A `request_review` node's reviewer finished its review.
+    RequestReview {
+        /// The version reviewed.
+        version: VersionRef,
+        /// The separate reviewer session.
+        session_id: SessionId,
+        /// The reviewer turn whose completion carried the result.
+        turn_id: AgentTurnId,
+    },
+    /// A `create_session` node created a session.
+    CreateSession {
+        /// The session.
+        session_id: SessionId,
+    },
+    /// An `attention_notice` node raised its notice.
+    AttentionNotice,
+    /// A `materialize_changeset` node wrote the version into a private directory.
+    MaterializeChangeset {
+        /// The version written.
+        version: VersionRef,
+        /// The materialisation that holds it.
+        materialisation_id: MaterialisationId,
+    },
+    /// An `apply_diff` node applied the version.
+    ApplyDiff {
+        /// The version applied.
+        applied_version: VersionRef,
+        /// Where it was applied.
+        destination: DestinationClass,
+        /// Which class the apply came to, absent for a preflight that found nothing to do.
+        outcome: Nullable<ApplyOutcomeClass>,
+        /// The immutable proposal a proposal apply produced.
+        proposal_version: Nullable<VersionRef>,
+    },
+    /// A `capture_changeset` node captured the workspace.
+    CaptureChangeset {
+        /// The version captured.
+        version: VersionRef,
+    },
+}
+
+impl NodeOutput {
+    /// The action kind whose output this is.
+    #[must_use]
+    pub const fn action_kind(&self) -> WorkflowActionKind {
+        match self {
+            Self::ShellCommand { .. } => WorkflowActionKind::ShellCommand,
+            Self::RunTests { .. } => WorkflowActionKind::RunTests,
+            Self::RequestReview { .. } => WorkflowActionKind::RequestReview,
+            Self::CreateSession { .. } => WorkflowActionKind::CreateSession,
+            Self::AttentionNotice => WorkflowActionKind::AttentionNotice,
+            Self::MaterializeChangeset { .. } => WorkflowActionKind::MaterializeChangeset,
+            Self::ApplyDiff { .. } => WorkflowActionKind::ApplyDiff,
+            Self::CaptureChangeset { .. } => WorkflowActionKind::CaptureChangeset,
+        }
+    }
+}
+
 /// An event trigger definition for a workflow.
 ///
 /// A trigger matches an event by its type and by nothing else. The events a workflow's own nodes
@@ -174,9 +327,10 @@ impl Default for WorkflowResourceScope {
 pub struct WorkflowNode {
     /// Unique identifier for this node within the workflow definition.
     pub node_id: String,
-    /// Registered action kind (e.g., "shell_command", "run_tests", "request_review").
-    pub action_kind: String,
-    /// Typed action parameters JSON string without template code.
+    /// The action kind this node performs.
+    pub action_kind: WorkflowActionKind,
+    /// The kind's own typed parameters, as a JSON document: exactly the fields the kind's
+    /// parameter type has, with no template code in any value.
     pub action_params: String,
     /// Declared execution environment required for shell commands.
     pub declared_environment: Nullable<EnvironmentId>,
@@ -369,8 +523,8 @@ pub struct NodeReceiptSummary {
     pub causal_parent: Nullable<String>,
     /// Node execution status.
     pub status: NodeStatus,
-    /// Output result string, if available.
-    pub output: Nullable<String>,
+    /// What the action produced, typed by the node's kind, for a node that succeeded.
+    pub output: Nullable<NodeOutput>,
     /// When execution started.
     pub started_at_ms: TimestampMs,
     /// When execution finished.
@@ -579,6 +733,51 @@ mod tests {
                 .event_type,
             "changeset.captured"
         );
+    }
+
+    #[test]
+    fn a_node_names_a_registered_action_kind_or_is_refused() {
+        let node = |kind: &str| {
+            serde_json::json!({
+                "node_id": "only",
+                "action_kind": kind,
+                "action_params": "{}",
+                "declared_environment": null,
+            })
+        };
+        for kind in WorkflowActionKind::ALL {
+            let decoded: WorkflowNode =
+                serde_json::from_value(node(kind.as_str())).expect("a registered kind");
+            assert_eq!(decoded.action_kind, *kind);
+            assert_eq!(WorkflowActionKind::from_wire(kind.as_str()), Some(*kind));
+        }
+        assert!(
+            serde_json::from_value::<WorkflowNode>(node("delete_everything")).is_err(),
+            "a kind nothing registered is refused when the node is read"
+        );
+    }
+
+    #[test]
+    fn an_output_names_the_kind_that_produced_it_and_carries_nothing_else() {
+        let version = VersionRef {
+            change_set_id: crate::ids::ChangeSetId::new(crate::scalars::Uuid::from_bytes([7; 16])),
+            version: crate::ids::ChangeSetVersion::new(3),
+        };
+        let captured = NodeOutput::CaptureChangeset { version };
+        let value = serde_json::to_value(&captured).expect("encodes");
+        assert_eq!(value["kind"], captured.action_kind().as_str());
+        assert_eq!(
+            serde_json::from_value::<NodeOutput>(value.clone()).expect("decodes"),
+            captured
+        );
+        let mut padded = value;
+        padded["exit_code"] = serde_json::json!(0);
+        assert!(
+            serde_json::from_value::<NodeOutput>(padded).is_err(),
+            "a field the kind does not produce is refused"
+        );
+        let notice = serde_json::to_value(NodeOutput::AttentionNotice).expect("encodes");
+        assert_eq!(notice, serde_json::json!({ "kind": "attention_notice" }));
     }
 
     #[test]

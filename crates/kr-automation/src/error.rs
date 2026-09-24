@@ -83,7 +83,7 @@ pub enum AutomationError {
     #[error("this host carries out no action of kind '{action_kind}'")]
     ActionUnavailable {
         /// The action kind the node named.
-        action_kind: String,
+        action_kind: kr_protocol::automation::WorkflowActionKind,
     },
 
     /// The named workflow was not found.

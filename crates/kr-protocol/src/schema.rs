@@ -47,12 +47,13 @@ use crate::attention::{
 };
 use crate::authority::MethodEntry;
 use crate::automation::{
-    CausalBudgetSummary, EdgeCondition, NodeReceiptSummary, NodeStatus, WorkflowAlert,
-    WorkflowAlertKind, WorkflowDeadlines, WorkflowDefinition, WorkflowDefinitionSummary,
-    WorkflowEdge, WorkflowEnableParams, WorkflowEnableResult, WorkflowInstallParams,
-    WorkflowInstallResult, WorkflowNode, WorkflowPauseParams, WorkflowPauseResult,
-    WorkflowReadParams, WorkflowReadResult, WorkflowResourceScope, WorkflowRunParams,
-    WorkflowRunResult, WorkflowRunStatus, WorkflowRunSummary, WorkflowTrigger,
+    AttentionNoticeParams, CausalBudgetSummary, EdgeCondition, NodeOutput, NodeReceiptSummary,
+    NodeStatus, RequestReviewParams, RunTestsParams, ShellCommandParams, WorkflowActionKind,
+    WorkflowAlert, WorkflowAlertKind, WorkflowDeadlines, WorkflowDefinition,
+    WorkflowDefinitionSummary, WorkflowEdge, WorkflowEnableParams, WorkflowEnableResult,
+    WorkflowInstallParams, WorkflowInstallResult, WorkflowNode, WorkflowPauseParams,
+    WorkflowPauseResult, WorkflowReadParams, WorkflowReadResult, WorkflowResourceScope,
+    WorkflowRunParams, WorkflowRunResult, WorkflowRunStatus, WorkflowRunSummary, WorkflowTrigger,
 };
 use crate::broker::{
     ActionToken, ActionTokenClaim, CapabilityMap, DecoderLedgerEntry, DecodingTrust,
@@ -693,10 +694,16 @@ pub fn protocol_schema() -> Value {
         "voice_stop_params" => VoiceStopParams,
         "voice_stop_result" => VoiceStopResult,
         // Automation: the definitions, runs, node receipts, causal budgets, and five method shapes.
+        "attention_notice_params" => AttentionNoticeParams,
         "causal_budget_summary" => CausalBudgetSummary,
         "edge_condition" => EdgeCondition,
+        "node_output" => NodeOutput,
         "node_receipt_summary" => NodeReceiptSummary,
         "node_status" => NodeStatus,
+        "request_review_params" => RequestReviewParams,
+        "run_tests_params" => RunTestsParams,
+        "shell_command_params" => ShellCommandParams,
+        "workflow_action_kind" => WorkflowActionKind,
         "workflow_alert" => WorkflowAlert,
         "workflow_alert_kind" => WorkflowAlertKind,
         "workflow_deadlines" => WorkflowDeadlines,

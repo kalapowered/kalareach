@@ -38,8 +38,9 @@ use kr_changeset::materialise;
 use kr_changeset::service::CaptureOrder;
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::automation::{
-    WorkflowDefinition, WorkflowEnableParams, WorkflowInstallParams, WorkflowNode,
-    WorkflowPauseParams, WorkflowReadParams, WorkflowRunParams,
+    NodeOutput, WorkflowActionKind, WorkflowDefinition, WorkflowEnableParams,
+    WorkflowInstallParams, WorkflowNode, WorkflowPauseParams, WorkflowReadParams,
+    WorkflowRunParams,
 };
 use kr_protocol::changeset::{ChangesetCaptureParams, ChangesetMaterializeParams, Provenance};
 use kr_protocol::envelope::{
@@ -221,8 +222,8 @@ impl ActionRunner for HostActions {
         };
         let run_id = dispatch.run_id;
         Box::pin(async move {
-            match held.node.action_kind.as_str() {
-                "capture_changeset" => {
+            match held.node.action_kind {
+                WorkflowActionKind::CaptureChangeset => {
                     let asked: ChangesetCaptureParams =
                         serde_json::from_str(&held.node.action_params)?;
                     blocking(move || {
@@ -233,7 +234,7 @@ impl ActionRunner for HostActions {
                     })
                     .await
                 }
-                "materialize_changeset" => {
+                WorkflowActionKind::MaterializeChangeset => {
                     let asked: ChangesetMaterializeParams =
                         serde_json::from_str(&held.node.action_params)?;
                     blocking(move || {
@@ -248,9 +249,9 @@ impl ActionRunner for HostActions {
                     })
                     .await
                 }
-                other => Err(kr_automation::AutomationError::ActionUnavailable {
-                    action_kind: other.to_owned(),
-                }),
+                other => {
+                    Err(kr_automation::AutomationError::ActionUnavailable { action_kind: other })
+                }
             }
         })
     }
@@ -443,10 +444,12 @@ fn capture(
     };
     match changesets.capture(&order) {
         Ok((version, _pinned)) => Ok(ActionOutcome::Success {
-            output: format!(
-                "captured change set {} version {}",
-                version.change_set_id, version.version
-            ),
+            output: NodeOutput::CaptureChangeset {
+                version: kr_protocol::changeset::VersionRef {
+                    change_set_id: version.change_set_id,
+                    version: version.version,
+                },
+            },
         }),
         Err(error) => held.refusal_of(error),
     }
@@ -476,10 +479,10 @@ fn materialise_version(
             ),
         }),
         Ok(record) => Ok(ActionOutcome::Success {
-            output: format!(
-                "materialised change set {} version {} as {}",
-                named.change_set_id, named.version, record.materialisation_id
-            ),
+            output: NodeOutput::MaterializeChangeset {
+                version: named,
+                materialisation_id: record.materialisation_id,
+            },
         }),
         Err(error) => held.refusal_of(error),
     }

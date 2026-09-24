@@ -22,8 +22,9 @@
 //! # Four properties the design rests on
 //!
 //! **A definition is a document, not a program.** Acyclicity is settled at install time, every
-//! node names an action kind this engine has registered, and a parameter that decodes to a
-//! template marker is refused. Nothing in a definition is evaluated.
+//! node names an action kind this engine registers and carries that kind's complete typed
+//! parameters, every node that succeeds records its kind's typed output, and a parameter that
+//! decodes to a template marker is refused. Nothing in a definition is evaluated.
 //!
 //! **Authority is read, never supplied.** A definition names a grant; the host reads that grant
 //! from its own store and reads it again immediately before every node it dispatches. A grant
@@ -62,10 +63,10 @@ pub use crate::admission::AdmissionController;
 pub use crate::authority::{AuthoritySource, GrantStanding, GrantTable};
 pub use crate::budget::CausalBudget;
 pub use crate::causal::{CausalContext, CausalParent};
-pub use crate::definition::{
-    REGISTERED_ACTION_KINDS, create_workflow_definition, produced_event, validate_definition,
+pub use crate::definition::{create_workflow_definition, produced_event, validate_definition};
+pub use crate::engine::{
+    ActionOutcome, ActionRunner, Dispatch, MockActionRunner, WorkflowEngine, stand_in_output,
 };
-pub use crate::engine::{ActionOutcome, ActionRunner, Dispatch, MockActionRunner, WorkflowEngine};
 pub use crate::error::{AutomationError, Result};
 pub use crate::service::{
     AdmittedTriggers, Answer, AutomationService, DERIVED_TRIGGER_PREFIX, StartedRun,
@@ -182,4 +183,127 @@ pub(crate) fn test_host(
 
 pub(crate) fn parse_uuid(s: &str) -> std::result::Result<kr_protocol::scalars::Uuid, uuid::Error> {
     uuid::Uuid::parse_str(s).map(|u| kr_protocol::scalars::Uuid::from_bytes(u.into_bytes()))
+}
+
+/// Complete stand-in parameters and nodes for the crate's own tests.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use kr_protocol::automation::{WorkflowActionKind, WorkflowNode};
+    use kr_protocol::changeset::VersionRef;
+    use kr_protocol::ids::{ChangeSetId, ChangeSetVersion, EnvironmentId, WorkspaceId};
+    use kr_protocol::scalars::{Nullable, Uuid};
+
+    /// The environment [`crate::test_host`] serves.
+    pub(crate) fn environment() -> EnvironmentId {
+        EnvironmentId::new(Uuid::from_bytes([0xe0; 16]))
+    }
+
+    /// Complete parameters of `kind`, as a node carries them, for a host serving `environment`.
+    pub(crate) fn params_in(kind: WorkflowActionKind, environment: EnvironmentId) -> String {
+        let version = VersionRef {
+            change_set_id: ChangeSetId::new(Uuid::from_bytes([0x33; 16])),
+            version: ChangeSetVersion::new(1),
+        };
+        let value = match kind {
+            WorkflowActionKind::ShellCommand => serde_json::json!({ "command": "cargo test" }),
+            WorkflowActionKind::RunTests => {
+                serde_json::json!({ "suite": "unit", "version": version })
+            }
+            WorkflowActionKind::RequestReview => serde_json::json!({
+                "reviewer_id": "reviewer",
+                "version": version,
+                "workspace": kr_protocol::project::WorkspaceKind::SharedExisting,
+                "instructions": "Review the change.",
+            }),
+            WorkflowActionKind::CreateSession => {
+                serde_json::to_value(kr_protocol::session::SessionCreateParams {
+                    environment_id: environment,
+                    presentation: kr_protocol::session::Presentation::Invisible,
+                    shell: Nullable::null(),
+                    shell_mode: kr_protocol::session::ShellMode::NativeCompat,
+                    cwd: Nullable::null(),
+                    dimensions: Nullable::null(),
+                    worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+                    environment_snapshot: Vec::new(),
+                    palette: Nullable::null(),
+                    launch_profile: kr_protocol::session::LaunchProfile::default(),
+                    terminal: Nullable::null(),
+                })
+                .expect("session.create's parameters")
+            }
+            WorkflowActionKind::AttentionNotice => {
+                serde_json::json!({ "summary": "the tests finished" })
+            }
+            WorkflowActionKind::MaterializeChangeset => {
+                serde_json::to_value(kr_protocol::changeset::ChangesetMaterializeParams {
+                    change_set_id: version.change_set_id,
+                    version: version.version,
+                    purpose: kr_protocol::changeset::MaterialisationPurpose::Test,
+                    label: "a copy".to_owned(),
+                })
+                .expect("changeset.materialize's parameters")
+            }
+            WorkflowActionKind::ApplyDiff => {
+                serde_json::to_value(kr_protocol::changeset::DiffApplyParams {
+                    change_set_id: version.change_set_id,
+                    version: version.version,
+                    destination: kr_protocol::changeset::DestinationClass::Proposal,
+                    workspace_id: Nullable::null(),
+                    expected_reference: Nullable::null(),
+                    affected: Vec::new(),
+                    paths: Vec::new(),
+                    preflight_only: true,
+                    acknowledged_limitations: Vec::new(),
+                })
+                .expect("diff.apply's parameters")
+            }
+            WorkflowActionKind::CaptureChangeset => {
+                serde_json::to_value(kr_protocol::changeset::ChangesetCaptureParams {
+                    workspace_id: WorkspaceId::new(Uuid::from_bytes([0x34; 16])),
+                    change_set_id: Nullable::null(),
+                    label: "a reading".to_owned(),
+                    policy: kr_protocol::project::InclusionPolicy {
+                        dirty_files: kr_protocol::project::InclusionChoice::Include,
+                        untracked_files: kr_protocol::project::InclusionChoice::Include,
+                        submodules: kr_protocol::project::InclusionChoice::Include,
+                        binary_files: kr_protocol::project::InclusionChoice::Include,
+                        generated_artefacts: kr_protocol::project::InclusionChoice::Include,
+                    },
+                    grant: kr_protocol::changeset::FileGrant::default(),
+                    quiescence_declared: false,
+                    required_consistency: Nullable::null(),
+                    pin: false,
+                    session_id: Nullable::null(),
+                    workflow_run_id: Nullable::null(),
+                    note: String::new(),
+                })
+                .expect("changeset.capture's parameters")
+            }
+        };
+        value.to_string()
+    }
+
+    /// A node of `kind` with complete parameters, for a host serving `environment`. A shell node
+    /// declares that environment.
+    pub(crate) fn node_in(
+        node_id: &str,
+        kind: WorkflowActionKind,
+        environment: EnvironmentId,
+    ) -> WorkflowNode {
+        WorkflowNode {
+            node_id: node_id.to_owned(),
+            action_kind: kind,
+            action_params: params_in(kind, environment),
+            declared_environment: if kind == WorkflowActionKind::ShellCommand {
+                Nullable::some(environment)
+            } else {
+                Nullable::null()
+            },
+        }
+    }
+
+    /// A node of `kind` with complete parameters, for the crate's test host.
+    pub(crate) fn node(node_id: &str, kind: WorkflowActionKind) -> WorkflowNode {
+        node_in(node_id, kind, environment())
+    }
 }

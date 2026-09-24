@@ -5,9 +5,8 @@ use std::sync::Arc;
 use kr_automation::{
     ActionOutcome, MockActionRunner, WorkflowEngine, WorkflowStore, create_workflow_definition,
 };
-use kr_protocol::automation::{
-    EdgeCondition, NodeStatus, WorkflowEdge, WorkflowNode, WorkflowRunStatus,
-};
+use kr_protocol::automation::WorkflowActionKind;
+use kr_protocol::automation::{EdgeCondition, NodeStatus, WorkflowEdge, WorkflowRunStatus};
 use kr_protocol::ids::{GrantId, WorkflowId, WorkflowRunId};
 use kr_protocol::scalars::{Nullable, Uuid};
 
@@ -48,23 +47,11 @@ async fn topological_execution_respects_dependencies() {
     let runner = Arc::new(MockActionRunner::new());
 
     // Register success for all nodes
-    runner.set_outcome(
-        "step1",
-        ActionOutcome::Success {
-            output: "{}".to_owned(),
-        },
-    );
-    runner.set_outcome(
-        "step2",
-        ActionOutcome::Success {
-            output: "{}".to_owned(),
-        },
-    );
+    runner.set_outcome("step1", common::succeeded(WorkflowActionKind::RunTests));
+    runner.set_outcome("step2", common::succeeded(WorkflowActionKind::RunTests));
     runner.set_outcome(
         "step3",
-        ActionOutcome::Success {
-            output: "{}".to_owned(),
-        },
+        common::succeeded(WorkflowActionKind::RequestReview),
     );
 
     let engine = WorkflowEngine::new(
@@ -76,24 +63,9 @@ async fn topological_execution_respects_dependencies() {
         ),
     );
 
-    let n1 = WorkflowNode {
-        node_id: "step1".to_owned(),
-        action_kind: "run_tests".to_owned(),
-        action_params: "{}".to_owned(),
-        declared_environment: Nullable::null(),
-    };
-    let n2 = WorkflowNode {
-        node_id: "step2".to_owned(),
-        action_kind: "run_tests".to_owned(),
-        action_params: "{}".to_owned(),
-        declared_environment: Nullable::null(),
-    };
-    let n3 = WorkflowNode {
-        node_id: "step3".to_owned(),
-        action_kind: "request_review".to_owned(),
-        action_params: "{}".to_owned(),
-        declared_environment: Nullable::null(),
-    };
+    let n1 = common::node("step1", WorkflowActionKind::RunTests);
+    let n2 = common::node("step2", WorkflowActionKind::RunTests);
+    let n3 = common::node("step3", WorkflowActionKind::RequestReview);
 
     let edges = vec![
         WorkflowEdge {
@@ -149,16 +121,12 @@ async fn edge_condition_branching_success_and_failure() {
     // on_failure succeeds
     runner.set_outcome(
         "on_failure",
-        ActionOutcome::Success {
-            output: "{}".to_owned(),
-        },
+        common::succeeded(WorkflowActionKind::AttentionNotice),
     );
     // on_success should NOT run
     runner.set_outcome(
         "on_success",
-        ActionOutcome::Success {
-            output: "{}".to_owned(),
-        },
+        common::succeeded(WorkflowActionKind::RequestReview),
     );
 
     let engine = WorkflowEngine::new(
@@ -170,24 +138,9 @@ async fn edge_condition_branching_success_and_failure() {
         ),
     );
 
-    let n1 = WorkflowNode {
-        node_id: "step1".to_owned(),
-        action_kind: "run_tests".to_owned(),
-        action_params: "{}".to_owned(),
-        declared_environment: Nullable::null(),
-    };
-    let n_succ = WorkflowNode {
-        node_id: "on_success".to_owned(),
-        action_kind: "request_review".to_owned(),
-        action_params: "{}".to_owned(),
-        declared_environment: Nullable::null(),
-    };
-    let n_fail = WorkflowNode {
-        node_id: "on_failure".to_owned(),
-        action_kind: "attention_notice".to_owned(),
-        action_params: "{}".to_owned(),
-        declared_environment: Nullable::null(),
-    };
+    let n1 = common::node("step1", WorkflowActionKind::RunTests);
+    let n_succ = common::node("on_success", WorkflowActionKind::RequestReview);
+    let n_fail = common::node("on_failure", WorkflowActionKind::AttentionNotice);
 
     let edges = vec![
         WorkflowEdge {
@@ -243,12 +196,7 @@ async fn unknown_predecessor_outcome_pauses_dependants_for_review() {
             detail: "process was terminated by SIGKILL before receipt".to_owned(),
         },
     );
-    runner.set_outcome(
-        "step2",
-        ActionOutcome::Success {
-            output: "{}".to_owned(),
-        },
-    );
+    runner.set_outcome("step2", common::succeeded(WorkflowActionKind::ApplyDiff));
 
     let engine = WorkflowEngine::new(
         store.clone(),
@@ -259,18 +207,8 @@ async fn unknown_predecessor_outcome_pauses_dependants_for_review() {
         ),
     );
 
-    let n1 = WorkflowNode {
-        node_id: "step1".to_owned(),
-        action_kind: "run_tests".to_owned(),
-        action_params: "{}".to_owned(),
-        declared_environment: Nullable::null(),
-    };
-    let n2 = WorkflowNode {
-        node_id: "step2".to_owned(),
-        action_kind: "apply_diff".to_owned(),
-        action_params: "{}".to_owned(),
-        declared_environment: Nullable::null(),
-    };
+    let n1 = common::node("step1", WorkflowActionKind::RunTests);
+    let n2 = common::node("step2", WorkflowActionKind::ApplyDiff);
 
     let edges = vec![WorkflowEdge {
         from_node: "step1".to_owned(),
@@ -307,6 +245,61 @@ async fn unknown_predecessor_outcome_pauses_dependants_for_review() {
     assert_eq!(r2.status, NodeStatus::Paused);
 }
 
+/// A success reported with an output of another kind is not this node's success. Each kind has one
+/// output shape, so an output of another shape says the action is not what the node dispatched,
+/// and what it did is not established: the node settles unknown, its receipt holds no output, and
+/// its dependants pause for review rather than running on it.
+#[tokio::test]
+async fn a_success_of_another_kind_is_not_taken_for_the_nodes_success() {
+    let store = Arc::new(WorkflowStore::in_memory().unwrap());
+    let runner = Arc::new(MockActionRunner::new());
+    runner.set_outcome(
+        "step1",
+        common::succeeded(WorkflowActionKind::CaptureChangeset),
+    );
+    let engine = WorkflowEngine::new(
+        store.clone(),
+        common::host(
+            runner,
+            authority(),
+            Arc::new(kr_automation::ManualClock::new(1000)),
+        ),
+    );
+    let def = create_workflow_definition(
+        test_wf_id(4),
+        1,
+        "mismatched-output",
+        test_grant_id(1),
+        vec![
+            common::node("step1", WorkflowActionKind::RunTests),
+            common::node("step2", WorkflowActionKind::RequestReview),
+        ],
+        vec![WorkflowEdge {
+            from_node: "step1".to_owned(),
+            to_node: "step2".to_owned(),
+            condition: EdgeCondition::Success,
+        }],
+    );
+    store.save_definition(&def, 1000).unwrap();
+    let run_id = test_run_id(4);
+    let causal_ctx = kr_automation::CausalContext::new_root();
+    store
+        .commit_trigger_and_run(run_id, &def, "evt-4", &causal_ctx, 1000)
+        .unwrap();
+
+    let status = engine.execute_run(run_id, &def, &causal_ctx).await.unwrap();
+    assert_eq!(status, WorkflowRunStatus::Paused);
+    let receipts = store.list_node_receipts(run_id).unwrap();
+    let r1 = receipts.iter().find(|r| r.node_id == "step1").unwrap();
+    let r2 = receipts.iter().find(|r| r.node_id == "step2").unwrap();
+    assert_eq!(r1.status, NodeStatus::Unknown);
+    assert!(
+        r1.output.0.is_none(),
+        "an output of another kind is not recorded"
+    );
+    assert_eq!(r2.status, NodeStatus::Paused);
+}
+
 /// A revision that was installed but never enabled does not run, and a pause stops one that was.
 #[tokio::test]
 async fn enable_and_pause_decide_whether_a_revision_runs() {
@@ -316,12 +309,7 @@ async fn enable_and_pause_decide_whether_a_revision_runs() {
     };
 
     let workflow_id = test_wf_id(7);
-    let node = WorkflowNode {
-        node_id: "step".to_owned(),
-        action_kind: "run_tests".to_owned(),
-        action_params: r#"{"suite": "unit"}"#.to_owned(),
-        declared_environment: Nullable::null(),
-    };
+    let node = common::node("step", WorkflowActionKind::RunTests);
     let definition = create_workflow_definition(
         workflow_id,
         1,
@@ -410,6 +398,7 @@ async fn an_uncertain_dispatch_pauses_dependants_rather_than_failing_them() {
             Box<dyn std::future::Future<Output = kr_automation::Result<ActionOutcome>> + Send>,
         > {
             let node_id = dispatch.node.node_id.clone();
+            let kind = dispatch.node.action_kind;
             Box::pin(async move {
                 if node_id == "step1" {
                     // The action was dispatched and the answer never came back.
@@ -419,7 +408,7 @@ async fn an_uncertain_dispatch_pauses_dependants_rather_than_failing_them() {
                     })
                 } else {
                     Ok(ActionOutcome::Success {
-                        output: "{}".to_owned(),
+                        output: kr_automation::stand_in_output(kind),
                     })
                 }
             })
@@ -436,18 +425,8 @@ async fn an_uncertain_dispatch_pauses_dependants_rather_than_failing_them() {
         ),
     );
 
-    let n1 = WorkflowNode {
-        node_id: "step1".to_owned(),
-        action_kind: "run_tests".to_owned(),
-        action_params: r#"{"suite": "unit"}"#.to_owned(),
-        declared_environment: Nullable::null(),
-    };
-    let n2 = WorkflowNode {
-        node_id: "step2".to_owned(),
-        action_kind: "request_review".to_owned(),
-        action_params: r#"{"reviewer_id": "bob"}"#.to_owned(),
-        declared_environment: Nullable::null(),
-    };
+    let n1 = common::node("step1", WorkflowActionKind::RunTests);
+    let n2 = common::node("step2", WorkflowActionKind::RequestReview);
     let edge = WorkflowEdge {
         from_node: "step1".to_owned(),
         to_node: "step2".to_owned(),
@@ -515,9 +494,10 @@ async fn cancellation_stops_undispatched_nodes() {
                 );
                 engine.cancel_run(self.run_id, 1_500).unwrap();
             }
+            let kind = dispatch.node.action_kind;
             Box::pin(async move {
                 Ok(ActionOutcome::Success {
-                    output: "{}".to_owned(),
+                    output: kr_automation::stand_in_output(kind),
                 })
             })
         }
@@ -538,18 +518,8 @@ async fn cancellation_stops_undispatched_nodes() {
         ),
     );
 
-    let n1 = WorkflowNode {
-        node_id: "step1".to_owned(),
-        action_kind: "run_tests".to_owned(),
-        action_params: r#"{"suite": "unit"}"#.to_owned(),
-        declared_environment: Nullable::null(),
-    };
-    let n2 = WorkflowNode {
-        node_id: "step2".to_owned(),
-        action_kind: "request_review".to_owned(),
-        action_params: r#"{"reviewer_id": "bob"}"#.to_owned(),
-        declared_environment: Nullable::null(),
-    };
+    let n1 = common::node("step1", WorkflowActionKind::RunTests);
+    let n2 = common::node("step2", WorkflowActionKind::RequestReview);
     let edge = WorkflowEdge {
         from_node: "step1".to_owned(),
         to_node: "step2".to_owned(),
@@ -604,18 +574,8 @@ async fn a_pause_mid_run_stops_the_next_node() {
     };
 
     let workflow_id = test_wf_id(10);
-    let n1 = WorkflowNode {
-        node_id: "step1".to_owned(),
-        action_kind: "run_tests".to_owned(),
-        action_params: r#"{"suite": "unit"}"#.to_owned(),
-        declared_environment: Nullable::null(),
-    };
-    let n2 = WorkflowNode {
-        node_id: "step2".to_owned(),
-        action_kind: "request_review".to_owned(),
-        action_params: r#"{"reviewer_id": "bob"}"#.to_owned(),
-        declared_environment: Nullable::null(),
-    };
+    let n1 = common::node("step1", WorkflowActionKind::RunTests);
+    let n2 = common::node("step2", WorkflowActionKind::RequestReview);
     let edge = WorkflowEdge {
         from_node: "step1".to_owned(),
         to_node: "step2".to_owned(),

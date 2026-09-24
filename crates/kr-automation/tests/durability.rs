@@ -3,7 +3,8 @@
 use std::sync::Arc;
 
 use kr_automation::{CausalContext, WorkflowStore, create_workflow_definition};
-use kr_protocol::automation::{NodeStatus, WorkflowNode, WorkflowRunStatus};
+use kr_protocol::automation::WorkflowActionKind;
+use kr_protocol::automation::{NodeStatus, WorkflowRunStatus};
 use kr_protocol::ids::{GrantId, WorkflowId, WorkflowRunId};
 use kr_protocol::scalars::{Nullable, Uuid};
 
@@ -44,12 +45,7 @@ fn sqlite_persistence_survives_drop_and_reopen() {
     {
         let store = WorkflowStore::open(tmp_dir.path()).unwrap();
 
-        let n1 = WorkflowNode {
-            node_id: "step1".to_owned(),
-            action_kind: "run_tests".to_owned(),
-            action_params: r#"{"suite": "core"}"#.to_owned(),
-            declared_environment: Nullable::null(),
-        };
+        let n1 = common::node("step1", WorkflowActionKind::RunTests);
 
         let def = create_workflow_definition(wf_id, 1, "durable-wf", grant_id, vec![n1], vec![]);
         store.save_definition(&def, 1000).unwrap();
@@ -65,7 +61,9 @@ fn sqlite_persistence_survives_drop_and_reopen() {
                 run_id,
                 "step1",
                 NodeStatus::Success,
-                Some(r#"{"exit_code": 0}"#),
+                Some(&kr_automation::stand_in_output(
+                    WorkflowActionKind::RunTests,
+                )),
                 None,
                 Some(1100),
             )
@@ -99,8 +97,9 @@ fn sqlite_persistence_survives_drop_and_reopen() {
         assert_eq!(receipts[0].node_id, "step1");
         assert_eq!(receipts[0].status, NodeStatus::Success);
         assert_eq!(
-            receipts[0].output.as_ref().map(|s| s.as_str()),
-            Some(r#"{"exit_code": 0}"#)
+            receipts[0].output.0,
+            Some(kr_automation::stand_in_output(WorkflowActionKind::RunTests)),
+            "the typed output reads back as it was written"
         );
 
         // Verify causal budget
@@ -188,12 +187,7 @@ fn read_answers_about_the_revision_it_was_asked_about() {
 
     let workflow_id = test_wf_id(5);
     for revision in [1_u64, 2] {
-        let node = WorkflowNode {
-            node_id: "step".to_owned(),
-            action_kind: "run_tests".to_owned(),
-            action_params: r#"{"suite": "unit"}"#.to_owned(),
-            declared_environment: Nullable::null(),
-        };
+        let node = common::node("step", WorkflowActionKind::RunTests);
         let definition = create_workflow_definition(
             workflow_id,
             revision,
@@ -249,7 +243,7 @@ struct Counting(std::sync::atomic::AtomicUsize);
 impl kr_automation::ActionRunner for Counting {
     fn execute(
         &self,
-        _dispatch: &kr_automation::Dispatch<'_>,
+        dispatch: &kr_automation::Dispatch<'_>,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<Output = kr_automation::Result<kr_automation::ActionOutcome>>
@@ -257,9 +251,10 @@ impl kr_automation::ActionRunner for Counting {
         >,
     > {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Box::pin(async {
+        let kind = dispatch.node.action_kind;
+        Box::pin(async move {
             Ok(kr_automation::ActionOutcome::Success {
-                output: "done".to_owned(),
+                output: kr_automation::stand_in_output(kind),
             })
         })
     }
@@ -267,12 +262,7 @@ impl kr_automation::ActionRunner for Counting {
 
 /// Two nodes, the second depending on the first's success.
 fn two_steps(workflow: u8, grant: GrantId) -> kr_protocol::automation::WorkflowDefinition {
-    let node = |id: &str| WorkflowNode {
-        node_id: id.to_owned(),
-        action_kind: "run_tests".to_owned(),
-        action_params: r#"{"suite": "unit"}"#.to_owned(),
-        declared_environment: Nullable::null(),
-    };
+    let node = |id: &str| common::node(id, WorkflowActionKind::RunTests);
     create_workflow_definition(
         test_wf_id(workflow),
         1,
@@ -318,7 +308,9 @@ fn stopped_mid_run(
                     run_id,
                     node_id: "first",
                     status: NodeStatus::Success,
-                    output: Some("done"),
+                    output: Some(&kr_automation::stand_in_output(
+                        WorkflowActionKind::RunTests
+                    )),
                     error: None,
                     produced: None,
                     at_ms: 1_100,
@@ -508,19 +500,28 @@ async fn an_event_waits_for_every_consumer_registered_for_its_type() {
 /// definitions have another shape, and reading them as this build's would fail part way.
 #[test]
 fn a_journal_at_an_earlier_development_version_is_refused() {
-    let directory = tempfile::tempdir().expect("a journal directory");
-    let path = directory
-        .path()
-        .join(kr_automation::store::WORKFLOW_DB_NAME);
-    {
-        let connection = rusqlite::Connection::open(&path).expect("the journal opens");
-        connection
-            .execute_batch("CREATE TABLE outbox_events (outbox_id INTEGER PRIMARY KEY);")
-            .expect("an older table");
-        connection
-            .pragma_update(None, "user_version", 3_u32)
-            .expect("an older version");
+    // Version 4 held node outputs as text, where this build reads typed ones.
+    for version in [3_u32, 4] {
+        let directory = tempfile::tempdir().expect("a journal directory");
+        let path = directory
+            .path()
+            .join(kr_automation::store::WORKFLOW_DB_NAME);
+        {
+            let connection = rusqlite::Connection::open(&path).expect("the journal opens");
+            connection
+                .execute_batch("CREATE TABLE outbox_events (outbox_id INTEGER PRIMARY KEY);")
+                .expect("an older table");
+            connection
+                .pragma_update(None, "user_version", version)
+                .expect("an older version");
+        }
+        let error = WorkflowStore::open(directory.path())
+            .expect_err("a journal at an earlier development version is refused");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("schema version {version}")),
+            "{error}"
+        );
     }
-    let error = WorkflowStore::open(directory.path()).expect_err("a version-3 journal is refused");
-    assert!(error.to_string().contains("schema version 3"), "{error}");
 }

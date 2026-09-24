@@ -17,9 +17,10 @@ use kr_automation::{
     ActionKey, ActionOutcome, ActionRunner, AutomationError, AutomationService, Dispatch,
     ManualClock, Submitted, WorkflowStore, create_workflow_definition,
 };
+use kr_protocol::automation::WorkflowActionKind;
 use kr_protocol::automation::{
-    NodeStatus, WorkflowDefinition, WorkflowEnableParams, WorkflowInstallParams, WorkflowNode,
-    WorkflowRunParams, WorkflowRunStatus,
+    NodeStatus, WorkflowDefinition, WorkflowEnableParams, WorkflowInstallParams, WorkflowRunParams,
+    WorkflowRunStatus,
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{GrantId, WorkflowId};
@@ -45,12 +46,7 @@ fn one_node(id: WorkflowId, grant: GrantId) -> WorkflowDefinition {
         1,
         "one node",
         grant,
-        vec![WorkflowNode {
-            node_id: "only".to_owned(),
-            action_kind: "run_tests".to_owned(),
-            action_params: r#"{"suite": "unit"}"#.to_owned(),
-            declared_environment: Nullable::null(),
-        }],
+        vec![common::node("only", WorkflowActionKind::RunTests)],
         vec![],
     )
 }
@@ -84,17 +80,18 @@ struct Held {
 impl ActionRunner for Held {
     fn execute(
         &self,
-        _dispatch: &Dispatch<'_>,
+        dispatch: &Dispatch<'_>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = kr_automation::Result<ActionOutcome>> + Send>,
     > {
         let entered = Arc::clone(&self.entered);
         let release = Arc::clone(&self.release);
+        let kind = dispatch.node.action_kind;
         Box::pin(async move {
             entered.notify_one();
             release.notified().await;
             Ok(ActionOutcome::Success {
-                output: "done".to_owned(),
+                output: kr_automation::stand_in_output(kind),
             })
         })
     }
@@ -336,10 +333,11 @@ impl ActionRunner for CancelledWhileRunning {
     > {
         let store = Arc::clone(self.store.get().expect("the journal is known"));
         let run_id = dispatch.run_id;
+        let kind = dispatch.node.action_kind;
         Box::pin(async move {
             store.cancel_run(run_id, "stopped by the person", 1_500)?;
             Ok(ActionOutcome::Success {
-                output: "finished after the host stopped asking".to_owned(),
+                output: kr_automation::stand_in_output(kind),
             })
         })
     }
@@ -591,19 +589,21 @@ async fn a_pass_that_stops_part_way_keeps_the_runs_it_committed() {
     ))
     .expect("a service");
 
-    let with_trigger = |id: u8, grant: GrantId, trigger: &str, kind: &str| {
+    let with_trigger = |id: u8, grant: GrantId, trigger: &str, kind: WorkflowActionKind| {
         let mut definition = one_node(workflow_id(id), grant);
         definition.trigger.event_type = trigger.to_owned();
-        definition.nodes[0].action_kind = kind.to_owned();
-        if kind == "request_review" {
-            definition.nodes[0].action_params = r#"{"reviewer_id": "reviewer"}"#.to_owned();
-        }
+        definition.nodes[0] = common::node("only", kind);
         definition
     };
-    let tests = with_trigger(10, producing, "manual", "run_tests");
-    let review = with_trigger(11, producing, "manual", "request_review");
-    let after_tests = with_trigger(12, producing, "tests.passed", "run_tests");
-    let after_review = with_trigger(13, unreadable, "review.completed", "run_tests");
+    let tests = with_trigger(10, producing, "manual", WorkflowActionKind::RunTests);
+    let review = with_trigger(11, producing, "manual", WorkflowActionKind::RequestReview);
+    let after_tests = with_trigger(12, producing, "tests.passed", WorkflowActionKind::RunTests);
+    let after_review = with_trigger(
+        13,
+        unreadable,
+        "review.completed",
+        WorkflowActionKind::RunTests,
+    );
     for definition in [&tests, &review, &after_tests] {
         service
             .submit_install(&install_params(definition), 1_000)

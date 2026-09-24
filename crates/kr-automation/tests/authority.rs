@@ -12,8 +12,8 @@ use kr_automation::{
     MockActionRunner, create_workflow_definition,
 };
 use kr_protocol::automation::{
-    EdgeCondition, NodeStatus, WorkflowDefinition, WorkflowEdge, WorkflowEnableParams,
-    WorkflowInstallParams, WorkflowNode, WorkflowRunParams,
+    EdgeCondition, NodeStatus, WorkflowActionKind, WorkflowDefinition, WorkflowEdge,
+    WorkflowEnableParams, WorkflowInstallParams, WorkflowNode, WorkflowRunParams,
 };
 use kr_protocol::ids::{EnvironmentId, GrantId, WorkflowId};
 use kr_protocol::rights::ActionRight;
@@ -31,17 +31,8 @@ fn test_grant_id(v: u8) -> GrantId {
     GrantId::new(Uuid::from_bytes([v; 16]))
 }
 
-fn node(node_id: &str, action_kind: &str) -> WorkflowNode {
-    WorkflowNode {
-        node_id: node_id.to_owned(),
-        action_kind: action_kind.to_owned(),
-        action_params: match action_kind {
-            "shell_command" => r#"{"command": "true"}"#.to_owned(),
-            "create_session" => r#"{"title": "review"}"#.to_owned(),
-            _ => r#"{"suite": "unit"}"#.to_owned(),
-        },
-        declared_environment: Nullable::null(),
-    }
+fn node(node_id: &str, action_kind: WorkflowActionKind) -> WorkflowNode {
+    common::node(node_id, action_kind)
 }
 
 fn install_params(definition: &WorkflowDefinition) -> WorkflowInstallParams {
@@ -92,7 +83,7 @@ impl ActionRunner for RevokesWhileRunning {
         if dispatch.node.node_id == "first" {
             self.table.restand(self.grant_id, GrantStanding::Revoked);
         }
-        let output = format!("ran {}", dispatch.node.node_id);
+        let output = kr_automation::stand_in_output(dispatch.node.action_kind);
         Box::pin(async move { Ok(ActionOutcome::Success { output }) })
     }
 }
@@ -106,7 +97,7 @@ async fn a_withdrawn_grant_admits_no_run() {
         1,
         "withdrawn",
         grant_id,
-        vec![node("step", "run_tests")],
+        vec![node("step", WorkflowActionKind::RunTests)],
         vec![],
     );
 
@@ -155,7 +146,7 @@ async fn a_definition_naming_an_unissued_grant_is_refused() {
         1,
         "unissued",
         test_grant_id(200),
-        vec![node("step", "run_tests")],
+        vec![node("step", WorkflowActionKind::RunTests)],
         vec![],
     );
     let service = service(
@@ -179,7 +170,7 @@ async fn a_view_only_grant_installs_neither_a_shell_node_nor_a_session_node() {
     let table = common::holding(grant_id, &[ActionRight::SessionView]);
     let service = service(Arc::new(MockActionRunner::new()), table);
 
-    let mut shell = node("sh", "shell_command");
+    let mut shell = node("sh", WorkflowActionKind::ShellCommand);
     shell.declared_environment = Nullable::some(EnvironmentId::new(Uuid::from_bytes([8; 16])));
     let shell_definition = create_workflow_definition(
         test_wf_id(3),
@@ -199,7 +190,7 @@ async fn a_view_only_grant_installs_neither_a_shell_node_nor_a_session_node() {
         1,
         "view-only-session",
         grant_id,
-        vec![node("make", "create_session")],
+        vec![node("make", WorkflowActionKind::CreateSession)],
         vec![],
     );
     let refusal = service
@@ -219,7 +210,10 @@ async fn a_revocation_between_two_nodes_stops_the_second() {
         1,
         "revoked-mid-run",
         grant_id,
-        vec![node("first", "run_tests"), node("second", "run_tests")],
+        vec![
+            node("first", WorkflowActionKind::RunTests),
+            node("second", WorkflowActionKind::RunTests),
+        ],
         vec![WorkflowEdge {
             from_node: "first".to_owned(),
             to_node: "second".to_owned(),
@@ -317,7 +311,7 @@ impl ActionRunner for CancelsAndRevokes {
             }
             self.table.restand(self.grant_id, GrantStanding::Revoked);
         }
-        let output = format!("ran {}", dispatch.node.node_id);
+        let output = kr_automation::stand_in_output(dispatch.node.action_kind);
         Box::pin(async move { Ok(ActionOutcome::Success { output }) })
     }
 }
@@ -336,7 +330,10 @@ async fn a_refusal_after_a_cancellation_leaves_the_cancellation_standing() {
         1,
         "cancelled-then-refused",
         grant_id,
-        vec![node("first", "run_tests"), node("second", "run_tests")],
+        vec![
+            node("first", WorkflowActionKind::RunTests),
+            node("second", WorkflowActionKind::RunTests),
+        ],
         vec![WorkflowEdge {
             from_node: "first".to_owned(),
             to_node: "second".to_owned(),
@@ -436,7 +433,7 @@ async fn a_capture_node_outside_the_declared_workspace_is_refused() {
         grant_id,
         vec![WorkflowNode {
             node_id: "capture".to_owned(),
-            action_kind: "capture_changeset".to_owned(),
+            action_kind: WorkflowActionKind::CaptureChangeset,
             action_params: serde_json::to_string(&params).expect("typed parameters"),
             declared_environment: Nullable::null(),
         }],
@@ -490,7 +487,7 @@ async fn a_refusal_where_the_effect_begins_pauses_the_node_and_its_run() {
         1,
         "refused at the effect",
         grant_id,
-        vec![node("only", "run_tests")],
+        vec![node("only", WorkflowActionKind::RunTests)],
         vec![],
     );
     let service = service(
@@ -551,7 +548,7 @@ async fn a_grant_that_does_not_cover_this_environment_installs_nothing_here() {
         1,
         "elsewhere",
         grant_id,
-        vec![node("only", "run_tests")],
+        vec![node("only", WorkflowActionKind::RunTests)],
         vec![],
     );
     let refusal = service
@@ -578,7 +575,7 @@ async fn a_caller_grant_reaches_only_the_workflows_under_it() {
         1,
         "mine",
         held,
-        vec![node("only", "run_tests")],
+        vec![node("only", WorkflowActionKind::RunTests)],
         vec![],
     );
     let theirs = create_workflow_definition(
@@ -586,7 +583,7 @@ async fn a_caller_grant_reaches_only_the_workflows_under_it() {
         1,
         "theirs",
         other,
-        vec![node("only", "run_tests")],
+        vec![node("only", WorkflowActionKind::RunTests)],
         vec![],
     );
     service
@@ -612,7 +609,7 @@ async fn a_caller_grant_reaches_only_the_workflows_under_it() {
                 1,
                 "borrowed",
                 other,
-                vec![node("only", "run_tests")],
+                vec![node("only", WorkflowActionKind::RunTests)],
                 vec![],
             )),
             &as_caller(&key, held),
@@ -685,7 +682,7 @@ async fn a_device_subscription_is_triggered_only_by_runs_under_its_own_grant() {
             1,
             "subscriber",
             grant,
-            vec![node("only", "run_tests")],
+            vec![node("only", WorkflowActionKind::RunTests)],
             vec![],
         );
         definition.trigger.event_type = trigger.to_owned();
@@ -777,7 +774,7 @@ async fn a_device_cannot_take_or_probe_another_grant_s_workflow() {
         1,
         "the owner's",
         owners,
-        vec![node("only", "run_tests")],
+        vec![node("only", WorkflowActionKind::RunTests)],
         vec![],
     );
     service
@@ -840,7 +837,7 @@ async fn a_device_cannot_take_or_probe_another_grant_s_workflow() {
         1,
         "enormous",
         owners,
-        vec![node("only", "run_tests")],
+        vec![node("only", WorkflowActionKind::RunTests)],
         vec![],
     );
     enormous.revision = kr_protocol::scalars::U64::new(u64::MAX);
@@ -851,17 +848,8 @@ async fn a_device_cannot_take_or_probe_another_grant_s_workflow() {
 }
 
 /// A node with the parameters its action kind requires.
-fn typed_node(node_id: &str, action_kind: &str) -> WorkflowNode {
-    WorkflowNode {
-        node_id: node_id.to_owned(),
-        action_kind: action_kind.to_owned(),
-        action_params: match action_kind {
-            "request_review" => r#"{"reviewer_id": "reviewer"}"#.to_owned(),
-            "create_session" => r#"{"title": "follow-up"}"#.to_owned(),
-            _ => r#"{"suite": "unit"}"#.to_owned(),
-        },
-        declared_environment: Nullable::null(),
-    }
+fn typed_node(node_id: &str, action_kind: WorkflowActionKind) -> WorkflowNode {
+    common::node(node_id, action_kind)
 }
 
 /// Installs and enables a one-node workflow, as the owner or as a paired device.
@@ -870,7 +858,7 @@ fn installed(
     id: u8,
     grant: GrantId,
     trigger: &str,
-    action_kind: &str,
+    action_kind: WorkflowActionKind,
     device: Option<GrantId>,
 ) -> WorkflowDefinition {
     use kr_protocol::method::Method;
@@ -925,13 +913,20 @@ async fn a_device_subscription_does_not_follow_an_owner_crossing_into_another_gr
         Arc::new(MockActionRunner::new()),
         common::every_right(&[owners, devices]),
     );
-    let producer = installed(&service, 40, owners, "manual", "run_tests", None);
+    let producer = installed(
+        &service,
+        40,
+        owners,
+        "manual",
+        WorkflowActionKind::RunTests,
+        None,
+    );
     let crossing = installed(
         &service,
         41,
         devices,
         "tests.passed",
-        "request_review",
+        WorkflowActionKind::RequestReview,
         None,
     );
     let subscriber = installed(
@@ -939,7 +934,7 @@ async fn a_device_subscription_does_not_follow_an_owner_crossing_into_another_gr
         42,
         devices,
         "review.completed",
-        "create_session",
+        WorkflowActionKind::CreateSession,
         Some(devices),
     );
 
@@ -977,7 +972,7 @@ async fn a_device_subscription_does_not_follow_an_owner_crossing_into_another_gr
         43,
         devices,
         "manual",
-        "request_review",
+        WorkflowActionKind::RequestReview,
         Some(devices),
     );
     let device = as_device(devices);
@@ -1013,13 +1008,20 @@ async fn a_device_reads_nothing_of_another_grant_s_chain_through_an_owner_crossi
         Arc::new(MockActionRunner::new()),
         common::every_right(&[owners, devices]),
     );
-    let producer = installed(&service, 44, owners, "manual", "run_tests", None);
+    let producer = installed(
+        &service,
+        44,
+        owners,
+        "manual",
+        WorkflowActionKind::RunTests,
+        None,
+    );
     let crossing = installed(
         &service,
         45,
         devices,
         "tests.passed",
-        "request_review",
+        WorkflowActionKind::RequestReview,
         None,
     );
     let owners_run = service
@@ -1118,7 +1120,7 @@ async fn a_revision_past_what_the_journal_holds_is_answered_as_not_installed() {
         1,
         "the largest revision",
         owners,
-        vec![typed_node("only", "run_tests")],
+        vec![typed_node("only", WorkflowActionKind::RunTests)],
         vec![],
     );
     largest.revision = U64::new(u64::try_from(i64::MAX).expect("fits"));

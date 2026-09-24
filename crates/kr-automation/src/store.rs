@@ -34,7 +34,7 @@ use std::sync::{Mutex, MutexGuard};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use kr_protocol::automation::{
-    NodeReceiptSummary, NodeStatus, WorkflowDefinition, WorkflowDefinitionSummary,
+    NodeOutput, NodeReceiptSummary, NodeStatus, WorkflowDefinition, WorkflowDefinitionSummary,
     WorkflowRunStatus, WorkflowRunSummary,
 };
 use kr_protocol::error::ProtocolError;
@@ -50,11 +50,12 @@ pub const WORKFLOW_DB_NAME: &str = "workflows.db";
 
 /// The schema version this build reads and writes.
 ///
-/// It covers the rows as well as the tables, the stored events and definitions among them.
-/// Versions 1 to 3 were written only by builds that never reached an installed product, so no
+/// It covers the rows as well as the tables, the stored events, definitions and node outputs among
+/// them. Versions 1 to 4 were written only by builds that never reached an installed product, so no
 /// installed journal holds any of them, and a journal at one of them is refused by name rather than
-/// read as if its rows said what this build expects.
-pub const WORKFLOW_SCHEMA_VERSION: u32 = 4;
+/// read as if its rows said what this build expects. Version 5 stores each node's output as its
+/// kind's typed output rather than as text.
+pub const WORKFLOW_SCHEMA_VERSION: u32 = 5;
 
 /// The columns [`Journal::parse_run_record`] expects, in order.
 const RUN_RECORD_COLUMNS: &str = "run_id, workflow_id, revision, causal_root_id, generation, depth,
@@ -317,8 +318,8 @@ pub struct NodeSettlement<'a> {
     pub node_id: &'a str,
     /// What it came to.
     pub status: NodeStatus,
-    /// What the action reported, when it succeeded.
-    pub output: Option<&'a str>,
+    /// What the action produced, when it succeeded.
+    pub output: Option<&'a NodeOutput>,
     /// Why it did not, when it did not.
     pub error: Option<&'a str>,
     /// The event a success produces.
@@ -1436,13 +1437,14 @@ impl<'c> Journal<'c> {
     /// its cancellation: the host stopped asking, and an answer that arrived afterwards does not
     /// make the run one that completed. Returns whether the outcome was written.
     fn settle_node(&self, settlement: &NodeSettlement<'_>) -> Result<bool> {
+        let output = settlement.output.map(serde_json::to_string).transpose()?;
         let settled = self.conn.execute(
             "UPDATE node_receipts SET status = ?1, output_json = ?2, error_json = ?3,
                     ended_at_ms = ?4
              WHERE run_id = ?5 AND node_id = ?6 AND status = ?7",
             params![
                 settlement.status.as_str(),
-                settlement.output,
+                output,
                 settlement.error,
                 stored(settlement.at_ms),
                 settlement.run_id.to_string(),
@@ -2473,10 +2475,11 @@ impl WorkflowStore {
         run_id: WorkflowRunId,
         node_id: &str,
         status: NodeStatus,
-        output: Option<&str>,
+        output: Option<&NodeOutput>,
         error: Option<&str>,
         ended_at_ms: Option<u64>,
     ) -> Result<()> {
+        let output = output.map(serde_json::to_string).transpose()?;
         let conn = self.lock();
         conn.execute(
             "UPDATE node_receipts SET status = ?1, output_json = ?2, error_json = ?3,
@@ -2542,6 +2545,19 @@ impl WorkflowStore {
             let output: Option<String> = row.get(4)?;
             let started: i64 = row.get(5)?;
             let ended: Option<i64> = row.get(6)?;
+            // The journal wrote this output from a typed one, so one it cannot read back is a
+            // corrupt row, reported as one rather than shown as something else.
+            let output = output
+                .map(|value| {
+                    serde_json::from_str::<NodeOutput>(&value).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                })
+                .transpose()?;
 
             Ok(NodeReceiptSummary {
                 run_id,

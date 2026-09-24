@@ -14,9 +14,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use kr_protocol::automation::{
-    EdgeCondition, NodeStatus, WorkflowDefinition, WorkflowNode, WorkflowRunStatus,
+    EdgeCondition, NodeOutput, NodeStatus, WorkflowActionKind, WorkflowDefinition, WorkflowNode,
+    WorkflowRunStatus,
 };
-use kr_protocol::ids::{ActionId, EnvironmentId, WorkflowRunId};
+use kr_protocol::changeset::{DestinationClass, VersionRef};
+use kr_protocol::ids::{
+    ActionId, AgentTurnId, ChangeSetId, ChangeSetVersion, EnvironmentId, MaterialisationId,
+    SessionId, WorkflowRunId,
+};
+use kr_protocol::scalars::{Nullable, Uuid};
 
 use crate::authority::{self, AuthoritySource};
 use crate::causal::CausalContext;
@@ -29,8 +35,8 @@ use crate::{Host, HostClock};
 pub enum ActionOutcome {
     /// Action completed with authoritative success.
     Success {
-        /// Result output data.
-        output: String,
+        /// What it produced, typed by the node's action kind.
+        output: NodeOutput,
     },
     /// Action completed with failure.
     Failed {
@@ -82,6 +88,48 @@ pub trait ActionRunner: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ActionOutcome>> + Send>>;
 }
 
+/// An output of `kind` whose identifiers name nothing, for a runner that stands in for the host.
+///
+/// It has the shape a real action of that kind produces and refers to no real session, version or
+/// materialisation.
+#[must_use]
+pub fn stand_in_output(kind: WorkflowActionKind) -> NodeOutput {
+    let nothing = Uuid::from_bytes([0; 16]);
+    let version = VersionRef {
+        change_set_id: ChangeSetId::new(nothing),
+        version: ChangeSetVersion::new(1),
+    };
+    match kind {
+        WorkflowActionKind::ShellCommand => NodeOutput::ShellCommand {
+            session_id: SessionId::new(nothing),
+        },
+        WorkflowActionKind::RunTests => NodeOutput::RunTests {
+            suite: "stand-in".to_owned(),
+            version,
+        },
+        WorkflowActionKind::RequestReview => NodeOutput::RequestReview {
+            version,
+            session_id: SessionId::new(nothing),
+            turn_id: AgentTurnId::new("stand-in".to_owned()).expect("a static turn identifier"),
+        },
+        WorkflowActionKind::CreateSession => NodeOutput::CreateSession {
+            session_id: SessionId::new(nothing),
+        },
+        WorkflowActionKind::AttentionNotice => NodeOutput::AttentionNotice,
+        WorkflowActionKind::MaterializeChangeset => NodeOutput::MaterializeChangeset {
+            version,
+            materialisation_id: MaterialisationId::new(nothing),
+        },
+        WorkflowActionKind::ApplyDiff => NodeOutput::ApplyDiff {
+            applied_version: version,
+            destination: DestinationClass::Proposal,
+            outcome: Nullable::null(),
+            proposal_version: Nullable::null(),
+        },
+        WorkflowActionKind::CaptureChangeset => NodeOutput::CaptureChangeset { version },
+    }
+}
+
 /// A default test/mock action runner.
 #[derive(Default)]
 pub struct MockActionRunner {
@@ -117,7 +165,7 @@ impl ActionRunner for MockActionRunner {
             .get(&node_id)
             .cloned()
             .unwrap_or_else(|| ActionOutcome::Success {
-                output: format!("mock-success for {node_id}"),
+                output: stand_in_output(dispatch.node.action_kind),
             });
         Box::pin(async move { Ok(outcome) })
     }
@@ -317,7 +365,7 @@ impl WorkflowEngine {
 
                     // A node that creates a session spends the chain's session allowance as
                     // well as its action allowance, and both are reserved before dispatch.
-                    if node.action_kind == "create_session"
+                    if node.action_kind == WorkflowActionKind::CreateSession
                         && let Err(err) = self.store.reserve_budget_session(
                             causal_ctx.root_id,
                             causal_ctx.generation,
@@ -381,9 +429,23 @@ impl WorkflowEngine {
                     // unless the runner said so: an uncertain answer stays uncertain and its
                     // dependants pause, and only a definite report of failure is a failure.
                     let (status, output, detail) = match outcome_res {
-                        Ok(ActionOutcome::Success { output }) => {
+                        Ok(ActionOutcome::Success { output })
+                            if output.action_kind() == node.action_kind =>
+                        {
                             (NodeStatus::Success, Some(output), None)
                         }
+                        // An output of another kind is not the result of this node's action, so
+                        // what the action did is not established, and its dependants pause.
+                        Ok(ActionOutcome::Success { output }) => (
+                            NodeStatus::Unknown,
+                            None,
+                            Some(format!(
+                                "the action reported a {} output for a {} node, so what it did \
+                                 is not established",
+                                output.action_kind(),
+                                node.action_kind
+                            )),
+                        ),
                         Ok(ActionOutcome::Failed { error }) => {
                             (NodeStatus::Failed, None, Some(error))
                         }
@@ -411,13 +473,13 @@ impl WorkflowEngine {
                     // names; the event's identifier is this node's action identifier, so a replay
                     // of it cannot become a second trigger.
                     let produced = (status == NodeStatus::Success)
-                        .then(|| crate::definition::produced_event(&node.action_kind))
+                        .then(|| crate::definition::produced_event(node.action_kind))
                         .flatten();
                     let settled = self.store.settle_node(&NodeSettlement {
                         run_id,
                         node_id: &node.node_id,
                         status,
-                        output: output.as_deref(),
+                        output: output.as_ref(),
                         error: detail.as_deref(),
                         produced,
                         at_ms: self.clock.now_ms(),
@@ -507,7 +569,7 @@ mod tests {
     use crate::definition::create_workflow_definition;
     use kr_protocol::automation::WorkflowEdge;
     use kr_protocol::ids::{GrantId, WorkflowId};
-    use kr_protocol::scalars::{Nullable, Uuid};
+    use kr_protocol::scalars::Uuid;
 
     fn test_wf_id(v: u8) -> WorkflowId {
         WorkflowId::new(Uuid::from_bytes([v; 16]))
@@ -533,18 +595,8 @@ mod tests {
         let wf_id = test_wf_id(1);
         let grant_id = test_grant_id(1);
 
-        let n1 = WorkflowNode {
-            node_id: "step1".to_owned(),
-            action_kind: "run_tests".to_owned(),
-            action_params: r#"{"suite": "unit"}"#.to_owned(),
-            declared_environment: Nullable::null(),
-        };
-        let n2 = WorkflowNode {
-            node_id: "step2".to_owned(),
-            action_kind: "request_review".to_owned(),
-            action_params: r#"{"reviewer_id": "bob"}"#.to_owned(),
-            declared_environment: Nullable::null(),
-        };
+        let n1 = crate::fixtures::node("step1", WorkflowActionKind::RunTests);
+        let n2 = crate::fixtures::node("step2", WorkflowActionKind::RequestReview);
         let e1 = WorkflowEdge {
             from_node: "step1".to_owned(),
             to_node: "step2".to_owned(),
@@ -593,18 +645,8 @@ mod tests {
         let wf_id = test_wf_id(2);
         let grant_id = test_grant_id(2);
 
-        let n1 = WorkflowNode {
-            node_id: "step1".to_owned(),
-            action_kind: "run_tests".to_owned(),
-            action_params: r#"{"suite": "unit"}"#.to_owned(),
-            declared_environment: Nullable::null(),
-        };
-        let n2 = WorkflowNode {
-            node_id: "step2".to_owned(),
-            action_kind: "request_review".to_owned(),
-            action_params: r#"{"reviewer_id": "bob"}"#.to_owned(),
-            declared_environment: Nullable::null(),
-        };
+        let n1 = crate::fixtures::node("step1", WorkflowActionKind::RunTests);
+        let n2 = crate::fixtures::node("step2", WorkflowActionKind::RequestReview);
         let e1 = WorkflowEdge {
             from_node: "step1".to_owned(),
             to_node: "step2".to_owned(),

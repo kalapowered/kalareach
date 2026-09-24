@@ -1003,6 +1003,79 @@ export type ResourceSelectorKind =
   | 'mailbox'
   | 'agent_target'
 /**
+ * What a node's action produced, as this host observed it.
+ *
+ * One shape per action kind, named by the kind itself, so a receipt says what it is a receipt
+ * of. An output holds identifiers and states, never text a node, a terminal or a model produced:
+ * a reader that needs more reads the session or the change set it names, under its own authority.
+ */
+export type NodeOutput =
+  | {
+      kind: 'shell_command'
+      /**
+       * One KalaReach terminal session.
+       */
+      session_id: string
+    }
+  | {
+      kind: 'run_tests'
+      /**
+       * The suite that ran.
+       */
+      suite: string
+      version: VersionRef5
+    }
+  | {
+      kind: 'request_review'
+      /**
+       * One KalaReach terminal session.
+       */
+      session_id: string
+      /**
+       * The upstream agent's current turn identifier, where available.
+       */
+      turn_id: string
+      version: VersionRef6
+    }
+  | {
+      kind: 'create_session'
+      /**
+       * One KalaReach terminal session.
+       */
+      session_id: string
+    }
+  | {
+      kind: 'attention_notice'
+    }
+  | {
+      kind: 'materialize_changeset'
+      /**
+       * The materialisation that holds it.
+       */
+      materialisation_id: string
+      version: VersionRef7
+    }
+  | {
+      applied_version: VersionRef8
+      /**
+       * Where it was applied.
+       */
+      destination: 'proposal' | 'versioned_reference' | 'shared_existing'
+      kind: 'apply_diff'
+      /**
+       * Which class the apply came to, absent for a preflight that found nothing to do.
+       */
+      outcome: ApplyOutcomeClass | null
+      /**
+       * The immutable proposal a proposal apply produced.
+       */
+      proposal_version: VersionRef | null
+    }
+  | {
+      kind: 'capture_changeset'
+      version: VersionRef9
+    }
+/**
  * Execution status of a single workflow action node.
  */
 export type NodeStatus =
@@ -1655,6 +1728,22 @@ export type VoiceAction =
   | 'apply_diff'
   | 'deliver_externally'
 /**
+ * The action kinds a workflow node can name.
+ *
+ * Each kind takes one parameter type, needs the rights the method that performs the same
+ * effect needs, and produces one output type ([`NodeOutput`]). A node naming anything else is
+ * refused when the definition is read.
+ */
+export type WorkflowActionKind =
+  | 'shell_command'
+  | 'run_tests'
+  | 'request_review'
+  | 'create_session'
+  | 'attention_notice'
+  | 'materialize_changeset'
+  | 'apply_diff'
+  | 'capture_changeset'
+/**
  * What a workflow alert is about.
  */
 export type WorkflowAlertKind = 'causal_limit' | 'workflow_paused' | 'workflow_resumed'
@@ -1723,6 +1812,7 @@ export interface KalaReachProtocol {
   attention_host_slice?: AttentionHostSlice
   attention_item?: AttentionItem
   attention_item_revision?: AttentionItemRevision
+  attention_notice_params?: AttentionNoticeParams
   attention_question_record?: AttentionQuestionRecord
   attention_question_slice?: AttentionQuestionSlice
   attention_quiet_hours_params?: AttentionQuietHoursParams
@@ -1988,6 +2078,7 @@ export interface KalaReachProtocol {
   mutation_request?: MutationRequest
   named_approval_preview?: NamedApprovalPreview
   named_question_preview?: NamedQuestionPreview
+  node_output?: NodeOutput
   node_receipt_summary?: NodeReceiptSummary
   node_status?: NodeStatus
   notification?: Notification
@@ -2103,6 +2194,7 @@ export interface KalaReachProtocol {
   relay_lease_request?: RelayLeaseRequest
   rendezvous_message?: RendezvousMessage
   request?: Request
+  request_review_params?: RequestReviewParams
   response?: Response
   resync_required?: ResyncRequired
   retained_log_view?: RetainedLogView
@@ -2136,6 +2228,7 @@ export interface KalaReachProtocol {
   root_editor_leave_result?: RootEditorLeaveResult
   root_eof_detach_params?: RootEofDetachParams
   root_eof_detach_result?: RootEofDetachResult
+  run_tests_params?: RunTestsParams
   sealed_envelope?: SealedEnvelope
   semantic_change?: SemanticChange
   semantic_continuation?: SemanticContinuation
@@ -2160,6 +2253,7 @@ export interface KalaReachProtocol {
   session_rename_params?: SessionRenameParams
   session_rename_result?: SessionRenameResult
   session_summary?: SessionSummary2
+  shell_command_params?: ShellCommandParams
   shell_launch_params?: ShellLaunchParams
   shell_launch_result?: ShellLaunchResult
   signed_archive_manifest?: SignedArchiveManifest
@@ -2217,6 +2311,7 @@ export interface KalaReachProtocol {
   worker_rendezvous?: WorkerRendezvous
   worker_verify_challenge?: WorkerVerifyChallenge
   worker_verify_proof?: WorkerVerifyProof
+  workflow_action_kind?: WorkflowActionKind
   workflow_alert?: WorkflowAlert
   workflow_alert_kind?: WorkflowAlertKind
   workflow_deadlines?: WorkflowDeadlines
@@ -4802,6 +4897,15 @@ export interface AttentionItem {
    * never an inferred approval or completion.
    */
   uncertain: boolean
+}
+/**
+ * Parameters of an `attention_notice` node.
+ */
+export interface AttentionNoticeParams {
+  /**
+   * What the notice says: 1 to [`MAX_NOTICE_SUMMARY_BYTES`] bytes.
+   */
+  summary: string
 }
 /**
  * One question transition, as the attention store reads it.
@@ -13799,6 +13903,71 @@ export interface RequiredRight {
     | 'issuing_owner'
 }
 /**
+ * One exact version of one change set.
+ */
+export interface VersionRef5 {
+  /**
+   * The change set.
+   */
+  change_set_id: string
+  /**
+   * The version within it, counting from one.
+   */
+  version: string
+}
+/**
+ * One exact version of one change set.
+ */
+export interface VersionRef6 {
+  /**
+   * The change set.
+   */
+  change_set_id: string
+  /**
+   * The version within it, counting from one.
+   */
+  version: string
+}
+/**
+ * One exact version of one change set.
+ */
+export interface VersionRef7 {
+  /**
+   * The change set.
+   */
+  change_set_id: string
+  /**
+   * The version within it, counting from one.
+   */
+  version: string
+}
+/**
+ * One exact version of one change set.
+ */
+export interface VersionRef8 {
+  /**
+   * The change set.
+   */
+  change_set_id: string
+  /**
+   * The version within it, counting from one.
+   */
+  version: string
+}
+/**
+ * One exact version of one change set.
+ */
+export interface VersionRef9 {
+  /**
+   * The change set.
+   */
+  change_set_id: string
+  /**
+   * The version within it, counting from one.
+   */
+  version: string
+}
+/**
  * Summary receipt of an executed action node.
  */
 export interface NodeReceiptSummary {
@@ -13820,9 +13989,9 @@ export interface NodeReceiptSummary {
    */
   node_id: string
   /**
-   * Output result string, if available.
+   * What the action produced, typed by the node's kind, for a node that succeeded.
    */
-  output: string | null
+  output: NodeOutput | null
   /**
    * One automation run.
    */
@@ -20275,6 +20444,40 @@ export interface RelayLeaseRevocation {
   revision: string
 }
 /**
+ * Parameters of a `request_review` node.
+ *
+ * Everything the review stands on is explicit: the agent that reviews, the immutable version it
+ * reads, and the workspace policy its separate session runs under.
+ */
+export interface RequestReviewParams {
+  /**
+   * Prompt or steering text carried inline. The normative bound is 65536                             bytes of UTF-8; maxLength counts characters and is therefore a                             necessary rather than a sufficient condition.
+   */
+  instructions: string
+  /**
+   * A plugin identifier from its manifest.
+   */
+  reviewer_id: string
+  version: VersionRef10
+  /**
+   * The kind of workspace the separate reviewer session works in.
+   */
+  workspace: 'shared_existing' | 'isolated'
+}
+/**
+ * One exact version of one change set.
+ */
+export interface VersionRef10 {
+  /**
+   * The change set.
+   */
+  change_set_id: string
+  /**
+   * The version within it, counting from one.
+   */
+  version: string
+}
+/**
  * The event that tells one subscriber to discard its partial state.
  */
 export interface ResyncRequired {
@@ -21437,6 +21640,30 @@ export interface RootEofDetachResult {
   state: 'outside' | 'unfenced' | 'fenced' | 'launch_reserved' | 'closing'
 }
 /**
+ * Parameters of a `run_tests` node.
+ */
+export interface RunTestsParams {
+  /**
+   * The test suite to run, by the name the environment's test configuration gives it: 1 to
+   * [`MAX_TEST_SUITE_BYTES`] bytes.
+   */
+  suite: string
+  version: VersionRef11
+}
+/**
+ * One exact version of one change set.
+ */
+export interface VersionRef11 {
+  /**
+   * The change set.
+   */
+  change_set_id: string
+  /**
+   * The version within it, counting from one.
+   */
+  version: string
+}
+/**
  * One semantic change in the changed-since-last-visit view.
  */
 export interface SemanticChange {
@@ -22415,6 +22642,18 @@ export interface SessionRenameResult {
    * The title now shown.
    */
   title: string
+}
+/**
+ * Parameters of a `shell_command` node.
+ *
+ * The command runs in the node's declared execution environment, and only under a broad shell
+ * grant that admits that environment.
+ */
+export interface ShellCommandParams {
+  /**
+   * The command line the shell runs: 1 to [`MAX_SHELL_COMMAND_BYTES`] bytes.
+   */
+  command: string
 }
 /**
  * Parameters of `shell.launch`.
@@ -25189,11 +25428,20 @@ export interface WorkflowEdge {
  */
 export interface WorkflowNode {
   /**
-   * Registered action kind (e.g., "shell_command", "run_tests", "request_review").
+   * The action kind this node performs.
    */
-  action_kind: string
+  action_kind:
+    | 'shell_command'
+    | 'run_tests'
+    | 'request_review'
+    | 'create_session'
+    | 'attention_notice'
+    | 'materialize_changeset'
+    | 'apply_diff'
+    | 'capture_changeset'
   /**
-   * Typed action parameters JSON string without template code.
+   * The kind's own typed parameters, as a JSON document: exactly the fields the kind's
+   * parameter type has, with no template code in any value.
    */
   action_params: string
   /**

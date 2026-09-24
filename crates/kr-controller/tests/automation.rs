@@ -24,10 +24,11 @@ use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::automation::{
-    NodeStatus, WorkflowDeadlines, WorkflowDefinition, WorkflowEnableParams, WorkflowEnableResult,
-    WorkflowInstallParams, WorkflowInstallResult, WorkflowNode, WorkflowPauseParams,
-    WorkflowPauseResult, WorkflowReadParams, WorkflowReadResult, WorkflowResourceScope,
-    WorkflowRunParams, WorkflowRunResult, WorkflowRunStatus, WorkflowTrigger,
+    NodeStatus, WorkflowActionKind, WorkflowDeadlines, WorkflowDefinition, WorkflowEnableParams,
+    WorkflowEnableResult, WorkflowInstallParams, WorkflowInstallResult, WorkflowNode,
+    WorkflowPauseParams, WorkflowPauseResult, WorkflowReadParams, WorkflowReadResult,
+    WorkflowResourceScope, WorkflowRunParams, WorkflowRunResult, WorkflowRunStatus,
+    WorkflowTrigger,
 };
 use kr_protocol::changeset::{
     ChangesetCaptureParams, ChangesetReadParams, ChangesetReadResult, FileGrant,
@@ -282,6 +283,18 @@ fn definition(
     }
 }
 
+/// The complete parameters of a test node: a suite, and the version its result binds to.
+fn tests_params() -> String {
+    serde_json::to_string(&kr_protocol::automation::RunTestsParams {
+        suite: "unit".to_owned(),
+        version: kr_protocol::changeset::VersionRef {
+            change_set_id: kr_protocol::ids::ChangeSetId::new(Uuid::from_bytes([0x5d; 16])),
+            version: kr_protocol::ids::ChangeSetVersion::new(1),
+        },
+    })
+    .expect("a test node's typed parameters")
+}
+
 /// The parameters of a capture node: the change-set method's own typed parameters.
 fn capture_node(workspace_id: WorkspaceId) -> WorkflowNode {
     let params = ChangesetCaptureParams {
@@ -299,7 +312,7 @@ fn capture_node(workspace_id: WorkspaceId) -> WorkflowNode {
     };
     WorkflowNode {
         node_id: "capture".to_owned(),
-        action_kind: "capture_changeset".to_owned(),
+        action_kind: WorkflowActionKind::CaptureChangeset,
         action_params: serde_json::to_string(&params).expect("the node's typed parameters"),
         declared_environment: Nullable::null(),
     }
@@ -512,7 +525,11 @@ async fn an_automation_run_captures_a_change_set_in(
         .0
         .as_ref()
         .expect("the receipt carries what the action produced");
-    assert!(captured.contains("captured change set"), "{captured}");
+    assert_eq!(
+        captured.action_kind(),
+        WorkflowActionKind::CaptureChangeset,
+        "{captured:?}"
+    );
 
     let change_sets: ChangesetReadResult = typed(
         &control
@@ -549,7 +566,7 @@ async fn an_automation_run_captures_a_change_set_in(
         "materialise-for-tests",
         WorkflowNode {
             node_id: "materialise".to_owned(),
-            action_kind: "materialize_changeset".to_owned(),
+            action_kind: WorkflowActionKind::MaterializeChangeset,
             action_params: serde_json::to_string(&materialise_params)
                 .expect("the node's typed parameters"),
             declared_environment: Nullable::null(),
@@ -578,7 +595,7 @@ async fn an_automation_run_captures_a_change_set_in(
         "materialise-from-elsewhere",
         WorkflowNode {
             node_id: "materialise".to_owned(),
-            action_kind: "materialize_changeset".to_owned(),
+            action_kind: WorkflowActionKind::MaterializeChangeset,
             action_params: serde_json::to_string(&materialise_params)
                 .expect("the node's typed parameters"),
             declared_environment: Nullable::null(),
@@ -636,13 +653,12 @@ async fn an_automation_run_captures_a_change_set_in(
     );
 }
 
-/// Reads the change-set identifier out of what the capture node reported.
-fn first_change_set(output: &str) -> kr_protocol::ids::ChangeSetId {
-    let identifier = output
-        .split_whitespace()
-        .nth(3)
-        .expect("the receipt names the change set");
-    kr_protocol::ids::ChangeSetId::new(identifier.parse::<Uuid>().expect("a change-set identifier"))
+/// Reads the change-set identifier out of what the capture node produced.
+fn first_change_set(output: &kr_protocol::automation::NodeOutput) -> kr_protocol::ids::ChangeSetId {
+    match output {
+        kr_protocol::automation::NodeOutput::CaptureChangeset { version } => version.change_set_id,
+        other => panic!("a capture produces a captured version, not {other:?}"),
+    }
 }
 
 /// KR-REQ-19.04: the grant a definition names is this host's, and a revoked one runs nothing.
@@ -658,8 +674,8 @@ async fn a_revoked_grant_runs_no_workflow() {
         "tests-on-completion",
         WorkflowNode {
             node_id: "tests".to_owned(),
-            action_kind: "run_tests".to_owned(),
-            action_params: r#"{"suite": "unit"}"#.to_owned(),
+            action_kind: WorkflowActionKind::RunTests,
+            action_params: tests_params(),
             declared_environment: Nullable::null(),
         },
     );
@@ -693,8 +709,8 @@ async fn a_node_this_host_cannot_carry_out_fails_rather_than_succeeding() {
         "tests-on-completion",
         WorkflowNode {
             node_id: "tests".to_owned(),
-            action_kind: "run_tests".to_owned(),
-            action_params: r#"{"suite": "unit"}"#.to_owned(),
+            action_kind: WorkflowActionKind::RunTests,
+            action_params: tests_params(),
             declared_environment: Nullable::null(),
         },
     );
@@ -749,8 +765,8 @@ async fn a_replayed_mutation_is_answered_from_its_record() {
         "replayed",
         WorkflowNode {
             node_id: "tests".to_owned(),
-            action_kind: "run_tests".to_owned(),
-            action_params: r#"{"suite": "unit"}"#.to_owned(),
+            action_kind: WorkflowActionKind::RunTests,
+            action_params: tests_params(),
             declared_environment: Nullable::null(),
         },
     );
@@ -849,8 +865,8 @@ async fn a_repeat_over_a_new_connection_is_answered_from_its_record() {
         "asked twice",
         WorkflowNode {
             node_id: "tests".to_owned(),
-            action_kind: "run_tests".to_owned(),
-            action_params: r#"{"suite": "unit"}"#.to_owned(),
+            action_kind: WorkflowActionKind::RunTests,
+            action_params: tests_params(),
             declared_environment: Nullable::null(),
         },
     );
@@ -946,8 +962,8 @@ async fn a_grant_the_host_policy_refuses_installs_no_workflow() {
         "under a revision nobody issued",
         WorkflowNode {
             node_id: "tests".to_owned(),
-            action_kind: "run_tests".to_owned(),
-            action_params: r#"{"suite": "unit"}"#.to_owned(),
+            action_kind: WorkflowActionKind::RunTests,
+            action_params: tests_params(),
             declared_environment: Nullable::null(),
         },
     );
@@ -1029,8 +1045,8 @@ async fn a_triggered_workflow_descends_from_the_node_that_triggered_it() {
         "tests-after-capture",
         WorkflowNode {
             node_id: "tests".to_owned(),
-            action_kind: "run_tests".to_owned(),
-            action_params: r#"{"suite": "unit"}"#.to_owned(),
+            action_kind: WorkflowActionKind::RunTests,
+            action_params: tests_params(),
             declared_environment: Nullable::null(),
         },
     );
@@ -1085,7 +1101,7 @@ async fn a_materialisation_whose_version_cannot_be_checked_is_refused() {
         "materialise-the-unknown",
         WorkflowNode {
             node_id: "materialise".to_owned(),
-            action_kind: "materialize_changeset".to_owned(),
+            action_kind: WorkflowActionKind::MaterializeChangeset,
             action_params: serde_json::to_string(&unchecked).expect("typed parameters"),
             declared_environment: Nullable::null(),
         },
@@ -1311,8 +1327,8 @@ async fn trigger_left_pending(state_dir: &Path, environment_id: EnvironmentId) -
         "producer",
         WorkflowNode {
             node_id: "tests".to_owned(),
-            action_kind: "run_tests".to_owned(),
-            action_params: r#"{"suite": "unit"}"#.to_owned(),
+            action_kind: WorkflowActionKind::RunTests,
+            action_params: tests_params(),
             declared_environment: Nullable::null(),
         },
     );
@@ -1536,8 +1552,8 @@ async fn a_fence_owed_after_admission_stops_the_workflow_write() {
         "admitted before the fence",
         WorkflowNode {
             node_id: "tests".to_owned(),
-            action_kind: "run_tests".to_owned(),
-            action_params: r#"{"suite": "unit"}"#.to_owned(),
+            action_kind: WorkflowActionKind::RunTests,
+            action_params: tests_params(),
             declared_environment: Nullable::null(),
         },
     );
@@ -1696,8 +1712,8 @@ async fn the_automation_group_is_served_at_every_ingress_the_registry_lists() {
         "a device's own",
         WorkflowNode {
             node_id: "tests".to_owned(),
-            action_kind: "run_tests".to_owned(),
-            action_params: r#"{"suite": "unit"}"#.to_owned(),
+            action_kind: WorkflowActionKind::RunTests,
+            action_params: tests_params(),
             declared_environment: Nullable::null(),
         },
     );
@@ -1818,8 +1834,8 @@ async fn the_automation_group_is_served_at_every_ingress_the_registry_lists() {
         "borrowing the owner's grant",
         WorkflowNode {
             node_id: "tests".to_owned(),
-            action_kind: "run_tests".to_owned(),
-            action_params: r#"{"suite": "unit"}"#.to_owned(),
+            action_kind: WorkflowActionKind::RunTests,
+            action_params: tests_params(),
             declared_environment: Nullable::null(),
         },
     );

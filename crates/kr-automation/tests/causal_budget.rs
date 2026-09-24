@@ -20,8 +20,8 @@ use kr_automation::{
 };
 use kr_protocol::attention::{AttentionRule, AttentionSource};
 use kr_protocol::automation::{
-    DEFAULT_CAUSAL_DEPTH_LIMIT, DEFAULT_CAUSAL_SESSIONS_LIMIT, WorkflowDefinition,
-    WorkflowEnableParams, WorkflowInstallParams, WorkflowNode, WorkflowRunParams,
+    DEFAULT_CAUSAL_DEPTH_LIMIT, DEFAULT_CAUSAL_SESSIONS_LIMIT, WorkflowActionKind,
+    WorkflowDefinition, WorkflowEnableParams, WorkflowInstallParams, WorkflowRunParams,
     WorkflowRunStatus,
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
@@ -56,18 +56,13 @@ fn authority() -> std::sync::Arc<kr_automation::GrantTable> {
 
 /// A one-node workflow triggered by `trigger`, whose node's success produces the event its action
 /// kind fixes, and which may take another turn inside a chain it already appears in.
-fn recurring_workflow(id: u8, name: &str, trigger: &str, action_kind: &str) -> WorkflowDefinition {
-    let params = match action_kind {
-        "create_session" => r#"{"title": "descendant"}"#,
-        "request_review" => r#"{"reviewer_id": "reviewer"}"#,
-        _ => r#"{"suite": "unit"}"#,
-    };
-    let node = WorkflowNode {
-        node_id: "step".to_owned(),
-        action_kind: action_kind.to_owned(),
-        action_params: params.to_owned(),
-        declared_environment: Nullable::null(),
-    };
+fn recurring_workflow(
+    id: u8,
+    name: &str,
+    trigger: &str,
+    action_kind: WorkflowActionKind,
+) -> WorkflowDefinition {
+    let node = common::node("step", action_kind);
     let mut def = create_workflow_definition(
         test_wf_id(id),
         1,
@@ -177,8 +172,13 @@ fn attention_at(path: &std::path::Path, now_ms: u64) -> Attention {
 async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
     let journal = tempfile::tempdir().expect("a journal directory");
     let clock = Arc::new(ManualClock::new(1_000));
-    let tests = recurring_workflow(1, "tests", "review.completed", "run_tests");
-    let review = recurring_workflow(2, "review", "tests.passed", "request_review");
+    let tests = recurring_workflow(1, "tests", "review.completed", WorkflowActionKind::RunTests);
+    let review = recurring_workflow(
+        2,
+        "review",
+        "tests.passed",
+        WorkflowActionKind::RequestReview,
+    );
 
     // The first trigger is external, so the host mints the root.
     let root = {
@@ -313,7 +313,7 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
 #[tokio::test]
 async fn run_events_between_attention_records_leave_no_history_gap() {
     let service = in_memory();
-    let def = recurring_workflow(9, "one-shot", "tests.passed", "run_tests");
+    let def = recurring_workflow(9, "one-shot", "tests.passed", WorkflowActionKind::RunTests);
     install_and_enable(&service, &def, 1_000);
     let journal = tempfile::tempdir().expect("a directory for the attention state");
     let mut attention = attention_at(&journal.path().join("attention.state"), 1_000);
@@ -396,7 +396,12 @@ fn clock_now(clock: &ManualClock) -> u64 {
 #[tokio::test]
 async fn self_retrigger_is_refused_without_explicit_recurrence() {
     let service = in_memory();
-    let mut def = recurring_workflow(3, "self-trigger", "tests.passed", "run_tests");
+    let mut def = recurring_workflow(
+        3,
+        "self-trigger",
+        "tests.passed",
+        WorkflowActionKind::RunTests,
+    );
     def.explicit_recurrence = false;
     install_and_enable(&service, &def, 1_000);
 
@@ -426,8 +431,8 @@ async fn self_retrigger_is_refused_without_explicit_recurrence() {
 #[tokio::test]
 async fn a_descendant_takes_its_ancestry_from_the_node_that_produced_its_trigger() {
     let service = in_memory();
-    let first = recurring_workflow(4, "first", "manual", "run_tests");
-    let second = recurring_workflow(5, "second", "tests.passed", "run_tests");
+    let first = recurring_workflow(4, "first", "manual", WorkflowActionKind::RunTests);
+    let second = recurring_workflow(5, "second", "tests.passed", WorkflowActionKind::RunTests);
     install_and_enable(&service, &first, 1_000);
     install_and_enable(&service, &second, 1_000);
 
@@ -486,7 +491,12 @@ async fn created_sessions_are_reserved_against_the_chain() {
     let journal = tempfile::tempdir().expect("a journal directory");
     let service = open(journal.path(), &clock);
 
-    let def = recurring_workflow(6, "session-maker", "session.created", "create_session");
+    let def = recurring_workflow(
+        6,
+        "session-maker",
+        "session.created",
+        WorkflowActionKind::CreateSession,
+    );
     install_and_enable(&service, &def, 1_000);
 
     let first = service
@@ -529,7 +539,12 @@ async fn an_expired_lifetime_stops_further_descendants() {
     let journal = tempfile::tempdir().expect("a journal directory");
     let service = open(journal.path(), &clock);
 
-    let def = recurring_workflow(7, "long-chain", "tests.passed", "run_tests");
+    let def = recurring_workflow(
+        7,
+        "long-chain",
+        "tests.passed",
+        WorkflowActionKind::RunTests,
+    );
     install_and_enable(&service, &def, 1_000);
     service
         .submit_run(&run_params(&def, "evt-1"), 1_000)
@@ -552,7 +567,7 @@ async fn rearm_is_authorised_and_refuses_late_descendants() {
     let journal = tempfile::tempdir().expect("a journal directory");
     let service = open(journal.path(), &clock);
 
-    let def = recurring_workflow(8, "rearmed", "tests.passed", "run_tests");
+    let def = recurring_workflow(8, "rearmed", "tests.passed", WorkflowActionKind::RunTests);
     install_and_enable(&service, &def, 1_000);
 
     // The first run finishes, and the trigger its node produced waits for the dispatcher.
@@ -730,7 +745,12 @@ fn budget_persists_across_store_reopen() {
 #[tokio::test]
 async fn an_external_callback_is_a_new_external_trigger() {
     let service = in_memory();
-    let def = recurring_workflow(9, "callback", "callback.received", "run_tests");
+    let def = recurring_workflow(
+        9,
+        "callback",
+        "callback.received",
+        WorkflowActionKind::RunTests,
+    );
     install_and_enable(&service, &def, 1_000);
 
     let first = service

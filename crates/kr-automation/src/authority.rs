@@ -22,7 +22,7 @@
 //! gives each registered action kind the right section 23 gives the method that performs the same
 //! effect, so a workflow is not a way around the method the person would otherwise have called.
 
-use kr_protocol::automation::{WorkflowDefinition, WorkflowNode};
+use kr_protocol::automation::{WorkflowActionKind, WorkflowDefinition, WorkflowNode};
 use kr_protocol::grant::Grant;
 use kr_protocol::ids::{EnvironmentId, GrantId};
 use kr_protocol::rights::ActionRight;
@@ -43,34 +43,30 @@ pub trait AuthoritySource: Send + Sync + std::fmt::Debug {
     fn grant(&self, grant_id: GrantId, now_ms: u64) -> Result<Grant>;
 }
 
-/// The rights one registered action kind needs before a node of that kind may be dispatched.
+/// The rights one action kind needs before a node of that kind may be dispatched.
 ///
-/// # Errors
-///
-/// Returns [`AutomationError::InvalidArgument`] for an action kind this engine has not registered.
-/// An unregistered kind is refused rather than treated as needing nothing.
-pub fn node_rights(action_kind: &str) -> Result<&'static [ActionRight]> {
-    Ok(match action_kind {
+/// Every kind has an entry: the set of kinds is closed, and a node naming anything else is refused
+/// when the definition is read.
+#[must_use]
+pub const fn node_rights(action_kind: WorkflowActionKind) -> &'static [ActionRight] {
+    match action_kind {
         // Sending a command to a shell exposes the account the shell runs as, which is the right
         // section 23 puts behind `shell.launch` and behind every other way of typing at a terminal.
-        "shell_command" | "run_tests" => &[ActionRight::TerminalInput],
+        WorkflowActionKind::ShellCommand | WorkflowActionKind::RunTests => {
+            &[ActionRight::TerminalInput]
+        }
         // A review asks an agent to do something, which is `agent.prompt`, and it is read back
         // through the session it ran in.
-        "request_review" => &[ActionRight::AgentPrompt, ActionRight::SessionView],
-        "create_session" => &[ActionRight::SessionCreate],
-        "attention_notice" => &[ActionRight::SessionView],
+        WorkflowActionKind::RequestReview => &[ActionRight::AgentPrompt, ActionRight::SessionView],
+        WorkflowActionKind::CreateSession => &[ActionRight::SessionCreate],
+        WorkflowActionKind::AttentionNotice => &[ActionRight::SessionView],
         // The three change-set kinds take the rights their methods take: `changeset.materialize`
         // is `workspace.manage`, `diff.apply` is `files.apply_diff`, `changeset.capture` is
         // `changeset.create`.
-        "materialize_changeset" => &[ActionRight::WorkspaceManage],
-        "apply_diff" => &[ActionRight::FilesApplyDiff],
-        "capture_changeset" => &[ActionRight::ChangesetCreate],
-        other => {
-            return Err(AutomationError::InvalidArgument(format!(
-                "no rights are registered for action kind '{other}'"
-            )));
-        }
-    })
+        WorkflowActionKind::MaterializeChangeset => &[ActionRight::WorkspaceManage],
+        WorkflowActionKind::ApplyDiff => &[ActionRight::FilesApplyDiff],
+        WorkflowActionKind::CaptureChangeset => &[ActionRight::ChangesetCreate],
+    }
 }
 
 /// Checks that `grant` is the definition's own grant and covers the resources it names.
@@ -127,8 +123,9 @@ pub fn check_scope(
 /// # Errors
 ///
 /// Returns [`AutomationError::PermissionDenied`] when the grant lacks a right the node's action
-/// kind needs, when the grant does not admit this environment, or when it does not admit the
-/// environment a shell node declares.
+/// kind needs, when the grant does not admit this environment, when it does not admit the
+/// environment a shell node declares, when a session node creates its session in another
+/// environment, or when a node touches a workspace outside the definition's declared scope.
 pub fn check_node(
     grant: &Grant,
     definition: &WorkflowDefinition,
@@ -136,7 +133,7 @@ pub fn check_node(
     environment_id: EnvironmentId,
 ) -> Result<()> {
     check_scope(grant, definition, environment_id)?;
-    for right in node_rights(&node.action_kind)? {
+    for right in node_rights(node.action_kind) {
         if !grant.permits(*right) {
             return Err(AutomationError::PermissionDenied(format!(
                 "node {} needs {} and grant {} does not carry it",
@@ -156,8 +153,19 @@ pub fn check_node(
             node.node_id, grant.grant_id
         )));
     }
-    // A node that reads a workspace names the one it reads, and a definition scoped to a
-    // workspace may not contain a node that reaches another. The declared scope is what a person
+    // A node that creates a session names the environment it creates it in, and that is the one
+    // this host serves: a host creates sessions nowhere else.
+    if let Some(target) = crate::definition::node_environment(node)
+        && target != environment_id
+    {
+        return Err(AutomationError::PermissionDenied(format!(
+            "node {} creates a session in environment {target}, and this host acts in \
+             {environment_id}",
+            node.node_id
+        )));
+    }
+    // A node that reads or writes a workspace names the one it touches, and a definition scoped to
+    // a workspace may not contain a node that reaches another. The declared scope is what a person
     // reviewing the definition read; a node acting outside it would make that reading false.
     if let (Some(declared), Some(target)) = (
         definition.resource_scope.workspace_id.0,
@@ -348,24 +356,15 @@ mod tests {
         )
     }
 
-    fn node(action_kind: &str) -> WorkflowNode {
-        WorkflowNode {
-            node_id: "only".to_owned(),
-            action_kind: action_kind.to_owned(),
-            action_params: match action_kind {
-                "shell_command" => r#"{"command": "true"}"#.to_owned(),
-                "run_tests" => r#"{"suite": "unit"}"#.to_owned(),
-                _ => r#"{"reviewer_id": "bob"}"#.to_owned(),
-            },
-            declared_environment: Nullable::null(),
-        }
+    fn node(action_kind: WorkflowActionKind) -> WorkflowNode {
+        crate::fixtures::node_in("only", action_kind, here())
     }
 
     #[test]
     fn a_view_only_grant_reaches_no_terminal_through_a_workflow() {
         // Section 19 ¶1: a view-only invitation cannot obtain terminal input through a workflow.
         let view_only = grant_with(&[ActionRight::SessionView]);
-        let definition = definition_with(node("shell_command"));
+        let definition = definition_with(node(WorkflowActionKind::ShellCommand));
         let refusal =
             check_definition(&view_only, &definition, here()).expect_err("a shell node is refused");
         assert!(refusal.to_string().contains("terminal.input"), "{refusal}");
@@ -380,7 +379,7 @@ mod tests {
         let session_id = SessionId::new(Uuid::from_bytes([3; 16]));
         let mut grant = grant_with(&[ActionRight::AgentPrompt, ActionRight::SessionView]);
         grant.session_selector = SessionSelector::None;
-        let mut definition = definition_with(node("request_review"));
+        let mut definition = definition_with(node(WorkflowActionKind::RequestReview));
         definition.resource_scope = WorkflowResourceScope {
             session_id: Nullable::some(session_id),
             ..WorkflowResourceScope::default()
@@ -399,7 +398,7 @@ mod tests {
                 .into_iter()
                 .collect(),
         };
-        let mut shell = node("shell_command");
+        let mut shell = node(WorkflowActionKind::ShellCommand);
         shell.declared_environment = Nullable::some(environment_id);
         let definition = definition_with(shell);
         let refusal = check_definition(&grant, &definition, here())
@@ -417,7 +416,7 @@ mod tests {
                 .into_iter()
                 .collect(),
         };
-        let definition = definition_with(node("request_review"));
+        let definition = definition_with(node(WorkflowActionKind::RequestReview));
         let refusal = check_definition(&grant, &definition, here())
             .expect_err("this environment is not covered");
         assert!(refusal.to_string().contains("environment"), "{refusal}");
@@ -426,7 +425,7 @@ mod tests {
     #[test]
     fn a_definition_scoped_to_another_environment_runs_nothing_here() {
         let grant = grant_with(&[ActionRight::AgentPrompt, ActionRight::SessionView]);
-        let mut definition = definition_with(node("request_review"));
+        let mut definition = definition_with(node(WorkflowActionKind::RequestReview));
         definition.resource_scope = WorkflowResourceScope {
             environment_id: Nullable::some(EnvironmentId::new(Uuid::from_bytes([6; 16]))),
             ..WorkflowResourceScope::default()
@@ -459,9 +458,48 @@ mod tests {
         }
     }
 
+    /// A session node creates its session in the environment this host serves, and nowhere else.
     #[test]
-    fn an_unregistered_action_kind_has_no_rights_to_fall_through() {
-        let refusal = node_rights("anything_at_all").expect_err("an unregistered kind is refused");
-        assert!(refusal.to_string().contains("anything_at_all"), "{refusal}");
+    fn a_session_node_creates_its_session_only_where_this_host_acts() {
+        let grant = grant_with(&[ActionRight::SessionCreate]);
+        let here_node = node(WorkflowActionKind::CreateSession);
+        check_definition(&grant, &definition_with(here_node), here())
+            .expect("a session in this host's environment");
+
+        let elsewhere = crate::fixtures::node_in(
+            "only",
+            WorkflowActionKind::CreateSession,
+            EnvironmentId::new(Uuid::from_bytes([6; 16])),
+        );
+        let refusal = check_definition(&grant, &definition_with(elsewhere), here())
+            .expect_err("a session in another environment is refused");
+        assert!(
+            refusal.to_string().contains("creates a session"),
+            "{refusal}"
+        );
+    }
+
+    /// An apply names the workspace it writes, and a definition scoped to a workspace reaches no
+    /// other through it.
+    #[test]
+    fn an_apply_node_writes_only_the_workspace_its_definition_is_scoped_to() {
+        let grant = grant_with(&[ActionRight::FilesApplyDiff]);
+        let target = kr_protocol::ids::WorkspaceId::new(Uuid::from_bytes([0x35; 16]));
+        let mut apply = node(WorkflowActionKind::ApplyDiff);
+        let mut params: serde_json::Value =
+            serde_json::from_str(&apply.action_params).expect("the fixture's parameters");
+        params["workspace_id"] = serde_json::to_value(target).expect("a workspace");
+        params["destination"] = serde_json::json!("shared_existing");
+        apply.action_params = params.to_string();
+        let mut definition = definition_with(apply);
+        definition.resource_scope = WorkflowResourceScope {
+            workspace_id: Nullable::some(kr_protocol::ids::WorkspaceId::new(Uuid::from_bytes(
+                [0x36; 16],
+            ))),
+            ..WorkflowResourceScope::default()
+        };
+        let refusal = check_definition(&grant, &definition, here())
+            .expect_err("another workspace is refused");
+        assert!(refusal.to_string().contains("workspace"), "{refusal}");
     }
 }

@@ -7,6 +7,7 @@ use kr_protocol::scalars::Uuid;
 mod common;
 
 use common::Submit;
+use kr_protocol::automation::WorkflowActionKind;
 
 fn test_wf_id(v: u8) -> WorkflowId {
     WorkflowId::new(Uuid::from_bytes([v; 16]))
@@ -151,18 +152,11 @@ async fn a_breached_workflow_limit_pauses_the_workflow_and_raises_one_item() {
         AttentionSubject, AutomationService, ManualClock, MockActionRunner,
         create_workflow_definition,
     };
-    use kr_protocol::automation::{
-        WorkflowEnableParams, WorkflowInstallParams, WorkflowNode, WorkflowRunParams,
-    };
+    use kr_protocol::automation::{WorkflowEnableParams, WorkflowInstallParams, WorkflowRunParams};
     use kr_protocol::scalars::Nullable;
 
     let workflow_id = test_wf_id(9);
-    let node = WorkflowNode {
-        node_id: "step".to_owned(),
-        action_kind: "run_tests".to_owned(),
-        action_params: r#"{"suite": "unit"}"#.to_owned(),
-        declared_environment: Nullable::null(),
-    };
+    let node = common::node("step", WorkflowActionKind::RunTests);
     let definition = create_workflow_definition(
         workflow_id,
         1,
@@ -270,18 +264,11 @@ async fn a_redelivered_trigger_neither_spends_an_allowance_nor_pauses_the_workfl
     use kr_automation::{
         AutomationService, ManualClock, MockActionRunner, create_workflow_definition,
     };
-    use kr_protocol::automation::{
-        WorkflowEnableParams, WorkflowInstallParams, WorkflowNode, WorkflowRunParams,
-    };
+    use kr_protocol::automation::{WorkflowEnableParams, WorkflowInstallParams, WorkflowRunParams};
     use kr_protocol::scalars::Nullable;
 
     let workflow_id = test_wf_id(11);
-    let node = WorkflowNode {
-        node_id: "step".to_owned(),
-        action_kind: "run_tests".to_owned(),
-        action_params: r#"{"suite": "unit"}"#.to_owned(),
-        declared_environment: Nullable::null(),
-    };
+    let node = common::node("step", WorkflowActionKind::RunTests);
     let definition = create_workflow_definition(
         workflow_id,
         1,
@@ -374,12 +361,7 @@ async fn a_read_shows_the_pause_and_its_alert() {
         1,
         "paused by a limit",
         grant,
-        vec![kr_protocol::automation::WorkflowNode {
-            node_id: "only".to_owned(),
-            action_kind: "run_tests".to_owned(),
-            action_params: r#"{"suite": "unit"}"#.to_owned(),
-            declared_environment: Nullable::null(),
-        }],
+        vec![common::node("only", WorkflowActionKind::RunTests)],
         vec![],
     );
     service
@@ -458,12 +440,7 @@ async fn a_read_that_names_a_chain_shows_only_its_alerts() {
         1,
         "two chains",
         grant,
-        vec![kr_protocol::automation::WorkflowNode {
-            node_id: "only".to_owned(),
-            action_kind: "run_tests".to_owned(),
-            action_params: r#"{"suite": "unit"}"#.to_owned(),
-            declared_environment: Nullable::null(),
-        }],
+        vec![common::node("only", WorkflowActionKind::RunTests)],
         vec![],
     );
     service

@@ -4,52 +4,45 @@
 //! resource scope, typed action nodes, success/failure edges, deadlines, and an explicit grant
 //! reference.
 //!
-//! Graph acyclicity is validated at install time. Nodes reference registered action kinds and typed
-//! outputs, with arbitrary template code strictly forbidden. Shell command nodes require both an
-//! explicit broad shell grant (`terminal.input`) and a declared execution environment.
+//! Graph acyclicity is validated at install time. Nodes name an action kind this engine registers
+//! and carry that kind's complete typed parameters, and arbitrary template code is refused. Shell
+//! command nodes require both an explicit broad shell grant (`terminal.input`) and a declared
+//! execution environment.
 
 use std::collections::{HashMap, HashSet};
 
 use kr_protocol::automation::{
-    WorkflowDeadlines, WorkflowDefinition, WorkflowEdge, WorkflowNode, WorkflowResourceScope,
-    WorkflowTrigger,
+    AttentionNoticeParams, MAX_NOTICE_SUMMARY_BYTES, MAX_SHELL_COMMAND_BYTES, MAX_TEST_SUITE_BYTES,
+    RequestReviewParams, RunTestsParams, ShellCommandParams, WorkflowActionKind, WorkflowDeadlines,
+    WorkflowDefinition, WorkflowEdge, WorkflowNode, WorkflowResourceScope, WorkflowTrigger,
 };
+use kr_protocol::changeset::{ChangesetCaptureParams, ChangesetMaterializeParams, DiffApplyParams};
 use kr_protocol::grant::Grant;
-use kr_protocol::ids::{GrantId, WorkflowId};
+use kr_protocol::ids::{EnvironmentId, GrantId, WorkflowId, WorkspaceId};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::U64;
+use kr_protocol::session::SessionCreateParams;
 
 use crate::error::{AutomationError, Result};
-
-/// Registered action kinds known to the automation engine.
-pub const REGISTERED_ACTION_KINDS: &[&str] = &[
-    "shell_command",
-    "run_tests",
-    "request_review",
-    "create_session",
-    "attention_notice",
-    "materialize_changeset",
-    "apply_diff",
-    "capture_changeset",
-];
 
 /// The event a successful node of a registered kind produces, which is what a trigger names.
 ///
 /// The only events a workflow can raise are the ones the host records when a node it dispatched
 /// succeeds, and the type is fixed by the node's action kind. A definition therefore cannot mint
 /// an event type of its choosing, just as it cannot mint an event identifier: the identifier of a
-/// derived trigger is the action identifier the journal gave the node that produced it.
+/// derived trigger is the action identifier the journal gave the node that produced it. A notice
+/// produces no event.
 #[must_use]
-pub fn produced_event(action_kind: &str) -> Option<&'static str> {
+pub const fn produced_event(action_kind: WorkflowActionKind) -> Option<&'static str> {
     Some(match action_kind {
-        "shell_command" => "command.completed",
-        "run_tests" => "tests.passed",
-        "request_review" => "review.completed",
-        "create_session" => "session.created",
-        "materialize_changeset" => "changeset.materialized",
-        "apply_diff" => "diff.applied",
-        "capture_changeset" => "changeset.captured",
-        _ => return None,
+        WorkflowActionKind::ShellCommand => "command.completed",
+        WorkflowActionKind::RunTests => "tests.passed",
+        WorkflowActionKind::RequestReview => "review.completed",
+        WorkflowActionKind::CreateSession => "session.created",
+        WorkflowActionKind::MaterializeChangeset => "changeset.materialized",
+        WorkflowActionKind::ApplyDiff => "diff.applied",
+        WorkflowActionKind::CaptureChangeset => "changeset.captured",
+        WorkflowActionKind::AttentionNotice => return None,
     })
 }
 
@@ -58,11 +51,13 @@ pub fn produced_event(action_kind: &str) -> Option<&'static str> {
 /// The order is from the shape of the document outwards, so the refusal names the first thing
 /// that is actually wrong with it:
 ///
-/// 1. The document: a name, at least one node, unique and non-empty node identifiers, and an
-///    action kind this engine has registered.
+/// 1. The document: a name, at least one node, and unique and non-empty node identifiers. A node
+///    naming a kind this engine does not register never reaches here: it is refused when the
+///    definition is read.
 /// 2. The graph: edges that point at real nodes, and no cycle.
-/// 3. The parameters: valid JSON, matching the typed shape of the node's action kind, and free
-///    of template markers even when the raw JSON escaped them.
+/// 3. The parameters: valid JSON, exactly the kind's own typed parameters with no field they do
+///    not have, every name they carry non-empty and bounded, and free of template markers even
+///    when the raw JSON escaped them.
 /// 4. The shell grant: a `shell_command` node needs a declared execution environment, and the
 ///    definition's own grant has to be a broad shell grant that admits that environment.
 ///
@@ -94,21 +89,15 @@ pub fn validate_definition(definition: &WorkflowDefinition, grant: &Grant) -> Re
                 node.node_id
             )));
         }
-        if !REGISTERED_ACTION_KINDS.contains(&node.action_kind.as_str()) {
-            return Err(AutomationError::InvalidArgument(format!(
-                "unregistered action kind '{}' in node {}",
-                node.action_kind, node.node_id
-            )));
-        }
     }
 
     validate_graph_acyclic(&definition.nodes, &definition.edges)?;
 
     let mut shell_nodes = Vec::new();
     for node in &definition.nodes {
-        validate_typed_action_params(&node.node_id, &node.action_kind, &node.action_params)?;
+        validate_typed_action_params(&node.node_id, node.action_kind, &node.action_params)?;
 
-        if node.action_kind == "shell_command" {
+        if node.action_kind == WorkflowActionKind::ShellCommand {
             let Some(env_id) = node.declared_environment.0 else {
                 return Err(AutomationError::ShellGrantRequired {
                     detail: format!(
@@ -131,7 +120,7 @@ pub fn validate_definition(definition: &WorkflowDefinition, grant: &Grant) -> Re
 /// Checks that a definition with shell nodes carries the broad shell grant it claims.
 fn validate_shell_grant(
     definition: &WorkflowDefinition,
-    shell_nodes: &[(&String, kr_protocol::ids::EnvironmentId)],
+    shell_nodes: &[(&String, EnvironmentId)],
     grant: &Grant,
 ) -> Result<()> {
     if grant.grant_id != definition.grant_reference {
@@ -163,132 +152,82 @@ fn validate_shell_grant(
     Ok(())
 }
 
-/// Validates typed action parameters and inspects decoded string values for template syntax.
-fn validate_typed_action_params(node_id: &str, action_kind: &str, params_json: &str) -> Result<()> {
+/// Validates a node's parameters against its kind's own typed parameters, and inspects every
+/// decoded string value for template syntax.
+fn validate_typed_action_params(
+    node_id: &str,
+    action_kind: WorkflowActionKind,
+    params_json: &str,
+) -> Result<()> {
     let parsed: serde_json::Value = serde_json::from_str(params_json).map_err(|e| {
         AutomationError::InvalidArgument(format!(
-            "node {} action_params is not valid JSON: {}",
-            node_id, e
+            "node {node_id} action_params is not valid JSON: {e}"
         ))
     })?;
 
     // Recursively check decoded strings for forbidden template patterns
     check_no_template_values(node_id, &parsed)?;
 
-    // Validate typed action schema
+    // Each kind takes exactly its own typed parameters. A change-set node or a session node asks
+    // for exactly what its method asks for, so its parameters are that method's own, and a node
+    // that would be refused when it ran is refused when it is installed.
     match action_kind {
-        "shell_command" => {
-            let obj = parsed.as_object().ok_or_else(|| {
-                AutomationError::InvalidArgument(format!(
-                    "node {} shell_command params must be a JSON object",
-                    node_id
-                ))
-            })?;
-            let cmd = obj.get("command").and_then(|v| v.as_str());
-            if cmd.is_none() || cmd.unwrap().trim().is_empty() {
+        WorkflowActionKind::ShellCommand => {
+            let params: ShellCommandParams = typed_params(node_id, action_kind, &parsed)?;
+            bounded(node_id, "command", &params.command, MAX_SHELL_COMMAND_BYTES)?;
+        }
+        WorkflowActionKind::RunTests => {
+            let params: RunTestsParams = typed_params(node_id, action_kind, &parsed)?;
+            bounded(node_id, "suite", &params.suite, MAX_TEST_SUITE_BYTES)?;
+        }
+        WorkflowActionKind::RequestReview => {
+            typed_params::<RequestReviewParams>(node_id, action_kind, &parsed)?;
+        }
+        WorkflowActionKind::CreateSession => {
+            let params: SessionCreateParams = typed_params(node_id, action_kind, &parsed)?;
+            if let Some(reason) = params.palette_refusal() {
                 return Err(AutomationError::InvalidArgument(format!(
-                    "node {} shell_command requires non-empty string 'command'",
-                    node_id
+                    "node {node_id} creates a session session.create would refuse: {reason}"
                 )));
             }
         }
-        "run_tests" => {
-            let obj = parsed.as_object().ok_or_else(|| {
-                AutomationError::InvalidArgument(format!(
-                    "node {} run_tests params must be a JSON object",
-                    node_id
-                ))
-            })?;
-            if obj.get("suite").and_then(|v| v.as_str()).is_none() {
-                return Err(AutomationError::InvalidArgument(format!(
-                    "node {} run_tests requires string 'suite'",
-                    node_id
-                )));
-            }
-        }
-        "request_review" => {
-            let obj = parsed.as_object().ok_or_else(|| {
-                AutomationError::InvalidArgument(format!(
-                    "node {} request_review params must be a JSON object",
-                    node_id
-                ))
-            })?;
-            if obj.get("reviewer_id").and_then(|v| v.as_str()).is_none() {
-                return Err(AutomationError::InvalidArgument(format!(
-                    "node {} request_review requires string 'reviewer_id'",
-                    node_id
-                )));
-            }
-        }
-        "create_session" => {
-            let obj = parsed.as_object().ok_or_else(|| {
-                AutomationError::InvalidArgument(format!(
-                    "node {} create_session params must be a JSON object",
-                    node_id
-                ))
-            })?;
-            if obj.get("title").and_then(|v| v.as_str()).is_none() {
-                return Err(AutomationError::InvalidArgument(format!(
-                    "node {} create_session requires string 'title'",
-                    node_id
-                )));
-            }
-        }
-        "attention_notice" => {
-            let obj = parsed.as_object().ok_or_else(|| {
-                AutomationError::InvalidArgument(format!(
-                    "node {} attention_notice params must be a JSON object",
-                    node_id
-                ))
-            })?;
-            if obj.get("summary").and_then(|v| v.as_str()).is_none() {
-                return Err(AutomationError::InvalidArgument(format!(
-                    "node {} attention_notice requires string 'summary'",
-                    node_id
-                )));
-            }
-        }
-        // A change-set node asks for exactly what the change-set method asks for, so its
-        // parameters are that method's own typed parameters and they are checked against that
-        // type here. A node that would be refused when it ran is refused when it is installed.
-        "materialize_changeset" => {
-            typed_params::<kr_protocol::changeset::ChangesetMaterializeParams>(
+        WorkflowActionKind::AttentionNotice => {
+            let params: AttentionNoticeParams = typed_params(node_id, action_kind, &parsed)?;
+            bounded(
                 node_id,
-                action_kind,
-                &parsed,
+                "summary",
+                &params.summary,
+                MAX_NOTICE_SUMMARY_BYTES,
             )?;
         }
-        "apply_diff" => {
-            let obj = parsed.as_object().ok_or_else(|| {
-                AutomationError::InvalidArgument(format!(
-                    "node {} apply_diff params must be a JSON object",
-                    node_id
-                ))
-            })?;
-            if obj.get("diff").and_then(|v| v.as_str()).is_none() {
-                return Err(AutomationError::InvalidArgument(format!(
-                    "node {} apply_diff requires string 'diff'",
-                    node_id
-                )));
-            }
+        WorkflowActionKind::MaterializeChangeset => {
+            typed_params::<ChangesetMaterializeParams>(node_id, action_kind, &parsed)?;
         }
-        "capture_changeset" => {
-            typed_params::<kr_protocol::changeset::ChangesetCaptureParams>(
-                node_id,
-                action_kind,
-                &parsed,
-            )?;
+        WorkflowActionKind::ApplyDiff => {
+            typed_params::<DiffApplyParams>(node_id, action_kind, &parsed)?;
         }
-        _ => {}
+        WorkflowActionKind::CaptureChangeset => {
+            typed_params::<ChangesetCaptureParams>(node_id, action_kind, &parsed)?;
+        }
     }
 
+    Ok(())
+}
+
+/// Refuses a name a node carries that is empty or longer than its kind allows.
+fn bounded(node_id: &str, field: &str, value: &str, max_bytes: usize) -> Result<()> {
+    if value.trim().is_empty() || value.len() > max_bytes {
+        return Err(AutomationError::InvalidArgument(format!(
+            "node {node_id} needs a {field} of 1 to {max_bytes} bytes"
+        )));
+    }
     Ok(())
 }
 
 /// Decodes one node's parameters into the exact wire type its action kind is dispatched with.
 fn typed_params<T: serde::de::DeserializeOwned>(
     node_id: &str,
-    action_kind: &str,
+    action_kind: WorkflowActionKind,
     parsed: &serde_json::Value,
 ) -> Result<T> {
     serde_json::from_value(parsed.clone()).map_err(|error| {
@@ -300,16 +239,37 @@ fn typed_params<T: serde::de::DeserializeOwned>(
 
 /// Returns the workspace a node acts on, when its action kind names one.
 ///
-/// A capture reads one workspace. That is the resource the node's effect touches, so it is the
-/// one a definition's declared scope and the grant's own selectors have to admit.
+/// A capture reads one workspace and an apply writes one. That is the resource the node's effect
+/// touches, so it is the one a definition's declared scope and the grant's own selectors have to
+/// admit.
 #[must_use]
-pub fn node_workspace(node: &WorkflowNode) -> Option<kr_protocol::ids::WorkspaceId> {
-    if node.action_kind != "capture_changeset" {
-        return None;
+pub fn node_workspace(node: &WorkflowNode) -> Option<WorkspaceId> {
+    match node.action_kind {
+        WorkflowActionKind::CaptureChangeset => {
+            serde_json::from_str::<ChangesetCaptureParams>(&node.action_params)
+                .ok()
+                .map(|params| params.workspace_id)
+        }
+        WorkflowActionKind::ApplyDiff => {
+            serde_json::from_str::<DiffApplyParams>(&node.action_params)
+                .ok()
+                .and_then(|params| params.workspace_id.0)
+        }
+        _ => None,
     }
-    serde_json::from_str::<kr_protocol::changeset::ChangesetCaptureParams>(&node.action_params)
-        .ok()
-        .map(|params| params.workspace_id)
+}
+
+/// Returns the environment a node creates a session in, when its action kind creates one.
+#[must_use]
+pub fn node_environment(node: &WorkflowNode) -> Option<EnvironmentId> {
+    match node.action_kind {
+        WorkflowActionKind::CreateSession => {
+            serde_json::from_str::<SessionCreateParams>(&node.action_params)
+                .ok()
+                .map(|params| params.environment_id)
+        }
+        _ => None,
+    }
 }
 
 /// Recursively checks that no JSON value contains arbitrary template code or script interpolation.
@@ -488,18 +448,8 @@ mod tests {
 
     #[test]
     fn valid_acyclic_graph_passes() {
-        let n1 = WorkflowNode {
-            node_id: "test".to_owned(),
-            action_kind: "run_tests".to_owned(),
-            action_params: r#"{"suite": "unit"}"#.to_owned(),
-            declared_environment: Nullable::null(),
-        };
-        let n2 = WorkflowNode {
-            node_id: "review".to_owned(),
-            action_kind: "request_review".to_owned(),
-            action_params: r#"{"reviewer_id": "alice"}"#.to_owned(),
-            declared_environment: Nullable::null(),
-        };
+        let n1 = crate::fixtures::node("test", WorkflowActionKind::RunTests);
+        let n2 = crate::fixtures::node("review", WorkflowActionKind::RequestReview);
         let e1 = WorkflowEdge {
             from_node: "test".to_owned(),
             to_node: "review".to_owned(),
@@ -520,18 +470,8 @@ mod tests {
 
     #[test]
     fn cyclic_graph_is_rejected() {
-        let n1 = WorkflowNode {
-            node_id: "a".to_owned(),
-            action_kind: "run_tests".to_owned(),
-            action_params: r#"{"suite": "unit"}"#.to_owned(),
-            declared_environment: Nullable::null(),
-        };
-        let n2 = WorkflowNode {
-            node_id: "b".to_owned(),
-            action_kind: "request_review".to_owned(),
-            action_params: r#"{"reviewer_id": "bob"}"#.to_owned(),
-            declared_environment: Nullable::null(),
-        };
+        let n1 = crate::fixtures::node("a", WorkflowActionKind::RunTests);
+        let n2 = crate::fixtures::node("b", WorkflowActionKind::RequestReview);
         let e1 = WorkflowEdge {
             from_node: "a".to_owned(),
             to_node: "b".to_owned(),
@@ -558,12 +498,8 @@ mod tests {
 
     #[test]
     fn arbitrary_template_syntax_is_rejected() {
-        let n1 = WorkflowNode {
-            node_id: "templated".to_owned(),
-            action_kind: "run_tests".to_owned(),
-            action_params: r#"{"suite": "{{ run_all }}"}"#.to_owned(),
-            declared_environment: Nullable::null(),
-        };
+        let mut n1 = crate::fixtures::node("templated", WorkflowActionKind::RunTests);
+        n1.action_params = n1.action_params.replace("unit", "{{ run_all }}");
         let def = create_workflow_definition(
             dummy_workflow_id(),
             1,
@@ -579,12 +515,8 @@ mod tests {
 
     #[test]
     fn shell_command_node_requires_declared_environment() {
-        let n1 = WorkflowNode {
-            node_id: "shell".to_owned(),
-            action_kind: "shell_command".to_owned(),
-            action_params: r#"{"command": "cargo test"}"#.to_owned(),
-            declared_environment: Nullable::null(), // Missing environment
-        };
+        let mut n1 = crate::fixtures::node("shell", WorkflowActionKind::ShellCommand);
+        n1.declared_environment = Nullable::null(); // Missing environment
         let def = create_workflow_definition(
             dummy_workflow_id(),
             1,

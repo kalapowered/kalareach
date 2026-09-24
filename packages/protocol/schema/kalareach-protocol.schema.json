@@ -2942,6 +2942,20 @@
         }
       ]
     },
+    "AttentionNoticeParams": {
+      "additionalProperties": false,
+      "description": "Parameters of an `attention_notice` node.",
+      "properties": {
+        "summary": {
+          "description": "What the notice says: 1 to [`MAX_NOTICE_SUMMARY_BYTES`] bytes.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "summary"
+      ],
+      "type": "object"
+    },
     "AttentionQuestionRecord": {
       "additionalProperties": false,
       "description": "One question transition, as the attention store reads it.",
@@ -17693,6 +17707,207 @@
       },
       "type": "object"
     },
+    "NodeOutput": {
+      "description": "What a node's action produced, as this host observed it.\n\nOne shape per action kind, named by the kind itself, so a receipt says what it is a receipt\nof. An output holds identifiers and states, never text a node, a terminal or a model produced:\na reader that needs more reads the session or the change set it names, under its own authority.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A `shell_command` node's command ran to completion.",
+          "properties": {
+            "kind": {
+              "const": "shell_command",
+              "type": "string"
+            },
+            "session_id": {
+              "$ref": "#/$defs/SessionId",
+              "description": "The session the command ran in."
+            }
+          },
+          "required": [
+            "kind",
+            "session_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A `run_tests` node's suite passed against the version.",
+          "properties": {
+            "kind": {
+              "const": "run_tests",
+              "type": "string"
+            },
+            "suite": {
+              "description": "The suite that ran.",
+              "type": "string"
+            },
+            "version": {
+              "$ref": "#/$defs/VersionRef",
+              "description": "The version it ran against."
+            }
+          },
+          "required": [
+            "kind",
+            "suite",
+            "version"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A `request_review` node's reviewer finished its review.",
+          "properties": {
+            "kind": {
+              "const": "request_review",
+              "type": "string"
+            },
+            "session_id": {
+              "$ref": "#/$defs/SessionId",
+              "description": "The separate reviewer session."
+            },
+            "turn_id": {
+              "$ref": "#/$defs/AgentTurnId",
+              "description": "The reviewer turn whose completion carried the result."
+            },
+            "version": {
+              "$ref": "#/$defs/VersionRef",
+              "description": "The version reviewed."
+            }
+          },
+          "required": [
+            "kind",
+            "version",
+            "session_id",
+            "turn_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A `create_session` node created a session.",
+          "properties": {
+            "kind": {
+              "const": "create_session",
+              "type": "string"
+            },
+            "session_id": {
+              "$ref": "#/$defs/SessionId",
+              "description": "The session."
+            }
+          },
+          "required": [
+            "kind",
+            "session_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "An `attention_notice` node raised its notice.",
+          "properties": {
+            "kind": {
+              "const": "attention_notice",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A `materialize_changeset` node wrote the version into a private directory.",
+          "properties": {
+            "kind": {
+              "const": "materialize_changeset",
+              "type": "string"
+            },
+            "materialisation_id": {
+              "$ref": "#/$defs/MaterialisationId",
+              "description": "The materialisation that holds it."
+            },
+            "version": {
+              "$ref": "#/$defs/VersionRef",
+              "description": "The version written."
+            }
+          },
+          "required": [
+            "kind",
+            "version",
+            "materialisation_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "An `apply_diff` node applied the version.",
+          "properties": {
+            "applied_version": {
+              "$ref": "#/$defs/VersionRef",
+              "description": "The version applied."
+            },
+            "destination": {
+              "$ref": "#/$defs/DestinationClass",
+              "description": "Where it was applied."
+            },
+            "kind": {
+              "const": "apply_diff",
+              "type": "string"
+            },
+            "outcome": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ApplyOutcomeClass"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Which class the apply came to, absent for a preflight that found nothing to do."
+            },
+            "proposal_version": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/VersionRef"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The immutable proposal a proposal apply produced."
+            }
+          },
+          "required": [
+            "kind",
+            "applied_version",
+            "destination",
+            "outcome",
+            "proposal_version"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A `capture_changeset` node captured the workspace.",
+          "properties": {
+            "kind": {
+              "const": "capture_changeset",
+              "type": "string"
+            },
+            "version": {
+              "$ref": "#/$defs/VersionRef",
+              "description": "The version captured."
+            }
+          },
+          "required": [
+            "kind",
+            "version"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "NodeReceiptSummary": {
       "additionalProperties": false,
       "description": "Summary receipt of an executed action node.",
@@ -17730,13 +17945,13 @@
         "output": {
           "anyOf": [
             {
-              "type": "string"
+              "$ref": "#/$defs/NodeOutput"
             },
             {
               "type": "null"
             }
           ],
-          "description": "Output result string, if available."
+          "description": "What the action produced, typed by the node's kind, for a node that succeeded."
         },
         "run_id": {
           "$ref": "#/$defs/WorkflowRunId",
@@ -25815,6 +26030,35 @@
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
+    "RequestReviewParams": {
+      "additionalProperties": false,
+      "description": "Parameters of a `request_review` node.\n\nEverything the review stands on is explicit: the agent that reviews, the immutable version it\nreads, and the workspace policy its separate session runs under.",
+      "properties": {
+        "instructions": {
+          "$ref": "#/$defs/PromptText",
+          "description": "What the reviewer is asked."
+        },
+        "reviewer_id": {
+          "$ref": "#/$defs/PluginId",
+          "description": "The agent that reviews, by the identifier of the connector that runs it."
+        },
+        "version": {
+          "$ref": "#/$defs/VersionRef",
+          "description": "The immutable change-set version the review reads, which its result binds to."
+        },
+        "workspace": {
+          "$ref": "#/$defs/WorkspaceKind",
+          "description": "The kind of workspace the separate reviewer session works in."
+        }
+      },
+      "required": [
+        "reviewer_id",
+        "version",
+        "workspace",
+        "instructions"
+      ],
+      "type": "object"
+    },
     "RequiredAuthority": {
       "description": "What a request must present besides a valid current grant.\n\nAn empty required-rights list is not \"no check\". It means scoped read authority and nothing\nmore: a valid, unexpired, unrevoked grant for this actor that covers the named environment and\nthe named resource. Only reads of host and environment configuration use it.",
       "oneOf": [
@@ -27556,6 +27800,25 @@
       ],
       "type": "object"
     },
+    "RunTestsParams": {
+      "additionalProperties": false,
+      "description": "Parameters of a `run_tests` node.",
+      "properties": {
+        "suite": {
+          "description": "The test suite to run, by the name the environment's test configuration gives it: 1 to\n[`MAX_TEST_SUITE_BYTES`] bytes.",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "#/$defs/VersionRef",
+          "description": "The immutable change-set version the tests run against, which their result binds to."
+        }
+      },
+      "required": [
+        "suite",
+        "version"
+      ],
+      "type": "object"
+    },
     "SavedCursorState": {
       "additionalProperties": false,
       "description": "A cursor an application saved, with the pen it saved alongside it.",
@@ -28875,6 +29138,20 @@
         "application_state",
         "root_process",
         "closure"
+      ],
+      "type": "object"
+    },
+    "ShellCommandParams": {
+      "additionalProperties": false,
+      "description": "Parameters of a `shell_command` node.\n\nThe command runs in the node's declared execution environment, and only under a broad shell\ngrant that admits that environment.",
+      "properties": {
+        "command": {
+          "description": "The command line the shell runs: 1 to [`MAX_SHELL_COMMAND_BYTES`] bytes.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "command"
       ],
       "type": "object"
     },
@@ -32594,6 +32871,51 @@
       ],
       "type": "object"
     },
+    "WorkflowActionKind": {
+      "description": "The action kinds a workflow node can name.\n\nEach kind takes one parameter type, needs the rights the method that performs the same\neffect needs, and produces one output type ([`NodeOutput`]). A node naming anything else is\nrefused when the definition is read.",
+      "oneOf": [
+        {
+          "const": "shell_command",
+          "description": "Runs a command line in a shell in the node's declared execution environment.",
+          "type": "string"
+        },
+        {
+          "const": "run_tests",
+          "description": "Runs a named test suite against one immutable change-set version.",
+          "type": "string"
+        },
+        {
+          "const": "request_review",
+          "description": "Asks an agent in a separate reviewer session to review one immutable change-set version.",
+          "type": "string"
+        },
+        {
+          "const": "create_session",
+          "description": "Creates a session, taking `session.create`'s own parameters.",
+          "type": "string"
+        },
+        {
+          "const": "attention_notice",
+          "description": "Raises an attention notice.",
+          "type": "string"
+        },
+        {
+          "const": "materialize_changeset",
+          "description": "Writes one immutable change-set version into a private directory, taking `changeset.materialize`'s own parameters.",
+          "type": "string"
+        },
+        {
+          "const": "apply_diff",
+          "description": "Applies one immutable change-set version to a destination, taking `diff.apply`'s own parameters.",
+          "type": "string"
+        },
+        {
+          "const": "capture_changeset",
+          "description": "Captures one workspace into an immutable change-set version, taking `changeset.capture`'s own parameters.",
+          "type": "string"
+        }
+      ]
+    },
     "WorkflowAlert": {
       "additionalProperties": false,
       "description": "One attention record the automation journal holds and no attention state has acknowledged.\n\nIt is the record an exhausted chain or a breached workflow limit owes, and the one that ends a\npause. It stays in the journal, and in `workflow.read`, until the environment's attention state\nhas taken it.",
@@ -32967,11 +33289,11 @@
       "description": "A single action node in a workflow graph.",
       "properties": {
         "action_kind": {
-          "description": "Registered action kind (e.g., \"shell_command\", \"run_tests\", \"request_review\").",
-          "type": "string"
+          "$ref": "#/$defs/WorkflowActionKind",
+          "description": "The action kind this node performs."
         },
         "action_params": {
-          "description": "Typed action parameters JSON string without template code.",
+          "description": "The kind's own typed parameters, as a JSON document: exactly the fields the kind's\nparameter type has, with no template code in any value.",
           "type": "string"
         },
         "declared_environment": {
@@ -34019,6 +34341,9 @@
     "attention_item_revision": {
       "$ref": "#/$defs/AttentionItemRevision"
     },
+    "attention_notice_params": {
+      "$ref": "#/$defs/AttentionNoticeParams"
+    },
     "attention_question_record": {
       "$ref": "#/$defs/AttentionQuestionRecord"
     },
@@ -34805,6 +35130,9 @@
     "named_question_preview": {
       "$ref": "#/$defs/NamedQuestionPreview"
     },
+    "node_output": {
+      "$ref": "#/$defs/NodeOutput"
+    },
     "node_receipt_summary": {
       "$ref": "#/$defs/NodeReceiptSummary"
     },
@@ -35150,6 +35478,9 @@
     "request": {
       "$ref": "#/$defs/Request"
     },
+    "request_review_params": {
+      "$ref": "#/$defs/RequestReviewParams"
+    },
     "response": {
       "$ref": "#/$defs/Response"
     },
@@ -35249,6 +35580,9 @@
     "root_eof_detach_result": {
       "$ref": "#/$defs/RootEofDetachResult"
     },
+    "run_tests_params": {
+      "$ref": "#/$defs/RunTestsParams"
+    },
     "sealed_envelope": {
       "$ref": "#/$defs/SealedEnvelope"
     },
@@ -35320,6 +35654,9 @@
     },
     "session_summary": {
       "$ref": "#/$defs/SessionSummary"
+    },
+    "shell_command_params": {
+      "$ref": "#/$defs/ShellCommandParams"
     },
     "shell_launch_params": {
       "$ref": "#/$defs/ShellLaunchParams"
@@ -35491,6 +35828,9 @@
     },
     "worker_verify_proof": {
       "$ref": "#/$defs/WorkerVerifyProof"
+    },
+    "workflow_action_kind": {
+      "$ref": "#/$defs/WorkflowActionKind"
     },
     "workflow_alert": {
       "$ref": "#/$defs/WorkflowAlert"
