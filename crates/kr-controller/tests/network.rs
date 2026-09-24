@@ -27,6 +27,7 @@ mod pairing_calls;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use iroh::{Endpoint, EndpointAddr};
@@ -570,24 +571,46 @@ async fn pair_with(
     owner: &DeviceKeys,
     proposal: ProposedGrant,
 ) -> DeviceRecord {
-    let signer = pairing_calls::Signer::OwnerDevice(owner);
     let mut client = daemon.client().await;
-    let environment = daemon.environment_id();
-    let invited = pairing_calls::invite_direct(
-        environment,
-        &mut client,
+    let invited = invite(daemon, &mut client, owner, &proposal).await;
+    redeem(daemon, &mut client, device, owner, &invited).await
+}
+
+/// Issues a direct invitation under an exact proposed grant, on the owner device's confirmation.
+async fn invite(
+    daemon: &RunningDaemon,
+    client: &mut LocalClient,
+    owner: &DeviceKeys,
+    proposal: &ProposedGrant,
+) -> kr_protocol::invitation::PairInviteResult {
+    pairing_calls::invite_direct(
+        daemon.environment_id(),
+        client,
         InviteGrantKind::SessionInvitation,
-        &proposal,
-        &signer,
+        proposal,
+        &pairing_calls::Signer::OwnerDevice(owner),
     )
     .await
-    .expect("an invitation");
+    .expect("an invitation")
+}
+
+/// Redeems a direct invitation as the candidate that scanned it, and has the owner device approve
+/// the candidate, and returns the record the host committed.
+async fn redeem(
+    daemon: &RunningDaemon,
+    client: &mut LocalClient,
+    device: &Device,
+    owner: &DeviceKeys,
+    invited: &kr_protocol::invitation::PairInviteResult,
+) -> DeviceRecord {
+    let signer = pairing_calls::Signer::OwnerDevice(owner);
+    let environment = daemon.environment_id();
     let (connection, mut candidate, verification_value) =
-        pairing_calls::redeem(&device.candidate(), &invited).await;
+        pairing_calls::redeem(&device.candidate(), invited).await;
     assert_eq!(verification_value.len(), 8);
 
     // The owner approves exactly what both devices displayed.
-    let status = pairing_calls::owner_status(&mut client, invited.invitation_id)
+    let status = pairing_calls::owner_status(client, invited.invitation_id)
         .await
         .expect("the owner's view");
     let shown = status
@@ -600,7 +623,7 @@ async fn pair_with(
         "both devices show one value"
     );
     let confirmed =
-        pairing_calls::confirm_candidate(environment, &mut client, invited.invitation_id, &signer)
+        pairing_calls::confirm_candidate(environment, client, invited.invitation_id, &signer)
             .await
             .expect("the pairing commits");
 
@@ -934,6 +957,9 @@ async fn close_session(client: &mut LocalClient, host: &Host, session_id: Sessio
 // Ignored by default: this suite starts real processes, and the binary it launches is built by
 // `scripts/end-to-end.sh`, which runs it with `--include-ignored`. A suite that skipped itself
 // silently when that binary was absent would report a pass for something it never ran.
+/// KR-REQ-17.12: direct iroh connections and local pairing need no KalaReach account. Neither the
+/// host nor the device configures an account, a relay, discovery or any managed service, and the
+/// device still pairs by the host's invitation and runs a live session over direct iroh.
 #[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor() {
@@ -1148,6 +1174,68 @@ fn host_paired_record(daemon: &RunningDaemon) -> PairedPeer {
         authorisation: pairing.identity().keys.authorisation,
         endpoint_id: daemon.network.endpoint_id(),
     }
+}
+
+// Ignored by default like the rest of this suite: the host fixture needs the worker binary that
+// `scripts/end-to-end.sh` builds, and that script runs the suite with `--include-ignored`.
+/// KR-REQ-17.45: a host's current direct addresses reach a device through the pairing exchange
+/// rather than through any lookup. Neither the host nor the device selects a relay or a discovery
+/// service. The invitation the host issues carries exactly the addresses its endpoint is bound to
+/// now, and a device that knows nothing but the invitation dials the host there and pairs.
+#[ignore = "starts a control daemon; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pairing_invitation_carries_the_hosts_current_direct_addresses() {
+    let Some(host) = Host::create() else {
+        return;
+    };
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let daemon = host.start(loopback(), &owner).await;
+
+    let proposed = proposal();
+    let mut client = daemon.client().await;
+    let invited = invite(&daemon, &mut client, &owner, &proposed).await;
+    let payload = pairing_calls::direct_payload(&invited);
+    let bound: BTreeSet<String> = daemon
+        .network
+        .bound_sockets()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert!(!bound.is_empty(), "the host is bound to direct addresses");
+    let hinted: BTreeSet<String> = payload
+        .network_config
+        .direct_addresses
+        .iter()
+        .map(|hint| hint.as_str().to_owned())
+        .collect();
+    assert_eq!(
+        hinted, bound,
+        "the invitation carries the addresses the host is bound to now"
+    );
+    let selected = &payload.network_config;
+    assert!(
+        selected.relay_urls.is_empty()
+            && selected.pkarr_publisher_url.as_ref().is_none()
+            && selected.pkarr_resolver_url.as_ref().is_none()
+            && selected.dns_origin.as_ref().is_none(),
+        "and nothing a device could look the host up in"
+    );
+
+    // The device dials the host at the invitation's hints and nowhere else, and the pairing
+    // completes over that path.
+    let device = Device::create(&loopback()).await;
+    let record = redeem(&daemon, &mut client, &device, &owner, &invited).await;
+    assert!(
+        daemon
+            .network
+            .devices()
+            .record_for_device(record.device_id)
+            .expect("reads the device records")
+            .is_some(),
+        "the host recorded the device it paired with"
+    );
+
+    daemon.stop().await;
 }
 
 // Ignored by default: this suite starts real processes, and the binary it launches is built by
@@ -1821,16 +1909,94 @@ async fn the_remote_path_ending_takes_neither_the_worker_nor_a_local_attachment(
     daemon.stop().await;
 }
 
+/// What a relay says when it turns an endpoint away because the allowance is spent.
+const ALLOWANCE_SPENT: &str = "the relay allowance for this period is used up";
+
+/// What a metered relay may still forward, and what it did once it could not.
+#[derive(Debug)]
+struct Allowance {
+    /// The count of forwarded bytes at which the allowance is spent.
+    limit: AtomicU64,
+    /// Set once the allowance is spent. From then on the relay admits nobody.
+    spent: AtomicBool,
+    /// Every endpoint the relay admitted, which is what it closes when the allowance is spent.
+    admitted: std::sync::Mutex<Vec<iroh::EndpointId>>,
+    /// Every endpoint it turned away because the allowance was spent.
+    refused: std::sync::Mutex<Vec<iroh::EndpointId>>,
+}
+
+/// The relay's admission check, which answers from the allowance.
+#[derive(Debug, Clone)]
+struct AllowanceGate(Arc<Allowance>);
+
+impl iroh_relay::server::AccessControl for AllowanceGate {
+    async fn on_connect(
+        &self,
+        request: &iroh_relay::server::ClientRequest,
+    ) -> iroh_relay::server::Access {
+        let endpoint = request.endpoint_id();
+        if self.0.spent.load(Ordering::SeqCst) {
+            self.0
+                .refused
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(endpoint);
+            return iroh_relay::server::Access::Deny {
+                reason: Some(ALLOWANCE_SPENT.to_owned()),
+            };
+        }
+        self.0
+            .admitted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(endpoint);
+        iroh_relay::server::Access::Allow
+    }
+}
+
+/// Counts what the relay forwards, and spends the allowance when the count reaches it.
+///
+/// Spending it is the relay's own act, as a managed relay's is: it closes every connection it
+/// admitted, and the gate turns away whoever comes back. The server goes on running throughout.
+async fn meter(
+    allowance: Arc<Allowance>,
+    forwarded: Arc<iroh_relay::server::Metrics>,
+    service: iroh_relay::server::RelayService,
+) {
+    loop {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if forwarded.bytes_sent.get() < allowance.limit.load(Ordering::SeqCst) {
+            continue;
+        }
+        allowance.spent.store(true, Ordering::SeqCst);
+        let admitted = allowance
+            .admitted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for endpoint in admitted {
+            service.clients().disconnect(endpoint, None);
+        }
+        return;
+    }
+}
+
 /// A relay server running in this process, with the trust anchor a client needs for it.
 ///
 /// `iroh::test_utils::run_relay_server` discards the certificate it generated, and an endpoint that
 /// cannot verify the relay's HTTPS certificate never reaches it. This spawns the same server and
 /// keeps the certificate, which is also how a self-hosted deployment with a private authority
 /// works: the certificate is pinned as an extra trust anchor beside the public ones.
+///
+/// It meters what it forwards, as a managed relay does. It forwards without limit until a test
+/// gives it an allowance, and once what it has forwarded reaches that allowance it closes every
+/// connection it admitted and refuses, with its reason, every endpoint that comes back.
 struct LocalRelay {
     url: iroh::RelayUrl,
     ca_roots: Vec<Vec<u8>>,
     server: Option<iroh_relay::server::Server>,
+    allowance: Arc<Allowance>,
+    metering: tokio::task::AbortHandle,
 }
 
 impl LocalRelay {
@@ -1848,9 +2014,16 @@ impl LocalRelay {
             (Ipv4Addr::LOCALHOST, 0),
             CertConfig::Manual { server_config },
         );
+        let allowance = Arc::new(Allowance {
+            limit: AtomicU64::new(u64::MAX),
+            spent: AtomicBool::new(false),
+            admitted: std::sync::Mutex::new(Vec::new()),
+            refused: std::sync::Mutex::new(Vec::new()),
+        });
         let mut relay = RelayServerConfig::new((Ipv4Addr::LOCALHOST, 0));
         relay.tls = Some(tls);
         relay.key_cache_capacity = Some(1024);
+        relay.access = Arc::new(AllowanceGate(Arc::clone(&allowance)));
 
         let mut config = ServerConfig::default();
         config.relay = Some(relay);
@@ -1860,11 +2033,43 @@ impl LocalRelay {
         let url: iroh::RelayUrl = format!("https://{}", server.https_addr().expect("configured"))
             .parse()
             .expect("a relay URL");
+        let metering = tokio::spawn(meter(
+            Arc::clone(&allowance),
+            Arc::clone(&server.metrics().server),
+            server.relay_service().expect("the server relays").clone(),
+        ))
+        .abort_handle();
         Self {
             url,
             ca_roots: certs.into_iter().map(|cert| cert.to_vec()).collect(),
             server: Some(server),
+            allowance,
+            metering,
         }
+    }
+
+    /// Leaves the relay `bytes` more to forward than it has forwarded so far.
+    fn allow_only(&self, bytes: u64) {
+        let forwarded = self
+            .server
+            .as_ref()
+            .expect("the relay is running")
+            .metrics()
+            .server
+            .bytes_sent
+            .get();
+        self.allowance
+            .limit
+            .store(forwarded.saturating_add(bytes), Ordering::SeqCst);
+    }
+
+    /// The endpoints the relay turned away because the allowance was spent.
+    fn refused(&self) -> Vec<iroh::EndpointId> {
+        self.allowance
+            .refused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn config(&self) -> EndpointConfig {
@@ -1890,9 +2095,16 @@ impl LocalRelay {
 
     /// Takes the relay away, which is what a lease that ran out of reserved bytes does to a path.
     async fn shut_down(&mut self) {
+        self.metering.abort();
         if let Some(server) = self.server.take() {
             server.shutdown().await.expect("the relay stops");
         }
+    }
+}
+
+impl Drop for LocalRelay {
+    fn drop(&mut self) {
+        self.metering.abort();
     }
 }
 
@@ -2030,6 +2242,221 @@ async fn a_device_pairs_and_attaches_through_a_relay_and_losing_it_leaves_the_se
         "the local attachment, by identity, is still attached"
     );
 
+    drop(attached_locally);
+    close_session(&mut local, &host, session_id).await;
+    daemon.stop().await;
+}
+
+/// What is left of a metered relay's allowance when the next command starts.
+const ALLOWANCE_LEFT: u64 = 32 * 1024;
+
+/// A command whose output is several times what is left of the allowance.
+const SPENDING_COMMAND: &str = "yes kalareach-spends-the-allowance | head -n 20000\n";
+
+/// How long the host may take to see a connection that went quiet as ended.
+///
+/// Section 23's thirty-second inactivity threshold, and room on either side of it.
+const DISCONNECT_PATIENCE: Duration = Duration::from_secs(90);
+
+// Ignored by default: this suite starts real processes, and the binary it launches is built by
+// `scripts/end-to-end.sh`, which runs it with `--include-ignored`. A suite that skipped itself
+// silently when that binary was absent would report a pass for something it never ran.
+/// KR-REQ-17.50: the terminal worker stays alive after a relay quota disconnect. A device reaches a
+/// session through a relay that meters what it forwards, and the session's own output spends the
+/// relay's allowance. The relay, still running, closes the path and turns the device away when it
+/// comes back, telling it why. The host sees the connection end and lets go of what it held for
+/// the device, and through all of it the worker process keeps running, the session stays live and
+/// the local attachment stays attached.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_quota_disconnect_leaves_the_terminal_worker_running() {
+    use iroh::Watcher as _;
+
+    let Some(host) = Host::create() else {
+        return;
+    };
+    let relay = LocalRelay::spawn().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    // Neither endpoint has a direct path, so the relay is the whole of the remote path and its
+    // allowance is the path's allowance.
+    let daemon = host.start(relay.relay_only_config(), &owner).await;
+    let mut local = host.client().await;
+    let created = create(&mut local, &host).await;
+    let session_id = created.session.session_id;
+    let worker_endpoint = kr_ipc::paths::Endpoint::from_path(
+        created
+            .endpoint
+            .as_ref()
+            .cloned()
+            .expect("a live session names its worker"),
+    )
+    .expect("a worker endpoint");
+
+    // A local attachment, which is what `kr attach` holds and what must not depend on the network.
+    let mut attached_locally =
+        LocalClient::connect(&worker_endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("the local client reaches the worker");
+    let local_attachment: SessionAttachResult = attached_locally
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget {
+                environment_id: host.environment_id,
+                session_id: Nullable::some(session_id),
+                session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            &SessionAttachParams {
+                session_id,
+                mode: AttachMode::Semantic,
+                claim_geometry: false,
+                dimensions: Nullable::null(),
+                terminal_profile_id: Nullable::null(),
+                requested: [AttachmentCapability::ObserveTerminal]
+                    .into_iter()
+                    .collect(),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the local attachment is admitted")
+        .to_typed()
+        .expect("an attachment");
+
+    let device = Device::create(&relay.relay_only_config()).await;
+    let record = pair(&daemon, &device, &owner).await;
+    let addr = EndpointAddr::new(
+        iroh::PublicKey::from_bytes(daemon.network.endpoint_id().as_bytes())
+            .expect("a usable endpoint identity"),
+    )
+    .with_relay_url(relay.url.clone());
+    let transport = NetworkTransport::connect(
+        &device.endpoint,
+        addr,
+        &device.paired_identity(record.device_id),
+        &host_paired_record(&daemon),
+        SendLimits::default(),
+    )
+    .await
+    .expect("the paired device connects over the relay");
+    let session = Session::start(Arc::new(transport)).expect("a session");
+    let attached = attach(&session, host.environment_id, session_id).await;
+    let seen = type_and_observe(
+        &session,
+        host.environment_id,
+        session_id,
+        attached.typing,
+        MARKER_COMMAND,
+    )
+    .await;
+    assert!(seen.contains(MARKER), "the relay carried the session");
+
+    // What is left of the allowance is less than the next command prints, so the session's own
+    // output is what spends it.
+    relay.allow_only(ALLOWANCE_LEFT);
+    session
+        .write_input(&InputWriteParams {
+            session_id,
+            attachment_id: attached.typing,
+            epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
+            sequence: kr_protocol::ids::InputSequence::new(1),
+            bytes: kr_protocol::scalars::Bytes::new(SPENDING_COMMAND.as_bytes().to_vec()),
+        })
+        .await
+        .expect("the command is accepted");
+
+    // The relay refuses. It closes the path and turns the device away when it comes back, and the
+    // device learns the relay's own reason from the relay. A relay that had stopped would have
+    // said nothing at all: this one is running and answering.
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    let mut statuses = device.endpoint.home_relay_status();
+    while !statuses
+        .get()
+        .iter()
+        .any(|status| status.auth_denied_reason() == Some(ALLOWANCE_SPENT))
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the relay never refused the device for its allowance: {:?}",
+            statuses.get()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        relay.refused().contains(&device.endpoint.id()),
+        "the relay turned the device away because the allowance is spent"
+    );
+    assert!(relay.server.is_some(), "the relay is still running");
+
+    // The host sees the connection end: nothing arrives on it any more, and at the inactivity
+    // threshold it is over. The host then lets go of both attachments it held for the device,
+    // which is the disconnect complete on the host's side.
+    let deadline = tokio::time::Instant::now() + DISCONNECT_PATIENCE;
+    loop {
+        let snapshot: kr_protocol::recovery::EventsSnapshotResult = attached_locally
+            .request(
+                Method::EventsSnapshot,
+                &kr_protocol::recovery::EventsSnapshotParams {
+                    session_id,
+                    agent_resources_from: kr_protocol::scalars::Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the worker")
+            .expect("the worker answers")
+            .to_typed()
+            .expect("decodes");
+        let held: BTreeSet<AttachmentId> = snapshot
+            .attachments
+            .iter()
+            .map(|summary| summary.attachment_id)
+            .collect();
+        if !held.contains(&attached.watching) && !held.contains(&attached.typing) {
+            assert!(
+                held.contains(&local_attachment.attachment.attachment_id),
+                "the local attachment, by identity, is still attached"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the host never let go of what it held for the device"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // The worker process that runs the terminal is still running, and the session is still live.
+    let registry = Registry::open(host.paths().registry_database(), host.environment_id)
+        .expect("opens the registry");
+    let worker = registry
+        .workers()
+        .expect("reads the worker records")
+        .into_iter()
+        .find(|worker| worker.session_id == session_id)
+        .expect("the session still has its worker");
+    assert!(
+        matches!(
+            kr_ipc::identity::process_state(&worker.process_identity),
+            kr_ipc::identity::ProcessState::Running
+        ),
+        "the worker process is still running"
+    );
+    let still_live: SessionReadResult = attached_locally
+        .request(Method::SessionRead, &SessionReadParams { session_id })
+        .await
+        .expect("the call reaches the worker")
+        .expect("the worker answers")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(
+        still_live.session.state,
+        SessionState::Live,
+        "a relay quota disconnect did not end the session"
+    );
+
+    drop(session);
     drop(attached_locally);
     close_session(&mut local, &host, session_id).await;
     daemon.stop().await;
