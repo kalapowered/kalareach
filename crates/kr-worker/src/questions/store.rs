@@ -317,7 +317,8 @@ impl Store {
             }
             // A question asked more than once has no one call that asked it, so no report of a
             // call can say which thread asked it: it keeps no origin and stays application-scoped.
-            // A binding already recorded from the call that created it stays.
+            // A binding the sweep already recorded came from the report of the call that created
+            // it, before any other call used the identifier, and it stays.
             self.connection
                 .execute(
                     "DELETE FROM question_origins WHERE question_id = ?1",
@@ -396,20 +397,58 @@ impl Store {
             )
             .map_err(QuestionError::unavailable)?;
         // The thread a bridge vouched was selected when this question was asked, recorded once,
-        // with the question. An exact retry returns the question above, never reaches here, and
-        // takes the origin away.
-        if let (Some(_), Some((thread, revision))) = (binding, origin) {
-            transaction
-                .execute(
-                    "INSERT INTO question_origins (question_id, thread, revision)
-                     VALUES (?1, ?2, ?3)",
+        // with the question. It becomes the question's binding only if the report of the call that
+        // asked names that thread, and a report names its call by the request identifier alone.
+        // So the origin is kept only while the identifier names this one question on this
+        // instance: an exact retry returns the question above and takes its origin away, and a
+        // question asked under an identifier another question of this instance already used keeps
+        // none and takes the other's away.
+        if let (Some(binding), Some((thread, revision))) = (binding, origin) {
+            let instance = binding.application_instance_id.get();
+            let asked_before: bool = transaction
+                .query_row(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM questions
+                         JOIN question_bindings
+                           ON question_bindings.question_id = questions.question_id
+                         WHERE questions.request_id = ?1
+                           AND question_bindings.application_instance_id = ?2
+                           AND questions.question_id != ?3
+                     )",
                     params![
+                        params.request_id,
+                        instance.as_bytes().as_slice(),
                         question_id.get().as_bytes().as_slice(),
-                        thread.as_str(),
-                        count(revision.get()),
                     ],
+                    |row| row.get(0),
                 )
                 .map_err(QuestionError::unavailable)?;
+            if asked_before {
+                transaction
+                    .execute(
+                        "DELETE FROM question_origins WHERE question_id IN (
+                             SELECT questions.question_id FROM questions
+                             JOIN question_bindings
+                               ON question_bindings.question_id = questions.question_id
+                             WHERE questions.request_id = ?1
+                               AND question_bindings.application_instance_id = ?2
+                         )",
+                        params![params.request_id, instance.as_bytes().as_slice()],
+                    )
+                    .map_err(QuestionError::unavailable)?;
+            } else {
+                transaction
+                    .execute(
+                        "INSERT INTO question_origins (question_id, thread, revision)
+                         VALUES (?1, ?2, ?3)",
+                        params![
+                            question_id.get().as_bytes().as_slice(),
+                            thread.as_str(),
+                            count(revision.get()),
+                        ],
+                    )
+                    .map_err(QuestionError::unavailable)?;
+            }
         }
         // The agent binding goes in the same transaction as the question, so a question that was
         // asked under a bridged agent is never on record without the instance it ends with.
@@ -647,9 +686,11 @@ impl Store {
                 Err(_) => false,
             };
             // A question asked under a bridged agent with no revision yet may have one now. It was
-            // asked while the bridge vouched for one thread (its origin); once the application's
-            // own hook reports that the call that asked it ran in that same thread, the question is
-            // bound to the revision recorded when it was asked. That is recorded once, and it is
+            // asked while the bridge vouched for one thread (its origin). While it keeps that
+            // origin, its request identifier names it alone on the instance, and only a call that
+            // succeeded is reported with its identifier, so every report under that identifier is
+            // the report of the call that asked it. Once they name the origin thread, the question
+            // is bound to the revision recorded when it was asked. That is recorded once, and it is
             // what a switch is judged by from then on. A report naming another thread, or reports
             // that disagree, bind it to nothing: it stays application-scoped.
             let revision = match (agents, instance.as_deref(), revision, origin_thread) {

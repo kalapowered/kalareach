@@ -3755,10 +3755,13 @@ the bridge's own: lifting a suspension placed for another reason does not lift i
 other. Every observation goes into the instance's observed history.
 
 A contact question records, when it is asked, the thread the bridge vouches is selected and its
-revision. When the application's own hook reports that the call that asked it ran in that same
-thread, the question is bound to that revision, and a later switch of thread invalidates it. If the
-reports name another thread, or disagree, or the question was asked more than once with the same
-request identifier, it stays bound to the application alone.
+revision. The hook's report of a finished call names the call by its request identifier, and only a
+call that succeeded is reported with one. So while that identifier names this one question on the
+instance, its reports are the reports of the call that asked it: when they name the thread recorded
+at the asking, the question is bound to that revision, and a later switch of thread invalidates it.
+If the reports name another thread or disagree, or the identifier is used again (an exact retry, or
+another question of the same instance under the same identifier), no report binds it, and it stays
+bound to the application alone.
 
 The gateway hands an admitted channel's connection to its caller, which serves the application's own
 protocol on it as JSON lines within the gateway's native frame bound. The Claude Code bridge is

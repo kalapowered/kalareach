@@ -153,12 +153,16 @@ A contact question is asked through the contact skill's own server, which one Cl
 shares between all of its threads. When a question is asked, the worker records the thread the
 bridge vouches is selected, and its revision. That is not the question's binding yet, because the
 request may have come from a thread whose report had not arrived. When the `ask_user` call finishes,
-its `PostToolUse` hook says which thread ran it. If that is the thread recorded when the question
-was asked, the question is bound to the revision recorded then, and a later switch of thread
-invalidates it for every client. If the reports name another thread, or disagree with each other,
-the question stays bound to the application alone and claims no thread-switch detection. So does a
-question the agent asked again with the same request identifier: no one call asked it, so no report
-of a call can say which thread did.
+its `PostToolUse` hook says which thread ran it, naming the call by its request identifier. Claude
+Code runs `PostToolUse` only for a call that succeeded; a refused call is a `PostToolUseFailure`,
+which names no request. So while the identifier names this one question, its reports are the
+reports of the call that asked it. If they name the thread recorded when the question was asked,
+the question is bound to the revision recorded then, and a later switch of thread invalidates it for
+every client. If the reports name another thread, or disagree with each other, the question stays
+bound to the application alone and claims no thread-switch detection. So does a question whose
+identifier is used again, by an exact retry that returns it or by another question the same launch
+asked under that identifier: no one call asked under it, so no report of a call can say which
+thread did.
 
 ## Channels
 

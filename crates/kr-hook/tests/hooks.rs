@@ -233,8 +233,9 @@ fn state_of(
 /// question from the old thread is invalidated for every client, with a person's answer refused.
 /// A question asked in the new thread stays open, and one no hook placed in a thread stays
 /// application-scoped. A report of the call that arrives after the thread was left and selected
-/// again still binds the question to the revision it was asked under, not to the later one; and a
-/// question whose reports disagree, as a retry from another thread makes them, is bound to nothing.
+/// again still binds the question to the revision it was asked under, not to the later one; a
+/// question asked again under the same request is bound to nothing, whichever reports follow; and a
+/// compaction leaves a bound question open while a resume of its thread invalidates it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_11_62_a_thread_switch_the_hooks_report_invalidates_the_questions_asked_under_the_old_thread()
  {

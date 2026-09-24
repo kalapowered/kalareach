@@ -20,8 +20,8 @@ use kr_protocol::broker::IntegrationMode;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{
-    ActorId, AgentBindingRevision, ApplicationInstanceId, ConnectionId, QuestionId, SessionEpoch,
-    SessionId,
+    ActorId, AgentBindingRevision, AgentThreadId, ApplicationInstanceId, ConnectionId, QuestionId,
+    SessionEpoch, SessionId,
 };
 use kr_protocol::question::{
     CallerToken, Question, QuestionAnswer, QuestionAnswerParams, QuestionCreateParams,
@@ -423,6 +423,125 @@ fn a_switch_an_attesting_bridge_detects_invalidates_the_questions_asked_under_th
         ),
         QuestionState::Pending
     );
+}
+
+/// A bridge that vouches for one selected thread, as the broker's native bridge does, and places
+/// each request in the thread the test says ran it, as the application's hooks do. Every helper it
+/// knows belongs to its one instance.
+#[derive(Debug)]
+struct Placing {
+    helpers: Vec<ProcessStartIdentity>,
+    instance: ApplicationInstanceId,
+    revision: std::sync::Mutex<u64>,
+    ran: std::sync::Mutex<std::collections::BTreeMap<String, AgentThreadId>>,
+}
+
+impl Placing {
+    fn ran_in(&self, request_id: &str, thread: &str) {
+        self.ran.lock().expect("the lock").insert(
+            request_id.to_owned(),
+            AgentThreadId::new(thread).expect("valid"),
+        );
+    }
+
+    fn switch(&self) {
+        *self.revision.lock().expect("the lock") += 1;
+    }
+
+    fn revision(&self) -> AgentBindingRevision {
+        AgentBindingRevision::new(*self.revision.lock().expect("the lock"))
+    }
+}
+
+impl kr_worker::questions::AgentBindings for Placing {
+    fn binding_of(&self, process: &ProcessStartIdentity) -> kr_worker::questions::AgentPlacement {
+        if self.helpers.iter().any(|helper| helper.matches(process)) {
+            kr_worker::questions::AgentPlacement::Bound(kr_worker::questions::AgentBinding {
+                application_instance_id: self.instance,
+                revision: None,
+            })
+        } else {
+            kr_worker::questions::AgentPlacement::Unbound
+        }
+    }
+
+    fn current(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+    ) -> Option<AgentBindingRevision> {
+        (application_instance_id == self.instance).then(|| self.revision())
+    }
+
+    fn selection(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+    ) -> Option<(AgentThreadId, AgentBindingRevision)> {
+        (application_instance_id == self.instance)
+            .then(|| (AgentThreadId::new("t1").expect("valid"), self.revision()))
+    }
+
+    fn attested(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+        request_id: &str,
+    ) -> Option<AgentThreadId> {
+        if application_instance_id != self.instance {
+            return None;
+        }
+        self.ran.lock().expect("the lock").get(request_id).cloned()
+    }
+}
+
+/// KR-REQ-11.62: a hook's report names the call that asked by its request identifier alone, so a
+/// question keeps the thread it was asked in only while its identifier names it alone on its
+/// instance. Asked alone and reported from the thread selected when it was asked, a question is
+/// bound to that thread's revision, and a switch invalidates it. Asked under an identifier another
+/// helper of the same instance used for another question, neither question is bound by a report,
+/// whichever it came from, and a switch leaves both open, application-scoped.
+#[test]
+fn a_request_identifier_two_questions_of_one_instance_share_places_neither_in_a_thread() {
+    let instance = ApplicationInstanceId::new(Uuid::from_bytes([12; 16]));
+    let bridge = Arc::new(Placing {
+        helpers: vec![this_process(), parent_process()],
+        instance,
+        revision: std::sync::Mutex::new(1),
+        ran: std::sync::Mutex::default(),
+    });
+    let questions = Questions::open(None, session(), SessionEpoch::V1)
+        .expect("a ledger")
+        .with_agents(Arc::clone(&bridge) as Arc<dyn kr_worker::questions::AgentBindings>);
+    let (first_helper, second_helper) = (source(this_process(), 1), source(parent_process(), 2));
+
+    let (alone, _) = questions
+        .create(&first_helper, &ask("alone"), now(1_000))
+        .expect("asked");
+    let (first, _) = questions
+        .create(&first_helper, &ask("shared"), now(1_000))
+        .expect("asked");
+    let (second, _) = questions
+        .create(&second_helper, &ask("shared"), now(1_100))
+        .expect("asked");
+    assert_ne!(
+        first.question.question_id, second.question.question_id,
+        "two helpers asked two questions under one identifier"
+    );
+    for request_id in ["alone", "shared"] {
+        bridge.ran_in(request_id, "t1");
+    }
+    assert!(questions.sweep(now(1_200)).expect("sweeps").is_empty());
+
+    bridge.switch();
+    let read = every_question(&questions, 2_000);
+    assert_eq!(
+        state_of(&read, alone.question.question_id),
+        QuestionState::Expired
+    );
+    for shared in [&first, &second] {
+        assert_eq!(
+            state_of(&read, shared.question.question_id),
+            QuestionState::Pending
+        );
+    }
 }
 
 /// A helper that an agent the broker launched started is bound to the session through the broker,

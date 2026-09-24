@@ -203,7 +203,9 @@ pub trait AgentBindings: Send + Sync + std::fmt::Debug {
     /// A bridge that sees the application's own tool calls can say which thread ran a call only
     /// once the call has finished, which is after the question it asked exists. What it says then
     /// is per-request source context. None when no bridge said anything about the request, or when
-    /// two reports disagree.
+    /// two reports disagree. A report names its call by the request identifier alone, so the ledger
+    /// relies on it only for a question whose identifier names that question alone on its
+    /// instance.
     fn attested(
         &self,
         application_instance_id: ApplicationInstanceId,
