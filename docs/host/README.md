@@ -398,7 +398,10 @@ decided.
 A narrower ceiling fences dispatch before the edit is acknowledged. The authority revision advances
 first, which withdraws every connection admitted under the wider ceiling; a device that reconnects
 is admitted at the new revision, and its requests are decided under the narrower ceiling from then
-on. The host policy moves to that revision with the registry, so a device paired after the edit is
+on. The fence answers for the ceiling devices are served under as well as for the document this
+host last finished accepting. The two differ after an edit whose ceiling went into force while
+another of its effects failed, and a later edit that withdraws what that ceiling allowed is fenced
+like any other. The host policy moves to that revision with the registry, so a device paired after the edit is
 issued a grant this host recognises as its own.
 
 A secret is never in the document. `secrets` holds named references: what this configuration calls
@@ -1627,6 +1630,13 @@ What the grant decides, for every request:
 * **Expiry.** A grant that has run out is refused, and once it has been found expired it stays
   expired, so a wall clock stepped backwards revives nothing. What remains of its lifetime is also
   an authority deadline: an action admitted a moment before the expiry cannot dispatch after it.
+  Two readings can find it expired: the deadline its connection anchored on the continuous clock,
+  and this host's wall clock with the floor under it, which a clock stepped forward or another
+  decision can move first. Either way the connection ends with its subscription, and the expiry is
+  written to the device's record, so the device cannot connect again. A refusal the wall clock
+  decided also writes that floor down; a write that fails is retried by every later decision and
+  by the network's record task until one lands, so a restart after a rollback finds the floor the
+  refusal stood on.
 * **Selectors.** The environment and the session the request names have to be ones the grant
   admits. A listing names no session, so the *answer* is narrowed instead: a device is told about
   the sessions its grant admits and no others.

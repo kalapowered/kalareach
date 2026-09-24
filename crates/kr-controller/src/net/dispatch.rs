@@ -186,12 +186,6 @@ impl Authorisation {
         self.controller.authorised(self.connection_id).is_ok()
     }
 
-    /// Returns whether this connection's grant still has time on it.
-    ///
-    /// Nothing but a clock read and two atomics, because this is also what decides at every
-    /// attempt to write a frame: a decision made inside a poll cannot wait on a lock or a
-    /// database. Writing the expiry down is [`Self::note_expiry`], which the checks that can
-    /// afford it call.
     /// Records that this grant has run out, and writes it down.
     ///
     /// For a caller that established the expiry some other way than by reading the deadline here:
@@ -201,6 +195,12 @@ impl Authorisation {
         self.note_expiry();
     }
 
+    /// Returns whether this connection's grant still has time on it.
+    ///
+    /// Nothing but a clock read and two atomics, because this is also what decides at every
+    /// attempt to write a frame: a decision made inside a poll cannot wait on a lock or a
+    /// database. Writing the expiry down is [`Self::note_expiry`], which the checks that can
+    /// afford it call.
     fn has_time_left(&self) -> bool {
         if self.expired.load(Ordering::Acquire) {
             return false;
@@ -2309,7 +2309,8 @@ impl RemoteConnection {
     /// leases and offline bound, the environment and session its selectors admit, and every right
     /// the method requires under the conditions this request meets, taken from the grant as the
     /// policy and the configured rights ceiling leave it. A right the configuration removed is
-    /// refused by name. Last comes the history scope. A requirement that depends on the resolved
+    /// refused by name, and a grant that decision finds expired ends this connection exactly as
+    /// its own deadline passing would. Last comes the history scope. A requirement that depends on the resolved
     /// subject - resource ownership, a local caller's token - is the subject's to answer, and the
     /// worker answers it inside its own dispatch barrier where the subject cannot move.
     fn check_grant(
@@ -2355,6 +2356,16 @@ impl RemoteConnection {
                     ErrorCode::PermissionDenied,
                     "this device holds no voice grant on this host",
                 ),
+                // The grant ran out by this host's wall clock, or by the floor under it, while
+                // the deadline this connection anchored still has time on it: a clock stepped
+                // forward, or a floor another decision raised. It is the same observation the
+                // deadline makes, so it goes where that one goes: the latch stops every frame
+                // this connection would write next, its subscription's output among them, and
+                // the record keeps the device from coming back on another connection.
+                expired @ CeilingRefusal::Refused(crate::grants::Refusal::Expired { .. }) => {
+                    self.authority.expire();
+                    expired.to_protocol_error()
+                }
                 other => other.to_protocol_error(),
             })?;
         self.check_history(entry)?;

@@ -707,10 +707,12 @@ pub const CLOCK_MARK_INTERVAL: std::time::Duration = std::time::Duration::from_s
 
 /// Keeps this host's records of the wall clock and of expiry moving while it is on the network.
 ///
-/// Two things it owns rather than a connection: the mark that says time has passed, and the
-/// tombstones a connection observed but could not write. Both have to outlive the connection that
-/// noticed them, and neither can wait for the next device to arrive.
+/// Three things it owns rather than a connection: the mark that says time has passed, the
+/// tombstones a connection observed but could not write, and the clock floor a refusal stood on
+/// when its write failed. Each has to outlive the connection that noticed it, and none can wait
+/// for the next device to arrive.
 async fn keep_the_record(
+    controller: Weak<Controller>,
     devices: Arc<DeviceDirectory>,
     pending: Arc<devices::PendingExpiry>,
     clock: Arc<devices::ClockTrust>,
@@ -731,6 +733,9 @@ async fn keep_the_record(
             );
         }
         pending.settle(&devices);
+        if let Some(controller) = controller.upgrade() {
+            controller.settle_floor();
+        }
     }
 }
 
@@ -910,6 +915,7 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
     // a grant that ran out while nothing was watching would come back. This is what makes the
     // mark evidence of time having passed rather than of connections having arrived.
     let marking = tokio::spawn(keep_the_record(
+        Arc::downgrade(controller),
         Arc::clone(&host.devices),
         Arc::clone(host.lifetimes.pending_expiry()),
         Arc::clone(host.lifetimes.clock_trust()),
@@ -1380,9 +1386,10 @@ impl Controller {
     /// [`crate::config::ceilings::decide_with_ceiling`] is the whole of the arithmetic; this only
     /// supplies what the daemon holds. The policy is decided against in place, so the clock floor
     /// the decision raises holds for every decision after it while the daemon runs. A refusal the
-    /// clock decided is also written down, because that is what a clock wound back before the next
-    /// start could otherwise revive; a permission needs no record, since a later reading can only
-    /// find the same grant expired sooner.
+    /// clock decided is also owed the floor's record, because that is what a clock wound back
+    /// before the next start could otherwise revive; a permission needs no record of its own,
+    /// since a later reading can only find the same grant expired sooner. A record still owed from
+    /// an earlier refusal is written by whichever decision comes next.
     ///
     /// # Errors
     ///
@@ -1413,14 +1420,19 @@ impl Controller {
             &mut policy,
             request,
         );
-        if let Err(crate::config::ceilings::CeilingRefusal::Refused(
-            crate::grants::Refusal::Expired { .. }
-            | crate::grants::Refusal::OfflineValidityLapsed { .. },
-        )) = &decided
-        {
-            // Written while the lock is held, like every other raise of the floor, and a write
-            // that fails leaves the refusal standing: it is already the stricter answer.
-            let _ = self.sharing.grants().store_policy(&policy.snapshot());
+        if matches!(
+            &decided,
+            Err(crate::config::ceilings::CeilingRefusal::Refused(
+                crate::grants::Refusal::Expired { .. }
+                    | crate::grants::Refusal::OfflineValidityLapsed { .. },
+            ))
+        ) {
+            self.owe_floor(&policy);
+        } else {
+            // Before this answer goes out, and whatever it is: a refusal whose record could not be
+            // written earlier is written as soon as storage takes it, rather than waiting for the
+            // clock to refuse something else.
+            self.write_owed_floor(&policy);
         }
         decided
     }
@@ -1442,5 +1454,207 @@ impl Controller {
     #[must_use]
     pub fn network_guard(&self) -> Option<&Arc<NetworkGuard>> {
         self.network.get()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use kr_protocol::actor::ActorIngress;
+    use kr_protocol::grant::{
+        EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector,
+    };
+    use kr_protocol::ids::{AuthorityRevision, BuildId, DeviceId, GrantId};
+    use kr_protocol::method::Method;
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs};
+
+    use crate::config::ceilings::CeilingRefusal;
+    use crate::grants::{AccessRequest, GrantRecord, Refusal};
+    use crate::service::{Controller, ControllerSetup};
+    use crate::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
+
+    /// A supervisor that starts nothing. Deciding a request needs no worker.
+    #[derive(Debug)]
+    struct NoWorkers;
+
+    impl WorkerSupervisor for NoWorkers {
+        fn start(&self, _launch: &WorkerLaunch) -> LaunchOutcome {
+            LaunchOutcome::NotStarted {
+                detail: "this test starts no workers".to_owned(),
+            }
+        }
+
+        fn describe(&self) -> &'static str {
+            "a supervisor that starts nothing"
+        }
+    }
+
+    /// Starts a daemon on an environment that may already hold an earlier daemon's records.
+    async fn daemon(temp: &kr_ipc::testing::TempHost) -> Arc<Controller> {
+        let environment = temp.environment();
+        let environment_id = temp.environment_id();
+        let secrets = environment.secrets_dir();
+        Controller::start(ControllerSetup {
+            paths: environment,
+            environment_id,
+            identity: Box::new(move || {
+                let store = kr_crypto::store::open_store_in(&secrets)
+                    .expect("a secret store for the test environment");
+                Ok(kr_ipc::verify::ControllerIdentity::open(
+                    store.store.as_ref(),
+                    environment_id,
+                    false,
+                )
+                .expect("an identity"))
+            }),
+            secret_store: kr_crypto::store::StoreSelection::File,
+            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            supervisor: Box::new(NoWorkers),
+            worker_program: temp.root().join("kr-worker"),
+            build_id: BuildId::new("kr-test/0").expect("a build identifier"),
+            release: "0".to_owned(),
+            shell_packages: None,
+            terminal: Box::new(crate::supervision::NoTerminal),
+        })
+        .await
+        .expect("the daemon starts")
+    }
+
+    /// A redeemed grant to one device, carrying viewing.
+    fn granted(expiry: GrantExpiry, authority_revision: AuthorityRevision) -> (Grant, GrantRecord) {
+        let device_id = DeviceId::new(kr_ipc::new_uuid());
+        let grant = Grant {
+            grant_id: GrantId::new(kr_ipc::new_uuid()),
+            parent_grant_id: Nullable::null(),
+            issuer_device_id: device_id,
+            recipient_device_id: device_id,
+            authority_revision,
+            environment_selector: EnvironmentSelector::Any,
+            session_selector: SessionSelector::Any,
+            actions: [ActionRight::SessionView].into_iter().collect(),
+            history: HistoryScope {
+                lower_bound_ms: Nullable::null(),
+                include_live_screen: false,
+                named_questions: CanonicalSet::new(),
+                named_approvals: CanonicalSet::new(),
+            },
+            expiry,
+            organisation: Nullable::null(),
+        };
+        let record = GrantRecord {
+            grant: grant.clone(),
+            session_id: None,
+            issued_at_ms: 1,
+            activated_at_ms: Some(1),
+            revoked_at_ms: None,
+            revoked_by_parent: None,
+        };
+        (grant, record)
+    }
+
+    /// A paired device's session listing, read against the wall clock as it says `now_ms`.
+    fn listing(temp: &kr_ipc::testing::TempHost, now_ms: u64) -> AccessRequest {
+        AccessRequest {
+            method: Method::SessionList,
+            ingress: ActorIngress::PairedDevice,
+            environment_id: temp.environment_id(),
+            session_id: None,
+            claims_geometry: false,
+            recipient_account: None,
+            own_subject: None,
+            now_ms,
+        }
+    }
+
+    /// The clock floor this environment has written down.
+    fn written_floor(controller: &Controller) -> u64 {
+        controller
+            .sharing()
+            .grants()
+            .stored_policy()
+            .expect("reads the policy")
+            .expect("the host has written its policy")
+            .utc_floor_ms
+            .get()
+    }
+
+    /// A refusal the clock decided outlives a failed write of its floor: the next decision writes
+    /// the floor as soon as storage takes it, permission or not, and a daemon started afterwards
+    /// with its clock wound back still refuses the grant.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_clock_refusal_whose_record_failed_is_written_by_the_next_decision_and_outlives_a_restart()
+     {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = daemon(&temp).await;
+        let revision = controller.policy().authority_revision();
+        let now = kr_ipc::now_ms().get();
+        let expires = now + 60 * 60 * 1000;
+        let (expiring, expiring_record) = granted(
+            GrantExpiry::At {
+                expires_at_ms: TimestampMs::new(expires),
+            },
+            revision,
+        );
+        let (lasting, lasting_record) = granted(GrantExpiry::Never, revision);
+        controller
+            .decide_for_device(&expiring, &expiring_record, listing(&temp, now))
+            .expect("the grant stands before it expires");
+
+        // From here every write of the host's policy fails, as it would on a full disk.
+        let registry = rusqlite::Connection::open(temp.environment().registry_database())
+            .expect("opens the registry");
+        registry
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .expect("waits for the daemon's writes");
+        registry
+            .execute_batch(
+                "CREATE TRIGGER refuse_policy BEFORE INSERT ON host_authority
+                 WHEN NEW.key = 'policy'
+                 BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+            )
+            .expect("the fault is in place");
+
+        // The wall clock steps past the expiry. The grant is refused, and the floor it was refused
+        // on cannot be written.
+        let refused = controller
+            .decide_for_device(&expiring, &expiring_record, listing(&temp, expires + 1))
+            .expect_err("the grant has run out by this reading");
+        assert!(
+            matches!(refused, CeilingRefusal::Refused(Refusal::Expired { .. })),
+            "{refused:?}"
+        );
+        assert!(written_floor(&controller) < expires, "the write failed");
+        // The clock is wound back. The floor in memory still refuses, and its write still fails.
+        controller
+            .decide_for_device(&expiring, &expiring_record, listing(&temp, now))
+            .expect_err("a clock wound back does not revive the grant while this daemon runs");
+
+        // Storage recovers. The next decision is a permission for another grant, which owes no
+        // record of its own, and it writes the floor the refusal stood on before it answers.
+        registry
+            .execute_batch("DROP TRIGGER refuse_policy;")
+            .expect("the fault is cleared");
+        controller
+            .decide_for_device(&lasting, &lasting_record, listing(&temp, now))
+            .expect("a grant that does not expire is served");
+        assert!(
+            written_floor(&controller) > expires,
+            "the floor the refusal stood on is written down"
+        );
+
+        // A daemon started afterwards, with the clock still wound back, decides from that floor.
+        drop(controller);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let controller = daemon(&temp).await;
+        let refused = controller
+            .decide_for_device(&expiring, &expiring_record, listing(&temp, now))
+            .expect_err("the refusal outlives the daemon that made it");
+        assert!(
+            matches!(refused, CeilingRefusal::Refused(Refusal::Expired { .. })),
+            "{refused:?}"
+        );
+        drop(controller);
     }
 }

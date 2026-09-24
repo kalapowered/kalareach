@@ -372,6 +372,15 @@ pub struct Controller {
     /// delivery runtime intersects an external destination's grant with the same policy at every
     /// question, and the automation service decides each node it dispatches under it.
     policy: Arc<std::sync::Mutex<crate::grants::HostPolicy>>,
+    /// True while a decision this daemon took on the policy's clock floor is owed that floor's
+    /// record.
+    ///
+    /// A refusal the clock decided has to outlive this process: a clock wound back before the next
+    /// start would otherwise find the floor as it was last written and allow what was refused. The
+    /// write can fail, so the debt is kept rather than dropped. It is read and changed only while
+    /// the policy's lock is held, and every later decision on the floor, and the network's record
+    /// task, writes the floor again until a write lands.
+    floor_owed: std::sync::atomic::AtomicBool,
     /// This host's half of the remote authority feed: the revisions only it issues, the revocation
     /// records it retains, and the synchronisation it owes before it serves remote work again.
     feed: std::sync::Mutex<crate::grants::AuthorityFeed>,
@@ -744,6 +753,7 @@ impl Controller {
             delivery_runtime,
             devices,
             policy,
+            floor_owed: std::sync::atomic::AtomicBool::new(false),
             feed: std::sync::Mutex::new(feed),
             changesets,
             automation,
@@ -1822,12 +1832,54 @@ impl Controller {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         policy.observe_utc(now_ms);
         let settled = policy.settled_now(now_ms);
-        // Written while the lock is held, like every other accepted change, so two callers cannot
-        // reach the store out of order and leave the older floor on disk. A failure leaves the
-        // raised floor in memory, because a floor only moves forward and keeping it is the
-        // stricter answer.
-        let _ = self.sharing.grants().store_policy(&policy.snapshot());
+        // Whatever the caller decides from this reading stands on the floor, so the floor is owed
+        // its record. A failure leaves the raised floor in memory, because a floor only moves
+        // forward and keeping it is the stricter answer, and leaves the record owed.
+        self.owe_floor(&policy);
         settled
+    }
+
+    /// Records that a decision was taken on the clock floor as it stands, and writes it down.
+    ///
+    /// The guard is the policy's own, so the write happens while the lock is held, like every
+    /// other write of the policy: two callers cannot reach the store out of order and leave the
+    /// older floor on disk.
+    pub(crate) fn owe_floor(&self, policy: &std::sync::MutexGuard<'_, crate::grants::HostPolicy>) {
+        self.floor_owed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.write_owed_floor(policy);
+    }
+
+    /// Writes the clock floor down when a decision taken on it is still owed that record.
+    ///
+    /// Nothing is written when nothing is owed, so the ordinary decision costs no write. A write
+    /// that fails leaves the debt for the next caller: every decision on the floor tries again,
+    /// and so does the network's record task, so storage that recovers settles it.
+    pub(crate) fn write_owed_floor(
+        &self,
+        policy: &std::sync::MutexGuard<'_, crate::grants::HostPolicy>,
+    ) {
+        if !self.floor_owed.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        match self.sharing.grants().store_policy(&policy.snapshot()) {
+            Ok(()) => self
+                .floor_owed
+                .store(false, std::sync::atomic::Ordering::Release),
+            Err(error) => eprintln!(
+                "kr-controller: could not record the clock floor this host decided from: {error}"
+            ),
+        }
+    }
+
+    /// Writes down a clock floor still owed its record, for a caller holding no decision of its
+    /// own.
+    pub(crate) fn settle_floor(&self) {
+        let policy = self
+            .policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.write_owed_floor(&policy);
     }
 
     /// Returns which workers have not yet acknowledged the environment's authority revision.
@@ -5647,7 +5699,7 @@ impl Controller {
     async fn accept_configuration(&self) -> crate::config::Accepted {
         let mut state = self.accepted_configuration.lock().await;
         let resolver = self.configuration();
-        let owed = kr_protocol::hostinfo::configuration::owed(
+        let mut owed = kr_protocol::hostinfo::configuration::owed(
             state.document.as_ref(),
             resolver.loaded().document.as_ref(),
         );
@@ -5664,20 +5716,33 @@ impl Controller {
         // it produced a document and as it was when it did not. Before the fence below, so a
         // narrower ceiling decides every request from here on while the work admitted under the
         // wider one is fenced; a reading that decided nothing lifts nothing.
-        let rights = {
+        let (rights, ceiling_moved) = {
             let mut held = self
                 .rights_ceiling
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let decided = resolver.loaded().document.as_ref();
+            let mut moved = false;
             if let Some(document) = decided {
-                *held = crate::config::ceilings::configured_rights(&document.ceilings);
+                let configured = crate::config::ceilings::configured_rights(&document.ceilings);
+                moved = *held != configured;
+                *held = configured;
             }
-            crate::config::EnforcedRights {
-                ceiling: held.clone(),
-                from_document: decided.is_some(),
-            }
+            (
+                crate::config::EnforcedRights {
+                    ceiling: held.clone(),
+                    from_document: decided.is_some(),
+                },
+                moved,
+            )
         };
+        // The fence answers for the ceiling in force as well as for the document last accepted.
+        // The two part when an acceptance put its ceiling in force and an effect after it failed:
+        // the document stays the one before, while devices are served under the new ceiling. A
+        // later document that matches the old one then moves nothing against it, and it still
+        // withdraws what the ceiling in force allowed, so the work admitted under that ceiling is
+        // fenced like any other.
+        owed.fences_dispatch |= ceiling_moved;
         let (sessions, mut failure) = self.apply_session_limit(&resolver, &state).await;
         if sessions.from_document {
             // Recorded the moment the registry took it, separately from everything below. A later

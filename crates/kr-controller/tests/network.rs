@@ -52,6 +52,7 @@ use kr_protocol::attachment::{
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope, SessionSelector};
+use kr_protocol::hostinfo::configuration::Change;
 use kr_protocol::ids::{
     ActionId, AttachmentId, BuildId, DeviceId, DeviceKeyRevision, EnvironmentId, SessionId,
     StreamId,
@@ -1210,6 +1211,222 @@ async fn a_revoked_device_is_fenced_before_it_is_served_again() {
     assert!(
         again.is_err(),
         "a revoked device's endpoint has no paired record to authorise"
+    );
+
+    session.close();
+    close_session(&mut local, &host, session_id).await;
+    daemon.stop().await;
+}
+
+/// The rights paired devices keep when the owner withholds viewing, as the document writes them.
+fn without_viewing() -> Vec<String> {
+    [
+        ActionRight::TerminalInput,
+        ActionRight::SessionCreate,
+        ActionRight::SessionClose,
+    ]
+    .iter()
+    .map(|right| right.as_str().to_owned())
+    .collect()
+}
+
+/// KR-REQ-26.15: a narrowing is measured against the rights ceiling in force, not only against
+/// the document this host last finished accepting.
+///
+/// The two part when an edit's ceiling went into force and an effect after it failed. Here the
+/// accepted document withholds viewing, a wider ceiling goes into force through an edit whose
+/// profile change cannot be applied, and a device connects and subscribes under it. Narrowing back
+/// to exactly what the accepted document said then withdraws viewing from that device, so the
+/// connection and its subscription are fenced before the narrowing is acknowledged.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_narrowing_after_a_failed_widening_fences_the_subscription_the_widening_admitted() {
+    let Some(host) = Host::create() else {
+        return;
+    };
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let daemon = host.start(loopback(), &owner).await;
+    let mut local = host.client().await;
+    let created = create(&mut local, &host).await;
+    let session_id = created.session.session_id;
+    let device = Device::create(&loopback()).await;
+    let record = pair(&daemon, &device, &owner).await;
+
+    daemon
+        .controller
+        .apply_configuration(&Change::GrantRights(Some(without_viewing())))
+        .await
+        .expect("the owner withholds viewing from every paired device");
+
+    // The capability revision is stored in a file, and a directory in its place is a write this
+    // host cannot make. A profile change owes that write, so an edit carrying one is written and
+    // is not in force.
+    let blocked = host
+        .paths()
+        .state_dir()
+        .join(kr_controller::service::CAPABILITY_REVISION_FILE);
+    std::fs::create_dir(&blocked).expect("something in the place the revision is written to");
+    let profile = match daemon.controller.default_profile().await {
+        kr_protocol::identity::WorkerProfile::HeadlessUser => {
+            kr_protocol::identity::WorkerProfile::DesktopBound
+        }
+        _ => kr_protocol::identity::WorkerProfile::HeadlessUser,
+    };
+    daemon
+        .controller
+        .apply_configuration(&Change::WorkerProfile(profile))
+        .await
+        .expect_err("the evidence taken under the old profile cannot be replaced");
+    // The ceiling widens while that effect is still owed. The wider ceiling decides requests from
+    // here on; the document this host finished accepting is still the one that withholds viewing.
+    let mut with_viewing = without_viewing();
+    with_viewing.push(ActionRight::SessionView.as_str().to_owned());
+    let failed = daemon
+        .controller
+        .apply_configuration(&Change::GrantRights(Some(with_viewing)))
+        .await
+        .expect_err("the profile's effect still fails");
+    assert!(
+        failed.to_string().contains("is not in force"),
+        "the caller is told the edit is not in force: {failed}"
+    );
+
+    // A device connects under the wider ceiling, and its subscription runs.
+    let session = connect(&daemon, &device, &record).await;
+    let attached = attach(&session, host.environment_id, session_id).await;
+    let seen = type_and_observe(
+        &session,
+        host.environment_id,
+        session_id,
+        attached.typing,
+        MARKER_COMMAND,
+    )
+    .await;
+    assert!(seen.contains(MARKER));
+
+    // The fault clears, and the owner narrows the ceiling to exactly what the accepted document
+    // says.
+    std::fs::remove_dir(&blocked).expect("the fault is cleared");
+    let applied = daemon
+        .controller
+        .apply_configuration(&Change::GrantRights(Some(without_viewing())))
+        .await
+        .expect("the narrowing is acknowledged");
+    assert!(
+        applied.fences_dispatch,
+        "withdrawing what the ceiling in force allowed owes a fence"
+    );
+    assert!(applied.barrier_holds);
+
+    // Acknowledged means fenced: the connection admitted under the wider ceiling, and the
+    // subscription on it, are ended rather than answered.
+    let refused = session
+        .read::<_, SessionReadResult>(Method::SessionRead, &SessionReadParams { session_id })
+        .await
+        .expect_err("the connection admitted under the wider ceiling is fenced");
+    assert_eq!(
+        refused.code(),
+        ErrorCode::ResourceUnavailable,
+        "the connection is ended rather than answered: {refused}"
+    );
+    session.close();
+
+    // A new connection is decided under the narrow ceiling.
+    let session = connect(&daemon, &device, &record).await;
+    let refused = session
+        .read::<_, SessionReadResult>(Method::SessionRead, &SessionReadParams { session_id })
+        .await
+        .expect_err("viewing is withheld");
+    assert!(
+        refused
+            .to_string()
+            .contains("this host's configuration removes session.view"),
+        "{refused}"
+    );
+    session.close();
+
+    // The fence withdrew the owner's connection as well, like every connection admitted under
+    // the revision it replaced, so the owner closes the session on a new one.
+    drop(local);
+    let mut local = host.client().await;
+    close_session(&mut local, &host, session_id).await;
+    daemon.stop().await;
+}
+
+/// A grant this host's clock floor has passed has expired, whatever the deadline its connection
+/// anchored still says.
+///
+/// Another decision on this host read a wall clock past the grant's expiry, and the floor moved
+/// with it. The next request the device makes finds the grant expired: the connection is ended
+/// with its subscription, the expiry is written down, and the device cannot come back on another
+/// connection.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_the_clock_floor_expired_ends_the_subscription_and_stays_expired() {
+    let Some(host) = Host::create() else {
+        return;
+    };
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let daemon = host.start(loopback(), &owner).await;
+    let mut local = host.client().await;
+    let created = create(&mut local, &host).await;
+    let session_id = created.session.session_id;
+    let device = Device::create(&loopback()).await;
+    let record = pair(&daemon, &device, &owner).await;
+    let GrantExpiry::At { expires_at_ms } = record.grant.expiry else {
+        panic!("a session invitation expires");
+    };
+
+    let session = connect(&daemon, &device, &record).await;
+    let attached = attach(&session, host.environment_id, session_id).await;
+    let seen = type_and_observe(
+        &session,
+        host.environment_id,
+        session_id,
+        attached.typing,
+        MARKER_COMMAND,
+    )
+    .await;
+    assert!(seen.contains(MARKER));
+
+    // The deadline this connection anchored when it was admitted is still a day away.
+    daemon
+        .controller
+        .update_policy(|policy| policy.observe_utc(expires_at_ms.get() + 1))
+        .expect("the floor moves past the grant's expiry");
+
+    let refused = session
+        .read::<_, SessionReadResult>(Method::SessionRead, &SessionReadParams { session_id })
+        .await
+        .expect_err("the grant has expired by the floor");
+    assert_eq!(
+        refused.code(),
+        ErrorCode::ResourceUnavailable,
+        "the connection and its subscription are ended rather than answered: {refused}"
+    );
+    let stored = daemon
+        .controller
+        .devices()
+        .devices()
+        .expect("reads the devices")
+        .into_iter()
+        .find(|stored| stored.device_id == record.device_id)
+        .expect("the device's record");
+    assert!(
+        stored.expired_at_ms.is_some(),
+        "the expiry is written where a later connection is admitted from: {stored:?}"
+    );
+    let again = NetworkTransport::connect(
+        &device.endpoint,
+        host_addr_of(&daemon),
+        &device.paired_identity(record.device_id),
+        &host_paired_record(&daemon),
+        SendLimits::default(),
+    )
+    .await;
+    assert!(
+        again.is_err(),
+        "an expired device's endpoint has no paired record to authorise"
     );
 
     session.close();
