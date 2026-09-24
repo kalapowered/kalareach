@@ -2837,8 +2837,9 @@ impl DeliveryJournal {
     ///
     /// The admission time orders a first question and never withholds one. Only a repeat question
     /// has a schedule to wait for; a record never asked is due at once, even when the clock has
-    /// been set back past its admission, so a correction of the host's clock cannot hold a first
-    /// question back for as long as the correction.
+    /// been set back past its admission, so a correction of the host's clock cannot take a first
+    /// question out of what a sweep may ask. Whether a sweep reaches it still depends on this order
+    /// and on the sweep's allowance.
     ///
     /// # Errors
     ///
