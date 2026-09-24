@@ -389,8 +389,9 @@ A process query answers one of three things: the process and its start identity,
 be established. Only an answer that no process holds the identifier is "gone": a missing
 `/proc/<pid>/stat` on Linux, `ESRCH` from `proc_pidinfo` on macOS, and on Windows a process table
 that was read and does not list the identifier. A Windows table read always lists the process
-reading it, so a reading that does not is a query that failed, and a process listed with a start
-time of zero is one the operating system would not describe; both cannot be established.
+reading it, so a reading that does not is a query that failed. A process listed with a start time
+of zero, or with one more than a day after the current time, is one whose start the operating
+system would not give; neither case can be established.
 
 ### Where the daemon keeps its keys
 

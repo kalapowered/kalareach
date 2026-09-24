@@ -866,34 +866,57 @@ mod platform {
         // answers a table it could not read with nothing at all, which looks exactly like a table
         // without the process asked about; a table that was read always lists the process reading
         // it, so this is what tells the two apart.
+        //
+        // Each identifier is named once, and nothing is removed from what the reading found: the
+        // table starts empty, so there is nothing to remove, and `sysinfo` removing an identifier it
+        // was given twice would drop this process from a reading that listed it.
         let own = sysinfo::Pid::from_u32(std::process::id());
         let target = sysinfo::Pid::from_u32(pid);
+        let both = [target, own];
+        let asked: &[sysinfo::Pid] = if target == own { &both[1..] } else { &both };
         let mut system = sysinfo::System::new();
         system.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&[target, own]),
-            true,
+            ProcessesToUpdate::Some(asked),
+            false,
             ProcessRefreshKind::nothing(),
         );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
         super::windows_answer(
             pid,
             system.process(own).is_some(),
             system.process(target).map(sysinfo::Process::start_time),
+            now,
         )
     }
 }
+
+/// How far past the wall clock a Windows start value may lie and still be a reading, in seconds.
+///
+/// A process starts before anyone asks about it, so a start value after the current time is a
+/// clock stepped back since the process started, or a value nobody read. A day covers any ordinary
+/// correction of the clock; a value further ahead establishes nothing.
+#[cfg(any(windows, test))]
+const WINDOWS_START_AHEAD_SECONDS: u64 = 24 * 60 * 60;
 
 /// Decides what one reading of the Windows process table says about `pid`.
 ///
 /// `listed_self` is whether the reading listed the process that took it. Every reading that
 /// happened lists at least that one, so a reading that did not list it did not happen: the query
-/// failed, and a process missing from it says nothing. `start` is the start value of `pid` when the
-/// reading listed it. `sysinfo` gives zero when it could not open the process to ask when it
-/// started, and zero is no start value, so the identity is not established either.
+/// failed, and a process missing from it says nothing.
+///
+/// `start` is the start value of `pid` when the reading listed it, in seconds since the epoch, and
+/// `now` is the wall clock in the same unit. Two start values are not readings, so neither
+/// identifies the process. `sysinfo` gives zero when it could not open the process to ask when it
+/// started. And when the operating system opened it but would not give its times, `sysinfo`
+/// subtracts the epoch offset from zero: a build with overflow checks stops there, and any other
+/// wraps round to a value near the top of the range, far past the wall clock.
 ///
 /// It is its own function so the decision can be checked with a failed reading injected, on any
 /// platform, which no real process table produces on request.
 #[cfg(any(windows, test))]
-fn windows_answer(pid: u32, listed_self: bool, start: Option<u64>) -> ProcessQuery {
+fn windows_answer(pid: u32, listed_self: bool, start: Option<u64>, now: u64) -> ProcessQuery {
     if !listed_self {
         return ProcessQuery::CannotEstablish(unavailable(
             "process start identity",
@@ -906,6 +929,12 @@ fn windows_answer(pid: u32, listed_self: bool, start: Option<u64>) -> ProcessQue
             "process start identity",
             format!("pid {pid}: the operating system would not say when it started"),
         )),
+        Some(start) if start > now.saturating_add(WINDOWS_START_AHEAD_SECONDS) => {
+            ProcessQuery::CannotEstablish(unavailable(
+                "process start identity",
+                format!("pid {pid}: a start time of {start} is not a time it could have started"),
+            ))
+        }
         Some(start) => ProcessQuery::Present(ProcessStartIdentity::new(
             u64::from(pid),
             ProcessStartSource::WindowsProcessStartSeconds,
@@ -1111,15 +1140,17 @@ mod tests {
     #[test]
     fn a_windows_table_that_could_not_be_read_is_not_an_absent_process() {
         let pid = 4242;
+        let now = 1_800_000_000;
+        let started = 1_700_000_000;
         // `sysinfo` answers a table it could not read with nothing at all. The process asking is
         // missing from it too, and that is what marks the reading as one that did not happen.
-        let unread = windows_answer(pid, false, None);
+        let unread = windows_answer(pid, false, None, now);
         assert!(
             matches!(unread, ProcessQuery::CannotEstablish(_)),
             "a failed reading is not an absent process: {unread:?}"
         );
         assert!(matches!(
-            windows_answer(pid, false, Some(1_700_000_000)),
+            windows_answer(pid, false, Some(started), now),
             ProcessQuery::CannotEstablish(_)
         ));
         // Carried through to what a session guard asks, the failed reading refuses rather than
@@ -1127,47 +1158,67 @@ mod tests {
         let recorded = ProcessStartIdentity::new(
             u64::from(pid),
             ProcessStartSource::WindowsProcessStartSeconds,
-            1_700_000_000,
+            started,
         );
         assert!(matches!(
-            state_from(&recorded, pid, windows_answer(pid, false, None)),
+            state_from(&recorded, pid, windows_answer(pid, false, None, now)),
             ProcessState::Unknown { .. }
         ));
-        assert!(started_from(pid, windows_answer(pid, false, None)).is_err());
+        assert!(started_from(pid, windows_answer(pid, false, None, now)).is_err());
 
         // A table that was read and does not list the process: it has gone.
         assert!(matches!(
-            windows_answer(pid, true, None),
+            windows_answer(pid, true, None, now),
             ProcessQuery::Gone
         ));
         assert_eq!(
-            state_from(&recorded, pid, windows_answer(pid, true, None)),
+            state_from(&recorded, pid, windows_answer(pid, true, None, now)),
             ProcessState::Ended
         );
-        // Listed, but the operating system would not say when it started: zero is no start value,
-        // so the process is not identified and nothing is concluded from comparing it.
-        assert!(matches!(
-            windows_answer(pid, true, Some(0)),
-            ProcessQuery::CannotEstablish(_)
-        ));
-        assert!(matches!(
-            state_from(&recorded, pid, windows_answer(pid, true, Some(0))),
-            ProcessState::Unknown { .. }
-        ));
+        // Listed, but with a start value nobody read: zero, when the process could not be opened,
+        // and the epoch offset subtracted from zero, when its times could not be read. Neither
+        // identifies the process, and nothing is concluded from comparing it.
+        for unreadable in [0, 0_u64.wrapping_sub(11_644_473_600)] {
+            assert!(
+                matches!(
+                    windows_answer(pid, true, Some(unreadable), now),
+                    ProcessQuery::CannotEstablish(_)
+                ),
+                "{unreadable} is not a start time"
+            );
+            assert!(matches!(
+                state_from(
+                    &recorded,
+                    pid,
+                    windows_answer(pid, true, Some(unreadable), now)
+                ),
+                ProcessState::Unknown { .. }
+            ));
+            assert!(started_from(pid, windows_answer(pid, true, Some(unreadable), now)).is_err());
+        }
         // Listed with its start value: the process, and the one recorded when the values agree.
         assert!(matches!(
-            windows_answer(pid, true, Some(1_700_000_000)),
+            windows_answer(pid, true, Some(started), now),
             ProcessQuery::Present(identity) if identity == recorded
         ));
         assert_eq!(
             state_from(
                 &recorded,
                 pid,
-                windows_answer(pid, true, Some(1_700_000_001))
+                windows_answer(pid, true, Some(started + 1), now)
             ),
             ProcessState::Ended,
             "another start value is another process"
         );
+        // A clock stepped back since the process started still identifies it, within a day.
+        assert!(matches!(
+            windows_answer(pid, true, Some(now + 60), now),
+            ProcessQuery::Present(_)
+        ));
+        assert!(matches!(
+            windows_answer(pid, true, Some(now + WINDOWS_START_AHEAD_SECONDS + 1), now),
+            ProcessQuery::CannotEstablish(_)
+        ));
     }
 
     #[cfg(target_os = "macos")]
