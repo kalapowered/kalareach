@@ -263,12 +263,9 @@ foreach ($id in @($First, $Second)) {
 const TICKS_PER_SECOND: u64 = 10_000_000;
 
 /// Replaces one process's access-control list with a protected one that grants this account the
-/// rights given, in hexadecimal, and nobody anything else; then prints whether this account can
-/// still open the process to wait on it.
+/// rights given, in hexadecimal, and nobody anything else, and prints `granted`.
 ///
-/// The owner of a process may always rewrite its list, so this needs no privilege. An account that
-/// opens the process to wait on it without that right holds a privilege that passes over every
-/// list, and a case built on the list proves nothing for it: the line printed says which.
+/// The owner of a process may always rewrite its list, so this needs no privilege.
 const GRANT_ONLY: &str = r#"
 param([int]$Id, [string]$Rights)
 $ErrorActionPreference = 'Stop'
@@ -302,12 +299,11 @@ public static class KrProcessList
     private static extern IntPtr LocalFree(IntPtr memory);
 
     private const uint WriteDac = 0x00040000;
-    private const uint Synchronize = 0x00100000;
     private const int KernelObject = 6;
     private const uint DaclInformation = 0x00000004;
     private const uint ProtectedDacl = 0x80000000;
 
-    public static string Grant(int pid, uint rights)
+    public static void Grant(int pid, uint rights)
     {
         string user = WindowsIdentity.GetCurrent().User.Value;
         IntPtr process = OpenProcess(WriteDac, false, pid);
@@ -333,14 +329,11 @@ public static class KrProcessList
             finally { LocalFree(descriptor); }
         }
         finally { CloseHandle(process); }
-        IntPtr waiter = OpenProcess(Synchronize, false, pid);
-        if (waiter == IntPtr.Zero) return "wait refused";
-        CloseHandle(waiter);
-        return "wait allowed";
     }
 }
 '@
-Write-Output ([KrProcessList]::Grant($Id, [Convert]::ToUInt32($Rights, 16)))
+[KrProcessList]::Grant($Id, [Convert]::ToUInt32($Rights, 16))
+Write-Output 'granted'
 "#;
 
 /// KR-REQ-02.04, KR-REQ-05.02: a worker's private endpoint carries the operating system's access
@@ -745,9 +738,11 @@ fn a_process_this_account_may_only_ask_about_is_identified() {
     let created_at = script(&host, "created-at", CREATED_AT);
     let drop_debug = script(&host, "drop-debug", DROP_DEBUG);
     // An elevated account holds the debug privilege, and a token with it enabled opens any process
-    // whatever its list says. This test process gives it up first. That only makes a list mean
-    // more, and every other case here asks about processes this account owns, whose lists grant
-    // it every right anyway. The processes started after this inherit the token as it now is.
+    // whatever its list says. This test process, which is the one that reads the process, gives
+    // it up first. That only makes a list mean more, and every other case here asks about
+    // processes this account owns, whose lists grant it every right anyway. What the process's
+    // list is checked against is this process's own token: a PowerShell started to change the list
+    // may hold the privilege again, and needs nothing but the owner's right to rewrite a list.
     let dropped = output_of(&drop_debug, &[&std::process::id().to_string()]);
     assert_eq!(dropped.trim(), "disabled");
     let mut child = std::process::Command::new("ping.exe")
@@ -769,13 +764,8 @@ fn a_process_this_account_may_only_ask_about_is_identified() {
     let _ = child.kill();
     let _ = child.wait();
 
-    assert_eq!(
-        query_only.trim(),
-        "wait refused",
-        "this account opened the process to wait on it without the right, so it holds a privilege \
-         that passes over the list, and the case cannot be made here"
-    );
-    assert_eq!(with_wait.trim(), "wait allowed");
+    assert_eq!(query_only.trim(), "granted");
+    assert_eq!(with_wait.trim(), "granted");
     let recorded: u64 = recorded
         .trim()
         .parse()
@@ -797,7 +787,9 @@ fn a_process_this_account_may_only_ask_about_is_identified() {
             unwaited,
             Some(kr_ipc::identity::ProcessState::Unknown { .. })
         ),
-        "without the right to wait on it, whether it runs is not established: {unwaited:?}"
+        "without the right to wait on it, whether it runs is not established: {unwaited:?} (a \
+         reading of running here means this process still opens it to wait, which a debug \
+         privilege left enabled would allow)"
     );
     assert_eq!(waited, Some(kr_ipc::identity::ProcessState::Running));
 }
