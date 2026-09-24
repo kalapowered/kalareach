@@ -127,8 +127,9 @@ of these falls back to reading the configuration and hoping.
   at all. Such a caller's invocation is refused with that reason rather than run with the owner's
   reach.
 * **A caller bounded by a grant, on a Linux host that cannot name the support set**: a program in
-  Git's helper directory whose loader, or a library its loader resolves, cannot be named. So is an
-  invocation that finds a support object gone when it starts. Each refusal names the object.
+  Git's helper directory whose loader, or a library its loader resolves, cannot be named, or lies in
+  a system directory such as `/etc`, `/proc` or `/dev`. So is an invocation that finds a support
+  object gone when it starts. Each refusal names the object.
 * **A caller bounded by a grant, over a directory with another filesystem mounted beneath it**, or
   with an operation that would reach a remote. A location says nothing about which providers this
   host may reach for such a caller, and its reads name no certificate store and no resolver file.
@@ -167,21 +168,26 @@ So the boundary bounds what the caller's own request can reach, repository conte
 symbolic link to a file outside, an object store borrowing another repository's objects, a
 configuration including a file outside and a descriptor left open are all refused.
 
-**It does not make the location's tree private.** Git reads the tree as the host presents it.
-Immediately before each invocation this host reads the mount table and refuses the operation when a
-filesystem is mounted beneath any directory the invocation would be granted, so a mount, or a second
-view of another directory bound there, that is already present stops the operation. The check sees
-that moment and nothing after it. A filesystem mounted beneath the location while Git runs, a
-directory holding a mount that another program moves beneath it, and an automatic mount that Git's
-own lookup of a path sets off are all read as part of the tree. So is a hard link already inside the
-tree to a file elsewhere on the same filesystem. Another program running as this host's user account
-can put any of these there. The confinement holds against what the caller can reach through
-repository content; it does not defend the location against this host's own user account or the
-host's own mount arrangement.
+**It does not make the location's tree private.** Git reads the tree as the host presents it,
+and this holds for every directory the invocation is granted, the support set's and the profile's
+own included, not only for the location. Immediately before each invocation this host reads the
+mount table and refuses the operation when it names a mount point beneath a granted directory's
+path. That stops a filesystem, or a second view of another directory, mounted there at that moment.
+It compares paths, though, and a granted directory can have other names: bound somewhere else on the
+host, it can have a filesystem mounted beneath that other name, and a symbolic link in the tree to
+the other name then reaches that filesystem through the granted directory's own rule. The check does
+not see that, and it sees nothing after its own moment either. A filesystem mounted beneath a granted
+directory while Git runs, a directory holding a mount that another program moves beneath one, and an
+automatic mount that Git's own lookup of a path sets off are all read as part of the tree. So is a
+hard link already inside the tree to a file elsewhere on the same filesystem. Another program running
+as this host's user account, or the host's own mount arrangement, can put any of these there. The
+confinement holds against what the caller can reach through repository content; it does not defend
+the location against this host's own user account or the host's own mount arrangement.
 
 A host that cannot hold this refuses such a caller and says why: on macOS and Windows, on a Linux
-kernel older than 6.2, where the support set cannot be named, where a support object is gone, and
-where a filesystem is mounted beneath a granted directory.
+kernel older than 6.2, where the support set cannot be named or would take in a system directory
+such as `/etc`, where a support object is gone, and where the mount table names a filesystem beneath
+a granted directory.
 
 ## What is left
 
