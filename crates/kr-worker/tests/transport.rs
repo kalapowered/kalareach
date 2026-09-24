@@ -80,7 +80,14 @@ fn trust() -> DecodingTrust {
         plugin_id: PluginId::new("kalareach.codex").expect("valid"),
         publisher_id: PublisherId::new("kalareach").expect("valid"),
         package_digest: Digest256::from_bytes([5; 32]),
-        methods: [method("session/request_permission")].into_iter().collect(),
+        // The reverse write is covered too, so a component that tries to interpret one is refused
+        // for what this host did to the request and not for a trust it lacks.
+        methods: [
+            method("fs/write_text_file"),
+            method("session/request_permission"),
+        ]
+        .into_iter()
+        .collect(),
         schema_versions: ["kr-approval/1".to_owned()].into_iter().collect(),
         max_decisions: U64::new(4),
         may_encode_response: true,
@@ -688,7 +695,7 @@ fn grant_files_in(
 ) {
     let root = kr_transfer::authority::AuthorisedDirectory::open_root(environment, directory)
         .expect("the granted directory opens");
-    let mut files = HostFiles::new(root, access);
+    let mut files = HostFiles::new(root, access).expect("the grant is confined to its mount");
     if let Some((read, write)) = bounds {
         files = files.with_bounds(read, write);
     }
@@ -1173,18 +1180,44 @@ async fn kr_req_12_13_a_duplicate_reverse_write_runs_once() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
+/// Asserts that a writer was refused because the resource was already answered or being answered.
+///
+/// `AlreadyResolved` names the state the host's own admission put the resource in: `claimed` while
+/// the operation runs and `resolved` once its answer went. A native answer that finds the admission
+/// held is refused naming it. A refusal for any other reason is not the one this suite is about, so
+/// it fails here rather than passing as a refusal.
+fn refused_by_the_hosts_admission<T: std::fmt::Debug>(outcome: kr_worker::broker::Result<T>) {
+    match outcome {
+        Err(kr_worker::broker::BrokerError::Arbitration(
+            kr_protocol::gateway::ArbitrationError::AlreadyResolved { state },
+        )) => assert!(
+            matches!(state, PendingState::Claimed | PendingState::Resolved),
+            "the host's admission leaves the resource claimed or resolved, not {state:?}"
+        ),
+        Err(kr_worker::broker::BrokerError::PermissionDenied { detail }) => assert!(
+            detail.contains("this host's own answer"),
+            "the refusal names the host's admission: {detail}"
+        ),
+        other => panic!("the writer was refused for the host's admission: {other:?}"),
+    }
+}
+
 /// KR-REQ-11.33 and KR-REQ-11.27: while this host is performing a reverse request, the native
 /// client's answer and a rich answer to it are both refused, and the upstream receives exactly one
 /// answer.
 ///
 /// The host's admission is taken with the request's record, under one lock, so there is no moment
-/// at which another writer could take it first. The race is run both ways round: with the
-/// operation held at its pause, and with the three writers released together.
+/// at which another writer could take it first. Both contenders are qualified: the same caller and
+/// decoder answer an ordinary request on this connection first, and the decoder's trust covers the
+/// reverse method, so each refusal below is the host's admission and nothing else. The race is run
+/// with the operation held at its pause and then released together sixteen times, each contender
+/// trying until the request has been recorded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_33_native_and_rich_answers_lose_to_the_hosts_own_answer() {
     let broker = broker();
-    let (owner, upstream, _client, drained) = duplex_over_sockets(&broker).await;
-    let upstream_reader = tokio::io::BufReader::new(upstream);
+    let (owner, upstream, client, drained) = duplex_over_sockets(&broker).await;
+    let mut upstream_reader = tokio::io::BufReader::new(upstream);
+    let mut client_reader = tokio::io::BufReader::new(client);
     let directory = private_directory();
     grant_files(&broker, &directory, FileAccess::ReadWrite);
     broker.bind_connection_dispatch(
@@ -1195,6 +1228,39 @@ async fn kr_req_11_33_native_and_rich_answers_lose_to_the_hosts_own_answer() {
         actor_id: ActorId::new("device-1").expect("valid"),
         grant_id: None,
     };
+    let respond = |resource_id| kr_protocol::agent::AgentApprovalRespondParams {
+        target: target(),
+        resource_id,
+        option_id: "allow".to_owned(),
+    };
+
+    // The contenders are live: this caller and this decoder answer an ordinary request here.
+    let ordinary = match owner
+        .from_upstream(
+            br#"{"id":70,"method":"session/request_permission","params":{}}"#,
+            TimestampMs::new(2),
+        )
+        .await
+        .expect("the request is carried")
+    {
+        Carried::UpstreamRequest {
+            resource_id: Some(resource_id),
+            ..
+        } => resource_id,
+        other => panic!("a request is what this was: {other:?}"),
+    };
+    let _ = next_line(&mut client_reader).await;
+    broker
+        .interpret(binding(), ordinary, projection(), None, TimestampMs::new(2))
+        .expect("the decoder interprets an ordinary request");
+    broker
+        .agent_approval_respond(&caller, &respond(ordinary), TimestampMs::new(2))
+        .await
+        .expect("the rich answer is admitted and carried");
+    assert_eq!(
+        next_frame(&mut upstream_reader).await["id"],
+        serde_json::json!(70)
+    );
 
     // Held at the pause: the admission is taken and the file has not been touched.
     let (arrived, release) = owner.pause_before_reverse_operation();
@@ -1207,33 +1273,22 @@ async fn kr_req_11_33_native_and_rich_answers_lose_to_the_hosts_own_answer() {
     .await;
     arrived_at(arrived).await;
     assert!(!directory.join("held.txt").exists(), "nothing has run yet");
-    assert!(
+    refused_by_the_hosts_admission(
         owner
             .from_client(br#"{"id":71,"result":{}}"#, TimestampMs::new(3))
-            .await
-            .is_err(),
-        "the native client's answer is refused before it is forwarded"
+            .await,
     );
-    assert!(
+    refused_by_the_hosts_admission(broker.interpret(
+        binding(),
+        held,
+        projection(),
+        None,
+        TimestampMs::new(3),
+    ));
+    refused_by_the_hosts_admission(
         broker
-            .interpret(binding(), held, projection(), None, TimestampMs::new(3))
-            .is_err(),
-        "a request this host performs is not something a person answers"
-    );
-    assert!(
-        broker
-            .agent_approval_respond(
-                &caller,
-                &kr_protocol::agent::AgentApprovalRespondParams {
-                    target: target(),
-                    resource_id: held,
-                    option_id: "allow".to_owned(),
-                },
-                TimestampMs::new(3),
-            )
-            .await
-            .is_err(),
-        "and a rich answer to it is refused"
+            .agent_approval_respond(&caller, &respond(held), TimestampMs::new(3))
+            .await,
     );
     release.send(()).expect("the operation is released");
     assert_eq!(
@@ -1241,7 +1296,8 @@ async fn kr_req_11_33_native_and_rich_answers_lose_to_the_hosts_own_answer() {
         Some(PendingState::Resolved)
     );
 
-    // Released together, many times over.
+    // Released together, many times over. A contender that arrives before the request is recorded
+    // has nothing to answer, and tries again until it is; what it meets then is the admission.
     for round in 0..16_u32 {
         let id = 100 + round;
         let start = Arc::new(tokio::sync::Barrier::new(3));
@@ -1267,9 +1323,20 @@ async fn kr_req_11_33_native_and_rich_answers_lose_to_the_hosts_own_answer() {
             tokio::spawn(async move {
                 start.wait().await;
                 let frame = format!(r#"{{"id":{id},"result":{{}}}}"#);
-                owner
-                    .from_client(frame.as_bytes(), TimestampMs::new(5))
-                    .await
+                let deadline = tokio::time::Instant::now() + LIVENESS_DEADLINE;
+                loop {
+                    match owner
+                        .from_client(frame.as_bytes(), TimestampMs::new(5))
+                        .await
+                    {
+                        Err(kr_worker::broker::BrokerError::UnknownSubject { .. })
+                            if tokio::time::Instant::now() < deadline =>
+                        {
+                            tokio::task::yield_now().await;
+                        }
+                        outcome => return outcome.map(|_| ()),
+                    }
+                }
             })
         };
         let rich_side = {
@@ -1278,24 +1345,43 @@ async fn kr_req_11_33_native_and_rich_answers_lose_to_the_hosts_own_answer() {
             let start = Arc::clone(&start);
             tokio::spawn(async move {
                 start.wait().await;
-                let resource = broker
-                    .pending_resources()
-                    .into_iter()
-                    .find(|resource| resource.request.upstream.as_str() == id.to_string())?;
-                Some(
-                    broker
-                        .agent_approval_respond(
-                            &caller,
-                            &kr_protocol::agent::AgentApprovalRespondParams {
-                                target: target(),
-                                resource_id: resource.resource_id,
-                                option_id: "allow".to_owned(),
-                            },
-                            TimestampMs::new(5),
-                        )
-                        .await
-                        .is_ok(),
-                )
+                let deadline = tokio::time::Instant::now() + LIVENESS_DEADLINE;
+                let resource = loop {
+                    if let Some(resource) = broker
+                        .pending_resources()
+                        .into_iter()
+                        .find(|resource| resource.request.upstream.as_str() == id.to_string())
+                    {
+                        break resource;
+                    }
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the request is recorded"
+                    );
+                    tokio::task::yield_now().await;
+                };
+                let interpreted = broker
+                    .interpret(
+                        binding(),
+                        resource.resource_id,
+                        projection(),
+                        None,
+                        TimestampMs::new(5),
+                    )
+                    .map(|_| ());
+                let answered = broker
+                    .agent_approval_respond(
+                        &caller,
+                        &kr_protocol::agent::AgentApprovalRespondParams {
+                            target: target(),
+                            resource_id: resource.resource_id,
+                            option_id: "allow".to_owned(),
+                        },
+                        TimestampMs::new(5),
+                    )
+                    .await
+                    .map(|_| ());
+                (interpreted, answered)
             })
         };
         let carried = upstream_side
@@ -1305,18 +1391,14 @@ async fn kr_req_11_33_native_and_rich_answers_lose_to_the_hosts_own_answer() {
         let Carried::Reverse { resource_id, .. } = carried else {
             panic!("a reverse request is what this was");
         };
-        assert!(
-            native_side.await.expect("joined").is_err(),
-            "round {round}: the native answer never wins"
-        );
-        assert_ne!(
-            rich_side.await.expect("joined"),
-            Some(true),
-            "round {round}: the rich answer never wins"
-        );
+        refused_by_the_hosts_admission(native_side.await.expect("joined"));
+        let (interpreted, answered) = rich_side.await.expect("joined");
+        refused_by_the_hosts_admission(interpreted);
+        refused_by_the_hosts_admission(answered);
         assert_eq!(
             settled_within(&broker, resource_id, LIVENESS_DEADLINE).await,
-            Some(PendingState::Resolved)
+            Some(PendingState::Resolved),
+            "round {round}: the host's own answer settled it"
         );
         assert_eq!(
             std::fs::read_to_string(directory.join(format!("race-{id}.txt"))).expect("readable"),
@@ -1324,6 +1406,9 @@ async fn kr_req_11_33_native_and_rich_answers_lose_to_the_hosts_own_answer() {
         );
     }
 
+    // Every operation has returned and every answer has settled its resource, so nothing of this
+    // connection can write anything more before the count.
+    operations_returned(&owner).await;
     let sent = everything_sent_upstream(owner, drained, upstream_reader).await;
     assert_eq!(answers_for(&sent, 71), 1, "one answer reached the upstream");
     for round in 0..16_u32 {
@@ -1338,6 +1423,18 @@ async fn kr_req_11_33_native_and_rich_answers_lose_to_the_hosts_own_answer() {
         "the host's"
     );
     let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// Waits until no reverse operation of one connection is still with the platform.
+async fn operations_returned(owner: &Duplex) {
+    let deadline = tokio::time::Instant::now() + LIVENESS_DEADLINE;
+    while owner.reverse_operations_running() > 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "every reverse operation returns"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 /// KR-REQ-11.32 and KR-REQ-11.31: a reverse operation that blocks does not stop the connection
@@ -1417,8 +1514,11 @@ async fn kr_req_11_32_a_blocked_reverse_read_does_not_stop_forwarding() {
         "a read that overran changed nothing, so its answer resolves it"
     );
 
-    // Letting the stalled read return sends nothing more.
+    // Letting the stalled read return sends nothing more. The count is taken once the read has come
+    // back from the platform, with the connection still open, so a late answer would be on the
+    // socket by then rather than stopped by the connection closing.
     release.send(()).expect("the operation is released");
+    operations_returned(&owner).await;
     let sent = everything_sent_upstream(owner, drained, upstream_reader).await;
     assert_eq!(
         answers_for(&sent, 81),
@@ -1429,9 +1529,12 @@ async fn kr_req_11_32_a_blocked_reverse_read_does_not_stop_forwarding() {
 }
 
 /// KR-REQ-11.32: one connection runs a bounded number of reverse operations at once. A place is
-/// held until the platform returns from the operation, so a stalled filesystem cannot collect more
-/// threads than the bound however many requests arrive, and a request that finds no place is
-/// refused without running.
+/// held until the platform returns from the operation, not until its deadline, so a stalled
+/// filesystem cannot collect more threads than the bound however many requests arrive, and a
+/// request that finds no place is refused without running.
+///
+/// Four reads are held inside the platform and each is answered at its deadline first. Only then is
+/// a fifth request sent, so what refuses it is places that outlived their deadlines.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_32_a_connection_runs_a_bounded_number_of_reverse_operations() {
     let broker = broker();
@@ -1443,19 +1546,36 @@ async fn kr_req_11_32_a_connection_runs_a_bounded_number_of_reverse_operations()
     owner.set_reverse_deadline(std::time::Duration::from_millis(200));
 
     let mut releases = Vec::new();
+    let mut held = std::collections::BTreeSet::new();
     for slot in 0..kr_worker::broker::MAX_REVERSE_IN_FLIGHT {
+        let id = u32::try_from(90 + slot).expect("small");
         let (arrived, release) = owner.pause_before_reverse_operation();
         ask(
             &owner,
-            u32::try_from(90 + slot).expect("small"),
+            id,
             "fs/read_text_file",
             serde_json::json!({ "path": "f.txt" }),
         )
         .await;
         arrived_at(arrived).await;
         releases.push(release);
+        held.insert(id);
     }
-    // Every place is held by an operation the platform has not returned from.
+    // Each held read is answered at its deadline, while it is still inside the platform.
+    while !held.is_empty() {
+        let frame = next_frame(&mut upstream_reader).await;
+        let id = frame["id"]
+            .as_u64()
+            .and_then(|id| u32::try_from(id).ok())
+            .expect("an answer names its request");
+        refused_saying(&frame, "did not finish within 200 milliseconds");
+        assert!(held.remove(&id), "{id} was answered once");
+    }
+    assert_eq!(
+        owner.reverse_operations_running(),
+        kr_worker::broker::MAX_REVERSE_IN_FLIGHT,
+        "their places are still held"
+    );
     ask(
         &owner,
         99,
@@ -1463,22 +1583,28 @@ async fn kr_req_11_32_a_connection_runs_a_bounded_number_of_reverse_operations()
         serde_json::json!({ "path": "not-run.txt", "content": "x" }),
     )
     .await;
-    let mut refused = None;
-    while refused.is_none() {
-        let frame = next_frame(&mut upstream_reader).await;
-        if frame["id"] == serde_json::json!(99) {
-            refused = Some(frame);
-        }
-    }
+    let refused = next_frame(&mut upstream_reader).await;
+    assert_eq!(refused["id"], serde_json::json!(99));
     refused_saying(
-        &refused.expect("answered"),
+        &refused,
         "reverse operations running, so filesystem_write was not started",
     );
-    assert!(!directory.join("not-run.txt").exists(), "it did not run");
     for release in releases {
         release.send(()).expect("released");
     }
-    let _ = everything_sent_upstream(owner, drained, upstream_reader).await;
+    operations_returned(&owner).await;
+    assert!(
+        !directory.join("not-run.txt").exists(),
+        "the refused write never ran"
+    );
+    let sent = everything_sent_upstream(owner, drained, upstream_reader).await;
+    for id in 90..=99 {
+        assert_eq!(
+            answers_for(&sent, id),
+            0,
+            "{id} was answered once, already read"
+        );
+    }
     let _ = std::fs::remove_dir_all(&directory);
 }
 
@@ -1526,10 +1652,12 @@ async fn kr_req_11_35_a_faulted_journal_refuses_reverse_writes_and_keeps_reads()
 /// KR-REQ-11.27, KR-REQ-12.16 and KR-REQ-24: a process that ends after the marker and before the
 /// operation leaves the request uncertain, and nothing after the restart runs it.
 ///
-/// The journal is copied at the moment the process stops, which is what a crash leaves on the
-/// disk. The restarted broker reads that copy: the request comes back with its marker, a
-/// reconciliation leaves it uncertain rather than answerable, and the upstream sending the same
-/// request again on the restored connection is refused as the request it already is.
+/// What a restart reads is the journal's committed state, and this test takes that state as a copy
+/// made at the moment the process stops, while the operation is held after its marker. The
+/// restarted broker reads the copy: the request comes back with its marker, a reconciliation leaves
+/// it uncertain rather than answerable, and the upstream sending the same request again on the
+/// restored connection is refused as the request it already is. It proves what recovery does with
+/// the committed record; the platform's own durability under an abrupt stop is not what it tests.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_27_a_crash_after_the_marker_leaves_the_write_uncertain_and_never_runs_it_again()
 {

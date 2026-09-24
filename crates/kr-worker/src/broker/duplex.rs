@@ -2155,6 +2155,18 @@ impl Duplex {
         });
     }
 
+    /// Returns how many reverse operations the platform has not yet returned from on this
+    /// connection.
+    ///
+    /// An operation counts until the platform returns from it, which can be after its deadline and
+    /// after its answer went: this is what bounds the threads a stalled file holds, and zero is the
+    /// point after which no operation of this connection can do anything more.
+    #[must_use]
+    pub fn reverse_operations_running(&self) -> usize {
+        crate::broker::host::MAX_REVERSE_IN_FLIGHT
+            .saturating_sub(self.reverse_slots.available_permits())
+    }
+
     /// Sets how long this connection's reverse operations have before the upstream is told they
     /// did not finish.
     ///

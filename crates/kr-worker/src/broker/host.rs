@@ -83,6 +83,10 @@ pub enum FileAccess {
 /// It holds the directory as the file authority's opened handle. The handle is the grant: a name
 /// is resolved beneath it and never beside it, and a rename of the directory moves the grant with
 /// the object rather than handing it to whatever takes the old name.
+///
+/// The handle is confined to the mount it was opened on. A directory or file mounted over a name
+/// inside the tree reaches another tree entirely, and nothing in the path says so; a grant that did
+/// not refuse that would let an upstream read or write whatever was mounted there.
 #[derive(Debug)]
 pub struct HostFiles {
     root: AuthorisedDirectory,
@@ -92,15 +96,20 @@ pub struct HostFiles {
 }
 
 impl HostFiles {
-    /// Grants one opened directory, with the default bounds.
-    #[must_use]
-    pub const fn new(root: AuthorisedDirectory, access: FileAccess) -> Self {
-        Self {
-            root,
+    /// Grants one opened directory, confined to its own mount, with the default bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns the file authority's refusal when this host cannot say which mount the directory
+    /// was opened on. The rule is refused rather than approximated: a grant that could not tell two
+    /// mounts apart would reach whatever was mounted beneath it.
+    pub fn new(root: AuthorisedDirectory, access: FileAccess) -> Result<Self, Escape> {
+        Ok(Self {
+            root: root.confined_to_one_mount()?,
             access,
             max_read_bytes: MAX_REVERSE_READ_BYTES,
             max_write_bytes: MAX_REVERSE_WRITE_BYTES,
-        }
+        })
     }
 
     /// Returns this grant with smaller byte bounds.
@@ -580,9 +589,13 @@ fn write(files: &HostFiles, name: &RelativeName, content: &str) -> Performed {
         Ok(leaf) => leaf,
         Err(escape) => return Performed::refused(authority_refusal(&escape)),
     };
-    let opened = match directory.probe(&leaf) {
-        Ok(ObjectKind::File) => directory.open_write(&leaf),
-        Err(Escape::NotFound { .. }) => directory.create_new(&leaf),
+    // A name that is taken by a regular file is opened and has its content replaced. A name that is
+    // free is created, and a creation is itself a change: the authority checks what it opened only
+    // after the platform has made it, so a creation it then refuses can leave a file under the
+    // name. From the creation on, a failure is an outcome nobody can establish.
+    let (opened, created) = match directory.probe(&leaf) {
+        Ok(ObjectKind::File) => (directory.open_write(&leaf), false),
+        Err(Escape::NotFound { .. }) => (directory.create_new(&leaf), true),
         Ok(kind) => {
             return Performed::refused(Refusal::refused(format!(
                 "{name} is {}, and this operation writes a regular file",
@@ -597,12 +610,24 @@ fn write(files: &HostFiles, name: &RelativeName, content: &str) -> Performed {
     };
     let mut file = match opened {
         Ok(file) => file,
+        Err(escape) if created => {
+            return Performed::unfinished(format!(
+                "{name} could not be created ({escape}), and whether a file was left under its \
+                 name cannot be established"
+            ));
+        }
         Err(escape) => return Performed::refused(authority_refusal(&escape)),
     };
     let handle = file.handle_mut();
-    // Nothing of the file has changed until the length does. From that point a failure leaves it
+    // An existing file has not changed until its length does. From that point a failure leaves it
     // holding something nobody asked for, and the answer says the outcome cannot be established.
     if let Err(error) = handle.set_len(0) {
+        if created {
+            return Performed::unfinished(format!(
+                "{name} was created and could not be prepared for its content ({error}), so what \
+                 is left under its name cannot be established"
+            ));
+        }
         return Performed::refused(Refusal::refused(format!(
             "{name} could not be emptied for its new content: {error}"
         )));
@@ -617,6 +642,15 @@ fn write(files: &HostFiles, name: &RelativeName, content: &str) -> Performed {
         return Performed::unfinished(format!(
             "{name} was written and could not be made durable ({error}), so what it holds after \
              a failure cannot be established"
+        ));
+    }
+    // A new file's content is durable once the file is flushed; its name is durable once the
+    // directory that holds the name is. Without this a power failure can take the name away after
+    // the answer said the file was written.
+    if created && let Err(escape) = directory.sync() {
+        return Performed::unfinished(format!(
+            "{name} was written and its new name could not be made durable ({escape}), so whether \
+             it survives a failure cannot be established"
         ));
     }
     Performed::done(Answer::Result(serde_json::json!({})))
@@ -729,6 +763,25 @@ mod tests {
                 "{outside} is not a file beneath the root"
             );
         }
+    }
+
+    #[test]
+    fn a_grant_is_confined_to_the_mount_its_directory_was_opened_on() {
+        let directory = std::env::temp_dir();
+        let root = AuthorisedDirectory::open_root(
+            EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([4; 16])),
+            &directory,
+        )
+        .expect("the directory opens");
+        assert!(
+            root.mount().is_none(),
+            "an opened directory is not confined by itself"
+        );
+        let files = HostFiles::new(root, FileAccess::Read).expect("the grant is made");
+        assert!(
+            files.root.mount().is_some(),
+            "the grant carries the one-mount rule, and every name beneath it is held to it"
+        );
     }
 
     #[test]
