@@ -1286,3 +1286,107 @@ async fn one_action_identifier_is_spent_on_one_pairing_answer() {
         .expect("withdrawn");
     host.stop().await;
 }
+
+/// KR-REQ-10.52: a host whose only owner device is revoked, with no enrolled presence signer and
+/// no terminal, refuses every confirmation and falls back to nothing. The terminal bootstrap stays
+/// over, because the host had an owner; the former owner device's proof no longer answers; a proof
+/// on the enrolled signer's channel is refused; and an answer the owner device gave before its
+/// revocation is spent on nothing after it, so nothing sensitive is issued. Before the revocation,
+/// the owner device's own proof answers the same kind of challenge and issues the invitation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_headless_host_with_no_owner_device_refuses_every_confirmation() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let owner_record = host.owner.clone().expect("the owner device");
+    // One grant throughout, so every answer and every invitation below names the same one.
+    let grant = viewer();
+    let subject = || issue_subject(InviteGrantKind::SessionInvitation, &grant);
+
+    // While the owner device is paired, its proof answers, and the invitation spends the answer.
+    let issued = calls::invite_direct(
+        environment,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &grant,
+        &owner,
+    )
+    .await
+    .expect("the owner device's proof issues an invitation");
+    calls::cancel(environment, &mut client, issued.invitation_id, false)
+        .await
+        .expect("withdrawn");
+    // And one more answer, which nothing spends before the revocation.
+    calls::confirm_subject(environment, &mut client, subject(), &owner)
+        .await
+        .expect("the owner device answers while it is paired");
+
+    let _: kr_protocol::sharing::RevocationResult = calls::mutate(
+        environment,
+        &mut client,
+        Method::DeviceRevoke,
+        &DeviceRevokeParams {
+            device_id: owner_record.device_id,
+        },
+    )
+    .await
+    .expect("the only owner device is revoked");
+    // The revocation withdrew the authority this connection was admitted under.
+    let mut client = host.client().await;
+
+    let terminal = keys();
+    let enrolled = keys();
+    for (who, signer) in [
+        (
+            "the terminal bootstrap",
+            Some(Signer::Bootstrap(&terminal.authorisation)),
+        ),
+        (
+            "the former owner device",
+            Some(Signer::OwnerDevice(&owner_keys)),
+        ),
+        ("an enrolled presence signer", None),
+    ] {
+        let challenge = calls::request(environment, &mut client, subject())
+            .await
+            .expect("a challenge");
+        assert!(
+            !challenge.initial_bootstrap,
+            "a host that had an owner is never in its initial bootstrap again"
+        );
+        let (proof, presented) = match &signer {
+            Some(signer) => calls::sign(&challenge.request, signer),
+            None => (
+                kr_pairing::confirm::sign_confirmation(
+                    &enrolled.authorisation,
+                    &challenge.request,
+                    ConfirmationChannel::EnrolledPresenceSigner,
+                )
+                .expect("a proof"),
+                None,
+            ),
+        };
+        assert_eq!(
+            code(calls::complete(environment, &mut client, proof, presented).await),
+            ErrorCode::OwnerConfirmationRequired,
+            "{who}"
+        );
+    }
+    assert_eq!(
+        code(
+            calls::mutate::<_, PairInviteResult>(
+                environment,
+                &mut client,
+                Method::PairInvite,
+                &invite_params(InviteGrantKind::SessionInvitation, &grant),
+            )
+            .await
+        ),
+        ErrorCode::OwnerConfirmationRequired,
+        "nothing answered since, and the answer the owner device gave before its revocation \
+         issues nothing"
+    );
+    host.stop().await;
+}
