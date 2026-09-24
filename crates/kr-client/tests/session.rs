@@ -19,7 +19,7 @@ use kr_client::error::ClientError;
 use kr_client::retry::{Recovery, RequestClass, UserAction};
 use kr_client::services::{
     ManagedService, NullService, RelayLeaseService, ServiceClients, SyncBackupService,
-    SyncExchanged, SyncPosition, SyncRequestFence, SyncRequestStatus, SyncRevision,
+    SyncExchanged, SyncPosition, SyncRecoveryId, SyncRequestFence, SyncRequestStatus, SyncRevision,
 };
 use kr_client::sync::SyncStore;
 
@@ -1124,6 +1124,33 @@ struct RemoteObjects {
     copies: Mutex<std::collections::HashSet<SyncConflictId>>,
     /// Whether the next exchange is applied and its answer lost on the way back.
     lose_the_next_answer: Mutex<bool>,
+    /// The recovery the service's last restore recorded, which every answer names.
+    recovery: Mutex<Option<SyncRecoveryId>>,
+}
+
+impl RemoteObjects {
+    /// Puts the service back from an export under a recovery of its own: each collection holds the
+    /// bytes the export held, at the place the export held them, in the history the restore began,
+    /// and nothing the export did not hold.
+    async fn put_back(&self, held: Vec<(String, u64, Vec<u8>)>, recovery: SyncRecoveryId) {
+        *self.recovery.lock().await = Some(recovery);
+        *self.objects.lock().await = held
+            .into_iter()
+            .map(|(collection, write_sequence, bytes)| {
+                (
+                    collection,
+                    (
+                        SyncPosition {
+                            recovery: Nullable::some(recovery),
+                            ..at(write_sequence)
+                        },
+                        bytes,
+                    ),
+                )
+            })
+            .collect();
+        self.receipts.lock().await.clear();
+    }
 }
 
 /// What every fence this suite's service records says about the past.
@@ -1184,6 +1211,7 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
                 }
                 return Ok(answered);
             }
+            let recovery = *self.recovery.lock().await;
             let mut objects = self.objects.lock().await;
             let current = objects.get(collection).map(|(position, _)| *position);
             // The comparison is against the revision the caller named, which is the only part of a
@@ -1191,7 +1219,10 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
             let answered =
                 if current.and_then(|position| position.revision.0) == expected_object(expected) {
                     // The service's own order: each applied write of an object takes the next place.
-                    let next = at(current.map_or(1, |position| position.write_sequence + 1));
+                    let next = SyncPosition {
+                        recovery: Nullable::from(recovery),
+                        ..at(current.map_or(1, |position| position.write_sequence + 1))
+                    };
                     objects.insert(collection.to_owned(), (next, ciphertext.to_vec()));
                     SyncExchanged::Applied { position: next }
                 } else {
@@ -1203,7 +1234,7 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
                     SyncExchanged::Refused {
                         retained: Some(kept),
                         current,
-                        recovery: None,
+                        recovery,
                     }
                 };
             receipts.insert(
@@ -1229,6 +1260,7 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
         request_id: Uuid,
     ) -> kr_client::services::ServiceFuture<'a, SyncRequestStatus> {
         Box::pin(async move {
+            let recovery = *self.recovery.lock().await;
             Ok(
                 match self
                     .receipts
@@ -1241,18 +1273,15 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
                         SyncRequestStatus::Applied { position }
                     }
                     Some(Some(SyncExchanged::Refused { retained, .. })) => {
-                        SyncRequestStatus::Refused {
-                            retained,
-                            recovery: None,
-                        }
+                        SyncRequestStatus::Refused { retained, recovery }
                     }
                     // A receipt that holds no reply is the one a fence wrote, and it carries what
                     // that fence established about the past.
                     Some(None) => SyncRequestStatus::Fenced {
                         never_ran: FENCE_FOUND_NO_RUN,
-                        recovery: None,
+                        recovery,
                     },
-                    None => SyncRequestStatus::Unknown { recovery: None },
+                    None => SyncRequestStatus::Unknown { recovery },
                 },
             )
         })
@@ -1269,6 +1298,7 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
             // A request the service has already decided keeps its outcome; one it has not is
             // fenced, and nothing runs under that identity afterwards. The fence is recorded under
             // the same lock an exchange decides under, so one of the two happens and not both.
+            let recovery = *self.recovery.lock().await;
             let mut receipts = self.receipts.lock().await;
             let recorded = receipts
                 .entry((collection.to_owned(), request_id))
@@ -1279,13 +1309,12 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
                 .answered;
             Ok(match recorded {
                 Some(SyncExchanged::Applied { position }) => SyncRequestFence::Applied { position },
-                Some(SyncExchanged::Refused { retained, .. }) => SyncRequestFence::Refused {
-                    retained,
-                    recovery: None,
-                },
+                Some(SyncExchanged::Refused { retained, .. }) => {
+                    SyncRequestFence::Refused { retained, recovery }
+                }
                 None => SyncRequestFence::Fenced {
                     never_ran: FENCE_FOUND_NO_RUN,
-                    recovery: None,
+                    recovery,
                 },
             })
         })
@@ -1336,6 +1365,9 @@ impl DraftSealer for ReversingSealer {
     }
 }
 
+/// KR-REQ-24.13: a draft outlives its attachment, its connection and another device's write; it is
+/// never replaced by remote content, and nothing a reconnect, a rebind or a settlement does
+/// submits it.
 #[tokio::test]
 async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_write() {
     let host = side(1, true).await;
@@ -1654,6 +1686,130 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
         .await
         .expect("a listing");
     assert!(script.actions.lock().await.is_empty());
+    session.close();
+    serving.abort();
+}
+
+/// KR-REQ-24.13 across a restore: a draft whose collection was put back from an archive is still
+/// the person's own. What the restored collection holds comes down beside it, never over it, the
+/// next publication lands in the restored history, and nothing submits the draft.
+#[tokio::test]
+async fn a_draft_whose_collection_was_put_back_is_kept_beside_and_never_submitted() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+
+    let directory = tempfile::tempdir().expect("a directory");
+    let device = DeviceId::new(Uuid::from_bytes([2; 16]));
+    let store = DraftStore::open(directory.path().join("mine"), device).expect("a store");
+    let target = DraftTarget::session(SessionId::new(Uuid::from_bytes([3; 16]))).in_application(
+        ApplicationInstanceId::new(Uuid::from_bytes([4; 16])),
+        AgentBindingRevision::new(1),
+    );
+    let draft = store
+        .create(
+            target,
+            "the message I have not sent".to_owned(),
+            TimestampMs::new(1),
+        )
+        .expect("a draft");
+    let service = Arc::new(RemoteObjects::default());
+    let sync = DraftSync::new(
+        Arc::clone(&service) as Arc<_>,
+        Arc::new(ReversingSealer),
+        SyncStore::open(directory.path().join("sync")).expect("a sync store"),
+    );
+
+    // Published, then edited and published again.
+    assert_eq!(
+        sync.publish(&store, draft.draft_id, draft.revision, TimestampMs::new(2))
+            .await
+            .expect("an answer"),
+        Published::Accepted { position: at(1) }
+    );
+    let edited = store
+        .update(
+            &Draft {
+                text: "the message I have not sent, edited".to_owned(),
+                ..draft.clone()
+            },
+            TimestampMs::new(3),
+        )
+        .expect("an edit");
+    assert_eq!(
+        sync.publish(
+            &store,
+            edited.draft_id,
+            edited.revision,
+            TimestampMs::new(4)
+        )
+        .await
+        .expect("an answer"),
+        Published::Accepted { position: at(2) }
+    );
+
+    // The service is put back from an archive taken after the first publication, under a recovery
+    // of its own: the collection holds the draft as it was then.
+    let restored = SyncRecoveryId::new(Uuid::from_bytes([0xb0; 16]));
+    let in_restored = |write_sequence| SyncPosition {
+        recovery: Nullable::some(restored),
+        ..at(write_sequence)
+    };
+    service
+        .put_back(
+            vec![(
+                draft_collection(draft.draft_id),
+                1,
+                ReversingSealer
+                    .seal(&DraftStore::encode_payload(&draft).expect("canonical bytes"))
+                    .expect("sealed"),
+            )],
+            restored,
+        )
+        .await;
+
+    // What the restored collection holds comes down beside the person's draft, never over it.
+    let fetched = sync
+        .fetch_beside(&store, draft.draft_id, TimestampMs::new(5))
+        .await
+        .expect("the collection put back is followed");
+    assert_eq!(fetched.position, in_restored(1));
+    assert_eq!(fetched.remote.text, "the message I have not sent");
+    assert_eq!(fetched.copy.conflict_of, Nullable::some(draft.draft_id));
+    assert_eq!(
+        store.load(draft.draft_id).expect("the draft"),
+        edited,
+        "the person's draft is untouched"
+    );
+
+    // The person publishes: the comparison is against the collection as it now stands, and the
+    // write lands after it in the restored history.
+    assert_eq!(
+        sync.publish(
+            &store,
+            edited.draft_id,
+            edited.revision,
+            TimestampMs::new(6)
+        )
+        .await
+        .expect("an answer"),
+        Published::Accepted {
+            position: in_restored(2)
+        }
+    );
+
+    // Nothing reached the host. A round trip first, so an empty list is not one the host had not
+    // reached yet.
+    let _: SessionList = session
+        .read(Method::SessionList, &Empty {})
+        .await
+        .expect("a listing");
+    assert!(
+        script.actions.lock().await.is_empty(),
+        "a draft is submitted by a person, not by a restore, a fetch or a publication"
+    );
     session.close();
     serving.abort();
 }

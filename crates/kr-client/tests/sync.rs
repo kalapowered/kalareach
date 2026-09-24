@@ -5337,6 +5337,177 @@ async fn a_late_answer_is_read_against_the_history_its_attempt_was_made_in() {
 }
 
 // ---------------------------------------------------------------------------
+// KR-REQ-24.28 and KR-REQ-20.13 across a restore: settlement, drafts and the account of what left
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_request_attempted_before_its_collection_was_put_back_is_ended_at_once_and_keeps_its_account()
+ {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    client.store().put_object(&mine).expect("stored");
+
+    // A publication is sent and lost on its way, so the service holds no receipt of it.
+    service.drop_the_next_request().await;
+    client
+        .publish(object_id, TimestampMs::new(NOW))
+        .await
+        .expect_err("the request never arrived");
+    assert_eq!(client.outstanding().expect("a count"), 1);
+
+    // The control: in the history it was sent in, no receipt settles nothing under the generation
+    // in force. The request may still be on its way, so it stays counted and nothing is fenced.
+    let reconciled = client
+        .reconcile_unsettled(TimestampMs::new(NOW + 1))
+        .await
+        .expect("reconciled");
+    assert_eq!(reconciled.unresolved, 1);
+    assert_eq!(reconciled.fenced, 0);
+    assert!(service.fence_requests().await.is_empty());
+    assert_eq!(client.outstanding().expect("a count"), 1);
+
+    // The service is put back under a recovery of its own. The request was attempted in the
+    // history the restore replaced, it is never attempted again, and the history that replaced it
+    // holds no receipt of it: the next pass ends it at once, whatever privacy generation is in
+    // force, and the restored service cannot say it never ran.
+    let restored = recovery(0xd0);
+    let archive = service.export().await;
+    service.put_back(&archive, restored).await;
+    let sent_before = service.exchanges().await.len();
+    let reconciled = client
+        .reconcile_unsettled(TimestampMs::new(NOW + 2))
+        .await
+        .expect("reconciled");
+    assert_eq!(reconciled.fenced, 1);
+    assert_eq!(reconciled.accounts_kept, 1);
+    assert_eq!(reconciled.unsettled, 0);
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    let fences = service.fence_requests().await;
+    assert_eq!(fences.len(), 1);
+    assert_eq!(
+        (fences[0].first_signed_at_ms, fences[0].last_signed_at_ms),
+        (NOW, NOW),
+        "the fence names the instants the attempt was signed at"
+    );
+    assert_eq!(
+        service.exchanges().await.len(),
+        sent_before,
+        "nothing was written on this device's behalf"
+    );
+    // The account of what left stays: the ciphertext left this device, and the history it went
+    // into is one nobody can ask about any more.
+    assert!(
+        client
+            .exported()
+            .expect("exported")
+            .iter()
+            .any(|entry| entry.kind.contains("sent and never accounted for")),
+        "the account of the request stays"
+    );
+    assert!(matches!(
+        client
+            .store()
+            .what_left()
+            .expect("what left")
+            .requests
+            .items[0]
+            .state,
+        RequestState::Unaccounted
+    ));
+}
+
+#[tokio::test]
+async fn a_draft_publication_attempted_before_its_collection_was_put_back_is_never_attempted_again()
+{
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let draft = drafts
+        .create(draft_target(), "mine".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+
+    // The publication is sent and lost on its way.
+    service.drop_the_next_request().await;
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(NOW),
+    )
+    .await
+    .expect_err("the request never arrived");
+    let first = service.exchanges().await[0].request_id;
+
+    // The service is put back, holding another device's draft, and this device reads it: the
+    // copy comes down beside the person's draft, and the note follows the restored collection.
+    let restored = recovery(0xd1);
+    let (theirs, sealed) = their_write_of(&draft);
+    service
+        .put_back(
+            &Export {
+                objects: [(draft_collection(draft.draft_id), (at(1), sealed))].into(),
+                ..Export::default()
+            },
+            restored,
+        )
+        .await;
+    let fetched = sync
+        .fetch_beside(&drafts, draft.draft_id, TimestampMs::new(NOW + 1))
+        .await
+        .expect("the collection put back is followed");
+    assert_eq!(fetched.remote.text, theirs.text);
+    assert_eq!(fetched.position, in_history(at(1), Some(restored)));
+
+    // Publishing the same revision again, well inside the span a later attempt may be made in, is
+    // not a later attempt at the first publication: that one was attempted in a history the
+    // collection was put back from, where its receipt may have gone with the history. It is new
+    // work under an identity of its own, and it lands in the restored history.
+    assert_eq!(
+        sync.publish(
+            &drafts,
+            draft.draft_id,
+            draft.revision,
+            TimestampMs::new(NOW + 2)
+        )
+        .await
+        .expect("an answer"),
+        DraftPublished::Accepted {
+            position: in_history(at(2), Some(restored))
+        }
+    );
+    let sent = service.exchanges().await;
+    assert_eq!(sent.len(), 2);
+    assert_ne!(
+        sent[1].request_id, first,
+        "the first identity is never presented again"
+    );
+    assert_eq!(client.outstanding().expect("a count"), 1);
+
+    // The draft half's reconciliation ends the first publication at once, under the generation
+    // in force, and keeps its account.
+    let reconciled = sync
+        .reconcile_unsettled(&drafts, TimestampMs::new(NOW + 3))
+        .await
+        .expect("reconciled");
+    assert_eq!(reconciled.fenced, 1);
+    assert_eq!(reconciled.accounts_kept, 1);
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    assert_eq!(service.fence_requests().await[0].request_id, first);
+    assert_eq!(
+        drafts.load(draft.draft_id).expect("the draft"),
+        draft,
+        "the person's draft is untouched throughout"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // KR-REQ-18.05: encrypted settings sync, named beside the rest of the feature
 // ---------------------------------------------------------------------------
 
