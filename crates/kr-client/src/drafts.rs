@@ -1452,11 +1452,12 @@ enum BroughtDown {
 /// same revision again while its answer is unknown is a later attempt at that work: it presents the
 /// same identity, the same bytes and the same comparison, so a service that already ran it answers
 /// from its receipt and runs nothing twice, and the record keeps the earliest and the latest
-/// instant any attempt was signed at. That holds only while the service still keeps the receipt of
-/// any attempt that ran, so once it may not, the earlier publication keeps its account for a
-/// reconciliation to end and publishing again is a new publication under an identity of its own.
-/// Nothing makes an attempt by itself. Section 23 retries nothing whose outcome is unknown, so a
-/// later attempt is always a caller asking for one.
+/// instant any attempt was signed at. That holds only while the service is certain to keep the
+/// receipt of any attempt that ran, which is while every attempt is signed within one freshness
+/// window of every other. Past that, the earlier publication keeps its account for a reconciliation
+/// to end, and publishing again is a new publication under an identity of its own. Nothing makes
+/// an attempt by itself. Section 23 retries nothing whose outcome is unknown, so a later attempt is
+/// always a caller asking for one.
 ///
 /// # A lost answer
 ///

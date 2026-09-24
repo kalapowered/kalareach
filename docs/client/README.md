@@ -125,12 +125,14 @@ and a draft publication is accounted for and settled there by the same rules as 
   again while the answer is unknown presents that identity with the same bytes and the same
   comparison, and the service answers from its receipt if an earlier attempt ran. The record keeps
   the earliest and the latest instant any attempt was signed at, which is what a fence carries. A
-  later attempt is a replay only while the service is sure to hold that receipt still. Section 9
-  keeps one for thirty days from the reading that admitted the attempt, so an identity is presented
-  again only by an attempt signed less than that, less two freshness windows, after the earliest.
-  After that the first publication keeps its own account and publishing again is new work under a
-  new identity. Nothing makes an attempt by itself, and a second call while one is out is refused
-  rather than sent beside it.
+  later attempt is a replay only while the service is sure to hold that receipt still, so an
+  identity is presented again only while every attempt under it is signed within one freshness
+  window of every other. Section 9 keeps a receipt for thirty days from the reading that admitted
+  its attempt, and a replay inside that span could then run twice only if the service's clock went
+  back by nearly all of those thirty days. Past the span, the first publication keeps its own
+  account and publishing again is new work under a new identity. Nothing makes an attempt by
+  itself, and an attempt under an identity whose call is still out is refused rather than sent
+  beside it.
 - `DraftSync::reconcile_unsettled` settles a publication whose answer was lost the way the settings
   client settles its own. It asks about the request's identity: an applied receipt moves the note
   beside the draft unless the note already names a later write, and a refused one brings the other

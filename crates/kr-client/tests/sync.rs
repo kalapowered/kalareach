@@ -2252,15 +2252,16 @@ async fn a_second_call_for_a_draft_publication_that_is_out_is_refused_rather_tha
     assert_eq!(client.outstanding().expect("a count"), 0);
 }
 
-/// How long after the earliest attempt a later one is still a replay: section 9's retention of a
-/// receipt, less the two freshness windows that separate a receipt's reading from the attempts'
-/// signing times.
-fn later_attempt_window_ms() -> u64 {
-    kr_protocol::limits::DEDUPLICATION_RETENTION.get() - 2 * SERVICE_REQUEST_FRESHNESS_MS
-}
+/// How far apart the attempts under one identity may be signed: one freshness window, so that a
+/// receipt any of them left is certain to be at the service when another arrives.
+const REPLAY_SPAN_MS: u64 = SERVICE_REQUEST_FRESHNESS_MS;
+
+/// Sixty days, which is further ahead than any receipt is kept.
+const TWO_MONTHS_MS: u64 = 60 * 24 * 60 * 60 * 1_000;
 
 #[tokio::test]
-async fn a_later_attempt_is_made_only_while_the_service_still_holds_what_an_earlier_one_left() {
+async fn a_later_attempt_inside_the_span_presents_the_same_identity_and_is_answered_from_the_receipt()
+ {
     let directory = tempfile::tempdir().expect("a directory");
     let service = Arc::new(Service::default());
     let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
@@ -2278,16 +2279,16 @@ async fn a_later_attempt_is_made_only_while_the_service_still_holds_what_an_earl
     .expect_err("the answer never came back");
     let first = the_only_record(&client);
 
-    // Just inside the window the service still keeps the receipt, so an attempt under the same
+    // At the edge of the span the service still keeps the receipt, so an attempt under the same
     // identity is answered from it and nothing runs twice.
-    let inside = NOW + later_attempt_window_ms() - 1;
-    service.its_clock_reads(inside).await;
+    let edge = NOW + REPLAY_SPAN_MS;
+    service.its_clock_reads(edge).await;
     assert_eq!(
         sync.publish(
             &drafts,
             draft.draft_id,
             draft.revision,
-            TimestampMs::new(inside),
+            TimestampMs::new(edge),
         )
         .await
         .expect("answered from the receipt"),
@@ -2301,7 +2302,7 @@ async fn a_later_attempt_is_made_only_while_the_service_still_holds_what_an_earl
 }
 
 #[tokio::test]
-async fn past_the_receipts_reach_publishing_again_is_new_work_and_the_first_keeps_its_account() {
+async fn past_the_span_publishing_again_is_new_work_and_the_first_keeps_its_account() {
     let directory = tempfile::tempdir().expect("a directory");
     let service = Arc::new(Service::default());
     let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
@@ -2310,8 +2311,9 @@ async fn past_the_receipts_reach_publishing_again_is_new_work_and_the_first_keep
         .expect("a draft");
     let collection = draft_collection(draft.draft_id);
 
-    // The write lands, its answer is lost, and the service later sweeps the receipt. Another
-    // device then removes the object, so a comparison against nothing would hold again.
+    // The write lands and its answer is lost. What follows is what the identity would meet if it
+    // were presented again after its receipt had gone: the receipt swept, and the object removed by
+    // another device, so a comparison against nothing would hold again.
     service.lose_the_next_answer().await;
     sync.publish(
         &drafts,
@@ -2328,10 +2330,10 @@ async fn past_the_receipts_reach_publishing_again_is_new_work_and_the_first_keep
         SyncPosition::removed_at(2)
     );
 
-    // Past the window, the identity is not presented again: under it the same bytes would run a
-    // second time, and the first attempt's account would become this one's. What is sent is a new
-    // publication of the same content, under an identity of its own.
-    let after = NOW + later_attempt_window_ms();
+    // One instant past the span, the identity is not presented again: under it the same bytes could
+    // run a second time, and the first attempt's account would become this one's. What is sent is
+    // a new publication of the same content, under an identity of its own.
+    let after = NOW + REPLAY_SPAN_MS + 1;
     service.its_clock_reads(after).await;
     assert_eq!(
         sync.publish(
@@ -2372,6 +2374,96 @@ async fn past_the_receipts_reach_publishing_again_is_new_work_and_the_first_keep
         exported
             .iter()
             .any(|entry| entry.kind == "synchronised draft" && entry.reference.contains("write 3"))
+    );
+}
+
+#[tokio::test]
+async fn an_attempt_signed_ahead_of_the_rest_keeps_its_identity_from_being_presented_again() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let draft = drafts
+        .create(draft_target(), "a prompt".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+    let collection = draft_collection(draft.draft_id);
+
+    // The first attempt is signed on a clock two months fast. The service refuses it as outside its
+    // window, and nothing says where the envelope itself has got to.
+    let ahead = NOW + TWO_MONTHS_MS;
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(ahead),
+    )
+    .await
+    .expect_err("outside the service's window");
+    let first = the_only_record(&client);
+    assert_eq!(
+        first.signing_times(),
+        Some((TimestampMs::new(ahead), TimestampMs::new(ahead)))
+    );
+
+    // The clock is corrected and the person asks again. The two attempts would be signed two months
+    // apart, so a receipt of the second could be gone by the time the first becomes fresh: this is
+    // new work under an identity of its own.
+    assert_eq!(
+        sync.publish(
+            &drafts,
+            draft.draft_id,
+            draft.revision,
+            TimestampMs::new(NOW)
+        )
+        .await
+        .expect("answered"),
+        DraftPublished::Accepted { position: at(1) }
+    );
+    let sent = service.exchanges().await;
+    assert_eq!(sent.len(), 2);
+    assert_ne!(sent[1].request_id, first.work_id);
+
+    // Two months on, the service has swept every receipt older than its retention, and the first
+    // envelope arrives, fresh at last. It is its own request: it is compared against where the
+    // object stands, refused, and kept by the service as a copy.
+    service.sweep_the_receipt(sent[1].request_id).await;
+    service.its_clock_reads(ahead).await;
+    assert!(matches!(
+        service
+            .compare_exchange(
+                &sent[0].collection,
+                sent[0].request_id,
+                sent[0].signed_at_ms,
+                sent[0].expected,
+                &sent[0].ciphertext,
+            )
+            .await
+            .expect("answered"),
+        SyncExchanged::Refused { .. }
+    ));
+
+    // Its own record settles it, so both envelopes are accounted for and neither ran twice.
+    let reconciled = sync
+        .reconcile_unsettled(&drafts, TimestampMs::new(ahead))
+        .await
+        .expect("reconciled");
+    assert_eq!(reconciled.settled, 1);
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    let exported = client.exported().expect("exported");
+    assert_eq!(exported.len(), 2, "{exported:?}");
+    assert!(
+        exported
+            .iter()
+            .any(|entry| entry.kind == "synchronised draft")
+    );
+    assert!(
+        exported
+            .iter()
+            .any(|entry| entry.kind.contains("kept as a copy by the service"))
+    );
+    assert_eq!(
+        service.stored(&collection).await.expect("stored").0,
+        at(1),
+        "one write landed"
     );
 }
 
