@@ -83,7 +83,16 @@ async fn kr_req_12_14_a_hook_the_launched_application_starts_is_admitted() {
         admitted.process.started.is_some(),
         "the kernel's forward-only record of its start is read"
     );
-    drop(admitted);
+    // The worker reads the observation the hook sent behind its hello and closes the connection,
+    // which is what the hook waits for before it answers.
+    let report = tokio::time::timeout(LIVENESS, launch.gateway.observe_hook(admitted))
+        .await
+        .expect("the observation arrives in time")
+        .expect("its observation is applied");
+    assert_eq!(
+        report.observation.event,
+        kr_worker::broker::ObservedEvent::ThreadStarted
+    );
     let outcome = launched::outcome(&request);
     assert_eq!(outcome.code, 0, "{}", outcome.stderr);
     assert_eq!(outcome.stdout, b"{}\n");
