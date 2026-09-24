@@ -644,17 +644,31 @@ impl GitProgram {
         }
         // Asked of the resolved binary with an environment of nothing, so the answer is the
         // program's own rather than an inherited `GIT_EXEC_PATH`.
-        let exec_path = PathBuf::from(ask(&program, &["--exec-path"])?.trim_end());
-        if !exec_path.is_absolute() {
+        let reported = PathBuf::from(ask(&program, &["--exec-path"])?.trim_end());
+        if !reported.is_absolute() {
             return Err(ProjectError::GitUnavailable {
                 detail: format!(
                     "{} reports a relative helper directory {}",
                     redact(&program.display().to_string()),
-                    redact(&exec_path.display().to_string())
+                    redact(&reported.display().to_string())
                 )
                 .into(),
             });
         }
+        // Named as the directory it resolves to. A packaging that reaches Git's versioned
+        // directory through a link has Git report its helper directory through that link, and a
+        // boundary that names the directory by path is judged by the path an execution resolves
+        // to: named through the link, it would name no helper Git starts from it.
+        let exec_path = reported
+            .canonicalize()
+            .map_err(|error| ProjectError::GitUnavailable {
+                detail: format!(
+                    "{} reports a helper directory {} that could not be resolved: {error}",
+                    redact(&program.display().to_string()),
+                    redact(&reported.display().to_string())
+                )
+                .into(),
+            })?;
         let version = ask(&program, &["--version"])?.trim_end().to_owned();
         let parsed = parse_version(&version).ok_or_else(|| ProjectError::GitUnavailable {
             detail: format!("{version} does not report a version this host can read").into(),
@@ -696,7 +710,8 @@ impl GitProgram {
         &self.executable
     }
 
-    /// Returns the helper directory the binary reported for itself.
+    /// Returns the helper directory the binary reported for itself, as the directory it resolves
+    /// to.
     #[must_use]
     pub fn exec_path(&self) -> &Path {
         &self.exec_path
@@ -3132,8 +3147,13 @@ fn handed_off_to(program: &Path, exec_path: &Path, version: &str) -> PathBuf {
     }
     let same_version =
         ask(&candidate, &["--version"]).is_ok_and(|reported| reported.trim_end() == version);
-    let same_helpers = ask(&candidate, &["--exec-path"])
-        .is_ok_and(|reported| Path::new(reported.trim_end()) == exec_path);
+    // Compared as the directories the two answers resolve to, because the helper directory is held
+    // resolved and either program may report it through a link.
+    let same_helpers = ask(&candidate, &["--exec-path"]).is_ok_and(|reported| {
+        Path::new(reported.trim_end())
+            .canonicalize()
+            .is_ok_and(|resolved| resolved == exec_path)
+    });
     if same_version && same_helpers {
         candidate
     } else {

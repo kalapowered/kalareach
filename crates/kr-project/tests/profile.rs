@@ -1554,3 +1554,92 @@ fn a_reference_updates_object_format_is_read_from_the_repository_it_writes_to() 
         "the refusal says what a full name is here, and said {refusal}"
     );
 }
+
+/// Git's own helper directory is named by the directory it resolves to.
+///
+/// A packaging that installs Git in a versioned directory and reaches it through a link has Git
+/// report its helper directory through that link. The macOS boundary names the helper directory in
+/// its sandbox profile, and the sandbox judges an execution by the path it resolves to, so a
+/// directory named through a link names no program Git starts from it: every helper would be
+/// refused. This builds that shape out of the installed Git, a copy of its binary beside a link to
+/// its own helper directory, and then clones a repository from a path on this machine, which starts
+/// Git's upload-pack helper through the connection shell.
+///
+/// A Git that computes its helper directory from where it was started reports it through the link;
+/// one whose helper directory was fixed when it was built reports that instead, and then this shows
+/// that resolving the directory changes nothing for it.
+#[cfg(unix)]
+#[test]
+fn a_helper_directory_reached_through_a_link_is_named_as_the_directory_it_resolves_to() {
+    let installed = kr_project::git::GitProgram::discover().expect("installed Git");
+    let root = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let prefix = root.path().join("prefix");
+    std::fs::create_dir_all(prefix.join("bin")).expect("a directory for the binary");
+    std::fs::create_dir_all(prefix.join("libexec")).expect("a directory for the link");
+    let copy = prefix.join("bin").join("git");
+    std::fs::copy(installed.executable(), &copy).expect("a copy of the installed Git");
+    std::os::unix::fs::symlink(
+        installed.exec_path(),
+        prefix.join("libexec").join("git-core"),
+    )
+    .expect("a link to Git's own helper directory");
+    let asked = std::process::Command::new(&copy)
+        .arg("--exec-path")
+        .env_clear()
+        .output()
+        .expect("the copy runs");
+    let reported = std::path::PathBuf::from(String::from_utf8_lossy(&asked.stdout).trim());
+    let through_a_link =
+        reported != std::fs::canonicalize(&reported).expect("the reported directory resolves");
+    println!(
+        "the copy reports its helper directory as {}, {}",
+        reported.display(),
+        if through_a_link {
+            "through a link"
+        } else {
+            "with no link in it"
+        }
+    );
+
+    let git = kr_project::git::GitProgram::at(&copy).expect("the copy resolves");
+    let state = root.path().join("state");
+    std::fs::create_dir(&state).expect("a directory for the profile");
+    let profile =
+        kr_project::git::RestrictedProfile::prepare_with(&state, an_environment(), git.clone())
+            .expect("the profile is prepared around the copy");
+    let source = ordinary_repository(root.path(), "source");
+    let staging = root.path().join("staging");
+    std::fs::create_dir(&staging).expect("a directory to clone into");
+    let arguments: [&OsStr; 7] = [
+        OsStr::new("clone"),
+        OsStr::new("--template="),
+        OsStr::new("--no-checkout"),
+        OsStr::new("--no-hardlinks"),
+        OsStr::new("--"),
+        source.as_os_str(),
+        OsStr::new("tree"),
+    ];
+    let cloned = profile
+        .run(
+            &GitRequest::write(&staging, &arguments)
+                .with_ceiling(&staging)
+                .reading(&[source.as_path()])
+                .with_transport(kr_project::git::RemoteAccess::local()),
+        )
+        .expect("the clone starts");
+    assert!(
+        cloned.success,
+        "a clone starts Git's upload-pack helper from its helper directory, and the boundary lets \
+         it run: it exited {:?} and said {}",
+        cloned.status, cloned.stderr
+    );
+    assert!(
+        staging.join("tree").join(".git").is_dir(),
+        "and the clone is there"
+    );
+    assert_eq!(
+        git.exec_path(),
+        std::fs::canonicalize(git.exec_path()).expect("the helper directory resolves"),
+        "the helper directory is named with no link left in it"
+    );
+}
