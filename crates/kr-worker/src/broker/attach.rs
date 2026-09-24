@@ -792,7 +792,9 @@ impl NativeGateway {
     /// 3. **Refuse a browser.** Anything a browser would have added disqualifies the connection.
     /// 4. **Authenticate and validate.** The owner, the process the hello presents against the one
     ///    the kernel named, the parent chain to the process this host launched, the installation
-    ///    this host recorded, and then the launch's private exchange.
+    ///    this host recorded, and then the launch's private exchange. The process that started the
+    ///    bridge and the kernel's forward-only record of its start are kept with it, to place what
+    ///    it reports.
     /// 5. **Admit.** One admission frame, so the bridge knows it may speak.
     ///
     /// What the admitted bridge then says is its surface's business; see
@@ -833,7 +835,12 @@ impl NativeGateway {
             self.launch.application_instance_id,
             presented.credential.expose(),
         )?;
-        let process = peer.process().unwrap_or(&presented.process).clone();
+        let identity = peer.process().unwrap_or(&presented.process).clone();
+        // Read while the bridge is known to be running, so the record is its own. A reading that
+        // failed places the bridge's reports nowhere, as a platform that keeps no record does.
+        let started = crate::questions::binding::monotonic_start(&identity)
+            .ok()
+            .flatten();
         let mut stream =
             crate::broker::bridge::BridgeStream::new(reader, writer, held, self.launch.framing);
         stream
@@ -841,8 +848,11 @@ impl NativeGateway {
             .await?;
         Ok(crate::broker::bridge::AdmittedBridge {
             surface: declared.surface,
-            process,
-            starter,
+            process: crate::broker::bridge::BridgeProcess {
+                identity,
+                starter,
+                started,
+            },
             stream,
         })
     }
@@ -885,10 +895,7 @@ impl NativeGateway {
         let observation = crate::broker::bridge::Observation::from_frame(&body)?;
         let (thread, cursor) = self.broker.observe_bridge(
             self.launch.application_instance_id,
-            &crate::broker::bridge::HookProcess {
-                process: admitted.process.clone(),
-                starter: admitted.starter.clone(),
-            },
+            &admitted.process,
             &observation,
             kr_ipc::now_ms(),
         )?;

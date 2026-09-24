@@ -66,14 +66,22 @@ async fn kr_req_12_14_a_hook_the_launched_application_starts_is_admitted() {
     let admitted = launch.accept().await.expect("the hook is admitted");
     assert_eq!(admitted.surface, kr_worker::broker::BridgeSurface::Hook);
     assert_ne!(
-        admitted.process.pid.get(),
+        admitted.process.identity.pid.get(),
         u64::from(launch.application.id()),
         "the admitted process is the hook the application started, not the application"
     );
     assert_eq!(
-        admitted.starter.as_ref().map(|starter| starter.pid.get()),
+        admitted
+            .process
+            .starter
+            .as_ref()
+            .map(|starter| starter.pid.get()),
         Some(u64::from(launch.application.id())),
         "and the application started it itself"
+    );
+    assert!(
+        admitted.process.started.is_some(),
+        "the kernel's forward-only record of its start is read"
     );
     drop(admitted);
     let outcome = launched::outcome(&request);

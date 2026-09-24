@@ -179,10 +179,9 @@ impl InstalledBridge {
 pub struct AdmittedBridge {
     /// Which registration it is.
     pub surface: BridgeSurface,
-    /// The process, as the kernel named it where it could.
-    pub process: ProcessStartIdentity,
-    /// The process that started it, as the kernel's parent chain names it, where it can.
-    pub starter: Option<ProcessStartIdentity>,
+    /// The process, as the kernel named it where it could, and what the kernel recorded about its
+    /// start.
+    pub process: BridgeProcess,
     /// The connection it speaks on.
     pub stream: BridgeStream,
 }
@@ -342,61 +341,26 @@ pub const MAX_OBSERVATION_TEXT_BYTES: usize = 4096;
 /// own request identifier may be.
 pub const MAX_CONTACT_REQUEST_BYTES: usize = 256;
 
-/// How far apart two process identifiers allocated within one tick of the kernel's clock can be.
-///
-/// Linux and macOS allocate process identifiers in sequence and wrap below a maximum no smaller than
-/// 32,768. Far fewer processes than half of that can be created within one tick, so a larger gap
-/// between two identifiers from the same tick is the counter wrapping, and the smaller identifier is
-/// the later one.
-const IDENTIFIER_WINDOW: u64 = 16_384;
-
-/// The hook process behind one report, as the kernel recorded it.
+/// A bridge process as the kernel recorded it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HookProcess {
-    /// The hook process.
-    pub process: ProcessStartIdentity,
+pub struct BridgeProcess {
+    /// The process.
+    pub identity: ProcessStartIdentity,
     /// The process that started it, where the kernel's parent chain could name one.
     pub starter: Option<ProcessStartIdentity>,
+    /// When the kernel recorded it starting, on a clock that only moves forward, where the platform
+    /// keeps such a record.
+    pub started: Option<u64>,
 }
 
-/// Whether the application started the hook behind `report` after, with or before the one behind
-/// `in_force`, as the kernel recorded both, or `None` when the kernel's records cannot say.
+/// Whether a hook started after the hook of a report this host has already applied, as the
+/// kernel's forward-only clock recorded both, or `None` where the platform keeps no such record.
 ///
-/// Both are hooks the application process started itself: the caller has checked that. Both
-/// values are the kernel's, set while the application was starting the process, so neither depends
-/// on when the process was first scheduled. The start value orders two hooks started in different
-/// ticks of the kernel's clock. Within one tick, where the platform allocates process identifiers
-/// in sequence, the identifier does: the application starts its hooks one after another, and the
-/// later one was given the later identifier. Where identifiers are not allocated in sequence, two
-/// hooks from one tick cannot be ordered.
-fn started_order(
-    report: &ProcessStartIdentity,
-    in_force: &ProcessStartIdentity,
-) -> Option<std::cmp::Ordering> {
-    use kr_protocol::identity::ProcessStartSource;
-    if report.source != in_force.source {
-        return None;
-    }
-    let (started, before) = (report.start_value.get(), in_force.start_value.get());
-    if started != before {
-        return Some(started.cmp(&before));
-    }
-    let (pid, earlier) = (report.pid.get(), in_force.pid.get());
-    if pid == earlier {
-        return Some(std::cmp::Ordering::Equal);
-    }
-    match report.source {
-        ProcessStartSource::LinuxProcStat | ProcessStartSource::MacosProcBsdInfo => {
-            let later = pid > earlier;
-            let wrapped = pid.abs_diff(earlier) > IDENTIFIER_WINDOW;
-            Some(if later != wrapped {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Less
-            })
-        }
-        ProcessStartSource::WindowsProcessStartSeconds => None,
-    }
+/// Both hooks were started by the application process itself: the caller has checked that. Two in
+/// one tick of that clock count in the order their reports were applied, so the one arriving now
+/// is the later: see [`BridgeThreads`].
+fn started_after(report: Option<u64>, applied: Option<u64>) -> Option<bool> {
+    Some(report? >= applied?)
 }
 
 /// What an instance's native bridge has reported about its threads.
@@ -407,23 +371,44 @@ fn started_order(
 /// threads, not the application's selection, and decides nothing.
 ///
 /// Hooks are separate processes on separate connections, so their reports can arrive in any order.
-/// What orders them is what the kernel recorded when the application started each hook process
-/// (`started_order`), because the application starts the hook for a later event later. A report
-/// whose hook started after the one in force decides the thread; one that started before changes
-/// nothing. Two the kernel's records cannot order are not ordered at all, and when the one that
-/// arrives second would change the binding whichever came first, the host does not guess: no
-/// thread is vouched for, the thread the binding had is left so nothing bound to it survives, and
-/// rich mutations are suspended until a report whose hook started later settles it.
+/// Each is placed by when the kernel recorded the application starting its hook, on a clock that
+/// only moves forward and that the kernel sets while the application is starting the process, so
+/// it does not depend on when the hook was first scheduled. Two hooks in one tick of that clock
+/// are placed in the order their reports were applied. The application waits for the hooks of one
+/// thread event before it raises the next, and a hook answers it only once its report is applied
+/// or after a deadline many ticks long, so within one tick the report applied first comes from the
+/// hook started first.
+///
+/// The newest report decides the thread. An older one still matters when its hook started after
+/// the report that began the binding's current revision: a thread starting or ending there, or
+/// another thread going on, is a switch the host learned of late, which a question bound to that
+/// revision may have been asked across, so the binding advances to a new revision of what the
+/// newest report says holds. One whose hook started before the current revision began changes
+/// nothing. Where the platform keeps no forward-only record, reports cannot be placed at all: one
+/// that would change the binding whichever came first leaves no thread vouched for, the thread the
+/// binding had is left so nothing bound to it survives, and rich mutations are suspended until a
+/// report the host can place settles it.
 #[derive(Debug, Default)]
 pub(crate) struct BridgeThreads {
-    /// The hook process whose report is in force.
-    in_force: Option<ProcessStartIdentity>,
-    /// True while the thread is not verified: two reports could not be ordered, or the thread
+    /// The newest thread report applied.
+    newest: Option<Reported>,
+    /// When the hook started whose report began the binding's current revision, where one did.
+    began: Option<u64>,
+    /// True while the thread is not verified: a report could not be placed, or the thread
     /// reported could not be selected. Rich mutations are suspended meanwhile, for this reason of
     /// the bridge's own, which nothing else lifts and which lifts nothing else.
     unsettled: bool,
     /// Contact requests a hook reported finishing, oldest first, with the thread that ran each.
     attested: std::collections::VecDeque<(String, AgentThreadId)>,
+}
+
+/// One thread report, as the bridge keeps it.
+#[derive(Debug)]
+struct Reported {
+    /// When its hook started, as [`BridgeProcess::started`].
+    started: Option<u64>,
+    /// The thread it leaves selected, or none.
+    selects: Option<AgentThreadId>,
 }
 
 impl BridgeThreads {
@@ -592,14 +577,20 @@ pub enum ThreadChange {
     /// The binding already said what the observation says, or the observation says nothing
     /// about threads.
     Unchanged,
-    /// The observation's hook started before the one whose report is in force: it changes nothing.
+    /// The observation's hook started before the report that began the binding's current revision:
+    /// it changes nothing.
     Stale,
+    /// The observation's hook started before the newest report's and after the report that began
+    /// the binding's current revision, and the thread changed there: the binding advanced to this
+    /// new revision of what the newest report says holds.
+    Overtaken(AgentBindingRevision),
     /// The observation's hook was not started by the application process itself, so it does not
     /// report the application's selection: it changes nothing.
     Indirect,
-    /// The observation's hook cannot be ordered against the one whose report is in force, and the
-    /// two disagree. No thread is vouched for, the thread the binding had is left so nothing bound
-    /// to it survives, and rich mutations are suspended until a later report settles it.
+    /// The observation's hook cannot be placed against the newest report's, and it would change
+    /// the binding whichever came first. No thread is vouched for, the thread the binding had is
+    /// left so nothing bound to it survives, and rich mutations are suspended until a report the
+    /// host can place settles it.
     Unordered,
     /// Selecting the thread was refused. No thread is vouched for, and rich mutations are
     /// suspended until a later report settles it.
@@ -626,14 +617,14 @@ impl crate::broker::Broker {
     /// Applies what one of an instance's native bridge hooks observed.
     ///
     /// This is the production caller of the binding's advance. Only a hook the launched
-    /// application process started itself reports its selection. A report whose hook started after
-    /// the one in force decides the thread: a thread starting selects it and advances the binding
-    /// revision, even when it is the thread already selected (a resume is a new selection); a
-    /// thread ending leaves none selected; a thread continuing (a compaction) confirms the one
-    /// selected. A report whose hook started before changes nothing, and one the kernel's records
-    /// cannot order against the report in force, when the two disagree, leaves no thread vouched
-    /// for and suspends rich mutations. A finished tool call that asked a contact question is
-    /// recorded with its thread.
+    /// application process started itself reports its selection. Reports are placed by the
+    /// kernel's forward-only record of when the application started each hook, and hooks from one
+    /// tick of it in the order their reports were applied. The newest report decides the thread: a
+    /// thread starting selects it and advances the binding revision, even when it is the thread
+    /// already selected (a resume is a new selection); a thread ending leaves none selected; a
+    /// thread continuing (a compaction) confirms the one selected. An older report of a change
+    /// after the current revision began advances the binding again; one from before changes
+    /// nothing. A finished tool call that asked a contact question is recorded with its thread.
     ///
     /// # Errors
     ///
@@ -641,7 +632,7 @@ impl crate::broker::Broker {
     pub fn observe_bridge(
         &self,
         application_instance_id: ApplicationInstanceId,
-        reporter: &HookProcess,
+        reporter: &BridgeProcess,
         observation: &Observation,
         now: TimestampMs,
     ) -> Result<(ThreadChange, StreamCursor)> {
@@ -722,7 +713,7 @@ fn decide(
     state: &mut crate::broker::BrokerState,
     application_instance_id: ApplicationInstanceId,
     observation: &Observation,
-    reporter: &HookProcess,
+    reporter: &BridgeProcess,
     now: TimestampMs,
 ) -> Result<ThreadChange> {
     let instance = instance_of(state, application_instance_id)?;
@@ -732,72 +723,173 @@ fn decide(
     if launched.is_none() || reporter.starter.as_ref() != launched {
         return Ok(ThreadChange::Indirect);
     }
-    let current = instance.thread_id.clone();
-    let thread = &observation.thread;
-    match instance
-        .bridge
-        .in_force
-        .as_ref()
-        .map(|in_force| started_order(&reporter.process, in_force))
-    {
-        Some(Some(std::cmp::Ordering::Less)) => return Ok(ThreadChange::Stale),
-        Some(Some(std::cmp::Ordering::Equal) | None) => {
-            // Which of the two came last cannot be read. That does not matter when the report
-            // leaves the binding as it is in either order: an end when none is selected, or the
-            // selected thread going on. A start is a new selection whichever came last.
-            let agrees = match observation.event {
-                ObservedEvent::ThreadEnded => current.is_none(),
-                ObservedEvent::ThreadContinued => current.as_ref() == Some(thread),
-                _ => false,
-            };
-            if agrees {
-                return Ok(ThreadChange::Unchanged);
-            }
-            // Otherwise neither decides. The binding leaves the thread it had, so nothing bound to
-            // it outlives a switch the host could not see.
-            if current.is_some() {
-                state.advance_binding(application_instance_id, None, now)?;
-            }
-            instance_of(state, application_instance_id)?
-                .bridge
-                .unsettled = true;
-            return Ok(ThreadChange::Unordered);
-        }
-        _ => {}
+    let bridge = &instance.bridge;
+    let placed = match &bridge.newest {
+        None => Some(true),
+        Some(newest) => started_after(reporter.started, newest.started),
+    };
+    // Started before the report that began the binding's current revision: every question bound
+    // to that revision was asked after this, whatever it says.
+    let before_revision = bridge
+        .began
+        .zip(reporter.started)
+        .is_some_and(|(began, started)| started < began);
+    match placed {
+        Some(true) => newest(state, application_instance_id, observation, reporter, now),
+        Some(false) if before_revision => Ok(ThreadChange::Stale),
+        Some(false) => overtaken(state, application_instance_id, observation, now),
+        None => unplaced(state, application_instance_id, observation, now),
     }
+}
+
+/// Applies the newest report there is: what it says is what holds now.
+fn newest(
+    state: &mut crate::broker::BrokerState,
+    application_instance_id: ApplicationInstanceId,
+    observation: &Observation,
+    reporter: &BridgeProcess,
+    now: TimestampMs,
+) -> Result<ThreadChange> {
+    let current = instance_of(state, application_instance_id)?
+        .thread_id
+        .clone();
+    let thread = &observation.thread;
+    let selects = match observation.event {
+        ObservedEvent::ThreadEnded => None,
+        _ => Some(thread.clone()),
+    };
     let change = match observation.event {
         ObservedEvent::ThreadContinued if current.as_ref() == Some(thread) => {
             ThreadChange::Unchanged
         }
-        ObservedEvent::ThreadEnded if current.is_none() => ThreadChange::Unchanged,
         // Whichever thread ended, none is selected after it: a thread the host did not know was
         // selected ending says the host's view was already behind.
-        ObservedEvent::ThreadEnded => {
-            ThreadChange::Ended(state.advance_binding(application_instance_id, None, now)?)
-        }
-        _ => match state.advance_binding(application_instance_id, Some(thread.clone()), now) {
-            Ok(revision) => ThreadChange::Selected(revision),
-            Err(error @ BrokerError::UnknownSubject { .. }) => return Err(error),
-            Err(error) => {
-                // The application is in a thread this instance cannot own, so its binding cannot
-                // be verified. Section 12: suspend rich mutations until it is. The thread the
-                // binding had is not the application's any more.
-                if current.is_some() {
-                    state.advance_binding(application_instance_id, None, now)?;
-                }
-                let instance = instance_of(state, application_instance_id)?;
-                instance.bridge.in_force = Some(reporter.process.clone());
-                instance.bridge.unsettled = true;
-                return Ok(ThreadChange::Refused(format!(
-                    "the application selected a thread this host refused: {error}"
-                )));
-            }
-        },
+        ObservedEvent::ThreadEnded if current.is_none() => ThreadChange::Unchanged,
+        _ => establish(state, application_instance_id, selects.clone(), now)?,
     };
     let instance = instance_of(state, application_instance_id)?;
-    instance.bridge.in_force = Some(reporter.process.clone());
-    instance.bridge.unsettled = false;
+    instance.bridge.newest = Some(Reported {
+        started: reporter.started,
+        selects,
+    });
+    if change != ThreadChange::Unchanged {
+        instance.bridge.began = reporter.started;
+    }
+    instance.bridge.unsettled = matches!(change, ThreadChange::Refused(_));
     Ok(change)
+}
+
+/// Applies a report older than the newest, whose hook started after the report that began the
+/// binding's current revision.
+fn overtaken(
+    state: &mut crate::broker::BrokerState,
+    application_instance_id: ApplicationInstanceId,
+    observation: &Observation,
+    now: TimestampMs,
+) -> Result<ThreadChange> {
+    let instance = instance_of(state, application_instance_id)?;
+    let current = instance.thread_id.clone();
+    let switched = match observation.event {
+        ObservedEvent::ThreadStarted | ObservedEvent::ThreadEnded => true,
+        _ => current.as_ref() != Some(&observation.thread),
+    };
+    if !switched {
+        return Ok(ThreadChange::Unchanged);
+    }
+    if instance.bridge.unsettled {
+        // Nothing is vouched for already; whatever the binding holds now is left too.
+        if current.is_some() {
+            state.advance_binding(application_instance_id, None, now)?;
+        }
+        return Ok(ThreadChange::Unordered);
+    }
+    // The thread changed after the current revision began, and the host learned of it late. A
+    // question bound to that revision may have been asked across the change, so none of them
+    // survives, and what the newest report says still holds.
+    let (holds, newest_started) = instance
+        .bridge
+        .newest
+        .as_ref()
+        .map_or((None, None), |newest| {
+            (newest.selects.clone(), newest.started)
+        });
+    let change = establish(state, application_instance_id, holds, now)?;
+    let instance = instance_of(state, application_instance_id)?;
+    instance.bridge.began = newest_started;
+    instance.bridge.unsettled = matches!(change, ThreadChange::Refused(_));
+    Ok(match change {
+        ThreadChange::Selected(revision) | ThreadChange::Ended(revision) => {
+            ThreadChange::Overtaken(revision)
+        }
+        other => other,
+    })
+}
+
+/// Applies a report that cannot be placed against the newest one.
+fn unplaced(
+    state: &mut crate::broker::BrokerState,
+    application_instance_id: ApplicationInstanceId,
+    observation: &Observation,
+    now: TimestampMs,
+) -> Result<ThreadChange> {
+    let current = instance_of(state, application_instance_id)?
+        .thread_id
+        .clone();
+    // Which came first cannot be read. That does not matter when the report leaves the binding as
+    // it is in either order: an end when none is selected, or the selected thread going on. A
+    // start is a new selection whichever came first.
+    let agrees = match observation.event {
+        ObservedEvent::ThreadEnded => current.is_none(),
+        ObservedEvent::ThreadContinued => current.as_ref() == Some(&observation.thread),
+        _ => false,
+    };
+    if agrees {
+        return Ok(ThreadChange::Unchanged);
+    }
+    // Otherwise neither decides. The binding leaves the thread it had, so nothing bound to it
+    // outlives a switch the host could not place.
+    if current.is_some() {
+        state.advance_binding(application_instance_id, None, now)?;
+    }
+    instance_of(state, application_instance_id)?
+        .bridge
+        .unsettled = true;
+    Ok(ThreadChange::Unordered)
+}
+
+/// Moves the binding to a new revision that selects `selects`, or none.
+///
+/// A thread this instance cannot own is refused: the thread the binding had is left, since it is
+/// not the application's any more, and the caller leaves no thread vouched for. Section 12: suspend
+/// rich mutations until the binding can be verified.
+fn establish(
+    state: &mut crate::broker::BrokerState,
+    application_instance_id: ApplicationInstanceId,
+    selects: Option<AgentThreadId>,
+    now: TimestampMs,
+) -> Result<ThreadChange> {
+    let Some(thread) = selects else {
+        return Ok(ThreadChange::Ended(state.advance_binding(
+            application_instance_id,
+            None,
+            now,
+        )?));
+    };
+    match state.advance_binding(application_instance_id, Some(thread), now) {
+        Ok(revision) => Ok(ThreadChange::Selected(revision)),
+        Err(error @ BrokerError::UnknownSubject { .. }) => Err(error),
+        Err(error) => {
+            if instance_of(state, application_instance_id)?
+                .thread_id
+                .is_some()
+            {
+                state.advance_binding(application_instance_id, None, now)?;
+            }
+            Ok(ThreadChange::Refused(format!(
+                "the application selected a thread this host refused: {error}"
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -983,16 +1075,43 @@ mod tests {
         )
     }
 
-    /// A hook the application started, whose start the kernel reports as `kernel`.
-    fn reporter(id: ApplicationInstanceId, kernel: u64) -> HookProcess {
-        HookProcess {
-            process: ProcessStartIdentity::new(
+    /// A hook the application started, whose start the kernel's forward-only clock recorded as
+    /// `kernel`.
+    fn reporter(id: ApplicationInstanceId, kernel: u64) -> BridgeProcess {
+        BridgeProcess {
+            identity: ProcessStartIdentity::new(
                 4_000 + kernel,
                 kr_protocol::identity::ProcessStartSource::LinuxProcStat,
                 kernel,
             ),
             starter: Some(application(id)),
+            started: Some(kernel),
         }
+    }
+
+    /// A hook the application started on a platform that keeps no forward-only record of a start.
+    fn unrecorded(id: ApplicationInstanceId, pid: u64) -> BridgeProcess {
+        BridgeProcess {
+            identity: ProcessStartIdentity::new(
+                pid,
+                kr_protocol::identity::ProcessStartSource::WindowsProcessStartSeconds,
+                50,
+            ),
+            starter: Some(application(id)),
+            started: None,
+        }
+    }
+
+    fn apply_as(
+        broker: &crate::broker::Broker,
+        id: ApplicationInstanceId,
+        reporter: &BridgeProcess,
+        observation: &Observation,
+    ) -> ThreadChange {
+        broker
+            .observe_bridge(id, reporter, observation, TimestampMs::new(1))
+            .expect("applied")
+            .0
     }
 
     fn broker_with(instances: &[ApplicationInstanceId]) -> crate::broker::Broker {
@@ -1146,55 +1265,114 @@ mod tests {
         assert!(!suspended(&broker, id));
     }
 
-    /// A hook the application started on a platform whose kernel records a start to the second
-    /// and allocates process identifiers out of sequence, so two hooks from one second cannot be
-    /// ordered.
-    fn per_second(id: ApplicationInstanceId, pid: u64, second: u64) -> HookProcess {
-        HookProcess {
-            process: ProcessStartIdentity::new(
-                pid,
-                kr_protocol::identity::ProcessStartSource::WindowsProcessStartSeconds,
-                second,
-            ),
-            starter: Some(application(id)),
-        }
-    }
-
     fn suspension(broker: &crate::broker::Broker, id: ApplicationInstanceId) -> Option<String> {
         broker.binding_state(id).expect("known").suspension_reason.0
     }
 
-    /// KR-REQ-11.62: two reports the kernel's records cannot order leave no thread vouched for when
-    /// they disagree: the thread the binding had is left, so nothing bound to it survives, and rich
-    /// mutations are suspended. Only a report whose hook started later settles it; an older one
-    /// arriving late does not. A report that leaves the binding as it is in either order needs no
-    /// order; a start is a new selection whichever came last, so it always does.
+    /// KR-REQ-11.62: a switch the host learns of only after a later report still invalidates the
+    /// revision it followed. A compaction reported before the end, the other thread and the
+    /// resume that came between leaves the thread as it was, but the first of those late reports
+    /// advances the binding, so nothing bound before the switch survives; the rest started before
+    /// that new revision began and change nothing. A late report of another thread going on is a
+    /// switch too, and one of the selected thread going on is not.
     #[test]
-    fn kr_req_11_62_reports_the_kernel_cannot_order_leave_no_thread_vouched_for() {
+    fn kr_req_11_62_a_switch_learned_late_still_invalidates_the_revision_it_followed() {
         let id = instance(3);
         let broker = broker_with(&[id]);
-        let at = |pid: u64, second: u64, observation: &Observation| {
-            broker
-                .observe_bridge(
-                    id,
-                    &per_second(id, pid, second),
-                    observation,
-                    TimestampMs::new(1),
-                )
-                .expect("applied")
-                .0
-        };
         assert!(matches!(
-            at(100, 50, &start("t1")),
+            apply(&broker, id, 10, &start("a")),
             ThreadChange::Selected(_)
         ));
-        assert_eq!(at(104, 50, &continued("t1")), ThreadChange::Unchanged);
+        let asked_under = revision(&broker, id);
+        assert_eq!(
+            apply(&broker, id, 60, &continued("a")),
+            ThreadChange::Unchanged
+        );
+        assert_eq!(revision(&broker, id), asked_under);
+
+        let change = apply(&broker, id, 20, &end("a"));
+        assert!(
+            matches!(change, ThreadChange::Overtaken(revision) if revision > asked_under),
+            "{change:?}"
+        );
+        assert_eq!(selected(&broker, id).as_deref(), Some("a"));
+        assert_eq!(vouched(&broker, id).as_deref(), Some("a"));
+        let after = revision(&broker, id);
+        for (kernel, late) in [(30, start("b")), (40, end("b")), (50, start("a"))] {
+            assert_eq!(apply(&broker, id, kernel, &late), ThreadChange::Stale);
+        }
+        assert_eq!(revision(&broker, id), after);
+
+        assert!(matches!(
+            apply(&broker, id, 110, &start("x")),
+            ThreadChange::Selected(_)
+        ));
+        assert_eq!(
+            apply(&broker, id, 160, &continued("x")),
+            ThreadChange::Unchanged
+        );
+        assert_eq!(
+            apply(&broker, id, 140, &continued("x")),
+            ThreadChange::Unchanged
+        );
+        assert!(matches!(
+            apply(&broker, id, 130, &continued("y")),
+            ThreadChange::Overtaken(_)
+        ));
+        assert_eq!(selected(&broker, id).as_deref(), Some("x"));
+        assert!(!suspended(&broker, id));
+    }
+
+    /// Within one tick of the kernel's clock, reports are placed in the order they were applied,
+    /// so an end and the start after it from one tick select the thread that started.
+    #[test]
+    fn kr_req_11_62_reports_from_one_tick_count_in_the_order_they_were_applied() {
+        let id = instance(8);
+        let broker = broker_with(&[id]);
+        assert!(matches!(
+            apply(&broker, id, 200, &start("p")),
+            ThreadChange::Selected(_)
+        ));
+        assert!(matches!(
+            apply(&broker, id, 200, &end("p")),
+            ThreadChange::Ended(_)
+        ));
+        assert!(matches!(
+            apply(&broker, id, 200, &start("q")),
+            ThreadChange::Selected(_)
+        ));
+        assert_eq!(vouched(&broker, id).as_deref(), Some("q"));
+        assert_eq!(started_after(Some(11), Some(10)), Some(true));
+        assert_eq!(started_after(Some(10), Some(10)), Some(true));
+        assert_eq!(started_after(Some(9), Some(10)), Some(false));
+        assert_eq!(started_after(None, Some(10)), None);
+        assert_eq!(started_after(Some(10), None), None);
+    }
+
+    /// KR-REQ-11.62: where the platform keeps no forward-only record of a start, reports cannot be
+    /// placed. One that leaves the binding as it is whichever came first changes nothing; any other
+    /// leaves the thread the binding had, so nothing bound to it survives, vouches for no thread
+    /// and suspends rich mutations. A start is a new selection whichever came first, so it never
+    /// leaves the binding as it is.
+    #[test]
+    fn kr_req_11_62_reports_the_host_cannot_place_leave_no_thread_vouched_for() {
+        let id = instance(4);
+        let broker = broker_with(&[id]);
+        assert!(matches!(
+            apply_as(&broker, id, &unrecorded(id, 100), &start("t1")),
+            ThreadChange::Selected(_)
+        ));
+        assert_eq!(
+            apply_as(&broker, id, &unrecorded(id, 104), &continued("t1")),
+            ThreadChange::Unchanged
+        );
         assert_eq!(vouched(&broker, id).as_deref(), Some("t1"));
 
-        // A resume of the selected thread from the same second: it may have come after the start
-        // in force, so nothing bound before it may survive.
         let before = revision(&broker, id);
-        assert_eq!(at(108, 50, &start("t1")), ThreadChange::Unordered);
+        assert_eq!(
+            apply_as(&broker, id, &unrecorded(id, 108), &start("t1")),
+            ThreadChange::Unordered
+        );
         assert!(
             revision(&broker, id) > before,
             "nothing bound to t1 survives"
@@ -1202,31 +1380,29 @@ mod tests {
         assert_eq!(selected(&broker, id), None);
         assert_eq!(vouched(&broker, id), None);
         assert_eq!(suspension(&broker, id).as_deref(), Some(UNVERIFIED_THREAD));
-
-        // An older report arriving late settles nothing, and neither does one that agrees.
-        assert_eq!(at(96, 49, &start("t3")), ThreadChange::Stale);
-        assert_eq!(at(112, 50, &end("t2")), ThreadChange::Unchanged);
-        assert_eq!(at(116, 50, &start("t2")), ThreadChange::Unordered);
+        assert_eq!(
+            apply_as(&broker, id, &unrecorded(id, 112), &end("t2")),
+            ThreadChange::Unchanged
+        );
+        assert_eq!(
+            apply_as(&broker, id, &unrecorded(id, 116), &start("t2")),
+            ThreadChange::Unordered
+        );
         assert!(suspended(&broker, id));
         assert_eq!(vouched(&broker, id), None);
-
-        // A later report settles it and lifts the bridge's suspension.
-        assert!(matches!(
-            at(90, 51, &start("t2")),
-            ThreadChange::Selected(_)
-        ));
-        assert!(!suspended(&broker, id));
-        assert_eq!(vouched(&broker, id).as_deref(), Some("t2"));
     }
 
     /// The bridge's suspension is its own. Lifting a suspension placed for another reason leaves
     /// the bridge's in place, and the bridge settling leaves the other in place.
     #[test]
     fn a_bridge_suspension_and_any_other_are_each_lifted_by_their_own() {
-        let id = instance(4);
+        let id = instance(12);
         let broker = broker_with(&[id]);
         apply(&broker, id, 10, &start("t1"));
-        apply(&broker, id, 10, &start("t2"));
+        assert_eq!(
+            apply_as(&broker, id, &unrecorded(id, 7), &start("t2")),
+            ThreadChange::Unordered
+        );
         broker
             .suspend_rich_mutations(id, "something else")
             .expect("suspended");
@@ -1259,15 +1435,15 @@ mod tests {
             5,
         );
         for starter in [Some(stranger), None] {
-            let started_elsewhere = HookProcess {
+            let started_elsewhere = BridgeProcess {
                 starter,
                 ..reporter(id, 20)
             };
             for observation in [start("t2"), end("t1"), continued("t2")] {
-                let (change, _) = broker
-                    .observe_bridge(id, &started_elsewhere, &observation, TimestampMs::new(1))
-                    .expect("applied");
-                assert_eq!(change, ThreadChange::Indirect);
+                assert_eq!(
+                    apply_as(&broker, id, &started_elsewhere, &observation),
+                    ThreadChange::Indirect
+                );
             }
         }
         assert_eq!(selected(&broker, id).as_deref(), Some("t1"));
@@ -1281,8 +1457,8 @@ mod tests {
     }
 
     /// KR-REQ-11.62: a thread another live execution already owns is not selected. The thread the
-    /// binding had is left, no thread is vouched for and rich mutations are suspended, for the same
-    /// one reason an unordered report gives, so the report that settles either lifts it.
+    /// binding had is left, no thread is vouched for and rich mutations are suspended. A report
+    /// from before the refusal settles nothing; the next one settles it.
     #[test]
     fn kr_req_11_62_a_thread_another_execution_owns_leaves_no_thread_vouched_for() {
         let (first, second) = (instance(6), instance(7));
@@ -1299,110 +1475,16 @@ mod tests {
         assert_eq!(selected(&broker, second), None);
         assert_eq!(vouched(&broker, second), None);
         assert!(suspended(&broker, second));
-        // Then a report the kernel cannot order against it, then one it can.
         assert_eq!(
-            apply(&broker, second, 11, &start("elsewhere")),
-            ThreadChange::Unordered
+            apply(&broker, second, 9, &start("elsewhere")),
+            ThreadChange::Stale
         );
+        assert!(suspended(&broker, second));
         assert!(matches!(
             apply(&broker, second, 12, &start("elsewhere")),
             ThreadChange::Selected(_)
         ));
-        assert!(!suspended(&broker, second), "the one reason is lifted");
-    }
-
-    fn process(
-        source: kr_protocol::identity::ProcessStartSource,
-        pid: u64,
-        start: u64,
-    ) -> ProcessStartIdentity {
-        ProcessStartIdentity::new(pid, source, start)
-    }
-
-    /// Two hooks are ordered by the kernel's start value, and within one tick of its clock by the
-    /// process identifier where the platform allocates identifiers in sequence, counting a wrap of
-    /// the counter; where it does not, two hooks from one tick are not ordered.
-    #[test]
-    fn hooks_are_ordered_by_what_the_kernel_recorded_when_they_started() {
-        use kr_protocol::identity::ProcessStartSource::{
-            LinuxProcStat, MacosProcBsdInfo, WindowsProcessStartSeconds,
-        };
-        use std::cmp::Ordering::{Equal, Greater, Less};
-        for source in [LinuxProcStat, MacosProcBsdInfo] {
-            let earlier = process(source, 900, 10);
-            // A later tick decides, whatever the identifiers.
-            assert_eq!(
-                started_order(&process(source, 5, 11), &earlier),
-                Some(Greater)
-            );
-            assert_eq!(
-                started_order(&process(source, 950, 9), &earlier),
-                Some(Less)
-            );
-            // Within one tick, the identifier allocated later.
-            assert_eq!(
-                started_order(&process(source, 901, 10), &earlier),
-                Some(Greater)
-            );
-            assert_eq!(
-                started_order(&process(source, 899, 10), &earlier),
-                Some(Less)
-            );
-            assert_eq!(started_order(&earlier.clone(), &earlier), Some(Equal));
-            // A counter that wrapped within the tick.
-            let before_wrap = process(source, 4_194_300, 10);
-            assert_eq!(
-                started_order(&process(source, 7, 10), &before_wrap),
-                Some(Greater)
-            );
-            assert_eq!(
-                started_order(&before_wrap, &process(source, 7, 10)),
-                Some(Less)
-            );
-        }
-        let windows = process(WindowsProcessStartSeconds, 900, 10);
-        assert_eq!(
-            started_order(&process(WindowsProcessStartSeconds, 904, 10), &windows),
-            None,
-            "identifiers there are not allocated in sequence"
-        );
-        assert_eq!(
-            started_order(&process(WindowsProcessStartSeconds, 904, 11), &windows),
-            Some(Greater)
-        );
-        assert_eq!(
-            started_order(&process(LinuxProcStat, 900, 10), &windows),
-            None
-        );
-    }
-
-    /// KR-REQ-11.62: on a platform whose kernel cannot order two hooks from one tick, two reports
-    /// from one tick that disagree leave no thread vouched for, and a later tick settles it.
-    #[test]
-    fn kr_req_11_62_two_hooks_from_one_tick_that_disagree_are_not_ordered() {
-        let id = instance(8);
-        let broker = broker_with(&[id]);
-        let at = |pid: u64, second: u64, observation: &Observation| {
-            broker
-                .observe_bridge(
-                    id,
-                    &per_second(id, pid, second),
-                    observation,
-                    TimestampMs::new(1),
-                )
-                .expect("applied")
-                .0
-        };
-        assert!(matches!(at(100, 50, &end("t0")), ThreadChange::Unchanged));
-        assert!(matches!(at(104, 50, &start("t1")), ThreadChange::Unordered));
-        assert_eq!(vouched(&broker, id), None);
-        assert!(suspended(&broker, id));
-        assert!(matches!(
-            at(96, 51, &start("t1")),
-            ThreadChange::Selected(_)
-        ));
-        assert_eq!(vouched(&broker, id).as_deref(), Some("t1"));
-        assert!(!suspended(&broker, id));
+        assert!(!suspended(&broker, second));
     }
 
     /// KR-REQ-11.62: a finished contact question's report places its request in the thread that

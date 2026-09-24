@@ -3744,15 +3744,21 @@ launched application process started itself, as the kernel's parent link says, r
 application's selection; a hook another process started reports that process's threads and moves
 nothing. A thread starting selects that thread and advances the binding revision, even when it is
 the thread already selected, since a resume is a new selection; a thread continuing after a
-compaction changes nothing; a thread ending leaves none selected. Reports are ordered by what the
-kernel recorded when the application started each hook, the start value and, within one tick of the
-kernel's clock, the process identifier where the platform allocates identifiers in sequence, never
-by when they arrived. A report whose hook started before the one in force changes nothing. When two
-reports cannot be ordered, and one would change the binding in either order (a start always would),
-no thread is vouched for: the thread the binding had is left, so nothing bound to it survives, and
-rich mutations are suspended until a report whose hook started later settles it. That suspension is
-the bridge's own: lifting a suspension placed for another reason does not lift it, and it lifts no
-other. Every observation goes into the instance's observed history.
+compaction changes nothing; a thread ending leaves none selected. Reports are placed by when the
+kernel recorded the application starting each hook, on a clock that only moves forward (Linux's
+start ticks since boot, macOS's absolute time at the fork), and hooks from one tick of it in the
+order their reports were applied, which is the order they started because the application waits
+for one thread event's hooks before the next and a hook answers only once its report is applied or
+after a deadline many ticks long. The newest report decides the thread. An older report whose hook
+started after the report that began the binding's current revision, and that shows the thread
+changing there, advances the binding to a new revision of what the newest report says, since a
+question bound to the old revision may have been asked across that change; an older one from
+before the revision began changes nothing. Where the record of a hook's start could not be read,
+its report cannot be placed: one that would change the binding whichever came first (a start always
+would) leaves no thread vouched for, leaves the thread the binding had so nothing bound to it
+survives, and suspends rich mutations until a report the host can place settles it. That suspension
+is the bridge's own: lifting a suspension placed for another reason does not lift it, and it lifts
+no other. Every observation goes into the instance's observed history.
 
 A contact question records, when it is asked, the thread the bridge vouches is selected and its
 revision. The hook's report of a finished call names the call by its request identifier, and only a

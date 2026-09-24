@@ -136,16 +136,27 @@ report from a hook some other process started (another Claude Code the session r
 between Claude Code and `kr-hook`) is recorded and moves nothing.
 
 Every hook is its own process on its own connection, so reports can arrive in any order. The worker
-orders them by what the kernel recorded when Claude Code started each hook process: the start value
-first, and within one tick of the kernel's clock the process identifier, which Linux and macOS
-allocate in sequence. Claude Code starts its hooks one after another, so the hook for a later event
-has the later record. A report whose hook started after the one in force decides the thread, and one
-whose hook started before changes nothing, whichever arrived first. A `SessionStart` for a resume, a
-clear or a fork is a new selection even of the thread already selected, so the binding advances;
-one for a compaction continues the thread and changes nothing. When two reports cannot be ordered
-and one of them would change the binding in either order, the worker does not guess: no thread is
-vouched for, the thread the binding had is left so nothing bound to it survives, and rich mutations
-are suspended until a report whose hook started later settles it.
+places each by when the kernel recorded Claude Code starting its hook, on a clock that only moves
+forward: on Linux the start time in clock ticks since boot, and on macOS the host's absolute time
+at the fork rather than the wall-clock start, which a change of the clock can move back. Two hooks
+from one tick of that clock are placed in the order their reports were applied. That order is
+right because Claude Code waits for the hooks of one thread event before it raises the next, and a
+hook answers only once its report is applied, or after its 500-millisecond deadline, which is many
+ticks.
+
+The newest report decides the thread. A `SessionStart` for a resume, a clear or a fork is a new
+selection even of the thread already selected, so the binding advances; one for a compaction
+continues the thread and changes nothing. An older report still matters when its hook started after
+the report that began the binding's current revision: a thread starting or ending there, or another
+thread going on, is a switch the worker learned of late, and a question bound to that revision may
+have been asked across it. So the binding advances to a new revision of what the newest report
+says, and the thread stays as it is. A report whose hook started before the current revision began
+changes nothing.
+
+Where the kernel's record of a hook's start could not be read, its report cannot be placed. One
+that leaves the binding as it is whichever came first changes nothing. Any other leaves no thread
+vouched for, leaves the thread the binding had so nothing bound to it survives, and suspends rich
+mutations.
 
 ### Which thread asked a question
 

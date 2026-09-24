@@ -91,7 +91,7 @@ pub use crate::broker::attach::{
     hello_frame,
 };
 pub use crate::broker::bridge::{
-    AdmittedBridge, BridgeDeclaration, BridgeStream, BridgeSurface, HookProcess, HookReport,
+    AdmittedBridge, BridgeDeclaration, BridgeProcess, BridgeStream, BridgeSurface, HookReport,
     InstalledBridge, Observation, ObservedEvent, ThreadChange,
 };
 pub use crate::broker::capability::{CapabilityOwner, Probe};

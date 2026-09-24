@@ -493,6 +493,20 @@ pub(crate) fn executable_of(pid: u32) -> Option<String> {
     platform::executable(pid)
 }
 
+/// Returns when the kernel recorded `process` starting, on a clock that only moves forward: `None`
+/// where the platform keeps no such record, and an error where it keeps one that could not be read
+/// as this process's.
+///
+/// Linux's start value counts clock ticks since boot, so it is one. macOS keeps the host's absolute
+/// time at the fork beside the wall-clock start the identity carries, which a change of the clock
+/// can move back; it is read here, with the identifier checked to name the same process afterwards.
+/// Windows records a creation time on the wall clock only, so there is none there.
+pub(crate) fn monotonic_start(
+    process: &ProcessStartIdentity,
+) -> std::result::Result<Option<u64>, String> {
+    platform::monotonic_start(process)
+}
+
 /// Returns whether the boundary this session owns holds this process.
 fn contains(table: &impl ProcessTable, boundary: &OwnershipBoundary, pid: u32) -> Finding {
     match boundary {
@@ -1959,6 +1973,43 @@ mod tests {
         let mut stranger = mine;
         stranger.start_value = kr_protocol::scalars::U64::new(stranger.start_value.get() ^ 0xFFFF);
         assert_eq!(parent_of(&stranger), None);
+    }
+
+    /// A process started later has a record no earlier than one started before it, and a record
+    /// read for an identity the kernel never reported is refused.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_later_process_has_a_later_monotonic_start() {
+        let start = || {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "sleep 30"])
+                .spawn()
+                .expect("a child")
+        };
+        let record = |pid: u32| {
+            monotonic_start(&kr_ipc::identity::process_start_identity(pid).expect("an identity"))
+                .expect("a reading")
+                .expect("a record")
+        };
+        let (mut first, mut second) = (start(), start());
+        let (mine, one, two) = (
+            record(std::process::id()),
+            record(first.id()),
+            record(second.id()),
+        );
+        for child in [&mut first, &mut second] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(mine <= one && one <= two, "{mine} {one} {two}");
+        #[cfg(target_os = "macos")]
+        {
+            let mut stranger =
+                kr_ipc::identity::process_start_identity(std::process::id()).expect("an identity");
+            stranger.start_value =
+                kr_protocol::scalars::U64::new(stranger.start_value.get() ^ 0xFFFF);
+            assert!(monotonic_start(&stranger).is_err());
+        }
     }
 
     #[test]
