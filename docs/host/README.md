@@ -892,6 +892,10 @@ it resynchronises, is the screen as it is now, rendered from a closed set of ope
 member that can ring, copy, notify, download, launch or ask anything. A terminal that was not there
 when the history happened does not have the history happen to it.
 
+Asking for the screen again over the same connection replaces that connection's subscription at a
+frame boundary. A frame of the old stream already part way to the client is finished, nothing more
+of the old stream follows it, and then the new screen is sent.
+
 Rendering a screen back into bytes cannot carry everything a client that holds its own grid could
 apply. What it leaves out is counted rather than assumed away — the saved cursor and keyboard
 negotiation of the buffer that is not showing, the virtual title stack, soft-wrap markers, the
