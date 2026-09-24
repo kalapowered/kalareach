@@ -315,22 +315,25 @@ impl Answer {
     }
 }
 
-/// A refusal the service named, whole: its code, the status it came with, and the members it
-/// carried beside the code.
+/// A refusal the service named, whole: its code, the status it came with, and the answer it
+/// arrived in, for an adapter that reads the members its contract gives that code.
 ///
 /// Most adapters want only the error it becomes. One that reads a refusal as an answer, because
-/// the code says something about the request the caller acts on, reads the code and whichever
-/// members its contract gives that code.
+/// the code says something about the request the caller acts on, reads the code, and then those
+/// members as the shape its contract gives them. The code, the message and the retry delay were
+/// read from the answer directly, so an answer that names one of them twice is not a refusal this
+/// client reads, and neither is a member an adapter reads that the answer names twice.
 pub(crate) struct Refusal {
     status: u16,
     code: String,
     message: String,
     retry_after_seconds: Option<u64>,
-    members: serde_json::Map<String, serde_json::Value>,
+    /// The whole answer the refusal arrived in, which [`Self::members`] reads again.
+    answer: Vec<u8>,
 }
 
 impl fmt::Debug for Refusal {
-    /// The code and the status. Never the message or the members, which are the service's.
+    /// The code and the status. Never the message or the answer, which are the service's.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Refusal")
@@ -346,9 +349,20 @@ impl Refusal {
         &self.code
     }
 
-    /// One member the refusal carried beside its code, when it carried it.
-    pub(crate) fn member(&self, name: &str) -> Option<&serde_json::Value> {
-        self.members.get(name)
+    /// The members the refusal carried beside its code, read as the shape `T` gives them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an unknown outcome when the refusal does not carry them in that shape, a member `T`
+    /// names appearing twice included.
+    pub(crate) fn members<T: for<'de> Deserialize<'de>>(&self, what: &str) -> Result<T> {
+        #[derive(Deserialize)]
+        struct Carried<T> {
+            error: T,
+        }
+        serde_json::from_slice::<Carried<T>>(&self.answer)
+            .map(|carried| carried.error)
+            .map_err(|error| unreadable_answer(what, &error))
     }
 
     /// The error the service named, with the delay it asked for when it named one.
@@ -377,9 +391,10 @@ fn answer_of(answer: &ServiceHttpAnswer) -> Result<Answer> {
         #[serde(default)]
         data: Option<serde_json::Value>,
         #[serde(default)]
-        error: Option<serde_json::Map<String, serde_json::Value>>,
+        error: Option<Named>,
     }
 
+    /// The members every refusal carries, read directly: a field named twice is refused here.
     #[derive(Deserialize)]
     struct Named {
         code: String,
@@ -403,22 +418,15 @@ fn answer_of(answer: &ServiceHttpAnswer) -> Result<Answer> {
             .ok_or_else(|| unreadable(answer.status, "its answer carries no data"));
     }
 
-    let Some(members) = envelope.error else {
+    let Some(named) = envelope.error else {
         return Err(unreadable(answer.status, "its refusal names no error"));
-    };
-    let Ok(named) = serde_json::from_value::<Named>(serde_json::Value::Object(members.clone()))
-    else {
-        return Err(unreadable(
-            answer.status,
-            "its answer is not one this client reads",
-        ));
     };
     Ok(Answer::Refused(Refusal {
         status: answer.status,
         code: named.code,
         message: named.message,
         retry_after_seconds: named.retry_after_seconds,
-        members,
+        answer: answer.body.clone(),
     }))
 }
 
@@ -615,6 +623,41 @@ mod tests {
             assert!(!rendering.contains(NEVER_RENDERED), "{rendering}");
         }
         assert_eq!(error.code(), ErrorCode::OutcomeUnknown);
+    }
+
+    #[test]
+    fn a_refusal_that_names_one_of_its_members_twice_is_not_one_this_client_reads() {
+        // The code, the message and the retry delay: whichever of two values a reader kept, it
+        // would be acting on an answer the service did not give once.
+        for body in [
+            r#"{"ok":false,"error":{"code":"COLLECTION_ABSENT","code":"INVALID_ARGUMENT","message":"refused"}}"#,
+            r#"{"ok":false,"error":{"code":"RATE_LIMITED","message":"wait","message":"now"}}"#,
+            r#"{"ok":false,"error":{"code":"RATE_LIMITED","message":"wait","retryAfterSeconds":1,"retryAfterSeconds":900}}"#,
+        ] {
+            let error = answer_of(&ServiceHttpAnswer {
+                status: 409,
+                body: body.as_bytes().to_vec(),
+            })
+            .expect_err("not a refusal this client reads");
+            assert!(matches!(error, ClientError::Host(_)), "{body}");
+        }
+
+        // A member an adapter reads beside the code is held to the same rule.
+        #[derive(Deserialize)]
+        struct Epoch {
+            #[expect(dead_code, reason = "read only to hold the refusal to its shape")]
+            key_epoch: String,
+        }
+        let answer = answer_of(&ServiceHttpAnswer {
+            status: 409,
+            body: br#"{"ok":false,"error":{"code":"KEY_EPOCH_RETIRED","message":"retired","key_epoch":"1","key_epoch":"2"}}"#.to_vec(),
+        })
+        .expect("a refusal");
+        let Answer::Refused(refusal) = answer else {
+            panic!("a refusal: {answer:?}");
+        };
+        assert_eq!(refusal.code(), "KEY_EPOCH_RETIRED");
+        assert!(refusal.members::<Epoch>("an epoch").is_err());
     }
 
     #[test]

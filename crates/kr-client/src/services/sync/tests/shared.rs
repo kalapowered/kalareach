@@ -480,7 +480,10 @@ async fn a_key_record_the_service_would_refuse_never_leaves_this_device() {
     let other_home = record(&shared_collection(installation(0x44), 0x42), 2, 1);
     let mut no_members = record(&collection, 2, 1);
     no_members.payload.members.clear();
-    for offered in [elsewhere, other_home, no_members] {
+    // Counters the service compares exactly and no further, in the revision and in the epoch.
+    let past_revision = record(&collection, MAX_SYNC_COUNTER + 1, 1);
+    let past_epoch = record(&collection, 2, MAX_SYNC_COUNTER + 1);
+    for offered in [elsewhere, other_home, no_members, past_revision, past_epoch] {
         let refused = client
             .rekey(&collection, identity(0x51), signed_at, &offered)
             .await
@@ -725,10 +728,11 @@ async fn an_inventory_reads_every_object_and_every_copy_with_its_epoch_to_the_en
     ]);
 
     let inventory = client
-        .inventory(&collection)
+        .inventory(&collection, None, 16)
         .await
         .expect("an answer")
         .expect("a member");
+    assert!(inventory.is_complete());
     assert_eq!(inventory.head, Some(head));
     assert_eq!(
         inventory.objects,
@@ -756,8 +760,8 @@ async fn an_inventory_reads_every_object_and_every_copy_with_its_epoch_to_the_en
         "every copy, to the end of the cursor"
     );
     assert_eq!(inventory.epochs(), BTreeSet::from([1, 2]));
-    assert!(inventory.holds_epoch(1), "copies under epoch 1 remain");
-    assert!(!inventory.holds_epoch(0));
+    assert!(inventory.may_hold_epoch(1), "copies under epoch 1 remain");
+    assert!(!inventory.may_hold_epoch(0));
 
     assert_eq!(recorder.requests(), 2);
     let sent = recorder.last_body();
@@ -777,7 +781,10 @@ async fn an_inventory_reads_every_object_and_every_copy_with_its_epoch_to_the_en
     // A collection that does not list this device.
     recorder.answering_with(vec![refusal(404, "COLLECTION_ABSENT", "not a member")]);
     assert_eq!(
-        client.inventory(&collection).await.expect("an answer"),
+        client
+            .inventory(&collection, None, 16)
+            .await
+            .expect("an answer"),
         None
     );
 
@@ -809,7 +816,7 @@ async fn an_inventory_reads_every_object_and_every_copy_with_its_epoch_to_the_en
     ] {
         recorder.answering(pages);
         let refused = client
-            .inventory(&collection)
+            .inventory(&collection, None, 16)
             .await
             .expect_err("not followed");
         assert_eq!(code_of(&refused), ErrorCode::OutcomeUnknown);
@@ -900,8 +907,8 @@ async fn a_shared_write_names_its_home_and_epoch_and_reads_both_answering_refusa
     recorder.answering_with(vec![refusal(404, "COLLECTION_ABSENT", "not a member")]);
     assert_eq!(write(4).await.expect("an answer"), Keyed::Absent);
 
-    // A retired refusal that does not name the head, an answer naming an epoch without its
-    // revision, and the other refusals are not answers.
+    // A retired refusal that does not name the head or names it twice, an answer naming an epoch
+    // without its revision, and the other refusals are not answers.
     let mut half_head = written.clone();
     half_head
         .as_object_mut()
@@ -910,6 +917,13 @@ async fn a_shared_write_names_its_home_and_epoch_and_reads_both_answering_refusa
     for (answer, expected) in [
         (
             refusal(409, "KEY_EPOCH_RETIRED", "retired"),
+            ErrorCode::OutcomeUnknown,
+        ),
+        (
+            ServiceHttpAnswer {
+                status: 409,
+                body: br#"{"ok":false,"error":{"code":"KEY_EPOCH_RETIRED","message":"retired","key_epoch":"1","key_epoch":"9","key_revision":"2"}}"#.to_vec(),
+            },
             ErrorCode::OutcomeUnknown,
         ),
         (answered(half_head), ErrorCode::OutcomeUnknown),
@@ -962,7 +976,7 @@ async fn a_shared_comparison_and_resolution_name_the_home_and_read_each_epoch() 
     recorder.answering(vec![page]);
 
     let compared = client
-        .compare_shared(&collection, true, None)
+        .compare_shared(&collection, &[], true, None)
         .await
         .expect("an answer")
         .expect("a member");
@@ -994,7 +1008,7 @@ async fn a_shared_comparison_and_resolution_name_the_home_and_read_each_epoch() 
     recorder.answering_with(vec![refusal(404, "COLLECTION_ABSENT", "not a member")]);
     assert_eq!(
         client
-            .compare_shared(&collection, false, None)
+            .compare_shared(&collection, &[], false, None)
             .await
             .expect("an answer"),
         None
@@ -1069,6 +1083,275 @@ async fn a_collection_only_its_home_writes_reads_neither_shared_refusal_as_an_an
         .await
         .expect_err("not an answer here");
     assert_eq!(fence.code(), ErrorCode::OutcomeUnknown);
+}
+
+/// A page of a shared comparison carrying `changed` objects, and naming `listed` as every object
+/// the collection holds.
+fn object_page(
+    changed: &[u64],
+    listed: &[u64],
+    sealed_object: &serde_json::Value,
+) -> serde_json::Value {
+    let head = KeyHead {
+        epoch: 1,
+        revision: 2,
+    };
+    let object = |index: u64| {
+        Uuid::from_bytes([
+            u8::try_from(index / 256).expect("a byte"),
+            u8::try_from(index % 256).expect("a byte"),
+            0,
+            0,
+            0,
+            0,
+            0x40,
+            0,
+            0x80,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+        ])
+    };
+    let revision_of = |index: u64| {
+        SyncRevision::new(Uuid::from_bytes([
+            u8::try_from(index % 256).expect("a byte"),
+            0x7a,
+            0,
+            0,
+            0,
+            0,
+            0x40,
+            0,
+            0x80,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            2,
+        ]))
+    };
+    let mut page = compared_shared(
+        &listed
+            .iter()
+            .map(|index| (object(*index), revision_of(*index), 1, 1))
+            .collect::<Vec<_>>(),
+        &[],
+        false,
+        0,
+        head,
+    );
+    page["changed"] = serde_json::Value::Array(
+        changed
+            .iter()
+            .map(|index| {
+                serde_json::json!({
+                    "kind": "settings",
+                    "object_id": object(*index).to_string(),
+                    "revision": revision_of(*index).to_string(),
+                    "write_sequence": "1",
+                    "key_epoch": "1",
+                    "object": sealed_object,
+                    "updated_at": "2026-09-24T10:00:00.000Z",
+                })
+            })
+            .collect(),
+    );
+    page
+}
+
+/// A shared collection holds up to 256 objects and the service answers 64 at a time, so a
+/// comparison follows the pages, naming what each brought as held, until nothing it lists is
+/// missing; what the reader already holds is named from the first page on and never sent.
+#[tokio::test]
+async fn a_shared_comparison_follows_every_page_of_objects_the_reader_lacks() {
+    let (client, recorder) = sync_client();
+    let collection = shared_collection(installation(0x41), 0x42);
+    let sealed_object = serde_json::to_value(sealed(b"theme=dark")).expect("an object");
+    let listed: Vec<u64> = (0..65).collect();
+
+    recorder.answering(vec![
+        object_page(&listed[..64], &listed, &sealed_object),
+        object_page(&listed[64..], &listed, &sealed_object),
+    ]);
+    let compared = client
+        .compare_shared(&collection, &[], false, None)
+        .await
+        .expect("an answer")
+        .expect("a member");
+    assert_eq!(
+        compared.objects.len(),
+        65,
+        "every object, across both pages"
+    );
+    assert_eq!(recorder.requests(), 2);
+    let second = recorder.last_body();
+    assert_eq!(
+        second["compare"]["known"].as_array().expect("known").len(),
+        64,
+        "the second page names the objects the first brought"
+    );
+    assert_eq!(second["compare"]["with_conflicts"], false);
+
+    // What the reader holds is named from the first request on, and the answer leaves it out.
+    let held: Vec<KnownRevision> = compared.objects[..10]
+        .iter()
+        .map(|object| KnownRevision {
+            object_id: object.object_id,
+            revision: object.position.revision.0.expect("a revision"),
+        })
+        .collect();
+    recorder.answering(vec![object_page(&listed[10..], &listed, &sealed_object)]);
+    let compared = client
+        .compare_shared(&collection, &held, false, None)
+        .await
+        .expect("an answer")
+        .expect("a member");
+    assert_eq!(compared.objects.len(), 55);
+    assert_eq!(recorder.requests(), 3, "one page was enough");
+    assert_eq!(
+        recorder.last_body()["compare"]["known"],
+        serde_json::to_value(&held).expect("known")
+    );
+
+    // A page that brings nothing while an object is missing, and a collection that keeps moving,
+    // are not followed; nor is a reader naming more than the service reads.
+    recorder.answering(vec![object_page(&[], &listed, &sealed_object)]);
+    let refused = client
+        .compare_shared(&collection, &[], false, None)
+        .await
+        .expect_err("not followed");
+    assert_eq!(code_of(&refused), ErrorCode::OutcomeUnknown);
+    recorder.answering(vec![object_page(&[0], &[0, 1], &sealed_object)]);
+    let before = recorder.requests();
+    let refused = client
+        .compare_shared(&collection, &[], false, None)
+        .await
+        .expect_err("not followed");
+    assert_eq!(code_of(&refused), ErrorCode::OutcomeUnknown);
+    assert_eq!(recorder.requests() - before, MAX_COMPARISON_PAGES);
+    let too_many = vec![held[0]; MAX_KNOWN_REVISIONS + 1];
+    let before = recorder.requests();
+    assert!(
+        client
+            .compare_shared(&collection, &too_many, false, None)
+            .await
+            .is_err()
+    );
+    assert_eq!(recorder.requests(), before, "nothing was sent");
+}
+
+/// Copies outlive the objects they were refused against, so an inventory has no bound on how many
+/// it may meet. It reads under the caller's budget of pages, says where it stopped, and continues
+/// from there when asked, until it reaches the end; until then it cannot show an epoch unused.
+#[tokio::test]
+async fn an_inventory_reads_under_a_budget_and_resumes_past_two_thousand_copies() {
+    let (client, recorder) = sync_client();
+    let collection = shared_collection(installation(0x41), 0x42);
+    let head = KeyHead {
+        epoch: 2,
+        revision: 3,
+    };
+    let live = identity(0x61);
+    let pages: u64 = 34;
+    let per_page: u64 = 64;
+    let copy = |sequence: u64| {
+        // Each copy is of an object identity the collection no longer holds.
+        let historical = Uuid::from_bytes([
+            u8::try_from(sequence / 256).expect("a byte"),
+            u8::try_from(sequence % 256).expect("a byte"),
+            0x11,
+            0x11,
+            0,
+            0,
+            0x40,
+            0,
+            0x80,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            3,
+        ]);
+        (sequence, historical, historical, 1)
+    };
+    recorder.answering(
+        (0..pages)
+            .map(|page| {
+                let copies: Vec<_> = (page * per_page + 1..=(page + 1) * per_page)
+                    .map(copy)
+                    .collect();
+                compared_shared(
+                    &[(live, revision(0x71), 4, 2)],
+                    &copies,
+                    page + 1 < pages,
+                    (page + 1) * per_page,
+                    head,
+                )
+            })
+            .collect(),
+    );
+
+    let mut inventory = client
+        .inventory(&collection, None, 10)
+        .await
+        .expect("an answer")
+        .expect("a member");
+    assert!(!inventory.is_complete());
+    assert_eq!(inventory.copies.len(), 640);
+    assert_eq!(inventory.resume_after, Some(640));
+    assert!(
+        inventory.may_hold_epoch(0),
+        "a read that stopped short cannot show an epoch unused"
+    );
+    let mut calls = 1;
+    while !inventory.is_complete() {
+        inventory = client
+            .inventory(&collection, Some(inventory), 10)
+            .await
+            .expect("an answer")
+            .expect("a member");
+        calls += 1;
+    }
+    assert_eq!(calls, 4);
+    assert_eq!(
+        inventory.copies.len(),
+        usize::try_from(pages * per_page).expect("a count")
+    );
+    assert!(inventory.copies.len() > 2048);
+    assert_eq!(
+        recorder.requests(),
+        usize::try_from(pages).expect("a count")
+    );
+    assert_eq!(inventory.epochs(), BTreeSet::from([1, 2]));
+    assert!(!inventory.may_hold_epoch(0));
+    let last = recorder.last_body();
+    assert_eq!(
+        last["compare"]["conflicts_after_sequence"],
+        (33 * per_page).to_string()
+    );
+    assert_eq!(
+        last["compare"]["known"],
+        serde_json::json!([{ "object_id": live.to_string(), "revision": revision(0x71).to_string() }]),
+        "the objects already read are named, so their content is not sent again"
+    );
+
+    // An inventory that reached the end has nothing to continue.
+    let before = recorder.requests();
+    let done = client
+        .inventory(&collection, Some(inventory.clone()), 10)
+        .await
+        .expect("an answer")
+        .expect("a member");
+    assert_eq!(done, inventory);
+    assert_eq!(recorder.requests(), before);
 }
 
 /* -------------------------------------------------------------------------- */

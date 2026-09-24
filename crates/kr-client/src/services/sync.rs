@@ -37,10 +37,12 @@
 //! the key epoch its object is sealed under, and the service admits only the devices its newest key
 //! record lists. The `_shared` calls address one: [`ManagedSyncService::exchange_shared`],
 //! [`ManagedSyncService::status_shared`], [`ManagedSyncService::fence_shared`],
-//! [`ManagedSyncService::compare_shared`] and [`ManagedSyncService::resolve_shared`].
-//! [`ManagedSyncService::inventory`] reads everything one holds, each with the epoch it is sealed
-//! under, and [`ManagedSyncService::memberships`] lists the shared collections whose newest record
-//! names this installation. Its key records are this client's [`KeyRecordService`].
+//! [`ManagedSyncService::compare_shared`] and [`ManagedSyncService::resolve_shared`]. A shared
+//! comparison follows the service's pages of objects until nothing it names is missing.
+//! [`ManagedSyncService::inventory`] reads what one holds, each with the epoch it is sealed under,
+//! under a budget of pages its caller continues from, and [`ManagedSyncService::memberships`] lists
+//! the shared collections whose newest record names this installation. Its key records are this
+//! client's [`KeyRecordService`].
 //!
 //! # Two refusals that are answers
 //!
@@ -48,10 +50,11 @@
 //! than reports. `COLLECTION_ABSENT` is a collection that does not exist or whose newest record
 //! does not list this installation, one answer for both. `KEY_EPOCH_RETIRED` is a write sealed
 //! under an epoch the collection has retired: nothing was stored or held, the refusal names the
-//! collection's epoch and revision, and it is the request's receipt. The `_shared` calls return
-//! both as [`Keyed`] answers, and the key-record reads return the first as [`KeyRecords::Absent`]
-//! and [`RecordAt::Absent`]. A collection only its home writes answers neither, so for it both stay
-//! errors.
+//! collection's epoch and revision, and it is the request's receipt. A shared write, its status
+//! query and its fence return both as [`Keyed`] answers; a shared comparison, a resolution and an
+//! inventory answer nothing for a collection that does not list this installation, and the
+//! key-record reads return that as [`KeyRecords::Absent`] and [`RecordAt::Absent`]. A collection
+//! only its home writes answers neither, so for it both stay errors.
 //!
 //! # What it keeps
 //!
@@ -61,8 +64,8 @@
 //! signed at the instant its caller recorded, never at a reading taken here, and a request's bytes
 //! are a function of what the caller passed and nothing else, so the same attempt made twice is the
 //! same document twice: the service answers a retry from its receipt only when nothing its digest
-//! covers has changed. The digest covers the key epoch a write names, so a retry names the epoch the
-//! first attempt named.
+//! covers has changed. The digest covers the key epoch a write names, so a retry names the epoch
+//! the first attempt named.
 //!
 //! # What an answer may carry
 //!
@@ -91,9 +94,7 @@ use kr_protocol::ids::{DraftId, InstallationId, SyncCollectionId, SyncConflictId
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, U64, Uuid};
 use kr_protocol::service::GatewayOrigin;
-use kr_protocol::sync::{
-    MAX_SYNC_CONFLICT_COPIES, MAX_SYNC_OBJECTS_PER_COLLECTION, SealedSyncObject, SyncObjectKind,
-};
+use kr_protocol::sync::{SealedSyncObject, SyncObjectKind};
 use serde::{Deserialize, Serialize};
 
 use super::relay::{ServiceHttp, ServiceSigner};
@@ -153,6 +154,16 @@ pub const MAX_KEY_RECORDS_READ: usize = 4096;
 
 /// The most shared collections one listing follows, across every page the service answers it with.
 pub const MAX_MEMBERSHIPS_READ: usize = 4096;
+
+/// The most objects a reader may name as held in one comparison, which is what the service reads.
+pub const MAX_KNOWN_REVISIONS: usize = 8 * 64;
+
+/// The most pages one shared comparison follows to bring every object the reader lacks.
+///
+/// A collection holds at most [`kr_protocol::sync::MAX_SYNC_OBJECTS_PER_COLLECTION`] objects and
+/// a page carries [`SYNC_ANSWER_PAGE`] of them, so four pages bring them all; the rest allows for
+/// objects written again while the pages are read.
+pub const MAX_COMPARISON_PAGES: usize = 16;
 
 /* -------------------------------------------------------------------------- */
 /* Which collection a call reaches                                             */
@@ -297,11 +308,14 @@ struct CompareBody {
     conflicts_after_sequence: Option<U64>,
 }
 
-/// One object a reader already holds.
-#[derive(Clone, Copy, Debug, Serialize)]
-struct KnownRevision {
-    object_id: SyncObjectId,
-    revision: SyncRevision,
+/// One object a reader already holds, at the revision it holds it at, which a comparison leaves
+/// out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct KnownRevision {
+    /// The object.
+    pub object_id: SyncObjectId,
+    /// The revision the reader holds.
+    pub revision: SyncRevision,
 }
 
 /// Drop copies the person has chosen about.
@@ -731,24 +745,34 @@ pub struct InventoryCopy {
     pub epoch: Option<u64>,
 }
 
-/// Everything a shared collection holds, each with the epoch it is sealed under: every object and
-/// every copy, read page by page to the end.
+/// What a shared collection holds, each with the epoch it is sealed under: every object, and every
+/// copy the read reached.
 ///
-/// It is what a member reads before it forgets an epoch's key: the key goes only once nothing
-/// the collection holds is sealed under it. Objects are as the last page found them, which is the
-/// newest account of each; copies are every one the pages reached, in the order they were kept.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// It is what a member reads before it forgets an epoch's key: the key goes only once a read that
+/// reached the end found nothing sealed under it. Objects are as the last page found them, which
+/// is the newest account of each; copies are every one the pages reached, in the order they were
+/// kept.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Inventory {
     /// Where the collection's key records stood when the last page was read.
     pub head: Option<KeyHead>,
     /// Every object.
     pub objects: Vec<InventoryObject>,
-    /// Every copy.
+    /// Every copy the read reached.
     pub copies: Vec<InventoryCopy>,
+    /// The cursor the copies continue from when the read stopped at its budget before the end, or
+    /// nothing when it reached the end.
+    pub resume_after: Option<u64>,
 }
 
 impl Inventory {
-    /// Every epoch something the collection holds is sealed under.
+    /// Whether the read reached the end of the copies.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.resume_after.is_none()
+    }
+
+    /// Every epoch something the read found is sealed under.
     #[must_use]
     pub fn epochs(&self) -> BTreeSet<u64> {
         self.objects
@@ -758,10 +782,12 @@ impl Inventory {
             .collect()
     }
 
-    /// Whether anything the collection holds is sealed under this epoch.
+    /// Whether the collection may hold something sealed under this epoch: it does when the read
+    /// found something, and it may whenever the read stopped before the end, because what it did
+    /// not reach cannot be shown not to be.
     #[must_use]
-    pub fn holds_epoch(&self, epoch: u64) -> bool {
-        self.epochs().contains(&epoch)
+    pub fn may_hold_epoch(&self, epoch: u64) -> bool {
+        !self.is_complete() || self.epochs().contains(&epoch)
     }
 }
 
@@ -849,33 +875,108 @@ impl ManagedSyncService {
         comparison(read(data, "what a comparison answered")?)
     }
 
-    /// Reads what a shared collection holds, and the copies its refusals kept when `with_copies`
-    /// asks, a page of copies at a time from `after`.
+    /// Reads every object a shared collection holds that the reader does not hold at the revision
+    /// the collection holds it at, and a page of the copies its refusals kept when `with_copies`
+    /// asks, from the cursor `after`.
+    ///
+    /// `known` is what the reader holds: each object at the revision it holds it at, which the
+    /// service leaves out. The service answers a page of objects at a time and names every object
+    /// the collection holds, so this follows the pages, adding what each one brought to what the
+    /// reader holds, until nothing the collection names is missing. A page that brings nothing
+    /// while something is missing is an answer this client does not follow, and so is a collection
+    /// still moving after [`MAX_COMPARISON_PAGES`] pages.
     ///
     /// Every object and copy names the epoch it is sealed under, and the comparison names where the
-    /// collection's key records stood.
+    /// collection's key records stood at its last page.
     ///
     /// # Errors
     ///
-    /// As [`Self::compare`]. A collection that does not list this installation is `None`.
+    /// As [`Self::compare`], and a reader that names more objects than a collection holds is
+    /// refused before anything is sent. A collection that does not list this installation is
+    /// `None`.
     pub async fn compare_shared(
         &self,
         collection: &CollectionRef,
+        known: &[KnownRevision],
         with_copies: bool,
         after: Option<u64>,
     ) -> Result<Option<SyncComparison>> {
-        let request = self.compare_body(
+        if known.len() > MAX_KNOWN_REVISIONS {
+            return Err(malformed(format!(
+                "a comparison names at most {MAX_KNOWN_REVISIONS} objects the reader holds"
+            )));
+        }
+        let mut known = known.to_vec();
+        let mut objects: Vec<SyncHeldObject> = Vec::new();
+        // The copies are the first page's: it is the one request that asks for them.
+        let mut first: Option<SyncComparison> = None;
+        let mut request = self.compare_body(
             Address::shared(collection),
             None,
             with_copies,
             after,
-            Vec::new(),
+            known.clone(),
         )?;
-        match reply(self.ask(&request, None).await?, false)? {
-            Reply::Data(data) => Ok(Some(comparison(read(data, "what a comparison answered")?)?)),
-            Reply::Absent => Ok(None),
-            Reply::Retired(_) => Err(retired_where_no_write_was()),
+        for _ in 0..MAX_COMPARISON_PAGES {
+            let answer: CompareAnswer = match reply(self.ask(&request, None).await?, false)? {
+                Reply::Data(data) => read(data, "what a comparison answered")?,
+                Reply::Absent => return Ok(None),
+                Reply::Retired(_) => return Err(retired_where_no_write_was()),
+            };
+            let listed: Vec<KnownRevision> = answer
+                .revisions
+                .iter()
+                .map(|position| KnownRevision {
+                    object_id: position.object_id,
+                    revision: position.revision,
+                })
+                .collect();
+            let page = comparison(answer)?;
+            let brought = !page.objects.is_empty();
+            for object in &page.objects {
+                let revision = object.position.revision.0.ok_or_else(|| {
+                    contrary("an object a comparison carries without its revision")
+                })?;
+                known.retain(|held| held.object_id != object.object_id);
+                known.push(KnownRevision {
+                    object_id: object.object_id,
+                    revision,
+                });
+                objects.retain(|held| held.object_id != object.object_id);
+                objects.push(object.clone());
+            }
+            let head = page.head;
+            let stored = page.stored;
+            let first = first.get_or_insert(page);
+            let missing = listed.iter().any(|named| !known.contains(named));
+            if !missing {
+                return Ok(Some(SyncComparison {
+                    objects,
+                    copies: std::mem::take(&mut first.copies),
+                    more_copies: first.more_copies,
+                    next_copies_after: first.next_copies_after,
+                    head,
+                    stored,
+                }));
+            }
+            if !brought {
+                return Err(contrary(
+                    "a comparison that names an object the reader lacks and carries none",
+                ));
+            }
+            // The objects that are left, with no copies: the first page carried those. What the
+            // reader holds is named only for objects the collection still lists, which keeps the
+            // request within what the service reads.
+            let held = known
+                .iter()
+                .filter(|held| listed.iter().any(|named| named.object_id == held.object_id))
+                .copied()
+                .collect();
+            request = self.compare_body(Address::shared(collection), None, false, None, held)?;
         }
+        Err(contrary(
+            "a collection that kept changing while it was read",
+        ))
     }
 
     /// Writes one object into a shared collection, sealed under `epoch`.
@@ -1045,38 +1146,54 @@ impl ManagedSyncService {
     }
 
     /// Reads everything a shared collection holds, each with the epoch it is sealed under, page by
-    /// page to the end.
+    /// page, for at most `pages` pages.
     ///
-    /// The first page names every object; each later page reads the next copies from the cursor
-    /// the one before ended at, naming every object already read so its content is not sent
-    /// again. A cursor that does not move on, or more copies than a collection can keep, is an
-    /// answer this client does not follow.
+    /// A collection keeps its copies of refused writes until a person chooses about them, so how
+    /// many there are has no bound this client can state, and every page carries each copy's
+    /// content. So a read stops at the budget the caller gives it and says where it stopped:
+    /// [`Inventory::resume_after`] is the cursor the next call continues from, given the inventory
+    /// this one returned as `resume`, and a read that reached the end names none. Every page after
+    /// the first names the objects already read, so their content is not sent again. A cursor that
+    /// does not move on is an answer this client does not follow.
     ///
     /// # Errors
     ///
     /// As [`Self::compare_shared`]. A collection that does not list this installation is `None`.
-    pub async fn inventory(&self, collection: &CollectionRef) -> Result<Option<Inventory>> {
-        let most_copies =
-            usize::try_from(MAX_SYNC_OBJECTS_PER_COLLECTION * MAX_SYNC_CONFLICT_COPIES)
-                .unwrap_or(usize::MAX);
-        let mut copies: Vec<InventoryCopy> = Vec::new();
-        let mut known: Vec<KnownRevision> = Vec::new();
-        let mut after: Option<u64> = None;
-        loop {
-            let request = self.compare_body(
-                Address::shared(collection),
-                None,
-                true,
-                after,
-                known.clone(),
-            )?;
+    pub async fn inventory(
+        &self,
+        collection: &CollectionRef,
+        resume: Option<Inventory>,
+        pages: usize,
+    ) -> Result<Option<Inventory>> {
+        let (mut inventory, mut after) = match resume {
+            // A read that already reached the end has nothing to continue.
+            Some(inventory) if inventory.is_complete() => return Ok(Some(inventory)),
+            Some(inventory) => {
+                let after = inventory.resume_after;
+                (inventory, after)
+            }
+            None => (Inventory::default(), None),
+        };
+        for _ in 0..pages.max(1) {
+            let known = inventory
+                .objects
+                .iter()
+                .filter_map(|object| {
+                    object.position.revision.0.map(|revision| KnownRevision {
+                        object_id: object.object_id,
+                        revision,
+                    })
+                })
+                .collect();
+            let request =
+                self.compare_body(Address::shared(collection), None, true, after, known)?;
             let answer: CompareAnswer = match reply(self.ask(&request, None).await?, false)? {
                 Reply::Data(data) => read(data, "what a comparison answered")?,
                 Reply::Absent => return Ok(None),
                 Reply::Retired(_) => return Err(retired_where_no_write_was()),
             };
             let head = head_of(answer.key_epoch, answer.key_revision)?;
-            let objects = answer
+            inventory.objects = answer
                 .revisions
                 .iter()
                 .map(|position| {
@@ -1090,15 +1207,17 @@ impl ManagedSyncService {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
+            inventory.head = head;
             for copy in &answer.conflicts {
-                if after.is_some_and(|cursor| copy.sequence.get() <= cursor)
-                    || copies
+                let behind = after.is_some_and(|cursor| copy.sequence.get() <= cursor)
+                    || inventory
+                        .copies
                         .last()
-                        .is_some_and(|last| copy.sequence.get() <= last.sequence)
-                {
+                        .is_some_and(|last| copy.sequence.get() <= last.sequence);
+                if behind {
                     return Err(contrary("a page of copies that does not follow the cursor"));
                 }
-                copies.push(InventoryCopy {
+                inventory.copies.push(InventoryCopy {
                     sequence: copy.sequence.get(),
                     conflict_id: copy.conflict_id,
                     object_id: copy.object_id,
@@ -1106,16 +1225,10 @@ impl ManagedSyncService {
                     epoch: epoch_in(head, copy.key_epoch)?,
                 });
             }
-            if copies.len() > most_copies {
-                return Err(contrary("more copies than one collection keeps"));
-            }
             let next = answer.next_conflicts_after_sequence.get();
             if !answer.more_conflicts {
-                return Ok(Some(Inventory {
-                    head,
-                    objects,
-                    copies,
-                }));
+                inventory.resume_after = None;
+                return Ok(Some(inventory));
             }
             if answer.conflicts.is_empty() || after.is_some_and(|cursor| next <= cursor) {
                 return Err(contrary(
@@ -1123,15 +1236,10 @@ impl ManagedSyncService {
                 ));
             }
             after = Some(next);
-            known = answer
-                .revisions
-                .iter()
-                .map(|position| KnownRevision {
-                    object_id: position.object_id,
-                    revision: position.revision,
-                })
-                .collect();
         }
+        // The budget is spent before the end: the next call continues from here.
+        inventory.resume_after = after;
+        Ok(Some(inventory))
     }
 
     /// Lists the shared collections whose newest key record names this installation, page by page
@@ -1407,8 +1515,8 @@ impl ManagedSyncService {
     ///
     /// The records are passed on as the service answered them: whether they form a chain from the
     /// revision asked about is for the reader to establish, because a chain it cannot follow is an
-    /// answer it acts on. Only the paging is held here, so a read ends: it follows a page only while
-    /// the page moves the cursor on, and it stops at [`MAX_KEY_RECORDS_READ`] records.
+    /// answer it acts on. Only the paging is held here, so a read ends: it follows a page only
+    /// while the page moves the cursor on, and it stops at [`MAX_KEY_RECORDS_READ`] records.
     async fn read_records_after(
         &self,
         collection: &CollectionRef,
@@ -1460,8 +1568,9 @@ impl ManagedSyncService {
         signed_at_ms: u64,
         record: &CollectionKeyRecord,
     ) -> Result<RekeyAnswer> {
-        // The service admits a record only for the collection and the home the request names, and
-        // only one whose structure holds; one it would refuse for either never leaves this device.
+        // The service admits a record only for the collection and the home the request names, only
+        // one whose structure holds, and only counters it compares exactly; one it would refuse for
+        // any of those never leaves this device.
         if record.payload.collection_id != collection.collection_id
             || record.payload.home != collection.home
         {
@@ -1474,6 +1583,8 @@ impl ManagedSyncService {
                 "that key record is not one a service admits: {rule}"
             ))
         })?;
+        a_counter("a key record revision", record.payload.revision.get())?;
+        a_counter("a key epoch", record.payload.key_epoch.get())?;
         let request = SyncRequest::Rekey(RekeyBody {
             request_id,
             collection_id: collection.collection_id,
@@ -1724,19 +1835,17 @@ fn reply(answer: Answer, write: bool) -> Result<Reply<serde_json::Value>> {
     }
 }
 
-/// The collection's epoch and revision a retired refusal names, both of which it must name.
+/// The collection's epoch and revision a retired refusal names, both of which it must name, once.
 fn retired_head(refusal: &Refusal) -> Result<KeyHead> {
-    let counter = |name: &str| -> Result<u64> {
-        let value = refusal.member(name).ok_or_else(|| {
-            contrary("a retired epoch without the collection's epoch and revision")
-        })?;
-        let counter: U64 = serde_json::from_value(value.clone())
-            .map_err(|error| unreadable_answer("what a retired epoch named", &error))?;
-        Ok(counter.get())
-    };
+    #[derive(Deserialize)]
+    struct Named {
+        key_epoch: U64,
+        key_revision: U64,
+    }
+    let named: Named = refusal.members("what a retired epoch named")?;
     Ok(KeyHead {
-        epoch: counter("key_epoch")?,
-        revision: counter("key_revision")?,
+        epoch: named.key_epoch.get(),
+        revision: named.key_revision.get(),
     })
 }
 
