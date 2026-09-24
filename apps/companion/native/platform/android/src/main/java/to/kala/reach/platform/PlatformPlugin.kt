@@ -1,6 +1,7 @@
 package to.kala.reach.platform
 
 import android.app.Activity
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.verify.domain.DomainVerificationManager
 import android.content.pm.verify.domain.DomainVerificationUserState
@@ -9,11 +10,14 @@ import android.os.Build
 import android.util.Base64
 import android.util.Log
 import android.webkit.WebView
-import androidx.activity.result.ActivityResult
+import androidx.activity.ComponentActivity
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.browser.auth.AuthTabIntent
 import androidx.browser.customtabs.CustomTabsClient
 import androidx.browser.customtabs.CustomTabsIntent
-import app.tauri.annotation.ActivityCallback
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.TauriPlugin
@@ -22,6 +26,7 @@ import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
 import java.io.File
 import to.kala.reach.companion.mobile.SecretFiles
+import to.kala.reach.companion.mobile.SignInSession
 
 @InvokeArg
 class SessionArguments {
@@ -53,10 +58,11 @@ class WrittenArguments {
  * The Android half of the companion's platform plugin.
  *
  * It reports facts and carries out requests; the plugin's Rust crate decides what the facts mean.
- * A sign-in runs in the default browser's Auth Tab, which returns the answer once as an activity
- * result, or in a Custom Tab, whose answer arrives as a verified link the system hands this
- * activity. Every result carries the attempt it belongs to, so a late one from an earlier attempt
- * is told apart. Secrets are files sealed under a Keystore key.
+ * A sign-in runs in the default browser's Auth Tab, which returns the answer once as the result of
+ * the launch that opened it, or in a Custom Tab, whose answer arrives as a verified link the
+ * system hands this activity and whose closing shows as this activity coming back to the front.
+ * [SignInSession] decides which of those belongs to the attempt under way. Every result carries
+ * the attempt it belongs to. Secrets are files sealed under a Keystore key.
  */
 @TauriPlugin
 class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
@@ -64,11 +70,23 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
         SecretFiles(File(activity.noBackupFilesDir, "secrets"), KeystoreSealer())
     }
 
-    private var attempt: String? = null
+    private val session = SignInSession()
     private var waiting: Invoke? = null
     private val queued = ArrayDeque<JSObject>()
 
     override fun load(webView: WebView) {
+        // A Custom Tab's closing is this activity coming back after the tab covered it.
+        (activity as LifecycleOwner).lifecycle.addObserver(
+            object : DefaultLifecycleObserver {
+                override fun onPause(owner: LifecycleOwner) {
+                    session.paused()
+                }
+
+                override fun onResume(owner: LifecycleOwner) {
+                    session.resumed()?.let { closed -> deliver(event(closed, "closed")) }
+                }
+            },
+        )
         // Without its start the verifier refuses every certificate, so an HTTPS request fails and
         // says so; everything that needs no request keeps working, rather than the application
         // failing to start. The log says which happened.
@@ -106,48 +124,52 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun authenticate(invoke: Invoke) {
         val arguments = invoke.parseArgs(SessionArguments::class.java)
-        attempt?.let { earlier -> deliver(event(earlier, "cancelled")) }
-        attempt = arguments.attempt
+        val mode = when (arguments.mode) {
+            "authTab" -> SignInSession.Mode.AUTH_TAB
+            "customTab" -> SignInSession.Mode.CUSTOM_TAB
+            else -> {
+                invoke.reject("a sign-in here runs in an Auth Tab or a Custom Tab")
+                return
+            }
+        }
+        session.begin(arguments.attempt, mode)?.let { earlier -> deliver(event(earlier, "cancelled")) }
         queued.clear()
         waiting = invoke
         val address = Uri.parse(arguments.url)
-        when (arguments.mode) {
-            "authTab" -> {
-                // What `AuthTabIntent.launch` puts on the intent, started through the launcher the
-                // activity registered when it was created.
-                val tab = AuthTabIntent.Builder().setEphemeralBrowsingEnabled(true).build()
-                tab.intent.data = address
-                tab.intent.putExtra(AuthTabIntent.EXTRA_HTTPS_REDIRECT_HOST, arguments.httpsHost)
-                tab.intent.putExtra(AuthTabIntent.EXTRA_HTTPS_REDIRECT_PATH, arguments.httpsPath)
-                startActivityForResult(invoke, tab.intent, "authTabResult")
+        try {
+            when (mode) {
+                SignInSession.Mode.AUTH_TAB -> {
+                    // What `AuthTabIntent.launch` puts on the intent, launched through a launcher of
+                    // this attempt's own, so a tab an earlier attempt left open cannot answer it.
+                    val tab = AuthTabIntent.Builder().setEphemeralBrowsingEnabled(true).build()
+                    tab.intent.data = address
+                    tab.intent.putExtra(AuthTabIntent.EXTRA_HTTPS_REDIRECT_HOST, arguments.httpsHost)
+                    tab.intent.putExtra(AuthTabIntent.EXTRA_HTTPS_REDIRECT_PATH, arguments.httpsPath)
+                    launchAuthTab(arguments.attempt, tab.intent)
+                }
+                SignInSession.Mode.CUSTOM_TAB ->
+                    CustomTabsIntent.Builder().build().launchUrl(activity, address)
             }
-            "customTab" -> {
-                val tab = CustomTabsIntent.Builder().build()
-                tab.intent.data = address
-                startActivityForResult(invoke, tab.intent, "customTabClosed")
-            }
-            else -> {
-                attempt = null
-                waiting = null
-                invoke.reject("a sign-in here runs in an Auth Tab or a Custom Tab")
-            }
+        } catch (failure: ActivityNotFoundException) {
+            end(arguments.attempt, event(arguments.attempt, "failed"))
         }
     }
 
-    @ActivityCallback
-    fun authTabResult(invoke: Invoke, result: ActivityResult) {
-        val current = attempt ?: return
-        val answer = event(current, "result")
-        answer.put("code", result.resultCode)
-        result.data?.data?.let { answer.put("url", it.toString()) }
-        deliver(answer)
-        finish()
-    }
-
-    @ActivityCallback
-    fun customTabClosed(invoke: Invoke, result: ActivityResult) {
-        val current = attempt ?: return
-        deliver(event(current, "closed"))
+    private fun launchAuthTab(launchedFor: String, intent: Intent) {
+        val registry = (activity as ComponentActivity).activityResultRegistry
+        lateinit var launcher: ActivityResultLauncher<Intent>
+        launcher = registry.register(
+            "to.kala.reach.platform.sign-in.$launchedFor",
+            ActivityResultContracts.StartActivityForResult(),
+        ) { result ->
+            launcher.unregister()
+            if (!session.result(launchedFor)) return@register
+            val answer = event(launchedFor, "result")
+            answer.put("code", result.resultCode)
+            result.data?.data?.let { answer.put("url", it.toString()) }
+            end(launchedFor, answer)
+        }
+        launcher.launch(intent)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -157,7 +179,8 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
         ) {
             return
         }
-        val current = attempt ?: return
+        // Only a Custom Tab attempt takes its answer as a link; an Auth Tab's comes from its launch.
+        val current = session.link() ?: return
         val link = event(current, "link")
         link.put("url", data.toString())
         deliver(link)
@@ -166,7 +189,7 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun nextEvent(invoke: Invoke) {
         val arguments = invoke.parseArgs(AttemptArguments::class.java)
-        if (arguments.attempt != attempt) {
+        if (arguments.attempt != session.current()) {
             invoke.resolve(event(arguments.attempt, "cancelled"))
             return
         }
@@ -177,9 +200,8 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun cancel(invoke: Invoke) {
         val arguments = invoke.parseArgs(AttemptArguments::class.java)
-        if (arguments.attempt == attempt) {
-            deliver(event(arguments.attempt, "cancelled"))
-            finish()
+        if (arguments.attempt == session.current()) {
+            end(arguments.attempt, event(arguments.attempt, "cancelled"))
         }
         invoke.resolve(done())
     }
@@ -231,8 +253,10 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve(answer)
     }
 
-    private fun finish() {
-        attempt = null
+    /** Ends [attempt] with [answer]: the waiting call is answered, and nothing of it is kept. */
+    private fun end(attempt: String, answer: JSObject) {
+        if (!session.ended(attempt)) return
+        deliver(answer)
         queued.clear()
     }
 
