@@ -847,17 +847,23 @@ fn read_link(
             }
         }
     };
-    // The child is read again, identity and parent together. If its identifier changed owners
-    // between the first read and this one, the parent reading describes the replacement's family
-    // rather than this one's. If it names a new parent, the old one exited while it was being
-    // read. And if it names the same parent, that parent was still its parent when it was read:
-    // the record changes when a parent exits, to whatever adopts the child, and never changes
-    // back, so the identifier had not passed to another process. Nothing here orders start
-    // times, which on some platforms are read from a clock that can be set back.
-    let unchanged = matches!(table.identity(current_pid), Reading::Found(again) if again.matches(current))
-        && table
-            .placement(current_pid)
-            .is_ok_and(|again| again.parent == parent_pid);
+    // The child is read again, its parent first and its identity last. The child's identity was
+    // established before its parent was first read, and it is read again only after its parent
+    // is read the second time, so the two identity readings bracket both parent readings: a
+    // process that holds its identifier at both ends held it throughout, because a process that
+    // has gone never comes back, and both parent readings are its own. Read the other way round,
+    // an identifier could pass to a replacement between the last identity reading and the second
+    // parent reading, and a replacement started by a process that took the parent's identifier
+    // would name that identifier too, which would link this child to a process that never
+    // started it. If the child names a new parent, the old one exited while it was being read.
+    // And if it names the same parent, that parent was still its parent when it was read: the
+    // record changes when a parent exits, to whatever adopts the child, and never changes back,
+    // so the identifier had not passed to another process. Nothing here orders start times,
+    // which on some platforms are read from a clock that can be set back.
+    let unchanged = table
+        .placement(current_pid)
+        .is_ok_and(|again| again.parent == parent_pid)
+        && matches!(table.identity(current_pid), Reading::Found(again) if again.matches(current));
     if !unchanged {
         return Err(format!(
             "process {current_pid} changed while its parent was being read"
@@ -1444,6 +1450,144 @@ mod tests {
             .placement(300, &[placed(0)]);
         let finding = descends_from(&gone, &identity(300, 30), &root());
         assert!(undetermined(&finding).contains("changed"), "{finding:?}");
+    }
+
+    /// The machine as it stands between two readings: each identifier, the process holding it and
+    /// the parent that process names.
+    type Snapshot = BTreeMap<u32, (ProcessStartIdentity, u32)>;
+
+    /// A process table that changes as it is read.
+    ///
+    /// [`Scripted`] queues readings per identifier, so it cannot say which of two readings of
+    /// different processes came first. Here every reading of an identity or a parent is one step
+    /// of a clock, and the table answers from the snapshot the clock has reached, so a test can
+    /// place a change between any two readings the walk takes, in whichever order it takes them.
+    /// Start values are on a clock that never goes back, and a recorded parent follows its exit, as
+    /// on Linux.
+    struct Timeline {
+        /// How many readings have been taken.
+        taken: std::cell::Cell<usize>,
+        /// Each snapshot, with the reading it is in place from; the first is in place from the
+        /// start.
+        snapshots: Vec<(usize, Snapshot)>,
+    }
+
+    impl Timeline {
+        /// Takes one reading and returns the snapshot it sees.
+        fn read(&self) -> &Snapshot {
+            let reading = self.taken.get() + 1;
+            self.taken.set(reading);
+            &self
+                .snapshots
+                .iter()
+                .rev()
+                .find(|(from, _)| *from <= reading)
+                .expect("a snapshot in place from the start")
+                .1
+        }
+    }
+
+    impl ProcessTable for Timeline {
+        fn identity(&self, pid: u32) -> Reading {
+            self.read()
+                .get(&pid)
+                .map_or(Reading::Absent, |(process, _)| {
+                    Reading::Found(process.clone())
+                })
+        }
+
+        fn placement(&self, pid: u32) -> std::result::Result<Placement, String> {
+            self.read()
+                .get(&pid)
+                .map(|(_, parent)| Placement {
+                    parent: *parent,
+                    group: Some(7),
+                    terminal: None,
+                })
+                .ok_or_else(|| format!("process {pid} is not in the process table"))
+        }
+
+        fn monotonic_start(
+            &self,
+            process: &ProcessStartIdentity,
+        ) -> std::result::Result<Option<u64>, String> {
+            Ok(Some(process.start_value.get()))
+        }
+
+        fn parent_follows_exit(&self) -> bool {
+            true
+        }
+
+        fn executable(&self, _pid: u32) -> Option<String> {
+            None
+        }
+    }
+
+    #[test]
+    fn a_child_and_a_parent_both_replaced_while_the_link_is_read_link_nothing_false() {
+        // Process 300 was started by process 250. Its parent exits, the child passes to the
+        // process that adopts orphans, and 250 goes to a new process. Then the child exits too,
+        // and 300 goes to a process the new 250 started. Every reading of 300 then names 250 as
+        // its parent, before and after, and 250 is a process running now: but it never started
+        // the child the walk is about. Each of the two changes is placed before every reading the
+        // walk might take, in every order, and no placement links the child to the new 250.
+        let child = identity(300, 30);
+        let parent = identity(250, 25);
+        let replacement_parent = identity(250, 26);
+        let adopter = identity(90, 9);
+        let replacement_child = identity(300, 31);
+        let before: Snapshot = [
+            (300, (child.clone(), 250)),
+            (250, (parent.clone(), 90)),
+            (90, (adopter.clone(), 0)),
+        ]
+        .into();
+        let parent_replaced: Snapshot = [
+            (300, (child.clone(), 90)),
+            (250, (replacement_parent.clone(), 90)),
+            (90, (adopter.clone(), 0)),
+        ]
+        .into();
+        let both_replaced: Snapshot = [
+            (300, (replacement_child, 250)),
+            (250, (replacement_parent.clone(), 90)),
+            (90, (adopter.clone(), 0)),
+        ]
+        .into();
+        let mut outcomes = Vec::new();
+        for parent_goes in 1..=6 {
+            for child_goes in parent_goes + 1..=7 {
+                let table = Timeline {
+                    taken: std::cell::Cell::new(0),
+                    snapshots: vec![
+                        (0, before.clone()),
+                        (parent_goes, parent_replaced.clone()),
+                        (child_goes, both_replaced.clone()),
+                    ],
+                };
+                let link = read_link(&table, &child, false);
+                if let Ok(Link::Parent(found)) = &link {
+                    assert_ne!(
+                        found, &replacement_parent,
+                        "the parent went at reading {parent_goes} and the child at reading \
+                         {child_goes}, and the child was linked to a process that never started it"
+                    );
+                    assert!(
+                        [&parent, &adopter].contains(&found),
+                        "the child is linked only to a process that was its parent: {found:?}"
+                    );
+                }
+                outcomes.push((parent_goes, child_goes, link.is_ok()));
+            }
+        }
+        // And the walk still answers where nothing changed while it read: once both changes come
+        // after every reading it takes, the child is linked to the parent that started it.
+        assert!(
+            outcomes
+                .iter()
+                .any(|(parent_goes, _, answered)| *parent_goes >= 5 && *answered),
+            "{outcomes:?}"
+        );
     }
 
     #[test]
