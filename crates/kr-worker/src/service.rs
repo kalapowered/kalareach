@@ -4041,6 +4041,18 @@ impl WorkerService {
                     &params,
                     kr_ipc::now_ms(),
                 )?;
+                // An answer names the pending resource it resolves. The broker checks that
+                // resource here with the checks its approval transaction makes: its owner, that
+                // it is still open, its deadline, its interpretation and everything the claim
+                // rechecks. A call naming a resource this instance cannot answer is then refused
+                // for that resource's own reason before anything is marked.
+                if let Some(resource_id) = params.resource_id.as_ref() {
+                    self.broker.check_resource_answerable(
+                        &params.target,
+                        *resource_id,
+                        kr_ipc::now_ms(),
+                    )?;
+                }
                 // And the refusal this host makes whatever the caller does: the effect the
                 // component prepares does not reach this broker yet, and the broker will not
                 // transmit one nobody validated against the invocation it was prepared under. It

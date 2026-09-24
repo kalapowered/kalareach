@@ -1334,6 +1334,61 @@ impl Broker {
         }
     }
 
+    /// Checks that one pending resource can still be answered for the instance a call targets,
+    /// whatever decision the answer carries.
+    ///
+    /// This is [`Broker::check_answerable`] without its last step: the resource's owner, that it
+    /// is still open, that the upstream's own deadline has not passed, that an interpretation was
+    /// recorded, and everything the claim rechecks. A call that names a pending resource before
+    /// its decision is known is checked with this, so a resource the call cannot answer is refused
+    /// for that resource's own reason before anything is marked.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Broker::check_answerable`] returns, except the refusal of a decision the
+    /// request did not offer.
+    pub fn check_resource_answerable(
+        &self,
+        target: &AgentMutationTarget,
+        resource_id: kr_protocol::ids::PendingResourceId,
+        now: TimestampMs,
+    ) -> Result<()> {
+        let resource = self
+            .pending(resource_id)
+            .ok_or_else(|| BrokerError::unknown(format!("no pending resource {resource_id}")))?;
+        if resource.application_instance_id != target.subject.application_instance_id {
+            return Err(BrokerError::denied(format!(
+                "{resource_id} belongs to another application instance"
+            )));
+        }
+        if resource.state != PendingState::Pending {
+            return Err(BrokerError::Arbitration(
+                kr_protocol::gateway::ArbitrationError::AlreadyResolved {
+                    state: resource.state,
+                },
+            ));
+        }
+        if let Some(deadline) = resource.deadline_ms.as_ref()
+            && deadline.get() <= now.get()
+        {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!(
+                    "{resource_id}'s upstream deadline passed at {}, so this answer would reach \
+                     nothing",
+                    deadline.get()
+                ),
+            });
+        }
+        if self.decoding(resource_id)?.is_none() {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!(
+                    "{resource_id} has no recorded interpretation, so there is nothing to answer"
+                ),
+            });
+        }
+        self.state().recheck_answerable(resource_id)
+    }
+
     /// Checks everything a plugin action call can be refused for before anything is marked.
     ///
     /// This is the same work `plugin.action.invoke` does up to the point of issuing the token: the

@@ -1638,3 +1638,199 @@ async fn kr_req_11_37_a_receipt_fault_the_broker_never_saw_is_still_its_gap() {
         "with nothing owed, rich work is back"
     );
 }
+
+/// Registers the plugin action the resource tests below call, on the approval tests' binding.
+fn register_answer_action(host: &Host) {
+    host.service
+        .broker()
+        .register_actions(
+            binding(),
+            [kr_worker::broker::RegisteredAction {
+                name: kr_protocol::broker::ActionName::new("approval.answer").expect("valid"),
+                grant: BrokerGrant::UpstreamAction,
+                effect: kr_protocol::authority::EffectClass::Write,
+                capability: Some(capability("agent.prompt")),
+                needs_draft: false,
+                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
+            }],
+        )
+        .expect("the action is registered");
+}
+
+/// Offers one request on a second instance, so a pending resource exists that the first instance
+/// cannot answer.
+fn offer_elsewhere(host: &Host) -> kr_protocol::ids::PendingResourceId {
+    let broker = host.service.broker();
+    let elsewhere = ApplicationInstanceId::new(Uuid::from_bytes([3; 16]));
+    let process = ProcessStartIdentity::new(42, ProcessStartSource::MacosProcBsdInfo, 901);
+    broker
+        .register_instance(
+            elsewhere,
+            IntegrationMode::Gateway,
+            None,
+            Some(ManagedProcess::new(
+                elsewhere,
+                process.clone(),
+                TransportHandle {
+                    transport: BrokerTransport::PrivateSocket,
+                    application_instance_id: elsewhere,
+                    executable_digest: Digest256::from_bytes([3; 32]),
+                    process: process.clone(),
+                },
+                Credential::from_bytes([8; 32]),
+                true,
+                TimestampMs::new(1),
+            )),
+        )
+        .expect("the second instance is registered");
+    broker
+        .pin_table(
+            elsewhere,
+            approval_table(),
+            kr_protocol::gateway::RichMethodTable {
+                table_version: kr_protocol::ids::MethodTableVersion::new(1),
+                upstream_protocol_version: "1".to_owned(),
+                entries: vec![kr_protocol::gateway::RichMethodEntry {
+                    method: kr_protocol::ids::UpstreamMethod::new("session/cancel").expect("valid"),
+                    class: kr_protocol::gateway::NativeMethodClass::Mutation,
+                    required_right: kr_protocol::rights::ActionRight::AgentCancel,
+                    operation: Nullable::some(kr_protocol::gateway::RichOperation::TurnCancel),
+                    provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
+                }],
+            },
+        )
+        .expect("the second instance's tables are pinned");
+    let connection = broker
+        .open_native_connection(
+            elsewhere,
+            &[8; 32],
+            &process,
+            &PluginId::new("kalareach.codex").expect("valid"),
+            "1",
+        )
+        .expect("the second native connection is authenticated");
+    broker
+        .forward_native(
+            connection,
+            br#"{"id":21,"method":"session/request_permission"}"#,
+            TimestampMs::new(2),
+        )
+        .expect("forwarded")
+        .1
+        .expect("it expects a response")
+        .resource_id
+}
+
+/// Sends one `plugin.action.invoke` naming a pending resource, or none, and returns the refusal
+/// code and the state of the receipt it left.
+async fn plugin_answer(
+    client: &mut LocalClient,
+    host: &Host,
+    request_id: u64,
+    resource_id: Nullable<kr_protocol::ids::PendingResourceId>,
+) -> (ErrorCode, ReceiptState) {
+    let mutation = MutationRequest {
+        request_id: RequestId::new(request_id),
+        method: Method::PluginActionInvoke.into(),
+        method_version: MethodVersion::V1,
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        grant_id: Nullable::null(),
+        target: ActionTarget {
+            environment_id: host.environment_id,
+            session_id: Nullable::some(host.session_id),
+            session_epoch: Nullable::some(SessionEpoch::V1),
+            application_instance_id: Nullable::some(instance()),
+            agent_binding_revision: Nullable::some(AgentBindingRevision::new(1)),
+        },
+        expected: ParamsValue::empty(),
+        action_window_id: client.action_window().action_window_id.clone(),
+        requested_ttl_ms: DurationMs::new(60_000),
+        params: ParamsValue::from_typed(&kr_protocol::agent::PluginActionInvokeParams {
+            target: AgentMutationTarget {
+                subject: subject(host.session_id, instance()),
+                binding_revision: AgentBindingRevision::new(1),
+            },
+            plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+            action: kr_protocol::broker::ActionName::new("approval.answer").expect("valid"),
+            draft_id: Nullable::null(),
+            resource_id,
+            parameters: kr_protocol::scalars::Bytes::from(br#"{"decision":"allow"}"#.to_vec()),
+        })
+        .expect("encodes"),
+    };
+    let action_id = mutation.action_id;
+    let outcome = send(client, mutation).await;
+    let Outcome::Error(error) = outcome else {
+        panic!("this host transmits no plugin action: {outcome:?}");
+    };
+    (error.code, receipt(client, action_id).await.state)
+}
+
+/// KR-REQ-12.18 and KR-REQ-09: a plugin action that names a pending resource is checked against
+/// that resource before its dispatch marker. An unknown resource, one that belongs to another
+/// instance and one already answered are each refused for that reason, with a receipt that says
+/// so. Naming none, or one this instance can still answer, passes the check and meets the refusal
+/// every plugin action meets here, and the resource is left exactly as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_18_a_plugin_answer_is_refused_for_the_resource_it_names() {
+    let host = host().await;
+    let upstream = Arc::new(CountingUpstream::default());
+    register(
+        &host,
+        Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
+    );
+    let live = offer_approval(&host, Arc::clone(&upstream));
+    register_answer_action(&host);
+    let foreign = offer_elsewhere(&host);
+    let unknown = kr_protocol::ids::PendingResourceId::new(Uuid::from_bytes([0x5a; 16]));
+    let mut client = cli(&host).await;
+
+    // The controls: the resource check passes, and the refusal is the one every plugin action
+    // meets here. Nothing about the live resource changed.
+    assert_eq!(
+        plugin_answer(&mut client, &host, 40, Nullable::null()).await,
+        (ErrorCode::UnsupportedCapability, ReceiptState::Rejected)
+    );
+    assert_eq!(
+        plugin_answer(&mut client, &host, 41, Nullable::some(live)).await,
+        (ErrorCode::UnsupportedCapability, ReceiptState::Rejected)
+    );
+    assert_eq!(
+        host.service
+            .broker()
+            .pending(live)
+            .expect("the resource is still held")
+            .state,
+        kr_protocol::gateway::PendingState::Pending,
+        "a checked resource is not claimed"
+    );
+
+    // Each refusal names the resource's own reason.
+    assert_eq!(
+        plugin_answer(&mut client, &host, 42, Nullable::some(unknown)).await,
+        (ErrorCode::StaleSession, ReceiptState::Rejected)
+    );
+    assert_eq!(
+        plugin_answer(&mut client, &host, 43, Nullable::some(foreign)).await,
+        (ErrorCode::PermissionDenied, ReceiptState::Rejected)
+    );
+    host.service
+        .broker()
+        .native_answer_through(
+            kr_protocol::ids::GatewayConnectionId::new(1),
+            br#"{"id":11,"result":{"option_id":"allow"}}"#,
+            TimestampMs::new(4),
+            |_| Ok(()),
+        )
+        .expect("the native answer is carried");
+    assert_eq!(
+        plugin_answer(&mut client, &host, 44, Nullable::some(live)).await,
+        (ErrorCode::QuestionResolved, ReceiptState::Rejected)
+    );
+
+    assert_eq!(
+        upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "nothing was carried to the upstream"
+    );
+}
