@@ -793,33 +793,42 @@ jobs:
           pnpm -C apps/companion build
           cargo build --locked -p companion-tauri --release --features custom-protocol
 
-  # The whole workspace on macOS: the lint, every test, the end-to-end demonstrations and the
-  # performance measurements, on the platform whose service manager, process table, disk images
+  # The whole workspace on macOS: the lint, the workspace's tests, the end-to-end demonstrations and
+  # the performance measurements, on the platform whose service manager, process table, disk images
   # and pseudo-terminals the host's macOS paths are written against. It runs beside the companion's
   # macOS leg rather than inside it, so neither waits for the other.
   #
   # What it leaves to the other jobs, because they run it natively and nothing in it differs on
   # macOS: formatting and the generated-file checks (rust), the TypeScript packages (typescript),
   # and compiling for Linux and Windows (rust and windows).
+  #
+  # A case this runner cannot run is left out by name, in the step that would otherwise count it as
+  # passed, and the comment there says where it runs instead. A case that depends on something this
+  # host provides comes after a step that shows the host provides it, or runs where its own output
+  # says whether it ran.
   macos:
     name: macos
     runs-on: macos-15
-    # Each long step below has a limit of its own, so a step that hangs ends and the steps after it
-    # still report. This one bounds the whole job.
-    timeout-minutes: 340
+    # Every step has a limit of its own, and the limits add up to less than this one, so a step that
+    # hangs is ended and the steps after it still report. This one is under GitHub's six hours.
+    timeout-minutes: 355
     env:
-      # As in the rust job: no debug information in the profiles this job builds, and no
+      # As in the rust job: no debug information in the profiles the tests build in, and no
       # incremental artefacts, which nothing here reads and the disk has to hold.
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
     steps:
       - name: Check out
+        timeout-minutes: 5
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # What this runner is, printed before anything asserts on it, so a pass or a failure below
-      # names the system, the login session and the disk it happened on.
+      # names the system, the login session, the keychain and the disk it happened on. The two
+      # scripts start four build jobs unless told otherwise, and this runner has fewer processors
+      # and less memory than that assumes, so every build here is given one job per processor.
       - name: What this runner is
+        timeout-minutes: 2
         run: |
           sw_vers
           uname -srm
@@ -828,8 +837,23 @@ jobs:
           echo "account: $(id -un), uid $(id -u); launchd session: $(launchctl managername)"
           security show-keychain-info "$HOME/Library/Keychains/login.keychain-db" 2>&1 || true
           df -h /System/Volumes/Data
+          echo "CARGO_BUILD_JOBS=$(sysctl -n hw.logicalcpu)" >> "$GITHUB_ENV"
+
+      # The host runs the first Git on PATH, and on this runner that is Homebrew's. These steps run
+      # the Git of Apple's command-line developer tools instead, the Git of a Mac with nothing else
+      # installed, reached by a path with no symbolic link in it.
+      - name: Put the developer tools' Git first
+        timeout-minutes: 2
+        run: |
+          git_directory="$RUNNER_TEMP/developer-tools-git"
+          mkdir -p "$git_directory"
+          ln -s /Library/Developer/CommandLineTools/usr/bin/git "$git_directory/git"
+          echo "$git_directory" >> "$GITHUB_PATH"
+          "$git_directory/git" --version
+          "$git_directory/git" --exec-path
 
       - name: Install the pinned toolchain
+        timeout-minutes: 5
         run: |
           rustup show active-toolchain || rustup toolchain install
           rustc --version
@@ -838,12 +862,14 @@ jobs:
       # The plugin runtime's test components, which KR_REQUIRE_PLUGIN_FIXTURES makes a failure to
       # leave out rather than a skip.
       - name: Install the component target
+        timeout-minutes: 5
         run: rustup target add wasm32-wasip2
 
       # The worker's pseudo-terminal suite starts each shell section 3 names as a session's root
       # shell. The runner has Bash and Zsh; Fish is installed here, and the test step names all
       # three as required, so a shell that is missing fails rather than being skipped.
       - name: Install the shells the worker's suite drives
+        timeout-minutes: 5
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
           HOMEBREW_NO_INSTALL_CLEANUP: "1"
@@ -854,33 +880,33 @@ jobs:
           done
           fish --version
 
-      # The registry and the dependencies' build output, never this workspace's own crates, and
-      # saved from main alone: the repository's cache is shared by every job, and a whole target
-      # directory from here would push the others out of it. The last steps of this job reduce the
-      # target directory to what this key describes before it is saved.
-      - name: Restore the cargo registry and dependency builds
-        id: cargo-cache
+      # The registry and the Git dependencies, and no build output: the dependencies' build output
+      # alone is some nine gigabytes here, and the repository's cache, which every job shares, holds
+      # ten in all. Saved from main alone, at the end of this job.
+      - name: Restore the cargo registry
+        id: cargo-registry
+        timeout-minutes: 10
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target
-          key: macos-cargo-${{ runner.os }}-${{ runner.arch }}-dependencies-nodebuginfo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          key: macos-cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Build the test components
+        timeout-minutes: 10
         run: bash scripts/build-plugin-fixtures.sh
 
       # A graphical login domain in which this account can bootstrap and start a job, in the
       # background domain as well, done here the way the host starts a worker for a desktop-bound
       # and for a headless session: a definition that starts nothing when it is loaded, bootstrapped
       # into the domain, started once and then booted out. Several suites below take a different
-      # branch on a host without that domain (a supervisor that is not launchd, or a case that has
-      # nothing to observe), so the job states the domain before them rather than let those cases
-      # pass without running.
+      # branch on a host without that domain (a supervisor that is not launchd, or a case with
+      # nothing to observe that returns early), so the job shows the domain works before them.
       - name: This account can start per-user launchd jobs
         if: ${{ !cancelled() }}
+        timeout-minutes: 2
         run: |
           set -euo pipefail
           uid="$(id -u)"
@@ -915,7 +941,7 @@ jobs:
             launchctl bootstrap "$domain" "$definition"
             loaded="$loaded $domain/$label"
             spawned="$(launchctl kickstart -p "$domain/$label")"
-            pid="$(printf '%s\n' "$spawned" | grep -Eo '[0-9]+' | tail -n 1)"
+            pid="$(printf '%s\n' "$spawned" | { grep -Eo '[0-9]+' || true; } | tail -n 1)"
             if [ -z "$pid" ] || ! ps -p "$pid" -o pid=,command=; then
               echo "$domain: the $session job reported no running process: $spawned" >&2
               exit 1
@@ -926,67 +952,152 @@ jobs:
           start "gui/$uid" Aqua
           start "user/$uid" Background
 
-      # From here every step runs whatever the one before it did, so each reports its own result,
-      # and any one of them failing fails the job.
+      # From here each step runs whatever the one before it did, unless the job itself was
+      # cancelled, so each reports its own result, and any one of them failing fails the job.
       - name: Clippy
         if: ${{ !cancelled() }}
-        timeout-minutes: 90
+        timeout-minutes: 30
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+      # The workspace's tests, less what this runner cannot run, each left out by name here:
+      #
+      # - kr-sync-integration, every test of which is a leg against a live deployment and does
+      #   nothing without one. The rust job runs each leg against the deployment it names.
+      # - The container cases, which need podman, and this runner has none. The rust job's runner
+      #   has it, and its test step runs them.
+      # - The case that writes to the platform's credential store, which does nothing without its
+      #   switch. The companion job's macOS leg runs it with the switch set.
+      # - The two cases that launch a built shell package, which do nothing unless
+      #   KR_SHELL_PACKAGES names one, and this job builds none. The shell-packages job builds the
+      #   packages and drives them through the contract and the qualification.
+      # - The cases that need another filesystem, which the step after this one runs where one is.
       - name: Test
         if: ${{ !cancelled() }}
-        timeout-minutes: 200
+        timeout-minutes: 70
         env:
           KR_REQUIRE_SHELLS: bash,zsh,fish
-        run: cargo test --locked --workspace --no-fail-fast
+        run: >-
+          cargo test --locked --workspace --exclude kr-sync-integration --no-fail-fast --
+          --skip the_helper_inside_a_container_refuses_a_handshake_that_declares_a_network_actor
+          --skip a_running_container_is_observed_as_running_and_a_stopped_one_as_stopped
+          --skip a_reused_container_name_is_not_the_identity_that_was_enrolled
+          --skip the_argument_vector_reaches_the_container_exactly_as_it_was_built
+          --skip a_helper_path_with_a_space_in_it_is_one_argument_inside_the_container
+          --skip a_refresh_that_reached_a_running_environment_without_a_helper_scopes_no_channel
+          --skip a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again
+          --skip the_built_packages_are_qualified_where_this_run_has_them
+          --skip a_real_qualified_package_registers_and_qualifies_on_this_hosts_endpoint
+          --skip a_repository_whose_own_data_is_on_another_filesystem_is_captured
+          --skip bind_mount_and_cross_device_grafts_are_refused
+          --skip recursive_removal_refuses_a_grafted_mount
+          --skip a_removal_stops_before_a_disk_image_attached_inside_the_tree
+
+      # The cases that put another filesystem in or beside a tree: a disk image attached inside a
+      # location or a tree, and a repository whose own data is on another filesystem. Each one says
+      # "not exercised" and returns when this host will not give it that filesystem, so they run
+      # here with their output shown, and a case that says so fails the step, as does a case that
+      # did not pass here by name.
+      #
+      # The repository case looks for a filesystem other than the one its temporary directory is
+      # on, and on this runner everything else it looks at is on the data volume. So this step's
+      # temporary directory is a volume of its own, added to the startup disk's container for the
+      # step and deleted after it: internal rather than removable, and another filesystem from
+      # /private/tmp.
+      - name: The cases that need another filesystem
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          cases=(
+            a_repository_whose_own_data_is_on_another_filesystem_is_captured
+            bind_mount_and_cross_device_grafts_are_refused
+            recursive_removal_refuses_a_grafted_mount
+            a_removal_stops_before_a_disk_image_attached_inside_the_tree
+          )
+          container="$(diskutil info -plist /System/Volumes/Data | plutil -extract APFSContainerReference raw -)"
+          volume="$RUNNER_TEMP/another-filesystem"
+          log="$RUNNER_TEMP/another-filesystem.log"
+          device=""
+          take_it_away() {
+            if [ -n "$device" ]; then
+              sudo diskutil apfs deleteVolume "$device" > /dev/null 2>&1 || true
+            fi
+          }
+          trap take_it_away EXIT
+          mkdir -p "$volume"
+          sudo diskutil apfs addVolume "$container" APFS kr-another-filesystem -mountpoint "$volume"
+          device="$(diskutil info -plist "$volume" | plutil -extract DeviceIdentifier raw -)"
+          sudo diskutil enableOwnership "$volume"
+          sudo chown "$(id -u):$(id -g)" "$volume"
+          diskutil info "$volume" | grep -E 'Device Identifier|Mount Point|Owners|Removable Media|Device Location' || true
+          echo "device of /private/tmp: $(stat -f %d /private/tmp); of $volume: $(stat -f %d "$volume")"
+          TMPDIR="$volume" cargo test --locked --workspace --exclude kr-sync-integration \
+            --test capture --test locations --test authority -- \
+            --exact --show-output --test-threads=1 "${cases[@]}" 2>&1 | tee "$log"
+          if grep -n 'not exercised' "$log"; then
+            echo "a case above says it was not exercised" >&2
+            exit 1
+          fi
+          for case in "${cases[@]}"; do
+            if ! grep -q "^test $case \.\.\. ok\$" "$log"; then
+              echo "$case did not pass here" >&2
+              exit 1
+            fi
+          done
 
       # Real processes, real sockets and real terminals, the suites the script names and nothing
       # else, each of which must demonstrate something, and no process of the run left behind.
       - name: End-to-end demonstrations
         if: ${{ !cancelled() }}
-        timeout-minutes: 120
+        timeout-minutes: 45
         run: bash scripts/end-to-end.sh
+
+      # The release build the measurements run in, which the script below would otherwise start
+      # with. Built here, so the machine can then be let settle: a figure taken while a build is
+      # still winding down is a figure about the build.
+      - name: Build the release profile the measurements use
+        if: ${{ !cancelled() }}
+        timeout-minutes: 60
+        run: cargo build --locked --release --workspace
+
+      # Until the load average over the last minute is under one and a half, or ten minutes have
+      # passed; the script records the load at the edges of every measurement either way.
+      - name: Let the machine settle
+        if: ${{ !cancelled() }}
+        timeout-minutes: 12
+        run: |
+          for _ in $(seq 1 60); do
+            if sysctl -n vm.loadavg | awk '{ exit !($2 < 1.5) }'; then
+              break
+            fi
+            sleep 10
+          done
+          echo "load average: $(sysctl -n vm.loadavg)"
 
       # The idle-resource and attach targets (KR-PERF-003, KR-PERF-004) and the input measurements,
       # in a release build, each figure printed with the conditions it was taken under and asserted
       # against its bound.
       - name: Performance measurements
         if: ${{ !cancelled() }}
-        timeout-minutes: 90
+        timeout-minutes: 45
         run: bash scripts/performance.sh
 
+      # What the disk had left once every step above was done, and the size of what the save below
+      # stores.
       - name: What the disk has left
         if: ${{ !cancelled() }}
-        run: df -h /System/Volumes/Data
-
-      # The workspace's own crates change from one commit to the next, so their artefacts would be
-      # rebuilt anyway; the dependencies' change only with the lock. Every workspace package is
-      # cleaned from both profiles, along with the tests' scratch space, and what is left is
-      # measured, because that is what the save below would store.
-      - name: Keep only the dependencies' build output
-        if: ${{ !cancelled() }}
+        timeout-minutes: 2
         run: |
-          set -euo pipefail
-          du -sh target/debug target/release 2>/dev/null || true
-          packages=""
-          for package in $(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[].name'); do
-            packages="$packages -p $package"
-          done
-          # shellcheck disable=SC2086
-          cargo clean --locked $packages
-          # shellcheck disable=SC2086
-          cargo clean --locked --release $packages
-          rm -rf target/tmp
-          du -sh ~/.cargo/registry/index ~/.cargo/registry/cache ~/.cargo/git/db target/debug target/release 2>/dev/null || true
-          du -sh target
+          df -h /System/Volumes/Data
+          du -sh ~/.cargo/registry/index ~/.cargo/registry/cache ~/.cargo/git/db
 
-      - name: Save the cargo registry and dependency builds
-        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+      - name: Save the cargo registry
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.cargo-registry.outputs.cache-hit != 'true' }}
+        timeout-minutes: 10
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target
-          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+          key: ${{ steps.cargo-registry.outputs.cache-primary-key }}
