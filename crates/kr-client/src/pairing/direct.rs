@@ -13,7 +13,9 @@ use kr_protocol::pairing::{DirectQrPayload, direct_verification_value};
 use kr_protocol::preauth::{PairRedeemParams, PairRedeemResult};
 use tokio::sync::watch;
 
-use super::candidate::{AttemptState, Pairing, RECOVERY_MARGIN_MS, Stage, awaiting};
+use super::candidate::{
+    AttemptState, Pairing, RECOVERY_MARGIN_MS, Stage, WAIT_STEP, awaiting, within,
+};
 use super::failure::{FailureKind, PairingFailure, refused_by_host};
 use super::link::{ConnectionPeer, LinkError};
 use super::paired::{AttemptMode, PairedHost, PendingAttempt};
@@ -55,11 +57,13 @@ impl Pairing {
                 "this device is already paired with the host the invitation pins",
             ));
         }
-        let connection = self
-            .link
-            .dial(&payload.network_config, &payload.endpoint_id)
-            .await
-            .map_err(|error| reached(&error))?;
+        let connection = within(
+            WAIT_STEP,
+            self.link
+                .dial(&payload.network_config, &payload.endpoint_id),
+        )
+        .await
+        .map_err(|error| reached(&error))?;
         let peer = ConnectionPeer::of(&connection);
         if peer.endpoint() != payload.endpoint_id {
             return Err(PairingFailure::new(
@@ -67,11 +71,13 @@ impl Pairing {
                 "the connection reached another endpoint than the invitation pins",
             ));
         }
-        let mut preauth = self
-            .link
-            .open_unpaired(&connection, &self.candidate.unpaired())
-            .await
-            .map_err(|error| reached(&error))?;
+        let mut preauth = within(
+            WAIT_STEP,
+            self.link
+                .open_unpaired(&connection, &self.candidate.unpaired()),
+        )
+        .await
+        .map_err(|error| reached(&error))?;
         let selection = preauth.selection().clone();
         if selection.endpoint_id != payload.endpoint_id {
             return Err(PairingFailure::new(
@@ -85,10 +91,10 @@ impl Pairing {
                 "this device is already paired with the host the invitation pins",
             ));
         }
-        let challenge = match preauth
-            .redeem(&PairRedeemParams::Challenge {
-                invitation_id: payload.invitation_id,
-            })
+        let asked = PairRedeemParams::Challenge {
+            invitation_id: payload.invitation_id,
+        };
+        let challenge = match within(WAIT_STEP, preauth.redeem(&asked))
             .await
             .map_err(|error| reached(&error))?
         {
@@ -139,9 +145,10 @@ impl Pairing {
         // Kept before the proof leaves, so a device that restarts while the owner decides can ask
         // again.
         self.hosts.keep_attempt(&pending)?;
-        let redeemed = preauth
-            .redeem(&PairRedeemParams::Direct(Box::new(proof)))
-            .await;
+        // A host that takes the proof and holds its answer back is asked again, on a connection of
+        // its own, like one whose answer was lost.
+        let proved = PairRedeemParams::Direct(Box::new(proof));
+        let redeemed = within(self.step(&pending), preauth.redeem(&proved)).await;
         let pending = match redeemed {
             Ok(PairRedeemResult::Locked {
                 verification_value, ..
