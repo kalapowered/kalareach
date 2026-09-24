@@ -934,15 +934,12 @@ fn give_an_access_control_list(
     None
 }
 
-/// KR-REQ-14.05: a name resolves through directories on this authority's own mount, and one on
-/// another mount is refused before anything beneath it is reached.
+/// KR-REQ-14.05: a name resolves through directories on this authority's own mount.
 ///
-/// A link is not the only way a path reaches content the path does not name. A directory mounted
-/// over a name inside the tree holds another tree entirely, and the path that gets there crosses
-/// nothing a no-follow open would see. So the mount is compared as the object is, and a name that
-/// resolves through another one does not resolve.
+/// The ordinary case, which stays ordinary once an authority is confined to one mount. The test
+/// after this one is the other half: a name on another mount does not resolve.
 #[test]
-fn a_name_that_resolves_through_another_mount_is_refused() {
+fn a_name_that_resolves_within_one_mount_is_opened() {
     let root = tempfile::tempdir().expect("a temporary directory");
     std::fs::create_dir_all(root.path().join("src/inner")).expect("creates the tree");
     std::fs::write(root.path().join("src/inner/notes.txt"), b"inside").expect("writes a file");
@@ -962,28 +959,39 @@ fn a_name_that_resolves_through_another_mount_is_refused() {
     authority
         .open_read(&name, ObjectPolicy::ReadableFile)
         .expect("reads through directories on one mount");
+}
 
-    // A boundary this host already carries, asked for through the directory that holds it. Two
-    // filesystems is a boundary any host can see, so where there is one the refusal is required
-    // rather than hoped for; where the platform has none to cross, this says so.
-    let Ok(top) = AuthorisedDirectory::open_root(environment(), Path::new("/"))
+/// KR-REQ-14.05: a name on another mount is refused before anything beneath it is reached.
+///
+/// A link is not the only way a path reaches content the path does not name. A directory mounted
+/// over a name inside the tree holds another tree entirely, and the path that gets there crosses
+/// nothing a no-follow open would see. So the mount is compared as the object is, and a name that
+/// resolves through another one does not resolve.
+///
+/// The boundary is one every Unix host carries: `/dev` on a filesystem of its own. Where the host
+/// does not have it this fails and says so, because a check that returned early would be counted
+/// as one that passed.
+#[cfg(unix)]
+#[test]
+fn a_name_that_resolves_through_another_mount_is_refused() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let top = AuthorisedDirectory::open_root(environment(), Path::new("/"))
         .and_then(AuthorisedDirectory::confined_to_one_mount)
-    else {
-        println!("not exercised: this platform would not open the root directory");
-        return;
-    };
-    let Ok(here) = std::fs::metadata("/") else {
-        println!("not exercised: this platform would not describe its root directory");
-        return;
-    };
-    let Ok(there) = std::fs::metadata("/dev") else {
-        println!("not exercised: this platform has no /dev to cross into");
-        return;
-    };
-    if device_of(&here) == device_of(&there) {
-        println!("not exercised: this host puts /dev on the filesystem that holds /");
-        return;
-    }
+        .unwrap_or_else(|error| {
+            panic!(
+                "this host would not open its root directory, so this check cannot run: {error:?}"
+            )
+        });
+    let here = std::fs::metadata("/").expect("the root directory is described");
+    let there = std::fs::metadata("/dev").unwrap_or_else(|error| {
+        panic!("this host has no /dev to cross into, so this check cannot run: {error}")
+    });
+    assert_ne!(
+        here.dev(),
+        there.dev(),
+        "this host puts /dev on the filesystem that holds /, so this check cannot run"
+    );
     let device = RelativeName::parse("dev").expect("a valid relative name");
     assert!(
         matches!(top.subdirectory(&device), Err(Escape::CrossedMount { .. })),
@@ -1010,19 +1018,6 @@ fn a_name_that_resolves_through_another_mount_is_refused() {
         .expect("an authority that is not confined resolves across a mount as it always did");
 }
 
-/// Returns the device an object is on, which is how this test knows a boundary exists at all.
-#[cfg(unix)]
-fn device_of(metadata: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt as _;
-
-    metadata.dev()
-}
-
-#[cfg(windows)]
-fn device_of(_metadata: &std::fs::Metadata) -> u64 {
-    0
-}
-
 /// KR-REQ-14.05: a mount placed while names are being resolved never reaches the tree it covers.
 ///
 /// This is the case the descent exists for. A mount is not a link: nothing in the path says one is
@@ -1032,10 +1027,12 @@ fn device_of(_metadata: &std::fs::Metadata) -> u64 {
 /// there when the directory is opened is refused by the mount comparison. Either way the bytes of
 /// the covering tree are never returned.
 ///
-/// It needs a mount namespace this account owns. Where the host does not allow one, the case says
-/// it was not exercised rather than reporting a result it did not produce.
+/// It needs a mount namespace this account may create, so it is ignored by default and runs with
+/// `--ignored` on a Linux host that allows one. Where the host allows none it fails and says so,
+/// because a check that returned early would be counted as one that passed.
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "needs a mount namespace this account may create (`unshare -r -m`), which the build box and core-ci's Linux runner deny by default; run it with --ignored on a Linux host that allows one"]
 fn a_mount_placed_while_reads_resolve_never_reaches_the_other_tree() {
     if std::env::var_os("KR_AUTHORITY_MOUNT_RACE").is_some() {
         mount_race();
@@ -1044,23 +1041,29 @@ fn a_mount_placed_while_reads_resolve_never_reaches_the_other_tree() {
     let probe = std::process::Command::new("unshare")
         .args(["-r", "-m", "--", "true"])
         .status();
-    if !probe.is_ok_and(|status| status.success()) {
-        println!("not exercised: this host does not give this account a mount namespace");
-        return;
-    }
+    assert!(
+        probe.is_ok_and(|status| status.success()),
+        "this host does not give this account a mount namespace, so this check cannot run here"
+    );
     let binary = std::env::current_exe().expect("the test binary");
     let status = std::process::Command::new("unshare")
         .args(["-r", "-m", "--"])
         .arg(binary)
-        .args(["--exact", "--nocapture", "--test-threads=1"])
+        .args([
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+            "--include-ignored",
+        ])
         .arg("a_mount_placed_while_reads_resolve_never_reaches_the_other_tree")
         .env("KR_AUTHORITY_MOUNT_RACE", "1")
         .status()
         .expect("the test binary runs inside a mount namespace");
-    if status.code() == Some(NOT_EXERCISED) {
-        println!("not exercised: this namespace would not place a bind mount");
-        return;
-    }
+    assert_ne!(
+        status.code(),
+        Some(NOT_EXERCISED),
+        "this namespace would not place a bind mount, so this check did not run"
+    );
     assert!(
         status.success(),
         "the reads inside the mount namespace did not hold: {status}"
@@ -2121,10 +2124,12 @@ fn an_exclusive_directory_admits_nobody_its_mode_does_not() {
 /// KR-REQ-14.05: a recursive removal stops before a directory mounted into the tree, and the tree
 /// mounted there is not reached.
 ///
-/// It needs a mount namespace this account owns. Where the host does not allow one, the case says
-/// it was not exercised rather than reporting a result it did not produce.
+/// It needs a mount namespace this account may create, so it is ignored by default and runs with
+/// `--ignored` on a Linux host that allows one. Where the host allows none it fails and says so,
+/// because a check that returned early would be counted as one that passed.
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "needs a mount namespace this account may create (`unshare -r -m`), which the build box and core-ci's Linux runner deny by default; run it with --ignored on a Linux host that allows one"]
 fn a_removal_stops_before_a_directory_mounted_into_the_tree() {
     if std::env::var_os("KR_AUTHORITY_REMOVAL_MOUNT").is_some() {
         removal_mount();
@@ -2133,23 +2138,29 @@ fn a_removal_stops_before_a_directory_mounted_into_the_tree() {
     let probe = std::process::Command::new("unshare")
         .args(["-r", "-m", "--", "true"])
         .status();
-    if !probe.is_ok_and(|status| status.success()) {
-        println!("not exercised: this host does not give this account a mount namespace");
-        return;
-    }
+    assert!(
+        probe.is_ok_and(|status| status.success()),
+        "this host does not give this account a mount namespace, so this check cannot run here"
+    );
     let binary = std::env::current_exe().expect("the test binary");
     let status = std::process::Command::new("unshare")
         .args(["-r", "-m", "--"])
         .arg(binary)
-        .args(["--exact", "--nocapture", "--test-threads=1"])
+        .args([
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+            "--include-ignored",
+        ])
         .arg("a_removal_stops_before_a_directory_mounted_into_the_tree")
         .env("KR_AUTHORITY_REMOVAL_MOUNT", "1")
         .status()
         .expect("the test binary runs inside a mount namespace");
-    if status.code() == Some(NOT_EXERCISED) {
-        println!("not exercised: this namespace would not place a bind mount");
-        return;
-    }
+    assert_ne!(
+        status.code(),
+        Some(NOT_EXERCISED),
+        "this namespace would not place a bind mount, so this check did not run"
+    );
     assert!(
         status.success(),
         "the removal inside the mount namespace did not hold: {status}"
@@ -2209,7 +2220,8 @@ fn removal_mount() {
 ///
 /// A mount this account places itself is the graft a removal has to refuse: the image's volume is
 /// another filesystem at a name inside the tree, and nothing in the path says so. Where the
-/// platform's disk image tool will not create or attach one, the case says it was not exercised.
+/// platform's disk image tool will not create or attach one this fails and says so, because a
+/// check that returned early would be counted as one that passed.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_removal_stops_before_a_disk_image_attached_inside_the_tree() {
@@ -2243,10 +2255,10 @@ fn a_removal_stops_before_a_disk_image_attached_inside_the_tree() {
         ])
         .arg(&image)
         .status();
-    if !made.is_ok_and(|status| status.success()) {
-        println!("not exercised: this host's disk image tool would not create an image");
-        return;
-    }
+    assert!(
+        made.is_ok_and(|status| status.success()),
+        "this host's disk image tool would not create an image, so this check cannot run here"
+    );
     let attached = std::process::Command::new("/usr/bin/hdiutil")
         .args([
             "attach",
@@ -2259,10 +2271,10 @@ fn a_removal_stops_before_a_disk_image_attached_inside_the_tree() {
         .arg(&graft)
         .arg(&image)
         .status();
-    if !attached.is_ok_and(|status| status.success()) {
-        println!("not exercised: this host would not attach a disk image inside the tree");
-        return;
-    }
+    assert!(
+        attached.is_ok_and(|status| status.success()),
+        "this host would not attach a disk image inside the tree, so this check cannot run here"
+    );
     let _attached = Attached(graft.clone());
     std::fs::write(graft.join("kept"), b"elsewhere\n").expect("a file on the image");
 

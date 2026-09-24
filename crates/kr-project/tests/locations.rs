@@ -3344,16 +3344,23 @@ fn bind(source: &Path, at: &Path) -> Option<Graft> {
         .then(|| Graft(at.to_path_buf()))
 }
 
-/// Says a case was not exercised: printed on macOS, and on Linux the namespace's exit code.
-fn not_exercised() {
+/// Ends a case whose host would not put another mount inside the location, as a failure rather
+/// than as a check that passed: on Linux the namespace's exit code, which the half outside it
+/// turns into that failure, and on macOS the failure itself.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn no_graft_here() {
     #[cfg(target_os = "linux")]
     std::process::exit(NOT_EXERCISED);
-    #[cfg(not(target_os = "linux"))]
-    println!("not exercised: this host would not put another mount inside the location");
+    #[cfg(target_os = "macos")]
+    panic!(
+        "this host would not put another mount inside the location, so this check cannot run here"
+    );
 }
 
-/// Runs `body` where this host can graft a mount beneath a location, and otherwise says the case
-/// was not exercised rather than reporting a result it did not produce.
+/// Runs `body` where this host can graft a mount beneath a location: on macOS directly, and on
+/// Linux inside a mount namespace of this account's own. Where the host allows neither it fails
+/// and says so, because a check that returned early would be counted as one that passed.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn with_grafts(test: &str, body: fn()) {
     #[cfg(target_os = "macos")]
     {
@@ -3369,34 +3376,41 @@ fn with_grafts(test: &str, body: fn()) {
         let probe = std::process::Command::new("unshare")
             .args(["-r", "-m", "--", "true"])
             .status();
-        if !probe.is_ok_and(|status| status.success()) {
-            println!("not exercised: this host does not give this account a mount namespace");
-            return;
-        }
+        assert!(
+            probe.is_ok_and(|status| status.success()),
+            "this host does not give this account a mount namespace, so this check cannot run here"
+        );
         let status = std::process::Command::new("unshare")
             .args(["-r", "-m", "--"])
             .arg(std::env::current_exe().expect("the test binary"))
-            .args(["--exact", "--nocapture", "--test-threads=1", test])
+            .args([
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+                "--include-ignored",
+                test,
+            ])
             .env(IN_NAMESPACE, "1")
             .status()
             .expect("the test binary runs inside a mount namespace");
-        if status.code() == Some(NOT_EXERCISED) {
-            println!("not exercised: this namespace would not place a bind mount");
-            return;
-        }
+        assert_ne!(
+            status.code(),
+            Some(NOT_EXERCISED),
+            "this namespace would not place a bind mount, so this check did not run"
+        );
         assert!(
             status.success(),
             "the case inside the namespace failed: {status}"
         );
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = (test, body);
-        not_exercised();
-    }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "needs a mount namespace this account may create (`unshare -r -m`), which the build box and core-ci's Linux runner deny by default; run it with --ignored on a Linux host that allows one"
+)]
 fn bind_mount_and_cross_device_grafts_are_refused() {
     with_grafts("bind_mount_and_cross_device_grafts_are_refused", || {
         // A repository on another mount beneath a source location, a repository beneath it whose
@@ -3419,7 +3433,7 @@ fn bind_mount_and_cross_device_grafts_are_refused() {
         );
 
         let Some(_grafted) = graft(&sources.join("grafted"), &scratch) else {
-            return not_exercised();
+            return no_graft_here();
         };
         ordinary_repository(&sources.join("grafted"), "repo");
         let refusal = clone_into(
@@ -3433,7 +3447,7 @@ fn bind_mount_and_cross_device_grafts_are_refused() {
 
         let metadata = ordinary_repository(&sources, "metadata");
         let Some(_objects) = graft(&metadata.join(".git/objects"), &scratch) else {
-            return not_exercised();
+            return no_graft_here();
         };
         let refusal = clone_into(
             fixture.service(),
@@ -3449,7 +3463,7 @@ fn bind_mount_and_cross_device_grafts_are_refused() {
             let patterned = ordinary_repository(&sources, "patterned");
             std::fs::write(patterned.join(".git/info/exclude"), b"").expect("a pattern file");
             let Some(_exclude) = graft(&patterned.join(".git/info/exclude"), &scratch) else {
-                return not_exercised();
+                return no_graft_here();
             };
             let refusal = clone_into(
                 fixture.service(),
@@ -3468,7 +3482,12 @@ fn bind_mount_and_cross_device_grafts_are_refused() {
     });
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "needs a mount namespace this account may create (`unshare -r -m`), which the build box and core-ci's Linux runner deny by default; run it with --ignored on a Linux host that allows one"
+)]
 fn recursive_removal_refuses_a_grafted_mount() {
     with_grafts("recursive_removal_refuses_a_grafted_mount", || {
         // A workspace made through a location is removed through that location's handle, and
@@ -3504,7 +3523,7 @@ fn recursive_removal_refuses_a_grafted_mount() {
         .expect("a workspace");
         let tree = workspaces.join("ws");
         let Some(_graft) = graft(&tree.join("grafted"), &scratch) else {
-            return not_exercised();
+            return no_graft_here();
         };
         std::fs::write(tree.join("grafted/kept"), b"elsewhere\n").expect("a file over there");
         let refusal = fixture

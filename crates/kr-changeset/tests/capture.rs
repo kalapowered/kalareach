@@ -1768,13 +1768,18 @@ fn a_directory_already_excluded_is_still_looked_inside() {
 /// between a directory and the working tree. A repository can keep its data on another filesystem
 /// altogether, and every directory of that data is then on neither the tree's mount nor anything
 /// near it. What the rule refuses is a mount **inside** a tree, and this is not one.
+///
+/// It needs a second filesystem it may write to. Where the host offers none it fails and says so,
+/// because a check that returned early would be counted as one that passed.
 #[test]
 fn a_repository_whose_own_data_is_on_another_filesystem_is_captured() {
     let fixture = Fixture::create();
-    let Some(elsewhere) = another_filesystem(fixture.work()) else {
-        println!("not exercised: this host offers no second filesystem to keep the data on");
-        return;
-    };
+    let elsewhere = another_filesystem(fixture.work()).unwrap_or_else(|| {
+        panic!(
+            "this host offers no second filesystem to keep the data on, so this check cannot run \
+             here"
+        )
+    });
     let data = elsewhere.path().join("data");
     git_raw(
         fixture.work(),
@@ -2523,10 +2528,12 @@ fn a_version_number_is_never_reused() {
 /// so, and no directory of the tree is on another mount. What finds it is the administrative scan
 /// opening each file it holds.
 ///
-/// It needs a mount namespace this account owns. Where the host gives none, the case says it was
-/// not exercised rather than reporting a result it did not produce.
+/// It needs a mount namespace this account may create, so it is ignored by default and runs with
+/// `--ignored` on a Linux host that allows one. Where the host allows none it fails and says so,
+/// because a check that returned early would be counted as one that passed.
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "needs a mount namespace this account may create (`unshare -r -m`), which the build box and core-ci's Linux runner deny by default; run it with --ignored on a Linux host that allows one"]
 fn a_file_mounted_inside_this_repository_s_own_data_is_not_captured_around() {
     const NOT_EXERCISED: i32 = 42;
 
@@ -2537,23 +2544,29 @@ fn a_file_mounted_inside_this_repository_s_own_data_is_not_captured_around() {
     let probe = std::process::Command::new("unshare")
         .args(["-r", "-m", "--", "true"])
         .status();
-    if !probe.is_ok_and(|status| status.success()) {
-        println!("not exercised: this host does not give this account a mount namespace");
-        return;
-    }
+    assert!(
+        probe.is_ok_and(|status| status.success()),
+        "this host does not give this account a mount namespace, so this check cannot run here"
+    );
     let binary = std::env::current_exe().expect("the test binary");
     let status = std::process::Command::new("unshare")
         .args(["-r", "-m", "--"])
         .arg(binary)
-        .args(["--exact", "--nocapture", "--test-threads=1"])
+        .args([
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+            "--include-ignored",
+        ])
         .arg("a_file_mounted_inside_this_repository_s_own_data_is_not_captured_around")
         .env("KR_CAPTURE_FILE_MOUNT", "1")
         .status()
         .expect("the test binary runs inside a mount namespace");
-    if status.code() == Some(NOT_EXERCISED) {
-        println!("not exercised: this namespace would not place a bind mount over a file");
-        return;
-    }
+    assert_ne!(
+        status.code(),
+        Some(NOT_EXERCISED),
+        "this namespace would not place a bind mount over a file, so this check did not run"
+    );
     assert!(
         status.success(),
         "the capture inside the mount namespace did not refuse: {status}"
@@ -2605,10 +2618,12 @@ fn a_file_mounted_inside_administrative_data() {
 /// rather than the data. Taking the tree's own handle there would account for the wrong directory
 /// and leave the data as ordinary content, so this host refuses instead of choosing between them.
 ///
-/// It needs a mount namespace this account owns. Where the host gives none, the case says it was
-/// not exercised rather than reporting a result it did not produce.
+/// It needs a mount namespace this account may create, so it is ignored by default and runs with
+/// `--ignored` on a Linux host that allows one. Where the host allows none it fails and says so,
+/// because a check that returned early would be counted as one that passed.
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "needs a mount namespace this account may create (`unshare -r -m`), which the build box and core-ci's Linux runner deny by default; run it with --ignored on a Linux host that allows one"]
 fn a_tree_reached_on_another_mount_is_not_taken_for_this_one() {
     const NOT_EXERCISED: i32 = 42;
 
@@ -2619,23 +2634,29 @@ fn a_tree_reached_on_another_mount_is_not_taken_for_this_one() {
     let probe = std::process::Command::new("unshare")
         .args(["-r", "-m", "--", "true"])
         .status();
-    if !probe.is_ok_and(|status| status.success()) {
-        println!("not exercised: this host does not give this account a mount namespace");
-        return;
-    }
+    assert!(
+        probe.is_ok_and(|status| status.success()),
+        "this host does not give this account a mount namespace, so this check cannot run here"
+    );
     let binary = std::env::current_exe().expect("the test binary");
     let status = std::process::Command::new("unshare")
         .args(["-r", "-m", "--"])
         .arg(binary)
-        .args(["--exact", "--nocapture", "--test-threads=1"])
+        .args([
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+            "--include-ignored",
+        ])
         .arg("a_tree_reached_on_another_mount_is_not_taken_for_this_one")
         .env("KR_CAPTURE_TWO_MOUNTS", "1")
         .status()
         .expect("the test binary runs inside a mount namespace");
-    if status.code() == Some(NOT_EXERCISED) {
-        println!("not exercised: this namespace would not place the two mounts");
-        return;
-    }
+    assert_ne!(
+        status.code(),
+        Some(NOT_EXERCISED),
+        "this namespace would not place the two mounts, so this check did not run"
+    );
     assert!(
         status.success(),
         "the capture inside the mount namespace did not hold: {status}"
@@ -2831,8 +2852,13 @@ fn a_directory_whose_name_only_looks_administrative_is_still_looked_through() {
 /// directory are the same object with different children, and a record of what has been looked
 /// through that named only the object would pass the second view over. One of the two views can
 /// hold a repository whose own data is an ordinary directory of this tree.
+///
+/// It needs a mount namespace this account may create, so it is ignored by default and runs with
+/// `--ignored` on a Linux host that allows one. Where the host allows none it fails and says so,
+/// because a check that returned early would be counted as one that passed.
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "needs a mount namespace this account may create (`unshare -r -m`), which the build box and core-ci's Linux runner deny by default; run it with --ignored on a Linux host that allows one"]
 fn two_views_of_one_directory_are_both_looked_through() {
     const NOT_EXERCISED: i32 = 42;
 
@@ -2843,23 +2869,29 @@ fn two_views_of_one_directory_are_both_looked_through() {
     let probe = std::process::Command::new("unshare")
         .args(["-r", "-m", "--", "true"])
         .status();
-    if !probe.is_ok_and(|status| status.success()) {
-        println!("not exercised: this host does not give this account a mount namespace");
-        return;
-    }
+    assert!(
+        probe.is_ok_and(|status| status.success()),
+        "this host does not give this account a mount namespace, so this check cannot run here"
+    );
     let binary = std::env::current_exe().expect("the test binary");
     let status = std::process::Command::new("unshare")
         .args(["-r", "-m", "--"])
         .arg(binary)
-        .args(["--exact", "--nocapture", "--test-threads=1"])
+        .args([
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+            "--include-ignored",
+        ])
         .arg("two_views_of_one_directory_are_both_looked_through")
         .env("KR_CAPTURE_TWO_VIEWS", "1")
         .status()
         .expect("the test binary runs inside a mount namespace");
-    if status.code() == Some(NOT_EXERCISED) {
-        println!("not exercised: this namespace would not place the two mounts");
-        return;
-    }
+    assert_ne!(
+        status.code(),
+        Some(NOT_EXERCISED),
+        "this namespace would not place the two mounts, so this check did not run"
+    );
     assert!(
         status.success(),
         "the capture inside the mount namespace did not hold: {status}"

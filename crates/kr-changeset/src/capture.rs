@@ -3980,11 +3980,9 @@ mod tests {
     }
 
     #[test]
-    fn a_directory_on_another_mount_is_not_opened_beneath_a_confined_one() {
-        // What the mount rule rests on, through the opener this capture actually uses: a boundary
-        // this host has is refused, and an ordinary subdirectory beside it is not. Where the
-        // platform offers no boundary to cross, the refusal is not exercised and this says so
-        // rather than asserting something it did not run.
+    fn an_ordinary_directory_is_opened_beneath_a_confined_one() {
+        // What the mount rule rests on, through the opener this capture actually uses: an
+        // ordinary subdirectory is not refused. Its other half, the boundary, is the test below.
         let host = kr_ipc::testing::TempHost::create();
         let environment_id = host.environment_id();
         let state = host.environment().state_dir().to_path_buf();
@@ -3996,15 +3994,28 @@ mod tests {
         open_beneath(&here, &ordinary, "ordinary")
             .expect("an ordinary directory is not refused")
             .expect("it opens");
+    }
 
-        // A mount every Unix host carries, asked for through the root that holds it.
-        let root = std::path::Path::new("/");
-        let Ok(top) = kr_transfer::AuthorisedDirectory::open_root(environment_id, root)
-            .and_then(kr_transfer::AuthorisedDirectory::confined_to_one_mount)
-        else {
-            println!("not exercised: this host would not open the root directory");
-            return;
-        };
+    /// A boundary this host has is refused, through the opener this capture actually uses.
+    ///
+    /// The boundary is a mount every Unix host carries, asked for through the root that holds it.
+    /// Where the host does not have it this fails and says so, because a check that returned early
+    /// would be counted as one that passed.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_on_another_mount_is_not_opened_beneath_a_confined_one() {
+        let host = kr_ipc::testing::TempHost::create();
+        let top = kr_transfer::AuthorisedDirectory::open_root(
+            host.environment_id(),
+            std::path::Path::new("/"),
+        )
+        .and_then(kr_transfer::AuthorisedDirectory::confined_to_one_mount)
+        .unwrap_or_else(|error| {
+            panic!(
+                "this host would not open its root directory, so this check cannot run \
+                         here: {error}"
+            )
+        });
         let name = RelativeName::parse("dev").expect("a name");
         match top.subdirectory(&name) {
             Err(kr_transfer::Escape::CrossedMount { .. }) => {
@@ -4015,8 +4026,12 @@ mod tests {
                     "the refusal names the mount: {refusal}"
                 );
             }
-            Ok(_) => println!("not exercised: this host puts /dev on the mount that holds /"),
-            Err(other) => println!("not exercised: this host would not open /dev: {other}"),
+            Ok(_) => panic!(
+                "this host puts /dev on the mount that holds /, so this check cannot run here"
+            ),
+            Err(other) => {
+                panic!("this host would not open /dev, so this check cannot run here: {other}")
+            }
         }
     }
 
