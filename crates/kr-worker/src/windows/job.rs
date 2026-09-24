@@ -539,10 +539,10 @@ pub fn holding(root: u32) -> Option<Arc<SessionJob>> {
 ///
 /// The agent is started where the broker's launch is, and placed where a caller is verified, so the
 /// two need somewhere to meet, as a session's root shell and its boundary do. The reference is
-/// strong and kept for the life of this worker, which serves one session: an agent's job is not
-/// kill-on-close, so keeping it keeps no process alive, and the broker may ask about an agent for
-/// as long as its instance lasts, which nothing here can see the end of. It costs one handle for
-/// each agent the session launched.
+/// strong and kept until the broker lets it go with [`release_agent`], when the last instance that
+/// names the agent ends: an agent's job is not kill-on-close, so keeping it keeps no process alive,
+/// and the broker asks about an agent only for as long as one of its instances lasts. It costs one
+/// handle for each agent with a live instance.
 static AGENTS: OnceLock<Mutex<Vec<KeptAgent>>> = OnceLock::new();
 
 /// One launched agent and the job it was started in.
@@ -559,6 +559,18 @@ pub fn keep_agent(agent: ProcessStartIdentity, job: Arc<AgentJob>) {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     kept.retain(|(recorded, _)| *recorded != agent);
     kept.push((agent, job));
+}
+
+/// Forgets the job `agent` was started in.
+///
+/// Nothing is placed under the agent afterwards: a process it started is found in no job this
+/// worker keeps. Closing the handle ends nothing, because an agent's job is not kill-on-close, and
+/// forgetting an agent that was never kept changes nothing.
+pub fn release_agent(agent: &ProcessStartIdentity) {
+    let mut kept = agents()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    kept.retain(|(recorded, _)| recorded != agent);
 }
 
 /// Returns the job `agent` was started in, or None when this worker did not start it in one.
@@ -832,6 +844,39 @@ mod tests {
             agent_job(&again).is_none(),
             "the same identifier started again is another process"
         );
+    }
+
+    #[test]
+    fn a_released_agent_is_placed_through_no_job_and_the_others_are_kept() {
+        let source = kr_protocol::identity::ProcessStartSource::WindowsProcessStartSeconds;
+        let released = ProcessStartIdentity::new(0xF000_0004, source, 17);
+        let kept = ProcessStartIdentity::new(0xF000_0005, source, 17);
+        let released_job = Arc::new(AgentJob::create().expect("a job"));
+        let kept_job = Arc::new(AgentJob::create().expect("a job"));
+        keep_agent(released.clone(), Arc::clone(&released_job));
+        keep_agent(kept.clone(), Arc::clone(&kept_job));
+
+        release_agent(&released);
+        assert!(
+            agent_job(&released).is_none(),
+            "a released agent is placed through no job"
+        );
+        assert_eq!(
+            Arc::strong_count(&released_job),
+            1,
+            "and nothing but this test holds its job any more"
+        );
+        assert!(
+            agent_job(&kept).is_some_and(|found| Arc::ptr_eq(&found, &kept_job)),
+            "another agent's job is kept"
+        );
+        release_agent(&released);
+        assert!(
+            agent_job(&kept).is_some(),
+            "releasing an agent twice changes nothing else"
+        );
+        release_agent(&kept);
+        assert!(agent_job(&kept).is_none());
     }
 
     #[test]

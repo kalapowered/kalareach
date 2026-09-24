@@ -806,7 +806,8 @@ impl Broker {
         if let Some(consumed) = consumed {
             semantic.resume_after(consumed);
         }
-        self.state().instances.insert(
+        let mut state = self.state();
+        let replaced = state.instances.insert(
             application_instance_id,
             Instance {
                 application_instance_id,
@@ -829,6 +830,11 @@ impl Broker {
                 host_files: None,
             },
         );
+        // An instance registered again under the same identity has ended as the one it was, and
+        // the agent it named is let go of unless the new one names it too.
+        if let Some(agent) = replaced.and_then(|instance| instance.process) {
+            release_agent_job(&state.instances, &agent.process);
+        }
         Ok(())
     }
 
@@ -1054,7 +1060,10 @@ impl Broker {
                     .process
                     .as_ref()
                     .and_then(|process| process.dedicated.then(|| process.process.clone()));
-                state.instances.remove(&application_instance_id);
+                let ended = state.instances.remove(&application_instance_id);
+                if let Some(agent) = ended.and_then(|instance| instance.process) {
+                    release_agent_job(&state.instances, &agent.process);
+                }
                 state.tokens.withdraw(application_instance_id);
                 state.profiles.release(application_instance_id);
                 state.capabilities.forget(application_instance_id);
@@ -4598,6 +4607,35 @@ pub fn action_name(text: &str) -> Result<ActionName> {
 
 fn unknown_instance(application_instance_id: ApplicationInstanceId) -> BrokerError {
     BrokerError::unknown(format!("no application instance {application_instance_id}"))
+}
+
+/// Lets go of the job `agent` was started in once no instance left in `instances` names it.
+///
+/// A caller is placed under an agent by that agent's job, and only the instances this broker holds
+/// are asked about, so a job whose agent no instance names is one nothing will ask about again.
+/// Another instance that names the same agent keeps it.
+#[cfg(windows)]
+fn release_agent_job(
+    instances: &BTreeMap<ApplicationInstanceId, Instance>,
+    agent: &ProcessStartIdentity,
+) {
+    let named = instances.values().any(|instance| {
+        instance
+            .process
+            .as_ref()
+            .is_some_and(|launched| launched.process == *agent)
+    });
+    if !named {
+        crate::windows::job::release_agent(agent);
+    }
+}
+
+/// An agent is started in no job on this platform, so there is nothing to let go of.
+#[cfg(not(windows))]
+const fn release_agent_job(
+    _instances: &BTreeMap<ApplicationInstanceId, Instance>,
+    _agent: &ProcessStartIdentity,
+) {
 }
 
 fn unknown_binding(binding_id: BrokerBindingId) -> BrokerError {
