@@ -287,7 +287,8 @@ jobs:
           key: windows-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
       # What this runner is, printed before anything asserts on it: a pass or a failure below then
-      # names the Windows build, the console host and the shells it happened on.
+      # names the Windows build, the console host, the shells it happened on and the privileges its
+      # account holds, which decide whether an access-control list binds that account at all.
       - name: What this runner is
         run: |
           [System.Environment]::OSVersion.VersionString
@@ -295,6 +296,7 @@ jobs:
           (Get-Command pwsh).Source
           (Get-Command git).Source
           & "$env:ProgramFiles\Git\usr\bin\sh.exe" -c 'echo the POSIX shell the test scripts use is here'
+          whoami /priv
 
       # Everything the workspace compiles for this target, including the test targets: a test that
       # only builds on Unix is a Windows failure, and this is where it is caught.
