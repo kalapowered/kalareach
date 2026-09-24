@@ -512,17 +512,54 @@ impl Registry {
         }
     }
 
-    /// Returns the identity this registry records for a process a worker states.
+    /// Returns the identity this registry records for the process a worker states, in the row of
+    /// `session_id`.
     ///
-    /// The identity itself, unless it is in whole seconds and the kernel can settle it: a worker of
-    /// the previous build states that, and its row is kept at the resolution this build reads.
-    fn to_record(&self, stated: &ProcessStartIdentity) -> ProcessStartIdentity {
-        if stated.source == ProcessStartSource::WindowsProcessStartSeconds
-            && let Some(settled) = self.settled(stated)
-        {
-            return settled;
+    /// The identity itself, unless it is in whole seconds, which a worker of the previous build
+    /// states. Then the finer identity this registry already established for that worker's
+    /// process is kept: it was proved when it was recorded, and asking the kernel again could only
+    /// answer less, or name a later process created in the same second under the identifier. Only
+    /// a row with no finer identity for that process is settled now, as the opening settles one.
+    fn to_record(
+        &self,
+        session_id: SessionId,
+        stated: &ProcessStartIdentity,
+    ) -> Result<ProcessStartIdentity> {
+        if stated.source != ProcessStartSource::WindowsProcessStartSeconds {
+            return Ok(stated.clone());
         }
-        stated.clone()
+        if let Some(established) = self.recorded_process(session_id)?
+            && established.source == ProcessStartSource::WindowsProcessCreationTime
+            && established.pid == stated.pid
+            && established.start_value.get() != kr_ipc::identity::START_VALUE_UNREAD
+            && established.start_value.get() / CREATION_TIME_UNITS_PER_SECOND
+                == stated.start_value.get()
+        {
+            return Ok(established);
+        }
+        Ok(self.settled(stated).unwrap_or_else(|| stated.clone()))
+    }
+
+    /// Returns the process identity one worker row records, when there is a row.
+    fn recorded_process(&self, session_id: SessionId) -> Result<Option<ProcessStartIdentity>> {
+        let row: Option<(i64, String, i64)> = self
+            .connection
+            .query_row(
+                "SELECT process_pid, process_source, process_start FROM workers
+                 WHERE session_id = ?1",
+                params![session_id.get().as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(ControllerError::registry)?;
+        row.map(|(pid, source, start)| {
+            Ok(ProcessStartIdentity {
+                pid: kr_protocol::scalars::U64::new(u64::try_from(pid).unwrap_or_default()),
+                source: source_from(&source)?,
+                start_value: kr_protocol::scalars::U64::new(start_from_column(start)),
+            })
+        })
+        .transpose()
     }
 
     /// Returns the environment this registry belongs to.
@@ -1195,7 +1232,7 @@ impl Registry {
         reservation_id: ReservationId,
         worker: &WorkerRecord,
     ) -> Result<()> {
-        let recorded = self.to_record(&worker.process_identity);
+        let recorded = self.to_record(worker.session_id, &worker.process_identity)?;
         let transaction = self
             .connection
             .transaction()
@@ -1258,7 +1295,7 @@ impl Registry {
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the write fails.
     pub fn adopt_worker(&mut self, worker: &WorkerRecord) -> Result<()> {
-        let recorded = self.to_record(&worker.process_identity);
+        let recorded = self.to_record(worker.session_id, &worker.process_identity)?;
         self.connection
             .execute(
                 "INSERT INTO workers (session_id, display_number, public_key, process_pid,
@@ -1504,6 +1541,9 @@ fn start_from_column(value: i64) -> u64 {
         u64::try_from(value).unwrap_or_default()
     }
 }
+
+/// Hundreds of nanoseconds in one second: a Windows creation time's unit.
+const CREATION_TIME_UNITS_PER_SECOND: u64 = 10_000_000;
 
 /// A record the previous build made of a Windows process: its creation time in whole seconds.
 fn in_whole_seconds(pid: i64, start: i64) -> ProcessStartIdentity {
@@ -1814,12 +1854,28 @@ mod tests {
         assert_eq!(stated(&registry, 3), "windows_process_start_seconds");
     }
 
+    /// A kernel that will not describe any process.
+    fn kernel_silent(_recorded: &ProcessStartIdentity) -> CurrentProcess {
+        CurrentProcess::Unknown {
+            detail: "Access is denied.".to_owned(),
+        }
+    }
+
+    /// A kernel in which the identifier asked about is held by a later process created in the
+    /// same second as the one recorded.
+    fn kernel_replaced(recorded: &ProcessStartIdentity) -> CurrentProcess {
+        let mut later = finer(recorded.pid.get());
+        later.start_value = U64::new(later.start_value.get() + 1);
+        CurrentProcess::Running(later)
+    }
+
     #[test]
     fn a_worker_that_states_whole_seconds_again_keeps_the_finer_record_and_what_it_states() {
         let directory = tempfile::tempdir().expect("a directory");
         let path = directory.path().join("registry.sqlite3");
         previous_build_registry(&path, &[(1, in_seconds(1001))], &[]);
         let mut registry = opened(&path, kernel);
+        assert_eq!(worker(&registry, 1), finer(1001));
         let record = WorkerRecord {
             session_id: session(1),
             display_number: DisplayNumber::new(1),
@@ -1830,10 +1886,31 @@ mod tests {
             state: SessionState::Live,
             acknowledged_revision: AuthorityRevision::new(0),
         };
-        // A controller adopts a worker from its own signed answer, which states whole seconds.
-        registry.adopt_worker(&record).expect("adopts");
-        assert_eq!(worker(&registry, 1), finer(1001));
-        assert_eq!(stated(&registry, 1), "windows_process_start_seconds");
+        // A controller adopts the worker again from its own signed answer, which states whole
+        // seconds. The finer identity the opening established is kept whatever the kernel would
+        // say now: that it will not describe the process, or that a later process created in the
+        // same second holds the identifier.
+        for now in [
+            kernel_silent as fn(&ProcessStartIdentity) -> CurrentProcess,
+            kernel_replaced,
+        ] {
+            registry.current_process = now;
+            registry.adopt_worker(&record).expect("adopts");
+            assert_eq!(worker(&registry, 1), finer(1001));
+            assert_eq!(stated(&registry, 1), "windows_process_start_seconds");
+        }
+        // A worker with no row yet that states whole seconds is settled as the opening settles
+        // one.
+        registry.current_process = kernel;
+        let arriving = WorkerRecord {
+            session_id: session(5),
+            display_number: DisplayNumber::new(5),
+            process_identity: in_seconds(1005),
+            ..record.clone()
+        };
+        registry.adopt_worker(&arriving).expect("adopts");
+        assert_eq!(worker(&registry, 5), finer(1005));
+        assert_eq!(stated(&registry, 5), "windows_process_start_seconds");
         // One this build started states the creation time, which is recorded as it is.
         let current = WorkerRecord {
             session_id: session(9),
