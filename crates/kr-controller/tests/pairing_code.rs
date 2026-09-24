@@ -8,7 +8,7 @@
 
 mod net_support;
 
-use kr_controller::service::net::rendezvous::{self, ClientFrame, CloseReason, decode_message};
+use kr_controller::service::net::rendezvous;
 use kr_crypto::keys::DeviceKeys;
 use kr_ipc::client::LocalClient;
 use kr_protocol::confirmation::ConfirmationSubject;
@@ -23,6 +23,7 @@ use kr_protocol::pairing::{
     PairStatus, PairingConsumedReason, ProposedGrant, QrPayload, RendezvousOrigin,
 };
 use kr_protocol::preauth::{PairStatusParams, PairStatusResult};
+use kr_protocol::rendezvous::{ClientFrame, CloseReason, decode_message};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Nonce256, Nullable};
 use net_support::pairing::{self as calls, Signer};
