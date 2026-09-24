@@ -8,7 +8,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-09.08 | `a_device_revocation_is_performed_once_however_long_its_first_attempt_waits`, `a_retry_while_a_device_revocation_runs_is_told_it_has_not_finished`, `a_share_whose_record_was_never_written_is_answered_from_what_it_wrote_after_a_restart`, `a_revocation_whose_record_was_never_written_is_answered_from_the_rows_after_a_restart`, `an_authority_change_whose_attempt_ended_unrecorded_is_not_performed_again`, `a_refused_authority_change_is_refused_the_same_way_when_it_is_sent_again`, `an_unfinished_key_registration_is_not_answered_with_another_actions_registration`, `an_unfinished_revocation_pays_the_fence_it_still_owes_before_it_is_answered`, `an_unfinished_revocation_of_a_grant_still_standing_is_unknown`, `an_unfinished_device_revocation_is_answered_only_once_the_device_record_is_revoked`, `an_unfinished_destination_credential_is_unknown`, `a_claim_excludes_every_other_attempt_and_is_never_taken_over`, `an_earlier_receipts_table_migrates_once_and_its_open_claims_are_unfinished` |
+//! | KR-REQ-09.08 | `a_device_revocation_is_performed_once_however_long_its_first_attempt_waits`, `a_retry_while_a_device_revocation_runs_is_told_it_has_not_finished`, `a_share_whose_record_was_never_written_is_answered_from_what_it_wrote_after_a_restart`, `a_revocation_whose_record_was_never_written_is_answered_from_the_rows_after_a_restart`, `an_authority_change_whose_attempt_ended_unrecorded_is_not_performed_again`, `a_refused_authority_change_is_refused_the_same_way_when_it_is_sent_again`, `an_unfinished_key_registration_is_not_answered_with_another_actions_registration`, `an_unfinished_revocation_pays_the_fence_it_still_owes_before_it_is_answered`, `an_unfinished_revocation_of_a_grant_still_standing_is_unknown`, `an_unfinished_device_revocation_is_answered_only_once_the_device_record_is_revoked`, `a_revocation_answered_from_the_rows_names_only_what_it_withdrew`, `a_device_revocation_answered_from_the_rows_names_only_what_it_withdrew`, `an_unfinished_destination_credential_is_unknown`, `a_claim_excludes_every_other_attempt_and_is_never_taken_over`, `an_earlier_receipts_table_migrates_once_and_its_open_claims_are_unfinished` |
 //! | KR-REQ-09.18 | `a_decision_that_reads_the_clock_waits_for_the_floor_whatever_the_grants_expiry`, `a_delegation_is_not_refused_as_expired_on_a_reading_this_host_could_not_write`, `a_paired_device_refused_while_the_floor_is_owed_is_told_storage_is_unavailable` |
 //! | KR-REQ-10.40 | `a_grant_carries_every_field_section_ten_names`, `the_host_intersects_the_grant_with_policy_on_every_request`, `a_delegation_narrows_and_never_extends`, `revoking_a_parent_revokes_every_descendant` |
 //! | KR-REQ-10.41 | `a_method_is_decided_from_the_registry_table_and_never_from_a_capability` |
@@ -3392,6 +3392,205 @@ async fn an_unfinished_device_revocation_is_answered_only_once_the_device_record
         answered.authority_revision, performed.authority_revision,
         "its fence ran, so the revision did not move again"
     );
+}
+
+/// The claim a local caller's action takes, taken by a first attempt that then ended without
+/// recording anything, as the host's own dispatch takes it.
+fn claimed_and_left(host: &Serving, mutation: &kr_protocol::envelope::MutationRequest) {
+    let actor = kr_protocol::ids::ActorId::new(format!("local:{}", kr_ipc::paths::current_uid()))
+        .expect("a principal");
+    let digest =
+        kr_protocol::digest::mutation_digest(mutation, &actor).expect("the payload digest");
+    let claimed = host
+        .controller
+        .sharing()
+        .grants()
+        .claim_action(&actor, mutation.action_id, &digest, kr_ipc::now_ms().get())
+        .expect("the attempt claims its action");
+    assert!(
+        matches!(claimed, kr_controller::grants::ActionClaim::Claimed { .. }),
+        "{claimed:?}"
+    );
+}
+
+/// KR-REQ-09.08: a revocation answered from the rows names what the rows say it withdrew, which is
+/// the answer its first attempt gave: not a descendant an earlier revocation had withdrawn already.
+/// A revocation of a grant that went with its ancestor names nothing, as a repeat does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revocation_answered_from_the_rows_names_only_what_it_withdrew() {
+    let host = Serving::start().await;
+    let controller = &host.controller;
+    let parent = grant(1, None, &[ActionRight::SessionView], GrantExpiry::Never);
+    let earlier = Grant {
+        grant_id: grant_id(2),
+        parent_grant_id: Nullable::some(parent.grant_id),
+        recipient_device_id: device_id(0xf2),
+        ..parent.clone()
+    };
+    let later = Grant {
+        grant_id: grant_id(3),
+        parent_grant_id: Nullable::some(parent.grant_id),
+        recipient_device_id: device_id(0xf3),
+        ..parent.clone()
+    };
+    for held in [&parent, &earlier, &later] {
+        controller
+            .sharing()
+            .grants()
+            .issue(&record(held.clone()), || Ok(()))
+            .expect("written");
+    }
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        controller.revoke_grant(earlier.grant_id, None),
+    )
+    .await
+    .expect("the earlier revocation completes")
+    .expect("it succeeds");
+
+    let mut client = host.client().await;
+    let action_id = kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x6b; 16]));
+    let mutation = client
+        .compose(
+            Method::GrantRevoke,
+            action_id,
+            kr_protocol::envelope::ActionTarget::environment(host.temp.environment_id()),
+            &kr_protocol::sharing::GrantRevokeParams {
+                grant_id: parent.grant_id,
+            },
+        )
+        .await
+        .expect("the revocation is composed");
+    let first: kr_protocol::sharing::RevocationResult = client
+        .repeat(&mutation)
+        .await
+        .expect("the daemon answers")
+        .expect("the grant is revoked")
+        .to_typed()
+        .expect("a revocation result");
+    assert!(first.revoked_grants.contains(&parent.grant_id));
+    assert!(first.revoked_grants.contains(&later.grant_id));
+    assert!(!first.revoked_grants.contains(&earlier.grant_id));
+    drop(client);
+    host.forget_answer(action_id);
+
+    // The fence the first attempt ran withdrew that connection's registration.
+    let mut client = host.client().await;
+    let again: kr_protocol::sharing::RevocationResult = client
+        .repeat(&mutation)
+        .await
+        .expect("the daemon answers")
+        .expect("the revocation is answered from the rows")
+        .to_typed()
+        .expect("a revocation result");
+    assert_eq!(
+        again.revoked_grants, first.revoked_grants,
+        "the answer the first attempt gave"
+    );
+    assert_eq!(again.authority_revision, first.authority_revision);
+
+    let action_id = kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x6c; 16]));
+    let mutation = client
+        .compose(
+            Method::GrantRevoke,
+            action_id,
+            kr_protocol::envelope::ActionTarget::environment(host.temp.environment_id()),
+            &kr_protocol::sharing::GrantRevokeParams {
+                grant_id: later.grant_id,
+            },
+        )
+        .await
+        .expect("the revocation is composed");
+    claimed_and_left(&host, &mutation);
+    let answered: kr_protocol::sharing::RevocationResult = client
+        .repeat(&mutation)
+        .await
+        .expect("the daemon answers")
+        .expect("the revocation is answered from the rows")
+        .to_typed()
+        .expect("a revocation result");
+    assert!(
+        answered.revoked_grants.is_empty(),
+        "the grant went with its ancestor, so a revocation naming it withdrew nothing: \
+         {answered:?}"
+    );
+    assert_eq!(
+        answered.authority_revision, first.authority_revision,
+        "and it advanced nothing"
+    );
+}
+
+/// KR-REQ-09.08 and 23.27: a device revocation answered from the rows names the grants withdrawn
+/// with the device's record, which is the answer its first attempt gave: not a grant of the
+/// device's that an earlier revocation had withdrawn already.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_revocation_answered_from_the_rows_names_only_what_it_withdrew() {
+    let host = Serving::start().await;
+    let controller = &host.controller;
+    let device = device_id(0xd4);
+    controller
+        .devices()
+        .commit(&paired_record(device))
+        .expect("a paired device");
+    let earlier = Grant {
+        recipient_device_id: device,
+        ..grant(0x43, None, &[ActionRight::SessionView], GrantExpiry::Never)
+    };
+    let later = Grant {
+        recipient_device_id: device,
+        ..grant(0x44, None, &[ActionRight::FilesRead], GrantExpiry::Never)
+    };
+    for held in [&earlier, &later] {
+        controller
+            .sharing()
+            .grants()
+            .issue(&record(held.clone()), || Ok(()))
+            .expect("written");
+    }
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        controller.revoke_grant(earlier.grant_id, None),
+    )
+    .await
+    .expect("the earlier revocation completes")
+    .expect("it succeeds");
+
+    let mut client = host.client().await;
+    let action_id = kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x6d; 16]));
+    let mutation = client
+        .compose(
+            Method::DeviceRevoke,
+            action_id,
+            kr_protocol::envelope::ActionTarget::environment(host.temp.environment_id()),
+            &kr_protocol::sharing::DeviceRevokeParams { device_id: device },
+        )
+        .await
+        .expect("the revocation is composed");
+    let first: kr_protocol::sharing::RevocationResult = client
+        .repeat(&mutation)
+        .await
+        .expect("the daemon answers")
+        .expect("the device is revoked")
+        .to_typed()
+        .expect("a revocation result");
+    assert!(first.revoked_grants.contains(&later.grant_id));
+    assert!(!first.revoked_grants.contains(&earlier.grant_id));
+    drop(client);
+    host.forget_answer(action_id);
+
+    let mut client = host.client().await;
+    let again: kr_protocol::sharing::RevocationResult = client
+        .repeat(&mutation)
+        .await
+        .expect("the daemon answers")
+        .expect("the revocation is answered from the rows")
+        .to_typed()
+        .expect("a revocation result");
+    assert_eq!(
+        again.revoked_grants, first.revoked_grants,
+        "the answer the first attempt gave"
+    );
+    assert_eq!(again.authority_revision, first.authority_revision);
 }
 
 /// KR-REQ-09.08: a destination's credential whose attempt ended unrecorded is not set again.

@@ -490,25 +490,43 @@ impl GrantDirectory {
         rows.into_iter().collect()
     }
 
-    /// Returns a grant and every grant delegated from it, however deep, that stands revoked, in
-    /// the order a revocation walks them.
+    /// Returns what the revocation that withdrew a grant withdrew with it, as the rows record it.
     ///
-    /// What a revocation of the grant withdraws is what this reads back: the named grant and its
-    /// descendants. A revocation whose record was never written is answered from it.
+    /// A revocation writes the grant it names with no ancestor, and each descendant it withdraws
+    /// with that grant as the ancestor that took it; a withdrawn row is never written again. So a
+    /// grant a revocation named reads back with the descendants withdrawn under it, which is what
+    /// that revocation withdrew. A grant that went with an ancestor reads back with nothing,
+    /// because a revocation naming it afterwards withdraws nothing. `None` is a grant this host
+    /// does not hold or that still stands. A revocation whose record was never written is answered
+    /// from this.
     ///
     /// # Errors
     ///
     /// Returns an error when the rows cannot be read.
-    pub fn revoked_under(&self, grant_id: GrantId) -> Result<Vec<GrantId>> {
+    pub fn withdrawn_with(&self, grant_id: GrantId) -> Result<Option<Vec<GrantId>>> {
         let connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok(subtree_within(&connection, grant_id)?
-            .into_iter()
-            .filter(|record| record.revoked_at_ms.is_some())
-            .map(|record| record.grant.grant_id)
-            .collect())
+        let subtree = subtree_within(&connection, grant_id)?;
+        let Some(named) = subtree.first() else {
+            return Ok(None);
+        };
+        if named.revoked_at_ms.is_none() {
+            return Ok(None);
+        }
+        if named.revoked_by_parent.is_some() {
+            return Ok(Some(Vec::new()));
+        }
+        Ok(Some(
+            subtree
+                .iter()
+                .filter(|record| {
+                    record.grant.grant_id == grant_id || record.revoked_by_parent == Some(grant_id)
+                })
+                .map(|record| record.grant.grant_id)
+                .collect(),
+        ))
     }
 
     /// Returns every grant one device holds.

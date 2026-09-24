@@ -3559,11 +3559,13 @@ window has closed, or whose daemon has restarted since, is still told what happe
   `OUTCOME_UNKNOWN`. A share is answered from the grant and the invitation it wrote, which take
   identities derived from the action. A grant revocation is answered from the rows once the grant
   it names stands revoked, and a device revocation once the device's own record does too, its last
-  write: the answer names the grant and its descendants as they stand revoked, and any fence still
-  owed runs before it goes back, so its revision and barrier hold. That fence withdraws the
-  registration of the connection that asked, as it does every other, so that connection is told to
-  open a new one and the retry on it is answered. Nothing else this host keeps
-  names the action that changed it: a device's record can hold a preview key because another
+  write. The rows record which revocation withdrew each grant, so the answer names what that
+  withdrawal took: the grant and the descendants withdrawn under it, or nothing when the grant went
+  with an ancestor, as a repeat finds; for a device, the grants withdrawn with its record. Any fence
+  still owed runs before the answer goes back, so its revision and barrier hold. That fence
+  withdraws the registration of the connection that asked, as it does every other, so that
+  connection is told to open a new one and the retry on it is answered. Nothing else this host
+  keeps names the action that changed it: a device's record can hold a preview key because another
   action registered the same one. So a revocation short of that, a preview-key registration, a
   destination's credential or a voice change in this state is `OUTCOME_UNKNOWN`.
 

@@ -5046,41 +5046,47 @@ impl Controller {
     /// What this host's records say an unfinished revocation withdrew, answered the way a
     /// revocation that finds its work done is answered.
     ///
-    /// The rows are the revocation's record. A grant revocation is answered once the grant it
-    /// names stands revoked; a device revocation once the device's own record does too, because
-    /// that is its last write, and grants withdrawn beside a device record still live are not a
-    /// withdrawal this host can call finished. The grants named are the named one and its
-    /// descendants as they stand revoked, which is what the revocation withdraws. Any fence still
-    /// owed runs first, so the answer's revision and barrier are ones that hold; a fence is
-    /// always safe to raise, and it is the one the earlier attempt owed. Anything short of that is
-    /// an outcome this host does not know, and it is not performed again.
+    /// The rows are the revocation's record, and they say which revocation withdrew each grant
+    /// ([`crate::grants::GrantDirectory::withdrawn_with`]). A grant revocation is answered once the
+    /// grant it names stands revoked, with what the revocation that withdrew it withdrew: the grant
+    /// and the descendants withdrawn under it, or nothing when it went with an ancestor, which is
+    /// what a repeat finds. A device revocation is answered once the device's own record stands
+    /// revoked, because that is its last write, and grants withdrawn beside a device record still
+    /// live are not a withdrawal this host can call finished. Its answer names the grants
+    /// withdrawn with that record: the device's grants its revocation named, at the moment the
+    /// record carries, and the descendants withdrawn under them. Any fence still owed runs first,
+    /// so the answer's revision and barrier are ones that hold; a fence is always safe to raise,
+    /// and it is the one the earlier attempt owed. Anything short of that is an outcome this host
+    /// does not know, and it is not performed again.
     async fn revocation_on_record(&self, mutation: &MutationRequest) -> Result<ParamsValue> {
         let withdrawn: Vec<kr_protocol::ids::GrantId> = match mutation.method.method() {
             Some(Method::GrantRevoke) => {
                 let params: kr_protocol::sharing::GrantRevokeParams = parse(&mutation.params)?;
-                let named_revoked = self
-                    .sharing
-                    .grants()
-                    .record(params.grant_id)?
-                    .is_some_and(|record| record.revoked_at_ms.is_some());
-                if !named_revoked {
-                    return Err(unfinished_and_unknown());
+                match self.sharing.grants().withdrawn_with(params.grant_id)? {
+                    Some(withdrawn) => withdrawn,
+                    None => return Err(unfinished_and_unknown()),
                 }
-                self.sharing.grants().revoked_under(params.grant_id)?
             }
             Some(Method::DeviceRevoke) => {
                 let params: kr_protocol::sharing::DeviceRevokeParams = parse(&mutation.params)?;
-                let record_revoked = self
+                let Some(revoked_at) = self
                     .devices
                     .record_for_device(params.device_id)?
-                    .is_some_and(|record| record.revoked_at_ms.is_some());
-                if !record_revoked {
+                    .and_then(|record| record.revoked_at_ms)
+                else {
                     return Err(unfinished_and_unknown());
-                }
+                };
                 let mut withdrawn = Vec::new();
                 for held in self.sharing.grants().records_for_device(params.device_id)? {
-                    if held.revoked_at_ms.is_some() {
-                        withdrawn.extend(self.sharing.grants().revoked_under(held.grant.grant_id)?);
+                    if held.revoked_at_ms == Some(revoked_at.get())
+                        && held.revoked_by_parent.is_none()
+                    {
+                        withdrawn.extend(
+                            self.sharing
+                                .grants()
+                                .withdrawn_with(held.grant.grant_id)?
+                                .unwrap_or_default(),
+                        );
                     }
                 }
                 withdrawn
