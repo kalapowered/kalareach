@@ -383,12 +383,14 @@ The source workflow registers what a run reported against the exact version it w
 * **Immutable change-set binding.** A test result and a review result are recorded against one
   immutable change-set version (`kr_changeset`). A later edit in the workspace produces a later
   version; it never changes evidence already recorded against an earlier one.
-* **No quiesced captures yet.** A capture a workflow runs asks the host to hold its workspace
-  still, and the host refuses, naming why: a shared existing checkout is written by the user's own
-  tools, a workspace live sessions hold is written by their shells, and this host's own writers do
-  not yet ask for a reservation before they write. The capture records the per-file consistency it
-  performs and never claims a quiesced or point-in-time tree, and a capture node that requires a
-  quiesced capture fails with the reason.
+* **No quiesced captures yet.** A capture of the working tree a workflow runs asks the host to
+  hold its workspace still, and the host refuses, naming why: a shared existing checkout is
+  written by the user's own tools, a workspace live sessions hold is written by their shells, and
+  this host's own writers do not yet ask for a reservation before they write. The capture records
+  the per-file consistency it performs and never claims a quiesced tree, and a capture node that
+  requires a quiesced capture fails with the reason. An atomic snapshot, which reads the base
+  commit's own Git objects rather than the working tree, is a point-in-time capture and needs no
+  reservation.
 * **Separate identities.** The agent, the test run and the reviewer each carry their own session
   and agent identity, and a review is recorded against the reviewer who gave it.
 * **A review is its turn's completion.** A review result names the reviewer's turn that produced

@@ -586,9 +586,10 @@ impl std::fmt::Display for Unheld {
 ///
 /// Every reservation is refused, because none of [`Unheld`]'s reasons is ever absent: a
 /// reservation that did not keep every writer off would let a capture claim a quiesced tree it
-/// did not read. A capture therefore records the per-file consistency it performs and never
-/// claims a quiesced or point-in-time tree, and a node that requires one fails, naming the reason
-/// that applies to its workspace.
+/// did not read. A capture of the working tree therefore records the per-file consistency it
+/// performs and never claims a quiesced tree, and a node that requires one fails, naming the
+/// reason that applies to its workspace. An atomic snapshot is untouched by this: it reads the base
+/// commit's own Git objects rather than the working tree, and asks for no reservation.
 #[derive(Debug)]
 struct WorkflowQuiescence;
 
