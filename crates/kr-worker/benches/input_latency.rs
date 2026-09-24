@@ -588,43 +588,17 @@ async fn latency_samples(hosted: &Hosted) -> Result<Vec<Duration>, String> {
             }))
             .await
             .map_err(|error| format!("the write did not reach the worker: {error}"))?;
-        let mut accepted = None;
-        let elapsed = loop {
+        let mut keystroke = Keystroke::new(request_id);
+        let (elapsed, accepted) = loop {
+            if let Some(arrived) = keystroke.arrived() {
+                break arrived;
+            }
             let frame = tokio::time::timeout(Duration::from_secs(10), client.recv())
                 .await
-                .map_err(|_| "the echo of a keystroke never arrived".to_owned())?
+                .map_err(|_| keystroke.missing())?
                 .map_err(|error| format!("the connection ended: {error}"))?;
-            match frame {
-                ControlFrame::Response(response) => {
-                    let value = match response.outcome {
-                        kr_protocol::envelope::Outcome::Ok(value) => value,
-                        kr_protocol::envelope::Outcome::Error(error) => {
-                            return Err(format!("the write was refused: {}", error.message));
-                        }
-                    };
-                    accepted = Some(
-                        value
-                            .to_typed::<InputWriteResult>()
-                            .map_err(|error| format!("the answer did not decode: {error}"))?,
-                    );
-                }
-                ControlFrame::Notification(notification)
-                    if notification.event_type.as_str() == "session.output" =>
-                {
-                    let event = notification
-                        .payload
-                        .to_typed::<kr_protocol::recovery::OutputEvent>()
-                        .map_err(|error| format!("the output did not decode: {error}"))?;
-                    if !event.bytes.as_slice().is_empty() {
-                        break started.elapsed();
-                    }
-                }
-                _ => {}
-            }
+            keystroke.take(frame, started.elapsed())?;
         };
-        let accepted = accepted.ok_or_else(|| {
-            "the host answered the write before the application echoed it".to_owned()
-        })?;
         if accepted.forwarded_bytes.get() != 1 {
             return Err(format!(
                 "a single ordinary byte was forwarded whole: {} forwarded, {} held",
@@ -637,6 +611,95 @@ async fn latency_samples(hosted: &Hosted) -> Result<Vec<Duration>, String> {
     drop(client);
     samples.sort_unstable();
     Ok(samples)
+}
+
+/// One keystroke's two arrivals at the client: the host's answer to the write, and the
+/// application's echo of the byte as output.
+///
+/// The host promises no order between them. It answers `input.write` once the bytes are handed to
+/// the session's writer, without waiting for them to reach the application, while the echo goes
+/// through the terminal, the application and the whole output path, and the two frames are
+/// written to the connection by different tasks. The answer usually wins; on a busy machine the
+/// echo can be written first. Either order completes the keystroke, and the figure is the time to
+/// the echo whichever came first, because the echo is what says the byte reached the application
+/// and came back.
+#[derive(Debug)]
+struct Keystroke {
+    /// The write this keystroke went as, which its answer names.
+    request_id: kr_protocol::ids::RequestId,
+    /// The host's answer, once it has arrived.
+    answer: Option<InputWriteResult>,
+    /// How long after the write the echo arrived, once it has.
+    echo: Option<Duration>,
+}
+
+impl Keystroke {
+    fn new(request_id: kr_protocol::ids::RequestId) -> Self {
+        Self {
+            request_id,
+            answer: None,
+            echo: None,
+        }
+    }
+
+    /// Takes one frame that arrived `elapsed` after the write was sent.
+    ///
+    /// A refusal is a failure, and so is an answer to any other request: one keystroke is in
+    /// flight at a time, so an answer that is not this write's is an answer the measurement cannot
+    /// place.
+    fn take(&mut self, frame: ControlFrame, elapsed: Duration) -> Result<(), String> {
+        match frame {
+            ControlFrame::Response(response) => {
+                if response.request_id != self.request_id {
+                    return Err(format!(
+                        "an answer to request {} arrived while the write of request {} was in \
+                         flight",
+                        response.request_id, self.request_id
+                    ));
+                }
+                let value = match response.outcome {
+                    kr_protocol::envelope::Outcome::Ok(value) => value,
+                    kr_protocol::envelope::Outcome::Error(error) => {
+                        return Err(format!("the write was refused: {}", error.message));
+                    }
+                };
+                self.answer = Some(
+                    value
+                        .to_typed::<InputWriteResult>()
+                        .map_err(|error| format!("the answer did not decode: {error}"))?,
+                );
+            }
+            ControlFrame::Notification(notification)
+                if notification.event_type.as_str() == "session.output" =>
+            {
+                let event = notification
+                    .payload
+                    .to_typed::<kr_protocol::recovery::OutputEvent>()
+                    .map_err(|error| format!("the output did not decode: {error}"))?;
+                if self.echo.is_none() && !event.bytes.as_slice().is_empty() {
+                    self.echo = Some(elapsed);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// The time to the echo and the host's answer, once both have arrived.
+    fn arrived(&self) -> Option<(Duration, InputWriteResult)> {
+        Some((self.echo?, self.answer.clone()?))
+    }
+
+    /// What had not arrived when the wait for it ran out.
+    fn missing(&self) -> String {
+        match (&self.answer, self.echo) {
+            (None, None) => "neither the answer to a keystroke nor its echo arrived",
+            (None, Some(_)) => "a keystroke was echoed and its write was never answered",
+            (Some(_), None) => "a keystroke was answered and its echo never arrived",
+            (Some(_), Some(_)) => "a keystroke that had arrived was waited for again",
+        }
+        .to_owned()
+    }
 }
 
 /// Reads whatever this client has waiting until nothing arrives for `quiet`.
@@ -902,6 +965,115 @@ fn a_percentile_is_the_rank_it_claims_to_be() {
         percentile(&[Duration::from_millis(7)], 0.99),
         Duration::from_millis(7)
     );
+}
+
+/// The host's answer to the write of request `request`, which forwarded one byte.
+fn answer_to(request: u64) -> ControlFrame {
+    ControlFrame::Response(kr_protocol::envelope::Response {
+        request_id: kr_protocol::ids::RequestId::new(request),
+        outcome: kr_protocol::envelope::Outcome::Ok(
+            kr_protocol::envelope::ParamsValue::from_typed(&InputWriteResult {
+                sequence: kr_protocol::ids::InputSequence::new(request - 1),
+                forwarded_bytes: kr_protocol::scalars::U64::new(1),
+                held_prefix_bytes: kr_protocol::scalars::U64::new(0),
+            })
+            .expect("the answer encodes"),
+        ),
+    })
+}
+
+/// The output the application's echo reaches the client as.
+fn output_of(bytes: &[u8]) -> ControlFrame {
+    ControlFrame::Notification(kr_protocol::envelope::Notification {
+        stream_id: kr_protocol::ids::StreamId::new("output").expect("a stream name"),
+        sequence: kr_protocol::ids::EventSequence::new(1),
+        event_type: kr_protocol::ids::EventType::new("session.output").expect("an event type"),
+        payload: kr_protocol::envelope::ParamsValue::from_typed(
+            &kr_protocol::recovery::OutputEvent {
+                cursor: kr_protocol::scalars::U64::new(0),
+                bytes: Bytes::new(bytes.to_vec()),
+            },
+        )
+        .expect("the output encodes"),
+    })
+}
+
+/// A keystroke is complete once both its answer and its echo have arrived, in either order, and
+/// its figure is the time to the echo.
+///
+/// The host answers a write before the byte reaches the application, and the echo travels the
+/// output path on its own, so on a busy machine the echo can reach the client first. That is a
+/// keystroke like any other rather than a sample that failed.
+#[test]
+fn a_keystroke_is_its_answer_and_its_echo_in_either_order() {
+    let millis = Duration::from_millis;
+    let request = kr_protocol::ids::RequestId::new(7);
+
+    let mut keystroke = Keystroke::new(request);
+    keystroke
+        .take(answer_to(7), millis(1))
+        .expect("the answer is taken");
+    assert_eq!(keystroke.arrived(), None, "the echo is still owed");
+    keystroke
+        .take(output_of(b"x"), millis(2))
+        .expect("the echo is taken");
+    let (elapsed, accepted) = keystroke.arrived().expect("both have arrived");
+    assert_eq!(elapsed, millis(2));
+    assert_eq!(accepted.forwarded_bytes.get(), 1);
+
+    let mut keystroke = Keystroke::new(request);
+    keystroke
+        .take(output_of(b"x"), millis(1))
+        .expect("an echo that arrives before the answer is taken");
+    assert_eq!(keystroke.arrived(), None, "the answer is still owed");
+    keystroke
+        .take(answer_to(7), millis(3))
+        .expect("the answer is taken");
+    let (elapsed, accepted) = keystroke.arrived().expect("both have arrived");
+    assert_eq!(
+        elapsed,
+        millis(1),
+        "the figure is the time to the echo, not to the answer after it"
+    );
+    assert_eq!(accepted.forwarded_bytes.get(), 1);
+}
+
+/// What does not complete a keystroke: an empty batch of output is not its echo, and an answer to
+/// another write or a refusal fails the sample.
+#[test]
+fn a_keystroke_is_not_completed_by_an_empty_batch_or_by_another_writes_answer() {
+    let millis = Duration::from_millis;
+    let request = kr_protocol::ids::RequestId::new(7);
+
+    let mut keystroke = Keystroke::new(request);
+    keystroke
+        .take(output_of(b""), millis(1))
+        .expect("an empty batch is taken");
+    keystroke
+        .take(answer_to(7), millis(2))
+        .expect("the answer is taken");
+    assert_eq!(keystroke.arrived(), None, "an empty batch is not the echo");
+    assert_eq!(
+        keystroke.missing(),
+        "a keystroke was answered and its echo never arrived"
+    );
+
+    let failure = Keystroke::new(request)
+        .take(answer_to(6), millis(1))
+        .expect_err("an answer to another write is not this one's");
+    assert!(failure.contains("request 6"), "{failure}");
+
+    let refused = ControlFrame::Response(kr_protocol::envelope::Response {
+        request_id: request,
+        outcome: kr_protocol::envelope::Outcome::Error(kr_protocol::error::ProtocolError::new(
+            kr_protocol::error::ErrorCode::LeaseLost,
+            "the lease moved",
+        )),
+    });
+    let failure = Keystroke::new(request)
+        .take(refused, millis(1))
+        .expect_err("a refused write fails the sample");
+    assert_eq!(failure, "the write was refused: the lease moved");
 }
 
 /// Both measurements need a root program that echoes, because the echo is what says the byte
