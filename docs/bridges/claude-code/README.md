@@ -5,7 +5,12 @@ that Claude Code starts as its own child and talks to over that child's standard
 hook is a command it runs for an event. So the only place KalaReach can stand is where those
 processes stand. The Claude Code connector package installs a small registration that makes Claude
 Code start `kr-hook`, the core forwarder, in both places. `kr-hook` carries what Claude Code says to
-the worker that owns the session, and the worker decides everything about it.
+the endpoint of the launch it belongs to, and the worker's gateway for that launch decides
+everything about it.
+
+What follows is the contract between the two: what the forwarder sends, and what the gateway checks
+and does when it serves a launch's endpoint. The gateway serves a launch it made; the section
+"Finding the worker" says what that launch publishes.
 
 The forwarder runs under Claude Code's own permissions, outside the KalaReach plugin sandbox and
 outside Wasmtime. The package's installation grant says so before anything is installed.
@@ -123,23 +128,29 @@ The thread is Claude Code's `session_id`. `/clear` and an interactive `/resume` 
 start another; compaction starts the same one again, which changes nothing.
 
 Every hook is its own process on its own connection, so reports can arrive in any order. The worker
-orders them by when each hook process started: first by the start value the kernel reports, and
-then, between two processes the kernel's clock cannot tell apart, by the boot-clock reading the
-forwarder took when it started. A report older than the one in force changes nothing, and a
-thread's own end overrules an older report of it starting, whichever arrived first. Two reports the
-worker cannot order at all move nothing: the binding stays where it was, and rich mutations are
-suspended until a report it can order settles the thread.
+orders them by what the kernel recorded when Claude Code started each hook process: the start value
+first, and within one tick of the kernel's clock the process identifier, which Linux and macOS
+allocate in sequence. Claude Code starts its hooks one after another, so the hook for a later event
+has the later record. A report whose hook started after the one in force decides the thread, and one
+whose hook started before changes nothing, whichever arrived first. A `SessionStart` for a resume, a
+clear or a fork is a new selection even of the thread already selected, so the binding advances;
+one for a compaction continues the thread and changes nothing. When two reports that disagree cannot
+be ordered at all, the worker does not guess: no thread is vouched for, the binding advances so
+nothing bound to the old thread survives, and rich mutations are suspended until a report whose hook
+started later settles it.
 
 ### Which thread asked a question
 
 A contact question is asked through the contact skill's own server, which one Claude Code process
 shares between all of its threads. When a question is asked, the worker records the thread the
-bridge last reported selected, and its revision. That is not yet the question's binding, because the
+bridge vouches is selected, and its revision. That is not the question's binding yet, because the
 request may have come from a thread whose report had not arrived. When the `ask_user` call finishes,
 its `PostToolUse` hook says which thread ran it. If that is the thread recorded when the question
 was asked, the question is bound to the revision recorded then, and a later switch of thread
 invalidates it for every client. If the reports name another thread, or disagree with each other,
-the question stays bound to the application alone and claims no thread-switch detection.
+the question stays bound to the application alone and claims no thread-switch detection. So does a
+question the agent asked again with the same request identifier: no one call asked it, so no report
+of a call can say which thread did.
 
 ## Channels
 
@@ -171,9 +182,9 @@ session as a message. A verdict is checked in full before the request it answers
 malformed one leaves the request answerable by a correct one. An approval too large for the exchange
 is not relayed, and the terminal's own dialog answers it.
 
-The worker hands the admitted channel to whatever serves the application's Channels traffic. Which
-answer goes is the worker's arbitration; the channel's checks are the last ones before the bytes
-leave KalaReach. When the worker closes the channel, the channel ends its session with Claude Code
+The gateway hands the admitted channel's connection to its caller, which serves the application's
+Channels traffic on it. Which answer goes is the worker's arbitration; the channel's checks are the
+last ones before the bytes leave KalaReach. When the worker closes the channel, the channel ends its session with Claude Code
 and exits 1. When Claude Code closes its end, the channel exits 0.
 
 ## Platforms
@@ -182,7 +193,8 @@ Where the platform has a private socket, the endpoint is one inside the worker's
 runtime directory, and the kernel names every connecting process. Elsewhere the endpoint is
 loopback, and the credential is the whole authentication. On a platform where the host cannot prove
 that a file is closed to other accounts, the launch publishes no credential file. A forwarder there
-finds nothing to present: its hooks answer `{}` and its channel declares nothing.
+finds nothing to present: its hooks answer `{}`, and its channel exits with a failure before the
+handshake, which Claude Code shows as a failed server.
 
 ## What admission does not prove
 

@@ -371,9 +371,10 @@ async fn kr_req_11_62_a_thread_switch_the_hooks_report_invalidates_the_questions
         QuestionState::Expired
     );
 
-    // Asked in the second thread, and reported both from another thread (a retry the agent made
-    // there, which returns this same question) and from its own: the reports disagree, so the
-    // question is bound to nothing and a switch does not invalidate it.
+    // Asked while the second thread is selected, then asked again with the same request: the
+    // retry returns this same question, so no one call asked it and it keeps no origin. Even a
+    // report naming the thread it was first asked in, arriving first and swept at once, binds it
+    // to nothing, and a switch leaves it open.
     let (retried, _) = questions
         .create(&helper, &ask("retried"), now(4_000))
         .expect("asked");
@@ -384,8 +385,9 @@ async fn kr_req_11_62_a_thread_switch_the_hooks_report_invalidates_the_questions
         again.deduplicated,
         "a retry returns the question it asked before"
     );
-    hook(&mut launch, &asked(FIRST_THREAD, "retried")).await;
     hook(&mut launch, &asked(SECOND_THREAD, "retried")).await;
+    assert!(questions.sweep(now(4_002)).expect("sweeps").is_empty());
+    hook(&mut launch, &asked(FIRST_THREAD, "retried")).await;
     // Asked while the first thread is selected, and reported only from the second: the report
     // does not name the thread it was asked in, so it binds nothing either.
     hook(&mut launch, &session_start(FIRST_THREAD, "resume")).await;
@@ -401,4 +403,27 @@ async fn kr_req_11_62_a_thread_switch_the_hooks_report_invalidates_the_questions
     for unbound in [retried.question.question_id, elsewhere.question.question_id] {
         assert_eq!(state_of(&questions, unbound, 4_100), QuestionState::Pending);
     }
+
+    // Bound in the second thread: a compaction goes on in that thread and leaves the question
+    // open, and a resume of the same thread is a new selection, which invalidates it.
+    let (compacted, _) = questions
+        .create(&helper, &ask("across-a-compaction"), now(5_000))
+        .expect("asked");
+    hook(&mut launch, &asked(SECOND_THREAD, "across-a-compaction")).await;
+    let (continued, _, _) = hook(&mut launch, &session_start(SECOND_THREAD, "compact")).await;
+    assert_eq!(continued.thread, ThreadChange::Unchanged);
+    assert_eq!(
+        state_of(&questions, compacted.question.question_id, 5_100),
+        QuestionState::Pending
+    );
+    let (resumed, _, _) = hook(&mut launch, &session_start(SECOND_THREAD, "resume")).await;
+    assert!(
+        matches!(resumed.thread, ThreadChange::Selected(_)),
+        "{:?}",
+        resumed.thread
+    );
+    assert_eq!(
+        state_of(&questions, compacted.question.question_id, 5_200),
+        QuestionState::Expired
+    );
 }

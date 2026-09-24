@@ -349,14 +349,8 @@ fn kr_req_12_14_over_loopback_the_forwarder_presents_the_launch_credential() {
                 {
                     observation.push(byte[0]);
                 }
-                let mut observation: serde_json::Value =
+                let observation: serde_json::Value =
                     serde_json::from_slice(&observation).expect("the observation is JSON");
-                let started = observation["kr_observation"]
-                    .as_object_mut()
-                    .and_then(|reported| reported.remove("started"))
-                    .and_then(|started| started.as_u64())
-                    .expect("it says when the hook started");
-                assert!(started <= kr_ipc::clock::boot_elapsed_ms());
                 assert_eq!(
                     observation,
                     serde_json::json!({"kr_observation": {

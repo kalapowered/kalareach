@@ -3740,21 +3740,25 @@ connection. When that exchange completes, the host has the report before the hoo
 application. It does not when the hook reaches its deadline first, or when the application moves on
 without waiting, as Claude Code may while background `SessionStart` hooks still run; the report is
 then applied late, or, if the hook has already gone, not at all. A thread
-starting selects that thread and advances the binding revision; the selected thread ending leaves
-none selected. Reports are ordered by when each hook process started, by the kernel's start value
-and then by the boot-clock reading the forwarder took, never by when they arrived; a report older
-than the one in force changes nothing, and two reports that cannot be ordered move nothing and
-suspend rich mutations until one that can be ordered settles the thread. Every observation goes
-into the instance's observed history.
+starting selects that thread and advances the binding revision, even when it is the thread already
+selected, since a resume is a new selection; a thread continuing after a compaction changes nothing;
+a thread ending leaves none selected. Reports are ordered by what the kernel recorded when the
+application started each hook, the start value and, within one tick of the kernel's clock, the
+process identifier where the platform allocates identifiers in sequence, never by when they
+arrived. A report whose hook started before the one in force changes nothing. Two reports that
+cannot be ordered and disagree leave no thread vouched for: the binding advances so nothing bound to
+the old thread survives, and rich mutations are suspended until a report whose hook started later
+settles it. Every observation goes into the instance's observed history.
 
-A contact question records, when it is asked, the thread the bridge last reported selected and its
+A contact question records, when it is asked, the thread the bridge vouches is selected and its
 revision. When the application's own hook reports that the call that asked it ran in that same
 thread, the question is bound to that revision, and a later switch of thread invalidates it. If the
-reports name another thread, or disagree, the question stays bound to the application alone.
+reports name another thread, or disagree, or the question was asked more than once with the same
+request identifier, it stays bound to the application alone.
 
-An admitted channel's connection is handed to whatever serves the application's own protocol on it,
-as JSON lines within the gateway's native frame bound. The Claude Code bridge is described in
-[`docs/bridges/claude-code/README.md`](../bridges/claude-code/README.md).
+The gateway hands an admitted channel's connection to its caller, which serves the application's own
+protocol on it as JSON lines within the gateway's native frame bound. The Claude Code bridge is
+described in [`docs/bridges/claude-code/README.md`](../bridges/claude-code/README.md).
 
 ## Agent methods
 

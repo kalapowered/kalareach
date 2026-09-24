@@ -315,6 +315,15 @@ impl Store {
                     request_id: params.request_id.clone(),
                 });
             }
+            // A question asked more than once has no one call that asked it, so no report of a
+            // call can say which thread asked it: it keeps no origin and stays application-scoped.
+            // A binding already recorded from the call that created it stays.
+            self.connection
+                .execute(
+                    "DELETE FROM question_origins WHERE question_id = ?1",
+                    params![existing.question.question_id.get().as_bytes().as_slice()],
+                )
+                .map_err(QuestionError::unavailable)?;
             // An exact retry returns the question as it stands and the token it was issued with.
             // The sealed copy is what makes that possible without ever storing the token itself.
             let caller_token = token::unseal(
@@ -387,8 +396,8 @@ impl Store {
             )
             .map_err(QuestionError::unavailable)?;
         // The thread a bridge vouched was selected when this question was asked, recorded once,
-        // with the question. An exact retry returns the question above and never reaches here, so
-        // a retry asked in another thread cannot replace the context the question was asked in.
+        // with the question. An exact retry returns the question above, never reaches here, and
+        // takes the origin away.
         if let (Some(_), Some((thread, revision))) = (binding, origin) {
             transaction
                 .execute(

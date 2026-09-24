@@ -39,14 +39,11 @@ pub const NEUTRAL_ANSWER: &str = "{}";
 /// Runs one hook and answers neutrally.
 #[must_use]
 pub fn run() -> std::process::ExitCode {
-    // Read first, so it says when this hook started: it orders this report against the reports of
-    // hooks the kernel's clock cannot tell this one apart from.
-    let started = kr_ipc::clock::boot_elapsed_ms();
     let (finished, outcome) = std::sync::mpsc::channel();
     // The work runs on its own thread so the deadline is kept whatever it is waiting on. When the
     // deadline passes, the answer is written and the process ends, which ends that thread too.
     std::thread::spawn(move || {
-        let _ = finished.send(observe(started));
+        let _ = finished.send(observe());
     });
     match outcome.recv_timeout(HOOK_DEADLINE) {
         Ok(Ok(())) => {}
@@ -72,13 +69,13 @@ pub const REGISTRATION_WAIT: Duration = Duration::from_millis(250);
 /// connection. This waits for that close, so an observation that selects a thread has been applied
 /// before the hook returns to Claude Code, which holds a session's first response until its
 /// `SessionStart` hooks have finished.
-fn observe(started: u64) -> Result<(), String> {
+fn observe() -> Result<(), String> {
     let input = read_input(std::io::stdin().lock())?;
     // Outside a launch there is nobody to tell, and the answer is the same neutral one.
     let Some(paths) = Paths::from_environment().map_err(|error| error.to_string())? else {
         return Ok(());
     };
-    let Some(observation) = observation(&input, started) else {
+    let Some(observation) = observation(&input) else {
         return Ok(());
     };
     let registration =
@@ -167,12 +164,14 @@ pub fn read_input(input: impl std::io::Read) -> Result<HookInput, String> {
 /// ends the thread, a tool finishing or failing and a notification are recorded as observed
 /// history. A finished call of the contact skill's `ask_user` also names the request it asked, so
 /// the worker learns which thread the question was asked in.
-///
-/// `started` is the boot-clock reading, in milliseconds, this hook took when it started.
 #[must_use]
-pub fn observation(input: &HookInput, started: u64) -> Option<serde_json::Value> {
+pub fn observation(input: &HookInput) -> Option<serde_json::Value> {
     let thread = kr_protocol::ids::AgentThreadId::new(input.session_id.clone()).ok()?;
     let (event, detail) = match input.hook_event_name.as_str() {
+        // A compaction goes on in the same thread; every other start is a new selection.
+        "SessionStart" if input.source.as_deref() == Some("compact") => {
+            ("thread_continued", input.source.as_deref())
+        }
         "SessionStart" => ("thread_started", input.source.as_deref()),
         "SessionEnd" => ("thread_ended", input.reason.as_deref()),
         "PostToolUse" => ("tool_finished", input.tool_name.as_deref()),
@@ -183,7 +182,6 @@ pub fn observation(input: &HookInput, started: u64) -> Option<serde_json::Value>
     let mut reported = serde_json::Map::new();
     reported.insert("event".to_owned(), serde_json::json!(event));
     reported.insert("thread".to_owned(), serde_json::json!(thread.as_str()));
-    reported.insert("started".to_owned(), serde_json::json!(started));
     if let Some(detail) = detail {
         reported.insert(
             "detail".to_owned(),
@@ -324,18 +322,9 @@ fn answer() -> std::process::ExitCode {
 mod tests {
     use super::*;
 
-    /// The observation one payload becomes, without the start reading every observation carries.
     fn translated(payload: &serde_json::Value) -> Option<serde_json::Value> {
         let input = read_input(payload.to_string().as_bytes()).expect("a hook's input");
-        observation(&input, 42).map(|frame| {
-            let mut reported = frame["kr_observation"].clone();
-            assert_eq!(reported["started"], 42, "it says when the hook started");
-            reported
-                .as_object_mut()
-                .expect("an object")
-                .remove("started");
-            reported
-        })
+        observation(&input).map(|frame| frame["kr_observation"].clone())
     }
 
     #[test]
@@ -345,6 +334,10 @@ mod tests {
             (
                 serde_json::json!({"session_id": thread, "hook_event_name": "SessionStart", "source": "clear", "model": "m"}),
                 serde_json::json!({"event": "thread_started", "thread": thread, "detail": "clear"}),
+            ),
+            (
+                serde_json::json!({"session_id": thread, "hook_event_name": "SessionStart", "source": "compact"}),
+                serde_json::json!({"event": "thread_continued", "thread": thread, "detail": "compact"}),
             ),
             (
                 serde_json::json!({"session_id": thread, "hook_event_name": "SessionEnd", "reason": "resume"}),
