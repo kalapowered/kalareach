@@ -22,6 +22,8 @@ pub enum Material {
     NotificationPreviewPrivateKey,
     /// The recovery seed itself.
     RecoverySeed,
+    /// A settings collection's key, at any epoch.
+    SyncCollectionKey,
     /// One grant.
     Grant {
         /// Whether the grant had been revoked.
@@ -43,6 +45,7 @@ impl Material {
             Self::ControlSigningPrivateKey => "a reusable control-signing private key",
             Self::NotificationPreviewPrivateKey => "the notification preview private key",
             Self::RecoverySeed => "the recovery seed",
+            Self::SyncCollectionKey => "a settings collection key",
             Self::Grant { revoked: true } => "a revoked grant",
             Self::Grant { revoked: false } => "a grant",
             Self::HostGrantAuthority => "this host's grant and revocation authority",
@@ -84,6 +87,11 @@ impl Admission {
 /// Section 20: *do not back up reusable endpoint/control private keys*. A backup that carried them
 /// would be a backup that recreates a device's authority from a service object, which is exactly
 /// what section 24 says a restore must not do.
+///
+/// A settings collection's key is refused as well. Settings come back through the archive's own
+/// wraps, the recovery recipient's among them; the key the collection is sealed under reaches a
+/// device only through that device's wrap in a key record, so a restored device reads the
+/// collection again only once a member has authorised it.
 #[must_use]
 pub const fn may_back_up(material: Material) -> Admission {
     match material {
@@ -105,6 +113,11 @@ pub const fn may_back_up(material: Material) -> Admission {
         },
         Material::RecoverySeed => Admission::Refused {
             because: "a seed inside the archive it unlocks protects nothing",
+        },
+        Material::SyncCollectionKey => Admission::Refused {
+            because: "a settings collection key in an archive the recovery seed opens would make \
+                      the seed a way into the collection, which a device joins only through its own \
+                      wrap after the owner authorises it",
         },
         Material::HostGrantAuthority => Admission::Refused {
             because: "grants and revocation state have one host authority, which a restored copy \
