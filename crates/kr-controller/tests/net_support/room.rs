@@ -451,6 +451,18 @@ impl RendezvousHost for TestRoom {
     }
 }
 
+impl kr_client::pairing::candidate::CandidateRoom for TestRoom {
+    fn open<'a>(
+        &'a self,
+        _origin: &'a RendezvousOrigin,
+        locator: &'a Locator,
+    ) -> kr_client::pairing::BoxFuture<'a, Result<RoomSocket, kr_client::pairing::room::RoomError>>
+    {
+        let socket = self.candidate(locator.as_str());
+        Box::pin(async move { Ok(socket) })
+    }
+}
+
 impl Rendezvous for TestRoom {
     fn attach(
         &self,

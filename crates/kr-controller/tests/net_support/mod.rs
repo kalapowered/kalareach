@@ -91,6 +91,8 @@ pub struct Host {
     pub owner_device: Option<Device>,
     /// The rendezvous service this host offers codes through, in this process.
     pub room: room::TestRoom,
+    /// The network configuration the host was started with, which a restart keeps.
+    endpoint_config: EndpointConfig,
 }
 
 impl Host {
@@ -108,7 +110,27 @@ impl Host {
 
     /// Starts a daemon on a fresh environment, on the network, with no owner yet.
     pub async fn start_unowned() -> Self {
-        Self::start_on(kr_ipc::testing::TempHost::create(), room::TestRoom::new()).await
+        Self::start_on(
+            kr_ipc::testing::TempHost::create(),
+            room::TestRoom::new(),
+            loopback(),
+        )
+        .await
+    }
+
+    /// Starts a daemon whose network selects the services `endpoint` names, with `owner` as its
+    /// first owner.
+    pub async fn start_with_endpoint(owner: &DeviceKeys, endpoint: EndpointConfig) -> Self {
+        let mut host = Self::start_on(
+            kr_ipc::testing::TempHost::create(),
+            room::TestRoom::new(),
+            endpoint,
+        )
+        .await;
+        let (device, record) = bootstrap_owner(&host, owner).await;
+        host.owner = Some(record);
+        host.owner_device = Some(device);
+        host
     }
 
     /// Stops this daemon and starts another on the same environment tree, the way a restart of
@@ -121,6 +143,7 @@ impl Host {
             clients,
             owner,
             room,
+            endpoint_config,
             ..
         } = self;
         clients.abort();
@@ -138,14 +161,18 @@ impl Host {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         drop(controller);
-        let mut host = Self::start_on(temp, room).await;
+        let mut host = Self::start_on(temp, room, endpoint_config).await;
         host.owner = owner;
         host
     }
 
     /// Starts a daemon on the network over an environment tree that may already hold records,
-    /// offering codes through `room`.
-    async fn start_on(temp: kr_ipc::testing::TempHost, room: room::TestRoom) -> Self {
+    /// offering codes through `room`, with `endpoint` as its network configuration.
+    async fn start_on(
+        temp: kr_ipc::testing::TempHost,
+        room: room::TestRoom,
+        network_endpoint: EndpointConfig,
+    ) -> Self {
         let environment = temp.environment();
         let environment_id = temp.environment_id();
         let secrets = environment.secrets_dir();
@@ -180,7 +207,7 @@ impl Host {
             &controller,
             NetworkSetup {
                 settings: kr_controller::service::net::config::NetworkSettings {
-                    endpoint: loopback(),
+                    endpoint: network_endpoint.clone(),
                     ..kr_controller::service::net::config::NetworkSettings::default()
                 },
                 secrets: Arc::new(MemoryStore::new()),
@@ -200,6 +227,7 @@ impl Host {
             owner: None,
             owner_device: None,
             room,
+            endpoint_config: network_endpoint,
         }
     }
 
