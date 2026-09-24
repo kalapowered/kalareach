@@ -3765,9 +3765,10 @@ revision. The hook's report of a finished call names the call by its request ide
 call that succeeded is reported with one. So while that identifier names this one question on the
 instance, its reports are the reports of the call that asked it: when they name the thread recorded
 at the asking, the question is bound to that revision, and a later switch of thread invalidates it.
-If the reports name another thread or disagree, or the identifier is used again (an exact retry, or
-another question of the same instance under the same identifier), no report binds it, and it stays
-bound to the application alone.
+If the reports name another thread or disagree, it stays bound to the application alone. Once the
+identifier is used again (an exact retry, or another question of the same instance under the same
+identifier, with a recorded thread or none), no later report binds either question; one already
+bound by then was bound by its own call's report and stays bound.
 
 The gateway hands an admitted channel's connection to its caller, which serves the application's own
 protocol on it as JSON lines within the gateway's native frame bound. The Claude Code bridge is

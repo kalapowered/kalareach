@@ -425,14 +425,15 @@ fn a_switch_an_attesting_bridge_detects_invalidates_the_questions_asked_under_th
     );
 }
 
-/// A bridge that vouches for one selected thread, as the broker's native bridge does, and places
-/// each request in the thread the test says ran it, as the application's hooks do. Every helper it
-/// knows belongs to its one instance.
+/// A bridge that vouches for one selected thread while it can, as the broker's native bridge does,
+/// and places each request in the thread the test says ran it, as the application's hooks do. Every
+/// helper it knows belongs to its one instance.
 #[derive(Debug)]
 struct Placing {
     helpers: Vec<ProcessStartIdentity>,
     instance: ApplicationInstanceId,
     revision: std::sync::Mutex<u64>,
+    vouching: std::sync::atomic::AtomicBool,
     ran: std::sync::Mutex<std::collections::BTreeMap<String, AgentThreadId>>,
 }
 
@@ -450,6 +451,11 @@ impl Placing {
 
     fn revision(&self) -> AgentBindingRevision {
         AgentBindingRevision::new(*self.revision.lock().expect("the lock"))
+    }
+
+    fn vouch(&self, vouching: bool) {
+        self.vouching
+            .store(vouching, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -476,8 +482,9 @@ impl kr_worker::questions::AgentBindings for Placing {
         &self,
         application_instance_id: ApplicationInstanceId,
     ) -> Option<(AgentThreadId, AgentBindingRevision)> {
-        (application_instance_id == self.instance)
-            .then(|| (AgentThreadId::new("t1").expect("valid"), self.revision()))
+        (application_instance_id == self.instance
+            && self.vouching.load(std::sync::atomic::Ordering::SeqCst))
+        .then(|| (AgentThreadId::new("t1").expect("valid"), self.revision()))
     }
 
     fn attested(
@@ -497,7 +504,8 @@ impl kr_worker::questions::AgentBindings for Placing {
 /// instance. Asked alone and reported from the thread selected when it was asked, a question is
 /// bound to that thread's revision, and a switch invalidates it. Asked under an identifier another
 /// helper of the same instance used for another question, neither question is bound by a report,
-/// whichever it came from, and a switch leaves both open, application-scoped.
+/// whichever it came from, and a switch leaves both open, application-scoped. That holds when the
+/// second is asked while the bridge vouches for no thread, and so has no origin of its own.
 #[test]
 fn a_request_identifier_two_questions_of_one_instance_share_places_neither_in_a_thread() {
     let instance = ApplicationInstanceId::new(Uuid::from_bytes([12; 16]));
@@ -505,6 +513,7 @@ fn a_request_identifier_two_questions_of_one_instance_share_places_neither_in_a_
         helpers: vec![this_process(), parent_process()],
         instance,
         revision: std::sync::Mutex::new(1),
+        vouching: std::sync::atomic::AtomicBool::new(true),
         ran: std::sync::Mutex::default(),
     });
     let questions = Questions::open(None, session(), SessionEpoch::V1)
@@ -518,9 +527,11 @@ fn a_request_identifier_two_questions_of_one_instance_share_places_neither_in_a_
     let (first, _) = questions
         .create(&first_helper, &ask("shared"), now(1_000))
         .expect("asked");
+    bridge.vouch(false);
     let (second, _) = questions
         .create(&second_helper, &ask("shared"), now(1_100))
         .expect("asked");
+    bridge.vouch(true);
     assert_ne!(
         first.question.question_id, second.question.question_id,
         "two helpers asked two questions under one identifier"

@@ -170,10 +170,11 @@ which names no request. So while the identifier names this one question, its rep
 reports of the call that asked it. If they name the thread recorded when the question was asked,
 the question is bound to the revision recorded then, and a later switch of thread invalidates it for
 every client. If the reports name another thread, or disagree with each other, the question stays
-bound to the application alone and claims no thread-switch detection. So does a question whose
-identifier is used again, by an exact retry that returns it or by another question the same launch
-asked under that identifier: no one call asked under it, so no report of a call can say which
-thread did.
+bound to the application alone and claims no thread-switch detection. Once the identifier is used
+again, by an exact retry that returns the question or by another question the same launch asked
+under it, no one call asked under it, so no later report binds either question. A question already
+bound by then was bound by its own call's report, before any other call used the identifier, and
+stays bound.
 
 ## Channels
 
@@ -215,10 +216,10 @@ session with Claude Code and exits 1. When Claude Code closes its end, the chann
 Where the platform has a private socket, the endpoint is one inside the worker's owner-only
 runtime directory, and the kernel names every connecting process. Elsewhere the endpoint is
 loopback, and the credential is the whole authentication. On a platform where the host cannot prove
-that a file is closed to other accounts, it does not publish the credential, and the gateway makes
-no launch there for a bridge to belong to. A forwarder whose environment names a registration it
-cannot read answers its hooks with `{}` and ends its channel with a failure before the handshake,
-which Claude Code shows as a failed server.
+that a file is closed to other accounts, it writes neither the credential file nor the registration
+that names it, so no bridge is admitted there. A forwarder whose environment names a registration
+it cannot read answers its hooks with `{}` and ends its channel with a failure before the
+handshake, which Claude Code shows as a failed server.
 
 ## What admission does not prove
 

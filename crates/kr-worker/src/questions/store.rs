@@ -399,11 +399,11 @@ impl Store {
         // The thread a bridge vouched was selected when this question was asked, recorded once,
         // with the question. It becomes the question's binding only if the report of the call that
         // asked names that thread, and a report names its call by the request identifier alone.
-        // So the origin is kept only while the identifier names this one question on this
-        // instance: an exact retry returns the question above and takes its origin away, and a
-        // question asked under an identifier another question of this instance already used keeps
-        // none and takes the other's away.
-        if let (Some(binding), Some((thread, revision))) = (binding, origin) {
+        // So an origin is kept only while the identifier names that one question on its instance:
+        // an exact retry returns the question above and takes its origin away, and a question
+        // asked under an identifier another question of this instance already used, with an origin
+        // of its own or none, keeps none and takes the other's away.
+        if let Some(binding) = binding {
             let instance = binding.application_instance_id.get();
             let asked_before: bool = transaction
                 .query_row(
@@ -436,7 +436,7 @@ impl Store {
                         params![params.request_id, instance.as_bytes().as_slice()],
                     )
                     .map_err(QuestionError::unavailable)?;
-            } else {
+            } else if let Some((thread, revision)) = origin {
                 transaction
                     .execute(
                         "INSERT INTO question_origins (question_id, thread, revision)
