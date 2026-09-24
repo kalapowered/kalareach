@@ -88,28 +88,38 @@ it dispatches and once more where the node's effect begins.
 
 * **Read, never supplied.** Nothing a caller passes in decides what a run may do. A grant this
   host never issued names no workflow it will install.
-* **Decided under the host's policy.** The grant is intersected with the host's policy as it
-  stands: a revoked ancestor, the clock floor, redemption, expiry, an authority revision the host
-  never issued, the organisation lease a grant requires and the bounded offline validity for a
-  grant held by a paired device. The rights the policy leaves are the rights the node is checked
-  against. Each of these decisions raises the clock floor and writes it down, as the host's other
-  decisions do, so a clock wound back between two dispatches of an unattended workflow does not
-  revive an expiry the host already refused. A decision stands on the floor in memory, so a floor
-  that is not yet on disk is written before the decision is used, and one that cannot be written
-  stops every dispatch until a write succeeds, because a restart would not know about it. A grant
-  that requires an organisation membership is refused here, because this path resolves no member
-  account for its recipient.
+* **Decided as a device's request is.** The daemon decides the grant with the model it decides a
+  paired device's request with. The rights ceiling the host's configuration puts in force narrows
+  the grant before anything else, so a right the configuration removed is not one a workflow may
+  use. The grant is then intersected with the host's policy as it stands: a revoked ancestor, the
+  clock floor, redemption, expiry, an authority revision the host never issued, the organisation
+  lease a grant requires and the bounded offline validity for a grant held by a paired device.
+  That bound is held on the continuous clock it was anchored on as well as in UTC, so a wall clock
+  wound back after the bound ran out does not bring it back. The rights left are the rights the
+  node is checked against. A grant that requires an organisation membership is refused here,
+  because nothing on this host yet records which member account a grant's recipient is.
+* **Nothing is decided on a floor a restart would not know.** Each decision raises the clock
+  floor, so a clock wound back between two dispatches of an unattended workflow does not revive an
+  expiry the host already refused. A refusal the clock decided is answered only once the floor it
+  stood on is written down, and while any such floor is still owed its record nothing is decided at
+  all: the write is made first, and while it cannot be, authority is unavailable and nothing is
+  dispatched. Every wait is therefore over before the decision, which is taken at the reading the
+  caller took advanced by the time those waits took, so a deadline that passed while the decision
+  waited for storage is decided as passed, and nothing waits between a permission and its use.
 * **Withdrawn is withdrawn.** A grant that has expired, has been revoked, has a revoked ancestor,
   or has never had its invitation redeemed admits no run. A withdrawal that lands between two
   nodes of a run stops the run where it stands: the node that has not been dispatched is paused,
   and nothing is claimed about the node that already ran.
-* **Asked again where the effect begins.** The host's own action runner reads the grant once more
-  inside the task that performs the effect, after the wait for that task. A refusal there pauses
-  the node and its run exactly as a refusal a moment earlier would have, because no action was
-  performed. The change-set service's own lock and preparation come after that last check. That
-  service can hold an admission in force inside its own transactions, and a workflow node's
-  capture does not give it one yet, so a withdrawal that lands during the service's own wait is
-  not seen until the next node.
+* **Held while the effect commits.** The host's own action runner reads the grant once more
+  inside the task that performs the effect, before a capture reads a working tree. The change-set
+  service then asks for the node's grant around every transaction that commits the effect: the
+  clone identity a capture fixes, the change set and its version, the row a materialisation is
+  written under. Each time, the host takes its registry, which a revocation takes to complete,
+  refuses while a fence is owed, reads the grant as it stands and checks the node against it, and
+  only then lets the transaction commit. A withdrawal that lands while the write waits for the
+  store is seen there and nothing is written; one that begins while the write commits finishes
+  after it. A refusal at any of these points pauses the node and its run exactly as a refusal a
+  moment earlier would have, because the effect did not happen.
 * **Each node needs the right its effect needs.** A `shell_command` or `run_tests` node needs
   `terminal.input`, `create_session` needs `session.create`, `request_review` needs
   `agent.prompt` and `session.view`, `capture_changeset` needs `changeset.create`,
@@ -117,20 +127,18 @@ it dispatches and once more where the node's effect begins.
   These are the rights the methods that perform the same effects require, so a workflow is not a
   way around the method a person would otherwise have called, and a view-only invitation cannot
   obtain terminal input through one.
-* **No more than the holder is served.** The host can refuse a grant's holder an effect whatever
-  rights the grant carries, and a workflow under that grant is refused it too. A paired device is
-  served no change-set write at the door it reaches this host through, because the change-set
-  service does not hold the device's grant inside its own transactions and a grant withdrawn while
-  the write prepares would still reach the effect. So under a paired device's grant a
-  `capture_changeset`, `materialize_changeset` or `apply_diff` node is refused at install, at
-  admission and before every dispatch. The same nodes under the owner's own grant run as below.
+* **A device's workflow gets what its grant carries.** Because the grant is held inside the
+  change-set service's own transactions, a workflow under a paired device's grant runs the
+  change-set nodes that grant's rights allow, under the same hold, and nothing more.
 * **Scope is checked too.** Every node's effect happens in the environment this host serves, so
   the grant has to cover that environment whether or not the definition names one, and a
   definition scoped to another environment runs nothing here. A definition scoped to a session is
-  refused unless the grant covers it, and a shell node's declared execution environment has to be
-  one the grant admits. A capture node has to name the workspace the definition is scoped to, and
-  a materialisation is refused where it would begin unless the version it names can be read and
-  was captured from the definition's workspace, when it names one, and from this environment.
+  refused unless the grant covers it, a shell node's declared execution environment has to be one
+  the grant admits, and a session node creates its session in this host's environment and nowhere
+  else. A capture node, and an apply node that names a workspace, has to name the workspace the
+  definition is scoped to, and a materialisation is refused where it would begin unless the
+  version it names can be read and was captured from the definition's workspace, when it names
+  one, and from this environment.
 
 ## What a node actually does
 
@@ -139,11 +147,16 @@ The host carries out the change-set nodes against the environment's own change-s
 and a `materialize_changeset` node's are `changeset.materialize`'s, so a node asks for exactly
 what the method asks for and nothing is interpreted along the way. The version a capture produces
 records the run that asked for it, whatever the document said, so evidence a later node reads is
-bound to the execution that made it.
+bound to the execution that made it. The node's receipt carries the captured version, or the
+version and the materialisation that holds it.
 
 Every other registered action kind is refused by name. A refusal is not an uncertain outcome:
 nothing was dispatched, so the node failed and its dependants see a failure rather than a result
 nobody produced.
+
+A node that succeeds records its kind's typed output, and a runner that reports an output of
+another kind has not reported this node's success: what its action did is not established, so the
+node settles unknown, its receipt holds no output, and its dependants pause for review.
 
 ## Definitions and graph validation
 
@@ -152,11 +165,25 @@ typed action nodes, success and failure transition edges, run and action deadlin
 
 Install-time validation enforces:
 * **Graph acyclicity.** The node graph must be an acyclic directed graph (DAG).
-* **Registered action kinds.** Action nodes must reference registered action types: `shell_command`,
-  `run_tests`, `request_review`, `create_session`, `attention_notice`, `materialize_changeset`,
-  `apply_diff` and `capture_changeset`.
-* **Typed parameters.** Each node's parameters must parse as JSON and carry the fields its action
-  kind declares.
+* **Registered action kinds.** Every node names one of eight action kinds, and a document naming
+  any other is refused when it is read.
+* **Typed parameters.** Each node carries exactly its kind's own typed parameters: every field the
+  type has, no field it does not, identifiers that are identifiers, and every name non-empty and
+  within its bound. A node that would be refused when it ran is refused when it is installed.
+* **Typed outputs.** Each kind produces one output type, named by the kind, and a receipt holds
+  that output and nothing else: identifiers and states the host observed, never text a node, a
+  terminal or a model produced.
+
+| Kind | Parameters | Output |
+| --- | --- | --- |
+| `shell_command` | `command`, 1 to 16 KiB, run in the node's declared execution environment | the session it ran in |
+| `run_tests` | `suite`, 1 to 256 bytes, and the immutable `version` the result binds to | the suite and the version it passed against |
+| `request_review` | the reviewer agent (`reviewer_id`), the immutable `version`, the `workspace` kind of the separate reviewer session, and the `instructions` | the version, the reviewer session and the turn that carried the result |
+| `create_session` | `session.create`'s own parameters, naming this host's environment | the session |
+| `attention_notice` | `summary`, 1 to 1024 bytes | none beyond its kind |
+| `materialize_changeset` | `changeset.materialize`'s own parameters | the version and the materialisation that holds it |
+| `apply_diff` | `diff.apply`'s own parameters | the version applied, its destination, the class it came to and any proposal version |
+| `capture_changeset` | `changeset.capture`'s own parameters | the version captured |
 * **No template evaluation.** Parameter values are inspected after JSON decoding, so a marker such
   as `{{ ... }}`, `${ ... }` or `$( ... )` is rejected however it was written. Nothing in a
   definition is evaluated.
