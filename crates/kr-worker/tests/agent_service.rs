@@ -67,27 +67,158 @@ fn capability(name: &str) -> CapabilityId {
     CapabilityId::new(name).expect("valid")
 }
 
-/// A transport that takes as long as it is told to, so a test can watch what waits for it.
+/// A transport whose upstream answers the first prompt only once a second prompt has been
+/// transmitted, and which records at each transmission whether the session boundary was free.
+///
+/// The first prompt's answer is what an upstream that is slow to answer looks like from here: the
+/// bytes have gone and the answer has not come. It is a pending outcome rather than a call that
+/// does not return, because that is what a transport hands back, and because a call that does not
+/// return holds the runtime thread it was made on.
 #[derive(Debug)]
-struct SlowUpstream {
-    holds: std::time::Duration,
+struct RendezvousUpstream {
+    /// The session whose boundary each transmission is checked against.
+    runtime: Arc<SessionRuntime>,
+    /// How long a wait for what the check expects is given before it counts as not having
+    /// happened.
+    patience: std::time::Duration,
+    /// Whether this transport takes the session boundary itself as it transmits the first prompt,
+    /// and keeps it until that prompt is answered. That is the negative control: from outside the
+    /// worker, it is what a transmission made inside the boundary looks like.
+    keeps_the_boundary: bool,
+    /// How many prompts have been transmitted.
     carried: std::sync::atomic::AtomicUsize,
+    /// Whether the session boundary could be taken while each transmission was being made, by the
+    /// order in which the transmissions began.
+    boundary_free: std::sync::Mutex<std::collections::BTreeMap<usize, bool>>,
+    /// Told once the first prompt has been transmitted, and the negative control's boundary is
+    /// held.
+    first_transmitted: tokio::sync::Notify,
+    /// Set once the second prompt has been transmitted.
+    second_transmitted: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    /// Whether the second prompt was transmitted before the first prompt's answer was given, once
+    /// that answer has been given.
+    second_during_first: Arc<std::sync::Mutex<Option<bool>>>,
 }
 
-impl UpstreamDispatch for SlowUpstream {
-    fn admit(&self, _request: &kr_worker::broker::UpstreamRequest) -> Result<(), BrokerError> {
+impl RendezvousUpstream {
+    fn new(
+        runtime: Arc<SessionRuntime>,
+        patience: std::time::Duration,
+        keeps_the_boundary: bool,
+    ) -> Self {
+        Self {
+            runtime,
+            patience,
+            keeps_the_boundary,
+            carried: std::sync::atomic::AtomicUsize::new(0),
+            boundary_free: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            first_transmitted: tokio::sync::Notify::new(),
+            second_transmitted: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
+            second_during_first: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Whether the session boundary can be taken while this transmission is being made.
+    ///
+    /// It is taken from another thread. The transport is called on the worker's own, so a boundary
+    /// this transmission was inside would be held by the caller waiting here, and the other thread
+    /// would wait for it until the patience ran out.
+    fn boundary_is_free(&self) -> bool {
+        let (taken, told) = std::sync::mpsc::channel();
+        let runtime = Arc::clone(&self.runtime);
+        std::thread::spawn(move || {
+            drop(runtime.session());
+            let _ = taken.send(());
+        });
+        told.recv_timeout(self.patience).is_ok()
+    }
+
+    /// Takes the session boundary on a thread of its own, and keeps it until the returned sender
+    /// is dropped.
+    fn keep_the_boundary(&self) -> std::sync::mpsc::Sender<()> {
+        let (held, holding) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let runtime = Arc::clone(&self.runtime);
+        std::thread::spawn(move || {
+            let session = runtime.session();
+            let _ = held.send(());
+            let _ = released.recv();
+            drop(session);
+        });
+        holding
+            .recv()
+            .expect("the thread keeping the boundary took it");
+        release
+    }
+
+    /// What the two transmissions showed.
+    fn seen(&self) -> (Vec<bool>, Option<bool>) {
+        (
+            self.boundary_free
+                .lock()
+                .expect("the record is not poisoned")
+                .values()
+                .copied()
+                .collect(),
+            *self
+                .second_during_first
+                .lock()
+                .expect("the record is not poisoned"),
+        )
+    }
+}
+
+impl UpstreamDispatch for RendezvousUpstream {
+    fn admit(&self, _request: &UpstreamRequest) -> Result<(), BrokerError> {
         Ok(())
     }
 
     fn submit(&self, request: &UpstreamRequest) -> Result<PendingTransmission, BrokerError> {
-        std::thread::sleep(self.holds);
-        self.carried
+        let index = self
+            .carried
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(PendingTransmission::settled(Ok(UpstreamOutcome {
+        let first = index == 0;
+        let kept = (first && self.keeps_the_boundary).then(|| self.keep_the_boundary());
+        if first {
+            // The first prompt has been handed over, so the second may go.
+            self.first_transmitted.notify_one();
+        }
+        let free = self.boundary_is_free();
+        self.boundary_free
+            .lock()
+            .expect("the record is not poisoned")
+            .insert(index, free);
+        let outcome = UpstreamOutcome {
             upstream_request_id: None,
             turn_id: request.turn_id.clone(),
             provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
-        })))
+        };
+        if !first {
+            let (transmitted, changed) = &*self.second_transmitted;
+            *transmitted.lock().expect("the flag is not poisoned") = true;
+            changed.notify_all();
+            return Ok(PendingTransmission::settled(Ok(outcome)));
+        }
+        let second = Arc::clone(&self.second_transmitted);
+        let during = Arc::clone(&self.second_during_first);
+        let patience = self.patience;
+        Ok(PendingTransmission::carried(async move {
+            // Waited for on the runtime's blocking pool, so no worker thread is held while this
+            // upstream has not answered.
+            let met = tokio::task::spawn_blocking(move || {
+                let (transmitted, changed) = &*second;
+                let flag = transmitted.lock().expect("the flag is not poisoned");
+                let (flag, _) = changed
+                    .wait_timeout_while(flag, patience, |transmitted| !*transmitted)
+                    .expect("the flag is not poisoned");
+                *flag
+            })
+            .await
+            .unwrap_or(false);
+            *during.lock().expect("the record is not poisoned") = Some(met);
+            drop(kept);
+            Ok(outcome)
+        }))
     }
 }
 
@@ -339,20 +470,20 @@ async fn kr_req_12_06_a_mutation_with_no_upstream_is_refused_before_its_marker()
     );
 }
 
-/// KR-REQ-12.04 and KR-REQ-12.06: an admitted operation leaves the session boundary before its
-/// bytes go, so two of them overlap instead of queueing behind one another.
-///
-/// The transport here holds each submission for 700 ms. If the transmission happened inside the
-/// session boundary the two prompts would be serial, because that boundary is one mutation at a
-/// time and terminal ingestion needs the same mutex. They are not, so they overlap.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_12_04_an_admitted_operation_leaves_the_session_boundary_before_it_transmits() {
+/// Sends two prompts through the worker to a [`RendezvousUpstream`], the second once the first has
+/// been transmitted, and returns what the transport saw: whether the session boundary was free at
+/// each transmission, and whether the second prompt was transmitted while the first was waiting
+/// for its upstream.
+async fn two_prompts(
+    patience: std::time::Duration,
+    keeps_the_boundary: bool,
+) -> (Vec<bool>, Option<bool>) {
     let host = host().await;
-    let holds = std::time::Duration::from_millis(700);
-    let upstream = Arc::new(SlowUpstream {
-        holds,
-        carried: std::sync::atomic::AtomicUsize::new(0),
-    });
+    let upstream = Arc::new(RendezvousUpstream::new(
+        Arc::clone(host.service.runtime()),
+        patience,
+        keeps_the_boundary,
+    ));
     register(
         &host,
         Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
@@ -364,30 +495,85 @@ async fn kr_req_12_04_an_admitted_operation_leaves_the_session_boundary_before_i
     let one = prompt_mutation(&first, &host, 12);
     let two = prompt_mutation(&second, &host, 13);
 
-    let started = std::time::Instant::now();
-    let (left, right) = tokio::join!(
-        tokio::spawn(async move { send(&mut first, one).await }),
-        async move {
-            // A moment behind, so the second one is admitted while the first is with its upstream
-            // rather than before it got there.
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            send(&mut second, two).await
-        }
-    );
-    let elapsed = started.elapsed();
+    let answered_first = tokio::spawn(async move {
+        tokio::time::timeout(LIVENESS_DEADLINE, send(&mut first, one)).await
+    });
+    // The second prompt goes once the first has been transmitted, so it arrives while the first
+    // is with its upstream rather than before it got there.
+    tokio::time::timeout(LIVENESS_DEADLINE, upstream.first_transmitted.notified())
+        .await
+        .expect("the first prompt was transmitted");
+    let answered_second = tokio::time::timeout(LIVENESS_DEADLINE, send(&mut second, two))
+        .await
+        .expect("the second prompt was answered while the first was with its upstream");
+    let answered_first = answered_first
+        .await
+        .expect("the first prompt's task finishes")
+        .expect("the first prompt was answered");
     assert!(
-        matches!(left.expect("the first task finishes"), Outcome::Ok(_)),
-        "the first prompt was applied"
+        matches!(answered_first, Outcome::Ok(_)),
+        "{answered_first:?}"
     );
-    assert!(matches!(right, Outcome::Ok(_)), "{right:?}");
     assert!(
-        elapsed < holds * 2,
-        "two prompts took {elapsed:?}, which is what queueing one behind the other would cost"
+        matches!(answered_second, Outcome::Ok(_)),
+        "{answered_second:?}"
     );
     assert_eq!(
         upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
         2,
         "both prompts reached the upstream"
+    );
+    upstream.seen()
+}
+
+/// KR-REQ-12.04 and KR-REQ-12.06: an admitted operation leaves the session boundary before its
+/// bytes go, so two of them overlap instead of queueing behind one another.
+///
+/// What is checked is an order, not a duration. At each transmission the transport takes the
+/// session boundary from another thread, which it can do only if the worker left the boundary
+/// before it transmitted: terminal ingestion needs the same mutex, so a slow upstream would
+/// otherwise stop a person typing. And the first prompt's upstream answers only once a second
+/// prompt has been transmitted. That second prompt is sent after the first has gone, and it can be
+/// admitted and transmitted while the first is still with its upstream only if neither the
+/// session boundary nor the dispatch barrier is held for the length of a transmission. The waits
+/// are liveness bounds; a host of any speed passes or fails this the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_04_an_admitted_operation_leaves_the_session_boundary_before_it_transmits() {
+    let (boundary_free, second_during_first) = two_prompts(LIVENESS_DEADLINE, false).await;
+    assert_eq!(
+        boundary_free,
+        [true, true],
+        "the session boundary was free while each prompt was being transmitted"
+    );
+    assert_eq!(
+        second_during_first,
+        Some(true),
+        "the second prompt was admitted and transmitted while the first was with its upstream"
+    );
+}
+
+/// The check above against a transport that takes the session boundary as it transmits the first
+/// prompt, and keeps it until that prompt is answered: what a transmission made inside the
+/// boundary looks like from outside the worker. Both halves of the check see it. The boundary
+/// could not be taken during that transmission, and the second prompt could not be admitted until
+/// the first had been answered.
+///
+/// Neither result depends on the wait it comes from. The boundary is kept until the first prompt
+/// is answered, and that answer is given only after both waits have ended, so nothing either wait
+/// looks for can happen however long it lasts. That is why a second is enough here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transmission_that_keeps_the_session_boundary_fails_the_same_check() {
+    let (boundary_free, second_during_first) =
+        two_prompts(std::time::Duration::from_secs(1), true).await;
+    assert_eq!(
+        boundary_free.first(),
+        Some(&false),
+        "the boundary could not be taken during the first transmission: {boundary_free:?}"
+    );
+    assert_eq!(
+        second_during_first,
+        Some(false),
+        "the second prompt was not transmitted while the first was with its upstream"
     );
 }
 
@@ -480,7 +666,7 @@ async fn kr_req_12_06_a_marker_that_could_not_be_written_leaves_nothing_to_trans
     );
 }
 
-/// A transport that records what it was asked to carry, for a test that expects nothing carried.
+/// A transport that answers at once and counts what it was asked to carry.
 #[derive(Debug, Default)]
 struct CountingUpstream {
     carried: std::sync::atomic::AtomicUsize,
@@ -1510,10 +1696,7 @@ async fn kr_req_09_a_request_that_went_and_was_never_answered_leaves_an_unknown_
 async fn kr_req_11_37_one_fence_covers_the_receipt_journal_and_the_ledger_and_maintenance_lifts_it()
 {
     let host = host().await;
-    let upstream = Arc::new(SlowUpstream {
-        holds: std::time::Duration::ZERO,
-        carried: std::sync::atomic::AtomicUsize::new(0),
-    });
+    let upstream = Arc::new(CountingUpstream::default());
     register(
         &host,
         Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
