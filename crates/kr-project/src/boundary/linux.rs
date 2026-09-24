@@ -440,9 +440,11 @@ fn bounded(
 /// and that includes another filesystem mounted there and a second view of one bound there. So
 /// such an invocation is not run over a granted directory that has a mount point beneath it. It is
 /// read from this process's own mount table immediately before each invocation, and it narrows
-/// rather than closes: a mount made, or a directory holding one moved beneath a granted directory,
-/// after this reading and while Git runs is read as part of the tree, which is the limit
-/// `README.md` in this crate states in what such a caller is promised.
+/// rather than closes. It compares paths, so a filesystem mounted beneath another name for a
+/// granted directory, a view of it bound somewhere else, is not seen; and a mount made, or a
+/// directory holding one moved beneath a granted directory, after this reading and while Git runs
+/// is read as part of the tree. `README.md` in this crate states both in what such a caller is
+/// promised.
 fn refuse_mounts_beneath(directories: &[PathBuf]) -> Result<()> {
     let table = std::fs::read("/proc/self/mountinfo").map_err(|error| {
         refused(
@@ -451,26 +453,33 @@ fn refuse_mounts_beneath(directories: &[PathBuf]) -> Result<()> {
             &error,
         )
     })?;
-    for line in table.split(|byte| *byte == b'\n') {
-        let Some(point) = mount_point(line) else {
-            continue;
-        };
-        for directory in directories {
-            if point != *directory && point.starts_with(directory) {
-                return Err(ProjectError::GitFailed {
-                    detail: format!(
-                        "a filesystem is mounted at {}, beneath {}, which this invocation would be \
-                         granted; an invocation for a caller bounded by a grant is not run over a \
-                         directory with another filesystem inside it",
-                        crate::git::redact(&point.display().to_string()),
-                        crate::git::redact(&directory.display().to_string())
-                    )
-                    .into(),
-                });
-            }
-        }
+    match mount_beneath(&table, directories) {
+        Some((point, directory)) => Err(ProjectError::GitFailed {
+            detail: format!(
+                "a filesystem is mounted at {}, beneath {}, which this invocation would be granted; \
+                 an invocation for a caller bounded by a grant is not run over a directory with \
+                 another filesystem inside it",
+                crate::git::redact(&point.display().to_string()),
+                crate::git::redact(&directory.display().to_string())
+            )
+            .into(),
+        }),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// Returns the first mount point a mount table names beneath one of these directories, and that
+/// directory. A directory that is itself a mount point has nothing mounted beneath it by that.
+fn mount_beneath<'a>(table: &[u8], directories: &'a [PathBuf]) -> Option<(PathBuf, &'a Path)> {
+    table
+        .split(|byte| *byte == b'\n')
+        .filter_map(mount_point)
+        .find_map(|point| {
+            directories
+                .iter()
+                .find(|directory| point != **directory && point.starts_with(directory))
+                .map(|directory| (point.clone(), directory.as_path()))
+        })
 }
 
 /// Returns the mount point one line of the mount table names, with the table's escapes undone.
@@ -607,6 +616,7 @@ pub fn support_set(
             continue;
         };
         let resolved = std::fs::canonicalize(&loader).map_err(|error| unnamed(&loader, &error))?;
+        refuse_broad(&resolved, &loader)?;
         if !required && !loaders.contains(&resolved) {
             return Err(ProjectError::GitFailed {
                 detail: format!(
@@ -620,11 +630,7 @@ pub fn support_set(
             });
         }
         for library in listed(&loader, candidate)? {
-            let resolved =
-                std::fs::canonicalize(&library).map_err(|error| unnamed(&library, &error))?;
-            if let Some(directory) = resolved.parent() {
-                libraries.insert(directory.to_owned());
-            }
+            libraries.insert(library_directory(&library)?);
         }
         loaders.insert(resolved);
     }
@@ -697,7 +703,9 @@ fn interpreter(program: &Path) -> Result<Option<PathBuf>> {
 /// Returns the libraries a program's loader resolves for it, each by the path the loader gives.
 ///
 /// The loader is asked with an environment of nothing, which is the environment every Git child
-/// has as far as a loader is concerned: nothing this host sets names a library.
+/// has as far as a loader is concerned: nothing this host sets names a library. A library it could
+/// not find is named from its own listing, and a failure it gives no listing for is refused in its
+/// own words.
 fn listed(loader: &Path, program: &Path) -> Result<Vec<PathBuf>> {
     let output = std::process::Command::new(loader)
         .arg("--list")
@@ -706,45 +714,108 @@ fn listed(loader: &Path, program: &Path) -> Result<Vec<PathBuf>> {
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|error| unnamed(loader, &error))?;
+    let libraries = parse_listing(&output.stdout).map_err(|missing| ProjectError::GitFailed {
+        detail: format!(
+            "{} loads {}, which {} does not find, so the support set of an invocation for a \
+             caller bounded by a grant cannot be named",
+            crate::git::redact(&program.display().to_string()),
+            crate::git::redact(&missing),
+            crate::git::redact(&loader.display().to_string())
+        )
+        .into(),
+    })?;
     if !output.status.success() {
         return Err(ProjectError::GitFailed {
             detail: format!(
-                "{} could not say which libraries {} loads, so the support set of an invocation \
-                 for a caller bounded by a grant cannot be named",
+                "{} could not say which libraries {} loads ({}), so the support set of an \
+                 invocation for a caller bounded by a grant cannot be named",
                 crate::git::redact(&loader.display().to_string()),
-                crate::git::redact(&program.display().to_string())
+                crate::git::redact(&program.display().to_string()),
+                crate::git::redact(String::from_utf8_lossy(&output.stderr).trim())
             )
             .into(),
         });
     }
+    Ok(libraries)
+}
+
+/// Reads a loader's listing of what a program loads.
+///
+/// A library is `name => path (address)`. A library the program names by an absolute path is that
+/// path and its address with no arrow, and so is the loader itself; the kernel's own shared object
+/// has neither an arrow nor a path and is no file. A name the loader could not resolve is the
+/// error, so a refusal can say which.
+fn parse_listing(listing: &[u8]) -> std::result::Result<Vec<PathBuf>, String> {
     let mut libraries = Vec::new();
-    for line in output.stdout.split(|byte| *byte == b'\n') {
-        // Each library is `name => path (address)`. The loader itself and the kernel's own shared
-        // object are named without an arrow, and neither is a library to read.
+    for line in listing.split(|byte| *byte == b'\n') {
         let line = line.trim_ascii();
-        let Some(arrow) = line.windows(4).position(|window| window == b" => ") else {
-            continue;
+        let target = match line.windows(4).position(|window| window == b" => ") {
+            Some(arrow) => {
+                let target = before_address(&line[arrow + 4..]);
+                if target.first() != Some(&b'/') {
+                    return Err(String::from_utf8_lossy(&line[..arrow]).into_owned());
+                }
+                target
+            }
+            None if line.first() == Some(&b'/') => before_address(line),
+            None => continue,
         };
-        let target = &line[arrow + 4..];
-        let target = target
-            .windows(2)
-            .position(|window| window == b" (")
-            .map_or(target, |end| &target[..end]);
-        if target.first() != Some(&b'/') {
-            return Err(ProjectError::GitFailed {
-                detail: format!(
-                    "{} loads {}, which {} does not find, so the support set of an invocation for \
-                     a caller bounded by a grant cannot be named",
-                    crate::git::redact(&program.display().to_string()),
-                    crate::git::redact(&String::from_utf8_lossy(&line[..arrow])),
-                    crate::git::redact(&loader.display().to_string())
-                )
-                .into(),
-            });
-        }
         libraries.push(PathBuf::from(std::ffi::OsStr::from_bytes(target)));
     }
     Ok(libraries)
+}
+
+/// Returns one entry of a loader's listing without the address it was loaded at.
+fn before_address(entry: &[u8]) -> &[u8] {
+    entry
+        .windows(2)
+        .position(|window| window == b" (")
+        .map_or(entry, |end| &entry[..end])
+        .trim_ascii_end()
+}
+
+/// The trees a support object may neither lie in nor hold: the kernel's own state, the devices
+/// and shared memory, the running system's state, the system's configuration, and the machine's
+/// shared temporary directories.
+const NEVER_SUPPORT: &[&str] = &["/proc", "/sys", "/dev", "/run", "/etc", "/tmp", "/var/tmp"];
+
+/// The trees a support directory may lie in but not be or hold: each holds a great deal besides
+/// libraries. A Git installed in one of them has its libraries in a directory of its own there,
+/// and granting that directory grants nothing else in the tree.
+const NEVER_OVER: &[&str] = &["/usr", "/opt", "/home", "/root", "/srv", "/mnt", "/media"];
+
+/// Returns the directory one library is in, resolved, and refuses a directory that is not one to
+/// grant as a support directory.
+fn library_directory(library: &Path) -> Result<PathBuf> {
+    let resolved = std::fs::canonicalize(library).map_err(|error| unnamed(library, &error))?;
+    let directory = resolved.parent().unwrap_or(&resolved).to_owned();
+    refuse_broad(&directory, library)?;
+    Ok(directory)
+}
+
+/// Refuses a support object that lies in, or holds, a tree no support object may, or that holds a
+/// tree a support directory may only lie in.
+fn refuse_broad(object: &Path, named: &Path) -> Result<()> {
+    let broad = NEVER_SUPPORT
+        .iter()
+        .map(Path::new)
+        .any(|tree| object.starts_with(tree) || tree.starts_with(object))
+        || NEVER_OVER
+            .iter()
+            .map(Path::new)
+            .any(|tree| tree.starts_with(object));
+    if broad {
+        return Err(ProjectError::GitFailed {
+            detail: format!(
+                "{} is in {}, which is not a support object this host grants, so the support set \
+                 of an invocation for a caller bounded by a grant cannot be named",
+                crate::git::redact(&named.display().to_string()),
+                crate::git::redact(&object.display().to_string())
+            )
+            .into(),
+        });
+    }
+    Ok(())
 }
 
 /// Reads eight bytes as a number, the low byte first.
@@ -1074,6 +1145,155 @@ mod tests {
         let script = root.path().join("script");
         std::fs::write(&script, "#!/bin/sh\nexit 0\n").expect("a script");
         assert_eq!(interpreter(&script).expect("the script reads"), None);
+    }
+
+    #[test]
+    fn a_loaders_listing_names_every_library_by_its_path_and_what_it_could_not_find() {
+        // The C library the host runs: libraries by arrow, one named by an absolute path with no
+        // arrow, the loader itself, and the kernel's own shared object, which is no file.
+        let glibc = b"\tlinux-vdso.so.1 (0x00007ffd1a3e5000)\n\
+                      \tlibz.so.1 => /lib/x86_64-linux-gnu/libz.so.1 (0x00007f1c2a000000)\n\
+                      \t/opt/git/lib/libextra.so (0x00007f1c29e00000)\n\
+                      \tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f1c29c00000)\n\
+                      \t/lib64/ld-linux-x86-64.so.2 (0x00007f1c2a200000)\n";
+        assert_eq!(
+            parse_listing(glibc),
+            Ok(vec![
+                PathBuf::from("/lib/x86_64-linux-gnu/libz.so.1"),
+                PathBuf::from("/opt/git/lib/libextra.so"),
+                PathBuf::from("/lib/x86_64-linux-gnu/libc.so.6"),
+                PathBuf::from("/lib64/ld-linux-x86-64.so.2"),
+            ])
+        );
+        // The other C library's loader lists the same way.
+        let musl = b"\t/lib/ld-musl-x86_64.so.1 (0x7f5d0a000000)\n\
+                     \tlibz.so.1 => /lib/libz.so.1 (0x7f5d09e00000)\n\
+                     \tlibc.musl-x86_64.so.1 => /lib/ld-musl-x86_64.so.1 (0x7f5d0a000000)\n";
+        assert_eq!(
+            parse_listing(musl),
+            Ok(vec![
+                PathBuf::from("/lib/ld-musl-x86_64.so.1"),
+                PathBuf::from("/lib/libz.so.1"),
+                PathBuf::from("/lib/ld-musl-x86_64.so.1"),
+            ])
+        );
+        // A library the loader could not find is named.
+        let missing = b"\tlibz.so.1 => /lib/x86_64-linux-gnu/libz.so.1 (0x1)\n\
+                        \tlibkr-gone.so.3 => not found\n";
+        assert_eq!(parse_listing(missing), Err("libkr-gone.so.3".to_owned()));
+    }
+
+    #[test]
+    fn a_support_object_in_or_over_a_broad_tree_is_refused() {
+        for object in [
+            "/",
+            "/etc",
+            "/etc/alternatives",
+            "/proc/1",
+            "/dev/shm",
+            "/run/user",
+            "/tmp/kr",
+            "/var",
+            "/usr",
+            "/home",
+        ] {
+            assert!(
+                refuse_broad(Path::new(object), Path::new("a library")).is_err(),
+                "{object} is not a support object"
+            );
+        }
+        for object in [
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/local/lib",
+            "/opt/git/lib",
+            "/home/linuxbrew/.linuxbrew/lib",
+        ] {
+            assert!(
+                refuse_broad(Path::new(object), Path::new("a library")).is_ok(),
+                "{object} is a library directory"
+            );
+        }
+        // The same refusal where a listed library resolves: a file in the system's configuration
+        // directory is named with the directory it is in.
+        let refusal = library_directory(Path::new("/etc/hostname"))
+            .expect_err("a library in /etc is not one to grant its directory for");
+        assert!(
+            refusal.to_string().contains("/etc/hostname is in /etc,"),
+            "the refusal names both: {refusal}"
+        );
+        // And a real library of this host's shell is in a directory that is granted.
+        let support = support_of(Path::new("/bin/sh"));
+        for directory in support.libraries() {
+            refuse_broad(directory, directory).expect("the shell's library directory is granted");
+        }
+    }
+
+    #[test]
+    fn a_mount_point_beneath_a_granted_directory_is_found_and_nothing_else() {
+        let granted = vec![
+            PathBuf::from("/srv/location"),
+            PathBuf::from("/usr/lib/git-core"),
+        ];
+        let table = b"22 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+                      31 22 8:2 / /srv/location rw - ext4 /dev/sda2 rw\n\
+                      32 22 0:40 / /srv/locations rw - tmpfs tmpfs rw\n\
+                      33 31 0:41 / /srv/location/with\\040space/graft rw - tmpfs tmpfs rw\n";
+        assert_eq!(
+            mount_beneath(table, &granted),
+            Some((
+                PathBuf::from("/srv/location/with space/graft"),
+                Path::new("/srv/location")
+            )),
+            "a filesystem mounted beneath the location is found"
+        );
+        // The control: the same table and the same directories without that one mount. The
+        // location being a mount point itself, and a sibling whose name begins the same way, are
+        // not mounts beneath it.
+        let without = b"22 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+                        31 22 8:2 / /srv/location rw - ext4 /dev/sda2 rw\n\
+                        32 22 0:40 / /srv/locations rw - tmpfs tmpfs rw\n";
+        assert_eq!(mount_beneath(without, &granted), None);
+    }
+
+    #[test]
+    fn a_helper_that_loads_a_library_the_loader_cannot_find_is_refused_by_that_librarys_name() {
+        let shell = Path::new("/bin/sh");
+        if interpreter(shell)
+            .expect("the shell's headers read")
+            .is_none()
+        {
+            println!("not exercised: this host's shell is not dynamically linked");
+            return;
+        }
+        let bytes = std::fs::read(shell).expect("the shell reads");
+        let needed = b"libc.so.6";
+        if !bytes.windows(needed.len()).any(|window| window == needed) {
+            println!("not exercised: this host's shell does not name libc.so.6");
+            return;
+        }
+        let helpers = tempfile::TempDir::new().expect("a helper directory");
+        // The control: an ordinary copy of the shell loads what its loader finds.
+        std::fs::write(helpers.path().join("git-ordinary"), &bytes).expect("a copy of the shell");
+        support_set(&[shell], helpers.path()).expect("an ordinary helper is named");
+        // The same copy naming a library no loader finds, in every place it names it.
+        let mut renamed = bytes.clone();
+        let mut at = 0;
+        while let Some(found) = renamed[at..]
+            .windows(needed.len())
+            .position(|window| window == needed)
+        {
+            renamed[at + found + needed.len() - 1] = b'9';
+            at += found + needed.len();
+        }
+        std::fs::write(helpers.path().join("git-ordinary"), &renamed)
+            .expect("the helper is rewritten");
+        let refusal = support_set(&[shell], helpers.path())
+            .expect_err("a helper whose library cannot be found is refused");
+        let said = refusal.to_string();
+        assert!(
+            said.contains("libc.so.9") && said.contains("git-ordinary"),
+            "the refusal names the library and the helper: {said}"
+        );
     }
 
     #[test]
