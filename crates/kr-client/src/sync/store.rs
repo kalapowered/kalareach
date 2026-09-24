@@ -713,6 +713,17 @@ pub enum SyncError {
         /// The identity that was asked for.
         object_id: SyncObjectId,
     },
+    /// A restore offered an object this store already holds, or holds a note of.
+    ///
+    /// A restore puts an object back only where there is none: section 20 leaves the choice between
+    /// two versions of one object to the person, never to whichever arrived last.
+    #[error(
+        "synchronised object {object_id} is already held here, or where it stood on the service is"
+    )]
+    AlreadyHeld {
+        /// The object the restore offered.
+        object_id: SyncObjectId,
+    },
     /// A stored file is not something this build can read.
     #[error("the stored file at {path} could not be read: {reason}")]
     Corrupt {
@@ -888,6 +899,7 @@ impl SyncError {
             // What became of the publication is not known yet, and what makes it known is the
             // answer to the call that is out rather than another one beside it.
             Self::InFlight { .. } => ErrorCode::OutcomeUnknown,
+            Self::AlreadyHeld { .. } => ErrorCode::IdConflict,
             Self::Client(error) => error.code(),
         }
     }
@@ -899,8 +911,10 @@ impl SyncError {
             Self::Storage { .. } => UserAction::FixConfiguration,
             Self::Client(error) => error.user_action(),
             // The message is the whole of it: choose a copy, shorten the settings, turn privacy
-            // mode off, or start the object again against the service this device now uses.
+            // mode off, start the object again against the service this device now uses, or keep
+            // the settings this device already holds.
             Self::Unknown { .. }
+            | Self::AlreadyHeld { .. }
             | Self::Corrupt { .. }
             | Self::TooLarge { .. }
             | Self::NotThatObject { .. }
@@ -1071,6 +1085,65 @@ impl SyncStore {
         let bytes = encode_within(object)?;
         let guard = self.lock()?;
         let outcome = self.write_bytes(&self.path(object.object_id, OBJECT_EXTENSION), &bytes.0);
+        drop(guard);
+        outcome
+    }
+
+    /// Reads an object for a backup, with the privacy generation it was read under.
+    ///
+    /// The privacy state and the object are read under one hold of the lock, as an admission reads
+    /// them: section 24 disables backup production as it disables sync production, and a fence
+    /// that landed between the two reads would let a backup carry an object read after it. The
+    /// generation goes with the object so that whatever produces the backup can publish it only
+    /// under the generation still in force.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Fenced`] while privacy mode is on, [`SyncError::Unknown`] when no such
+    /// object is stored, and [`SyncError::Storage`] or [`SyncError::Corrupt`] otherwise.
+    pub fn read_for_backup(&self, object_id: SyncObjectId) -> Result<(SyncObject, u64)> {
+        let guard = self.lock()?;
+        let outcome = (|| {
+            let privacy = self.read_privacy()?;
+            if privacy.fenced {
+                return Err(SyncError::Fenced {
+                    generation: privacy.generation.get(),
+                });
+            }
+            let object = self
+                .read_object(object_id)?
+                .ok_or(SyncError::Unknown { object_id })?;
+            Ok((object, privacy.generation.get()))
+        })();
+        drop(guard);
+        outcome
+    }
+
+    /// Puts back an object a restore took out of a backup, as this device's own.
+    ///
+    /// Only into a store that holds neither the object nor a note of where it stood. Replacing an
+    /// object this device holds would choose between two versions of it by which arrived last,
+    /// which section 20 leaves to the person; and an object written beside a note would compare
+    /// against a place on a service the restored object never reached. Nothing is written beside
+    /// it, so its first publication compares against nothing and learns from the service where the
+    /// object stands. The check and the write are one hold of the lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::AlreadyHeld`] when the store holds the object or a note of it,
+    /// [`SyncError::TooLarge`] when the record is past what one synchronised object carries, and
+    /// [`SyncError::Storage`] or [`SyncError::Corrupt`] otherwise.
+    pub fn put_restored(&self, object: &SyncObject) -> Result<()> {
+        let bytes = encode_within(object)?;
+        let guard = self.lock()?;
+        let outcome = (|| {
+            let object_id = object.object_id;
+            if self.read_object(object_id)?.is_some() || self.read_checkpoint(object_id)?.is_some()
+            {
+                return Err(SyncError::AlreadyHeld { object_id });
+            }
+            self.write_bytes(&self.path(object_id, OBJECT_EXTENSION), &bytes.0)
+        })();
         drop(guard);
         outcome
     }

@@ -19,6 +19,12 @@
 //! * **A restore puts back data and device configuration, and nothing that would recreate
 //!   authority.** [`may_back_up`] and [`may_restore`] are that rule, each case with the reason it
 //!   is refused.
+//! * **Settings come back as the device's own, and nothing comes back with them.**
+//!   [`export_settings`] and [`import_settings`] are the paths this device's settings object takes
+//!   into a recovery-enabled archive and out of one, and each asks the table for what it carries.
+//!   Neither carries a settings collection's key, its key records, this device's membership or
+//!   where the object stood on the sync service, so a restored device joins a collection only once
+//!   the owner has paired it again and a member has authorised it.
 //!
 //! # What the seed is, and is not
 //!
@@ -30,6 +36,7 @@ mod bundle;
 mod kit;
 mod record;
 mod restore;
+mod settings;
 
 use kr_protocol::ids::SyncConflictId;
 use kr_protocol::scalars::Digest256;
@@ -45,6 +52,9 @@ pub use crate::recovery::kit::{
     render as render_kit,
 };
 pub use crate::recovery::restore::{FreshRestore, RetrievalPolicy, ServiceAccess, TrustedMaterial};
+pub use crate::recovery::settings::{
+    ExportedSettings, ImportedSettings, SETTINGS_FILENAME, export_settings, import_settings,
+};
 // One definition of what a backup carries, in the crate that owns the backup layer. A device and a
 // host that answered this question separately could answer it differently; they ask the same table.
 pub use kr_crypto::backup::{
@@ -267,6 +277,26 @@ pub enum RecoveryError {
         /// The lock the other store holds.
         path: std::path::PathBuf,
     },
+    /// The table refuses this material, for the reason it gives.
+    ///
+    /// Asked before a byte of the material is read, so what is refused is named rather than
+    /// silently left out.
+    #[error("{} is never carried here: {because}", .material.as_str())]
+    Refused {
+        /// What was offered.
+        material: Material,
+        /// The table's reason.
+        because: &'static str,
+    },
+    /// What was offered as this device's settings is not its settings object.
+    #[error("that is not this device's settings: {what}")]
+    NotSettings {
+        /// What it is instead.
+        what: &'static str,
+    },
+    /// This device's sync store refused.
+    #[error("{0}")]
+    Sync(#[from] crate::sync::SyncError),
     /// The service failed.
     #[error("{0}")]
     Service(#[from] crate::error::ClientError),

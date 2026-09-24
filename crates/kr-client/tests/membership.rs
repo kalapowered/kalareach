@@ -5,6 +5,7 @@
 //! | --- | --- |
 //! | KR-REQ-18.05, settings-sync part (the library path) | `a_production_device_receives_its_key_through_its_own_wrap_and_keeps_it_in_its_store`, `nothing_is_sealed_to_a_device_its_host_has_not_committed` |
 //! | KR-REQ-20.11, sync-collection half | `removing_a_device_gives_the_rest_a_key_it_cannot_open`, `every_new_epoch_has_a_freshly_drawn_key`, `publication_stays_fenced_from_a_recorded_removal_until_its_record_is_installed` |
+//! | KR-REQ-20.17, settings part (export and import) | `a_collection_key_is_neither_backed_up_nor_restored`, `a_restore_returns_settings_without_a_key_a_membership_or_a_sync_checkpoint`, `a_restored_device_joins_only_after_a_fresh_authorisation` |
 //!
 //! Every directory a test uses is a temporary one on the internal disk, and every secret store is
 //! the owner-only directory the file seam opens there: nothing here touches a keychain.
@@ -13,26 +14,43 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use kr_client::ClientError;
-use kr_client::services::ServiceFuture;
-use kr_client::sync::StoredCollectionKeys;
+use kr_client::recovery::{
+    ExportedSettings, FreshRestore, RecoveryError, SETTINGS_FILENAME, export_settings,
+    import_settings,
+};
+use kr_client::services::{ServiceFuture, SyncPosition, SyncRevision};
 use kr_client::sync::membership::{
     CollectionRef, Device, DeviceDirectory, Ended, HostAnswers, HostDevice, HostReport,
     KeyRecordService, KeyRecords, MembershipError, Outcome, PLAN_LIFETIME_MS, Plan, PlanRefusal,
     PlannedOperation, RecordAt, Refreshed, RekeyAnswer, RekeyFence, RekeyStatus, Settlement, Step,
     SyncMembership,
 };
+use kr_client::sync::{
+    PrivacyRecord, SettingValue, StoredCollectionKeys, SyncBody, SyncCheckpoint, SyncError,
+    SyncObject, SyncSettings, SyncStore,
+};
+use kr_crypto::backup::{
+    ArchiveExpectation, ArchivePlan, ArchiveReader, ArchiveRecipients, CollectionKind,
+    GenerationExpectation, Material, ObjectSource, may_back_up, may_restore, open_archive,
+    seal_archive, stage_object,
+};
 use kr_crypto::envelope::{
     CollectionRecipient, CollectionRecordDraft, check_genesis, check_successor,
     issue_collection_key_record, open_collection_key,
 };
+use kr_crypto::kdf::RecoverySeed;
 use kr_crypto::keys::{DeviceKeys, key_id};
-use kr_crypto::secret::{Secret, SymmetricKey};
+use kr_crypto::secret::{Secret, SecretVec, SymmetricKey};
 use kr_crypto::store::{StoreSelection, open_store_in};
+use kr_protocol::archive::TrustedWriter;
 use kr_protocol::collection_keys::CollectionKeyRecord;
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::{SyncCollectionId, SyncKeyEpoch, SyncKeyRecordRevision};
+use kr_protocol::ids::{
+    ArchiveId, BackupGeneration, BackupObjectId, DeviceId, SyncCollectionId, SyncKeyEpoch,
+    SyncKeyRecordRevision, SyncObjectId, SyncRevisionId,
+};
 use kr_protocol::pairing::KeyPurpose;
-use kr_protocol::scalars::{AuthorisationKey, TimestampMs, Uuid};
+use kr_protocol::scalars::{AuthorisationKey, Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::service::installation_id;
 
 /* -------------------------------------------------------------------------- */
@@ -2951,4 +2969,420 @@ async fn a_record_whose_issuer_the_hosts_report_with_another_key_is_never_opened
     }
     assert!(!lists(&world.newest(&collection), &other));
     assert!(owner.publishes());
+}
+
+/* -------------------------------------------------------------------------- */
+/* Recovery: settings come back, and nothing that grants comes with them       */
+/* -------------------------------------------------------------------------- */
+
+/// Whether `needle` appears anywhere in `haystack`.
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// The settings object a device holds in its own sync store, with the note a publication left of
+/// where it stood on the service.
+fn settings_on(node: &Node) -> (SyncStore, SyncObject) {
+    let store = SyncStore::open(node.root.path().join("sync")).expect("a sync store");
+    let object = SyncObject {
+        object_id: SyncObjectId::new(Uuid::from_bytes([0x5a; 16])),
+        revision: SyncRevisionId::new(Uuid::from_bytes([0x6b; 16])),
+        device_id: DeviceId::new(Uuid::from_bytes([0x7c; 16])),
+        updated_at_ms: now(),
+        body: SyncBody::Settings(SyncSettings {
+            values: BTreeMap::from([
+                ("theme".to_owned(), SettingValue::Text("dusk".to_owned())),
+                ("font-size".to_owned(), SettingValue::Number(U64::new(14))),
+                ("bell".to_owned(), SettingValue::Flag(false)),
+            ]),
+            pinned_labels: BTreeSet::from(["release".to_owned()]),
+        }),
+    };
+    store.put_object(&object).expect("the settings");
+    store
+        .record_checkpoint(
+            object.object_id,
+            SyncCheckpoint {
+                position: SyncPosition::at(3, SyncRevision::new(Uuid::from_bytes([0x8d; 16]))),
+                published_revision: Nullable::some(object.revision),
+            },
+        )
+        .expect("the note of where the settings stood");
+    (store, object)
+}
+
+/// The keys a device holds for the epochs up to `last`.
+fn keys_held(node: &Node, collection: &CollectionRef, last: u64) -> Vec<SymmetricKey> {
+    (0..=last)
+        .filter_map(|epoch| node.held(collection, epoch))
+        .collect()
+}
+
+/// Carries an exported member through a recovery-enabled archive and opens it again with the
+/// recovery recipient the seed derives, which is the only key a fresh restore holds. The producer
+/// is the suite's, standing in for the device's own: what is proved here is the export and the
+/// import on either side of it.
+fn through_an_archive(
+    producer: &Node,
+    seed: &RecoverySeed,
+    exported: &ExportedSettings,
+) -> (String, SecretVec) {
+    let recovery = seed.recipient().expect("a recovery recipient");
+    let mut recipients = ArchiveRecipients::new(CollectionKind::Owned);
+    assert!(recipients.add(*producer.keys.stored_envelope.public()));
+    assert!(recipients.add_recovery(&recovery));
+    let staged = stage_object(
+        &ObjectSource {
+            object_id: BackupObjectId::new(Uuid::from_bytes([0x21; 16])),
+            filename: exported.filename(),
+            plaintext: exported.plaintext(),
+        },
+        recipients.rotation(),
+    )
+    .expect("a staged object");
+    let archive_id = ArchiveId::new(Uuid::from_bytes([0x11; 16]));
+    let sealed = seal_archive(
+        &producer.keys.authorisation,
+        &producer.keys.stored_envelope,
+        &recipients,
+        &ArchivePlan {
+            archive_id,
+            backup_generation: BackupGeneration::new(1),
+            owner_device_id: DeviceId::new(Uuid::from_bytes([0x7c; 16])),
+            manifest_object_id: BackupObjectId::new(Uuid::from_bytes([0xf0; 16])),
+            created_at_ms: now(),
+        },
+        std::slice::from_ref(&staged),
+    )
+    .expect("a sealed archive");
+
+    let reader = ArchiveReader::Recovery(&recovery);
+    let writer = TrustedWriter {
+        writer_key_id: producer.keys.authorisation.key_id(),
+        signing_key: *producer.keys.authorisation.public(),
+        enrolled_at_ms: now(),
+    };
+    let opened = open_archive(
+        &reader,
+        producer.keys.stored_envelope.public(),
+        &[writer],
+        &ArchiveExpectation {
+            archive_id,
+            generation: GenerationExpectation::Unverified,
+        },
+        &sealed.descriptor_bytes,
+        &sealed.encrypted_manifest,
+    )
+    .expect("the archive opens with the recovery recipient");
+    let restored = opened
+        .restore_object(
+            &reader,
+            producer.keys.stored_envelope.public(),
+            staged.object_id(),
+            staged.bytes(),
+        )
+        .expect("the member restores");
+    (restored.filename, restored.plaintext)
+}
+
+/// What the archive says a member is: this device's settings go under one name.
+fn material_named(filename: &str) -> Material {
+    assert_eq!(filename, SETTINGS_FILENAME, "the settings member's name");
+    ExportedSettings::MATERIAL
+}
+
+/// KR-REQ-20.17, the settings part: a settings collection's key is never carried. The table
+/// refuses it both ways with its reason; a device that holds the collection's keys exports its
+/// settings and none of them; and an import asks about what an archive says a member is before it
+/// reads a byte of it.
+#[tokio::test]
+async fn a_collection_key_is_neither_backed_up_nor_restored() {
+    for admission in [
+        may_back_up(Material::SyncCollectionKey),
+        may_restore(Material::SyncCollectionKey),
+    ] {
+        assert!(!admission.is_allowed());
+        assert!(
+            admission
+                .because()
+                .is_some_and(|because| because.contains("seed")),
+            "the refusal says why: {admission:?}"
+        );
+    }
+    let admitted =
+        FreshRestore::admits(&[Material::DeviceConfiguration, Material::SyncCollectionKey]);
+    assert_eq!(admitted.restored, vec![Material::DeviceConfiguration]);
+    assert!(admitted.refused_kind(Material::SyncCollectionKey));
+
+    // A device that holds its collection's keys, and its settings.
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut other = Node::new(&world);
+    let collection = collection_of(&world, &mut owner, &mut [&mut other]).await;
+    let keys = keys_held(&owner, &collection, epoch_of(&world.newest(&collection)));
+    assert!(!keys.is_empty(), "the device holds the collection's keys");
+    let (store, object) = settings_on(&owner);
+
+    let exported = export_settings(&store, object.object_id).expect("the settings export");
+    assert_eq!(exported.material(), Material::DeviceConfiguration);
+    assert_eq!(exported.filename(), SETTINGS_FILENAME);
+    let seed = RecoverySeed::generate().expect("a seed");
+    let (filename, plaintext) = through_an_archive(&owner, &seed, &exported);
+    for key in &keys {
+        assert!(
+            !contains(exported.plaintext(), key.expose()),
+            "no key in the export"
+        );
+        assert!(
+            !contains(plaintext.expose(), key.expose()),
+            "no key in the archive"
+        );
+    }
+
+    // An archive that calls a member a collection key is refused before the member is read, with
+    // the table's reason; one that calls a key settings is refused as not a settings object.
+    let restored = Node::new(&world);
+    let fresh = SyncStore::open(restored.root.path().join("sync")).expect("a sync store");
+    for key in &keys {
+        match import_settings(&fresh, Material::SyncCollectionKey, key.expose()) {
+            Err(RecoveryError::Refused { material, because }) => {
+                assert_eq!(material, Material::SyncCollectionKey);
+                assert!(because.contains("seed"));
+            }
+            other => panic!("a collection key is refused, not {other:?}"),
+        }
+        assert!(matches!(
+            import_settings(&fresh, Material::DeviceConfiguration, key.expose()),
+            Err(RecoveryError::NotSettings { .. })
+        ));
+    }
+    assert!(
+        fresh
+            .object(object.object_id)
+            .expect("a readable store")
+            .is_none()
+    );
+
+    // The settings come back, and the restored device holds no key of any epoch.
+    import_settings(&fresh, material_named(&filename), plaintext.expose()).expect("the settings");
+    for epoch in 0..=epoch_of(&world.newest(&collection)) + 1 {
+        assert!(restored.held(&collection, epoch).is_none(), "epoch {epoch}");
+    }
+}
+
+/// KR-REQ-20.17, the settings part (the library's half; the device's archive producer carries it
+/// the rest of the way): a fresh restore returns the settings object as the restored device's own,
+/// with no collection key, no membership and no note of where the object stood on the service.
+#[tokio::test]
+async fn a_restore_returns_settings_without_a_key_a_membership_or_a_sync_checkpoint() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut lost = Node::new(&world);
+    let collection = collection_of(&world, &mut owner, &mut [&mut lost]).await;
+    assert!(lost.publishes());
+    let (store, object) = settings_on(&lost);
+    assert!(
+        store
+            .checkpoint(object.object_id)
+            .expect("readable")
+            .is_some()
+    );
+
+    // The export goes through a recovery-enabled archive, which is opened again with nothing but
+    // the recovery recipient.
+    let exported = export_settings(&store, object.object_id).expect("the settings export");
+    let seed = RecoverySeed::generate().expect("a seed");
+    let (filename, plaintext) = through_an_archive(&lost, &seed, &exported);
+    drop(exported);
+
+    // A new device: its keys are its own, since no reusable key is backed up.
+    let mut restored = Node::new(&world);
+    let fresh = SyncStore::open(restored.root.path().join("sync")).expect("a sync store");
+    let imported = import_settings(&fresh, material_named(&filename), plaintext.expose())
+        .expect("the settings come back");
+    assert_eq!(imported.object_id, object.object_id);
+    assert!(imported.limits.requires_fresh_owner_authorised_pairing());
+    assert!(!imported.limits.creates_remote_control_authority());
+    assert!(imported.describe().contains("pair it with the host again"));
+
+    // The settings, whole and as the device's own ...
+    assert_eq!(
+        fresh.object(object.object_id).expect("readable"),
+        Some(object.clone())
+    );
+    // ... with no note of where they stood, no key of any epoch and no membership.
+    assert_eq!(fresh.checkpoint(object.object_id).expect("readable"), None);
+    for epoch in 0..=epoch_of(&world.newest(&collection)) + 1 {
+        assert!(restored.held(&collection, epoch).is_none(), "epoch {epoch}");
+    }
+    assert!(
+        restored
+            .membership
+            .members()
+            .expect("a readable membership")
+            .is_none()
+    );
+    assert!(!restored.publishes());
+    assert_eq!(restored.refresh().await, Refreshed::NoMembership);
+
+    // A restore never writes over settings a device holds, nor beside a note of where they stood.
+    assert!(matches!(
+        import_settings(&fresh, Material::DeviceConfiguration, plaintext.expose()),
+        Err(RecoveryError::Sync(SyncError::AlreadyHeld { .. }))
+    ));
+    let noted = SyncStore::open(restored.root.path().join("noted")).expect("a sync store");
+    noted
+        .record_checkpoint(
+            object.object_id,
+            SyncCheckpoint {
+                position: SyncPosition::at(9, SyncRevision::new(Uuid::from_bytes([0x9e; 16]))),
+                published_revision: Nullable::null(),
+            },
+        )
+        .expect("a note");
+    assert!(matches!(
+        import_settings(&noted, Material::DeviceConfiguration, plaintext.expose()),
+        Err(RecoveryError::Sync(SyncError::AlreadyHeld { .. }))
+    ));
+    assert!(noted.object(object.object_id).expect("readable").is_none());
+}
+
+/// Section 24: privacy mode disables backup production as it disables sync production, so the
+/// settings are not exported while it is on, and an export names the generation it was read
+/// under.
+#[tokio::test]
+async fn a_settings_export_waits_for_privacy_mode_to_end_and_names_its_generation() {
+    let world = World::default();
+    let device = Node::new(&world);
+    let (store, object) = settings_on(&device);
+    store
+        .record_privacy(PrivacyRecord {
+            generation: U64::new(4),
+            fenced: true,
+        })
+        .expect("privacy mode on");
+    assert!(matches!(
+        export_settings(&store, object.object_id),
+        Err(RecoveryError::Sync(SyncError::Fenced { generation: 4 }))
+    ));
+    store
+        .record_privacy(PrivacyRecord {
+            generation: U64::new(5),
+            fenced: false,
+        })
+        .expect("privacy mode off");
+    let exported = export_settings(&store, object.object_id).expect("the settings export");
+    assert_eq!(exported.produced_under(), 5);
+    assert!(
+        !format!("{exported:?}").contains("dusk"),
+        "the settings are never rendered"
+    );
+}
+
+/// A restored device joins its settings collection only as any new device does: once the owner
+/// has paired it with a host again, a member has authorised it and the owner has confirmed the
+/// join on it. The records that listed the device it replaces give it nothing.
+#[tokio::test]
+async fn a_restored_device_joins_only_after_a_fresh_authorisation() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut lost = Node::new(&world);
+    let collection = collection_of(&world, &mut owner, &mut [&mut lost]).await;
+    let (store, object) = settings_on(&lost);
+    let exported = export_settings(&store, object.object_id).expect("the settings export");
+    let seed = RecoverySeed::generate().expect("a seed");
+    let (filename, plaintext) = through_an_archive(&lost, &seed, &exported);
+
+    let mut restored = Node::new(&world);
+    let fresh = SyncStore::open(restored.root.path().join("sync")).expect("a sync store");
+    import_settings(&fresh, material_named(&filename), plaintext.expose()).expect("the settings");
+
+    // Its pairing is not committed yet, so no member can plan to share with it.
+    owner.refresh().await;
+    assert!(matches!(
+        owner.membership.plan_share(&restored.auth(), now()),
+        Err(MembershipError::NotCommitted)
+    ));
+    // The records list the device it replaces, whose keys it does not have, so a join the owner
+    // confirmed on it finds no record that lists it.
+    let early = restored
+        .membership
+        .plan_join(collection, now())
+        .expect("a plan");
+    assert!(matches!(
+        restored.membership.join(&early, now()).await,
+        Err(MembershipError::NotListed)
+    ));
+    let lost_epoch = epoch_of(&world.newest(&collection));
+    for epoch in 0..=lost_epoch + 2 {
+        assert!(restored.held(&collection, epoch).is_none(), "epoch {epoch}");
+    }
+
+    // The owner revokes the lost device at the host, and the owner's device rotates it out.
+    world.hosts.revoke(lost.device());
+    owner.reconcile().await;
+    let rotated = world.newest(&collection);
+    assert!(!lists(&rotated, &lost));
+    assert!(epoch_of(&rotated) > lost_epoch);
+
+    // A pairing whose grant does not manage the host is not the owner-authorised pairing a member
+    // shares settings with.
+    world.hosts.commit(restored.device(), false);
+    owner.refresh().await;
+    assert!(matches!(
+        owner.membership.plan_share(&restored.auth(), now()),
+        Err(MembershipError::NotCommitted)
+    ));
+
+    // The owner pairs the restored device again; committed is not yet authorised.
+    world.hosts.commit(restored.device(), true);
+    owner.refresh().await;
+    let share = owner
+        .membership
+        .plan_share(&restored.auth(), now())
+        .expect("a committed device");
+    assert_eq!(
+        owner.membership.authorise(&share, now()).expect("a plan"),
+        Ended::Done
+    );
+    owner.reconcile().await;
+    let newest = world.newest(&collection);
+    assert!(lists(&newest, &restored));
+    assert!(
+        restored.held(&collection, epoch_of(&newest)).is_none(),
+        "nothing until the owner confirms the join on the restored device"
+    );
+
+    let join = restored
+        .membership
+        .plan_join(collection, now())
+        .expect("a plan");
+    restored
+        .membership
+        .join(&join, now())
+        .await
+        .expect("a join");
+    restored.reconcile().await;
+    assert!(restored.publishes());
+    assert_eq!(
+        restored
+            .held(&collection, epoch_of(&newest))
+            .expect("the key through its own wrap")
+            .expose(),
+        key_in(&newest, &restored).expose()
+    );
+    for epoch in 0..epoch_of(&newest) {
+        assert!(
+            restored.held(&collection, epoch).is_none(),
+            "nothing from before it joined: epoch {epoch}"
+        );
+    }
+    // The restored settings are still its own, untouched by the membership.
+    assert_eq!(fresh.checkpoint(object.object_id).expect("readable"), None);
+    assert_eq!(
+        fresh.object(object.object_id).expect("readable"),
+        Some(object)
+    );
 }
