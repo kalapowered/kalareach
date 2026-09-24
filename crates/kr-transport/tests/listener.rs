@@ -260,6 +260,9 @@ async fn early_data_never_reaches_an_authorised_connection() {
             client.keys.transport.export_endpoint_seed().expose(),
         ))
         .relay_mode(iroh::RelayMode::Disabled)
+        // The loopback and nothing else: naming an address replaces iroh's default socket for its
+        // own family only, so the defaults go first, as the product's endpoints do.
+        .clear_ip_transports()
         .bind_addr(
             "127.0.0.1:0"
                 .parse::<std::net::SocketAddr>()

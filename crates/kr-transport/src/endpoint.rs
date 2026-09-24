@@ -556,6 +556,7 @@ mod tests {
                     "every socket an endpoint bound to {loopback} holds is a loopback socket: \
                      {sockets:?}"
                 );
+                eprintln!("{loopback}: bound {sockets:?}");
                 endpoint.close().await;
             }
         }
