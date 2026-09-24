@@ -434,7 +434,9 @@ jobs:
       # refused when it opens it, and so is the owner arriving over the network, which is why this
       # case opens a pipe through the runner's own file-sharing server. The pipe names the process
       # at its other end; a descriptor is published under its owner's list and replaced whole; a
-      # process's start identity is the creation time Windows records.
+      # process's start identity is the creation time Windows records, in its hundreds of
+      # nanoseconds, so two processes started within one second are two identities, and a process
+      # this account may only ask when it started is identified without its liveness being guessed.
       - name: Test the local endpoint, the descriptors and the process identity
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-ipc --test windows
@@ -461,6 +463,21 @@ jobs:
       - name: Test controller and local authority at a worker's pipe
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-worker --test authority
+
+      # A worker of the previous release keeps running across an upgrade and states its start in
+      # whole seconds. The registry settles every record of one each time it is opened: a process
+      # still running is recorded at the creation time Windows records, and one that has gone is
+      # marked ended. The test process stands in for such a worker.
+      - name: Settle the registry's records of a previous release's workers
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-controller --lib registry
+
+      # The environment feature store on this platform, among its tests the claim a controller of
+      # the previous release wrote on it with its start in whole seconds, which the next owner
+      # reads and replaces.
+      - name: Test the attention store
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-attention
 
       # The settings-sync store flushes the directory it changes a name in, through a handle of
       # the directory's own, and passes over a directory on its path this account may not add to.
