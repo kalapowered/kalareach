@@ -283,11 +283,17 @@ async fn seed(directory: &Path, origin: &str) {
 }
 
 /// Starts this binary once per role, from a copy on the internal disk.
+///
+/// The tests run on several threads of one process, and a child started for one test keeps every
+/// descriptor this process had open at that instant until its own program takes over. If this
+/// process wrote the copy itself, a child started for another test could still hold it open for
+/// writing when this test starts it, which Linux refuses. So a separate process writes the copy
+/// and has ended before the first child starts.
 async fn children(directory: &Path, origin: &str, roles: &[&str], shared: bool) -> Vec<String> {
     let copy = directory.join("children");
     std::fs::create_dir_all(&copy).expect("a directory");
     let binary = copy.join("account-lock-child");
-    std::fs::copy(std::env::current_exe().expect("this binary"), &binary).expect("a copy");
+    kr_ipc::testing::place_program(&std::env::current_exe().expect("this binary"), &binary);
     let mut running = Vec::new();
     for role in roles {
         let mut command = tokio::process::Command::new(&binary);
