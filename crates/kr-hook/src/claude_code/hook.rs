@@ -12,6 +12,15 @@
 use std::io::Read as _;
 use std::time::Duration;
 
+use crate::exchange::Exchange;
+use crate::registration::{Bridge, Paths, Registration};
+
+/// What a hook declares itself to the worker as.
+const BRIDGE: Bridge = Bridge {
+    application: super::APPLICATION,
+    surface: "hook",
+};
+
 /// How long one hook run may take, from start to answer.
 ///
 /// The package registers a one-second timeout for `SessionEnd` and five seconds for the other four
@@ -48,7 +57,13 @@ pub fn run() -> std::process::ExitCode {
     answer()
 }
 
-/// Reads the event Claude Code wrote.
+/// How long a hook waits for the worker to finish publishing its launch.
+///
+/// The worker writes the registration as soon as it knows which process it started, long before
+/// the application runs its first hook, so this only covers a hook that races the launch itself.
+pub const REGISTRATION_WAIT: Duration = Duration::from_millis(250);
+
+/// Reads the event Claude Code wrote and, inside a launch, reaches the worker with it.
 fn observe() -> Result<(), String> {
     let mut input = Vec::new();
     std::io::stdin()
@@ -56,7 +71,22 @@ fn observe() -> Result<(), String> {
         .take(MAX_HOOK_INPUT_BYTES)
         .read_to_end(&mut input)
         .map_err(|error| format!("the hook's input could not be read: {error}"))?;
-    Ok(())
+    // Outside a launch there is nobody to tell, and the answer is the same neutral one.
+    let Some(paths) = Paths::from_environment().map_err(|error| error.to_string())? else {
+        return Ok(());
+    };
+    let registration =
+        Registration::read(&paths, REGISTRATION_WAIT).map_err(|error| error.to_string())?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("the hook could not start: {error}"))?;
+    runtime
+        .block_on(async {
+            let mut exchange = Exchange::open(&registration, BRIDGE).await?;
+            exchange.admitted(HOOK_DEADLINE).await
+        })
+        .map_err(|error| error.to_string())
 }
 
 /// Writes the neutral answer and ends with the code that blocks nothing.
