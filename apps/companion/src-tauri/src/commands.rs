@@ -1171,6 +1171,52 @@ mod tests {
         );
     }
 
+    /// An application whose commands are `handler`, with no host configured, and the window its
+    /// page runs in.
+    fn page_with(
+        handler: impl Fn(tauri::ipc::Invoke<tauri::test::MockRuntime>) -> bool + Send + Sync + 'static,
+    ) -> (
+        tauri::App<tauri::test::MockRuntime>,
+        tauri::WebviewWindow<tauri::test::MockRuntime>,
+    ) {
+        let app = tauri::test::mock_builder()
+            .manage(AppState::new())
+            .invoke_handler(handler)
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("an application");
+        let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .expect("a window");
+        (app, window)
+    }
+
+    /// Calls `command` the way the page does, through the invoke path, and returns what it was
+    /// refused with: the refusal's code, or the invoke layer's own sentence when the refusal came
+    /// from there, or nothing when the call succeeded.
+    fn refusal_of(
+        window: &tauri::WebviewWindow<tauri::test::MockRuntime>,
+        command: &str,
+        body: serde_json::Value,
+    ) -> Option<String> {
+        tauri::test::get_ipc_response(
+            window,
+            tauri::webview::InvokeRequest {
+                cmd: command.into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: "tauri://localhost".parse().expect("the bundle's address"),
+                body: tauri::ipc::InvokeBody::Json(body),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.to_owned(),
+            },
+        )
+        .err()
+        .map(|error| match error["code"].as_str() {
+            Some(code) => code.to_owned(),
+            None => error.to_string(),
+        })
+    }
+
     #[test]
     fn every_named_command_is_unique() {
         let mut seen = BTreeSet::new();
@@ -1179,11 +1225,11 @@ mod tests {
         }
     }
 
-    /// KR-REQ-10.01: the WebView reaches only the named commands the native side validates.
+    /// KR-REQ-10.01: the command table names none of the protocol methods listed here, each of which
+    /// the page must never perform.
     #[test]
     fn no_command_reaches_a_method_outside_the_named_set() {
-        // The page cannot name a method, so the reachable set is exactly the methods these
-        // commands name. This is the sentence the boundary rests on, written as a test.
+        // This test checks that no table entry names a method in the forbidden list.
         let reachable: BTreeSet<&str> = NAMED_COMMANDS
             .iter()
             .filter_map(|(_, method)| method.map(Method::as_str))
@@ -1275,13 +1321,77 @@ mod tests {
         assert!(safe_file_name(&"a".repeat(300)).is_err());
     }
 
-    /// KR-REQ-10.01: parameters from the WebView are validated before anything is sent.
+    /// KR-REQ-10.01: parameters from the WebView are validated before anything is sent. Called the
+    /// way the page calls them, through the invoke path with no host configured, every command
+    /// that performs a method refuses a parameter map that is not that method's shape with
+    /// `INVALID_ARGUMENT`, which it can answer only by parsing before it asks for a host. The two
+    /// reads that take nothing from the page go straight to that question, and the upload, which
+    /// takes a path rather than a map, refuses one that nobody dropped.
     #[test]
     fn parameters_that_are_not_the_methods_shape_are_refused_before_anything_is_sent() {
         let refusal: Result<kr_protocol::session::SessionReadParams> =
             decode(serde_json::json!({ "session_id": "the one I was looking at" }));
         let error = refusal.expect_err("that is not a session identifier");
         assert_eq!(error.code, kr_protocol::error::ErrorCode::InvalidArgument);
+
+        // Every command in the table that performs a method. A command added to the table and not
+        // here is not found below, which fails this test rather than leaving it unchecked.
+        let (_app, window) = page_with(tauri::generate_handler![
+            host_info,
+            environment_list,
+            environment_capabilities,
+            session_list,
+            session_read,
+            session_create,
+            session_close,
+            session_attach,
+            session_detach,
+            attachment_configure,
+            attachment_viewport,
+            terminal_resize,
+            input_acquire,
+            input_release,
+            input_interrupt,
+            input_write,
+            shell_launch,
+            draft_create,
+            draft_update,
+            draft_add_attachment,
+            attachment_upload,
+            attachment_upload_status,
+            attachment_image,
+            attachment_image_chunk,
+            events_subscribe,
+            events_snapshot,
+            history_page,
+            action_read,
+            action_cancel,
+            question_read,
+            question_answer,
+            pair_status,
+        ]);
+        // One body for every command: each reads the arguments it takes and nothing else.
+        let foreign = serde_json::json!({
+            "subject": {},
+            "params": { "a_field_no_method_takes": true },
+            "path": "/a/file/nobody/dropped",
+            "sessionId": null,
+        });
+        for (command, method) in NAMED_COMMANDS {
+            if method.is_none() {
+                continue;
+            }
+            let expected = match *command {
+                "host_info" | "environment_list" => "HOST_NOT_CONFIGURED",
+                "attachment_upload" => "PERMISSION_DENIED",
+                _ => "INVALID_ARGUMENT",
+            };
+            assert_eq!(
+                refusal_of(&window, command, foreign.clone()).as_deref(),
+                Some(expected),
+                "{command} answers a shape its method does not take"
+            );
+        }
     }
 
     /// KR-REQ-13.21: a command that is handed a path acts only on one the platform gave this
@@ -1293,33 +1403,12 @@ mod tests {
     fn a_path_the_page_names_is_refused_at_the_command_boundary() {
         use tauri::Manager as _;
 
-        let app = tauri::test::mock_builder()
-            .manage(AppState::new())
-            .invoke_handler(tauri::generate_handler![
-                attachment_upload,
-                export_semantic_json
-            ])
-            .build(tauri::test::mock_context(tauri::test::noop_assets()))
-            .expect("an application");
-        let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
-            .build()
-            .expect("a window");
-        let refusal_code = |command: &str, body: serde_json::Value| -> Option<String> {
-            tauri::test::get_ipc_response(
-                &window,
-                tauri::webview::InvokeRequest {
-                    cmd: command.into(),
-                    callback: tauri::ipc::CallbackFn(0),
-                    error: tauri::ipc::CallbackFn(1),
-                    url: "tauri://localhost".parse().expect("the bundle's address"),
-                    body: tauri::ipc::InvokeBody::Json(body),
-                    headers: Default::default(),
-                    invoke_key: tauri::test::INVOKE_KEY.to_owned(),
-                },
-            )
-            .err()
-            .map(|error| error["code"].as_str().unwrap_or_default().to_owned())
-        };
+        let (app, window) = page_with(tauri::generate_handler![
+            attachment_upload,
+            export_semantic_json
+        ]);
+        let refusal_code =
+            |command: &str, body: serde_json::Value| refusal_of(&window, command, body);
         let state = app.state::<AppState>();
 
         // An upload of a file the page names, which nobody dropped on this window.
@@ -1374,16 +1463,41 @@ mod tests {
         );
     }
 
-    /// KR-REQ-10.01: an unknown field from the WebView is refused.
+    /// KR-REQ-10.01: an unknown field from the WebView is refused. Called the way the page calls it,
+    /// `session_read` with a complete parameter map passes the parse and stops only at the host
+    /// question, and the same map with one field the method does not declare is refused with
+    /// `INVALID_ARGUMENT` before the host is asked.
     #[test]
     fn a_parameter_map_with_an_unknown_field_is_refused() {
-        let refusal: Result<kr_protocol::session::SessionReadParams> = decode(serde_json::json!({
-            "session_id": "44444444-4444-4444-8444-444444444444",
-            "and_also": "run this"
-        }));
+        let complete = serde_json::json!({ "session_id": "44444444-4444-4444-8444-444444444444" });
+        let mut widened = complete.clone();
+        widened["and_also"] = serde_json::json!("run this");
+        let refusal: Result<kr_protocol::session::SessionReadParams> = decode(widened.clone());
         assert!(
             refusal.is_err(),
             "a closed schema refuses what it does not name"
+        );
+
+        let (_app, window) = page_with(tauri::generate_handler![session_read]);
+        assert_eq!(
+            refusal_of(
+                &window,
+                "session_read",
+                serde_json::json!({ "params": complete })
+            )
+            .as_deref(),
+            Some("HOST_NOT_CONFIGURED"),
+            "a complete map passes the parse and stops at the host question"
+        );
+        assert_eq!(
+            refusal_of(
+                &window,
+                "session_read",
+                serde_json::json!({ "params": widened })
+            )
+            .as_deref(),
+            Some("INVALID_ARGUMENT"),
+            "one field the method does not declare is refused"
         );
     }
 }
