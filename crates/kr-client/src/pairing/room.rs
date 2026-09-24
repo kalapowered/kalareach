@@ -276,7 +276,9 @@ async fn open_socket(
 ///
 /// A status other than switching protocols is the room's answer, whatever it is. An answer that
 /// is not an upgrade, or that the guard refused, is not one either. Anything else is the
-/// connection failing part way through.
+/// connection failing part way through, TLS included: its failures after the handshake reach this
+/// as input errors of the same kind the guard's do, so the guard's are told apart by their own
+/// type rather than by their kind.
 fn upgrade_failed(origin: &RendezvousOrigin, error: tokio_websockets::Error) -> RoomError {
     let origin = origin.as_str().to_owned();
     match error {
@@ -287,7 +289,7 @@ fn upgrade_failed(origin: &RendezvousOrigin, error: tokio_websockets::Error) -> 
             origin,
             reason: error.to_string(),
         },
-        tokio_websockets::Error::Io(error) if error.kind() == io::ErrorKind::InvalidData => {
+        tokio_websockets::Error::Io(error) if GuardRefusal::refused(&error) => {
             RoomError::NotAnUpgrade {
                 origin,
                 reason: error.to_string(),
@@ -315,6 +317,34 @@ struct UpgradeGuard<S> {
     stream: S,
     answer: Answered,
 }
+
+/// The guard refusing the room's answer to the upgrade.
+///
+/// It travels inside an input error, the only kind of error a stream can return, and is its own
+/// type so that a refusal of the answer is never confused with the stream failing underneath: TLS
+/// reports a corrupt record after the handshake with the same error kind.
+#[derive(Debug)]
+struct GuardRefusal(&'static str);
+
+impl GuardRefusal {
+    /// Returns the input error that carries this refusal.
+    fn error(reason: &'static str) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, Self(reason))
+    }
+
+    /// Returns true when `error` carries the guard's refusal.
+    fn refused(error: &io::Error) -> bool {
+        error.get_ref().is_some_and(|inner| inner.is::<Self>())
+    }
+}
+
+impl std::fmt::Display for GuardRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for GuardRefusal {}
 
 /// How far the room's answer to the upgrade has come.
 enum Answered {
@@ -367,8 +397,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for UpgradeGuard<S> {
                     head.extend_from_slice(into.filled());
                     let start = head.len().min(STATUS_LINE_START.len());
                     if head[..start] != STATUS_LINE_START[..start] {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
+                        return Poll::Ready(Err(GuardRefusal::error(
                             "the room's answer to the upgrade does not begin with a status line",
                         )));
                     }
@@ -377,8 +406,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for UpgradeGuard<S> {
                         let read = std::mem::take(head);
                         this.answer = Answered::Handing { read, at: 0 };
                     } else if head.len() >= MAX_UPGRADE_ANSWER_BYTES {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
+                        return Poll::Ready(Err(GuardRefusal::error(
                             "the room's answer to the upgrade is longer than an answer may be",
                         )));
                     }
@@ -454,8 +482,7 @@ fn check_upgrade_head(head: &[u8]) -> io::Result<()> {
                 .iter()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'));
         if !digest {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+            return Err(GuardRefusal::error(
                 "the room's answer to the upgrade carries an accept value that is no SHA-1 digest",
             ));
         }

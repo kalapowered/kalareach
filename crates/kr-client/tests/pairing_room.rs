@@ -574,19 +574,67 @@ async fn a_frame_the_client_cannot_read_ends_its_socket() {
     );
 }
 
-/// KR-REQ-10.27: a frame larger than a room frame may be ends the socket before it is read.
+/// KR-REQ-10.27: a frame larger than a room frame may be ends the socket as soon as its header
+/// declares the length, before any of its body arrives: the room here sends the header of an
+/// oversized frame and nothing more, and keeps the connection open, so only the limit can end it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_oversized_frame_ends_the_socket() {
+async fn an_oversized_frame_ends_the_socket_at_its_header() {
     let authority = Authority::new("rendezvous test authority");
     let room = LoopbackRoom::start(&authority).await;
     let (mut socket, _, _, mut end) =
         open_while(&authority.trusted_by(), &room, RoomRole::Candidate).await;
-    // The room's own library would refuse to send this; a room that sends it anyway is ended.
-    let _ = end
-        .send(Message::binary(vec![0xa0; MAX_FRAME_BYTES + 1]))
-        .await;
-    let ended = tokio::time::timeout(WATCHDOG, socket.incoming.recv())
+    // A final binary frame, unmasked as a server's are, whose 64-bit length is one byte more than
+    // a room frame may be.
+    let declared = u64::try_from(MAX_FRAME_BYTES + 1).expect("a frame length");
+    let mut header = vec![0x82, 127];
+    header.extend_from_slice(&declared.to_be_bytes());
+    let stream = end.get_mut();
+    stream
+        .write_all(&header)
         .await
-        .expect("the pump ends");
+        .expect("the header is written");
+    stream.flush().await.expect("the header is sent");
+    let ended = tokio::time::timeout(Duration::from_secs(5), socket.incoming.recv())
+        .await
+        .expect("the socket ends at the header, without waiting for a body that never comes");
     assert_eq!(ended, None, "an oversized frame ends the socket");
+}
+
+/// A TLS failure after the handshake, while the room answers the upgrade, is the room being
+/// unreachable, not an answer that is not an upgrade: the stream failing underneath says nothing
+/// about what the origin serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tls_failure_during_the_upgrade_is_unreachable() {
+    let authority = Authority::new("rendezvous test authority");
+    let room = LoopbackRoom::start(&authority).await;
+    let connector = authority.trusted_by();
+    let locator = locator();
+    let (opened, ()) = tokio::time::timeout(WATCHDOG, async {
+        tokio::join!(
+            connector.open(&room.origin, &locator, RoomRole::Candidate),
+            async {
+                let (stream, _) = room.listener.accept().await.expect("a connection");
+                let mut stream = room.acceptor.accept(stream).await.expect("TLS");
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    head.push(stream.read_u8().await.expect("the request"));
+                }
+                // Bytes written past TLS, straight onto the connection: to the client they are a
+                // record that fails TLS's own checks.
+                let (connection, _) = stream.get_mut();
+                connection
+                    .write_all(b"this is not a TLS record")
+                    .await
+                    .expect("written");
+                connection.flush().await.expect("sent");
+                let _ = tokio::time::timeout(WATCHDOG, connection.read_u8()).await;
+            }
+        )
+    })
+    .await
+    .expect("the attempt ends");
+    assert!(
+        matches!(opened, Err(RoomError::Unreachable { .. })),
+        "{opened:?}"
+    );
 }
