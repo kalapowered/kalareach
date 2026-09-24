@@ -33,7 +33,7 @@ use kr_pairing::host::{
 };
 use kr_pairing::platform::{InvitationState, LivePeer, PairingClock};
 use kr_protocol::confirmation::{
-    ConfirmationDisplay, ConfirmationSubject, OwnerConfirmationCompleteParams,
+    CLOCK_PURPOSE, ConfirmationDisplay, ConfirmationSubject, OwnerConfirmationCompleteParams,
     OwnerConfirmationCompleteResult, OwnerConfirmationPendingResult,
     OwnerConfirmationRequestParams, OwnerConfirmationRequestResult,
 };
@@ -109,11 +109,6 @@ impl PairingClock for HostPairingClock {
         kr_ipc::now_ms().get()
     }
 }
-
-/// What an owner confirms when it establishes this host's clock again.
-///
-/// The digest of this, and of nothing else, is what the confirmation is bound to.
-pub const CLOCK_PURPOSE: &str = "kr-host-clock/1";
 
 /// The invitation this host is offering, and what it was issued as.
 struct Open {

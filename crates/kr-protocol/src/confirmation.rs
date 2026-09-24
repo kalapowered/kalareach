@@ -34,6 +34,12 @@ use crate::pairing::{
 use crate::rights::ActionRight;
 use crate::scalars::{AuthorisationKey, CanonicalSet, Digest256, Nullable, TimestampMs};
 
+/// What an owner confirms when it establishes a host's clock again.
+///
+/// The confirmation is bound to the digest of this value and of nothing else. The host asks for
+/// it and an owner device checks it, so both compute it from this one definition.
+pub const CLOCK_PURPOSE: &str = "kr-host-clock/1";
+
 /// What an owner confirmation is asked for.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
