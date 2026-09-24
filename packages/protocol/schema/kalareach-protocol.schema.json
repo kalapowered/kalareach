@@ -20044,6 +20044,17 @@
           "$ref": "#/$defs/PluginId",
           "description": "The package whose action this is."
         },
+        "resource_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PendingResourceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The pending resource this invocation answers.\n\nAn action whose effect class is `approval.respond` answers exactly one pending request,\nand this names it. Every other action names none. The caller never supplies the upstream's\nown request identifier: an answer carries the identifier the named resource recorded when\nthe request arrived, so it can resolve only the request it names."
+        },
         "target": {
           "$ref": "#/$defs/AgentMutationTarget",
           "description": "What the action acts on."
@@ -20054,6 +20065,7 @@
         "plugin_id",
         "action",
         "draft_id",
+        "resource_id",
         "parameters"
       ],
       "type": "object"

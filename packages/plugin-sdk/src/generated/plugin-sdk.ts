@@ -7,6 +7,10 @@
  */
 
 /**
+ * One pending resource the broker arbitrates and resolves exactly once.
+ */
+export type PendingResourceId = string
+/**
  * The user-facing reason something is unavailable. One line, no control or bidirectional characters.
  */
 export type DisabledReason = string
@@ -255,6 +259,13 @@ export type Predicate1 =
         | 'holds_input_lease'
       op: 'flag'
     }
+  | {
+      op: 'pending_approval_for'
+      /**
+       * The upstream approval request.
+       */
+      request_id: string
+    }
 /**
  * One term of a visibility predicate.
  */
@@ -368,6 +379,13 @@ export type Predicate =
         | 'transfer_in_progress'
         | 'holds_input_lease'
       op: 'flag'
+    }
+  | {
+      op: 'pending_approval_for'
+      /**
+       * The upstream approval request.
+       */
+      request_id: string
     }
 /**
  * One piece of a terminal text template.
@@ -741,6 +759,14 @@ export interface ActionInvocation {
    * The supplied parameter values, keyed by parameter name.
    */
   arguments: ActionArgument[]
+  /**
+   * The pending resource this invocation answers.
+   *
+   * Present exactly when the action's effect class is [`EffectClass::ApprovalRespond`]. The
+   * upstream's own request identifier is not here: an answer carries the identifier the named
+   * resource recorded, so it resolves only the request it names.
+   */
+  resource_id: PendingResourceId | null
 }
 /**
  * One supplied parameter value.
@@ -1225,6 +1251,13 @@ export interface PublisherRecord {
  */
 export interface ConnectorManifest {
   /**
+   * Where an answer to a pending approval goes, for a table that answers approvals.
+   *
+   * Null for a table that answers none. Without a destination nothing a package declares can
+   * answer an approval on this connection, whatever trust it is granted.
+   */
+  decision_destination: DecisionDestination | null
+  /**
    * How messages are separated.
    */
   framing:
@@ -1268,7 +1301,7 @@ export interface ConnectorManifest {
    * The manifest format version.
    */
   manifest_version: number
-  method_path: FieldPath
+  method_path: FieldPath2
   /**
    * What each method does.
    */
@@ -1282,13 +1315,13 @@ export interface ConnectorManifest {
    * What the publisher says about the qualification behind this table.
    */
   qualification_note: Summary | null
-  request_id_path: FieldPath1
+  request_id_path: FieldPath3
   /**
    * How a response is matched to its request.
    */
   response_correlation:
     | {
-        id_path: FieldPath2
+        id_path: FieldPath4
         type: 'matching_id'
       }
     | {
@@ -1318,9 +1351,72 @@ export interface ConnectorManifest {
   volatile_forwarding: boolean
 }
 /**
- * Where a message names its method.
+ * Where an answer to a pending approval goes, and what the upstream reads for each decision.
+ *
+ * The broker answers a pending request by sending one routed method. This says which method,
+ * which requests it answers, where the answer repeats the identifier of the request it answers,
+ * where the decision goes, and the exact value the upstream reads for each decision a person can
+ * make. The identifier comes from the pending request and the value from this mapping, so an
+ * answer carries nothing a caller typed: a decision the mapping does not list is refused rather
+ * than sent, and an answer cannot name a request other than the one it resolves.
+ */
+export interface DecisionDestination {
+  /**
+   * The routed method whose requests this destination answers.
+   *
+   * The upstream sends it; a message of this method is a pending approval. The table
+   * otherwise could not say which of the messages it routes asks for a decision.
+   */
+  answers: string
+  decision_path: FieldPath
+  /**
+   * Every decision a person can make, and the value the upstream reads for it.
+   */
+  decisions: DecisionValue[]
+  /**
+   * The routed method that carries the answer.
+   */
+  method: string
+  request_id_path: FieldPath1
+}
+/**
+ * Where the answer carries the decision.
  */
 export interface FieldPath {
+  /**
+   * The path segments, from the root of the message.
+   */
+  segments: FieldSegment[]
+}
+/**
+ * One decision and the upstream's own value for it.
+ */
+export interface DecisionValue {
+  /**
+   * The decision, as a validated answer names it.
+   */
+  decision: string
+  /**
+   * The value written at the decision path, exactly as the upstream reads it.
+   */
+  value: string
+}
+/**
+ * Where the answer carries the identifier of the request it answers.
+ *
+ * An answer is a response to that request, so this is where the table matches a response to
+ * its request: the path of its [`ResponseCorrelation::MatchingId`].
+ */
+export interface FieldPath1 {
+  /**
+   * The path segments, from the root of the message.
+   */
+  segments: FieldSegment[]
+}
+/**
+ * Where a message names its method.
+ */
+export interface FieldPath2 {
   /**
    * The path segments, from the root of the message.
    */
@@ -1363,7 +1459,7 @@ export interface ProtocolPin {
 /**
  * Where a request carries its identifier.
  */
-export interface FieldPath1 {
+export interface FieldPath3 {
   /**
    * The path segments, from the root of the message.
    */
@@ -1372,7 +1468,7 @@ export interface FieldPath1 {
 /**
  * Where the identifier is in a response.
  */
-export interface FieldPath2 {
+export interface FieldPath4 {
   /**
    * The path segments, from the root of the message.
    */
@@ -1783,6 +1879,13 @@ export interface Control {
           | 'holds_input_lease'
         op: 'flag'
       }
+    | {
+        op: 'pending_approval_for'
+        /**
+         * The upstream approval request.
+         */
+        request_id: string
+      }
   /**
    * The standard icon.
    */
@@ -1939,6 +2042,13 @@ export interface Control {
           | 'transfer_in_progress'
           | 'holds_input_lease'
         op: 'flag'
+      }
+    | {
+        op: 'pending_approval_for'
+        /**
+         * The upstream approval request.
+         */
+        request_id: string
       }
 }
 /**
@@ -2083,6 +2193,13 @@ export interface Control1 {
           | 'holds_input_lease'
         op: 'flag'
       }
+    | {
+        op: 'pending_approval_for'
+        /**
+         * The upstream approval request.
+         */
+        request_id: string
+      }
   /**
    * The standard icon.
    */
@@ -2239,6 +2356,13 @@ export interface Control1 {
           | 'transfer_in_progress'
           | 'holds_input_lease'
         op: 'flag'
+      }
+    | {
+        op: 'pending_approval_for'
+        /**
+         * The upstream approval request.
+         */
+        request_id: string
       }
 }
 /**
@@ -2371,6 +2495,13 @@ export interface Control2 {
           | 'holds_input_lease'
         op: 'flag'
       }
+    | {
+        op: 'pending_approval_for'
+        /**
+         * The upstream approval request.
+         */
+        request_id: string
+      }
   /**
    * The standard icon.
    */
@@ -2527,6 +2658,13 @@ export interface Control2 {
           | 'transfer_in_progress'
           | 'holds_input_lease'
         op: 'flag'
+      }
+    | {
+        op: 'pending_approval_for'
+        /**
+         * The upstream approval request.
+         */
+        request_id: string
       }
 }
 /**
@@ -2659,6 +2797,13 @@ export interface Control3 {
           | 'holds_input_lease'
         op: 'flag'
       }
+    | {
+        op: 'pending_approval_for'
+        /**
+         * The upstream approval request.
+         */
+        request_id: string
+      }
   /**
    * The standard icon.
    */
@@ -2815,6 +2960,13 @@ export interface Control3 {
           | 'transfer_in_progress'
           | 'holds_input_lease'
         op: 'flag'
+      }
+    | {
+        op: 'pending_approval_for'
+        /**
+         * The upstream approval request.
+         */
+        request_id: string
       }
 }
 /**
@@ -2993,6 +3145,13 @@ export interface ActionDeclaration {
         type: 'upstream_method'
       }
     | {
+        /**
+         * The declared choice parameter that carries the decision.
+         */
+        decision: string
+        type: 'decision_destination'
+      }
+    | {
         type: 'upstream_cancel'
       }
     | {
@@ -3012,7 +3171,7 @@ export interface ActionDeclaration {
  * One declared parameter bound to a field of an upstream request.
  */
 export interface ParameterBinding {
-  field: FieldPath3
+  field: FieldPath5
   /**
    * The declared parameter supplying the value.
    */
@@ -3021,7 +3180,7 @@ export interface ParameterBinding {
 /**
  * Where the value goes in the upstream request.
  */
-export interface FieldPath3 {
+export interface FieldPath5 {
   /**
    * The path segments, from the root of the message.
    */

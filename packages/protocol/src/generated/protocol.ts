@@ -15228,6 +15228,15 @@ export interface PluginActionInvokeParams {
    * A plugin identifier from its manifest.
    */
   plugin_id: string
+  /**
+   * The pending resource this invocation answers.
+   *
+   * An action whose effect class is `approval.respond` answers exactly one pending request,
+   * and this names it. Every other action names none. The caller never supplies the upstream's
+   * own request identifier: an answer carries the identifier the named resource recorded when
+   * the request arrived, so it can resolve only the request it names.
+   */
+  resource_id: PendingResourceId | null
   target: AgentMutationTarget4
 }
 /**

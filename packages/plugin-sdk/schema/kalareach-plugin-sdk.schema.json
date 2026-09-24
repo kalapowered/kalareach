@@ -102,7 +102,7 @@
         },
         {
           "additionalProperties": false,
-          "description": "The broker sends one routed upstream method with the bound parameters.\n\nThe method must be one the package's connector table routes and classifies, so what the\nbroker sends is something a reviewer read and a publisher qualified.",
+          "description": "The broker sends one routed upstream method with the bound parameters.\n\nThe method must be one the package's connector table routes and classifies, so what the\nbroker sends is something a reviewer read and a publisher qualified. It does not answer an\napproval: an answer carries the identifier of the request it resolves and a value the\nconnector table maps, and neither is a parameter. That is\n[`ActionImplementation::DecisionDestination`].",
           "properties": {
             "bindings": {
               "description": "Which declared parameter supplies each field of the request.",
@@ -124,6 +124,25 @@
             "type",
             "method",
             "bindings"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The broker answers the pending request the invocation names, through the connector table's\ndecision destination.\n\nThe answer is the destination's method, carrying the named request's own identifier and the\nupstream's value for the decision the named parameter holds. Nothing else goes in, so a\ncaller can neither choose which request is answered nor supply a value the table does not\nmap.",
+          "properties": {
+            "decision": {
+              "$ref": "#/$defs/ParameterName",
+              "description": "The declared choice parameter that carries the decision."
+            },
+            "type": {
+              "const": "decision_destination",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "decision"
           ],
           "type": "object"
         },
@@ -179,10 +198,22 @@
             "$ref": "#/$defs/ActionArgument"
           },
           "type": "array"
+        },
+        "resource_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PendingResourceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The pending resource this invocation answers.\n\nPresent exactly when the action's effect class is [`EffectClass::ApprovalRespond`]. The\nupstream's own request identifier is not here: an answer carries the identifier the named\nresource recorded, so it resolves only the request it names."
         }
       },
       "required": [
         "action_id",
+        "resource_id",
         "arguments"
       ],
       "type": "object"
@@ -887,6 +918,17 @@
       "additionalProperties": false,
       "description": "The connector manifest.",
       "properties": {
+        "decision_destination": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecisionDestination"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where an answer to a pending approval goes, for a table that answers approvals.\n\nNull for a table that answers none. Without a destination nothing a package declares can\nanswer an approval on this connection, whatever trust it is granted."
+        },
         "framing": {
           "$ref": "#/$defs/Framing",
           "description": "How messages are separated."
@@ -962,6 +1004,7 @@
         "response_correlation",
         "routes",
         "methods",
+        "decision_destination",
         "volatile_forwarding",
         "qualification_note"
       ],
@@ -1050,6 +1093,62 @@
       "maximum": 4294967295,
       "minimum": 0,
       "type": "integer"
+    },
+    "DecisionDestination": {
+      "additionalProperties": false,
+      "description": "Where an answer to a pending approval goes, and what the upstream reads for each decision.\n\nThe broker answers a pending request by sending one routed method. This says which method,\nwhich requests it answers, where the answer repeats the identifier of the request it answers,\nwhere the decision goes, and the exact value the upstream reads for each decision a person can\nmake. The identifier comes from the pending request and the value from this mapping, so an\nanswer carries nothing a caller typed: a decision the mapping does not list is refused rather\nthan sent, and an answer cannot name a request other than the one it resolves.",
+      "properties": {
+        "answers": {
+          "$ref": "#/$defs/MethodName",
+          "description": "The routed method whose requests this destination answers.\n\nThe upstream sends it; a message of this method is a pending approval. The table\notherwise could not say which of the messages it routes asks for a decision."
+        },
+        "decision_path": {
+          "$ref": "#/$defs/FieldPath",
+          "description": "Where the answer carries the decision."
+        },
+        "decisions": {
+          "description": "Every decision a person can make, and the value the upstream reads for it.",
+          "items": {
+            "$ref": "#/$defs/DecisionValue"
+          },
+          "type": "array"
+        },
+        "method": {
+          "$ref": "#/$defs/MethodName",
+          "description": "The routed method that carries the answer."
+        },
+        "request_id_path": {
+          "$ref": "#/$defs/FieldPath",
+          "description": "Where the answer carries the identifier of the request it answers.\n\nAn answer is a response to that request, so this is where the table matches a response to\nits request: the path of its [`ResponseCorrelation::MatchingId`]."
+        }
+      },
+      "required": [
+        "answers",
+        "method",
+        "request_id_path",
+        "decision_path",
+        "decisions"
+      ],
+      "type": "object"
+    },
+    "DecisionValue": {
+      "additionalProperties": false,
+      "description": "One decision and the upstream's own value for it.",
+      "properties": {
+        "decision": {
+          "$ref": "#/$defs/ParameterName",
+          "description": "The decision, as a validated answer names it."
+        },
+        "value": {
+          "description": "The value written at the decision path, exactly as the upstream reads it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "decision",
+        "value"
+      ],
+      "type": "object"
     },
     "DiffFile": {
       "additionalProperties": false,
@@ -2779,6 +2878,12 @@
         }
       ]
     },
+    "PendingResourceId": {
+      "description": "One pending resource the broker arbitrates and resolves exactly once.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
+    },
     "PlatformSupport": {
       "additionalProperties": false,
       "description": "One operating system and the architectures a package supports on it.",
@@ -3175,6 +3280,25 @@
             "flag"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "True when the named upstream approval request is pending.\n\nThe identifier is the upstream's own, exactly as the pending approval resource records it,\nso a document drawn for one request can say that its controls are for that request and no\nother. An identifier that names no pending approval is false rather than an error: the\nrequest has been answered, cancelled or has expired, or it never existed, and in each case\nthere is nothing for the control to answer.\n\nThe identifier is required. The question \"is any approval pending\" is\n[`PresentationFlag::PendingApproval`], so this term has no untargeted form.",
+          "properties": {
+            "op": {
+              "const": "pending_approval_for",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "#/$defs/ApprovalRequestId",
+              "description": "The upstream approval request."
+            }
+          },
+          "required": [
+            "op",
+            "request_id"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -3183,7 +3307,7 @@
       "oneOf": [
         {
           "const": "pending_approval",
-          "description": "A pending approval resource exists in the ledger.",
+          "description": "A pending approval resource exists in the ledger.\n\nAny one: this fact does not say which. A control that answers one request tests\n[`Predicate::PendingApprovalFor`] instead, so it is hidden once that request is resolved\nwhatever else is still waiting.",
           "type": "string"
         },
         {

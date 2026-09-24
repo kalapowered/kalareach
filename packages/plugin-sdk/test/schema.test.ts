@@ -171,3 +171,35 @@ describe('manifest validation', () => {
     expect(validateCatalogueIndex({ index_version: 1 }).ok).toBe(false)
   })
 })
+
+describe('approval answers', () => {
+  // KR-REQ-11.46 and KR-REQ-12.18: a control drawn for one pending approval request names the
+  // request's identifier, and the term has no form without one.
+  it('reads a visibility term that names one pending approval request', () => {
+    const presentation = readJson('valid', 'example-connector', 'presentation.json') as {
+      nodes: Array<{ body: { kind: string; controls?: Array<Record<string, unknown>> } }>
+    }
+    const group = presentation.nodes.find((node) => node.body.kind === 'action_group')
+    const control = group?.body.controls?.[0]
+    expect(control).toBeDefined()
+    if (!control) return
+    control.visible_when = { op: 'pending_approval_for', request_id: 'abcde' }
+    expect(validatePresentationManifest(presentation).ok).toBe(true)
+    control.visible_when = { op: 'pending_approval_for', request_id: null }
+    expect(validatePresentationManifest(presentation).ok).toBe(false)
+    control.visible_when = { op: 'pending_approval_for' }
+    expect(validatePresentationManifest(presentation).ok).toBe(false)
+    control.visible_when = { op: 'pending_approval_for', request_id: 'abcde', pattern: '*' }
+    expect(validatePresentationManifest(presentation).ok).toBe(false)
+  })
+
+  // KR-REQ-12.18: every connector table says whether it answers approvals: the decision
+  // destination is present, as null when it answers none, and never left out.
+  it('keeps the decision destination present in every connector table', () => {
+    const table = readJson('valid', 'example-connector', 'connector.json') as Record<string, unknown>
+    expect(validateConnectorManifest(table).ok).toBe(true)
+    expect(validateConnectorManifest({ ...table, decision_destination: null }).ok).toBe(true)
+    const { decision_destination: _omitted, ...without } = table
+    expect(validateConnectorManifest(without).ok).toBe(false)
+  })
+})
