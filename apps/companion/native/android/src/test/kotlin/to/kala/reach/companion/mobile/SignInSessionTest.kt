@@ -8,31 +8,6 @@ import org.junit.Test
 
 class SignInSessionTest {
     @Test
-    fun aCustomTabThatCoveredTheAppAndClosedIsReportedOnceForItsAttempt() {
-        val session = SignInSession()
-        assertNull(session.begin("7", SignInSession.Mode.CUSTOM_TAB))
-        session.paused()
-        assertEquals("7", session.resumed())
-        // Only once: a second resume without the tab covering the app again says nothing.
-        assertNull(session.resumed())
-    }
-
-    @Test
-    fun aResumeTheTabNeverCausedSaysNothing() {
-        val session = SignInSession()
-        session.begin("7", SignInSession.Mode.CUSTOM_TAB)
-        assertNull(session.resumed())
-    }
-
-    @Test
-    fun anAuthTabIsNeverReportedClosedByTheAppsOwnLifecycle() {
-        val session = SignInSession()
-        session.begin("7", SignInSession.Mode.AUTH_TAB)
-        session.paused()
-        assertNull(session.resumed())
-    }
-
-    @Test
     fun aVerifiedLinkAnswersOnlyACustomTabAttempt() {
         val session = SignInSession()
         assertNull(session.link())
@@ -58,20 +33,18 @@ class SignInSessionTest {
     fun aNewAttemptNamesTheOneItEnds() {
         val session = SignInSession()
         assertNull(session.begin("7", SignInSession.Mode.CUSTOM_TAB))
-        session.paused()
         assertEquals("7", session.begin("8", SignInSession.Mode.CUSTOM_TAB))
-        // The earlier tab's cover does not carry over to the new attempt.
-        assertNull(session.resumed())
+        assertEquals("8", session.current())
+        assertEquals("8", session.link())
     }
 
     @Test
     fun afterTheAttemptEndsNothingIsReported() {
         val session = SignInSession()
         session.begin("7", SignInSession.Mode.CUSTOM_TAB)
-        session.paused()
         assertFalse(session.ended("6"))
         assertTrue(session.ended("7"))
-        assertNull(session.resumed())
+        assertNull(session.current())
         assertNull(session.link())
         assertFalse(session.result("7"))
         assertFalse(session.ended("7"))

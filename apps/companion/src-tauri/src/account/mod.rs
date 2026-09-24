@@ -39,8 +39,6 @@ pub const ACCOUNT_EVENT: &str = "kr://account";
 pub enum Outcome {
     /// The person, or the application, ended the ceremony.
     Cancelled,
-    /// A Custom Tab closed without an answer.
-    TabClosed,
     /// The person or the service said no.
     Refused,
     /// The service could not be reached.
@@ -348,7 +346,6 @@ impl Account {
                 outcome
             }
             Ending::Cancelled => Some(Outcome::Cancelled),
-            Ending::TabClosed => Some(Outcome::TabClosed),
             Ending::CouldNotReturn => Some(Outcome::CouldNotReturn),
             Ending::PortBusy => Some(Outcome::PortBusy),
             Ending::TimedOut => Some(Outcome::TimedOut),
@@ -440,10 +437,6 @@ fn page(outcome: Option<Outcome>) -> &'static str {
 pub const fn message(outcome: Outcome) -> &'static str {
     match outcome {
         Outcome::Cancelled => "Sign-in cancelled. Nothing changed.",
-        Outcome::TabClosed => {
-            "Sign-in cancelled. Nothing changed. If the browser stayed on reach.kala.to after you \
-             signed in, it did not hand the sign-in back; a current Chrome does."
-        }
         Outcome::Refused => "reach.kala.to did not sign this device in.",
         Outcome::Unreachable => {
             "reach.kala.to could not be reached. Check the connection and try again."
@@ -647,7 +640,6 @@ mod tests {
     fn every_outcome_is_said_in_one_or_two_sentences_and_names_no_address_to_follow() {
         for outcome in [
             Outcome::Cancelled,
-            Outcome::TabClosed,
             Outcome::Refused,
             Outcome::Unreachable,
             Outcome::CouldNotReturn,

@@ -26,14 +26,6 @@ pub type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// How long a sign-in waits for the person before it stops.
 pub const WAIT: Duration = Duration::from_secs(15 * 60);
 
-/// How long a closed Custom Tab waits for the link that closed it.
-///
-/// A browser that hands the answer over as a verified link brings the application to the front,
-/// and the system closes the tab on the way: the closed tab and the link reach the application
-/// in either order, a moment apart. A link inside this window is the answer; without one, the tab
-/// closed with nothing, which is a cancel or a browser that kept the answer.
-pub const LINK_GRACE: Duration = Duration::from_secs(2);
-
 /// Why this device cannot carry a sign-in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unavailable {
@@ -64,8 +56,6 @@ pub enum Ending {
     },
     /// The person, or the application, ended the ceremony.
     Cancelled,
-    /// A Custom Tab closed without an answer.
-    TabClosed,
     /// The system would not return the answer to this application.
     CouldNotReturn,
     /// Another program holds the loopback address.
@@ -241,22 +231,22 @@ pub trait SessionEvents: Send + Sync {
 ///
 /// A result for another attempt is a late one and is skipped. An answer goes through the attempt's
 /// checks; on a Custom Tab, one the checks set aside leaves the wait going, and on a terminal
-/// session any result ends the attempt. A closed Custom Tab waits `grace` for the link that closed
-/// it. The person's cancel and the `wait` end it too. However it ends, the native half is told, so
-/// it holds nothing of the attempt afterwards.
+/// session any result ends the attempt. A Custom Tab gives no sign that it closed, so its attempt
+/// ends with its answer, the person's cancel or the `wait`, and a person who left the tab is
+/// offered the cancel. However it ends, the native half is told, so it holds nothing of the
+/// attempt afterwards.
 ///
 /// A call to the native half is never left behind. Its answer goes to the future that asked, and
 /// a future dropped while its call is out leaves that answer nowhere to go, which the plugin
-/// bridge does not survive. So a cancel, the long wait and a closed tab's grace each end the
-/// attempt through the native half, which answers the call that is out, and that answer is
-/// awaited before the attempt ends.
+/// bridge does not survive. So a cancel and the long wait end the attempt through the native
+/// half, which answers the call that is out, and that answer is awaited before the attempt ends.
+/// When they come before any call was made, no call is made at all.
 pub async fn converse(
     events: &dyn SessionEvents,
     request: &SessionRequest,
     pending: &mut PendingAuthorisation,
     cancel: watch::Receiver<bool>,
     wait: Duration,
-    grace: Duration,
 ) -> Ending {
     let attempt = request.attempt.as_str();
     let delivery = if request.mode.is_terminal() {
@@ -264,13 +254,13 @@ pub async fn converse(
     } else {
         Delivery::Continuing
     };
+    let started = std::sync::atomic::AtomicBool::new(false);
     let conversation = async {
-        let mut closed = false;
+        started.store(true, std::sync::atomic::Ordering::SeqCst);
         let mut next = events.start(request).await;
         loop {
             let raw = match next {
                 Ok(raw) => raw,
-                Err(_) if closed => return Ending::TabClosed,
                 Err(_) => {
                     tracing::warn!("the browser session could not be started");
                     return Ending::BrowserFailed;
@@ -289,7 +279,6 @@ pub async fn converse(
                             };
                         }
                     },
-                    SessionEvent::TabClosed => closed = true,
                     SessionEvent::Cancelled => return Ending::Cancelled,
                     SessionEvent::CouldNotReturn => return Ending::CouldNotReturn,
                     SessionEvent::Failed => return Ending::BrowserFailed,
@@ -298,38 +287,23 @@ pub async fn converse(
                     return Ending::CouldNotReturn;
                 }
             }
-            next = if closed {
-                let asked = events.next(attempt);
-                tokio::pin!(asked);
-                match tokio::time::timeout(grace, &mut asked).await {
-                    Ok(next) => next,
-                    Err(_) => {
-                        // Nothing followed the closed tab: the native half ends the attempt and
-                        // answers the call that is out.
-                        events.cancel(attempt).await;
-                        settle(asked).await;
-                        return Ending::TabClosed;
-                    }
-                }
-            } else {
-                events.next(attempt).await
-            };
+            next = events.next(attempt).await;
         }
     };
     tokio::pin!(conversation);
-    let ending = tokio::select! {
-        ending = &mut conversation => ending,
-        () = cancelled(cancel) => {
-            events.cancel(attempt).await;
-            settle(&mut conversation).await;
-            Ending::Cancelled
-        }
-        () = tokio::time::sleep(wait) => {
-            events.cancel(attempt).await;
-            settle(&mut conversation).await;
-            Ending::TimedOut
-        }
+    // A cancel that has already happened wins before the conversation makes its first call.
+    let (ending, finished) = tokio::select! {
+        biased;
+        () = cancelled(cancel) => (Ending::Cancelled, false),
+        () = tokio::time::sleep(wait) => (Ending::TimedOut, false),
+        ending = &mut conversation => (ending, true),
     };
+    // Left unfinished, the conversation has a call out only if it started one: that call is ended
+    // through the native half and its answer awaited. One that never started made no call.
+    if !finished && started.load(std::sync::atomic::Ordering::SeqCst) {
+        events.cancel(attempt).await;
+        settle(&mut conversation).await;
+    }
     events.cancel(attempt).await;
     ending
 }
@@ -442,7 +416,7 @@ impl<R: tauri::Runtime> Carrier for Session<R> {
                 https_path: "/app/oauth/callback".to_owned(),
                 scheme: "to.kala.reach".to_owned(),
             };
-            converse(self, &request, pending, cancel, WAIT, LINK_GRACE).await
+            converse(self, &request, pending, cancel, WAIT).await
         })
     }
 }
@@ -463,8 +437,10 @@ mod tests {
     /// answered is counted: the real bridge does not survive answering one.
     struct Script {
         steps: Mutex<VecDeque<(Duration, RawEvent)>>,
+        under_way: Mutex<Vec<String>>,
         ended: Mutex<Vec<String>>,
         ending: tokio::sync::Notify,
+        starts: std::sync::atomic::AtomicUsize,
         abandoned: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
@@ -487,8 +463,10 @@ mod tests {
         fn new(steps: Vec<(Duration, RawEvent)>) -> Self {
             Self {
                 steps: Mutex::new(steps.into()),
+                under_way: Mutex::new(Vec::new()),
                 ended: Mutex::new(Vec::new()),
                 ending: tokio::sync::Notify::new(),
+                starts: std::sync::atomic::AtomicUsize::new(0),
                 abandoned: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
@@ -529,6 +507,12 @@ mod tests {
 
     impl SessionEvents for Script {
         fn start<'a>(&'a self, request: &'a SessionRequest) -> Boxed<'a, Result<RawEvent, String>> {
+            self.starts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.under_way
+                .lock()
+                .expect("the record")
+                .push(request.attempt.clone());
             self.take(&request.attempt)
         }
 
@@ -537,11 +521,16 @@ mod tests {
         }
 
         fn cancel<'a>(&'a self, attempt: &'a str) -> Boxed<'a, ()> {
-            self.ended
-                .lock()
-                .expect("the record")
-                .push(attempt.to_owned());
-            self.ending.notify_waiters();
+            // As the native halves do, a cancel for an attempt that is not under way does nothing.
+            let mut under_way = self.under_way.lock().expect("the record");
+            if let Some(at) = under_way.iter().position(|current| current == attempt) {
+                under_way.remove(at);
+                self.ended
+                    .lock()
+                    .expect("the record")
+                    .push(attempt.to_owned());
+                self.ending.notify_waiters();
+            }
             Box::pin(async {})
         }
     }
@@ -667,61 +656,6 @@ mod tests {
         assert_eq!(*opened_after_binding.lock().expect("the record"), [true]);
     }
 
-    /// The emulator showed this order: Firefox handed the verified link over, the application came
-    /// to the front, and the closed tab was reported first. The link is still the answer.
-    #[tokio::test(start_paused = true)]
-    async fn a_link_that_follows_the_closed_tab_is_the_answer() {
-        for (grace, expect_granted) in [(LINK_GRACE, true), (Duration::from_millis(100), false)] {
-            let (mut pending, request, state) = attempt(Mode::CustomTab);
-            let script = Script::new(vec![
-                (Duration::ZERO, report(&request.attempt, "closed", Some(0))),
-                (
-                    Duration::from_millis(500),
-                    answer(&request.attempt, "link", &state),
-                ),
-            ]);
-            let ending = converse(
-                &script,
-                &request,
-                &mut pending,
-                nobody_cancels(),
-                WAIT,
-                grace,
-            )
-            .await;
-            // The control: a window shorter than the link's lateness ends the attempt as closed.
-            assert_eq!(granted(&ending), expect_granted, "{grace:?}: {ending:?}");
-            if !expect_granted {
-                assert!(matches!(ending, Ending::TabClosed), "{ending:?}");
-            }
-            assert!(script.ended().iter().all(|ended| *ended == request.attempt));
-            assert!(!script.ended().is_empty());
-            assert_eq!(script.abandoned(), 0, "a call was left behind");
-        }
-    }
-
-    /// A tab closed with no link after it is a cancel, or a browser that kept the answer.
-    #[tokio::test(start_paused = true)]
-    async fn a_closed_tab_with_no_link_after_it_ends_as_closed() {
-        let (mut pending, request, _) = attempt(Mode::CustomTab);
-        let script = Script::new(vec![(
-            Duration::ZERO,
-            report(&request.attempt, "closed", Some(0)),
-        )]);
-        let ending = converse(
-            &script,
-            &request,
-            &mut pending,
-            nobody_cancels(),
-            WAIT,
-            LINK_GRACE,
-        )
-        .await;
-        assert!(matches!(ending, Ending::TabClosed), "{ending:?}");
-        assert!(script.ended().iter().all(|ended| *ended == request.attempt));
-        assert_eq!(script.abandoned(), 0, "a call was left behind");
-    }
-
     /// On a Custom Tab a link with another state is set aside and the wait goes on.
     #[tokio::test(start_paused = true)]
     async fn a_link_for_another_state_is_set_aside_and_the_right_one_answers() {
@@ -730,15 +664,7 @@ mod tests {
             (Duration::ZERO, answer(&request.attempt, "link", "another")),
             (Duration::ZERO, answer(&request.attempt, "link", &state)),
         ]);
-        let ending = converse(
-            &script,
-            &request,
-            &mut pending,
-            nobody_cancels(),
-            WAIT,
-            LINK_GRACE,
-        )
-        .await;
+        let ending = converse(&script, &request, &mut pending, nobody_cancels(), WAIT).await;
         assert!(granted(&ending), "{ending:?}");
     }
 
@@ -750,15 +676,7 @@ mod tests {
             (Duration::ZERO, report("1", "result", Some(0))),
             (Duration::ZERO, answer(&request.attempt, "result", &state)),
         ]);
-        let ending = converse(
-            &script,
-            &request,
-            &mut pending,
-            nobody_cancels(),
-            WAIT,
-            LINK_GRACE,
-        )
-        .await;
+        let ending = converse(&script, &request, &mut pending, nobody_cancels(), WAIT).await;
         assert!(granted(&ending), "{ending:?}");
     }
 
@@ -771,15 +689,7 @@ mod tests {
             Duration::ZERO,
             report(&request.attempt, "result", Some(2)),
         )]);
-        let ending = converse(
-            &script,
-            &request,
-            &mut pending,
-            nobody_cancels(),
-            WAIT,
-            LINK_GRACE,
-        )
-        .await;
+        let ending = converse(&script, &request, &mut pending, nobody_cancels(), WAIT).await;
         assert!(matches!(ending, Ending::CouldNotReturn), "{ending:?}");
 
         let (mut pending, request, _) = attempt(Mode::SessionHttps);
@@ -787,15 +697,7 @@ mod tests {
             Duration::ZERO,
             answer(&request.attempt, "redirected", "another"),
         )]);
-        let ending = converse(
-            &script,
-            &request,
-            &mut pending,
-            nobody_cancels(),
-            WAIT,
-            LINK_GRACE,
-        )
-        .await;
+        let ending = converse(&script, &request, &mut pending, nobody_cancels(), WAIT).await;
         assert!(
             matches!(
                 ending,
@@ -806,6 +708,20 @@ mod tests {
             ),
             "{ending:?}"
         );
+    }
+
+    /// A cancel that happened before the session started: no session is started, and so no call
+    /// is left behind.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_before_the_session_starts_makes_no_call() {
+        let (mut pending, request, _) = attempt(Mode::CustomTab);
+        let script = Script::new(Vec::new());
+        let (cancel, cancelled) = watch::channel(false);
+        cancel.send(true).expect("the attempt listens");
+        let ending = converse(&script, &request, &mut pending, cancelled, WAIT).await;
+        assert!(matches!(ending, Ending::Cancelled), "{ending:?}");
+        assert_eq!(script.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(script.abandoned(), 0, "a call was left behind");
     }
 
     /// The person's cancel, and the long wait, end the attempt and tell the native half.
@@ -819,7 +735,7 @@ mod tests {
             cancel.send(true).expect("the attempt listens");
         };
         let (ending, ()) = tokio::join!(
-            converse(&script, &request, &mut pending, cancelled, WAIT, LINK_GRACE),
+            converse(&script, &request, &mut pending, cancelled, WAIT),
             press
         );
         assert!(matches!(ending, Ending::Cancelled), "{ending:?}");
@@ -828,15 +744,7 @@ mod tests {
 
         let (mut pending, request, _) = attempt(Mode::SessionHttps);
         let script = Script::new(Vec::new());
-        let ending = converse(
-            &script,
-            &request,
-            &mut pending,
-            nobody_cancels(),
-            WAIT,
-            LINK_GRACE,
-        )
-        .await;
+        let ending = converse(&script, &request, &mut pending, nobody_cancels(), WAIT).await;
         assert!(matches!(ending, Ending::TimedOut), "{ending:?}");
         assert!(script.ended().iter().all(|ended| *ended == request.attempt));
         assert_eq!(script.abandoned(), 0, "a call was left behind");

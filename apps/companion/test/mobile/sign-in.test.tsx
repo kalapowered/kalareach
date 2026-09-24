@@ -43,7 +43,7 @@ describe('signing in hands the ceremony to the system browser (KR-REQ-17.19)', (
     expect(controls.openedLinks).toEqual([])
     expect(
       await within(account).findByText(
-        'Continue on reach.kala.to. This screen updates when you come back.'
+        'Continue on reach.kala.to. This screen updates when you finish there.'
       )
     ).toBeInTheDocument()
     expect(within(account).getByRole('button', { name: 'Cancel' })).toHaveFocus()

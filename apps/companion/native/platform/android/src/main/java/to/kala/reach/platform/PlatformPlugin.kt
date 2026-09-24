@@ -16,8 +16,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.browser.auth.AuthTabIntent
 import androidx.browser.customtabs.CustomTabsClient
 import androidx.browser.customtabs.CustomTabsIntent
-import androidx.lifecycle.DefaultLifecycleObserver
-import androidx.lifecycle.LifecycleOwner
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.TauriPlugin
@@ -60,9 +58,9 @@ class WrittenArguments {
  * It reports facts and carries out requests; the plugin's Rust crate decides what the facts mean.
  * A sign-in runs in the default browser's Auth Tab, which returns the answer once as the result of
  * the launch that opened it, or in a Custom Tab, whose answer arrives as a verified link the
- * system hands this activity and whose closing shows as this activity coming back to the front.
- * [SignInSession] decides which of those belongs to the attempt under way. Every result carries
- * the attempt it belongs to. Secrets are files sealed under a Keystore key.
+ * system hands this activity. [SignInSession] decides which of those belongs to the attempt under
+ * way. Every result carries the attempt it belongs to. Secrets are files sealed under a Keystore
+ * key.
  */
 @TauriPlugin
 class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
@@ -75,18 +73,6 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
     private val queued = ArrayDeque<JSObject>()
 
     override fun load(webView: WebView) {
-        // A Custom Tab's closing is this activity coming back after the tab covered it.
-        (activity as LifecycleOwner).lifecycle.addObserver(
-            object : DefaultLifecycleObserver {
-                override fun onPause(owner: LifecycleOwner) {
-                    session.paused()
-                }
-
-                override fun onResume(owner: LifecycleOwner) {
-                    session.resumed()?.let { closed -> deliver(event(closed, "closed")) }
-                }
-            },
-        )
         // Without its start the verifier refuses every certificate, so an HTTPS request fails and
         // says so; everything that needs no request keeps working, rather than the application
         // failing to start. The log says which happened.

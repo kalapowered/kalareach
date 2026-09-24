@@ -65,7 +65,6 @@ export const PURCHASE_WORDS: readonly string[] = [
 /** How the last sign-in attempt, or the last sign-out, ended. */
 export type AccountOutcome =
   | 'cancelled'
-  | 'tab_closed'
   | 'refused'
   | 'unreachable'
   | 'could_not_return'
@@ -139,7 +138,7 @@ export function describeAccount(view: AccountView): string {
     case 'unavailable':
       return 'No account on this device. Your hosts, sessions and agents work exactly as they do with one.'
     case 'browser_open':
-      return `Continue on ${ACCOUNT_HOST}. This screen updates when you come back.`
+      return `Continue on ${ACCOUNT_HOST}. This screen updates when you finish there.`
     case 'finishing':
       return 'Signing in…'
     case 'signed_in':
@@ -169,11 +168,6 @@ export function describeOutcome(outcome: AccountOutcome): string {
   switch (outcome) {
     case 'cancelled':
       return 'Sign-in cancelled. Nothing changed.'
-    case 'tab_closed':
-      return (
-        `Sign-in cancelled. Nothing changed. If the browser stayed on ${ACCOUNT_HOST} after you ` +
-        'signed in, it did not hand the sign-in back; a current Chrome does.'
-      )
     case 'refused':
       return `${ACCOUNT_HOST} did not sign this device in.`
     case 'unreachable':

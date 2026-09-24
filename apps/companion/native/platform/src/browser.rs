@@ -137,8 +137,8 @@ pub struct SessionRequest {
 pub struct RawEvent {
     /// The attempt it belongs to.
     pub attempt: String,
-    /// `redirected` or `ended` from iOS; `result`, `link` or `closed` from Android; `cancelled`
-    /// when the application ended the attempt itself.
+    /// `redirected` or `ended` from iOS; `result` or `link` from Android; `cancelled` when the
+    /// application ended the attempt itself; `failed` when the browser could not be opened.
     pub kind: String,
     /// The address that came back, when one did.
     pub url: Option<String>,
@@ -157,8 +157,6 @@ pub enum SessionEvent {
     Answer(String),
     /// The person, or the application, ended the ceremony.
     Cancelled,
-    /// A Custom Tab closed without an answer: a cancel, or a browser that kept the answer.
-    TabClosed,
     /// The system would not return the answer to this application: the association (iOS) or the
     /// Digital Asset Links check (Android) failed.
     CouldNotReturn,
@@ -197,7 +195,6 @@ impl std::fmt::Debug for SessionEvent {
         match self {
             Self::Answer(_) => formatter.debug_tuple("Answer").finish_non_exhaustive(),
             Self::Cancelled => formatter.write_str("Cancelled"),
-            Self::TabClosed => formatter.write_str("TabClosed"),
             Self::CouldNotReturn => formatter.write_str("CouldNotReturn"),
             Self::Failed => formatter.write_str("Failed"),
         }
@@ -253,7 +250,6 @@ pub fn event(raw: &RawEvent) -> SessionEvent {
             }
             _ => SessionEvent::Failed,
         },
-        "closed" => SessionEvent::TabClosed,
         "cancelled" => SessionEvent::Cancelled,
         _ => SessionEvent::Failed,
     }
@@ -457,7 +453,6 @@ mod tests {
         assert_eq!(event(&result), SessionEvent::CouldNotReturn);
         result.code = Some(-2);
         assert_eq!(event(&result), SessionEvent::Failed);
-        assert_eq!(event(&raw("closed")), SessionEvent::TabClosed);
         let mut link = raw("link");
         link.url = Some("https://reach.kala.to/app/oauth/callback?code=x".to_owned());
         assert!(matches!(event(&link), SessionEvent::Answer(_)));
