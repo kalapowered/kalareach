@@ -25,6 +25,8 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
+# shellcheck source=scripts/lib/owned-processes.sh
+. "$root/scripts/lib/owned-processes.sh"
 
 log="${1:-}"
 if [ -n "$log" ]; then
@@ -126,8 +128,6 @@ kr="$run_root/bin/kr"
 authorised_file="$run_root/authorised/nominated.txt"
 printf 'the person nominated this file for the authorised read check\n' >"$authorised_file"
 
-started_pids=()
-
 # The launchd jobs this run's daemon defined, by label. The daemon writes one definition per
 # worker's job into its environment's jobs directory and removes it once the job has gone.
 defined_jobs() {
@@ -176,9 +176,8 @@ for entry in document.get("sessions", []):
   while [ -n "$(jobs_left)" ] && [ "$(date +%s)" -lt "$deadline" ]; do
     sleep 1
   done
-  for pid in "${started_pids[@]:-}"; do
-    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-  done
+  # Each by its record, and only while its number still names the process this run started.
+  end_owned_processes
   sleep 1
   local survivors keep=0
   survivors="$(pgrep -u "$uid" -f "$run_root" 2>/dev/null | grep -v "^$$\$" || true)"
@@ -236,7 +235,7 @@ echo "starting the control daemon"
   --secret-store file \
   --worker "$run_root/bin/kr-worker") \
   >"$run_root/evidence/controller.log" 2>&1 &
-started_pids+=("$!")
+remember_process "$!" "$run_root/bin/kr-controller"
 daemon_started_at="$(date +%s)"
 daemon_deadline=$((daemon_started_at + 180))
 while [ "$(date +%s)" -lt "$daemon_deadline" ]; do

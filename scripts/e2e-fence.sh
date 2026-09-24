@@ -26,6 +26,8 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
+# shellcheck source=scripts/lib/owned-processes.sh
+. "$root/scripts/lib/owned-processes.sh"
 
 log="${1:-}"
 if [ -n "$log" ]; then
@@ -93,8 +95,6 @@ run_root="$(mktemp -d "${TMPDIR:-/tmp}/kr-fence.XXXXXX")"
 mkdir -p "$run_root/bin" "$run_root/r" "$run_root/s" "$run_root/cwd"
 chmod 700 "$run_root/r" "$run_root/s"
 
-started_pids=()
-
 # The launchd jobs this run's daemon defined, by label. On macOS the daemon writes one definition
 # per worker's job into its environment's jobs directory and removes it once the job has gone.
 defined_jobs() {
@@ -144,9 +144,8 @@ for entry in document.get("sessions", []):
   while [ -n "$(jobs_left)" ] && [ "$(date +%s)" -lt "$deadline" ]; do
     sleep 1
   done
-  for pid in "${started_pids[@]:-}"; do
-    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-  done
+  # Each by its record, and only while its number still names the process this run started.
+  end_owned_processes
   sleep 1
   local left keep=0 target
   left="$(pgrep -u "$(id -u)" -f "$run_root" 2>/dev/null | grep -v "^$$\$" || true)"
@@ -290,7 +289,7 @@ managed_shell="$packages/zsh/$(cat "$packages/zsh/current")/bin/zsh"
   --secret-store file \
   --worker "$run_root/bin/kr-worker") \
   >"$run_root/controller.log" 2>&1 &
-started_pids+=("$!")
+remember_process "$!" "$run_root/bin/kr-controller"
 
 deadline=$(( $(date +%s) + 180 ))
 while [ "$(date +%s)" -lt "$deadline" ]; do

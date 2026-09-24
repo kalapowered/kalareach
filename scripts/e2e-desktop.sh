@@ -24,6 +24,8 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
+# shellcheck source=scripts/lib/owned-processes.sh
+. "$root/scripts/lib/owned-processes.sh"
 
 log="${1:-}"
 if [ -n "$log" ]; then
@@ -92,9 +94,6 @@ export KR_RUNTIME_DIR="$run_root/r"
 export KR_STATE_DIR="$run_root/s"
 kr="$run_root/bin/kr"
 
-started_pids=()
-gui_pids=()
-
 # The launchd jobs this run's daemon defined, by label. The daemon writes one definition per
 # worker's job into its environment's jobs directory and removes it once the job has gone.
 defined_jobs() {
@@ -143,12 +142,8 @@ for entry in document.get("sessions", []):
   while [ -n "$(jobs_left)" ] && [ "$(date +%s)" -lt "$deadline" ]; do
     sleep 1
   done
-  for pid in "${gui_pids[@]:-}"; do
-    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-  done
-  for pid in "${started_pids[@]:-}"; do
-    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
-  done
+  # Each by its record, and only while its number still names the process this run started.
+  end_owned_processes
   sleep 1
   local survivors keep=0
   survivors="$(pgrep -u "$uid" -f "$run_root" 2>/dev/null | grep -v "^$$\$" || true)"
@@ -207,7 +202,7 @@ echo "starting the control daemon"
   --secret-store file \
   --worker "$run_root/bin/kr-worker") \
   >"$run_root/evidence/controller.log" 2>&1 &
-started_pids+=("$!")
+remember_process "$!" "$run_root/bin/kr-controller"
 # Three minutes of asking, because this is a real daemon on a real machine: it opens its registry,
 # builds its signing identity in this run's own file store, and publishes its socket, on a machine
 # that may be running several builds at once. The wall clock is what is reported, not the waiting,
@@ -318,8 +313,10 @@ new_gui="$(comm -13 <(sort -u "$run_root/evidence/textedit-before" 2>/dev/null |
 if [ -z "$new_gui" ]; then
   fail "a graphical application started from the session's shell"
 else
+  # Recorded as the process each number names now, so the number is not signalled once it names
+  # something else.
   for pid in $new_gui; do
-    gui_pids+=("$pid")
+    remember_process "$pid" "$(process_command "$pid")"
   done
   echo "  ok: a graphical application started from the session's shell: $new_gui"
 fi
