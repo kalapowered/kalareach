@@ -219,6 +219,16 @@ pub struct WorkerService {
             std::sync::mpsc::Receiver<()>,
         )>,
     >,
+    /// A pause before a connection replaces a delivery that is still running, which this host's
+    /// own tests arm to make that replacement meet a frame part way to its peer. It is compiled
+    /// away in every shipped build.
+    #[cfg(feature = "testing")]
+    replacement_pause: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
 }
 
 impl WorkerService {
@@ -358,6 +368,8 @@ impl WorkerService {
             build_id: binding.build_id,
             #[cfg(feature = "testing")]
             admission_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            replacement_pause: Mutex::new(None),
         })
     }
 
@@ -432,6 +444,75 @@ impl WorkerService {
     #[must_use]
     pub fn attention_transition_raised(&self) -> bool {
         self.attention_fence.is_raised()
+    }
+
+    /// Stops the next connection that replaces a running delivery immediately before it does, for
+    /// this host's own tests.
+    ///
+    /// The answer to the subscription that replaces it has been written by then, and the delivery
+    /// being replaced goes on writing what it was sent before, so a test can let it begin a frame
+    /// its peer does not take and replace it part way through that frame.
+    ///
+    /// Returns the end that says the connection has arrived, and the end that lets it go; dropping
+    /// the second lets it go too. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_replacing_delivery(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (arrived, watch) = tokio::sync::oneshot::channel();
+        let (release, go) = tokio::sync::oneshot::channel();
+        *self
+            .replacement_pause
+            .lock()
+            .expect("the pause is not poisoned") = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Waits at the pause above, where one is armed. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    async fn wait_before_replacing_delivery(&self) {
+        let armed = self
+            .replacement_pause
+            .lock()
+            .expect("the pause is not poisoned")
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.await;
+        }
+    }
+
+    /// Returns whether the connection that owns `attachment_id` has sent its peer part of a frame
+    /// and not the rest, for this host's own tests.
+    ///
+    /// That is where a delivery waits when its peer has stopped reading part way through a frame,
+    /// and it is the state a replacement must not cut: the frame is finished before anything else is
+    /// written, or the connection ends.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn part_way_through_a_frame(&self, attachment_id: AttachmentId) -> bool {
+        let writer = self
+            .admitted
+            .lock()
+            .expect("the connection registry is not poisoned")
+            .values()
+            .find(|registration| {
+                registration
+                    .attachments
+                    .lock()
+                    .expect("the attachment list is not poisoned")
+                    .contains(&attachment_id)
+            })
+            .map(|registration| Arc::clone(&registration.writer));
+        writer.is_some_and(|writer| {
+            let writer = writer
+                .lock()
+                .expect("the connection writer is not poisoned");
+            writer.is_mid_frame() && writer.has_sent_any()
+        })
     }
 
     /// Returns the generation this worker currently accepts.
@@ -867,24 +948,35 @@ impl WorkerService {
                 continue;
             }
             if let Some((attachment_id, mut stream)) = state.subscribed.take() {
-                // A connection has one delivery task. Replacing one without cancelling its
-                // predecessor would leave two tasks writing the same stream identifier down the
-                // same connection.
-                if let Some(previous) = state.delivery.take() {
-                    previous.abort();
+                // A connection has one delivery writing at a time. The one this subscription
+                // replaces stops between two frames: a frame it has begun is finished, because one
+                // cut part way would end the connection, and it begins no other. The new one
+                // begins its first frame only once the old one has stopped, so the peer is sent
+                // the old stream's last frame whole and then the new stream.
+                #[cfg(feature = "testing")]
+                if state.delivery.is_some() {
+                    self.wait_before_replacing_delivery().await;
                 }
+                let previous = state
+                    .delivery
+                    .take()
+                    .map(|previous| previous.replace(&writer));
+                let (replacement, replaced) = tokio::sync::oneshot::channel::<()>();
                 // And a withdrawn connection starts none at all. The task is created holding a
                 // permit it has to be given before it does anything, and the permit is only sent
                 // once its abort handle is installed in a registration that still stands. The two
                 // are therefore one step: nothing can start delivering between the check and the
                 // moment a withdrawal could stop it.
                 let (start, started) = tokio::sync::oneshot::channel::<()>();
-                let sender = Arc::clone(&writer);
                 // The latch the connection's own writes watch. This task watches it too, because
                 // aborting the task only takes effect where it yields, and a task with every chunk
                 // ready to go does not yield between them.
-                let delivery_withdrawn = Arc::clone(&registration.withdrawn);
-                let delivery_writable = registration.writable.clone();
+                let mut outlet = Outlet {
+                    writable: registration.writable.clone(),
+                    writer: Arc::clone(&writer),
+                    withdrawn: Arc::clone(&registration.withdrawn),
+                    replaced,
+                };
                 let stream_id = state.stream_id.clone();
                 let restoration = state.restoration.take();
                 let task = tokio::spawn(async move {
@@ -892,6 +984,10 @@ impl WorkerService {
                     // means the registration was withdrawn while this task was being created.
                     if started.await.is_err() {
                         return;
+                    }
+                    // The delivery this one replaced finishes the frame it had begun first.
+                    if let Some(previous) = previous {
+                        previous.stopped().await;
                     }
                     let mut sequence = 0_u64;
                     // The screen this attachment joins on is the canonical screen as it is now,
@@ -906,22 +1002,12 @@ impl WorkerService {
                                 notification(&stream_id, sequence, "session.gap", gap)
                         {
                             sequence += 1;
-                            if !write_frame(
-                                &delivery_writable,
-                                &sender,
-                                &notification,
-                                &delivery_withdrawn,
-                                true,
-                            )
-                            .await
-                            {
+                            if !outlet.write(&notification).await {
                                 return;
                             }
                         }
                         if !send_screen(
-                            &delivery_writable,
-                            &sender,
-                            &delivery_withdrawn,
+                            &mut outlet,
                             &stream_id,
                             &mut sequence,
                             joined.cursor,
@@ -932,7 +1018,17 @@ impl WorkerService {
                             return;
                         }
                     }
-                    while let Some(delivery) = stream.recv().await {
+                    loop {
+                        // Waiting for the next delivery is between two frames too, and a replaced
+                        // delivery stops there rather than keeping its successor waiting.
+                        let delivery = tokio::select! {
+                            biased;
+                            _ = &mut outlet.replaced => break,
+                            delivery = stream.recv() => match delivery {
+                                Some(delivery) => delivery,
+                                None => break,
+                            },
+                        };
                         let delivered = delivery.len();
                         let written = match delivery {
                             OutputDelivery::Bytes { cursor, bytes } => {
@@ -948,9 +1044,7 @@ impl WorkerService {
                                     .unwrap_or(0)
                                     .min(bytes.len());
                                 send_stream(
-                                    &delivery_writable,
-                                    &sender,
-                                    &delivery_withdrawn,
+                                    &mut outlet,
                                     &stream_id,
                                     &mut sequence,
                                     cursor + skip as u64,
@@ -962,16 +1056,8 @@ impl WorkerService {
                             // takes: its cursor is the state it describes rather than an offset,
                             // so the parts do not carry advancing cursors of their own.
                             OutputDelivery::Screen { cursor, bytes } => {
-                                send_screen(
-                                    &delivery_writable,
-                                    &sender,
-                                    &delivery_withdrawn,
-                                    &stream_id,
-                                    &mut sequence,
-                                    cursor,
-                                    &bytes,
-                                )
-                                .await
+                                send_screen(&mut outlet, &stream_id, &mut sequence, cursor, &bytes)
+                                    .await
                             }
                             // A projection event is state, not a span of the stream: its cursor
                             // says which screen it describes and the client applies it to the one
@@ -997,14 +1083,7 @@ impl WorkerService {
                                     continue;
                                 };
                                 sequence += 1;
-                                write_frame(
-                                    &delivery_writable,
-                                    &sender,
-                                    &frame,
-                                    &delivery_withdrawn,
-                                    true,
-                                )
-                                .await
+                                outlet.write(&frame).await
                             }
                             // An attachment event about this attachment's own input. It carries
                             // no output, so it neither advances the output stream nor waits behind
@@ -1021,14 +1100,7 @@ impl WorkerService {
                                     continue;
                                 };
                                 sequence += 1;
-                                write_frame(
-                                    &delivery_writable,
-                                    &sender,
-                                    &notification,
-                                    &delivery_withdrawn,
-                                    true,
-                                )
-                                .await
+                                outlet.write(&notification).await
                             }
                             OutputDelivery::EditorBusy(event) => {
                                 let Some(notification) = notification(
@@ -1040,14 +1112,7 @@ impl WorkerService {
                                     continue;
                                 };
                                 sequence += 1;
-                                write_frame(
-                                    &delivery_writable,
-                                    &sender,
-                                    &notification,
-                                    &delivery_withdrawn,
-                                    true,
-                                )
-                                .await
+                                outlet.write(&notification).await
                             }
                             OutputDelivery::Resync(marker) => {
                                 let Some(notification) =
@@ -1056,14 +1121,7 @@ impl WorkerService {
                                     continue;
                                 };
                                 sequence += 1;
-                                write_frame(
-                                    &delivery_writable,
-                                    &sender,
-                                    &notification,
-                                    &delivery_withdrawn,
-                                    true,
-                                )
-                                .await
+                                outlet.write(&notification).await
                             }
                             OutputDelivery::Detached => {
                                 // The attachment has ended. The client is told so it can put its
@@ -1077,14 +1135,7 @@ impl WorkerService {
                                         line_token: Nullable::null(),
                                     },
                                 ) {
-                                    let _ = write_frame(
-                                        &delivery_writable,
-                                        &sender,
-                                        &notification,
-                                        &delivery_withdrawn,
-                                        true,
-                                    )
-                                    .await;
+                                    let _ = outlet.write(&notification).await;
                                 }
                                 return;
                             }
@@ -1099,14 +1150,7 @@ impl WorkerService {
                                     sequence,
                                     kr_protocol::session::SESSION_CLOSED_EVENT,
                                     notice.record(),
-                                ) && write_frame(
-                                    &delivery_writable,
-                                    &sender,
-                                    &notification,
-                                    &delivery_withdrawn,
-                                    true,
-                                )
-                                .await
+                                ) && outlet.write(&notification).await
                                 {
                                     // A frame written is not always a frame the connection has
                                     // taken. A pipe finishes a write in the background, a process
@@ -1114,15 +1158,14 @@ impl WorkerService {
                                     // frame until it has finished. So a keepalive, which every
                                     // client already ignores, follows the notice, and its being
                                     // taken is what shows the notice was. A socket takes a write
-                                    // when it is made, and there this costs one small frame.
-                                    let _ = write_frame(
-                                        &delivery_writable,
-                                        &sender,
-                                        &ControlFrame::Event(ControlEvent::Keepalive),
-                                        &delivery_withdrawn,
-                                        true,
-                                    )
-                                    .await;
+                                    // when it is made, and there this costs one small frame. It is
+                                    // part of delivering the notice, so a replacement that arrives
+                                    // in between does not stop it.
+                                    let _ = outlet
+                                        .write_even_if_replaced(&ControlFrame::Event(
+                                            ControlEvent::Keepalive,
+                                        ))
+                                        .await;
                                 }
                                 drop(notice);
                                 return;
@@ -1158,7 +1201,7 @@ impl WorkerService {
                     admitted
                 };
                 if still_admitted && start.send(()).is_ok() {
-                    state.delivery = Some(task);
+                    state.delivery = Some(Delivery { task, replacement });
                 } else {
                     task.abort();
                 }
@@ -1174,8 +1217,8 @@ impl WorkerService {
         }
         // A connection that goes away takes its delivery task and its attachments with it.
         // Undelivered input from them is discarded rather than replayed.
-        if let Some(task) = state.delivery.take() {
-            task.abort();
+        if let Some(delivery) = state.delivery.take() {
+            delivery.abort();
         }
         // And a page it was holding, which nobody is left to read.
         drop(state.page_cancel.take());
@@ -5613,7 +5656,7 @@ pub struct ConnectionState {
     /// The screen a new subscription is drawn before live output resumes.
     pub restoration: Option<JoinedScreen>,
     /// The delivery task this connection owns, cancelled when the connection goes.
-    pub delivery: Option<tokio::task::JoinHandle<()>>,
+    delivery: Option<Delivery>,
     /// The host-issued principal this connection acts under.
     ///
     /// It is built from the authenticated operating-system caller. A local caller never asserts
@@ -5718,6 +5761,58 @@ impl ConnectionState {
     }
 }
 
+/// The task delivering a connection's subscription, and how it is told a newer one replaced it.
+#[derive(Debug)]
+struct Delivery {
+    task: tokio::task::JoinHandle<()>,
+    /// Dropped when a newer subscription replaces this one.
+    replacement: tokio::sync::oneshot::Sender<()>,
+}
+
+impl Delivery {
+    /// Tells the task that a newer subscription has replaced it, and hands it over to be waited
+    /// for.
+    ///
+    /// The word goes out under the connection's writer, which is where the task decides whether to
+    /// begin its next frame: it either sees the replacement and begins nothing more, or had already
+    /// begun and finishes that frame.
+    fn replace(self, writer: &Mutex<kr_ipc::framed::FrameWriter>) -> Predecessor {
+        {
+            let _boundary = writer
+                .lock()
+                .expect("the connection writer is not poisoned");
+            drop(self.replacement);
+        }
+        Predecessor(self.task)
+    }
+
+    /// Stops the task where it stands, and the delivery it replaced if that one is still going.
+    fn abort(&self) {
+        self.task.abort();
+    }
+}
+
+/// A delivery that a newer subscription replaced, finishing the frame it had begun.
+///
+/// The delivery that replaced it waits for it before writing anything, and owns it while it waits:
+/// stopping the waiter stops this one too, so a connection that ends, or whose authority is
+/// withdrawn, leaves no task behind that is still writing to it.
+#[derive(Debug)]
+struct Predecessor(tokio::task::JoinHandle<()>);
+
+impl Predecessor {
+    /// Waits until the replaced delivery has stopped.
+    async fn stopped(mut self) {
+        let _ = (&mut self.0).await;
+    }
+}
+
+impl Drop for Predecessor {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// One connection's registration in the worker's authority store.
 ///
 /// It is what a withdrawal acts on, and it holds everything a withdrawal has to end without asking
@@ -5814,9 +5909,9 @@ async fn write_frame(
 /// Writes one frame, as [`write_frame`], unless `abandoned` says so before its first byte is
 /// written.
 ///
-/// An answer a newer request has replaced is not written, however long it waited for its turn.
-/// Once its first byte has gone, it is finished rather than cut: a frame cut part way would end
-/// the connection.
+/// An answer a newer request has replaced is not written, however long it waited for its turn, and
+/// nor is the next frame of a delivery a newer subscription has replaced. Once its first byte has
+/// gone, it is finished rather than cut: a frame cut part way would end the connection.
 async fn write_frame_unless(
     writable: &Writing,
     writer: &Arc<Mutex<kr_ipc::framed::FrameWriter>>,
@@ -5977,7 +6072,7 @@ async fn write_within(
     }
 }
 
-/// Whether a newer request has replaced the one this belongs to.
+/// Whether a newer request or subscription has replaced the one this belongs to.
 ///
 /// The replacement sends, or drops the sender; either one is a replacement.
 fn replaced(cancelled: &mut tokio::sync::oneshot::Receiver<()>) -> bool {
@@ -6012,14 +6107,49 @@ struct Writing {
     readiness: kr_ipc::framed::Writable,
 }
 
+/// Where one delivery writes its frames, and what stops it.
+///
+/// Every frame of a delivery goes through here, so each one passes both checks: the withdrawal,
+/// which stops a delivery wherever it stands, and the replacement, which stops it between two
+/// frames.
+#[derive(Debug)]
+struct Outlet {
+    writable: Writing,
+    writer: Arc<Mutex<kr_ipc::framed::FrameWriter>>,
+    withdrawn: Arc<Withdrawal>,
+    /// Closed when a newer subscription replaces this delivery.
+    replaced: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl Outlet {
+    /// Writes one frame of this delivery, unless the delivery has been withdrawn, or has been
+    /// replaced before the frame began.
+    async fn write(&mut self, frame: &ControlFrame) -> bool {
+        write_frame_unless(
+            &self.writable,
+            &self.writer,
+            frame,
+            &self.withdrawn,
+            true,
+            Some(&mut self.replaced),
+        )
+        .await
+    }
+
+    /// Writes one frame that belongs with the frame this delivery wrote last, whether or not the
+    /// delivery has been replaced since. A withdrawal still stops it.
+    async fn write_even_if_replaced(&self, frame: &ControlFrame) -> bool {
+        write_frame(&self.writable, &self.writer, frame, &self.withdrawn, true).await
+    }
+}
+
 /// Writes a span of the output stream, in frames the control stream can carry.
 ///
 /// Each frame carries the cursor its own bytes start at, because they are consecutive positions in
-/// one stream.
+/// one stream. A span that a newer subscription replaces part way stops at the next frame, as it
+/// does at a withdrawal.
 async fn send_stream(
-    writable: &Writing,
-    sender: &Arc<Mutex<kr_ipc::framed::FrameWriter>>,
-    withdrawn: &Withdrawal,
+    outlet: &mut Outlet,
     stream_id: &StreamId,
     sequence: &mut u64,
     cursor: u64,
@@ -6040,7 +6170,7 @@ async fn send_stream(
         // at the first one after the withdrawal rather than finishing the span it had begun.
         // Stopping the task is not enough on its own: a task whose chunks are all ready writes
         // them without ever yielding to the abort.
-        if !write_frame(writable, sender, &notification, withdrawn, true).await {
+        if !outlet.write(&notification).await {
             return false;
         }
         at += chunk.len() as u64;
@@ -6051,11 +6181,11 @@ async fn send_stream(
 /// Writes a rendering of the canonical screen, in frames the control stream can carry.
 ///
 /// Every frame carries the same cursor: they are parts of one screen at one moment, not
-/// consecutive positions in a stream, and a client draws them in the order they arrive.
+/// consecutive positions in a stream, and a client draws them in the order they arrive. A screen
+/// that a newer subscription replaces part way stops at the next frame: the new subscription is
+/// drawn a screen of its own.
 async fn send_screen(
-    writable: &Writing,
-    sender: &Arc<Mutex<kr_ipc::framed::FrameWriter>>,
-    withdrawn: &Withdrawal,
+    outlet: &mut Outlet,
     stream_id: &StreamId,
     sequence: &mut u64,
     cursor: u64,
@@ -6074,7 +6204,7 @@ async fn send_screen(
             return false;
         };
         *sequence += 1;
-        if !write_frame(writable, sender, &notification, withdrawn, true).await {
+        if !outlet.write(&notification).await {
             return false;
         }
     }
@@ -6344,8 +6474,8 @@ mod tests {
     use kr_transport::clock::ManualClock;
 
     use super::{
-        ContinuousClock, ContinuousInstant, MAX_OUTPUT_EVENT_BYTES, StreamId, Withdrawal, Writing,
-        notification, send_stream, vouched_deadline, write_frame, write_within,
+        ContinuousClock, ContinuousInstant, MAX_OUTPUT_EVENT_BYTES, Outlet, StreamId, Withdrawal,
+        Writing, notification, send_stream, vouched_deadline, write_frame, write_within,
     };
 
     /// Two clocks with one pause between the first reading and the second.
@@ -6658,25 +6788,23 @@ mod tests {
         // its own: a task whose frames are all ready writes them without ever yielding to the
         // abort. Each frame therefore passes the withdrawal itself.
         let (_temp, writable, writer, mut reader) = connected().await;
-        let withdrawn = Withdrawal::default();
+        let (_subscription, replaced) = tokio::sync::oneshot::channel();
+        let mut outlet = Outlet {
+            writable,
+            writer: Arc::clone(&writer),
+            withdrawn: Arc::new(Withdrawal::default()),
+            replaced,
+        };
         let stream_id = StreamId::new("test".to_owned()).expect("a stream identifier");
         let bytes = vec![b'a'; MAX_OUTPUT_EVENT_BYTES * 3];
         let mut sequence = 0_u64;
 
-        withdrawn.set();
+        outlet.withdrawn.set();
         // Bounded, because the failure this guards against is a writer that goes on writing into a
         // socket nobody is reading: without the boundary the call does not return at all.
         let sent = tokio::time::timeout(
             Duration::from_secs(5),
-            send_stream(
-                &writable,
-                &writer,
-                &withdrawn,
-                &stream_id,
-                &mut sequence,
-                0,
-                &bytes,
-            ),
+            send_stream(&mut outlet, &stream_id, &mut sequence, 0, &bytes),
         )
         .await
         .expect("a withdrawn registration stops rather than waiting for a peer");
