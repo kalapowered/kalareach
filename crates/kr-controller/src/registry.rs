@@ -401,8 +401,9 @@ impl Registry {
     /// the previous build states its start in whole seconds while its row is settled at the
     /// resolution this build reads: each row comes forward stating the source it recorded.
     ///
-    /// This migration goes when there can no longer be a version 3 registry to read, which is the
-    /// first release: nothing before it is installed anywhere it has to be read from again.
+    /// This migration goes with the whole-seconds source, in the first release after one in which
+    /// every running worker states the creation time: until then a registry the previous build
+    /// wrote may still be opened by this one.
     fn migrate_3_to_4(&self) -> Result<()> {
         self.connection
             .execute_batch(
