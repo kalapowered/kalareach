@@ -490,6 +490,27 @@ impl GrantDirectory {
         rows.into_iter().collect()
     }
 
+    /// Returns a grant and every grant delegated from it, however deep, that stands revoked, in
+    /// the order a revocation walks them.
+    ///
+    /// What a revocation of the grant withdraws is what this reads back: the named grant and its
+    /// descendants. A revocation whose record was never written is answered from it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the rows cannot be read.
+    pub fn revoked_under(&self, grant_id: GrantId) -> Result<Vec<GrantId>> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(subtree_within(&connection, grant_id)?
+            .into_iter()
+            .filter(|record| record.revoked_at_ms.is_some())
+            .map(|record| record.grant.grant_id)
+            .collect())
+    }
+
     /// Returns every grant one device holds.
     ///
     /// # Errors

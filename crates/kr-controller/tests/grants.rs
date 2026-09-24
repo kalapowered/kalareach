@@ -8,7 +8,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-09.08 | `a_device_revocation_is_performed_once_however_long_its_first_attempt_waits`, `a_retry_while_a_device_revocation_runs_is_told_it_has_not_finished`, `a_share_whose_record_was_never_written_is_answered_from_what_it_wrote_after_a_restart`, `a_revocation_whose_record_was_never_written_is_not_performed_again_after_a_restart`, `an_authority_change_whose_attempt_ended_unrecorded_is_not_performed_again`, `a_refused_authority_change_is_refused_the_same_way_when_it_is_sent_again`, `an_unfinished_key_registration_is_not_answered_with_another_actions_registration`, `a_claim_excludes_every_other_attempt_and_is_never_taken_over`, `an_earlier_receipts_table_migrates_once_and_its_open_claims_are_unfinished` |
+//! | KR-REQ-09.08 | `a_device_revocation_is_performed_once_however_long_its_first_attempt_waits`, `a_retry_while_a_device_revocation_runs_is_told_it_has_not_finished`, `a_share_whose_record_was_never_written_is_answered_from_what_it_wrote_after_a_restart`, `a_revocation_whose_record_was_never_written_is_answered_from_the_rows_after_a_restart`, `an_authority_change_whose_attempt_ended_unrecorded_is_not_performed_again`, `a_refused_authority_change_is_refused_the_same_way_when_it_is_sent_again`, `an_unfinished_key_registration_is_not_answered_with_another_actions_registration`, `an_unfinished_revocation_pays_the_fence_it_still_owes_before_it_is_answered`, `an_unfinished_revocation_of_a_grant_still_standing_is_unknown`, `an_unfinished_device_revocation_is_answered_only_once_the_device_record_is_revoked`, `an_unfinished_destination_credential_is_unknown`, `a_claim_excludes_every_other_attempt_and_is_never_taken_over`, `an_earlier_receipts_table_migrates_once_and_its_open_claims_are_unfinished` |
 //! | KR-REQ-09.18 | `a_decision_that_reads_the_clock_waits_for_the_floor_whatever_the_grants_expiry`, `a_delegation_is_not_refused_as_expired_on_a_reading_this_host_could_not_write` |
 //! | KR-REQ-10.40 | `a_grant_carries_every_field_section_ten_names`, `the_host_intersects_the_grant_with_policy_on_every_request`, `a_delegation_narrows_and_never_extends`, `revoking_a_parent_revokes_every_descendant` |
 //! | KR-REQ-10.41 | `a_method_is_decided_from_the_registry_table_and_never_from_a_capability` |
@@ -2700,10 +2700,11 @@ async fn a_share_whose_record_was_never_written_is_answered_from_what_it_wrote_a
 }
 
 /// KR-REQ-09.08: a revocation whose daemon stopped between its effect and its record is never
-/// performed again. After a restart, and with the freshness window it was sent under long gone,
-/// its retry is told the outcome is not known, and the revision does not move.
+/// performed again. After a restart, and with the freshness window it was sent under long gone, its
+/// retry is answered from the rows: the grant stands revoked, its fence ran, and the revision does
+/// not move again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_revocation_whose_record_was_never_written_is_not_performed_again_after_a_restart() {
+async fn a_revocation_whose_record_was_never_written_is_answered_from_the_rows_after_a_restart() {
     let host = Serving::start().await;
     let held = grant(1, None, &[ActionRight::SessionView], GrantExpiry::Never);
     host.controller
@@ -2736,6 +2737,175 @@ async fn a_revocation_whose_record_was_never_written_is_not_performed_again_afte
 
     let host = host.restart().await;
     let mut client = host.client().await;
+    let again: kr_protocol::sharing::RevocationResult = client
+        .repeat(&mutation)
+        .await
+        .expect("the daemon answers")
+        .expect("the revocation is answered from the rows")
+        .to_typed()
+        .expect("a revocation result");
+    assert!(again.revoked_grants.contains(&held.grant_id), "{again:?}");
+    assert_eq!(
+        again.authority_revision, first.authority_revision,
+        "its fence ran, so the revision did not move again"
+    );
+    assert_eq!(
+        again.barrier.authority_revision, again.authority_revision,
+        "the answer and its barrier are one moment"
+    );
+}
+
+/// KR-REQ-09.08 and 10.45: a revocation whose attempt withdrew its grant and ended before its fence
+/// ran is answered once that fence has run. The fence is the one the withdrawal owed and it runs
+/// once. Like every connection that fence withdraws, the one whose retry raised it is told to open
+/// a new connection; the retry on the new one is answered, and carries the revision the fence
+/// advanced to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unfinished_revocation_pays_the_fence_it_still_owes_before_it_is_answered() {
+    let host = Serving::start().await;
+    let controller = &host.controller;
+    let parent = grant(1, None, &[ActionRight::SessionView], GrantExpiry::Never);
+    let child = Grant {
+        grant_id: grant_id(2),
+        parent_grant_id: Nullable::some(parent.grant_id),
+        recipient_device_id: device_id(0xf2),
+        ..parent.clone()
+    };
+    for held in [&parent, &child] {
+        controller
+            .sharing()
+            .grants()
+            .issue(&record(held.clone()), || Ok(()))
+            .expect("written");
+    }
+    let before = controller.policy().authority_revision();
+    let mut client = host.client().await;
+    let action_id = kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x66; 16]));
+    let mutation = client
+        .compose(
+            Method::GrantRevoke,
+            action_id,
+            kr_protocol::envelope::ActionTarget::environment(host.temp.environment_id()),
+            &kr_protocol::sharing::GrantRevokeParams {
+                grant_id: parent.grant_id,
+            },
+        )
+        .await
+        .expect("the revocation is composed");
+    let actor = kr_protocol::ids::ActorId::new(format!("local:{}", kr_ipc::paths::current_uid()))
+        .expect("a principal");
+    let digest =
+        kr_protocol::digest::mutation_digest(&mutation, &actor).expect("the payload digest");
+
+    // The attempt claims, withdraws the rows with the fence they owe, and ends before the fence.
+    let claimed = controller
+        .sharing()
+        .grants()
+        .claim_action(&actor, action_id, &digest, kr_ipc::now_ms().get())
+        .expect("the attempt claims its action");
+    controller
+        .sharing()
+        .grants()
+        .revoke(parent.grant_id, kr_ipc::now_ms().get(), || Ok(()))
+        .expect("the rows are withdrawn");
+    drop(claimed);
+    assert!(
+        !controller
+            .sharing()
+            .grants()
+            .fence_owed()
+            .expect("readable")
+            .is_empty(),
+        "the withdrawal owes its fence"
+    );
+
+    let fenced = client
+        .repeat(&mutation)
+        .await
+        .expect("the daemon answers")
+        .expect_err("the fence the retry raised withdrew this connection's registration too");
+    assert_eq!(
+        fenced.code,
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "{fenced:?}"
+    );
+    assert!(
+        fenced.message.contains("open a new connection"),
+        "{fenced:?}"
+    );
+    assert_eq!(
+        controller.policy().authority_revision().get(),
+        before.get() + 1,
+        "the fence the withdrawal owed ran"
+    );
+
+    let mut client = host.client().await;
+    let answered: kr_protocol::sharing::RevocationResult = client
+        .repeat(&mutation)
+        .await
+        .expect("the daemon answers")
+        .expect("the revocation is answered from the rows")
+        .to_typed()
+        .expect("a revocation result");
+    assert!(answered.revoked_grants.contains(&parent.grant_id));
+    assert!(
+        answered.revoked_grants.contains(&child.grant_id),
+        "the named grant and its descendants"
+    );
+    assert_eq!(
+        answered.authority_revision.get(),
+        before.get() + 1,
+        "the fence the withdrawal owed ran once, and not again for the answer"
+    );
+    assert!(
+        controller
+            .sharing()
+            .grants()
+            .fence_owed()
+            .expect("readable")
+            .is_empty(),
+        "and nothing is owed now"
+    );
+}
+
+/// KR-REQ-09.08: a revocation whose attempt ended before it withdrew anything is not performed
+/// again: the grant it names still stands, and its retry is told the outcome is not known.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unfinished_revocation_of_a_grant_still_standing_is_unknown() {
+    let host = Serving::start().await;
+    let controller = &host.controller;
+    let held = grant(1, None, &[ActionRight::SessionView], GrantExpiry::Never);
+    controller
+        .sharing()
+        .grants()
+        .issue(&record(held.clone()), || Ok(()))
+        .expect("written");
+    let before = controller.policy().authority_revision();
+    let mut client = host.client().await;
+    let action_id = kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x67; 16]));
+    let mutation = client
+        .compose(
+            Method::GrantRevoke,
+            action_id,
+            kr_protocol::envelope::ActionTarget::environment(host.temp.environment_id()),
+            &kr_protocol::sharing::GrantRevokeParams {
+                grant_id: held.grant_id,
+            },
+        )
+        .await
+        .expect("the revocation is composed");
+    let actor = kr_protocol::ids::ActorId::new(format!("local:{}", kr_ipc::paths::current_uid()))
+        .expect("a principal");
+    let digest =
+        kr_protocol::digest::mutation_digest(&mutation, &actor).expect("the payload digest");
+    drop(
+        controller
+            .sharing()
+            .grants()
+            .claim_action(&actor, action_id, &digest, kr_ipc::now_ms().get())
+            .expect("the attempt claims its action"),
+    );
+
     let refusal = client
         .repeat(&mutation)
         .await
@@ -2746,11 +2916,14 @@ async fn a_revocation_whose_record_was_never_written_is_not_performed_again_afte
         kr_protocol::error::ErrorCode::OutcomeUnknown,
         "{refusal:?}"
     );
-    assert_eq!(
-        host.controller.policy().authority_revision(),
-        first.authority_revision,
-        "the revision did not move again"
-    );
+    let stored = controller
+        .sharing()
+        .grants()
+        .record(held.grant_id)
+        .expect("readable")
+        .expect("present");
+    assert!(stored.revoked_at_ms.is_none(), "nothing was withdrawn");
+    assert_eq!(controller.policy().authority_revision(), before);
 }
 
 /// KR-REQ-09.08: an authority change whose attempt ended in this daemon without recording what it
@@ -2979,6 +3152,197 @@ async fn a_delegation_is_not_refused_as_expired_on_a_reading_this_host_could_not
     registry
         .execute_batch("DROP TRIGGER refuse_policy;")
         .expect("the fault is cleared");
+}
+
+/// A paired device's record, as this host commits one when a pairing completes.
+fn paired_record(device: DeviceId) -> kr_controller::service::net::devices::DeviceRecord {
+    kr_controller::service::net::devices::DeviceRecord {
+        device_id: device,
+        endpoint_id: kr_protocol::scalars::EndpointKey::from_bytes(kr_cbor::sha256(
+            device.get().as_bytes(),
+        )),
+        device_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
+        authorisation: kr_protocol::scalars::AuthorisationKey::from_bytes([2; 32]),
+        stored_envelope: None,
+        device_name: kr_protocol::pairing::DeviceName::new("phone").expect("a name"),
+        platform: kr_protocol::pairing::DevicePlatform::Ios,
+        grant: Grant {
+            recipient_device_id: device,
+            ..grant(0x40, None, &[ActionRight::SessionView], GrantExpiry::Never)
+        },
+        paired_at_ms: TimestampMs::new(1_000),
+        revoked_at_ms: None,
+        expired_at_ms: None,
+        committed_invitation_id: None,
+        notification_preview: None,
+    }
+}
+
+/// The device revocation a local caller composes under `action`, claimed by a first attempt that
+/// then ended without recording anything, as the host's own dispatch claims it.
+async fn device_revocation_claimed_and_left(
+    host: &Serving,
+    client: &mut kr_ipc::client::LocalClient,
+    action: u8,
+    device: DeviceId,
+) -> kr_protocol::envelope::MutationRequest {
+    let (mutation, claimed) = host
+        .claim_first_revocation(
+            client,
+            kr_protocol::ids::ActionId::new(Uuid::from_bytes([action; 16])),
+            device,
+            kr_ipc::now_ms().get(),
+        )
+        .await;
+    assert!(
+        matches!(claimed, kr_controller::grants::ActionClaim::Claimed { .. }),
+        "{claimed:?}"
+    );
+    drop(claimed);
+    mutation
+}
+
+/// KR-REQ-09.08 and 23.27: a device revocation whose attempt ended unrecorded is answered from the
+/// rows only once the device's own record stands revoked, its last write.
+///
+/// One attempt withdrew the device's grants and ended before its record: grants withdrawn beside a
+/// record still live are not a finished withdrawal, and the retry is told the outcome is not
+/// known. Another withdrew everything, its record too, and ended before its answer: the retry is
+/// answered with what the rows show withdrawn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unfinished_device_revocation_is_answered_only_once_the_device_record_is_revoked() {
+    let host = Serving::start().await;
+    let controller = &host.controller;
+    let mut client = host.client().await;
+
+    let partial = device_id(0xd2);
+    let partial_grant = Grant {
+        recipient_device_id: partial,
+        ..grant(0x41, None, &[ActionRight::SessionView], GrantExpiry::Never)
+    };
+    controller
+        .devices()
+        .commit(&paired_record(partial))
+        .expect("a paired device");
+    controller
+        .sharing()
+        .grants()
+        .issue(&record(partial_grant.clone()), || Ok(()))
+        .expect("written");
+    let unfinished = device_revocation_claimed_and_left(&host, &mut client, 0x68, partial).await;
+    controller
+        .sharing()
+        .grants()
+        .revoke_device(partial, kr_ipc::now_ms().get(), || Ok(()))
+        .expect("the grants are withdrawn");
+    let refusal = client
+        .repeat(&unfinished)
+        .await
+        .expect("the daemon answers")
+        .expect_err("a withdrawal short of the device's record is not called finished");
+    assert_eq!(
+        refusal.code,
+        kr_protocol::error::ErrorCode::OutcomeUnknown,
+        "{refusal:?}"
+    );
+    assert!(
+        controller
+            .devices()
+            .record_for_device(partial)
+            .expect("readable")
+            .expect("present")
+            .revoked_at_ms
+            .is_none(),
+        "and it is not finished for it"
+    );
+
+    let whole = device_id(0xd3);
+    let whole_grant = Grant {
+        recipient_device_id: whole,
+        ..grant(0x42, None, &[ActionRight::SessionView], GrantExpiry::Never)
+    };
+    controller
+        .devices()
+        .commit(&paired_record(whole))
+        .expect("a paired device");
+    controller
+        .sharing()
+        .grants()
+        .issue(&record(whole_grant.clone()), || Ok(()))
+        .expect("written");
+    let finished = device_revocation_claimed_and_left(&host, &mut client, 0x69, whole).await;
+    let performed = tokio::time::timeout(
+        Duration::from_secs(20),
+        controller.revoke_device_authority(whole, None),
+    )
+    .await
+    .expect("the withdrawal completes")
+    .expect("it succeeds");
+    let mut client = host.client().await;
+    let answered: kr_protocol::sharing::RevocationResult = client
+        .repeat(&finished)
+        .await
+        .expect("the daemon answers")
+        .expect("the revocation is answered from the rows")
+        .to_typed()
+        .expect("a revocation result");
+    assert!(
+        answered.revoked_grants.contains(&whole_grant.grant_id),
+        "{answered:?}"
+    );
+    assert_eq!(
+        answered.authority_revision, performed.authority_revision,
+        "its fence ran, so the revision did not move again"
+    );
+}
+
+/// KR-REQ-09.08: a destination's credential whose attempt ended unrecorded is not set again.
+/// Nothing this host keeps says which request set a credential, so the retry is told the outcome
+/// is not known.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unfinished_destination_credential_is_unknown() {
+    let host = Serving::start().await;
+    let mut client = host.client().await;
+    let action_id = kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x6a; 16]));
+    let mutation = client
+        .compose(
+            Method::DeliveryDestinationSecretSet,
+            action_id,
+            kr_protocol::envelope::ActionTarget::environment(host.temp.environment_id()),
+            &kr_protocol::delivery::DeliveryDestinationSecretSetParams {
+                destination_id: "alerts".to_owned(),
+                secret: kr_protocol::delivery::DestinationSecret::Slack {
+                    webhook_url: kr_protocol::delivery::SecretText::new(
+                        "https://hooks.slack.com/services/T000/B000/XXXXXXXXXXXXXXXX",
+                    )
+                    .expect("a credential"),
+                },
+            },
+        )
+        .await
+        .expect("the credential is composed");
+    let actor = kr_protocol::ids::ActorId::new(format!("local:{}", kr_ipc::paths::current_uid()))
+        .expect("a principal");
+    let digest =
+        kr_protocol::digest::mutation_digest(&mutation, &actor).expect("the payload digest");
+    drop(
+        host.controller
+            .sharing()
+            .grants()
+            .claim_action(&actor, action_id, &digest, kr_ipc::now_ms().get())
+            .expect("the attempt claims its action"),
+    );
+
+    let refusal = client
+        .repeat(&mutation)
+        .await
+        .expect("the daemon answers")
+        .expect_err("an unfinished credential is not set again");
+    assert_eq!(
+        refusal.code,
+        kr_protocol::error::ErrorCode::OutcomeUnknown,
+        "{refusal:?}"
+    );
 }
 
 /// KR-REQ-09.08: an authority change refused before its effect is refused the same way when the

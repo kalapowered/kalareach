@@ -2266,7 +2266,7 @@ impl Controller {
                 | Method::DevicePreviewKeyUpdate
                 | Method::DeliveryDestinationSecretSet
         ) {
-            return self.retained_authority_change(actor_id, mutation);
+            return self.retained_authority_answer(actor_id, mutation).await;
         }
         // A declaration of a device's keys is answered the same way, from the outcome the device
         // directory recorded beside the keys: a completion or a refusal alike, so a retry whose
@@ -4908,7 +4908,7 @@ impl Controller {
     /// a revocation that could not reach its record would otherwise be told its window is gone
     /// rather than what happened. What the answer is, for each state a claim can be in, is
     /// [`Self::recorded_authority_change`].
-    fn retained_authority_change(
+    async fn retained_authority_answer(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
@@ -4921,37 +4921,53 @@ impl Controller {
         {
             Ok(Some(record)) => Some(respond(
                 mutation.request_id,
-                self.recorded_authority_change(mutation, record),
+                self.recorded_authority_change(mutation, record).await,
             )),
             Ok(None) => None,
             Err(error) => Some(respond(mutation.request_id, Err(error))),
         }
     }
 
-    /// Claims one authority change for this attempt, or gives the answer an earlier attempt's claim
-    /// is owed.
+    /// The same answer, for a caller that cannot wait: a paired device's preview-key registration.
     ///
-    /// `Ok` is this attempt's hold: it wrote the claim and is the one attempt that may perform the
-    /// change. `Err` is the answer to give instead, and nothing is performed.
+    /// Every state is answered here but an unfinished revocation, whose answer waits for any fence
+    /// it still owes; this gives none for one, and the claim the caller then takes answers it.
+    fn retained_authority_change(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+    ) -> Option<ControlFrame> {
+        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).ok()?;
+        match self
+            .sharing
+            .grants()
+            .recorded_action(actor_id, mutation.action_id, &digest)
+        {
+            Ok(Some(record)) => self
+                .answer_without_fence(mutation, &record)
+                .map(|answer| respond(mutation.request_id, answer)),
+            Ok(None) => None,
+            Err(error) => Some(respond(mutation.request_id, Err(error))),
+        }
+    }
+
+    /// Claims one authority change for this attempt, or reads what an earlier attempt's claim
+    /// holds.
+    ///
+    /// [`crate::grants::ActionClaim::Claimed`] is this attempt's hold: it wrote the claim and is the
+    /// one attempt that may perform the change. Anything else is answered by
+    /// [`Self::recorded_authority_change`], and nothing is performed.
     fn claim_authority_change(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
         now_ms: u64,
-    ) -> std::result::Result<crate::grants::ClaimHold, Result<ParamsValue>> {
+    ) -> Result<crate::grants::ActionClaim> {
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
-            .map_err(|error| Err(ControllerError::InvalidArgument(error.to_string())))?;
-        match self
-            .sharing
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        self.sharing
             .grants()
             .claim_action(actor_id, mutation.action_id, &digest, now_ms)
-            .map_err(Err)?
-        {
-            crate::grants::ActionClaim::Claimed { hold } => Ok(hold),
-            crate::grants::ActionClaim::Recorded(record) => {
-                Err(self.recorded_authority_change(mutation, record))
-            }
-        }
     }
 
     /// The answer an authority change an earlier attempt claimed is owed.
@@ -4962,52 +4978,121 @@ impl Controller {
     /// attempt ended without recording what it did is never performed again, however long ago it
     /// was claimed: an attempt is not known to have stopped short of its effect, and section 9 does
     /// not dispatch an identifier again because its receipt is incomplete. It is answered from
-    /// what this host's own records prove the change did, and otherwise as an outcome this host
-    /// does not know.
-    fn recorded_authority_change(
+    /// what this host's own records prove the change did ([`Self::answer_without_fence`],
+    /// [`Self::revocation_on_record`]), and otherwise as an outcome this host does not know.
+    async fn recorded_authority_change(
         &self,
         mutation: &MutationRequest,
         record: crate::grants::ActionRecord,
     ) -> Result<ParamsValue> {
-        match record {
-            crate::grants::ActionRecord::Answered { result } => decoded(&result),
-            crate::grants::ActionRecord::Refused { code, detail } => {
-                Err(ControllerError::Refused { code, detail })
-            }
-            crate::grants::ActionRecord::InFlight => Err(ControllerError::Refused {
-                code: ErrorCode::ResourceUnavailable,
-                detail: "another attempt under this action identifier has not finished".to_owned(),
-            }),
-            crate::grants::ActionRecord::Unfinished => self
-                .proven_authority_change(mutation)?
-                .ok_or_else(|| ControllerError::Uncertain {
-                    detail: "an earlier attempt at this action ended without recording what it \
-                             did, and this host's records do not show it; it is not performed \
-                             again, so read what it concerns before asking under a new action"
-                        .to_owned(),
-                }),
+        match self.answer_without_fence(mutation, &record) {
+            Some(answer) => answer,
+            None => self.revocation_on_record(mutation).await,
         }
     }
 
-    /// What this host's own records prove an unfinished authority change produced, when they
-    /// prove it.
+    /// The answer a record is owed, when nothing has to run first: every state but an unfinished
+    /// revocation, whose answer waits for any fence it still owes.
     ///
     /// A grant and the invitation that carries it take identities derived from the action and are
     /// written in one commit, so finding them is finding what this action wrote, and the answer is
-    /// rebuilt from what was written rather than proposed again. Nothing else this host keeps names
-    /// the action that changed it: a device's record holding the key a registration asked for may
-    /// hold it because another action registered the same key, and a revoked grant may have been
-    /// revoked by any of several.
-    fn proven_authority_change(&self, mutation: &MutationRequest) -> Result<Option<ParamsValue>> {
-        if mutation.method.method() != Some(Method::GrantCreate) {
-            return Ok(None);
+    /// rebuilt from what was written rather than proposed again. Nothing else outside a revocation
+    /// names the action that changed it: a device's record can hold the key a registration asked
+    /// for because another action registered the same key, a destination's credential says nothing
+    /// about which request set it, and a voice change is not an authority change.
+    fn answer_without_fence(
+        &self,
+        mutation: &MutationRequest,
+        record: &crate::grants::ActionRecord,
+    ) -> Option<Result<ParamsValue>> {
+        match record {
+            crate::grants::ActionRecord::Answered { result } => Some(decoded(result)),
+            crate::grants::ActionRecord::Refused { code, detail } => {
+                Some(Err(ControllerError::Refused {
+                    code: *code,
+                    detail: detail.clone(),
+                }))
+            }
+            crate::grants::ActionRecord::InFlight => Some(Err(ControllerError::Refused {
+                code: ErrorCode::ResourceUnavailable,
+                detail: "another attempt under this action identifier has not finished".to_owned(),
+            })),
+            crate::grants::ActionRecord::Unfinished => match mutation.method.method() {
+                Some(Method::GrantRevoke | Method::DeviceRevoke) => None,
+                Some(Method::GrantCreate) => {
+                    let action = mutation.action_id.get();
+                    Some(
+                        self.sharing
+                            .shared(
+                                kr_protocol::ids::GrantId::new(Self::derived_identity(
+                                    action, b"grant",
+                                )),
+                                kr_protocol::ids::InvitationId::new(Self::derived_identity(
+                                    action,
+                                    b"invitation",
+                                )),
+                            )
+                            .and_then(|shared| match shared {
+                                Some(shared) => encode(&shared),
+                                None => Err(unfinished_and_unknown()),
+                            }),
+                    )
+                }
+                _ => Some(Err(unfinished_and_unknown())),
+            },
         }
-        let action = mutation.action_id.get();
-        let shared = self.sharing.shared(
-            kr_protocol::ids::GrantId::new(Self::derived_identity(action, b"grant")),
-            kr_protocol::ids::InvitationId::new(Self::derived_identity(action, b"invitation")),
-        )?;
-        shared.as_ref().map(encode).transpose()
+    }
+
+    /// What this host's records say an unfinished revocation withdrew, answered the way a
+    /// revocation that finds its work done is answered.
+    ///
+    /// The rows are the revocation's record. A grant revocation is answered once the grant it
+    /// names stands revoked; a device revocation once the device's own record does too, because
+    /// that is its last write, and grants withdrawn beside a device record still live are not a
+    /// withdrawal this host can call finished. The grants named are the named one and its
+    /// descendants as they stand revoked, which is what the revocation withdraws. Any fence still
+    /// owed runs first, so the answer's revision and barrier are ones that hold; a fence is
+    /// always safe to raise, and it is the one the earlier attempt owed. Anything short of that is
+    /// an outcome this host does not know, and it is not performed again.
+    async fn revocation_on_record(&self, mutation: &MutationRequest) -> Result<ParamsValue> {
+        let withdrawn: Vec<kr_protocol::ids::GrantId> = match mutation.method.method() {
+            Some(Method::GrantRevoke) => {
+                let params: kr_protocol::sharing::GrantRevokeParams = parse(&mutation.params)?;
+                let named_revoked = self
+                    .sharing
+                    .grants()
+                    .record(params.grant_id)?
+                    .is_some_and(|record| record.revoked_at_ms.is_some());
+                if !named_revoked {
+                    return Err(unfinished_and_unknown());
+                }
+                self.sharing.grants().revoked_under(params.grant_id)?
+            }
+            Some(Method::DeviceRevoke) => {
+                let params: kr_protocol::sharing::DeviceRevokeParams = parse(&mutation.params)?;
+                let record_revoked = self
+                    .devices
+                    .record_for_device(params.device_id)?
+                    .is_some_and(|record| record.revoked_at_ms.is_some());
+                if !record_revoked {
+                    return Err(unfinished_and_unknown());
+                }
+                let mut withdrawn = Vec::new();
+                for held in self.sharing.grants().records_for_device(params.device_id)? {
+                    if held.revoked_at_ms.is_some() {
+                        withdrawn.extend(self.sharing.grants().revoked_under(held.grant.grant_id)?);
+                    }
+                }
+                withdrawn
+            }
+            _ => return Err(unfinished_and_unknown()),
+        };
+        let now_ms = self.settled_now_ms();
+        encode(
+            &self
+                .complete_revocation(withdrawn.into_iter().collect(), now_ms)
+                .await?,
+        )
     }
 
     /// Keeps what a claimed action came to, under the hold that claimed it.
@@ -5243,9 +5328,11 @@ impl Controller {
         carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
         let claimed_at_ms = kr_ipc::now_ms().get();
-        let hold = match self.claim_authority_change(actor_id, mutation, claimed_at_ms) {
-            Ok(hold) => hold,
-            Err(answer) => return answer,
+        let hold = match self.claim_authority_change(actor_id, mutation, claimed_at_ms)? {
+            crate::grants::ActionClaim::Claimed { hold } => hold,
+            crate::grants::ActionClaim::Recorded(record) => {
+                return self.recorded_authority_change(mutation, record).await;
+            }
         };
         let outcome = match method {
             Method::GrantCreate => self.grant_create(mutation, carried, claimed_at_ms).await,
@@ -5429,9 +5516,11 @@ impl Controller {
         actor_id: &ActorId,
         mutation: &MutationRequest,
     ) -> Result<ParamsValue> {
-        let hold = match self.claim_authority_change(actor_id, mutation, kr_ipc::now_ms().get()) {
-            Ok(hold) => hold,
-            Err(answer) => return answer,
+        let hold = match self.claim_authority_change(actor_id, mutation, kr_ipc::now_ms().get())? {
+            crate::grants::ActionClaim::Claimed { hold } => hold,
+            crate::grants::ActionClaim::Recorded(record) => {
+                return self.recorded_authority_change(mutation, record).await;
+            }
         };
         let outcome = self.device_preview_key_update(actor_id, mutation).await;
         self.settle_claim(&hold, &outcome)?;
@@ -9070,6 +9159,17 @@ fn parse<T: kr_protocol::wire::WireMessage>(params: &ParamsValue) -> Result<T> {
 fn encode<T: serde::Serialize>(value: &T) -> Result<ParamsValue> {
     ParamsValue::from_typed(value)
         .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+}
+
+/// The answer to an action whose attempt ended without recording what it did, when this host's
+/// records do not show what it did either.
+fn unfinished_and_unknown() -> ControllerError {
+    ControllerError::Uncertain {
+        detail: "an earlier attempt at this action ended without recording what it did, and this \
+                 host's records do not show it; it is not performed again, so read what it \
+                 concerns before asking under a new action"
+            .to_owned(),
+    }
 }
 
 /// Reads back a result the action store kept in its canonical encoding.
