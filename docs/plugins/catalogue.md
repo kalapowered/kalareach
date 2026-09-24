@@ -76,6 +76,12 @@ forward is the one verification ended on rather than the one it started from: a 
 by the root it replaces, and a host that always restarted from the original could have old trust
 restored by a repository that simply withheld the newer root.
 
+A sync reads the root it verifies from, and the generation it is on, once it holds the repository's
+lock. Two syncs that wait for each other therefore never both start from the root the first one
+moved past, and a root is recorded only over one of a lower version: a sync that arrives at a root
+the repository has since moved past records nothing, and its generation and checkpoint go no
+further either.
+
 The client's rollback protection is the metadata it last verified: each role's new version is
 compared with the one it holds. That store is this host's accepted trust checkpoint, and the client
 never writes into it. Every verification works in a private copy of it, and the copy becomes the

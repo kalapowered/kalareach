@@ -42,7 +42,7 @@ use crate::ceiling::{InstallationGrant, capability_from_str};
 use crate::error::{CatalogueError, CatalogueResult};
 use crate::install::{DisablePolicy, Installation};
 use crate::repository::{CapabilityCeiling, Enrolment, EnrolmentKey, RepositoryId, RepositoryKind};
-use crate::trust::{AcceptedTarget, MetadataVersions, TargetRecord};
+use crate::trust::{self, AcceptedTarget, MetadataVersions, TargetRecord};
 
 /// The database file, beside the repositories' directories.
 pub const DATABASE_FILE: &str = "catalogue.sqlite3";
@@ -796,6 +796,9 @@ impl Changes<'_> {
 
     /// Records the root verification arrived at, which is the one the next load starts from.
     ///
+    /// Only a root of a higher version replaces the one recorded. Each root is signed by the one
+    /// before it, so a load that started from an older root can arrive at a root the repository
+    /// has since moved past, and recording that one would give back trust a later root withdrew.
     /// An enrolment removed while it synchronised is not recreated: there is then nothing to keep
     /// the root for.
     ///
@@ -806,8 +809,23 @@ impl Changes<'_> {
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogueError::StorageUnavailable`] when it cannot be written.
+    /// Returns [`CatalogueError::Untrusted`] when the root is no newer than the one recorded or
+    /// either cannot be read, and [`CatalogueError::StorageUnavailable`] when it cannot be written.
     pub fn set_root(&self, key: &EnrolmentKey, root: &[u8], reset: bool) -> CatalogueResult<()> {
+        let Some(current) = self.enrolment_by_key(key)? else {
+            return Ok(());
+        };
+        let held = trust::root_version(&current.enrolment.root)?;
+        let arriving = trust::root_version(root)?;
+        if arriving <= held {
+            return Err(CatalogueError::Untrusted {
+                detail: format!(
+                    "{} trusts a root of version {held}, and a root of version {arriving} does \
+                     not replace it",
+                    current.enrolment.id
+                ),
+            });
+        }
         self.execute(
             "UPDATE enrolments SET root = ?2, trust_reset = MAX(trust_reset, ?3)
               WHERE enrolment_key = ?1",

@@ -1032,8 +1032,12 @@ impl Catalogue {
         let authority = change.authority;
         authority.check()?;
         let enrolled = self.enrolled(id)?;
-        let store = Store::open(&self.root, &enrolled.key)?;
-        let _lock = store.lock()?;
+        #[cfg(test)]
+        sync_pause::run();
+        // What the sync verifies from is read once the store is held: a sync that waited may find
+        // the repository on a newer root and generation than it read before the wait, and trust
+        // that a newer root withdrew is not where a load starts.
+        let (store, _lock, enrolled) = self.locked(&enrolled)?;
         self.check_reachable(&enrolled.enrolment)?;
         let ledger = ledger_of(&store, &enrolled)?;
 
@@ -2556,6 +2560,30 @@ fn not_installed(plugin_id: &PluginId) -> CatalogueError {
     }
 }
 
+/// What the unit tests run just after a sync has read which repository it is for and before it
+/// waits for that repository's store, to reach a sync another one moves on in between.
+#[cfg(test)]
+pub(crate) mod sync_pause {
+    use std::cell::RefCell;
+
+    type Then = Box<dyn FnOnce()>;
+
+    thread_local! {
+        static AFTER_READ: RefCell<Option<Then>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `then` once, the next time a sync on this thread has read its enrolment.
+    pub(crate) fn once(then: impl FnOnce() + 'static) {
+        AFTER_READ.with(|after| *after.borrow_mut() = Some(Box::new(then)));
+    }
+
+    pub(crate) fn run() {
+        if let Some(then) = AFTER_READ.with(|after| after.borrow_mut().take()) {
+            then();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2609,18 +2637,20 @@ mod tests {
     /// and the working copy the next verification starts from leaves those floors out.
     #[tokio::test]
     async fn a_reset_kept_with_a_root_is_owed_until_a_checkpoint_is_published() {
-        let (_home, mut catalogue, id) = development();
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let [served, intermediate, newest] = three_roots(home.path()).await;
+        let (mut catalogue, id) = enrolled_generation(home.path(), &served);
         catalogue.sync(&id).await.expect("a generation");
         let enrolled = catalogue.enrolled(&id).expect("enrolled");
         let store = catalogue.store(&id).expect("enrolled");
-        let (key, root) = (&enrolled.key, &enrolled.enrolment.root);
+        let key = &enrolled.key;
         let owed = |catalogue: &Catalogue| {
             catalogue
                 .db
                 .read(|records| records.trust_reset(key))
                 .expect("readable")
         };
-        let set_root = |catalogue: &mut Catalogue, reset: bool| {
+        let set_root = |catalogue: &mut Catalogue, root: &[u8], reset: bool| {
             let pending = catalogue.db.begin().expect("the write lock");
             committed(&Owner::acting(), &Effect::Records, move |permit| {
                 pending.run(permit, |changes| changes.set_root(key, root, reset))
@@ -2628,9 +2658,9 @@ mod tests {
             .expect("recorded");
         };
         assert!(!owed(&catalogue));
-        set_root(&mut catalogue, true);
+        set_root(&mut catalogue, &intermediate.root_bytes(), true);
         assert!(owed(&catalogue));
-        set_root(&mut catalogue, false);
+        set_root(&mut catalogue, &newest.root_bytes(), false);
         assert!(
             owed(&catalogue),
             "a later root that changes nothing does not clear it"
@@ -2659,11 +2689,179 @@ mod tests {
             "the reset leaves the timestamp and snapshot floors out of the copy"
         );
 
+        // The repository publishes what the root it is on now signs.
+        served.replace_with(&newest);
         catalogue.sync(&id).await.expect("verified again");
         assert!(
             !owed(&catalogue),
             "a published checkpoint settles the reset"
         );
+    }
+
+    /// A repository published at root 1 with generation 1, and two later states of it: generation
+    /// 2 under root 2, and generation 3 under root 3 with root 2 still published, each root signed
+    /// by the one before it. A client that trusts root 1 reaches root 3 through root 2.
+    async fn three_roots(home: &Path) -> [crate::test_support::Generation; 3] {
+        use crate::test_support::{Generation, GenerationSpec, KeySet};
+        let keys = [KeySet::generate(), KeySet::generate(), KeySet::generate()];
+        let first = Generation::build(
+            &home.join("root-1"),
+            GenerationSpec {
+                keys: Some(keys[0].clone()),
+                ..GenerationSpec::default()
+            },
+        )
+        .await;
+        let under_root_2 = GenerationSpec {
+            generation: 2,
+            root_version: 2,
+            keys: Some(keys[1].clone()),
+            previous_keys: Some(keys[0].clone()),
+            ..GenerationSpec::default()
+        };
+        let second = Generation::build(&home.join("root-2"), under_root_2.clone()).await;
+        let third = Generation::build(&home.join("root-3"), under_root_2).await;
+        third
+            .rotate_to(GenerationSpec {
+                generation: 3,
+                root_version: 3,
+                keys: Some(keys[2].clone()),
+                ..GenerationSpec::default()
+            })
+            .await;
+        [first, second, third]
+    }
+
+    /// The version of the root a repository's enrolment trusts now.
+    fn trusted_root(catalogue: &Catalogue, id: &RepositoryId) -> u64 {
+        let root = catalogue.enrolled(id).expect("enrolled").enrolment.root;
+        serde_json::from_slice::<tough::schema::Signed<tough::schema::Root>>(&root)
+            .expect("a root")
+            .signed
+            .version
+            .get()
+    }
+
+    /// Syncs `id` on `second`, which has synchronised generation 1 of `served`, while a sync in
+    /// another catalogue on the same directory runs whole in between: after `second` has read its
+    /// enrolment and before it waits for the store, as a sync in another process would.
+    ///
+    /// The other sync is served `newest`, which moves the repository through roots 2 and 3 to
+    /// generation 3. `second` is then served `then_served`.
+    async fn sync_after_another_moved_on(
+        second: &mut Catalogue,
+        id: &RepositoryId,
+        served: &crate::test_support::Generation,
+        newest: &crate::test_support::Generation,
+        then_served: &crate::test_support::Generation,
+    ) -> CatalogueResult<SyncOutcome> {
+        served.replace_with(newest);
+        let directory = second.root().to_path_buf();
+        let (location, then_served) = (served.directory(), then_served.directory());
+        let first_id = id.clone();
+        sync_pause::once(move || {
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a runtime");
+                let mut first = Catalogue::open(&directory).expect("a second catalogue");
+                runtime
+                    .block_on(first.sync(&first_id))
+                    .expect("roots 2 and 3, and generation 3");
+            })
+            .join()
+            .expect("the first sync finished");
+            std::fs::remove_dir_all(&location).expect("removable");
+            crate::test_support::copy_tree(&then_served, &location);
+        });
+        second.sync(id).await
+    }
+
+    /// Two syncs each read the enrolment before either holds the store. The first moves the
+    /// repository through roots 2 and 3 to generation 3; the second is then served a repository
+    /// that withholds root 3. The second moves nothing back: not the root, not the floors of the
+    /// accepted checkpoint and not the generation.
+    #[tokio::test]
+    async fn a_sync_another_moved_on_while_it_waited_takes_back_no_root_or_checkpoint() {
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let [served, intermediate, newest] = three_roots(home.path()).await;
+        let (mut second, id) = enrolled_generation(home.path(), &served);
+        second.sync(&id).await.expect("generation 1");
+
+        sync_after_another_moved_on(&mut second, &id, &served, &newest, &intermediate)
+            .await
+            .expect_err("a repository that withholds the newest root moves nothing on");
+
+        assert_eq!(trusted_root(&second, &id), 3, "the root went back");
+        assert_eq!(floors(&second, &id), (3, 3), "the checkpoint went back");
+        assert_eq!(
+            second
+                .active(&id)
+                .expect("enrolled")
+                .map(|active| active.generation),
+            Some(3)
+        );
+    }
+
+    /// Two syncs each read the enrolment before either holds the store, and both are served the
+    /// repository at root 3. The second starts from the root the first moved it to, so it finds
+    /// nothing to move on and succeeds, rather than walking the chain again from root 1 to a root
+    /// it may not record twice.
+    #[tokio::test]
+    async fn a_sync_starts_from_the_root_another_moved_it_to_while_it_waited() {
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let [served, _, newest] = three_roots(home.path()).await;
+        let (mut second, id) = enrolled_generation(home.path(), &served);
+        second.sync(&id).await.expect("generation 1");
+
+        let outcome = sync_after_another_moved_on(&mut second, &id, &served, &newest, &newest)
+            .await
+            .expect("the repository as the first sync found it");
+
+        assert_eq!(outcome.generation.get(), 3);
+        assert_eq!(trusted_root(&second, &id), 3);
+        assert_eq!(floors(&second, &id), (3, 3));
+        let key = second.enrolled(&id).expect("enrolled").key;
+        assert!(
+            !second
+                .db
+                .read(|records| records.trust_reset(&key))
+                .expect("readable"),
+            "nothing is owed"
+        );
+    }
+
+    /// A root is recorded only over an older one. A root of the version already trusted, or of an
+    /// earlier one, is refused, and the root trusted now stays.
+    #[tokio::test]
+    async fn a_root_no_newer_than_the_one_trusted_is_refused() {
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let [served, intermediate, newest] = three_roots(home.path()).await;
+        let (mut catalogue, id) = enrolled_generation(home.path(), &served);
+        let enrolled = catalogue.enrolled(&id).expect("enrolled");
+        let key = &enrolled.key;
+        let set_root = |catalogue: &mut Catalogue, root: &[u8]| {
+            let pending = catalogue.db.begin().expect("the write lock");
+            committed(&Owner::acting(), &Effect::Records, move |permit| {
+                pending.run(permit, |changes| changes.set_root(key, root, false))
+            })
+        };
+        set_root(&mut catalogue, &newest.root_bytes()).expect("root 3 over root 1");
+        for (root, version) in [
+            (intermediate.root_bytes(), 2),
+            (newest.root_bytes(), 3),
+            (served.root_bytes(), 1),
+        ] {
+            let refusal = set_root(&mut catalogue, &root).expect_err("no newer than root 3");
+            assert!(
+                matches!(&refusal, CatalogueError::Untrusted { detail }
+                    if detail.contains(&format!("version {version}"))
+                        && detail.contains("version 3")),
+                "{refusal:?}"
+            );
+        }
+        assert_eq!(trusted_root(&catalogue, &id), 3);
     }
 
     /// Arranges for a sync to move `id` on to its next generation just before the next index

@@ -104,6 +104,19 @@ pub(crate) fn resets_floors(old: &[u8], new: &[u8]) -> CatalogueResult<bool> {
     .any(|role| old.signed.keys(role).ne(new.signed.keys(role))))
 }
 
+/// Returns the version a trusted root declares.
+///
+/// # Errors
+///
+/// Returns [`CatalogueError::Untrusted`] when the root cannot be read.
+pub(crate) fn root_version(root: &[u8]) -> CatalogueResult<u64> {
+    serde_json::from_slice::<tough::schema::Signed<tough::schema::Root>>(root)
+        .map(|signed| signed.signed.version.get())
+        .map_err(|source| CatalogueError::Untrusted {
+            detail: format!("a trusted root could not be read: {source}"),
+        })
+}
+
 /// One delegated role, as this host understands its scope.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DelegationScope {
