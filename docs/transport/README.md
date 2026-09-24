@@ -119,10 +119,18 @@ and its separator is kept whole and shown as it is, with no kind of its own.
 
 A refusal counts only when the relay that gave it is on the route: a relay the dialled address
 names, or one the endpoint already holds for the peer, both of which iroh tries. iroh keeps a
-relay's reason only for the endpoint's own home relay, so the status of that relay is followed for
-the whole attempt, and a refusal by a home relay that is not on the route says nothing about the
-connection. A route relay that is not the endpoint's home relay leaves no reason to read, and a
-failure through it is reported as `TransportError::Connect`.
+relay's reason only for the endpoint's own home relay, and only as the latest thing that relay
+said, so the status is followed for the whole attempt and read again whenever a decision rests on
+it. A refusal stands while iroh dials the relay again, and ends when the relay admits the endpoint,
+when the latest attempt to reach it failed for another cause, or when it is no longer a home relay,
+since nothing it says afterwards is reported. A refusal by a home relay that is not on the route
+says nothing about the connection. A route relay that is not the endpoint's home relay leaves no
+reason to read, and a failure through it is reported as `TransportError::Connect`.
+
+A refusal explains only a failure in which nothing answered: an attempt that timed out. A peer that
+answered and refused, an endpoint that was closing and a request that could not be made at all are
+each their own reason and are reported as `TransportError::Connect`, whatever a relay said at the
+time.
 
 An endpoint with no IP transport, one built with `relay_only`, has nothing but relays to try, so
 once every relay on its route has refused it the attempt ends at once rather than at its 30-second

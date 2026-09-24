@@ -335,6 +335,46 @@ async fn a_refused_device_still_reaches_the_host_by_a_direct_address() {
     host.endpoint.close().await;
 }
 
+/// KR-REQ-17.40: a refusal explains only a failure in which nothing answered. A device its relay
+/// turns away dials a host whose direct address is on the route, in a protocol the host does not
+/// speak: the host answers and refuses the handshake, and that refusal, not the relay's, is the
+/// failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_that_answered_and_refused_is_not_reported_as_the_relays_refusal() {
+    const SPENT: &str = "allowance_spent: the reserved bytes for this endpoint are spent";
+    let relay = RefusingRelay::spawn().await;
+    let host = host(&with_direct(&relay)).await;
+    let device = refused_device(&with_direct(&relay), &relay, SPENT).await;
+    until_refused(&device, &relay.url, SPENT).await;
+
+    // The host takes the attempt up, so its refusal is an answer rather than silence.
+    let endpoint = host.endpoint.clone();
+    let answering = tokio::spawn(async move {
+        if let Some(incoming) = endpoint.accept().await {
+            let _ = incoming.await;
+        }
+    });
+    let mut route = EndpointAddr::new(host.endpoint.id()).with_relay_url(relay.url.clone());
+    for socket in host.endpoint.bound_sockets() {
+        route = route.with_ip_addr(socket);
+    }
+    let outcome = tokio::time::timeout(
+        PATIENCE,
+        kr_transport::endpoint::connect(&device.endpoint, route, b"kalareach-unspoken"),
+    )
+    .await
+    .expect("the attempt ends by itself");
+    let error = outcome.expect_err("the host refuses a protocol it does not speak");
+    assert!(
+        matches!(error, TransportError::Connect(_)),
+        "the host's refusal is the failure, not the relay's: {error}"
+    );
+
+    answering.abort();
+    device.endpoint.close().await;
+    host.endpoint.close().await;
+}
+
 /// KR-REQ-17.40: a refusal is the reason for a connection only when the refusing relay is on its
 /// route. A device whose own home relay turns it away dials a host through another relay, which
 /// admits it, and connects: neither at once nor at the end is the home relay's refusal taken for
