@@ -1,4 +1,5 @@
 import AuthenticationServices
+import CompanionSession
 import SwiftRs
 import Tauri
 import UIKit
@@ -44,13 +45,10 @@ struct SessionEvent: Encodable {
 class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
   private var session: ASWebAuthenticationSession?
   private var waiting: Invoke?
-  private var attempt: String?
+  private let attempts = SessionAttempts()
 
   @objc public func capabilities(_ invoke: Invoke) {
-    var httpsCallback = false
-    if #available(iOS 17.4, *) {
-      httpsCallback = true
-    }
+    let httpsCallback = takesHttpsCallback(ProcessInfo.processInfo.operatingSystemVersion)
     let group = Bundle.main.object(forInfoDictionaryKey: "KRPrivateKeychainGroup") as? String
     invoke.resolve(Capabilities(httpsCallback: httpsCallback, privateKeychainGroup: group))
   }
@@ -63,11 +61,22 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
     }
     DispatchQueue.main.async {
       // One attempt at a time: a newer one ends the older one's wait.
-      if let earlier = self.attempt {
+      if let earlier = self.attempts.inProgress {
         self.session?.cancel()
         self.finish(SessionEvent(attempt: earlier, kind: "cancelled"))
       }
       let attempt = arguments.attempt
+      _ = self.attempts.begin(attempt)
+      self.waiting = invoke
+      guard
+        let configuration = sessionConfiguration(
+          mode: arguments.mode, httpsHost: arguments.httpsHost, httpsPath: arguments.httpsPath,
+          scheme: arguments.scheme,
+          httpsTaken: takesHttpsCallback(ProcessInfo.processInfo.operatingSystemVersion))
+      else {
+        self.finish(SessionEvent(attempt: attempt, kind: "ended", code: -1))
+        return
+      }
       let completion: ASWebAuthenticationSession.CompletionHandler = { [weak self] callback, error in
         guard let self = self else { return }
         if let callback = callback {
@@ -82,20 +91,22 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
         }
       }
       let session: ASWebAuthenticationSession
-      if arguments.mode == "sessionHttps", #available(iOS 17.4, *) {
+      switch configuration.callback {
+      case .https(let host, let path):
+        guard #available(iOS 17.4, *) else {
+          // The rules above take the HTTPS callback only from iOS 17.4, so this is not reached.
+          self.finish(SessionEvent(attempt: attempt, kind: "ended", code: -1))
+          return
+        }
         session = ASWebAuthenticationSession(
-          url: url,
-          callback: .https(host: arguments.httpsHost, path: arguments.httpsPath),
-          completionHandler: completion)
-      } else {
+          url: url, callback: .https(host: host, path: path), completionHandler: completion)
+      case .scheme(let scheme):
         session = ASWebAuthenticationSession(
-          url: url, callbackURLScheme: arguments.scheme, completionHandler: completion)
+          url: url, callbackURLScheme: scheme, completionHandler: completion)
       }
-      session.prefersEphemeralWebBrowserSession = true
+      session.prefersEphemeralWebBrowserSession = configuration.ephemeral
       session.presentationContextProvider = self
       self.session = session
-      self.waiting = invoke
-      self.attempt = attempt
       if !session.start() {
         self.finish(SessionEvent(attempt: attempt, kind: "ended", code: -1))
       }
@@ -110,7 +121,7 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
   @objc public func cancel(_ invoke: Invoke) throws {
     let arguments = try invoke.parseArgs(AttemptArguments.self)
     DispatchQueue.main.async {
-      if self.attempt == arguments.attempt {
+      if self.attempts.inProgress == arguments.attempt {
         // Cancelling from here dismisses the sheet without calling the completion, so the waiting
         // call is answered here.
         self.session?.cancel()
@@ -120,12 +131,14 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
     }
   }
 
+  /// Answers the waiting call with the attempt's one result; a result for any other attempt is
+  /// late, and dropped.
   private func finish(_ event: SessionEvent) {
-    guard self.attempt == event.attempt, let waiting = self.waiting else { return }
+    guard attempts.end(event.attempt) else { return }
+    let waiting = self.waiting
     self.waiting = nil
     self.session = nil
-    self.attempt = nil
-    waiting.resolve(event)
+    waiting?.resolve(event)
   }
 
   func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
