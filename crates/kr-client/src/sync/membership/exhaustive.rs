@@ -941,11 +941,19 @@ fn other_records(world: &World) -> Vec<ModelRecord> {
             // A service can hand X the wraps of any candidate D sent, applied or not, and X can
             // carry such a key into a record of its own, here one that keeps the current members.
             // D refuses it whatever it lists, and a record that also removed a member would only
-            // be refused the same way.
+            // be refused the same way. The key of a candidate that applied is its record's.
             let exposed: BTreeSet<KeyLabel> = world
                 .sent
                 .keys()
                 .map(|(_, key)| *key)
+                .chain(
+                    world
+                        .service
+                        .chain
+                        .iter()
+                        .filter(|record| record.issuer == D)
+                        .map(|record| record.key),
+                )
                 .filter(|key| *key != current.key)
                 .collect();
             for key in exposed {
