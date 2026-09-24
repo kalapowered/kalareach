@@ -1077,6 +1077,73 @@ mod tests {
     }
 
     #[test]
+    fn the_loader_needs_the_execute_right_and_the_libraries_only_reading() {
+        let shell = Path::new("/bin/sh");
+        let Some(loader) = interpreter(shell).expect("the shell's headers read") else {
+            println!("not exercised: this host's shell is not dynamically linked");
+            return;
+        };
+        let root = tempfile::TempDir::new().expect("a directory on the internal disk");
+        let named = support_of(shell);
+        let arguments = [OsString::from("-c"), OsString::from("echo started")];
+        let start = |support: SupportSet, readable: Vec<PathBuf>| {
+            let mut confinement = confinement_in(
+                root.path(),
+                shell,
+                Reach::Nothing,
+                Reads::Bounded(Arc::new(support)),
+            );
+            confinement.readable = readable;
+            crate::boundary::start(
+                &Invocation {
+                    program: shell,
+                    arguments: &arguments,
+                    environment: &[],
+                    described: "a shell started under the named set",
+                },
+                &confinement,
+            )
+        };
+        // The set as it is named: the loader may be executed and the libraries only read.
+        let (status, stdout, _) = output_of(start(named.clone(), Vec::new()).expect("it starts"));
+        assert_eq!(
+            (status, stdout.as_str()),
+            (Some(0), "started\n"),
+            "the shell runs"
+        );
+        // The loader readable but not executable: the kernel will not start the program.
+        let refusal = start(
+            SupportSet {
+                loaders: Vec::new(),
+                libraries: named.libraries.clone(),
+            },
+            vec![loader.clone()],
+        )
+        .expect_err("a program whose loader may not be executed does not start");
+        assert!(
+            refusal.to_string().contains("Permission denied"),
+            "the kernel refused to execute the loader: {refusal}"
+        );
+        // The library directories withheld: the loader runs and cannot load what the shell links.
+        let (status, stdout, stderr) = output_of(
+            start(
+                SupportSet {
+                    loaders: named.loaders.clone(),
+                    libraries: Vec::new(),
+                },
+                Vec::new(),
+            )
+            .expect("the loader starts"),
+        );
+        assert_eq!(status, Some(127), "the program cannot be loaded");
+        assert!(stdout.is_empty(), "and never ran");
+        assert!(
+            stderr.contains("error while loading shared libraries"),
+            "the loader says so: {stderr}"
+        );
+    }
+
+    #[test]
     fn a_helper_that_names_another_loader_is_refused_and_that_loader_never_runs() {
         let shell = Path::new("/bin/sh");
         let Some(loader) = interpreter(shell).expect("the shell's headers read") else {
