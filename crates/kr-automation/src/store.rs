@@ -41,7 +41,8 @@ use kr_protocol::error::ProtocolError;
 use kr_protocol::ids::{ActionId, CausalRootId, GrantId, WorkflowId, WorkflowRunId};
 use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 
-use crate::budget::CausalBudget;
+use crate::admission::Placement;
+use crate::budget::{CausalBudget, Inherited};
 use crate::causal::CausalContext;
 use crate::error::{AutomationError, Result};
 
@@ -51,11 +52,13 @@ pub const WORKFLOW_DB_NAME: &str = "workflows.db";
 /// The schema version this build reads and writes.
 ///
 /// It covers the rows as well as the tables, the stored events, definitions and node outputs among
-/// them. Versions 1 to 4 were written only by builds that never reached an installed product, so no
+/// them. Versions 1 to 5 were written only by builds that never reached an installed product, so no
 /// installed journal holds any of them, and a journal at one of them is refused by name rather than
 /// read as if its rows said what this build expects. Version 5 stores each node's output as its
-/// kind's typed output rather than as text.
-pub const WORKFLOW_SCHEMA_VERSION: u32 = 5;
+/// kind's typed output rather than as text. Version 6 keeps the admissions the host-wide and
+/// per-grant rates count, a run that waits for a slot as pending, and the ceilings a chain
+/// inherited.
+pub const WORKFLOW_SCHEMA_VERSION: u32 = 6;
 
 /// The columns [`Journal::parse_run_record`] expects, in order.
 const RUN_RECORD_COLUMNS: &str = "run_id, workflow_id, revision, causal_root_id, generation, depth,
@@ -990,6 +993,35 @@ impl<'c> Journal<'c> {
         }
     }
 
+    /// Counts the runs of every revision of one workflow that stand in `status`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the rows cannot be read.
+    pub fn runs_in(&self, workflow_id: WorkflowId, status: WorkflowRunStatus) -> Result<u64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM workflow_runs WHERE workflow_id = ?1 AND status = ?2",
+            params![workflow_id.to_string(), status.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(u64::try_from(count).unwrap_or_default())
+    }
+
+    /// Counts the runs admitted at or after `since_ms`, host-wide or under one grant.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the rows cannot be read.
+    pub fn admissions_since(&self, since_ms: u64, grant: Option<GrantId>) -> Result<u64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM run_admissions
+             WHERE admitted_at_ms >= ?1 AND (?2 IS NULL OR grant_reference = ?2)",
+            params![stored(since_ms), grant.map(|grant| grant.to_string())],
+            |row| row.get(0),
+        )?;
+        Ok(u64::try_from(count).unwrap_or_default())
+    }
+
     fn parse_run_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRunRecord> {
         let run_id_str: String = row.get(0)?;
         let wf_id_str: String = row.get(1)?;
@@ -1046,15 +1078,23 @@ impl<'c> Journal<'c> {
         })
     }
 
-    /// Commits a trigger, its run, the run's node receipts and the chain's reservation together.
+    /// Commits a trigger, its run, the run's node receipts, the chain's reservation and the
+    /// admission the rates count, together.
     ///
     /// Deduplicates by `(workflow_id, definition_revision, event_id)`. A refusal from the budget
-    /// writes the exhausted budget and the one attention item it owes, and nothing else.
+    /// writes the exhausted budget and the one attention item it owes, and nothing else. A run
+    /// placed to start is recorded running, with its deadline; one placed in the queue is recorded
+    /// pending, and its deadline is set when it is claimed. A new root's budget records what the
+    /// chain inherits from its host; a descendant's reads the root's.
     ///
     /// # Errors
     ///
     /// Returns [`AutomationError::DuplicateTrigger`] for a trigger already recorded, the budget's
     /// `CAUSAL_LIMIT` refusal, and whatever the admission refused with.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one transaction's worth of facts, each of which the caller decided"
+    )]
     pub fn commit_trigger_and_run(
         &self,
         run_id: WorkflowRunId,
@@ -1062,6 +1102,8 @@ impl<'c> Journal<'c> {
         event_id: &str,
         causal_ctx: &CausalContext,
         now_ms: u64,
+        placement: Placement,
+        inherited: Inherited,
     ) -> Result<CausalBudget> {
         let wf_id_str = definition.workflow_id.to_string();
         let rev = revision_key(definition.revision.get())
@@ -1078,7 +1120,7 @@ impl<'c> Journal<'c> {
         self.admit()?;
         let mut budget = self
             .load_budget(causal_ctx.root_id)?
-            .unwrap_or_else(|| CausalBudget::new(causal_ctx.root_id, now_ms));
+            .unwrap_or_else(|| CausalBudget::new(causal_ctx.root_id, now_ms, inherited));
         budget.check_generation(causal_ctx.generation)?;
         let was_emitted = budget.attention_emitted;
         if let Err(err) = budget.reserve_run(causal_ctx.depth, now_ms) {
@@ -1093,7 +1135,14 @@ impl<'c> Journal<'c> {
 
         let parent_run_id = causal_ctx.parent.as_ref().map(|p| p.run_id.to_string());
         let parent_node_id = causal_ctx.parent.as_ref().map(|p| p.node_id.clone());
-        let deadline_ms = now_ms.saturating_add(definition.deadlines.run_deadline_ms.get());
+        let (status, deadline_ms) = match placement {
+            Placement::Start => (
+                WorkflowRunStatus::Running,
+                now_ms.saturating_add(definition.deadlines.run_deadline_ms.get()),
+            ),
+            // A run's deadline measures its execution, which has not begun.
+            Placement::Queue => (WorkflowRunStatus::Pending, 0),
+        };
 
         self.conn.execute(
             "INSERT INTO workflow_runs (
@@ -1110,7 +1159,7 @@ impl<'c> Journal<'c> {
                 stored(causal_ctx.depth),
                 parent_run_id,
                 parent_node_id,
-                WorkflowRunStatus::Pending.as_str(),
+                status.as_str(),
                 stored(now_ms),
                 stored(deadline_ms),
             ],
@@ -1120,6 +1169,19 @@ impl<'c> Journal<'c> {
             "INSERT INTO trigger_dedup (workflow_id, revision, event_id, run_id, created_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![wf_id_str, rev, event_id, run_id.to_string(), stored(now_ms)],
+        )?;
+
+        // What the host-wide and per-grant rates count. Kept here rather than in memory, so a
+        // restart is not a way past a rate, and written only for a run that was admitted.
+        self.conn.execute(
+            "DELETE FROM run_admissions WHERE admitted_at_ms < ?1",
+            params![stored(
+                now_ms.saturating_sub(crate::admission::ADMISSION_WINDOW_MS)
+            )],
+        )?;
+        self.conn.execute(
+            "INSERT INTO run_admissions (admitted_at_ms, grant_reference) VALUES (?1, ?2)",
+            params![stored(now_ms), definition.grant_reference.to_string()],
         )?;
 
         for node in &definition.nodes {
@@ -1168,7 +1230,8 @@ impl<'c> Journal<'c> {
             .query_row(
                 "SELECT generation, depth, max_depth, total_runs, max_runs, total_actions,
                         max_actions, created_sessions, max_sessions, started_at_ms,
-                        max_lifetime_ms, paused, exhausted, attention_emitted, rearmed_at_ms
+                        max_lifetime_ms, paused, exhausted, attention_emitted, rearmed_at_ms,
+                        managed_spend, max_managed_spend
                  FROM causal_budgets WHERE causal_root_id = ?1",
                 params![root_id.to_string()],
                 |row| {
@@ -1189,6 +1252,8 @@ impl<'c> Journal<'c> {
                         exhausted: row.get::<_, i64>(12)? != 0,
                         attention_emitted: row.get::<_, i64>(13)? != 0,
                         rearmed_at_ms: row.get::<_, Option<i64>>(14)?.map(|v| v as u64),
+                        managed_spend: row.get::<_, i64>(15)? as u64,
+                        max_managed_spend: row.get::<_, i64>(16)? as u64,
                     })
                 },
             )
@@ -1202,8 +1267,9 @@ impl<'c> Journal<'c> {
                 causal_root_id, generation, depth, max_depth, total_runs, max_runs,
                 total_actions, max_actions, created_sessions, max_sessions,
                 started_at_ms, max_lifetime_ms, paused, exhausted,
-                attention_emitted, rearmed_at_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                attention_emitted, rearmed_at_ms, managed_spend, max_managed_spend
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                      ?18)
             ON CONFLICT(causal_root_id) DO UPDATE SET
                 generation = excluded.generation,
                 depth = excluded.depth,
@@ -1214,7 +1280,8 @@ impl<'c> Journal<'c> {
                 paused = excluded.paused,
                 exhausted = excluded.exhausted,
                 attention_emitted = excluded.attention_emitted,
-                rearmed_at_ms = excluded.rearmed_at_ms",
+                rearmed_at_ms = excluded.rearmed_at_ms,
+                managed_spend = excluded.managed_spend",
             params![
                 budget.causal_root_id.to_string(),
                 stored(budget.generation),
@@ -1232,6 +1299,8 @@ impl<'c> Journal<'c> {
                 i64::from(budget.exhausted),
                 i64::from(budget.attention_emitted),
                 budget.rearmed_at_ms.map(stored),
+                stored(budget.managed_spend),
+                stored(budget.max_managed_spend),
             ],
         )?;
         Ok(())
@@ -1248,9 +1317,13 @@ impl<'c> Journal<'c> {
         now_ms: u64,
         reserve: impl FnOnce(&mut CausalBudget) -> Result<()>,
     ) -> Result<()> {
-        let mut budget = self
-            .load_budget(root_id)?
-            .unwrap_or_else(|| CausalBudget::new(root_id, now_ms));
+        // A chain's budget is written with its root run, so a reservation for a chain this journal
+        // holds no budget for is not one it can decide.
+        let mut budget = self.load_budget(root_id)?.ok_or_else(|| {
+            AutomationError::InvalidArgument(format!(
+                "this journal holds no budget for causal root {root_id}"
+            ))
+        })?;
         budget.check_generation(generation)?;
         let was_emitted = budget.attention_emitted;
         let outcome = reserve(&mut budget);
@@ -1480,6 +1553,41 @@ impl<'c> Journal<'c> {
             settlement.at_ms,
         )?;
         Ok(true)
+    }
+
+    /// Stops a run: every node still waiting or running is cancelled, and so is the run.
+    ///
+    /// A node that already settled keeps what it settled with, and a run that already finished is
+    /// not reopened as a cancelled one.
+    fn cancel_run(&self, run_id: WorkflowRunId, reason: &str, now_ms: u64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE node_receipts SET status = ?1, error_json = ?2, ended_at_ms = ?3
+             WHERE run_id = ?4 AND status IN (?5, ?6)",
+            params![
+                NodeStatus::Cancelled.as_str(),
+                reason,
+                stored(now_ms),
+                run_id.to_string(),
+                NodeStatus::Pending.as_str(),
+                NodeStatus::Running.as_str(),
+            ],
+        )?;
+        let cancelled = self.conn.execute(
+            "UPDATE workflow_runs SET status = ?1, ended_at_ms = ?2
+             WHERE run_id = ?3 AND status IN (?4, ?5, ?6)",
+            params![
+                WorkflowRunStatus::Cancelled.as_str(),
+                stored(now_ms),
+                run_id.to_string(),
+                WorkflowRunStatus::Pending.as_str(),
+                WorkflowRunStatus::Running.as_str(),
+                WorkflowRunStatus::Paused.as_str(),
+            ],
+        )?;
+        if cancelled > 0 {
+            self.record_run_settled(run_id, WorkflowRunStatus::Cancelled, now_ms)?;
+        }
+        Ok(())
     }
 
     /// Commits the event a run's new status owes, for a run whose status just changed.
@@ -1725,7 +1833,9 @@ impl WorkflowStore {
                 paused INTEGER NOT NULL,
                 exhausted INTEGER NOT NULL,
                 attention_emitted INTEGER NOT NULL,
-                rearmed_at_ms INTEGER
+                rearmed_at_ms INTEGER,
+                managed_spend INTEGER NOT NULL,
+                max_managed_spend INTEGER NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS workflow_runs (
@@ -1795,6 +1905,16 @@ impl WorkflowStore {
                 event_type TEXT NOT NULL,
                 PRIMARY KEY (consumer, event_type)
             );
+
+            -- One row per admitted run, for the host-wide and per-grant rates, kept for as long
+            -- as a rate counts it.
+            CREATE TABLE IF NOT EXISTS run_admissions (
+                admitted_at_ms INTEGER NOT NULL,
+                grant_reference TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS run_admissions_by_time
+                ON run_admissions (admitted_at_ms);
 
             -- One row per action, written in the transaction that performed it. Exactly one of
             -- the three outcome columns is set: there is no row for an action still under way.
@@ -2003,7 +2123,8 @@ impl WorkflowStore {
         })
     }
 
-    /// Loads or creates a causal budget for a causal root.
+    /// Loads or creates a causal budget for a causal root, one a new root inherits section 25's
+    /// defaults and no managed allowance into.
     ///
     /// # Errors
     ///
@@ -2013,7 +2134,7 @@ impl WorkflowStore {
             if let Some(budget) = journal.load_budget(root_id)? {
                 return Ok(budget);
             }
-            let budget = CausalBudget::new(root_id, now_ms);
+            let budget = CausalBudget::new(root_id, now_ms, Inherited::DEFAULTS);
             journal.save_budget(&budget)?;
             Ok(budget)
         })
@@ -2037,7 +2158,8 @@ impl WorkflowStore {
         self.read(|journal| journal.save_budget(budget))
     }
 
-    /// Reserves one action of the causal budget, in one transaction with its refusal.
+    /// Reserves one action of the causal budget, spending `managed_spend` of the chain's managed
+    /// allowance, in one transaction with its refusal.
     ///
     /// # Errors
     ///
@@ -2046,12 +2168,13 @@ impl WorkflowStore {
         &self,
         root_id: CausalRootId,
         generation: u64,
+        managed_spend: u64,
         now_ms: u64,
     ) -> Result<()> {
         self.write(|journal| {
             decided(
                 journal.reserve_in_budget(root_id, generation, now_ms, |budget| {
-                    budget.reserve_action(now_ms)
+                    budget.reserve_action(managed_spend, now_ms)
                 }),
             )
         })?
@@ -2260,54 +2383,122 @@ impl WorkflowStore {
     ///
     /// Returns a storage error when the rows cannot be written.
     pub fn cancel_run(&self, run_id: WorkflowRunId, reason: &str, now_ms: u64) -> Result<()> {
-        self.write(|journal| {
-            journal.conn.execute(
-                "UPDATE node_receipts SET status = ?1, error_json = ?2, ended_at_ms = ?3
-                 WHERE run_id = ?4 AND status IN (?5, ?6)",
-                params![
-                    NodeStatus::Cancelled.as_str(),
-                    reason,
-                    stored(now_ms),
-                    run_id.to_string(),
-                    NodeStatus::Pending.as_str(),
-                    NodeStatus::Running.as_str(),
-                ],
-            )?;
-            let cancelled = journal.conn.execute(
-                "UPDATE workflow_runs SET status = ?1, ended_at_ms = ?2
-                 WHERE run_id = ?3 AND status IN (?4, ?5, ?6)",
-                params![
-                    WorkflowRunStatus::Cancelled.as_str(),
-                    stored(now_ms),
-                    run_id.to_string(),
-                    WorkflowRunStatus::Pending.as_str(),
-                    WorkflowRunStatus::Running.as_str(),
-                    WorkflowRunStatus::Paused.as_str(),
-                ],
-            )?;
-            if cancelled > 0 {
-                journal.record_run_settled(run_id, WorkflowRunStatus::Cancelled, now_ms)?;
-            }
-            Ok(())
-        })
+        self.write(|journal| journal.cancel_run(run_id, reason, now_ms))
     }
 
-    /// Moves a run from waiting to running, unless something already settled it.
+    /// Starts the oldest pending run of one workflow, when fewer than `running_limit` of its runs
+    /// are running and its revision is enabled and unpaused, and answers it with the definition
+    /// it runs.
+    ///
+    /// The count, the choice and the move to running are one transaction, so two callers cannot
+    /// both take the last slot or both start the same run. The run's deadline starts here, because
+    /// it measures the run's execution rather than its wait.
     ///
     /// # Errors
     ///
-    /// Returns a storage error when the row cannot be written.
-    pub fn start_run(&self, run_id: WorkflowRunId) -> Result<()> {
+    /// Returns a storage error when the rows cannot be read or written.
+    pub fn claim_queued_run(
+        &self,
+        workflow_id: WorkflowId,
+        running_limit: u64,
+        now_ms: u64,
+    ) -> Result<Option<(StoredRunRecord, WorkflowDefinition)>> {
+        self.write(|journal| {
+            if journal.runs_in(workflow_id, WorkflowRunStatus::Running)? >= running_limit {
+                return Ok(None);
+            }
+            let next = journal
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT {RUN_RECORD_COLUMNS} FROM workflow_runs r
+                         WHERE r.workflow_id = ?1 AND r.status = ?2
+                           AND EXISTS (
+                               SELECT 1 FROM workflow_definitions d
+                               WHERE d.workflow_id = r.workflow_id AND d.revision = r.revision
+                                 AND d.enabled = 1 AND d.paused = 0
+                           )
+                         ORDER BY r.started_at_ms ASC, r.rowid ASC LIMIT 1"
+                    ),
+                    params![workflow_id.to_string(), WorkflowRunStatus::Pending.as_str()],
+                    Journal::parse_run_record,
+                )
+                .optional()?;
+            let Some(run) = next else {
+                return Ok(None);
+            };
+            let Some(installed) = journal.definition(run.workflow_id, run.revision)? else {
+                return Ok(None);
+            };
+            let deadline_ms =
+                now_ms.saturating_add(installed.definition.deadlines.run_deadline_ms.get());
+            journal.conn.execute(
+                "UPDATE workflow_runs SET status = ?1, deadline_ms = ?2
+                 WHERE run_id = ?3 AND status = ?4",
+                params![
+                    WorkflowRunStatus::Running.as_str(),
+                    stored(deadline_ms),
+                    run.run_id.to_string(),
+                    WorkflowRunStatus::Pending.as_str(),
+                ],
+            )?;
+            Ok(Some((run, installed.definition)))
+        })
+    }
+
+    /// Lists the workflows that have a run waiting for a slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the rows cannot be read.
+    pub fn workflows_with_queued_runs(&self) -> Result<Vec<WorkflowId>> {
         let conn = self.lock();
-        conn.execute(
-            "UPDATE workflow_runs SET status = ?1 WHERE run_id = ?2 AND status = ?3",
-            params![
-                WorkflowRunStatus::Running.as_str(),
-                run_id.to_string(),
-                WorkflowRunStatus::Pending.as_str(),
-            ],
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT workflow_id FROM workflow_runs WHERE status = ?1
+             ORDER BY workflow_id",
         )?;
-        Ok(())
+        let rows = stmt.query_map(params![WorkflowRunStatus::Pending.as_str()], |row| {
+            parse_stored_uuid(&row.get::<_, String>(0)?).map(WorkflowId::new)
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Reads the moment a running run's deadline passes, on the host's clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the row cannot be read.
+    pub fn run_deadline(&self, run_id: WorkflowRunId) -> Result<Option<u64>> {
+        let conn = self.lock();
+        let deadline: Option<i64> = conn
+            .query_row(
+                "SELECT deadline_ms FROM workflow_runs WHERE run_id = ?1",
+                params![run_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(deadline.map(|deadline| u64::try_from(deadline).unwrap_or_default()))
+    }
+
+    /// Stops a run that exceeded one of its workflow's limits, in one transaction: every node
+    /// still waiting or running is cancelled, the run is cancelled, and the revision is paused
+    /// with the attention item the pause owes. A run already settled keeps what it settled with.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the rows cannot be written.
+    pub fn stop_run_on_breach(
+        &self,
+        run_id: WorkflowRunId,
+        workflow_id: WorkflowId,
+        revision: u64,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<()> {
+        self.write(|journal| {
+            journal.cancel_run(run_id, reason, now_ms)?;
+            journal.pause_workflow_on_breach(workflow_id, revision, reason, now_ms)
+        })
     }
 
     /// Records where a run ended, unless it was cancelled, which is terminal.
@@ -2415,7 +2606,9 @@ impl WorkflowStore {
         self.read(|journal| journal.chain_grant(root_id))
     }
 
-    /// Commits a trigger, run, and budget reservation together in one local transaction.
+    /// Commits a trigger, run, and budget reservation together in one local transaction, for a
+    /// caller outside the service: the run starts at once, and a new root inherits section 25's
+    /// defaults and no managed allowance.
     ///
     /// # Errors
     ///
@@ -2430,8 +2623,15 @@ impl WorkflowStore {
     ) -> Result<CausalBudget> {
         let mut conn = self.lock();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let outcome = Journal::unguarded(&tx)
-            .commit_trigger_and_run(run_id, definition, event_id, causal_ctx, now_ms);
+        let outcome = Journal::unguarded(&tx).commit_trigger_and_run(
+            run_id,
+            definition,
+            event_id,
+            causal_ctx,
+            now_ms,
+            Placement::Start,
+            Inherited::DEFAULTS,
+        );
         // A budget refusal writes the exhaustion it owes; every other refusal wrote nothing.
         if outcome.is_ok() || matches!(outcome, Err(AutomationError::CausalLimitExhausted { .. })) {
             tx.commit()?;
@@ -2442,7 +2642,7 @@ impl WorkflowStore {
     /// Overwrites a run's status, whatever it was.
     ///
     /// A record-keeping operation for a caller that is restoring a known state; the engine itself
-    /// moves a run only through [`Self::start_run`], [`Self::finish_run`],
+    /// moves a run only through [`Self::claim_queued_run`], [`Self::finish_run`],
     /// [`Self::pause_on_refusal`] and [`Self::cancel_run`], which respect a cancellation.
     ///
     /// # Errors
@@ -2611,22 +2811,20 @@ impl WorkflowStore {
         })
     }
 
-    /// Lists the runs the journal holds as waiting or running.
+    /// Lists the runs the journal holds as running: the ones a stopped host may have been
+    /// dispatching. A run still waiting for a slot is not among them; it waits on.
     ///
     /// # Errors
     ///
     /// Returns a storage error when the rows cannot be read.
-    pub fn unfinished_runs(&self) -> Result<Vec<StoredRunRecord>> {
+    pub fn running_runs(&self) -> Result<Vec<StoredRunRecord>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(&format!(
-            "SELECT {RUN_RECORD_COLUMNS} FROM workflow_runs WHERE status IN (?1, ?2)
+            "SELECT {RUN_RECORD_COLUMNS} FROM workflow_runs WHERE status = ?1
              ORDER BY started_at_ms ASC"
         ))?;
         let rows = stmt.query_map(
-            params![
-                WorkflowRunStatus::Pending.as_str(),
-                WorkflowRunStatus::Running.as_str()
-            ],
+            params![WorkflowRunStatus::Running.as_str()],
             Journal::parse_run_record,
         )?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)

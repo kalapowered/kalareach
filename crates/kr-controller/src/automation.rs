@@ -31,7 +31,7 @@ use std::sync::{Arc, Weak};
 
 use kr_automation::{
     ActionKey, ActionOutcome, ActionRunner, Answer as Recorded, AuthoritySource, AutomationService,
-    Dispatch, Host, Submitted, SystemClock, WorkflowStore,
+    Dispatch, Host, Submitted, WorkflowStore,
 };
 use kr_changeset::ChangeSetService;
 use kr_changeset::materialise;
@@ -75,6 +75,43 @@ impl Daemon {
                 "this host's daemon is not serving".to_owned(),
             )
         })
+    }
+
+    /// This host's reading of UTC: the later of the wall clock and the daemon's clock floor, so a
+    /// wall clock wound back does not move it backwards. The wall clock alone before the daemon
+    /// is bound and after it has gone.
+    fn now_ms(&self) -> u64 {
+        self.get().map_or_else(
+            |_| kr_ipc::now_ms().get(),
+            |daemon| daemon.settled_utc_now(),
+        )
+    }
+}
+
+/// The clock a workflow's deadlines, its action waits and its chain's lifetime are measured on:
+/// the daemon's own reading of UTC, which a wall clock wound back does not move backwards.
+#[derive(Debug)]
+struct DaemonClock(Arc<Daemon>);
+
+impl kr_automation::HostClock for DaemonClock {
+    fn now_ms(&self) -> u64 {
+        self.0.now_ms()
+    }
+}
+
+/// What a new workflow chain inherits from this host: no more created sessions than the session
+/// number admission enforces now, and no managed allowance, because this host gives a workflow
+/// none. Before the daemon is bound and after it has gone, nothing.
+#[derive(Debug)]
+struct DaemonCeilings(Arc<Daemon>);
+
+impl kr_automation::HostCeilings for DaemonCeilings {
+    fn sessions(&self) -> u64 {
+        self.0.get().map_or(0, |daemon| daemon.sessions_in_force())
+    }
+
+    fn managed_spend(&self) -> u64 {
+        0
     }
 }
 
@@ -205,6 +242,13 @@ impl std::fmt::Debug for HostActions {
 }
 
 impl ActionRunner for HostActions {
+    /// Neither change-set kind can be stopped once it has begun: the change-set service offers no
+    /// point inside a capture or a materialisation to stop at. An action that outlives its wait
+    /// is therefore left unknown, and its dependants pause for review.
+    fn cancel(&self, _dispatch: &Dispatch<'_>) -> kr_automation::Cancellation {
+        kr_automation::Cancellation::Unsupported
+    }
+
     fn execute(
         &self,
         dispatch: &Dispatch<'_>,
@@ -283,7 +327,7 @@ impl HeldGrant {
     fn still_authorised(&self) -> kr_automation::Result<()> {
         let grant = self
             .authority
-            .grant(self.definition.grant_reference, kr_ipc::now_ms().get())?;
+            .grant(self.definition.grant_reference, self.daemon.now_ms())?;
         kr_automation::authority::check_node(
             &grant,
             &self.definition,
@@ -524,7 +568,11 @@ impl Drop for AutomationModule {
 /// whenever a run stops and on a timer for anything that did not wake it. Each run executes on a task of its own, so one long run does not hold the rest
 /// of a chain back. Every decision is the journal's: the dispatcher's own position commits with the
 /// runs it starts, so a daemon that stops in the middle neither loses a trigger nor starts one twice.
-async fn dispatch(service: Arc<AutomationService>, resumed: Vec<kr_automation::StartedRun>) {
+async fn dispatch(
+    service: Arc<AutomationService>,
+    daemon: Arc<Daemon>,
+    resumed: Vec<kr_automation::StartedRun>,
+) {
     for run in resumed {
         execute_apart(&service, run);
     }
@@ -532,7 +580,8 @@ async fn dispatch(service: Arc<AutomationService>, resumed: Vec<kr_automation::S
     loop {
         let admitted = {
             let service = Arc::clone(&service);
-            blocking(move || service.admit_triggers(kr_ipc::now_ms().get())).await
+            let daemon = Arc::clone(&daemon);
+            blocking(move || service.admit_triggers(daemon.now_ms())).await
         };
         // Every run the pass committed is executed, including those committed before a later
         // event stopped it: each is in the journal already, and nothing else would start it
@@ -544,6 +593,21 @@ async fn dispatch(service: Arc<AutomationService>, resumed: Vec<kr_automation::S
             eprintln!(
                 "kr-controller: the workflow trigger dispatcher stopped before its last trigger: \
                  {error}"
+            );
+        }
+        // A run that stopped freed a slot, so the runs waiting for one start as far as the slots
+        // allow, oldest first.
+        let queued = {
+            let service = Arc::clone(&service);
+            let daemon = Arc::clone(&daemon);
+            blocking(move || service.start_queued(daemon.now_ms())).await
+        };
+        for run in queued.started {
+            execute_apart(&service, run);
+        }
+        if let Some(error) = queued.stopped {
+            eprintln!(
+                "kr-controller: the workflow runs waiting for a slot were not started: {error}"
             );
         }
         // The events every consumer that reads them has passed are no longer owed. Removing them
@@ -603,7 +667,8 @@ impl AutomationModule {
                 environment_id,
             }),
             authority: grants,
-            clock: Arc::new(SystemClock),
+            clock: Arc::new(DaemonClock(Arc::clone(&daemon))),
+            ceilings: Arc::new(DaemonCeilings(Arc::clone(&daemon))),
         };
         let service =
             tokio::task::spawn_blocking(move || AutomationService::open(&state_dir, host))
@@ -660,7 +725,11 @@ impl AutomationModule {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take()
                 .unwrap_or_default();
-            tokio::spawn(dispatch(Arc::clone(&self.service), resumed))
+            tokio::spawn(dispatch(
+                Arc::clone(&self.service),
+                Arc::clone(&self.daemon),
+                resumed,
+            ))
         });
     }
 
@@ -805,7 +874,7 @@ impl AutomationModule {
         }
         let service = Arc::clone(&self.service);
         let params = request.params.clone();
-        let now_ms = kr_ipc::now_ms().get();
+        let now_ms = self.daemon.now_ms();
         blocking(move || {
             let asked: WorkflowReadParams = typed(&params)?;
             encode(&service.read(&asked, caller_grant, now_ms)?)
@@ -838,7 +907,7 @@ impl AutomationModule {
         let key = action_key(actor_id, mutation, method)?;
         let service = Arc::clone(&self.service);
         let params = mutation.params.clone();
-        let now_ms = kr_ipc::now_ms().get();
+        let now_ms = self.daemon.now_ms();
         let still_admitted = move || -> kr_automation::Result<()> {
             admission().map_err(|refusal| kr_automation::AutomationError::Lapsed {
                 code: refusal.code,

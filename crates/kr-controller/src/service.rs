@@ -429,6 +429,9 @@ pub struct Controller {
     /// The environment's automation service: workflow definitions, runs and the causal budgets
     /// they share. It reads the grant each definition names from this daemon's own grant store.
     automation: Arc<crate::automation::AutomationModule>,
+    /// The session number admission enforces now, as the registry last took it, readable without
+    /// the registry's lock. A new workflow chain's created-session ceiling does not exceed it.
+    sessions_in_force: std::sync::atomic::AtomicU64,
     /// The environment's attention store: one inbox, review state and visits across every session.
     attention: Arc<crate::attention::AttentionModule>,
     /// The serial boundary every contact-skill installation passes through.
@@ -630,6 +633,7 @@ impl Controller {
             registry.set_session_limit(limit)?;
             accepted_configuration.sessions = limit;
         }
+        let sessions_in_force = accepted_configuration.sessions;
         let in_force = crate::config::InForce::of(&startup_configuration);
         // The network and the voice broker come from this same reading, and from nothing a
         // process inherited: section 26 keeps a provider origin out of reach of an environment
@@ -829,6 +833,7 @@ impl Controller {
             feed: std::sync::Mutex::new(feed),
             changesets,
             automation,
+            sessions_in_force: std::sync::atomic::AtomicU64::new(sessions_in_force),
             attention,
             agent_tools: tokio::sync::Mutex::new(()),
             worker_program,
@@ -2162,6 +2167,13 @@ impl Controller {
                 refusal.detail()
             ))
         })
+    }
+
+    /// The session number admission enforces now, which a new workflow chain's created-session
+    /// ceiling does not exceed.
+    pub(crate) fn sessions_in_force(&self) -> u64 {
+        self.sessions_in_force
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Runs `effect` while this daemon's registry is held and no fence is owed, for work that
@@ -6124,6 +6136,8 @@ impl Controller {
             // effect that fails does not put this number back, and a state that said it had would
             // make the next report describe a ceiling admission is no longer enforcing.
             state.sessions = sessions.value;
+            self.sessions_in_force
+                .store(sessions.value, std::sync::atomic::Ordering::SeqCst);
         }
         // The durable fact, read before anything acts on it. The flag this process used to keep
         // decided nothing that survived it.

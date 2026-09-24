@@ -12,9 +12,10 @@
 use std::collections::{HashMap, HashSet};
 
 use kr_protocol::automation::{
-    AttentionNoticeParams, MAX_NOTICE_SUMMARY_BYTES, MAX_SHELL_COMMAND_BYTES, MAX_TEST_SUITE_BYTES,
-    RequestReviewParams, RunTestsParams, ShellCommandParams, WorkflowActionKind, WorkflowDeadlines,
-    WorkflowDefinition, WorkflowEdge, WorkflowNode, WorkflowResourceScope, WorkflowTrigger,
+    AttentionNoticeParams, DEFAULT_WORKFLOW_ACTION_WAIT_MS, DEFAULT_WORKFLOW_RUN_DEADLINE_MS,
+    MAX_NOTICE_SUMMARY_BYTES, MAX_SHELL_COMMAND_BYTES, MAX_TEST_SUITE_BYTES, RequestReviewParams,
+    RunTestsParams, ShellCommandParams, WorkflowActionKind, WorkflowDeadlines, WorkflowDefinition,
+    WorkflowEdge, WorkflowNode, WorkflowResourceScope, WorkflowTrigger,
 };
 use kr_protocol::changeset::{
     ChangesetCaptureParams, ChangesetMaterializeParams, DestinationClass, DiffApplyParams,
@@ -50,6 +51,16 @@ pub const fn produced_event(action_kind: WorkflowActionKind) -> Option<&'static 
     })
 }
 
+/// What one action of `action_kind` spends of its chain's managed allowance.
+///
+/// No kind this engine carries out spends one, so a chain that inherited no managed allowance
+/// runs every kind; a kind that spends one is held to what its chain inherited.
+#[must_use]
+pub const fn managed_spend(action_kind: WorkflowActionKind) -> u64 {
+    let _ = action_kind;
+    0
+}
+
 /// Validates a workflow definition against everything that must hold before it is installed.
 ///
 /// The order is from the shape of the document outwards, so the refusal names the first thing
@@ -78,6 +89,19 @@ pub fn validate_definition(definition: &WorkflowDefinition, grant: &Grant) -> Re
         return Err(AutomationError::InvalidArgument(
             "a workflow definition needs at least one action node".to_owned(),
         ));
+    }
+    // Section 17's per-workflow deadlines are the most a definition may give itself: a
+    // definition may shorten them, and may neither lengthen them nor set one to nothing.
+    let deadlines = definition.deadlines;
+    if !(1..=DEFAULT_WORKFLOW_RUN_DEADLINE_MS).contains(&deadlines.run_deadline_ms.get()) {
+        return Err(AutomationError::InvalidArgument(format!(
+            "a run deadline is 1 to {DEFAULT_WORKFLOW_RUN_DEADLINE_MS} milliseconds"
+        )));
+    }
+    if !(1..=DEFAULT_WORKFLOW_ACTION_WAIT_MS).contains(&deadlines.action_wait_ms.get()) {
+        return Err(AutomationError::InvalidArgument(format!(
+            "an action's wait is 1 to {DEFAULT_WORKFLOW_ACTION_WAIT_MS} milliseconds"
+        )));
     }
 
     let mut node_ids = HashSet::new();

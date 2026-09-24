@@ -5207,6 +5207,10 @@
           "description": "Whether any limit was exhausted.",
           "type": "boolean"
         },
+        "managed_spend": {
+          "$ref": "#/$defs/U64",
+          "description": "Managed allowance the chain's actions have spent."
+        },
         "max_actions": {
           "$ref": "#/$defs/U64",
           "description": "Maximum allowed action nodes."
@@ -5218,6 +5222,10 @@
         "max_lifetime_ms": {
           "$ref": "#/$defs/U64",
           "description": "Maximum allowed lifetime in milliseconds."
+        },
+        "max_managed_spend": {
+          "$ref": "#/$defs/U64",
+          "description": "The managed allowance the chain inherited from its host when its root was admitted."
         },
         "max_runs": {
           "$ref": "#/$defs/U64",
@@ -5252,6 +5260,8 @@
         "max_sessions",
         "elapsed_lifetime_ms",
         "max_lifetime_ms",
+        "managed_spend",
+        "max_managed_spend",
         "paused",
         "exhausted"
       ],

@@ -206,6 +206,10 @@ pub fn host(
         runner,
         authority,
         clock,
+        ceilings: Arc::new(kr_automation::FixedCeilings {
+            sessions: 128,
+            managed_spend: 0,
+        }),
     }
 }
 

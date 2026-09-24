@@ -2988,7 +2988,7 @@ fn run(journal: &kr_automation::WorkflowStore, definition: &WorkflowDefinition) 
 fn exhaust(journal: &kr_automation::WorkflowStore, root: CausalRootId) -> u64 {
     let later = kr_ipc::now_ms().get() + kr_protocol::automation::DEFAULT_CAUSAL_LIFETIME_MS + 1;
     journal
-        .reserve_budget_action(root, 0, later)
+        .reserve_budget_action(root, 0, 0, later)
         .expect_err("the chain has outlived its budget");
     newest_record(journal)
 }

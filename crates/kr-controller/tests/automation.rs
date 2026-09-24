@@ -1318,6 +1318,10 @@ async fn trigger_left_pending(state_dir: &Path, environment_id: EnvironmentId) -
             runner: Arc::new(kr_automation::MockActionRunner::new()),
             authority: Arc::new(table),
             clock: Arc::new(kr_automation::SystemClock),
+            ceilings: Arc::new(kr_automation::FixedCeilings {
+                sessions: 128,
+                managed_spend: 0,
+            }),
         },
     )
     .expect("the journal opens");

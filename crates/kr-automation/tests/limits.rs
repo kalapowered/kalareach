@@ -1,6 +1,5 @@
 //! Tests for host-wide rate limits, per-grant rate limits, and per-workflow concurrency limits.
 
-use kr_automation::AdmissionController;
 use kr_protocol::ids::{GrantId, WorkflowId};
 use kr_protocol::scalars::Uuid;
 
@@ -32,115 +31,119 @@ fn authority() -> std::sync::Arc<kr_automation::GrantTable> {
     ])
 }
 
-#[test]
-fn concurrency_limits_are_enforced_per_workflow() {
-    let mut controller = AdmissionController::new();
-
-    let wf1 = test_wf_id(1);
-    let wf2 = test_wf_id(2);
-    let grant = test_grant_id(1);
-
-    // Limit concurrency to 2 for wf1
-    let max_conc = Some(2);
-
-    // Admit run 1 and run 2 for wf1
-    assert!(
-        controller
-            .admit_run(wf1, grant, 1000, max_conc, None)
-            .is_ok()
-    );
-    assert!(
-        controller
-            .admit_run(wf1, grant, 1000, max_conc, None)
-            .is_ok()
-    );
-
-    // 3rd concurrent run for wf1 is rejected
-    let err = controller
-        .admit_run(wf1, grant, 1000, max_conc, None)
-        .unwrap_err();
-    assert!(err.to_string().contains("concurrency limit"));
-
-    // wf2 is unaffected by wf1's limit
-    assert!(
-        controller
-            .admit_run(wf2, grant, 1000, max_conc, None)
-            .is_ok()
-    );
-
-    // When a run of wf1 completes, another run can be admitted
-    controller.release_run(wf1);
-    assert!(
-        controller
-            .admit_run(wf1, grant, 1000, max_conc, None)
-            .is_ok()
-    );
+/// A service over an in-memory journal whose runs complete at once, holding the grants
+/// `grants` name.
+fn service_holding(grants: &[GrantId]) -> kr_automation::AutomationService {
+    kr_automation::AutomationService::in_memory(common::host(
+        std::sync::Arc::new(kr_automation::MockActionRunner::new()),
+        common::every_right(grants),
+        std::sync::Arc::new(kr_automation::ManualClock::new(1_000)),
+    ))
+    .expect("a service")
 }
 
-#[test]
-fn host_wide_rate_limits_throttle_excessive_traffic() {
-    let mut controller = AdmissionController::new();
-    controller.host_rate_limit = 3;
+/// Installs and enables a one-node workflow under `grant`.
+fn installed_under(
+    service: &kr_automation::AutomationService,
+    id: WorkflowId,
+    grant: GrantId,
+) -> kr_protocol::automation::WorkflowDefinition {
+    use kr_protocol::automation::{WorkflowEnableParams, WorkflowInstallParams};
 
-    let wf1 = test_wf_id(1);
-    let grant = test_grant_id(1);
-
-    // Consume 3 runs
-    assert!(controller.admit_run(wf1, grant, 1000, None, None).is_ok());
-    assert!(controller.admit_run(wf1, grant, 1000, None, None).is_ok());
-    assert!(controller.admit_run(wf1, grant, 1000, None, None).is_ok());
-
-    // 4th run in same sliding window (1 minute) fails
-    let err = controller
-        .admit_run(wf1, grant, 1000, None, None)
-        .unwrap_err();
-    assert!(err.to_string().contains("host-wide rate limit"));
-
-    // After 61 seconds (61,000 ms), window slides and runs can be admitted again
-    assert!(controller.admit_run(wf1, grant, 62_000, None, None).is_ok());
+    let definition = kr_automation::create_workflow_definition(
+        id,
+        1,
+        "rated",
+        grant,
+        vec![common::node("step", WorkflowActionKind::RunTests)],
+        vec![],
+    );
+    service
+        .submit_install(
+            &WorkflowInstallParams {
+                workflow_id: id,
+                revision: definition.revision,
+                definition: definition.clone(),
+                grant_reference: grant,
+            },
+            1_000,
+        )
+        .expect("installs");
+    service
+        .submit_enable(
+            &WorkflowEnableParams {
+                workflow_id: id,
+                revision: definition.revision,
+            },
+            1_000,
+        )
+        .expect("enables");
+    definition
 }
 
-#[test]
-fn per_grant_rate_limits_isolate_tenants() {
-    let mut controller = AdmissionController::new();
-    controller.grant_rate_limit = 2;
+fn run_of(
+    definition: &kr_protocol::automation::WorkflowDefinition,
+    event: &str,
+) -> kr_protocol::automation::WorkflowRunParams {
+    kr_protocol::automation::WorkflowRunParams {
+        workflow_id: definition.workflow_id,
+        revision: definition.revision,
+        event_id: event.to_owned(),
+        event_type: "manual".to_owned(),
+        event_payload: kr_protocol::scalars::Nullable::null(),
+    }
+}
 
-    let wf = test_wf_id(1);
-    let grant_a = test_grant_id(10);
-    let grant_b = test_grant_id(20);
-    let max_conc = Some(100);
+/// Each grant has its own minute's allowance: one grant spending all of its own leaves another's
+/// untouched, and the window moves on after a minute.
+#[tokio::test]
+async fn per_grant_rate_limits_isolate_tenants() {
+    let (grant_a, grant_b) = (test_grant_id(10), test_grant_id(11));
+    let service = service_holding(&[grant_a, grant_b]);
+    let a = installed_under(&service, test_wf_id(30), grant_a);
+    let b = installed_under(&service, test_wf_id(31), grant_b);
+    for index in 0..120 {
+        service
+            .submit_run(&run_of(&a, &format!("evt-{index}")), 1_000)
+            .await
+            .unwrap_or_else(|error| panic!("run {index} under the first grant: {error}"));
+    }
+    let refused = service
+        .submit_run(&run_of(&a, "evt-over"), 1_000)
+        .await
+        .expect_err("the first grant's allowance is spent");
+    assert!(refused.to_string().contains("grant"), "{refused}");
+    service
+        .submit_run(&run_of(&b, "evt-other"), 1_000)
+        .await
+        .expect("the second grant's allowance is its own");
+}
 
-    // Exhaust grant_a
-    assert!(
-        controller
-            .admit_run(wf, grant_a, 1000, max_conc, None)
-            .is_ok()
-    );
-    assert!(
-        controller
-            .admit_run(wf, grant_a, 1000, max_conc, None)
-            .is_ok()
-    );
-    let err_a = controller
-        .admit_run(wf, grant_a, 1000, max_conc, None)
-        .unwrap_err();
-    assert!(err_a.to_string().contains("grant"));
-
-    // grant_b has separate quota and succeeds
-    assert!(
-        controller
-            .admit_run(wf, grant_b, 1000, max_conc, None)
-            .is_ok()
-    );
-    assert!(
-        controller
-            .admit_run(wf, grant_b, 1000, max_conc, None)
-            .is_ok()
-    );
-    let err_b = controller
-        .admit_run(wf, grant_b, 1000, max_conc, None)
-        .unwrap_err();
-    assert!(err_b.to_string().contains("grant"));
+/// The host admits no more than its own minute's allowance, whichever grants the runs are under,
+/// and a callback that arrives as a new external trigger is counted like any other.
+#[tokio::test]
+async fn host_wide_rate_limits_throttle_excessive_traffic() {
+    let grants: Vec<GrantId> = (40..46).map(test_grant_id).collect();
+    let service = service_holding(&grants);
+    let definitions: Vec<_> = grants
+        .iter()
+        .enumerate()
+        .map(|(index, grant)| installed_under(&service, test_wf_id(40 + index as u8), *grant))
+        .collect();
+    // Five grants, each within its own allowance, fill the host's.
+    for (definition, _) in definitions.iter().zip(0..5) {
+        for index in 0..120 {
+            service
+                .submit_run(&run_of(definition, &format!("evt-{index}")), 1_000)
+                .await
+                .unwrap_or_else(|error| panic!("run {index}: {error}"));
+        }
+    }
+    let refused = service
+        .submit_run(&run_of(&definitions[5], "evt-sixth-grant"), 1_000)
+        .await
+        .expect_err("the host's allowance is spent");
+    assert!(refused.to_string().contains("host-wide"), "{refused}");
 }
 
 /// A breached per-workflow limit pauses the revision and leaves one attention record.
@@ -483,7 +486,7 @@ async fn a_read_that_names_a_chain_shows_only_its_alerts() {
         assert!(
             service
                 .store()
-                .reserve_budget_action(run.causal_root_id, 0, 1_000 + 3_600_001)
+                .reserve_budget_action(run.causal_root_id, 0, 0, 1_000 + 3_600_001)
                 .is_err()
         );
         roots.push(run.causal_root_id);
@@ -502,4 +505,82 @@ async fn a_read_that_names_a_chain_shows_only_its_alerts() {
     assert_eq!(read.alerts.len(), 1, "{:?}", read.alerts);
     assert_eq!(read.alerts[0].kind, WorkflowAlertKind::CausalLimit);
     assert_eq!(read.alerts[0].causal_root_id.0, Some(roots[0]));
+}
+
+/// The admission rates are the journal's, not the running service's: a minute's allowance spent
+/// before a restart is still spent after it, so reopening the service is not a way past the rate.
+#[tokio::test]
+async fn the_admission_rates_survive_a_restart_of_the_service() {
+    use std::sync::Arc;
+
+    use kr_automation::{
+        AutomationService, ManualClock, MockActionRunner, create_workflow_definition,
+    };
+    use kr_protocol::automation::{WorkflowEnableParams, WorkflowInstallParams, WorkflowRunParams};
+    use kr_protocol::scalars::Nullable;
+
+    let journal = tempfile::tempdir().expect("a journal directory");
+    let workflow_id = test_wf_id(20);
+    let definition = create_workflow_definition(
+        workflow_id,
+        1,
+        "rate-limited across a restart",
+        test_grant_id(20),
+        vec![common::node("step", WorkflowActionKind::RunTests)],
+        vec![],
+    );
+    let open = || {
+        AutomationService::open(
+            journal.path(),
+            common::host(
+                Arc::new(MockActionRunner::new()),
+                authority(),
+                Arc::new(ManualClock::new(1_000)),
+            ),
+        )
+        .expect("the journal opens")
+    };
+    let params = |event: &str| WorkflowRunParams {
+        workflow_id,
+        revision: definition.revision,
+        event_id: event.to_owned(),
+        event_type: "manual".to_owned(),
+        event_payload: Nullable::null(),
+    };
+    {
+        let service = open();
+        service
+            .submit_install(
+                &WorkflowInstallParams {
+                    workflow_id,
+                    revision: definition.revision,
+                    definition: definition.clone(),
+                    grant_reference: definition.grant_reference,
+                },
+                1_000,
+            )
+            .expect("installs");
+        service
+            .submit_enable(
+                &WorkflowEnableParams {
+                    workflow_id,
+                    revision: definition.revision,
+                },
+                1_000,
+            )
+            .expect("enables");
+        for index in 0..120 {
+            service
+                .submit_run(&params(&format!("evt-{index}")), 1_000)
+                .await
+                .unwrap_or_else(|error| panic!("run {index} is admitted: {error}"));
+        }
+    }
+
+    let service = open();
+    let refused = service
+        .submit_run(&params("evt-after-restart"), 1_000)
+        .await
+        .expect_err("the minute's allowance was spent before the restart");
+    assert!(refused.to_string().contains("rate limit"), "{refused}");
 }

@@ -7382,6 +7382,10 @@ export interface CausalBudgetSummary {
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
+  managed_spend: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
   max_actions: string
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
@@ -7391,6 +7395,10 @@ export interface CausalBudgetSummary {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_lifetime_ms: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  max_managed_spend: string
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */

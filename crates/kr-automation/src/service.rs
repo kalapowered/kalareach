@@ -31,7 +31,7 @@
 //!   still admits them, go on.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use kr_attention::event::{EventCursor, EventKind, Origin, SourceEvent};
 use kr_attention::{Attention, HostReading, Outcome};
@@ -50,7 +50,6 @@ use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 
 use crate::Host;
-use crate::admission::AdmissionController;
 use crate::authority::{self, AuthoritySource};
 use crate::causal::CausalContext;
 use crate::definition::validate_definition;
@@ -84,37 +83,34 @@ fn attention_subject(subject: AttentionSubject) -> PluginId {
         .unwrap_or_else(|_| PluginId::new("automation").expect("a static identifier"))
 }
 
-/// Holds one run's place in the per-workflow concurrency allowance until the run ends.
+/// A run the journal has recorded as running, ready for its first node or its next one.
 ///
-/// The release happens on drop, so a run that returns early, fails, or has its future cancelled
-/// gives its place back. A permit that only released on the success path would leak the
-/// allowance a few cancellations at a time until the workflow could not run at all.
-#[derive(Debug)]
-struct RunPermit {
-    admission: Arc<Mutex<AdmissionController>>,
-    workflow_id: WorkflowId,
-}
-
-impl Drop for RunPermit {
-    fn drop(&mut self) {
-        self.admission
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .release_run(self.workflow_id);
-    }
-}
-
-/// A run the journal has admitted and recorded, ready for its first node.
-///
-/// It holds the run's place in its workflow's concurrency allowance until it is executed and
-/// dropped, so a host that admits a run and hands it to a task of its own keeps the allowance
-/// honest.
+/// Its place among the four its workflow runs at once is the journal's record that it is
+/// running, which the run leaves only when it settles, so a host that hands it to a task of its
+/// own keeps the count honest however that task ends.
 #[derive(Debug)]
 pub struct StartedRun {
     run_id: WorkflowRunId,
     definition: WorkflowDefinition,
     causal: CausalContext,
-    _permit: RunPermit,
+}
+
+/// What admitting one trigger came to: a run that starts now, or one that waits for a slot.
+#[derive(Debug)]
+enum Admitted {
+    /// A slot was free.
+    Started(Box<StartedRun>),
+    /// Every slot was taken, and the run waits as pending.
+    Queued(WorkflowRunResult),
+}
+
+impl Admitted {
+    const fn run_id(&self) -> WorkflowRunId {
+        match self {
+            Self::Started(started) => started.run_id,
+            Self::Queued(queued) => queued.run_id,
+        }
+    }
 }
 
 impl StartedRun {
@@ -177,7 +173,7 @@ pub enum Answer {
 /// The central automation service of an environment.
 pub struct AutomationService {
     store: Arc<WorkflowStore>,
-    admission: Arc<Mutex<AdmissionController>>,
+    ceilings: Arc<dyn crate::HostCeilings>,
     authority: Arc<dyn AuthoritySource>,
     environment_id: EnvironmentId,
     engine: Arc<WorkflowEngine>,
@@ -220,12 +216,13 @@ impl AutomationService {
     fn on_store(store: Arc<WorkflowStore>, host: Host) -> Self {
         let environment_id = host.environment_id;
         let authority = Arc::clone(&host.authority);
+        let ceilings = Arc::clone(&host.ceilings);
         let engine = Arc::new(WorkflowEngine::new(Arc::clone(&store), host));
         let quiescence = Arc::new(QuiescenceManager::new());
 
         Self {
             store,
-            admission: Arc::new(Mutex::new(AdmissionController::new())),
+            ceilings,
             authority,
             environment_id,
             engine,
@@ -425,11 +422,13 @@ impl AutomationService {
     /// The run is an external trigger: the host mints its causal root, and nothing in the
     /// request can place it inside a chain. It is admitted in one journal transaction: the record
     /// of an earlier submission of the same action is looked for, the trigger is deduplicated by
-    /// `(workflow_id, definition_revision, event_id)` before anything is spent, per-workflow
-    /// concurrency and the per-grant and host-wide rates are applied, and the trigger, the run,
-    /// its node receipts, the chain's reservation and the record of the action commit together.
-    /// The run is therefore durable before its first node dispatches, and a repeat of the action
-    /// is answered with where that run stands now rather than starting a second one.
+    /// `(workflow_id, definition_revision, event_id)` before anything is spent, the host-wide and
+    /// per-grant rates and the workflow's own limits are applied, and the trigger, the run, its
+    /// node receipts, the chain's reservation and the record of the action commit together. The
+    /// run is therefore durable before its first node dispatches, and a repeat of the action is
+    /// answered with where that run stands now rather than starting a second one. A run admitted
+    /// while its workflow already runs four waits as pending, and the answer says so; the host's
+    /// dispatcher starts it when a slot frees.
     ///
     /// # Errors
     ///
@@ -442,16 +441,19 @@ impl AutomationService {
         now_ms: u64,
     ) -> Result<WorkflowRunResult> {
         let acted = self.store.act(submitted, now_ms, |journal| {
-            let started = self.admit_run(journal, params, submitted, now_ms)?;
+            let admitted = self.admit_run(journal, params, submitted, now_ms)?;
             Ok((
                 ActionRecord::Started {
-                    run_id: started.run_id,
+                    run_id: admitted.run_id(),
                 },
-                started,
+                admitted,
             ))
         })?;
         match acted {
-            Acted::Performed(started) => self.execute(started).await,
+            Acted::Performed(Admitted::Started(started)) => self.execute(*started).await,
+            // Every slot was taken, so the run waits as pending and the host's dispatcher starts
+            // it when one frees. The caller is told so rather than kept waiting for it.
+            Acted::Performed(Admitted::Queued(queued)) => Ok(queued),
             Acted::Answered(record) => self.ran(record),
         }
     }
@@ -485,7 +487,7 @@ impl AutomationService {
         params: &WorkflowRunParams,
         submitted: &Submitted<'_>,
         now_ms: u64,
-    ) -> Result<StartedRun> {
+    ) -> Result<Admitted> {
         let installed = visible(journal, params.workflow_id, params.revision, submitted)?;
         if !installed.enabled {
             return Err(AutomationError::WorkflowDisabled(params.workflow_id));
@@ -527,7 +529,7 @@ impl AutomationService {
         event_id: &str,
         causal: CausalContext,
         now_ms: u64,
-    ) -> Result<StartedRun> {
+    ) -> Result<Admitted> {
         let grant = self.authority.grant(definition.grant_reference, now_ms)?;
         validate_definition(definition, &grant)?;
         authority::check_definition(&grant, definition, self.environment_id)?;
@@ -548,41 +550,53 @@ impl AutomationService {
         // run spends rather than only before the first thing it writes.
         journal.admit()?;
 
-        // Per-workflow concurrency, the per-grant rate and the host-wide rate, in that order.
-        // A breach pauses the revision and records the attention item that pause owes, so the
-        // workflow stops rather than being refused one request at a time.
-        let admitted = self
-            .admission
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .admit_run(
-                definition.workflow_id,
-                definition.grant_reference,
-                now_ms,
-                None,
-                None,
-            );
-        if let Err(breach) = admitted {
-            journal.pause_workflow_on_breach(
-                definition.workflow_id,
-                definition.revision.get(),
-                &breach.to_string(),
-                now_ms,
-            )?;
-            return Err(breach);
-        }
-        let permit = RunPermit {
-            admission: Arc::clone(&self.admission),
-            workflow_id: definition.workflow_id,
+        // The host-wide rate, the grant's rate and the workflow's own limits, all read from the
+        // journal inside this transaction. A limit exceeded pauses the revision and records the
+        // attention item that pause owes, so the workflow stops rather than being refused one
+        // request at a time.
+        let placement = match crate::admission::place(
+            journal,
+            definition.workflow_id,
+            definition.grant_reference,
+            now_ms,
+        ) {
+            Ok(placement) => placement,
+            Err(breach) if breach.is_decided() => {
+                journal.pause_workflow_on_breach(
+                    definition.workflow_id,
+                    definition.revision.get(),
+                    &breach.to_string(),
+                    now_ms,
+                )?;
+                return Err(breach);
+            }
+            Err(error) => return Err(error),
         };
 
         let run_id = WorkflowRunId::new(crate::new_uuid());
-        journal.commit_trigger_and_run(run_id, definition, event_id, &causal, now_ms)?;
-        Ok(StartedRun {
-            run_id,
-            definition: definition.clone(),
-            causal,
-            _permit: permit,
+        // What a new chain inherits from this host is read now, when its root is admitted, and
+        // recorded with its budget. A descendant is admitted against that record.
+        let inherited = crate::budget::Inherited {
+            sessions: self.ceilings.sessions(),
+            managed_spend: self.ceilings.managed_spend(),
+        };
+        journal.commit_trigger_and_run(
+            run_id, definition, event_id, &causal, now_ms, placement, inherited,
+        )?;
+        Ok(match placement {
+            crate::admission::Placement::Start => Admitted::Started(Box::new(StartedRun {
+                run_id,
+                definition: definition.clone(),
+                causal,
+            })),
+            crate::admission::Placement::Queue => Admitted::Queued(WorkflowRunResult {
+                run_id,
+                workflow_id: definition.workflow_id,
+                revision: definition.revision,
+                causal_root_id: causal.root_id,
+                depth: U64::new(causal.depth),
+                status: kr_protocol::automation::WorkflowRunStatus::Pending,
+            }),
         })
     }
 
@@ -632,10 +646,12 @@ impl AutomationService {
         }
     }
 
-    /// Admits and executes the runs pending triggers have started, one pass.
+    /// Admits and executes the runs pending triggers have started, and the queued runs a free
+    /// slot lets start, one pass.
     ///
-    /// A host that runs each started run on a task of its own uses [`Self::admit_triggers`] and
-    /// [`Self::execute`] instead. This is the same pass, executing each run in turn.
+    /// A host that runs each started run on a task of its own uses [`Self::admit_triggers`],
+    /// [`Self::start_queued`] and [`Self::execute`] instead. This is the same pass, executing each
+    /// run in turn.
     ///
     /// # Errors
     ///
@@ -643,15 +659,56 @@ impl AutomationService {
     /// before it stopped.
     pub async fn dispatch_triggers(&self, now_ms: u64) -> Result<Vec<TriggerDecision>> {
         let admitted = self.admit_triggers(now_ms);
-        for started in admitted.started {
+        let queued = self.start_queued(now_ms);
+        for started in admitted.started.into_iter().chain(queued.started) {
             // A run that stopped on a refusal has recorded its pause; the decision already says
             // the run was started.
             let _ = self.execute(started).await;
         }
-        match admitted.stopped {
+        match admitted.stopped.or(queued.stopped) {
             Some(error) => Err(error),
             None => Ok(admitted.decisions),
         }
+    }
+
+    /// Starts the runs that wait as pending, as far as each workflow's four slots allow.
+    ///
+    /// Each run is taken oldest first, and the count of running runs, the choice and the move to
+    /// running are one transaction, so a run is started once and a slot is never given twice. A
+    /// revision that is paused or disabled starts nothing until it is enabled again. The host
+    /// asks this whenever a run stops, which is when a slot frees.
+    #[must_use]
+    pub fn start_queued(&self, now_ms: u64) -> AdmittedTriggers {
+        let mut started = AdmittedTriggers::default();
+        let workflows = match self.store.workflows_with_queued_runs() {
+            Ok(workflows) => workflows,
+            Err(error) => {
+                started.stopped = Some(error);
+                return started;
+            }
+        };
+        for workflow_id in workflows {
+            loop {
+                let claimed = self.store.claim_queued_run(
+                    workflow_id,
+                    kr_protocol::automation::DEFAULT_WORKFLOW_CONCURRENT_RUNS,
+                    now_ms,
+                );
+                match claimed {
+                    Ok(Some((run, definition))) => started.started.push(StartedRun {
+                        run_id: run.run_id,
+                        definition,
+                        causal: CausalContext::of_run(&run),
+                    }),
+                    Ok(None) => break,
+                    Err(error) => {
+                        started.stopped = Some(error);
+                        return started;
+                    }
+                }
+            }
+        }
+        started
     }
 
     /// Decides what one settled-node event triggers.
@@ -692,11 +749,13 @@ impl AutomationService {
             let outcome = descendant_context(journal, &definition, &parent, node_id)
                 .and_then(|causal| self.admit(journal, &definition, &trigger_id, causal, now_ms));
             let outcome = match outcome {
-                Ok(run) => {
+                Ok(Admitted::Started(run)) => {
                     let run_id = run.run_id;
-                    started.push(run);
+                    started.push(*run);
                     Ok(run_id)
                 }
+                // Waits as pending, for [`Self::start_queued`] to start when a slot frees.
+                Ok(Admitted::Queued(queued)) => Ok(queued.run_id),
                 Err(error) if error.is_decided() => Err(error),
                 // A grant store that could not be read, or a journal that could not be written,
                 // says nothing about this trigger. The event stays unread and is decided again.
@@ -712,21 +771,22 @@ impl AutomationService {
         Ok((decisions, started))
     }
 
-    /// Picks up the runs a stopped host left unfinished.
+    /// Picks up the runs a stopped host left running.
     ///
     /// A node that was running when the host stopped may have been dispatched, and nothing this
     /// host holds says whether its action happened, so it is settled as unknown: its dependants
     /// pause for review rather than running on a guess, and no edge fires from it. Every other
     /// node is as the journal left it, and executing the returned runs dispatches exactly the
     /// nodes that were never dispatched and whose predecessors are authoritative, each only after
-    /// its grant is read again.
+    /// its grant is read again and only before the run's deadline. A run that was waiting for a
+    /// slot waits on, for [`Self::start_queued`].
     ///
     /// # Errors
     ///
     /// Returns a storage error when the journal cannot be read or written.
     pub fn recover(&self, now_ms: u64) -> Result<Vec<StartedRun>> {
         let mut resumed = Vec::new();
-        for run in self.store.unfinished_runs()? {
+        for run in self.store.running_runs()? {
             self.store.settle_interrupted_nodes(
                 run.run_id,
                 "this host stopped while the action was dispatched, so its outcome is not known",
@@ -735,18 +795,10 @@ impl AutomationService {
             let Some(installed) = self.store.get_definition(run.workflow_id, run.revision)? else {
                 continue;
             };
-            self.admission
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .resume_run(run.workflow_id);
             resumed.push(StartedRun {
                 run_id: run.run_id,
                 definition: installed.definition,
                 causal: CausalContext::of_run(&run),
-                _permit: RunPermit {
-                    admission: Arc::clone(&self.admission),
-                    workflow_id: run.workflow_id,
-                },
             });
         }
         Ok(resumed)

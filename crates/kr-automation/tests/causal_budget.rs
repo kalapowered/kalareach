@@ -326,7 +326,7 @@ async fn run_events_between_attention_records_leave_no_history_gap() {
     assert!(
         service
             .store()
-            .reserve_budget_action(first.causal_root_id, 0, 1_000 + 3_600_001)
+            .reserve_budget_action(first.causal_root_id, 0, 0, 1_000 + 3_600_001)
             .is_err(),
         "the chain is out of lifetime"
     );
@@ -352,7 +352,7 @@ async fn run_events_between_attention_records_leave_no_history_gap() {
     assert!(
         service
             .store()
-            .reserve_budget_action(second.causal_root_id, 0, 3_700_000 + 3_600_001)
+            .reserve_budget_action(second.causal_root_id, 0, 0, 3_700_000 + 3_600_001)
             .is_err(),
         "the chain is out of lifetime"
     );
@@ -602,7 +602,7 @@ async fn rearm_is_authorised_and_refuses_late_descendants() {
     );
     assert_eq!(
         rearmed.max_runs,
-        CausalBudget::new(root, 0).max_runs,
+        CausalBudget::new(root, 0, kr_automation::Inherited::DEFAULTS).max_runs,
         "nobody had to raise a ceiling to make the chain usable again"
     );
 
@@ -630,7 +630,7 @@ fn concurrent_action_reservations_do_not_oversubscribe() {
     let store = Arc::new(WorkflowStore::open(journal.path()).expect("the journal opens"));
     let root = test_root_id(10);
 
-    let mut budget = CausalBudget::new(root, 1_000);
+    let mut budget = CausalBudget::new(root, 1_000, kr_automation::Inherited::DEFAULTS);
     budget.max_actions = 20;
     store.save_budget(&budget).expect("the budget saves");
 
@@ -639,7 +639,7 @@ fn concurrent_action_reservations_do_not_oversubscribe() {
             let store = Arc::clone(&store);
             std::thread::spawn(move || {
                 (0..10)
-                    .filter(|_| store.reserve_budget_action(root, 0, 1_000).is_ok())
+                    .filter(|_| store.reserve_budget_action(root, 0, 0, 1_000).is_ok())
                     .count()
             })
         })
@@ -664,7 +664,7 @@ fn concurrent_action_reservations_do_not_oversubscribe() {
 /// The budget itself, not a run, is what the ceilings live on.
 #[test]
 fn budget_enforces_each_default_ceiling() {
-    let mut budget = CausalBudget::new(test_root_id(1), 1_000);
+    let mut budget = CausalBudget::new(test_root_id(1), 1_000, kr_automation::Inherited::DEFAULTS);
     budget.max_depth = 3;
     budget.reserve_run(1, 1_000).unwrap();
     budget.reserve_run(2, 1_010).unwrap();
@@ -681,14 +681,14 @@ fn budget_enforces_each_default_ceiling() {
         "an exhausted chain refuses even a run it would otherwise have room for"
     );
 
-    let mut budget = CausalBudget::new(test_root_id(2), 1_000);
+    let mut budget = CausalBudget::new(test_root_id(2), 1_000, kr_automation::Inherited::DEFAULTS);
     budget.max_actions = 3;
     for at in [1_001, 1_002, 1_003] {
-        budget.reserve_action(at).unwrap();
+        budget.reserve_action(0, at).unwrap();
     }
     assert!(
         budget
-            .reserve_action(1_004)
+            .reserve_action(0, 1_004)
             .unwrap_err()
             .to_string()
             .contains("actions")
@@ -697,7 +697,7 @@ fn budget_enforces_each_default_ceiling() {
     assert!(summary.exhausted);
     assert_eq!(summary.total_actions.get(), 3);
 
-    let mut budget = CausalBudget::new(test_root_id(3), 1_000);
+    let mut budget = CausalBudget::new(test_root_id(3), 1_000, kr_automation::Inherited::DEFAULTS);
     budget.max_runs = 2;
     budget.reserve_run(1, 1_001).unwrap();
     budget.reserve_run(2, 1_002).unwrap();
@@ -709,7 +709,7 @@ fn budget_enforces_each_default_ceiling() {
             .contains("runs")
     );
 
-    let mut budget = CausalBudget::new(test_root_id(4), 1_000);
+    let mut budget = CausalBudget::new(test_root_id(4), 1_000, kr_automation::Inherited::DEFAULTS);
     budget.max_lifetime_ms = 5_000;
     budget.reserve_run(1, 2_000).unwrap();
     assert!(
@@ -729,8 +729,11 @@ fn budget_persists_across_store_reopen() {
 
     {
         let store = WorkflowStore::open(journal.path()).unwrap();
-        store.reserve_budget_action(root, 0, 1_010).unwrap();
-        store.reserve_budget_action(root, 0, 1_020).unwrap();
+        // A chain's budget is written with its root; a reservation reaches no chain that has none.
+        assert!(store.reserve_budget_action(root, 0, 0, 1_000).is_err());
+        store.get_or_create_budget(root, 1_000).unwrap();
+        store.reserve_budget_action(root, 0, 0, 1_010).unwrap();
+        store.reserve_budget_action(root, 0, 0, 1_020).unwrap();
     }
 
     {

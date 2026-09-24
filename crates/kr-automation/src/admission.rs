@@ -1,178 +1,84 @@
-//! Host and per-grant admission rates and per-workflow concurrency control.
+//! Per-workflow concurrency and pending limits, and host-wide and per-grant admission rates.
 //!
-//! Section 17 ¶8 and Section 25 specify:
-//! - Per-workflow defaults: 4 concurrent runs, 100 pending runs, 30-minute run deadline,
-//!   10-minute maximum action wait.
-//! - A breached limit pauses the workflow and emits an attention event.
-//! - Per-host and per-grant admission rates apply beyond per-workflow concurrency.
-//! - Unauthenticated external callbacks are treated as new external triggers under host-wide limits.
+//! Section 17 ¶8 and section 25 specify:
+//! - Per-workflow defaults: 4 concurrent runs, 100 pending runs, a 30-minute run deadline and a
+//!   10-minute maximum action wait. Exceeding a limit pauses the workflow and emits an attention
+//!   event.
+//! - Per-host and per-grant admission rates apply in addition to per-workflow concurrency.
+//! - Unauthenticated external callbacks are new external triggers under host-wide limits.
+//! - Limits survive restart.
+//!
+//! Every count here is the workflow journal's, read inside the transaction that records the run it
+//! decides. A restart therefore finds the rates as they stood and the queue as it was left, and two
+//! admissions that arrive at once are serialised by that transaction rather than both reading the
+//! last free place.
 
-use std::collections::HashMap;
-
-use kr_protocol::automation::{DEFAULT_WORKFLOW_CONCURRENT_RUNS, DEFAULT_WORKFLOW_PENDING_RUNS};
+use kr_protocol::automation::{
+    DEFAULT_WORKFLOW_CONCURRENT_RUNS, DEFAULT_WORKFLOW_PENDING_RUNS, WorkflowRunStatus,
+};
 use kr_protocol::ids::{GrantId, WorkflowId};
 
 use crate::error::{AutomationError, Result};
+use crate::store::Journal;
 
-/// Default host-wide maximum dispatches per minute.
-pub const DEFAULT_HOST_MAX_DISPATCHES_PER_MINUTE: u64 = 600;
-/// Default per-grant maximum dispatches per minute.
-pub const DEFAULT_GRANT_MAX_DISPATCHES_PER_MINUTE: u64 = 120;
+/// The most runs this host admits in one window, whatever their grant.
+pub const DEFAULT_HOST_MAX_ADMISSIONS_PER_MINUTE: u64 = 600;
+/// The most runs this host admits under one grant in one window.
+pub const DEFAULT_GRANT_MAX_ADMISSIONS_PER_MINUTE: u64 = 120;
+/// The window both rates are counted over, in milliseconds.
+pub const ADMISSION_WINDOW_MS: u64 = 60_000;
 
-/// Manages admission rates and concurrency limits.
-#[derive(Debug)]
-pub struct AdmissionController {
-    /// Active runs currently executing per workflow.
-    pub active_runs: HashMap<WorkflowId, u64>,
-    /// Pending runs currently queued per workflow.
-    pub pending_runs: HashMap<WorkflowId, u64>,
-    /// Timestamps of recent host-wide dispatches for sliding window rate limiting.
-    pub host_dispatches: Vec<u64>,
-    /// Timestamps of recent dispatches per grant.
-    pub grant_dispatches: HashMap<GrantId, Vec<u64>>,
-    /// Configured host-wide maximum dispatches per minute.
-    pub host_rate_limit: u64,
-    /// Configured per-grant maximum dispatches per minute.
-    pub grant_rate_limit: u64,
+/// Where an admitted run goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    /// A slot is free: the run is recorded running and executes now.
+    Start,
+    /// Every slot is taken: the run is recorded pending and starts when one frees.
+    Queue,
 }
 
-impl Default for AdmissionController {
-    fn default() -> Self {
-        Self {
-            active_runs: HashMap::new(),
-            pending_runs: HashMap::new(),
-            host_dispatches: Vec::new(),
-            grant_dispatches: HashMap::new(),
-            host_rate_limit: DEFAULT_HOST_MAX_DISPATCHES_PER_MINUTE,
-            grant_rate_limit: DEFAULT_GRANT_MAX_DISPATCHES_PER_MINUTE,
-        }
+/// Decides one run's admission against the journal, inside the transaction that will record it.
+///
+/// The host-wide rate first, then the grant's, then the workflow's own limits: a run starts when
+/// fewer than four of its workflow's runs are running, waits as pending when fewer than a hundred
+/// are waiting, and is refused otherwise. A refusal here is a limit exceeded; the caller pauses
+/// the workflow and records the attention item that pause owes.
+///
+/// # Errors
+///
+/// Returns [`AutomationError::RateLimitExceeded`] for a rate the window is full of,
+/// [`AutomationError::PendingLimitExceeded`] for a full queue, and a storage error when the
+/// journal cannot be read.
+pub fn place(
+    journal: &Journal<'_>,
+    workflow_id: WorkflowId,
+    grant: GrantId,
+    now_ms: u64,
+) -> Result<Placement> {
+    let since = now_ms.saturating_sub(ADMISSION_WINDOW_MS);
+    if journal.admissions_since(since, None)? >= DEFAULT_HOST_MAX_ADMISSIONS_PER_MINUTE {
+        return Err(AutomationError::RateLimitExceeded {
+            reason: format!(
+                "host-wide rate limit of {DEFAULT_HOST_MAX_ADMISSIONS_PER_MINUTE}/min exceeded"
+            ),
+        });
     }
-}
-
-impl AdmissionController {
-    /// Creates a new admission controller.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    if journal.admissions_since(since, Some(grant))? >= DEFAULT_GRANT_MAX_ADMISSIONS_PER_MINUTE {
+        return Err(AutomationError::RateLimitExceeded {
+            reason: format!(
+                "grant {grant} rate limit of {DEFAULT_GRANT_MAX_ADMISSIONS_PER_MINUTE}/min exceeded"
+            ),
+        });
     }
-
-    /// Checks host-wide and per-grant admission rates and per-workflow concurrency.
-    ///
-    /// If concurrency is breached, returns an error and indicates that the workflow must be paused.
-    pub fn admit_run(
-        &mut self,
-        workflow_id: WorkflowId,
-        grant_id: GrantId,
-        now_ms: u64,
-        max_concurrent: Option<u64>,
-        max_pending: Option<u64>,
-    ) -> Result<()> {
-        let max_conc = max_concurrent.unwrap_or(DEFAULT_WORKFLOW_CONCURRENT_RUNS);
-        let max_pend = max_pending.unwrap_or(DEFAULT_WORKFLOW_PENDING_RUNS);
-
-        // Check per-workflow concurrency
-        let current_active = self.active_runs.get(&workflow_id).copied().unwrap_or(0);
-        if current_active >= max_conc {
-            return Err(AutomationError::ConcurrencyLimitExceeded {
-                workflow_id,
-                limit: max_conc,
-            });
-        }
-
-        let current_pending = self.pending_runs.get(&workflow_id).copied().unwrap_or(0);
-        if current_pending >= max_pend {
-            return Err(AutomationError::ConcurrencyLimitExceeded {
-                workflow_id,
-                limit: max_pend,
-            });
-        }
-
-        // Check host-wide rate limit (1 minute window)
-        let one_minute_ago = now_ms.saturating_sub(60_000);
-        self.host_dispatches.retain(|&ts| ts >= one_minute_ago);
-        if self.host_dispatches.len() as u64 >= self.host_rate_limit {
-            return Err(AutomationError::RateLimitExceeded {
-                reason: format!(
-                    "host-wide rate limit of {}/min exceeded",
-                    self.host_rate_limit
-                ),
-            });
-        }
-
-        // Check per-grant rate limit (1 minute window)
-        let grant_history = self.grant_dispatches.entry(grant_id).or_default();
-        grant_history.retain(|&ts| ts >= one_minute_ago);
-        if grant_history.len() as u64 >= self.grant_rate_limit {
-            return Err(AutomationError::RateLimitExceeded {
-                reason: format!(
-                    "grant {} rate limit of {}/min exceeded",
-                    grant_id, self.grant_rate_limit
-                ),
-            });
-        }
-
-        // Record admission
-        self.host_dispatches.push(now_ms);
-        self.grant_dispatches
-            .entry(grant_id)
-            .or_default()
-            .push(now_ms);
-        *self.active_runs.entry(workflow_id).or_default() += 1;
-
-        Ok(())
+    if journal.runs_in(workflow_id, WorkflowRunStatus::Running)? < DEFAULT_WORKFLOW_CONCURRENT_RUNS
+    {
+        return Ok(Placement::Start);
     }
-
-    /// Holds a place for a run the journal already admitted, which a restart is resuming.
-    ///
-    /// The run was admitted under the rates in force when it started, so nothing is checked or
-    /// spent again: it only counts against the workflow's concurrency while it runs.
-    pub fn resume_run(&mut self, workflow_id: WorkflowId) {
-        *self.active_runs.entry(workflow_id).or_default() += 1;
+    if journal.runs_in(workflow_id, WorkflowRunStatus::Pending)? < DEFAULT_WORKFLOW_PENDING_RUNS {
+        return Ok(Placement::Queue);
     }
-
-    /// Signals that a run has finished, releasing concurrency permits.
-    pub fn release_run(&mut self, workflow_id: WorkflowId) {
-        if let Some(active) = self.active_runs.get_mut(&workflow_id) {
-            *active = active.saturating_sub(1);
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use kr_protocol::scalars::Uuid;
-
-    fn test_workflow_id(v: u8) -> WorkflowId {
-        WorkflowId::new(Uuid::from_bytes([v; 16]))
-    }
-
-    fn test_grant_id(v: u8) -> GrantId {
-        GrantId::new(Uuid::from_bytes([v; 16]))
-    }
-
-    #[test]
-    fn enforces_concurrency_limit() {
-        let mut admission = AdmissionController::new();
-        let wf = test_workflow_id(1);
-        let grant = test_grant_id(1);
-
-        // Admit 4 runs (default max)
-        for _ in 0..4 {
-            assert!(admission.admit_run(wf, grant, 1000, None, None).is_ok());
-        }
-
-        // 5th run is rejected
-        let err = admission
-            .admit_run(wf, grant, 1000, None, None)
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            AutomationError::ConcurrencyLimitExceeded { limit: 4, .. }
-        ));
-
-        // Release one
-        admission.release_run(wf);
-        assert!(admission.admit_run(wf, grant, 1000, None, None).is_ok());
-    }
+    Err(AutomationError::PendingLimitExceeded {
+        workflow_id,
+        limit: DEFAULT_WORKFLOW_PENDING_RUNS,
+    })
 }

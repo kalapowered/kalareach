@@ -58,12 +58,38 @@ pub struct CausalBudget {
     pub attention_emitted: bool,
     /// Timestamp of most recent rearm, if rearmed.
     pub rearmed_at_ms: Option<u64>,
+    /// Managed allowance the chain's actions have spent.
+    pub managed_spend: u64,
+    /// The managed allowance the chain inherited from its host when its root was admitted.
+    pub max_managed_spend: u64,
+}
+
+/// What a new chain inherits from its host, recorded with its root.
+///
+/// Recorded once, when the root run is admitted. A descendant is admitted against the root's
+/// record, so a ceiling the host raises later widens no chain already running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Inherited {
+    /// The most sessions the host admitted when the chain began.
+    pub sessions: u64,
+    /// The managed allowance the chain may spend.
+    pub managed_spend: u64,
+}
+
+impl Inherited {
+    /// What a chain inherits from a host that narrows none of section 25's defaults and gives no
+    /// managed allowance.
+    pub const DEFAULTS: Self = Self {
+        sessions: u64::MAX,
+        managed_spend: 0,
+    };
 }
 
 impl CausalBudget {
-    /// Creates a new causal budget with standard default limits.
+    /// Creates a new causal budget with section 25's defaults, narrowed by what the chain inherits
+    /// from its host.
     #[must_use]
-    pub fn new(causal_root_id: CausalRootId, started_at_ms: u64) -> Self {
+    pub fn new(causal_root_id: CausalRootId, started_at_ms: u64, inherited: Inherited) -> Self {
         Self {
             causal_root_id,
             generation: 0,
@@ -74,13 +100,15 @@ impl CausalBudget {
             total_actions: 0,
             max_actions: DEFAULT_CAUSAL_ACTIONS_LIMIT,
             created_sessions: 0,
-            max_sessions: DEFAULT_CAUSAL_SESSIONS_LIMIT,
+            max_sessions: DEFAULT_CAUSAL_SESSIONS_LIMIT.min(inherited.sessions),
             started_at_ms,
             max_lifetime_ms: DEFAULT_CAUSAL_LIFETIME_MS,
             paused: false,
             exhausted: false,
             attention_emitted: false,
             rearmed_at_ms: None,
+            managed_spend: 0,
+            max_managed_spend: inherited.managed_spend,
         }
     }
 
@@ -127,8 +155,9 @@ impl CausalBudget {
         Ok(())
     }
 
-    /// Checks whether another action can be admitted, and reserves it.
-    pub fn reserve_action(&mut self, now_ms: u64) -> Result<()> {
+    /// Checks whether another action, spending `managed_spend` of the chain's managed allowance,
+    /// can be admitted, and reserves both.
+    pub fn reserve_action(&mut self, managed_spend: u64, now_ms: u64) -> Result<()> {
         self.check_open()?;
         self.check_lifetime(now_ms)?;
 
@@ -139,8 +168,16 @@ impl CausalBudget {
                 self.max_actions
             )));
         }
+        let spent = self.managed_spend.saturating_add(managed_spend);
+        if spent > self.max_managed_spend {
+            return Err(self.exceeded(format!(
+                "managed spend {spent} exceeds the {} the chain inherited",
+                self.max_managed_spend
+            )));
+        }
 
         self.total_actions = self.total_actions.saturating_add(1);
+        self.managed_spend = spent;
         Ok(())
     }
 
@@ -211,14 +248,15 @@ impl CausalBudget {
     /// Rearms the budget under an authorised administrative request.
     ///
     /// The chain gets a fresh generation and fresh counters, so the same ceilings are usable
-    /// again without anybody raising them. Runs from the previous generation keep their old
-    /// number, and [`Self::check_generation`] refuses them: a replayed or late event cannot
-    /// spend the new budget, and it cannot rearm one of its own.
+    /// again without anybody raising them, the ones it inherited among them. Runs from the previous
+    /// generation keep their old number, and [`Self::check_generation`] refuses them: a replayed
+    /// or late event cannot spend the new budget, and it cannot rearm one of its own.
     pub fn rearm(&mut self, now_ms: u64) {
         self.generation = self.generation.saturating_add(1);
         self.total_runs = 0;
         self.total_actions = 0;
         self.created_sessions = 0;
+        self.managed_spend = 0;
         self.depth = 0;
         self.paused = false;
         self.exhausted = false;
@@ -243,6 +281,8 @@ impl CausalBudget {
             max_sessions: U64::new(self.max_sessions),
             elapsed_lifetime_ms: U64::new(elapsed),
             max_lifetime_ms: U64::new(self.max_lifetime_ms),
+            managed_spend: U64::new(self.managed_spend),
+            max_managed_spend: U64::new(self.max_managed_spend),
             paused: self.paused,
             exhausted: self.exhausted,
         }
@@ -258,10 +298,62 @@ mod tests {
         CausalRootId::new(Uuid::from_bytes([42; 16]))
     }
 
+    /// A host that admits more sessions than a chain may create, and gives no managed allowance.
+    const HOST: Inherited = Inherited {
+        sessions: 128,
+        managed_spend: 0,
+    };
+
+    /// A chain creates no more sessions than its host admitted when it began, and spends no more
+    /// managed allowance than it inherited.
+    #[test]
+    fn a_chain_is_held_to_what_it_inherited() {
+        let mut narrow = CausalBudget::new(
+            test_root_id(),
+            1_000,
+            Inherited {
+                sessions: 2,
+                managed_spend: 5,
+            },
+        );
+        assert_eq!(narrow.max_sessions, 2);
+        narrow.reserve_session(1_000).unwrap();
+        narrow.reserve_session(1_000).unwrap();
+        assert!(
+            narrow.reserve_session(1_000).is_err(),
+            "a third session is refused"
+        );
+
+        let mut spending = CausalBudget::new(
+            test_root_id(),
+            1_000,
+            Inherited {
+                sessions: 128,
+                managed_spend: 5,
+            },
+        );
+        assert_eq!(
+            spending.max_sessions, 10,
+            "section 25's default when the host admits more"
+        );
+        spending.reserve_action(3, 1_000).unwrap();
+        spending.reserve_action(2, 1_000).unwrap();
+        let refused = spending.reserve_action(1, 1_000).unwrap_err();
+        assert!(refused.to_string().contains("managed spend"), "{refused}");
+
+        let mut free = CausalBudget::new(test_root_id(), 1_000, HOST);
+        free.reserve_action(0, 1_000)
+            .expect("an action that spends nothing");
+        assert!(
+            free.reserve_action(1, 1_000).is_err(),
+            "a host that gave nothing"
+        );
+    }
+
     #[test]
     fn budget_tracks_runs_and_exhausts_at_limit() {
         let root = test_root_id();
-        let mut budget = CausalBudget::new(root, 1000);
+        let mut budget = CausalBudget::new(root, 1000, HOST);
         budget.max_runs = 3;
 
         budget.reserve_run(1, 1000).unwrap();
@@ -287,7 +379,7 @@ mod tests {
     #[test]
     fn budget_enforces_depth_limit() {
         let root = test_root_id();
-        let mut budget = CausalBudget::new(root, 1000);
+        let mut budget = CausalBudget::new(root, 1000, HOST);
         budget.max_depth = 5;
 
         assert!(budget.reserve_run(4, 1000).is_ok());
@@ -299,7 +391,7 @@ mod tests {
     #[test]
     fn budget_enforces_lifetime_limit() {
         let root = test_root_id();
-        let mut budget = CausalBudget::new(root, 1_000);
+        let mut budget = CausalBudget::new(root, 1_000, HOST);
         budget.max_lifetime_ms = 5_000;
 
         assert!(budget.reserve_run(1, 2_000).is_ok());
@@ -311,7 +403,7 @@ mod tests {
     #[test]
     fn rearm_establishes_a_fresh_usable_generation() {
         let root = test_root_id();
-        let mut budget = CausalBudget::new(root, 1000);
+        let mut budget = CausalBudget::new(root, 1000, HOST);
         budget.max_runs = 1;
         budget.reserve_run(1, 1000).unwrap();
         assert!(budget.reserve_run(1, 1000).is_err());

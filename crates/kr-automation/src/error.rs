@@ -140,12 +140,12 @@ pub enum AutomationError {
         event_id: String,
     },
 
-    /// Per-workflow concurrency limit was breached.
-    #[error("concurrency limit {limit} exceeded for workflow {workflow_id}")]
-    ConcurrencyLimitExceeded {
-        /// The workflow ID.
+    /// A workflow's queue of runs waiting for a slot is full.
+    #[error("workflow {workflow_id} already has {limit} runs pending, which is its limit")]
+    PendingLimitExceeded {
+        /// The workflow.
         workflow_id: WorkflowId,
-        /// The concurrency limit.
+        /// The pending limit.
         limit: u64,
     },
 
@@ -345,9 +345,11 @@ impl From<&AutomationError> for ProtocolError {
                     "duplicate trigger for workflow {workflow_id} rev {revision} event {event_id}"
                 ),
             ),
-            AutomationError::ConcurrencyLimitExceeded { workflow_id, limit } => Self::new(
+            AutomationError::PendingLimitExceeded { workflow_id, limit } => Self::new(
                 ErrorCode::RateLimited,
-                format!("concurrency limit {limit} exceeded for workflow {workflow_id}"),
+                format!(
+                    "workflow {workflow_id} already has {limit} runs pending, which is its limit"
+                ),
             ),
             AutomationError::RateLimitExceeded { reason } => Self::new(
                 ErrorCode::RateLimited,

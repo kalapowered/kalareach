@@ -73,6 +73,15 @@ pub struct Dispatch<'a> {
     pub now_ms: u64,
 }
 
+/// What asking an action to stop came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cancellation {
+    /// The action was asked to stop. Nothing is claimed about what it did before it stopped.
+    Requested,
+    /// An action of this kind cannot be stopped once it has begun.
+    Unsupported,
+}
+
 /// Trait implemented by action node runners (e.g., shell commands, test runners, reviews).
 ///
 /// A runner that asks the grant again before its effect, as the host's own does, answers
@@ -86,7 +95,19 @@ pub trait ActionRunner: Send + Sync {
         &self,
         dispatch: &Dispatch<'_>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ActionOutcome>> + Send>>;
+
+    /// Asks the action `dispatch` began to stop.
+    ///
+    /// The engine asks this when the action has outlived its wait or its run's deadline, and then
+    /// stops waiting for it. A kind that can be stopped settles cancelled, which says the host
+    /// stopped asking and not that the world is as it was; a kind that cannot settles unknown, and
+    /// its dependants pause for review.
+    fn cancel(&self, dispatch: &Dispatch<'_>) -> Cancellation;
 }
+
+/// How often the engine reads the host's clock while it waits for an action, so a deadline that
+/// passes during the wait is found within this long of passing.
+const DEADLINE_POLL_MS: u64 = 250;
 
 /// An output of `kind` whose identifiers name nothing, for a runner that stands in for the host.
 ///
@@ -134,6 +155,7 @@ pub fn stand_in_output(kind: WorkflowActionKind) -> NodeOutput {
 #[derive(Default)]
 pub struct MockActionRunner {
     outcomes: std::sync::Mutex<HashMap<String, ActionOutcome>>,
+    stoppable: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl MockActionRunner {
@@ -149,6 +171,11 @@ impl MockActionRunner {
             .lock()
             .unwrap()
             .insert(node_id.to_owned(), outcome);
+    }
+
+    /// Lets the action of `node_id` be stopped once it has begun.
+    pub fn set_stoppable(&self, node_id: &str) {
+        self.stoppable.lock().unwrap().insert(node_id.to_owned());
     }
 }
 
@@ -168,6 +195,19 @@ impl ActionRunner for MockActionRunner {
                 output: stand_in_output(dispatch.node.action_kind),
             });
         Box::pin(async move { Ok(outcome) })
+    }
+
+    fn cancel(&self, dispatch: &Dispatch<'_>) -> Cancellation {
+        if self
+            .stoppable
+            .lock()
+            .unwrap()
+            .contains(&dispatch.node.node_id)
+        {
+            Cancellation::Requested
+        } else {
+            Cancellation::Unsupported
+        }
     }
 }
 
@@ -224,9 +264,11 @@ impl WorkflowEngine {
                 .push((edge.from_node.as_str(), edge.condition));
         }
 
-        // The run is running from here, unless something settled it while it waited: a
-        // cancellation is terminal and is not reopened by the run starting late.
-        self.store.start_run(run_id)?;
+        // The run's deadline, set when it began running: it measures the run's execution. It is
+        // decided on the host's clock before every node and while every action runs, and each
+        // action is waited for no longer than the definition's action wait either.
+        let deadline_ms = self.store.run_deadline(run_id)?.unwrap_or(u64::MAX);
+        let action_wait_ms = definition.deadlines.action_wait_ms.get();
 
         let mut progress = true;
         let mut run_status = WorkflowRunStatus::Completed;
@@ -303,6 +345,19 @@ impl WorkflowEngine {
                 }
 
                 if can_run {
+                    // A run past its deadline dispatches nothing further. Section 17 makes the
+                    // deadline one of the workflow's own limits: the run stops where it stands,
+                    // the revision pauses, and the pause owes one attention item.
+                    let checked_ms = self.clock.now_ms();
+                    if checked_ms >= deadline_ms {
+                        return self.stop_on_breach(
+                            run_id,
+                            definition,
+                            &crate::error::AutomationError::RunTimeout { run_id }.to_string(),
+                            checked_ms,
+                        );
+                    }
+
                     // The grant is read again here, immediately before this node is dispatched,
                     // rather than once when the run was admitted. A run takes minutes and a
                     // revocation, an expiry or a narrowing can land between two of its nodes; a
@@ -378,6 +433,7 @@ impl WorkflowEngine {
                     if let Err(err) = self.store.reserve_budget_action(
                         causal_ctx.root_id,
                         causal_ctx.generation,
+                        crate::definition::managed_spend(node.action_kind),
                         dispatch_time_ms,
                     ) {
                         return self.pause_on_refusal(run_id, &node.node_id, err, dispatch_time_ms);
@@ -406,7 +462,70 @@ impl WorkflowEngine {
                         causal: causal_ctx,
                         now_ms: dispatch_time_ms,
                     };
-                    let outcome_res = self.runner.execute(&dispatch).await;
+                    // The action is waited for until its own wait or the run's deadline passes,
+                    // whichever comes first, and no longer.
+                    let wait_until = dispatch_time_ms
+                        .saturating_add(action_wait_ms)
+                        .min(deadline_ms);
+                    let Some(outcome_res) = self
+                        .wait_for(self.runner.execute(&dispatch), wait_until)
+                        .await
+                    else {
+                        let outlived_ms = self.clock.now_ms();
+                        let past_deadline = outlived_ms >= deadline_ms;
+                        let limit = if past_deadline {
+                            crate::error::AutomationError::RunTimeout { run_id }
+                        } else {
+                            crate::error::AutomationError::ActionTimeout {
+                                node_id: node.node_id.clone(),
+                            }
+                        }
+                        .to_string();
+                        // The host stops waiting and asks the action to stop. What it did is
+                        // claimed either way only as far as the host knows it.
+                        let (status, detail) = match self.runner.cancel(&dispatch) {
+                            Cancellation::Requested => (
+                                NodeStatus::Cancelled,
+                                format!(
+                                    "{limit}: the action was asked to stop, and nothing is claimed \
+                                     about what it did before it stopped"
+                                ),
+                            ),
+                            Cancellation::Unsupported => (
+                                NodeStatus::Unknown,
+                                format!(
+                                    "{limit}: an action of this kind cannot be stopped once it \
+                                     has begun, so what it did is not established"
+                                ),
+                            ),
+                        };
+                        self.store.settle_node(&NodeSettlement {
+                            run_id,
+                            node_id: &node.node_id,
+                            status,
+                            output: None,
+                            error: Some(&detail),
+                            produced: None,
+                            at_ms: outlived_ms,
+                        })?;
+                        if past_deadline {
+                            return self.stop_on_breach(run_id, definition, &limit, outlived_ms);
+                        }
+                        // The action's wait is one of the workflow's own limits too.
+                        self.store.pause_workflow_on_breach(
+                            definition.workflow_id,
+                            definition.revision.get(),
+                            &limit,
+                            outlived_ms,
+                        )?;
+                        let recorded = self.recorded_status(run_id, &node.node_id)?;
+                        node_statuses.insert(node.node_id.clone(), recorded);
+                        if recorded == NodeStatus::Unknown {
+                            run_status = WorkflowRunStatus::Paused;
+                        }
+                        progress = true;
+                        continue;
+                    };
 
                     // A runner that asked the grant once more and was refused never began the
                     // effect, so this is a refusal and not an outcome: the node pauses as it would
@@ -516,9 +635,65 @@ impl WorkflowEngine {
             run_status = WorkflowRunStatus::Failed;
         }
 
-        self.store
-            .finish_run(run_id, run_status, self.clock.now_ms())?;
+        if run_status == WorkflowRunStatus::Cancelled {
+            // A cancelled node's dependants can never run, so the nodes still waiting are
+            // cancelled with the run rather than left looking as though they might.
+            self.store.cancel_run(
+                run_id,
+                "a node of this run was cancelled, so the nodes after it do not run",
+                self.clock.now_ms(),
+            )?;
+        } else {
+            self.store
+                .finish_run(run_id, run_status, self.clock.now_ms())?;
+        }
         Ok(run_status)
+    }
+
+    /// Waits for `action` until the host's clock reaches `until`, and answers `None` when it
+    /// outlived that moment.
+    ///
+    /// The clock is read at least every [`DEADLINE_POLL_MS`], so a deadline that passes while the
+    /// host sleeps or while nothing else happens is found soon after it passes rather than when
+    /// the action ends.
+    async fn wait_for<T>(
+        &self,
+        action: impl std::future::Future<Output = T>,
+        until: u64,
+    ) -> Option<T> {
+        let mut action = std::pin::pin!(action);
+        loop {
+            let now = self.clock.now_ms();
+            if now >= until {
+                return None;
+            }
+            let left = std::time::Duration::from_millis((until - now).min(DEADLINE_POLL_MS));
+            tokio::select! {
+                biased;
+                outcome = &mut action => return Some(outcome),
+                () = tokio::time::sleep(left) => {}
+            }
+        }
+    }
+
+    /// Stops a run that exceeded one of its workflow's limits: every node still waiting is
+    /// cancelled, the run is cancelled, and the revision pauses with the attention item it owes,
+    /// all in one transaction.
+    fn stop_on_breach(
+        &self,
+        run_id: WorkflowRunId,
+        definition: &WorkflowDefinition,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<WorkflowRunStatus> {
+        self.store.stop_run_on_breach(
+            run_id,
+            definition.workflow_id,
+            definition.revision.get(),
+            reason,
+            now_ms,
+        )?;
+        Ok(WorkflowRunStatus::Cancelled)
     }
 
     /// Reads a node's status from the journal, for a node this loop no longer owns.

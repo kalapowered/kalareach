@@ -241,6 +241,10 @@ fn read_answers_about_the_revision_it_was_asked_about() {
 struct Counting(std::sync::atomic::AtomicUsize);
 
 impl kr_automation::ActionRunner for Counting {
+    fn cancel(&self, _dispatch: &kr_automation::Dispatch<'_>) -> kr_automation::Cancellation {
+        kr_automation::Cancellation::Unsupported
+    }
+
     fn execute(
         &self,
         dispatch: &kr_automation::Dispatch<'_>,

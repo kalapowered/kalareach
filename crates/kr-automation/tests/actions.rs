@@ -78,6 +78,10 @@ struct Held {
 }
 
 impl ActionRunner for Held {
+    fn cancel(&self, _dispatch: &Dispatch<'_>) -> kr_automation::Cancellation {
+        kr_automation::Cancellation::Unsupported
+    }
+
     fn execute(
         &self,
         dispatch: &Dispatch<'_>,
@@ -325,6 +329,10 @@ struct CancelledWhileRunning {
 }
 
 impl ActionRunner for CancelledWhileRunning {
+    fn cancel(&self, _dispatch: &Dispatch<'_>) -> kr_automation::Cancellation {
+        kr_automation::Cancellation::Unsupported
+    }
+
     fn execute(
         &self,
         dispatch: &Dispatch<'_>,

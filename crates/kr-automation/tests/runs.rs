@@ -391,6 +391,10 @@ async fn an_uncertain_dispatch_pauses_dependants_rather_than_failing_them() {
     struct UncertainRunner;
 
     impl kr_automation::ActionRunner for UncertainRunner {
+        fn cancel(&self, _dispatch: &kr_automation::Dispatch<'_>) -> kr_automation::Cancellation {
+            kr_automation::Cancellation::Unsupported
+        }
+
         fn execute(
             &self,
             dispatch: &kr_automation::Dispatch<'_>,
@@ -474,6 +478,10 @@ async fn cancellation_stops_undispatched_nodes() {
     }
 
     impl kr_automation::ActionRunner for CancellingRunner {
+        fn cancel(&self, _dispatch: &kr_automation::Dispatch<'_>) -> kr_automation::Cancellation {
+            kr_automation::Cancellation::Unsupported
+        }
+
         fn execute(
             &self,
             dispatch: &kr_automation::Dispatch<'_>,

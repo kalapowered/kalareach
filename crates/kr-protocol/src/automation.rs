@@ -424,6 +424,10 @@ pub struct CausalBudgetSummary {
     pub elapsed_lifetime_ms: U64,
     /// Maximum allowed lifetime in milliseconds.
     pub max_lifetime_ms: U64,
+    /// Managed allowance the chain's actions have spent.
+    pub managed_spend: U64,
+    /// The managed allowance the chain inherited from its host when its root was admitted.
+    pub max_managed_spend: U64,
     /// Whether the chain is paused due to limit exhaustion.
     pub paused: bool,
     /// Whether any limit was exhausted.

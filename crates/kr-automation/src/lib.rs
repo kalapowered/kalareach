@@ -11,8 +11,8 @@
 //! | [`authority`] | The grant a workflow acts under, and the rights each action kind needs |
 //! | [`definition`] | Parsing, validation, acyclicity checks, and registration constraints |
 //! | [`causal`] | Causal contexts, causal roots, depth and parent tracking |
-//! | [`budget`] | Persistent causal budgets, ceilings, exhaustion, and rearm |
-//! | [`admission`] | Concurrency limits and host-wide/per-grant rate limiters |
+//! | [`budget`] | Persistent causal budgets, inherited ceilings, exhaustion, and rearm |
+//! | [`admission`] | Per-workflow concurrency and pending limits, and host-wide and per-grant rates, decided from the journal |
 //! | [`store`] | The SQLite workflow journal holding definitions, triggers, runs, receipts, budgets and the attention outbox |
 //! | [`engine`] | Topological node sequencing, dependency resolution, and outcomes |
 //! | [`source_workflow`] | The completion-tests-reviewer workflow and evidence binding |
@@ -59,13 +59,14 @@ pub mod service;
 pub mod source_workflow;
 pub mod store;
 
-pub use crate::admission::AdmissionController;
+pub use crate::admission::Placement;
 pub use crate::authority::{AuthoritySource, GrantStanding, GrantTable};
-pub use crate::budget::CausalBudget;
+pub use crate::budget::{CausalBudget, Inherited};
 pub use crate::causal::{CausalContext, CausalParent};
 pub use crate::definition::{create_workflow_definition, produced_event, validate_definition};
 pub use crate::engine::{
-    ActionOutcome, ActionRunner, Dispatch, MockActionRunner, WorkflowEngine, stand_in_output,
+    ActionOutcome, ActionRunner, Cancellation, Dispatch, MockActionRunner, WorkflowEngine,
+    stand_in_output,
 };
 pub use crate::error::{AutomationError, Result};
 pub use crate::service::{
@@ -101,6 +102,8 @@ pub struct Host {
     pub authority: std::sync::Arc<dyn AuthoritySource>,
     /// The clock the engine reads before each reservation and each receipt.
     pub clock: std::sync::Arc<dyn HostClock>,
+    /// What a new causal chain inherits from this host.
+    pub ceilings: std::sync::Arc<dyn HostCeilings>,
 }
 
 impl std::fmt::Debug for Host {
@@ -110,7 +113,42 @@ impl std::fmt::Debug for Host {
             .field("environment_id", &self.environment_id)
             .field("authority", &self.authority)
             .field("clock", &self.clock)
+            .field("ceilings", &self.ceilings)
             .finish_non_exhaustive()
+    }
+}
+
+/// What a new causal chain inherits from the host it runs on.
+///
+/// A chain's budget records these when its root run is admitted. Every run after that reads the
+/// root's record rather than the host's current values, so a ceiling the host raises later does
+/// not widen a chain that is already running, and no descendant can enlarge what its root was
+/// given.
+pub trait HostCeilings: Send + Sync + std::fmt::Debug {
+    /// The most sessions this host admits now. A new chain's created-session ceiling is the lower
+    /// of this and section 25's default.
+    fn sessions(&self) -> u64;
+
+    /// The managed allowance a new chain may spend.
+    fn managed_spend(&self) -> u64;
+}
+
+/// Ceilings a caller fixes once, rather than a host that decides them as it runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FixedCeilings {
+    /// The most sessions the host admits.
+    pub sessions: u64,
+    /// The managed allowance a chain may spend.
+    pub managed_spend: u64,
+}
+
+impl HostCeilings for FixedCeilings {
+    fn sessions(&self) -> u64 {
+        self.sessions
+    }
+
+    fn managed_spend(&self) -> u64 {
+        self.managed_spend
     }
 }
 
@@ -178,6 +216,10 @@ pub(crate) fn test_host(
         runner,
         authority,
         clock,
+        ceilings: std::sync::Arc::new(FixedCeilings {
+            sessions: 128,
+            managed_spend: 0,
+        }),
     }
 }
 

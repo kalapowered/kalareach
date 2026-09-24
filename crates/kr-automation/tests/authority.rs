@@ -74,6 +74,10 @@ struct RevokesWhileRunning {
 }
 
 impl ActionRunner for RevokesWhileRunning {
+    fn cancel(&self, _dispatch: &kr_automation::Dispatch<'_>) -> kr_automation::Cancellation {
+        kr_automation::Cancellation::Unsupported
+    }
+
     fn execute(
         &self,
         dispatch: &kr_automation::Dispatch<'_>,
@@ -289,6 +293,10 @@ struct CancelsAndRevokes {
 }
 
 impl ActionRunner for CancelsAndRevokes {
+    fn cancel(&self, _dispatch: &kr_automation::Dispatch<'_>) -> kr_automation::Cancellation {
+        kr_automation::Cancellation::Unsupported
+    }
+
     fn execute(
         &self,
         dispatch: &kr_automation::Dispatch<'_>,
@@ -462,6 +470,10 @@ async fn a_capture_node_outside_the_declared_workspace_is_refused() {
 struct RefusesBeforeItsEffect;
 
 impl ActionRunner for RefusesBeforeItsEffect {
+    fn cancel(&self, _dispatch: &kr_automation::Dispatch<'_>) -> kr_automation::Cancellation {
+        kr_automation::Cancellation::Unsupported
+    }
+
     fn execute(
         &self,
         _dispatch: &kr_automation::Dispatch<'_>,
@@ -1034,7 +1046,7 @@ async fn a_device_reads_nothing_of_another_grant_s_chain_through_an_owner_crossi
     assert!(
         service
             .store()
-            .reserve_budget_action(root, 0, 1_000 + 3_600_001)
+            .reserve_budget_action(root, 0, 0, 1_000 + 3_600_001)
             .is_err(),
         "the chain is out of lifetime"
     );
