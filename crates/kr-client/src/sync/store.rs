@@ -3292,6 +3292,18 @@ pub(super) fn flush_path_names(directory: &Path) -> std::io::Result<()> {
 /// reported, as it is on Unix.
 #[cfg(windows)]
 pub(super) fn flush_path_names(directory: &Path) -> std::io::Result<()> {
+    let resolved = walk_path_names(directory, &sync_new_level)?;
+    sync_directory(&resolved)
+}
+
+/// The walk behind [`flush_path_names`]: flushes the directory each name on the path lives in with
+/// `flush_holder`, passing over one it refuses for want of the right, and returns the directory the
+/// path resolves to.
+#[cfg(windows)]
+fn walk_path_names(
+    directory: &Path,
+    flush_holder: &dyn Fn(&Path) -> std::io::Result<()>,
+) -> std::io::Result<PathBuf> {
     use std::collections::VecDeque;
     use std::path::Component;
 
@@ -3340,7 +3352,7 @@ pub(super) fn flush_path_names(directory: &Path) -> std::io::Result<()> {
         };
         let holder = resolved.clone();
         if !flushed.contains(&holder) {
-            match sync_new_level(&holder) {
+            match flush_holder(&holder) {
                 Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
                 other => other?,
             }
@@ -3368,7 +3380,7 @@ pub(super) fn flush_path_names(directory: &Path) -> std::io::Result<()> {
             remaining.push_front(part);
         }
     }
-    sync_directory(&resolved)
+    Ok(resolved)
 }
 
 /// Flushes nothing, because this platform has no directory a program can flush.
@@ -3559,26 +3571,6 @@ mod windows_tests {
         printed
     }
 
-    /// This account's security identifier, as `whoami` gives it.
-    fn this_account() -> String {
-        let printed = run(
-            "whoami.exe",
-            &[
-                "/user".as_ref(),
-                "/fo".as_ref(),
-                "csv".as_ref(),
-                "/nh".as_ref(),
-            ],
-        );
-        printed
-            .trim()
-            .rsplit(',')
-            .next()
-            .map(|field| field.trim_matches('"').to_owned())
-            .filter(|sid| sid.starts_with("S-1-"))
-            .unwrap_or_else(|| panic!("whoami named this account: {printed:?}"))
-    }
-
     #[test]
     fn a_directory_is_flushed_through_a_handle_of_its_own() {
         let root = tempfile::tempdir().expect("a directory");
@@ -3649,51 +3641,50 @@ mod windows_tests {
     }
 
     #[test]
-    fn a_directory_this_account_may_not_change_is_refused_a_flush_and_passed_over_by_the_walk() {
+    fn the_walk_passes_over_a_directory_refused_for_want_of_the_right_and_reports_anything_else() {
+        // Whether this account is refused a directory is a matter of the directory's list and of
+        // the privileges the account holds, which override the list for an account that has them
+        // turned on. So the refusal is given to the walk here rather than asked of a list: what is
+        // under test is what the walk makes of it.
         let root = tempfile::tempdir().expect("a directory");
-        let fixed = root.path().join("fixed");
-        let inner = fixed.join("inner");
-        std::fs::create_dir_all(&inner).expect("two levels");
-        let account = this_account();
-        // The inner level keeps what it inherited as a list of its own, and the outer one is
-        // narrowed to reading and traversing for this account, with nothing inherited.
-        run(
-            "icacls.exe",
-            &[inner.as_os_str(), "/inheritance:d".as_ref()],
+        let refused = std::path::absolute(root.path().join("refused")).expect("an absolute path");
+        let store = refused.join("store");
+        std::fs::create_dir_all(&store).expect("two levels");
+        let asked = std::cell::RefCell::new(Vec::new());
+        let resolved = walk_path_names(&store, &|holder: &Path| {
+            asked.borrow_mut().push(holder.to_path_buf());
+            if holder == refused {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            } else {
+                Ok(())
+            }
+        })
+        .expect("a directory refused for want of the right is passed over");
+        assert_eq!(
+            resolved, store,
+            "the walk reaches the store's own directory"
         );
-        run(
-            "icacls.exe",
-            &[
-                fixed.as_os_str(),
-                "/inheritance:r".as_ref(),
-                "/grant:r".as_ref(),
-                format!("*{account}:(RX)").as_ref(),
-            ],
+        let asked = asked.into_inner();
+        assert!(
+            asked.contains(&refused),
+            "the refused directory was asked: {asked:?}"
+        );
+        assert!(
+            asked.iter().any(|holder| holder.as_path() == root.path()),
+            "and the directory above it was flushed: {asked:?}"
         );
 
-        assert_eq!(
-            sync_directory(&fixed)
-                .expect_err("no right to add a file there")
-                .kind(),
-            std::io::ErrorKind::PermissionDenied
-        );
-        assert_eq!(
-            sync_new_level(&fixed)
-                .expect_err("no right to add a directory there")
-                .kind(),
-            std::io::ErrorKind::PermissionDenied
-        );
-        // No opener running as this account made a name in it, so a store beneath it is flushed
-        // everywhere else on its path, and there is nothing to report.
-        flush_path_names(&inner).expect("the walk passes over it");
-
-        run(
-            "icacls.exe",
-            &[
-                fixed.as_os_str(),
-                "/grant".as_ref(),
-                format!("*{account}:(OI)(CI)F").as_ref(),
-            ],
+        // Any other failure is reported, as it is on Unix.
+        let failed = walk_path_names(&store, &|holder: &Path| {
+            if holder == refused {
+                Err(std::io::Error::other("the device did not answer"))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(
+            failed.is_err_and(|error| error.kind() == std::io::ErrorKind::Other),
+            "a failure that is not a refusal is the answer"
         );
     }
 }
