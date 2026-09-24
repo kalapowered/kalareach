@@ -6492,8 +6492,8 @@ mod tests {
     }
 
     /// A statement's write is bounded whole: one that cannot get the connection's turn before its
-    /// deadline is never offered, and one the peer has part of when the deadline passes is reported
-    /// for the caller to end the connection over.
+    /// deadline is never offered, and, where a peer can hold part of a frame, one the peer has part
+    /// of when the deadline passes is reported for the caller to end the connection over.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_bounded_write_reports_what_it_could_not_finish() {
         let (_temp, writable, writer, mut reader) = connected().await;
@@ -6521,25 +6521,30 @@ mod tests {
             "nothing of it went"
         );
 
-        // Larger than the socket holds, with the peer no longer reading.
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-        assert!(
-            !write_within(
-                &writable,
-                &writer,
-                &output_frame(900 * 1024),
-                &withdrawn,
-                deadline
-            )
-            .await
-        );
-        assert!(
-            writer
-                .lock()
-                .expect("the connection writer is not poisoned")
-                .is_mid_frame(),
-            "the peer has part of it, so the caller ends the connection"
-        );
+        // Larger than the socket holds, with the peer no longer reading. A Unix socket takes what
+        // fits and leaves the rest of the frame waiting; a Windows pipe takes each slice whole into
+        // a buffer of its own, so there a peer that stops reading never holds part of a frame.
+        #[cfg(unix)]
+        {
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+            assert!(
+                !write_within(
+                    &writable,
+                    &writer,
+                    &output_frame(900 * 1024),
+                    &withdrawn,
+                    deadline
+                )
+                .await
+            );
+            assert!(
+                writer
+                    .lock()
+                    .expect("the connection writer is not poisoned")
+                    .is_mid_frame(),
+                "the peer has part of it, so the caller ends the connection"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
