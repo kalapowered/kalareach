@@ -58,7 +58,8 @@ pub const WORKFLOW_DB_NAME: &str = "workflows.db";
 /// read as if its rows said what this build expects. Version 5 stores each node's output as its
 /// kind's typed output rather than as text. Version 6 keeps the admissions the host-wide and
 /// per-grant rates count, a run that waits for a slot as pending, the ceilings a chain inherited,
-/// and the descendants an exhausted chain refused, which an authorised rearm continues it from.
+/// the descendants an exhausted chain refused, which an authorised rearm continues it from, and
+/// the depth each generation of a chain began at.
 pub const WORKFLOW_SCHEMA_VERSION: u32 = 6;
 
 /// The columns [`Journal::parse_run_record`] expects, in order.
@@ -1330,7 +1331,7 @@ impl<'c> Journal<'c> {
                 "SELECT generation, depth, max_depth, total_runs, max_runs, total_actions,
                         max_actions, created_sessions, max_sessions, started_at_ms,
                         max_lifetime_ms, paused, exhausted, attention_emitted, rearmed_at_ms,
-                        managed_spend, max_managed_spend
+                        managed_spend, max_managed_spend, base_depth
                  FROM causal_budgets WHERE causal_root_id = ?1",
                 params![root_id.to_string()],
                 |row| {
@@ -1353,6 +1354,7 @@ impl<'c> Journal<'c> {
                         rearmed_at_ms: row.get::<_, Option<i64>>(14)?.map(|v| v as u64),
                         managed_spend: row.get::<_, i64>(15)? as u64,
                         max_managed_spend: row.get::<_, i64>(16)? as u64,
+                        base_depth: row.get::<_, i64>(17)? as u64,
                     })
                 },
             )
@@ -1366,9 +1368,9 @@ impl<'c> Journal<'c> {
                 causal_root_id, generation, depth, max_depth, total_runs, max_runs,
                 total_actions, max_actions, created_sessions, max_sessions,
                 started_at_ms, max_lifetime_ms, paused, exhausted,
-                attention_emitted, rearmed_at_ms, managed_spend, max_managed_spend
+                attention_emitted, rearmed_at_ms, managed_spend, max_managed_spend, base_depth
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                      ?18)
+                      ?18, ?19)
             ON CONFLICT(causal_root_id) DO UPDATE SET
                 generation = excluded.generation,
                 depth = excluded.depth,
@@ -1380,7 +1382,8 @@ impl<'c> Journal<'c> {
                 exhausted = excluded.exhausted,
                 attention_emitted = excluded.attention_emitted,
                 rearmed_at_ms = excluded.rearmed_at_ms,
-                managed_spend = excluded.managed_spend",
+                managed_spend = excluded.managed_spend,
+                base_depth = excluded.base_depth",
             params![
                 budget.causal_root_id.to_string(),
                 stored(budget.generation),
@@ -1400,6 +1403,7 @@ impl<'c> Journal<'c> {
                 budget.rearmed_at_ms.map(stored),
                 stored(budget.managed_spend),
                 stored(budget.max_managed_spend),
+                stored(budget.base_depth),
             ],
         )?;
         Ok(())
@@ -1975,7 +1979,8 @@ impl WorkflowStore {
                 attention_emitted INTEGER NOT NULL,
                 rearmed_at_ms INTEGER,
                 managed_spend INTEGER NOT NULL,
-                max_managed_spend INTEGER NOT NULL
+                max_managed_spend INTEGER NOT NULL,
+                base_depth INTEGER NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS workflow_runs (
@@ -2423,6 +2428,13 @@ impl WorkflowStore {
                     continued.push(value);
                 }
             }
+            // A continuation the new budget refused would otherwise be kept again, under the new
+            // generation, for a later rearm to spend a second time. Nothing but these attempts
+            // writes to the chain inside this transaction, so the chain leaves it holding none.
+            journal.conn.execute(
+                "DELETE FROM chain_continuations WHERE causal_root_id = ?1",
+                params![root_id.to_string()],
+            )?;
             Ok((budget, continued))
         })
     }

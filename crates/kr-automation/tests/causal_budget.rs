@@ -1029,3 +1029,141 @@ async fn a_rearm_continues_its_chain_once_and_late_descendants_stay_refused() {
             .is_empty()
     );
 }
+
+/// A chain its depth ceiling stopped is continued by a rearm, and goes as deep again: the ceiling
+/// counts the depth the new generation adds past where the previous one stopped, so the
+/// continuation one level past the ceiling is admitted rather than refused by the ceiling again.
+#[tokio::test]
+async fn a_rearm_continues_a_chain_its_depth_ceiling_stopped() {
+    let service = in_memory();
+    let tests = recurring_workflow(1, "tests", "review.completed", WorkflowActionKind::RunTests);
+    let review = recurring_workflow(
+        2,
+        "review",
+        "tests.passed",
+        WorkflowActionKind::RequestReview,
+    );
+    install_and_enable(&service, &tests, 1_000);
+    install_and_enable(&service, &review, 1_000);
+    let root = service
+        .submit_run(&run_params(&tests, "external-1"), 1_000)
+        .await
+        .expect("the root runs")
+        .causal_root_id;
+
+    // Runs until the chain is refused, and answers the deepest run it reached.
+    let deepest = |service: &AutomationService| {
+        service
+            .store()
+            .list_runs(None)
+            .expect("the journal")
+            .iter()
+            .filter(|run| run.causal_root_id == root)
+            .map(|run| run.depth.get())
+            .max()
+            .expect("the chain has runs")
+    };
+    let refused = loop {
+        let decision = only(service.dispatch_triggers(2_000).await.expect("a pass"));
+        if let Err(error) = decision.outcome {
+            break error;
+        }
+    };
+    assert_eq!(code(&refused), ErrorCode::CausalLimit, "{refused}");
+    assert_eq!(deepest(&service), DEFAULT_CAUSAL_DEPTH_LIMIT);
+
+    let continued = service
+        .rearm(root, test_grant_id(1), 3_000)
+        .expect("an authorised rearm");
+    assert_eq!(continued.len(), 1, "the descendant the ceiling refused");
+    let ran = service
+        .execute(continued.into_iter().next().expect("one run"))
+        .await
+        .expect("the continuation runs");
+    assert_eq!(ran.status, WorkflowRunStatus::Completed, "{ran:?}");
+    assert_eq!(ran.depth.get(), DEFAULT_CAUSAL_DEPTH_LIMIT + 1);
+
+    let refused = loop {
+        let decision = only(service.dispatch_triggers(4_000).await.expect("a pass"));
+        if let Err(error) = decision.outcome {
+            break error;
+        }
+    };
+    assert_eq!(code(&refused), ErrorCode::CausalLimit, "{refused}");
+    assert_eq!(
+        deepest(&service),
+        2 * DEFAULT_CAUSAL_DEPTH_LIMIT,
+        "the new generation added as much depth again"
+    );
+    let budget = service.store().get_budget(root).unwrap().unwrap();
+    assert_eq!(budget.generation, 1);
+    assert_eq!(budget.base_depth, DEFAULT_CAUSAL_DEPTH_LIMIT);
+    assert!(budget.exhausted);
+}
+
+/// A continuation the new generation's budget refuses is spent with the rest: the rearm's
+/// transaction leaves the chain holding no continuation, so a later rearm has nothing to spend a
+/// second time.
+#[test]
+fn a_continuation_the_new_budget_refuses_is_spent() {
+    use kr_automation::{CausalContext, CausalParent, Inherited, Placement};
+    let journal = tempfile::tempdir().expect("a journal directory");
+    let store = WorkflowStore::open(journal.path()).expect("the journal opens");
+    let def = recurring_workflow(5, "deep", "tests.passed", WorkflowActionKind::RunTests);
+    store.save_definition(&def, 1_000).unwrap();
+    let root_context = CausalContext::new_root();
+    let root = root_context.root_id;
+    let root_run = kr_protocol::ids::WorkflowRunId::new(Uuid::from_bytes([0x51; 16]));
+    store
+        .commit_trigger_and_run(root_run, &def, "evt-root", &root_context, 1_000)
+        .expect("the root is admitted");
+    // A descendant past the depth ceiling: refused, and kept for a rearm.
+    let past = |generation: u64, depth: u64| CausalContext {
+        root_id: root,
+        generation,
+        depth,
+        parent: Some(CausalParent {
+            run_id: root_run,
+            node_id: "step".to_owned(),
+        }),
+    };
+    store
+        .commit_trigger_and_run(
+            kr_protocol::ids::WorkflowRunId::new(Uuid::from_bytes([0x52; 16])),
+            &def,
+            "evt-deep",
+            &past(0, DEFAULT_CAUSAL_DEPTH_LIMIT + 1),
+            1_100,
+        )
+        .expect_err("past the ceiling");
+
+    // The rearm hands the continuation over once, and the new budget refuses it too.
+    let mut handed = 0;
+    store
+        .rearm_budget(root, 1_200, |journal, continuation, generation| {
+            handed += 1;
+            journal
+                .commit_trigger_and_run(
+                    kr_protocol::ids::WorkflowRunId::new(Uuid::from_bytes([0x53; 16])),
+                    &def,
+                    &continuation.event_id,
+                    &past(generation, 1_000),
+                    1_200,
+                    Placement::Start,
+                    Inherited::DEFAULTS,
+                )
+                .expect_err("the new budget refuses it as well");
+            Ok(None::<()>)
+        })
+        .expect("the rearm");
+    assert_eq!(handed, 1);
+
+    let mut handed_again = 0;
+    store
+        .rearm_budget(root, 1_300, |_, _, _| {
+            handed_again += 1;
+            Ok(None::<()>)
+        })
+        .expect("a second rearm");
+    assert_eq!(handed_again, 0, "the continuation was spent");
+}

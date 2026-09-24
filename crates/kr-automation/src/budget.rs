@@ -28,10 +28,18 @@ use crate::error::{AutomationError, Result};
 pub struct CausalBudget {
     /// Causal root identifier.
     pub causal_root_id: CausalRootId,
-    /// Maximum depth reached.
+    /// The most depth this generation has added to the chain.
     pub depth: u64,
-    /// Maximum depth ceiling.
+    /// Maximum depth ceiling, for the depth one generation adds.
     pub max_depth: u64,
+    /// The chain's depth when this generation began: nought for the first, and for a rearmed one
+    /// the depth its previous generation had reached.
+    ///
+    /// A run's depth is its place in the chain and never changes, so a rearm that continues the
+    /// chain from where its depth ceiling stopped it continues it deeper still. The ceiling counts
+    /// the depth this generation adds past this point; otherwise the first continuation of a chain
+    /// the ceiling exhausted would be refused by the ceiling again.
+    pub base_depth: u64,
     /// Total workflow runs executed.
     pub total_runs: u64,
     /// Maximum allowed runs.
@@ -95,6 +103,7 @@ impl CausalBudget {
             generation: 0,
             depth: 0,
             max_depth: DEFAULT_CAUSAL_DEPTH_LIMIT,
+            base_depth: 0,
             total_runs: 0,
             max_runs: DEFAULT_CAUSAL_RUNS_LIMIT,
             total_actions: 0,
@@ -135,10 +144,11 @@ impl CausalBudget {
         self.check_open()?;
         self.check_lifetime(now_ms)?;
 
-        if requested_depth > self.max_depth {
+        let added = requested_depth.saturating_sub(self.base_depth);
+        if added > self.max_depth {
             return Err(self.exceeded(format!(
-                "depth {} exceeds limit {}",
-                requested_depth, self.max_depth
+                "depth {requested_depth} exceeds the limit of {} past depth {}",
+                self.max_depth, self.base_depth
             )));
         }
 
@@ -151,7 +161,7 @@ impl CausalBudget {
         }
 
         self.total_runs = self.total_runs.saturating_add(1);
-        self.depth = self.depth.max(requested_depth);
+        self.depth = self.depth.max(added);
         Ok(())
     }
 
@@ -248,11 +258,13 @@ impl CausalBudget {
     /// Rearms the budget under an authorised administrative request.
     ///
     /// The chain gets a fresh generation and fresh counters, so the same ceilings are usable
-    /// again without anybody raising them, the ones it inherited among them. Runs from the previous
+    /// again without anybody raising them, the ones it inherited among them. The depth ceiling
+    /// counts from the depth the previous generation reached. Runs from the previous
     /// generation keep their old number, and [`Self::check_generation`] refuses them: a replayed
     /// or late event cannot spend the new budget, and it cannot rearm one of its own.
     pub fn rearm(&mut self, now_ms: u64) {
         self.generation = self.generation.saturating_add(1);
+        self.base_depth = self.base_depth.saturating_add(self.depth);
         self.total_runs = 0;
         self.total_actions = 0;
         self.created_sessions = 0;
