@@ -924,7 +924,7 @@ fn an_agent_started_in_no_job_places_nothing_below_it() {
 fn an_agents_job_is_let_go_of_with_the_last_instance_that_names_it() {
     let (_session_job, boundary) = an_empty_session(0xF000_0103);
     let started = Started::new();
-    let broker = Broker::open(None, session()).expect("a broker");
+    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("a broker");
     let first = ApplicationInstanceId::new(Uuid::from_bytes([0x21; 16]));
     let second = ApplicationInstanceId::new(Uuid::from_bytes([0x22; 16]));
     launched(&broker, first, started.identity.clone());
