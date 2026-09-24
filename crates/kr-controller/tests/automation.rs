@@ -2854,8 +2854,9 @@ fn chain_progress(journal: &Path, root: kr_protocol::ids::CausalRootId) -> Optio
 }
 
 /// Ends the daemon process once at least `completed` runs of the chain have completed, at a moment
-/// no action of the chain is under way: the process is frozen, the journal read, and the process
-/// killed if nothing was dispatched, or let go on and asked again if something was. A run killed
+/// no action of the chain is under way: the process is frozen, and once the kernel reports it
+/// stopped the journal is read, and the process killed if nothing was dispatched, or let go on and
+/// asked again if something was. A run killed
 /// between two of its nodes is taken up by the next daemon; one killed during an action is not
 /// known to have happened, which would end the chain rather than test its budget.
 #[cfg(unix)]
@@ -2874,6 +2875,16 @@ async fn end_between_actions(
         );
         rustix::process::kill_process(pid, rustix::process::Signal::STOP)
             .expect("the daemon can be frozen");
+        // Sending the signal is not the process stopping: its threads can still commit until the
+        // kernel reports it stopped, so the journal is read only after that report.
+        let reported = rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::UNTRACED)
+            .expect("the daemon's state can be waited for")
+            .expect("the daemon changed state");
+        assert!(
+            reported.1.stopped(),
+            "the daemon stopped rather than ended: {:?}",
+            reported.1
+        );
         match chain_progress(journal, root) {
             Some((done, 0)) if done >= completed => {
                 daemon.kill();
