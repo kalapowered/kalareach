@@ -13,7 +13,7 @@ use kr_protocol::pairing::{DirectQrPayload, direct_verification_value};
 use kr_protocol::preauth::{PairRedeemParams, PairRedeemResult};
 use tokio::sync::watch;
 
-use super::candidate::{AttemptState, Pairing, Stage, awaiting};
+use super::candidate::{AttemptState, Pairing, RECOVERY_MARGIN_MS, Stage, awaiting};
 use super::failure::{FailureKind, PairingFailure, refused_by_host};
 use super::link::{ConnectionPeer, LinkError};
 use super::paired::{AttemptMode, PairedHost, PendingAttempt};
@@ -126,15 +126,23 @@ impl Pairing {
             network_config: payload.network_config.clone(),
             proposed_grant: payload.proposed_grant.clone(),
             verification_value: value.clone(),
+            value_confirmed: false,
             expires_at_ms: Some(payload.expires_at_ms.get()),
+            // The payload's expiry is the one the transcript binds, so it bounds how long this
+            // device keeps asking.
+            recover_until_ms: payload
+                .expires_at_ms
+                .get()
+                .saturating_add(RECOVERY_MARGIN_MS),
+            tries_left: None,
         };
         // Kept before the proof leaves, so a device that restarts while the owner decides can ask
         // again.
         self.hosts.keep_attempt(&pending)?;
-        match preauth
+        let redeemed = preauth
             .redeem(&PairRedeemParams::Direct(Box::new(proof)))
-            .await
-        {
+            .await;
+        let pending = match redeemed {
             Ok(PairRedeemResult::Locked {
                 verification_value, ..
             }) => {
@@ -145,6 +153,7 @@ impl Pairing {
                         "the host's verification value is not the one this device computed",
                     ));
                 }
+                self.value_confirmed(pending)?
             }
             Ok(PairRedeemResult::Challenge(_)) => {
                 let _ = self.hosts.clear_attempt();
@@ -160,11 +169,14 @@ impl Pairing {
                     refusal.message,
                 ));
             }
-            // Whether the host locked the invitation is unknown; asking is how to find out.
+            // Whether the host locked the invitation is unknown; asking is how to find out, on a
+            // connection of its own.
             Err(LinkError::Lost(_) | LinkError::Configuration(_)) => {
+                drop(preauth);
+                drop(connection);
                 return self.await_approval(pending, None, progress).await;
             }
-        }
+        };
         progress.send_replace(awaiting(&pending));
         self.await_approval(pending, Some((connection, preauth)), progress)
             .await

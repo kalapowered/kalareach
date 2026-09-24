@@ -114,8 +114,20 @@ pub struct PendingAttempt {
     pub proposed_grant: ProposedGrant,
     /// The value both devices display, as this device computed it.
     pub verification_value: String,
+    /// True once the host has answered with the value this device computed. Until then the value
+    /// is not shown: a device shows it only when the host's value is the one it computed.
+    pub value_confirmed: bool,
     /// When the invitation expires, in UTC milliseconds, once the host has said.
     pub expires_at_ms: Option<u64>,
+    /// When this device stops asking, in UTC milliseconds on its own clock.
+    ///
+    /// It is set when the attempt starts, from what this device knows without the service's word:
+    /// an invitation lives five minutes, so a code entered now cannot be open much past five
+    /// minutes from now, and a direct invitation's expiry is in the payload the device read. The
+    /// host's own expiry, once it names one, can only bring it forward.
+    pub recover_until_ms: u64,
+    /// How many tries this device has left with the code, for a code attempt.
+    pub tries_left: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize)]
