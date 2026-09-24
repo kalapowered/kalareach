@@ -619,7 +619,10 @@ locations are printed twice over: the paths this host resolved, which is where y
 the rule this platform follows, which is where the next one would go. A location an allowlisted
 variable chose says so in place of the rule. This is your own host answering you about your own
 machine; a support bundle is written for somebody else to read and carries those paths as their
-class and their length instead. The value in
+class and their length instead. A paired device that asks this host for its diagnostics, its
+environments, its capabilities or its metadata is answered the way a bundle is written: it is told
+which environment this is and what it runs on, and never your account name, a path on your disk or
+what the platform said. The value in
 force is the one the host is enforcing, not the one the document asks for: where an effect could
 not be applied, the `configuration-in-force` check fails and says what stopped it, and the ceiling
 lines show both what was asked for and what is in force. `--json` carries the same two facts as

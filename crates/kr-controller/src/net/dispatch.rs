@@ -582,12 +582,11 @@ impl RemoteConnection {
         // host's own principal would be answered about the host's own objects.
         let actor_id = self.device.principal();
         let answer = match entry.method {
-            // `host.info` carries this host's sleep inhibition and the reason for it, and
-            // `environment.capabilities` carries the desktop's capability records with their
-            // platform distinctions. Both are the daemon's own answer, and a device is given the
-            // answer the owner's own socket is given: capability evidence describes feasibility
-            // and never authority, so narrowing it would say something untrue about the machine
-            // rather than protect anything.
+            // The four host-and-environment reads are the daemon's own answers, and what a device
+            // reads of them is their export form: the daemon decides the form by who asked, in the
+            // one function every such answer leaves through, so a device is told which
+            // environments these are, what they run on and what they can do, and never an account
+            // name, a local path or what the platform said.
             Method::HostInfo
             | Method::EnvironmentList
             | Method::EnvironmentCapabilities

@@ -264,31 +264,47 @@ prose beside each effective value, a ceiling's configured and in-force values an
 them, the precedence ladder, the documented rule for each location, why an override sits where it
 does, what stopped a document taking effect, what a fence is still owed, a component's name and
 version, what produced a redacted error and what a selected content export contains: each of them is
-one of those two types. A test walks every type a bundle, a `host.doctor` result and the capability
-evidence can reach, fills each field that takes arbitrary text with a marker by reading it in, and
-exports the result; the marker never appears.
+one of those two types. A test walks every type a bundle and the four host-and-environment answers
+a paired device is sent can reach, fills each field that takes arbitrary text with a marker by
+reading it in, and exports the result; the marker never appears.
 
-The allowlist is checked against the same three roots, through the schema rather than through a list
-of types. Every reference is followed, arrays and alternatives are descended, and every object the
-walk arrives at must have a class for each of its members, so a type that is reachable only inside
-another one is covered and a member added to one fails the build's own tests on the day it is added.
-Nothing may be classed that no export reaches, which keeps the list a record of what leaves rather
-than a place entries accumulate. One value is reported by its kind alone: the boot identity is
+The allowlist is checked against the same roots, through the schema of what a serialiser writes
+rather than through a list of types. Every reference and everything beside it is followed, arrays
+and alternatives are descended, and every object the walk arrives at must have a class for each of
+its members, so a type that is reachable only inside another one is covered and a member added to
+one fails the build's own tests on the day it is added. A form the walk cannot account for is
+refused rather than passed over: a value of any shape, a map, whose keys are text nothing classes,
+and a keyword that holds a schema the walk does not follow. Nothing may be classed that no export
+reaches, which keeps the list a record of what leaves rather than a place entries accumulate. One value is reported by its kind alone: the boot identity is
 opaque bytes that identify one boot of one machine, so an export says which kernel facility this
 platform reads it from and carries none of the value.
 
-`host.doctor` and `environment.capabilities` answer the owner's own socket with the display form
-and everybody else with the export form, each through one function that reduces every member of its
-answer. `host.info` has one response form, whose producers are this host's product metadata,
-counters and controlled power descriptions.
+### What a paired device reads of this host
 
-`environment.list` is the one host-and-environment read that answers a paired device with display
-values. Its labels are the owner's own names for the environments that device was granted, chosen by
-the owner and given to that device deliberately, so withholding them would take away the only thing
-that tells one environment from another on a device that is already allowed to use them. Nothing reads a value to decide about it, which is why an unfamiliar spelling
-changes nothing: a credential written in lower case, in an alphabet nobody expected, or in the
-middle of an ordinary sentence is gone for the same reason as any other, that the field it arrived
-in is one this host does not publish the text of.
+The four host-and-environment reads, `host.info`, `environment.list`, `environment.capabilities` and
+`host.doctor`, answer the owner's own socket with the display form and everybody else, a paired
+device among them, with the export form. One function in the daemon decides which form leaves, by
+who asked, and each answer's reduction sits beside its type, so a member added to an answer is
+reduced there or not at all.
+
+What a device reads is which environments these are, what they run on, how busy they are and what
+they can do, in this build's own words and numbers. It never reads an account name, a local path or
+what the platform said:
+
+| Read | What the device gets instead |
+| --- | --- |
+| `environment.list` | the operating-system user as a name's class and length; the runtime and state directories as a path's; a label written again as `environment <prefix> on <platform>`, because the owner's label names the account |
+| `host.info` | the name the platform shows for a sleep assertion and its reason for withholding one as their class and length; the facility the boot identity is read from, with none of its bytes; the build named in full only when it parses as one of this product's builds |
+| `environment.capabilities` | the capability evidence, the desktop context and the persistence table on the same terms as a support bundle |
+| `host.doctor` | the checks and the effective configuration on the same terms as a support bundle |
+
+The allowlist walk above has all four answers as roots, so a field added to one fails the build's
+own tests until it is classed.
+
+Nothing reads a value to decide about it, which is why an unfamiliar spelling changes nothing: a
+credential written in lower case, in an alphabet nobody expected, or in the middle of an ordinary
+sentence is gone for the same reason as any other, that the field it arrived in is one this host
+does not publish the text of.
 
 The locations `kr doctor` reports are both: the paths this host resolved, and the rule this platform
 follows. `$XDG_STATE_HOME/kalareach/environments/<prefix>`, or `~/.local/state/kalareach/...` where
@@ -1594,6 +1610,9 @@ What a device reaches, in order:
 3. **Reads the daemon owns** — the host, the environment list, the environment's capability
    records, the diagnostics, the session list, one session's metadata, and the repository and
    workspace metadata — are answered by the daemon, out of the same call a local caller reaches.
+   The four host-and-environment reads leave in their export form, with no account name, local
+   path or platform message in them; "What a paired device reads of this host" lists what each
+   carries instead.
 4. **Effects the daemon owns** — creating a session, and the repository and workspace mutations —
    are performed by the daemon, on a task that outlives the connection that asked. They name no
    session, so no worker owns them.

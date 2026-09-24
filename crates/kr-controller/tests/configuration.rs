@@ -594,6 +594,107 @@ async fn an_address_the_document_chose_that_cannot_be_bound_is_named() {
     drop(controller);
 }
 
+/// KR-REQ-26.44: a paired device reads no account name and no local path of the host it is paired
+/// with, from any of the four host-and-environment reads, and the owner's own socket still does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paired_device_reads_no_account_and_no_path_of_its_host() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (_device, session) = net_support::paired_device(&host, &owner, VIEWER).await;
+    let mut local = host.client().await;
+    let environment = host.tree().environment();
+    let paths = [
+        host.tree().root().display().to_string(),
+        environment.runtime_dir().display().to_string(),
+        environment.state_dir().display().to_string(),
+    ];
+
+    // The owner is told whose environment this is and where its directories are.
+    let owners: kr_protocol::hostinfo::EnvironmentListResult = typed(
+        &local
+            .request(Method::EnvironmentList, &())
+            .await
+            .expect("the call reaches the daemon")
+            .expect("environment.list is served on the local socket"),
+    );
+    let owners = &owners.environments[0];
+    assert_eq!(owners.runtime_directory, paths[1]);
+    assert_eq!(owners.state_directory, paths[2]);
+
+    // The device is told which environment it is, what it runs on and how busy it is.
+    let devices: kr_protocol::hostinfo::EnvironmentListResult = session
+        .read(Method::EnvironmentList, &())
+        .await
+        .expect("environment.list is served to the device");
+    let devices = &devices.environments[0];
+    assert_eq!(devices.environment_id, owners.environment_id);
+    assert_eq!(devices.os, owners.os);
+    assert_eq!(devices.arch, owners.arch);
+    assert_eq!(devices.live_sessions, owners.live_sessions);
+    assert_eq!(
+        devices.label,
+        format!(
+            "environment {} on {}",
+            kr_protocol::hostinfo::configuration::short_prefix(owners.environment_id),
+            owners.os
+        )
+    );
+    assert_eq!(
+        devices.os_user,
+        format!("[name withheld, {} bytes]", owners.os_user.len())
+    );
+    assert_eq!(
+        devices.runtime_directory,
+        format!("[path withheld, {} bytes]", paths[1].len())
+    );
+    assert_eq!(
+        devices.state_directory,
+        format!("[path withheld, {} bytes]", paths[2].len())
+    );
+
+    // And nothing any of the four answers sends the device names a directory of this host.
+    let host_info: kr_protocol::hostinfo::HostInfoResult = session
+        .read(Method::HostInfo, &())
+        .await
+        .expect("host.info is served to the device");
+    assert!(host_info.boot_identity.value.is_empty());
+    let environment_list: kr_protocol::hostinfo::EnvironmentListResult = session
+        .read(Method::EnvironmentList, &())
+        .await
+        .expect("environment.list is served to the device");
+    let capabilities: kr_protocol::desktop::EnvironmentCapabilitiesResult = session
+        .read(
+            Method::EnvironmentCapabilities,
+            &kr_protocol::desktop::EnvironmentCapabilitiesParams {
+                environment_id: host.environment_id,
+            },
+        )
+        .await
+        .expect("environment.capabilities is served to the device");
+    let doctor: HostDoctorResult = session
+        .read(Method::HostDoctor, &())
+        .await
+        .expect("host.doctor is served to the device");
+    let sent = [
+        serde_json::to_string(&host_info),
+        serde_json::to_string(&environment_list),
+        serde_json::to_string(&capabilities),
+        serde_json::to_string(&doctor),
+    ];
+    for answer in sent {
+        let answer = answer.expect("the answer serialises");
+        for path in &paths {
+            assert!(
+                !answer.contains(path.as_str()),
+                "{path} reached a paired device: {answer}"
+            );
+        }
+    }
+
+    session.close();
+    host.stop().await;
+}
+
 /// The session list a device may always ask for when its grant carries viewing.
 fn session_list() -> kr_protocol::session::SessionListParams {
     kr_protocol::session::SessionListParams {

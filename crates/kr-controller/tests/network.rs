@@ -1844,18 +1844,20 @@ async fn a_listing_names_only_the_sessions_a_grant_admits() {
     daemon.stop().await;
 }
 
-/// KR-REQ-23.25, KR-REQ-23.34, in part.
+/// KR-REQ-23.25, KR-REQ-23.34, in part, and KR-REQ-26.44 for the host reads.
 ///
-/// One answer, two doors. What the host does to a method's result before it leaves belongs to the
-/// method, not to the ingress the request arrived on: the grant decides what a device may ask
-/// about, and once it has admitted the subject the device is given the answer the owner's own
-/// socket is given. A second filter on one path and not the other would make the two ingresses
-/// disagree about what the same method means.
+/// Two doors. A session's answers are the same on both once the grant admits the subject: the
+/// grant decides what a device may ask about, and a second filter on one path and not the other
+/// would make the two ingresses disagree about what the same method means. The host's own
+/// metadata is the one thing each door reads differently, on purpose: the owner at their own
+/// machine is told whose account the environment belongs to and where its directories are, and a
+/// paired device reads the same answer with every account name, local path and platform message
+/// held to its class and its length.
 ///
-/// What this demonstrates is that parity, for the four reads this daemon answers itself. It is not
-/// evidence about diagnostic redaction or about `session.describe`'s own filtering, and the two
-/// callers are what they are: the environment's owner on one side and a paired device on the
-/// other, because no actor reaches this host through both doors.
+/// What this demonstrates is both halves: parity for the session reads, and the reduced form of
+/// `host.info` and `environment.list` for the device. The two callers are what they are: the
+/// environment's owner on one side and a paired device on the other, because no actor reaches this
+/// host through both doors.
 // Ignored by default: this suite starts real processes, and the binary it launches is built by
 // `scripts/end-to-end.sh`, which runs it with `--include-ignored`. A suite that skipped itself
 // silently when that binary was absent would report a pass for something it never ran.
@@ -1894,9 +1896,41 @@ async fn the_same_method_answers_both_ingresses_alike_once_the_grant_admits_the_
         .read(Method::HostInfo, &())
         .await
         .expect("host.info is served to the device");
+    // The same host, its counters and its identifiers; the boot's bytes and whatever the platform
+    // said about a sleep assertion stay with the owner.
     assert_eq!(
-        locally, remotely,
-        "host.info is the same answer on both ingresses"
+        (
+            remotely.environment_id,
+            remotely.generation,
+            remotely.protocol_version,
+            remotely.session_limit,
+            remotely.default_worker_profile,
+        ),
+        (
+            locally.environment_id,
+            locally.generation,
+            locally.protocol_version,
+            locally.session_limit,
+            locally.default_worker_profile,
+        ),
+        "host.info names the same host on both ingresses"
+    );
+    assert_eq!(
+        remotely.boot_identity.source, locally.boot_identity.source,
+        "the device is told which facility the boot identity comes from"
+    );
+    assert!(
+        remotely.boot_identity.value.is_empty(),
+        "and none of its value"
+    );
+    assert!(
+        remotely
+            .power
+            .holder
+            .as_ref()
+            .is_none_or(|holder| holder.starts_with("[name withheld, ")),
+        "{:?}",
+        remotely.power
     );
 
     let locally: kr_protocol::hostinfo::EnvironmentListResult = local
@@ -1910,9 +1944,45 @@ async fn the_same_method_answers_both_ingresses_alike_once_the_grant_admits_the_
         .read(Method::EnvironmentList, &())
         .await
         .expect("environment.list is served to the device");
+    // The owner is told the account and the directories; the device is told which environment
+    // this is, what it runs on and how busy it is, and nothing that names the account or a path.
+    let (owner, device) = (&locally.environments[0], &remotely.environments[0]);
+    assert_eq!(locally.environments.len(), remotely.environments.len());
     assert_eq!(
-        locally, remotely,
-        "environment.list is the same answer on both ingresses"
+        (
+            device.environment_id,
+            device.os.as_str(),
+            device.arch.as_str(),
+            device.live_sessions,
+        ),
+        (
+            owner.environment_id,
+            owner.os.as_str(),
+            owner.arch.as_str(),
+            owner.live_sessions,
+        ),
+    );
+    assert!(owner.runtime_directory.starts_with('/'), "{owner:?}");
+    assert_eq!(
+        device.os_user,
+        format!("[name withheld, {} bytes]", owner.os_user.len())
+    );
+    assert_eq!(
+        device.runtime_directory,
+        format!("[path withheld, {} bytes]", owner.runtime_directory.len())
+    );
+    assert_eq!(
+        device.state_directory,
+        format!("[path withheld, {} bytes]", owner.state_directory.len())
+    );
+    assert_eq!(
+        device.label,
+        format!(
+            "environment {} on {}",
+            kr_protocol::hostinfo::configuration::short_prefix(owner.environment_id),
+            owner.os
+        ),
+        "the device's label is the environment's prefix and platform, and names no account"
     );
 
     let locally: SessionReadResult = local

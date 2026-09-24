@@ -3991,13 +3991,23 @@ impl Controller {
         // later cannot forget which one it is.
         let owner = is_owners_own_socket(actor_id);
         let outcome = match method {
-            Method::HostInfo => self.host_info().await,
-            Method::EnvironmentCapabilities => {
-                self.environment_capabilities(&request.params, owner).await
-            }
-            Method::EnvironmentList => self.environment_list().await,
+            Method::HostInfo => self
+                .host_info()
+                .await
+                .and_then(|answer| host_read(answer, owner)),
+            Method::EnvironmentCapabilities => self
+                .environment_capabilities(&request.params)
+                .await
+                .and_then(|answer| host_read(answer, owner)),
+            Method::EnvironmentList => self
+                .environment_list()
+                .await
+                .and_then(|answer| host_read(answer, owner)),
             Method::EnvironmentInventory => self.environment_inventory(&request.params).await,
-            Method::HostDoctor => self.host_doctor(owner).await,
+            Method::HostDoctor => self
+                .host_doctor()
+                .await
+                .and_then(|answer| host_read(answer, owner)),
             Method::SessionList => self.session_list(&request.params).await,
             Method::SessionRead => self.session_read(&request.params).await,
             // A closed or crashed session's history and receipts are the archive's, and it serves
@@ -5113,7 +5123,7 @@ impl Controller {
         crate::agent_tools::Installer::discover(self.paths.state_dir())
     }
 
-    async fn host_info(self: &Arc<Self>) -> Result<ParamsValue> {
+    async fn host_info(self: &Arc<Self>) -> Result<HostInfoResult> {
         // Asking what this host is configured as is what puts its configuration into force, the
         // same way asking for its diagnostics is. Reading the numbers without accepting the
         // document first is how this answer comes to name a session ceiling or a sleep policy a
@@ -5123,7 +5133,7 @@ impl Controller {
         let live = registry.occupancy()?;
         let limit = registry.session_limit()?;
         drop(registry);
-        encode(&HostInfoResult {
+        Ok(HostInfoResult {
             build_id: self.build_id.clone(),
             protocol_version: PROTOCOL_VERSION,
             environment_id: self.paths.environment_id(),
@@ -5469,8 +5479,7 @@ impl Controller {
     async fn environment_capabilities(
         self: &Arc<Self>,
         params: &ParamsValue,
-        owner: bool,
-    ) -> Result<ParamsValue> {
+    ) -> Result<EnvironmentCapabilitiesResult> {
         let params: EnvironmentCapabilitiesParams = parse(params)?;
         if params.environment_id != self.paths.environment_id() {
             return Err(ControllerError::InvalidArgument(format!(
@@ -5478,7 +5487,7 @@ impl Controller {
                 self.paths.environment_id()
             )));
         }
-        let answer = EnvironmentCapabilitiesResult {
+        Ok(EnvironmentCapabilitiesResult {
             environment_id: self.paths.environment_id(),
             // The same answer `host.info` gives: what this host creates a session in when the
             // request chooses nothing, which is what the configuration resolves rather than what
@@ -5487,18 +5496,7 @@ impl Controller {
             desktop: self.capability_report().await?,
             persistence: crate::desktop::persistence(self.supervisor.describe()),
             power: self.power_state().await,
-        };
-        if owner {
-            return encode(&answer);
-        }
-        // The answer leaves this host here, so it crosses the same export boundary a support
-        // bundle does. A probe names the binary it found on `PATH` and repeats what that binary
-        // printed; the evidence this host keeps for its own comparisons is untouched, because a
-        // withheld path is no longer a path it can compare. One function reduces every member, so
-        // a member added to the answer cannot be forwarded by being forgotten here.
-        encode(&kr_protocol::hostinfo::export::environment_capabilities(
-            answer,
-        ))
+        })
     }
 
     /// Closes every session recorded in an earlier boot.
@@ -5573,11 +5571,11 @@ impl Controller {
         Ok(())
     }
 
-    async fn environment_list(&self) -> Result<ParamsValue> {
+    async fn environment_list(&self) -> Result<EnvironmentListResult> {
         let registry = self.registry.lock().await;
         let live = registry.occupancy()?;
         drop(registry);
-        encode(&EnvironmentListResult {
+        Ok(EnvironmentListResult {
             environments: vec![EnvironmentSummary {
                 environment_id: self.paths.environment_id(),
                 label: format!("{} on {}", whoami(), std::env::consts::OS),
@@ -6229,7 +6227,7 @@ impl Controller {
         }
     }
 
-    async fn host_doctor(self: &Arc<Self>, owner: bool) -> Result<ParamsValue> {
+    async fn host_doctor(self: &Arc<Self>) -> Result<HostDoctorResult> {
         let mut checks = Vec::new();
         checks.push(DoctorCheck::new(
             "runtime-directory",
@@ -6362,14 +6360,7 @@ impl Controller {
             self.catalogue_evidence.as_deref(),
             budgets,
         ));
-        let result = HostDoctorResult::new(checks, effective);
-        if owner {
-            return encode(&result);
-        }
-        // Not the owner's own terminal, so this is an export: every path this host composed from
-        // an account name, every label somebody wrote and every message a library produced leaves
-        // as its class and its length, beside the rule this platform follows.
-        encode(kr_protocol::hostinfo::export::ForExport::for_export(result).get())
+        Ok(HostDoctorResult::new(checks, effective))
     }
 
     async fn session_list(self: &Arc<Self>, params: &ParamsValue) -> Result<ParamsValue> {
@@ -8321,6 +8312,30 @@ fn encode<T: serde::Serialize>(value: &T) -> Result<ParamsValue> {
 /// than the one that publishes.
 fn is_owners_own_socket(actor_id: &ActorId) -> bool {
     actor_id.as_str().starts_with(LOCAL_PRINCIPAL_PREFIX)
+}
+
+/// Encodes one host-and-environment read for whoever asked: the one function that decides what a
+/// paired device reads of this host.
+///
+/// The owner at their own machine, on its owner-only socket, is answered with the display form:
+/// the account the environments belong to, the directories this host resolved, what the platform
+/// said. Everybody else - a paired device, and any caller that is not the owner's own socket - is
+/// answered with the export form of the same answer,
+/// [`kr_protocol::hostinfo::export::ForExport::for_export`], which carries each
+/// account name, path and platform message as its class and its length and composes the rest
+/// from this build's own words. The four answers are `host.info`, `environment.list`,
+/// `environment.capabilities` and `host.doctor`; each has its one reduction beside its type, and
+/// the protocol's tests walk every field of all four, so a field added to one is classed before it
+/// can be sent.
+fn host_read<T>(answer: T, owner: bool) -> Result<ParamsValue>
+where
+    T: kr_protocol::hostinfo::export::ForExport + serde::Serialize,
+{
+    if owner {
+        encode(&answer)
+    } else {
+        encode(answer.for_export().get())
+    }
 }
 
 /// How the local listener names the operating-system peer it admitted.

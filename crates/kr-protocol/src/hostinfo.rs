@@ -50,6 +50,44 @@ pub struct HostInfoResult {
     pub power: SleepInhibitionState,
 }
 
+impl export::ForExport for HostInfoResult {
+    /// This host's metadata as somebody other than its owner at this machine reads it.
+    ///
+    /// Almost all of it is this build's own: the protocol, the identifiers it generated, its
+    /// counters and its closed words. Three values are not. The name the operating system shows
+    /// for a sleep assertion and the sentence it gives for withholding one leave as their class and
+    /// their length, and the boot this host is in leaves as the facility it was read from with none
+    /// of its value, exactly as they leave `environment.capabilities`. The build identity is named
+    /// in full when it parses as one of this product's builds, as a support bundle names it, and
+    /// as its class and its length when it does not.
+    fn for_export(self) -> export::Exported<Self> {
+        export::Exported::of(Self {
+            build_id: export::build_id(&self.build_id),
+            boot_identity: export::boot_identity(&self.boot_identity),
+            power: export::sleep_inhibition(self.power),
+            ..self
+        })
+    }
+}
+
+impl export::ForExport for EnvironmentListResult {
+    /// The environments as somebody other than their owner at this machine reads them.
+    ///
+    /// What they are, what they run on and how busy they are, with no account and no directory:
+    /// the operating-system user leaves as a name's class and length, the runtime and state
+    /// directories as a path's, and the label, which names the account for the owner, is written
+    /// again from the environment's own short prefix and its platform.
+    fn for_export(self) -> export::Exported<Self> {
+        export::Exported::of(Self {
+            environments: self
+                .environments
+                .into_iter()
+                .map(EnvironmentSummary::withheld_form)
+                .collect(),
+        })
+    }
+}
+
 /// One environment this host serves.
 ///
 /// Read-only metadata: a field a newer host adds is explicitly optional, and a client whose schema
@@ -74,6 +112,39 @@ pub struct EnvironmentSummary {
     pub state_directory: String,
     /// How many sessions are live or creating.
     pub live_sessions: U64,
+}
+
+impl EnvironmentSummary {
+    /// Returns this environment with every field held to what may leave this host.
+    ///
+    /// Each field goes on the terms the allowlist gives it. The label is the one that is not
+    /// measured: a record of its length would say nothing a person could use, so it is written
+    /// again from what may leave, `environment <prefix> on <platform>`, with the short prefix this
+    /// environment's own directories are named by.
+    fn withheld_form(self) -> Self {
+        let os = export::carry(export::class("EnvironmentSummary", "os"), &self.os);
+        Self {
+            label: format!(
+                "environment {} on {os}",
+                configuration::short_prefix(self.environment_id)
+            ),
+            arch: export::carry(export::class("EnvironmentSummary", "arch"), &self.arch),
+            os_user: export::carry(
+                export::class("EnvironmentSummary", "os_user"),
+                &self.os_user,
+            ),
+            runtime_directory: export::carry(
+                export::class("EnvironmentSummary", "runtime_directory"),
+                &self.runtime_directory,
+            ),
+            state_directory: export::carry(
+                export::class("EnvironmentSummary", "state_directory"),
+                &self.state_directory,
+            ),
+            os,
+            ..self
+        }
+    }
 }
 
 /// The result of `environment.list`.
@@ -3448,7 +3519,8 @@ pub mod configuration {
     /// comes from a table this module or the protocol already owns: the preference keys, the
     /// selection keys and the words their values are reported in, the ceiling keys, the enrolment
     /// budgets, the documented environment variables, the variables this build reads outside the
-    /// precedence, and the wire words of the closed enumerations a report names. A string that is
+    /// precedence, the wire words of the closed enumerations a report names, and the operating
+    /// system and processor words of the platform this build was compiled for. A string that is
     /// none of them is something somebody else wrote, and a sentence carries its class and its
     /// length instead.
     #[must_use]
@@ -3465,6 +3537,9 @@ pub mod configuration {
                 .iter()
                 .any(|entry| entry.variable == value)
             || WIRE_WORDS.contains(&value)
+            // The platform this build was compiled for, in the words the compiler wrote in.
+            || value == std::env::consts::OS
+            || value == std::env::consts::ARCH
             || crate::desktop::CAPABILITIES.contains(&value)
             || crate::desktop::SleepInhibitionSetting::from_wire(value).is_some()
             || value.parse::<crate::rights::ActionRight>().is_ok()
@@ -3942,6 +4017,53 @@ pub mod export {
             "records",
             ContentClass::Structure,
         ),
+        // `host.info`, as a paired device reads it. The build identity is composed from the closed
+        // word and the three numbers a parse keeps, or leaves as a name's record when it does not
+        // parse; the boot and the sleep state go through the reductions every other answer uses.
+        field("HostInfoResult", "build_id", ContentClass::Identifier),
+        field(
+            "HostInfoResult",
+            "protocol_version",
+            ContentClass::Structure,
+        ),
+        field("HostInfoResult", "environment_id", ContentClass::Identifier),
+        field("HostInfoResult", "generation", ContentClass::Identifier),
+        field("HostInfoResult", "boot_identity", ContentClass::Structure),
+        field("HostInfoResult", "started_at_ms", ContentClass::Number),
+        field("HostInfoResult", "live_sessions", ContentClass::Number),
+        field("HostInfoResult", "session_limit", ContentClass::Number),
+        field(
+            "HostInfoResult",
+            "default_worker_profile",
+            ContentClass::Term,
+        ),
+        field("HostInfoResult", "power", ContentClass::Structure),
+        field("ProtocolVersion", "major", ContentClass::Number),
+        field("ProtocolVersion", "minor", ContentClass::Number),
+        // `environment.list`, as a paired device reads it. The account and the directories are
+        // somebody else's names; the label names the account for the owner, so it is written again
+        // from the environment's prefix and its platform rather than measured.
+        field(
+            "EnvironmentListResult",
+            "environments",
+            ContentClass::Structure,
+        ),
+        field(
+            "EnvironmentSummary",
+            "environment_id",
+            ContentClass::Identifier,
+        ),
+        field("EnvironmentSummary", "label", ContentClass::Name),
+        field("EnvironmentSummary", "os", ContentClass::Term),
+        field("EnvironmentSummary", "arch", ContentClass::Term),
+        field("EnvironmentSummary", "os_user", ContentClass::Name),
+        field(
+            "EnvironmentSummary",
+            "runtime_directory",
+            ContentClass::Path,
+        ),
+        field("EnvironmentSummary", "state_directory", ContentClass::Path),
+        field("EnvironmentSummary", "live_sessions", ContentClass::Number),
     ];
 
     const fn field(
@@ -4711,16 +4833,60 @@ pub mod export {
                     .as_ref()
                     .map(|_| withheld_identity()),
             ),
-            boot_identity: crate::identity::BootIdentity {
-                // Which kernel facility this platform reads its boot identity from, which is a
-                // word of this build's own and a useful thing to know about a host. The value is
-                // bytes: one boot of one machine, compared for equality and never interpreted, so
-                // nobody reading an export has anything to compare it to and it does not leave.
-                source: context.boot_identity.source,
-                value: crate::scalars::Bytes::new(Vec::new()),
-            },
+            boot_identity: boot_identity(&context.boot_identity),
             ..context
         }
+    }
+
+    /// Returns a boot identity as it leaves this host: the facility it was read from, and none of
+    /// its value.
+    ///
+    /// Which kernel facility this platform reads its boot identity from is a word of this build's
+    /// own and a useful thing to know about a host. The value is bytes: one boot of one machine,
+    /// compared for equality and never interpreted, so nobody reading an export has anything to
+    /// compare it to and it does not leave. The one reduction every answer that carries a boot
+    /// identity goes through.
+    pub(super) fn boot_identity(
+        boot: &crate::identity::BootIdentity,
+    ) -> crate::identity::BootIdentity {
+        crate::identity::BootIdentity {
+            source: boot.source,
+            value: crate::scalars::Bytes::new(Vec::new()),
+        }
+    }
+
+    /// Returns this host's sleep inhibition as it leaves this host.
+    ///
+    /// The name the operating system shows for the assertion and the sentence it gives for
+    /// withholding one are the platform's words about this machine, so both leave as their class
+    /// and their length, and the class comes from the allowlist rather than from here: a field of
+    /// this type added later is classed in the one place every other exported field is, or the
+    /// tests refuse it. The one reduction every answer that carries the sleep state goes through.
+    pub(super) fn sleep_inhibition(
+        power: crate::desktop::SleepInhibitionState,
+    ) -> crate::desktop::SleepInhibitionState {
+        crate::desktop::SleepInhibitionState {
+            holder: carry_null(class("SleepInhibitionState", "holder"), &power.holder),
+            withheld_reason: carry_null(
+                class("SleepInhibitionState", "withheld_reason"),
+                &power.withheld_reason,
+            ),
+            ..power
+        }
+    }
+
+    /// Returns a build identifier as it leaves this host.
+    ///
+    /// Named in full when it parses as one of this product's builds, composed from the closed word
+    /// and the three numbers the parse keeps, and as its class and its length when it does not:
+    /// the text arrived in a reply or a setup value, and nothing about where it came from says it
+    /// is one.
+    pub(super) fn build_id(id: &crate::ids::BuildId) -> crate::ids::BuildId {
+        let text = BuildIdentity::parse(id.as_str()).map_or_else(
+            || withheld(ContentClass::Name, id.as_str()),
+            |build| build.to_string(),
+        );
+        crate::ids::BuildId::new(text).expect("a build identity or its record is an identifier")
     }
 
     /// The identifier a withheld desktop identity leaves as.
@@ -4772,43 +4938,27 @@ pub mod export {
         crate::ids::CapabilityId::new("[name withheld]").expect(why)
     }
 
-    /// Returns one environment's capability answer, every part of it through the allowlist.
-    ///
-    /// The one place this answer crosses a boundary. Every member that carries text is reduced
-    /// here rather than at the caller, so a member added to the answer is reduced by this function
-    /// or by nothing: a caller that reduced the records and forgot the persistence table would be
-    /// the failure this exists to prevent.
-    #[must_use]
-    pub fn environment_capabilities(
-        result: crate::desktop::EnvironmentCapabilitiesResult,
-    ) -> crate::desktop::EnvironmentCapabilitiesResult {
-        crate::desktop::EnvironmentCapabilitiesResult {
-            desktop: crate::desktop::DesktopCapabilityReport {
-                desktop: desktop_context(result.desktop.desktop),
-                records: capability_records(result.desktop.records),
-            },
-            persistence: result
-                .persistence
-                .iter()
-                .map(crate::desktop::ProfilePersistence::withheld_form)
-                .collect(),
-            power: crate::desktop::SleepInhibitionState {
-                // The name the operating system shows for the assertion and the sentence it gives
-                // for withholding one. Both are the platform's words about this machine, so both
-                // leave as their class and their length, and the class comes from the allowlist
-                // rather than from here: a field of this type added later is classed in the one
-                // place every other exported field is, or the tests refuse it.
-                holder: carry_null(
-                    class("SleepInhibitionState", "holder"),
-                    &result.power.holder,
-                ),
-                withheld_reason: carry_null(
-                    class("SleepInhibitionState", "withheld_reason"),
-                    &result.power.withheld_reason,
-                ),
-                ..result.power
-            },
-            ..result
+    impl ForExport for crate::desktop::EnvironmentCapabilitiesResult {
+        /// One environment's capability answer, every part of it through the allowlist.
+        ///
+        /// The one place this answer crosses a boundary. Every member that carries text is reduced
+        /// here rather than at the caller, so a member added to the answer is reduced by this
+        /// function or by nothing: a caller that reduced the records and forgot the persistence
+        /// table would be the failure this exists to prevent.
+        fn for_export(self) -> Exported<Self> {
+            Exported::of(Self {
+                desktop: crate::desktop::DesktopCapabilityReport {
+                    desktop: desktop_context(self.desktop.desktop),
+                    records: capability_records(self.desktop.records),
+                },
+                persistence: self
+                    .persistence
+                    .iter()
+                    .map(crate::desktop::ProfilePersistence::withheld_form)
+                    .collect(),
+                power: sleep_inhibition(self.power),
+                ..self
+            })
         }
     }
 
@@ -5224,21 +5374,29 @@ mod tests {
         Ok(reached)
     }
 
-    /// KR-REQ-26.44: the allowlist covers every field of every type an export can reach.
+    /// KR-REQ-26.44: the allowlist covers every field of every type an export can reach, and of
+    /// the four host reads a paired device is sent.
     ///
     /// Walked from the export roots through the schema of what is written rather than through a
     /// list of types somebody keeps up to date, by [`reach`]. So a type reached only inside
     /// another exported type is covered, and a member added to one tomorrow fails this on the day
-    /// it is added whether or not anything in this file names it.
+    /// it is added whether or not anything in this file names it: `host.info`,
+    /// `environment.list`, `environment.capabilities` and `host.doctor` are all roots, so a field
+    /// added to what a device reads is classed before it can be sent.
     #[test]
     fn every_exported_field_is_classed() {
         let mut generator = export_generator();
+        // A support bundle, and the four host-and-environment answers a paired device is sent.
         let roots = vec![
             generator.subschema_for::<SupportBundle>().to_value(),
-            generator.subschema_for::<HostDoctorResult>().to_value(),
+            generator.subschema_for::<HostInfoResult>().to_value(),
+            generator
+                .subschema_for::<EnvironmentListResult>()
+                .to_value(),
             generator
                 .subschema_for::<crate::desktop::EnvironmentCapabilitiesResult>()
                 .to_value(),
+            generator.subschema_for::<HostDoctorResult>().to_value(),
         ];
         let defined = generator.take_definitions(false);
         let reached = reach(&roots, &defined).unwrap_or_else(|problem| panic!("{problem}"));
@@ -5801,9 +5959,133 @@ mod tests {
         assert!(count > 8, "the marker reached {count} fields");
         let parsed: crate::desktop::EnvironmentCapabilitiesResult =
             serde_json::from_value(planted).expect("an answer parses");
-        let written = serde_json::to_string(&export::environment_capabilities(parsed))
+        let written = serde_json::to_string(&export::ForExport::for_export(parsed))
             .expect("the export serialises");
         assert!(!written.contains(PLANTED), "{written}");
+
+        // The host's metadata, which is what `host.info` sends a paired device.
+        let (planted, count) = plant_everywhere::<_, HostInfoResult>(&a_host_info());
+        assert!(count >= 3, "the marker reached {count} fields");
+        let parsed: HostInfoResult = serde_json::from_value(planted).expect("an answer parses");
+        let written = serde_json::to_string(&export::ForExport::for_export(parsed))
+            .expect("the export serialises");
+        assert!(!written.contains(PLANTED), "{written}");
+
+        // The environments, which is what `environment.list` sends a paired device.
+        let (planted, count) = plant_everywhere::<_, EnvironmentListResult>(&an_environment_list());
+        assert!(count >= 6, "the marker reached {count} fields");
+        let parsed: EnvironmentListResult =
+            serde_json::from_value(planted).expect("an answer parses");
+        let written = serde_json::to_string(&export::ForExport::for_export(parsed))
+            .expect("the export serialises");
+        assert!(!written.contains(PLANTED), "{written}");
+    }
+
+    /// One host's metadata, as the owner's own socket is answered with it.
+    fn a_host_info() -> HostInfoResult {
+        HostInfoResult {
+            build_id: crate::ids::BuildId::new("kr-controller/0.1.0").expect("a build"),
+            protocol_version: crate::hello::ProtocolVersion::new(1, 0),
+            environment_id: an_environment(),
+            generation: crate::ids::ControllerGeneration::new(3),
+            boot_identity: a_desktop().boot_identity,
+            started_at_ms: TimestampMs::new(1),
+            live_sessions: U64::new(2),
+            session_limit: U64::new(128),
+            default_worker_profile: WorkerProfile::HeadlessUser,
+            power: crate::desktop::SleepInhibitionState {
+                holder: Nullable::some("kalareach work for someone".to_owned()),
+                withheld_reason: Nullable::some("someone asked for battery".to_owned()),
+                ..crate::desktop::SleepInhibitionState::off(
+                    crate::desktop::InhibitionMechanism::None,
+                    crate::desktop::PowerSource::Unknown,
+                )
+            },
+        }
+    }
+
+    /// One environment list, as the owner's own socket is answered with it.
+    fn an_environment_list() -> EnvironmentListResult {
+        EnvironmentListResult {
+            environments: vec![EnvironmentSummary {
+                environment_id: an_environment(),
+                label: format!("someone on {}", std::env::consts::OS),
+                os: std::env::consts::OS.to_owned(),
+                arch: std::env::consts::ARCH.to_owned(),
+                os_user: "someone".to_owned(),
+                runtime_directory: "/run/user/1000/kalareach/03030303".to_owned(),
+                state_directory: "/home/someone/.local/state/kalareach/environments/03030303"
+                    .to_owned(),
+                live_sessions: U64::new(2),
+            }],
+        }
+    }
+
+    /// KR-REQ-26.44: a paired device reads no account name and no local path of its host.
+    ///
+    /// The owner's own socket is answered with the display form of the four host reads, which
+    /// names both, and everybody else with the export form. `environment.list` carries the
+    /// operating-system user and the runtime and state directories, and its label names the
+    /// account; `host.info` carries the name the platform shows for a sleep assertion, its reason
+    /// and the boot's bytes. None of it reaches what a device is sent, and what is left still says
+    /// which environment this is, what it runs on and how busy it is.
+    #[test]
+    fn a_device_reads_no_account_and_no_path_of_its_host() {
+        let exported = export::ForExport::for_export(an_environment_list());
+        let environment = &exported.get().environments[0];
+        assert_eq!(
+            environment.label,
+            format!("environment 03030303 on {}", std::env::consts::OS),
+            "the label says which environment this is without naming the account"
+        );
+        assert_eq!(environment.os, std::env::consts::OS);
+        assert_eq!(environment.arch, std::env::consts::ARCH);
+        assert_eq!(environment.os_user, "[name withheld, 7 bytes]");
+        assert_eq!(environment.runtime_directory, "[path withheld, 33 bytes]");
+        assert!(
+            environment.state_directory.starts_with("[path withheld, "),
+            "{}",
+            environment.state_directory
+        );
+        assert_eq!(environment.live_sessions.get(), 2);
+        let written = serde_json::to_string(&exported).expect("the export serialises");
+        for leaked in ["someone", "/run/", "/home/", ".local"] {
+            assert!(
+                !written.contains(leaked),
+                "{leaked} reached a device: {written}"
+            );
+        }
+
+        let info = a_host_info();
+        let exported = export::ForExport::for_export(info.clone());
+        let sent = exported.get();
+        assert_eq!(sent.build_id.as_str(), "kr-controller/0.1.0");
+        assert_eq!(sent.boot_identity.source, info.boot_identity.source);
+        assert!(sent.boot_identity.value.is_empty());
+        assert_eq!(
+            sent.power.holder.as_ref().map(String::as_str),
+            Some("[name withheld, 26 bytes]")
+        );
+        assert_eq!(
+            sent.power.withheld_reason.as_ref().map(String::as_str),
+            Some("[message withheld, 25 bytes]")
+        );
+        assert_eq!(
+            (sent.live_sessions, sent.session_limit, sent.environment_id),
+            (info.live_sessions, info.session_limit, info.environment_id)
+        );
+        let written = serde_json::to_string(&exported).expect("the export serialises");
+        assert!(!written.contains("someone"), "{written}");
+
+        // A build identifier that is not one of this product's builds is a name like any other.
+        let other = HostInfoResult {
+            build_id: crate::ids::BuildId::new("kr-test/0").expect("a build identifier"),
+            ..a_host_info()
+        };
+        assert_eq!(
+            export::ForExport::for_export(other).get().build_id.as_str(),
+            "[name withheld, 9 bytes]"
+        );
     }
 
     /// KR-REQ-26.44: an exported boot identity says which facility it came from and carries none
@@ -5837,7 +6119,8 @@ mod tests {
             "the reply carries the bytes to be reduced"
         );
 
-        let exported = export::environment_capabilities(read.clone());
+        let exported = export::ForExport::for_export(read.clone());
+        let exported = exported.get();
         assert_eq!(
             exported.desktop.desktop.boot_identity.source, desktop.boot_identity.source,
             "which facility this platform reads is kept"
