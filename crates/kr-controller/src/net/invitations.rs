@@ -1,15 +1,28 @@
 //! The host's durable pairing records.
 //!
-//! Five tables in the daemon's registry database, beside the device directory and written through
+//! Six tables in the daemon's registry database, beside the device directory and written through
 //! its connection, so one transaction can hold a device row and the records of how it was admitted:
 //!
 //! | Table | What it holds |
 //! | --- | --- |
-//! | `pairing_invitations` | Every invitation this host issued: kr-pairing's record, its mode and origin, the proposed grant, and who issued it under which action |
+//! | `pairing_invitations` | Every invitation this host issued: kr-pairing's record, its mode and origin, the proposed grant, and who issued it |
 //! | `pairing_commitments` | What each completed pairing committed, the owner's proof included |
 //! | `pairing_events` | The retained security outbox: one immutable row per completed pairing |
 //! | `host_owner` | Whether, and how, this host has an owner |
 //! | `owner_confirmations` | The acceptance record: each owner confirmation answered, and the effect that consumed it |
+//! | `pairing_actions` | Every pairing mutation this host answered: whose, under which action identifier, with the digest of which payload, and what it acted on |
+//!
+//! # One action identity per answer
+//!
+//! Section 9 keys a mutation by its verified actor and its action identifier, answers an exact
+//! repeat with the existing outcome and refuses the identifier reused with another payload as
+//! `ID_CONFLICT`. `pairing_actions` is that key for the five pairing mutations, one table for all
+//! five, so an identifier spent on one of them is spent on every one. A mutation's row is written in
+//! the transaction that writes its effect, so no effect exists without it and no row exists for an
+//! effect that did not happen; an answer that wrote nothing else, such as a repeat confirmation of
+//! a pairing that already committed, writes its row on its own before it is given. A retained answer
+//! is read back through the row and nowhere else: from the row's subject, and only for the payload
+//! whose digest it holds.
 //!
 //! Section 10 is why the invitation records are durable even though a candidate's attempt is not.
 //! A host restart cancels every unfinished invitation, because nothing can resume an attempt that
@@ -39,6 +52,7 @@ use kr_protocol::ids::{
     ActionId, ActorId, AttemptId, ConfirmationId, DeviceId, InvitationId, PairingEventSequence,
 };
 use kr_protocol::invitation::{InviteGrantKind, InviteModeKind, PairingSecurityEvent};
+use kr_protocol::method::Method;
 use kr_protocol::pairing::{
     ClientBundle, ConfirmationChannel, DevicePublicKeys, KeyPurpose, Locator,
     OwnerConfirmationProof, OwnerConfirmationRequest, PairingConsumedReason, ProposedGrant,
@@ -92,14 +106,9 @@ pub fn prepare(directory: &DeviceDirectory) -> Result<()> {
                      proposed_grant BLOB NOT NULL,
                      issuing_actor TEXT NOT NULL,
                      issuing_ingress TEXT NOT NULL,
-                     issuing_action_id BLOB,
-                     mutation_digest BLOB,
                      issued_at_ms INTEGER NOT NULL,
                      confirmation_id BLOB NOT NULL
                  );
-                 CREATE UNIQUE INDEX IF NOT EXISTS pairing_invitations_action
-                     ON pairing_invitations (issuing_actor, issuing_action_id)
-                     WHERE issuing_action_id IS NOT NULL;
                  CREATE TABLE IF NOT EXISTS pairing_commitments (
                      invitation_id BLOB PRIMARY KEY NOT NULL,
                      commitment BLOB NOT NULL
@@ -117,11 +126,14 @@ pub fn prepare(directory: &DeviceDirectory) -> Result<()> {
                      invitation_id BLOB,
                      established_at_ms INTEGER NOT NULL
                  );
-                 CREATE TABLE IF NOT EXISTS owner_confirmation_requests (
+                 CREATE TABLE IF NOT EXISTS pairing_actions (
                      actor TEXT NOT NULL,
                      action_id BLOB NOT NULL,
+                     method TEXT NOT NULL,
                      mutation_digest BLOB NOT NULL,
-                     request BLOB NOT NULL,
+                     subject BLOB NOT NULL,
+                     challenge BLOB,
+                     recorded_at_ms INTEGER NOT NULL,
                      PRIMARY KEY (actor, action_id)
                  );
                  CREATE TABLE IF NOT EXISTS owner_confirmations (
@@ -217,25 +229,87 @@ pub struct IssueTerms {
     pub issuing_actor: ActorId,
     /// How that owner reached the host.
     pub issuing_ingress: ActorIngress,
-    /// The action that issued it and the digest of that whole mutation, so a retry is recognised
-    /// after a restart without anything secret having been written.
-    pub action: Option<(ActionId, Digest256)>,
     /// When it was issued, in UTC milliseconds.
     pub issued_at_ms: TimestampMs,
+}
+
+/// One pairing mutation as `pairing_actions` holds it: whose it is, under which action identifier,
+/// the digest of its whole payload, and what it acted on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PairingAction {
+    /// The verified actor that submitted it.
+    pub actor: ActorId,
+    /// Its action identifier.
+    pub action_id: ActionId,
+    /// The digest of the whole mutation, as every retained action on this host is keyed.
+    pub digest: Digest256,
+    /// What it acted on.
+    pub subject: ActionSubject,
+}
+
+/// What one pairing mutation acted on, which is what a repeat of it is answered from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActionSubject {
+    /// `owner.confirmation.request`: the challenge it was given.
+    Requested(Box<OwnerConfirmationRequest>),
+    /// `owner.confirmation.complete`: the challenge whose answer it recorded.
+    Completed(ConfirmationId),
+    /// `pair.invite`: the invitation it issued.
+    Issued(InvitationId),
+    /// `pair.confirm`: the invitation whose candidate it committed.
+    Confirmed(InvitationId),
+    /// `pair.cancel`: the invitation it ended.
+    Ended(InvitationId),
+}
+
+impl ActionSubject {
+    /// Returns the name of the method a mutation with this subject is.
+    #[must_use]
+    pub const fn method(&self) -> Method {
+        match self {
+            Self::Requested(_) => Method::OwnerConfirmationRequest,
+            Self::Completed(_) => Method::OwnerConfirmationComplete,
+            Self::Issued(_) => Method::PairInvite,
+            Self::Confirmed(_) => Method::PairConfirm,
+            Self::Ended(_) => Method::PairCancel,
+        }
+    }
+
+    /// Returns the identity of what it acted on: a challenge or an invitation.
+    fn identity(&self) -> Uuid {
+        match self {
+            Self::Requested(request) => request.confirmation_id.get(),
+            Self::Completed(confirmation_id) => confirmation_id.get(),
+            Self::Issued(invitation_id)
+            | Self::Confirmed(invitation_id)
+            | Self::Ended(invitation_id) => invitation_id.get(),
+        }
+    }
 }
 
 /// The check an owner mutation makes immediately before its effect: its connection's registration
 /// under the revision it was admitted at, and the deadline it was accepted with.
 pub type Admission = Arc<dyn Fn() -> Result<()> + Send + Sync>;
 
-/// The admission of the owner mutation an invitation's next write is made for.
+/// The owner mutation an invitation's next write is made for: its admission, and its action.
 ///
-/// Set for the length of one call into kr-pairing and asked inside the transaction that call's
-/// write takes, after every lock and every wait before it: the owner's own confirmation, the
-/// invitation's lock and the database's. A candidate's steps and the restart sweep write with it
-/// empty, because no owner mutation is waiting on them.
+/// Set for the length of one call into kr-pairing. The admission is asked inside the transaction
+/// that call's write takes, after every lock and every wait before it: the owner's own
+/// confirmation, the invitation's lock and the database's. The action is recorded by the one write
+/// that is its effect, in that write's transaction: the commit a confirmation asked for, or the
+/// ending a withdrawal or a denial asked for, and no other write the call happens to make. A
+/// candidate's steps and the restart sweep write with the slot empty, because no owner mutation is
+/// waiting on them.
 #[derive(Clone, Default)]
-pub struct WriteAdmission(Arc<Mutex<Option<Admission>>>);
+pub struct WriteAdmission(Arc<Mutex<Option<OwnerWrite>>>);
+
+/// What the slot holds while an owner mutation drives an invitation.
+struct OwnerWrite {
+    admission: Admission,
+    action: Option<PairingAction>,
+    /// Whether the write that is the action's effect committed, recording it.
+    recorded: bool,
+}
 
 impl std::fmt::Debug for WriteAdmission {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -247,27 +321,56 @@ impl std::fmt::Debug for WriteAdmission {
 }
 
 impl WriteAdmission {
-    /// Runs `call` with `admission` asked inside every write it makes, and clears it afterwards,
-    /// however `call` ends.
-    pub fn during<T>(&self, admission: &Admission, call: impl FnOnce() -> T) -> T {
+    /// Runs `call` with `admission` asked inside every write it makes and `action` recorded by the
+    /// write that is its effect, and clears both afterwards, however `call` ends.
+    ///
+    /// Returns what `call` returned, and whether that write committed and recorded the action.
+    pub fn during<T>(
+        &self,
+        admission: &Admission,
+        action: Option<PairingAction>,
+        call: impl FnOnce() -> T,
+    ) -> (T, bool) {
         struct Clear<'a>(&'a WriteAdmission);
         impl Drop for Clear<'_> {
             fn drop(&mut self) {
                 *self.0.held() = None;
             }
         }
-        *self.held() = Some(Arc::clone(admission));
-        let _clear = Clear(self);
-        call()
+        *self.held() = Some(OwnerWrite {
+            admission: Arc::clone(admission),
+            action,
+            recorded: false,
+        });
+        let clear = Clear(self);
+        let answer = call();
+        let recorded = self.held().as_ref().is_some_and(|held| held.recorded);
+        drop(clear);
+        (answer, recorded)
     }
 
     /// Asks the admission a write is being made under, when one is.
     fn check(&self) -> Result<()> {
-        let admission = self.held().clone();
+        let admission = self.held().as_ref().map(|held| Arc::clone(&held.admission));
         admission.map_or(Ok(()), |admission| admission())
     }
 
-    fn held(&self) -> MutexGuard<'_, Option<Admission>> {
+    /// Returns the action a write records, when the write is the effect `subject` names.
+    fn action_for(&self, subject: &ActionSubject) -> Option<PairingAction> {
+        self.held()
+            .as_ref()
+            .and_then(|held| held.action.clone())
+            .filter(|action| &action.subject == subject)
+    }
+
+    /// Notes that the write that is the action's effect committed with its record.
+    fn note_recorded(&self) {
+        if let Some(held) = self.held().as_mut() {
+            held.recorded = true;
+        }
+    }
+
+    fn held(&self) -> MutexGuard<'_, Option<OwnerWrite>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -339,8 +442,9 @@ impl StoredCommitment {
 /// The pairing records, as kr-pairing's [`InvitationStore`].
 ///
 /// A handle carries the terms of the invitation it is about to issue, when it is about to issue
-/// one: kr-pairing's `create` hands over its own record and the proof, and the host's own terms
-/// travel here so the row is written complete in one statement.
+/// one, and the action that issues it: kr-pairing's `create` hands over its own record and the
+/// proof, and the host's own terms and the action travel here so the invitation and its action's
+/// record are written in one transaction.
 ///
 /// A handle that issues an invitation also carries that invitation's [`WriteAdmission`]: the
 /// admission of the owner mutation its next write is made for, asked inside that write's
@@ -349,8 +453,17 @@ impl StoredCommitment {
 pub struct InvitationRows {
     directory: Arc<DeviceDirectory>,
     lifetimes: Arc<GrantLifetimes>,
-    issue: Option<Arc<IssueTerms>>,
+    issue: Option<Arc<Issuing>>,
     admission: WriteAdmission,
+}
+
+/// What a handle that issues an invitation writes with it.
+#[derive(Debug)]
+struct Issuing {
+    terms: IssueTerms,
+    /// The action that issues it and the digest of that whole mutation, recorded with the
+    /// invitation so a retry is recognised after a restart without anything secret being written.
+    action: (ActionId, Digest256),
 }
 
 impl InvitationRows {
@@ -366,14 +479,14 @@ impl InvitationRows {
         }
     }
 
-    /// Returns a handle that issues one invitation under these terms, with an admission slot of
-    /// its own.
+    /// Returns a handle that issues one invitation under these terms, for the action given, with an
+    /// admission slot of its own.
     #[must_use]
-    pub fn issuing(&self, terms: IssueTerms) -> Self {
+    pub fn issuing(&self, terms: IssueTerms, action: (ActionId, Digest256)) -> Self {
         Self {
             directory: Arc::clone(&self.directory),
             lifetimes: Arc::clone(&self.lifetimes),
-            issue: Some(Arc::new(terms)),
+            issue: Some(Arc::new(Issuing { terms, action })),
             admission: WriteAdmission::default(),
         }
     }
@@ -443,30 +556,64 @@ impl InvitationRows {
             .transpose()
     }
 
-    /// Returns the invitation one owner issued under one action, when there is one.
+    /// Returns the record of one actor's pairing action, when it has one.
     ///
     /// # Errors
     ///
-    /// Returns a registry error when the row cannot be read.
-    pub fn row_for_action(
+    /// Returns a registry error when the row cannot be read or decoded.
+    pub fn action(&self, actor: &ActorId, action_id: ActionId) -> Result<Option<PairingAction>> {
+        self.directory
+            .with(|connection| read_action_row(connection, actor, action_id))?
+            .map(|raw| decode_action(actor, action_id, raw))
+            .transpose()
+    }
+
+    /// Returns what one actor's action acted on, when that action already has an outcome and this
+    /// is the same payload.
+    ///
+    /// This is the only place a pairing mutation's payload is compared with its record, so every
+    /// retained pairing answer is given for the same action identity and the same payload digest,
+    /// and for nothing else.
+    ///
+    /// # Errors
+    ///
+    /// The inner result is `ID_CONFLICT` when the identifier was used with another payload, for
+    /// this method or for any other pairing method, and a registry error when the record cannot be
+    /// read.
+    #[must_use]
+    pub fn answered(
         &self,
         actor: &ActorId,
         action_id: ActionId,
-    ) -> Result<Option<InvitationRow>> {
-        let invitation = self.directory.with(|connection| {
-            connection
-                .query_row(
-                    "SELECT invitation_id FROM pairing_invitations
-                     WHERE issuing_actor = ?1 AND issuing_action_id = ?2",
-                    params![actor.as_str(), action_id.get().as_bytes().as_slice()],
-                    |row| row.get::<_, Vec<u8>>(0),
-                )
-                .optional()
-        })?;
-        match invitation {
-            Some(bytes) => self.row(InvitationId::new(uuid(Some(&bytes))?)),
-            None => Ok(None),
+        digest: Digest256,
+    ) -> Option<Result<ActionSubject>> {
+        match self.action(actor, action_id) {
+            Ok(Some(recorded)) if recorded.digest == digest => Some(Ok(recorded.subject)),
+            Ok(Some(_)) => Some(Err(id_conflict(action_id))),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
         }
+    }
+
+    /// Records the action of an answer that wrote nothing else, in a transaction of its own.
+    ///
+    /// Some answers change nothing: a repeat confirmation of a pairing that already committed, a
+    /// withdrawal of an invitation that already ended. They are answers all the same, and the
+    /// identifier they were given under is spent on them, so its record is written before the
+    /// answer is given. The record of the same action and payload that is already there is this
+    /// one.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ID_CONFLICT` when the identifier is recorded with another payload or subject, and
+    /// a registry error when the row cannot be written.
+    pub fn record_action(&self, action: &PairingAction) -> Result<()> {
+        self.directory
+            .transaction(|transaction| match claim_action(transaction, action)? {
+                None => Ok(()),
+                Some(recorded) if recorded == *action => Ok(()),
+                Some(_) => Err(id_conflict(action.action_id)),
+            })
     }
 
     /// Returns the security event one completed pairing wrote.
@@ -514,103 +661,68 @@ impl InvitationRows {
         rows.iter().map(|bytes| decode(bytes)).collect()
     }
 
-    /// Returns the challenge one caller's action already asked for, and the digest of that
-    /// mutation.
+    /// Records the challenge one owner's `owner.confirmation.request` is given, with its action,
+    /// under that action's admission, before the challenge is issued.
     ///
-    /// `owner.confirmation.request` is answered once per action: a retry of the same mutation gets
-    /// the challenge it was given, whether or not it is still outstanding, and the same action with
-    /// another payload is refused. This is the record that makes that hold across a restart.
-    ///
-    /// # Errors
-    ///
-    /// Returns a registry error when the row cannot be read or decoded.
-    pub fn requested(
-        &self,
-        actor: &ActorId,
-        action_id: ActionId,
-    ) -> Result<Option<(Digest256, OwnerConfirmationRequest)>> {
-        self.directory
-            .with(|connection| {
-                connection
-                    .query_row(
-                        "SELECT mutation_digest, request FROM owner_confirmation_requests
-                         WHERE actor = ?1 AND action_id = ?2",
-                        params![actor.as_str(), action_id.get().as_bytes().as_slice()],
-                        |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
-                    )
-                    .optional()
-            })?
-            .map(|(digest, request)| {
-                Ok((
-                    Digest256::from_bytes(
-                        <[u8; 32]>::try_from(digest.as_slice()).map_err(|_| {
-                            ControllerError::registry("a mutation digest is 32 bytes")
-                        })?,
-                    ),
-                    decode::<OwnerConfirmationRequest>(&request)?,
-                ))
-            })
-            .transpose()
-    }
-
-    /// Records the challenge one caller's action asked for, under that action's admission.
+    /// Returns the challenge already on record when the same action and payload recorded one
+    /// first: that is the challenge this action is owed, and the one just made is not issued.
     ///
     /// # Errors
     ///
-    /// Returns the admission's refusal, and a registry error when the row cannot be written,
-    /// including when the action already has one.
+    /// Returns the admission's refusal, `ID_CONFLICT` for an identifier recorded with another
+    /// payload, and a registry error when the row cannot be written.
     pub fn record_requested(
         &self,
-        actor: &ActorId,
-        action_id: ActionId,
-        digest: Digest256,
-        request: &OwnerConfirmationRequest,
+        action: &PairingAction,
         admission: &dyn Fn() -> Result<()>,
-    ) -> Result<()> {
-        let request = encode(request)?;
+    ) -> Result<Option<OwnerConfirmationRequest>> {
         self.directory.transaction(|transaction| {
             admission()?;
-            transaction
-                .execute(
-                    "INSERT INTO owner_confirmation_requests
-                         (actor, action_id, mutation_digest, request)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![
-                        actor.as_str(),
-                        action_id.get().as_bytes().as_slice(),
-                        digest.as_bytes().as_slice(),
-                        request,
-                    ],
-                )
-                .map_err(ControllerError::registry)?;
-            Ok(())
+            match claim_action(transaction, action)? {
+                None => Ok(None),
+                Some(PairingAction {
+                    subject: ActionSubject::Requested(request),
+                    ..
+                }) => Ok(Some(*request)),
+                Some(_) => Err(another_subject()),
+            }
         })
     }
 
-    /// Records that an owner confirmation was answered, before anything spends it, under the
-    /// admission of the completion that answered it.
+    /// Records that an owner confirmation was answered, before anything spends it, with the
+    /// action that answered it, under that action's admission.
     ///
     /// Section 10 makes user-presence verification part of the host's acceptance record, so the
     /// answer is on record from the moment the host accepts the proof, whatever happens next. The
-    /// caller that completed it and the proof itself are kept, so a repeat of that completion is
-    /// recognised as the same caller's same proof and nothing else.
+    /// caller that completed it and the proof itself are kept. A proof is accepted once: a second
+    /// completion of the same proof, under another action, records that action and leaves the
+    /// acceptance as it was.
+    ///
+    /// Returns when the proof was accepted, as the acceptance record holds it.
     ///
     /// # Errors
     ///
-    /// Returns the admission's refusal, and a registry error when the row cannot be written.
+    /// Returns the admission's refusal, `ID_CONFLICT` for an identifier recorded with another
+    /// payload, and a registry error when a row cannot be written.
     pub fn record_answered(
         &self,
         proof: &OwnerConfirmationProof,
-        answered_by: &ActorId,
+        action: &PairingAction,
         now: TimestampMs,
         admission: &dyn Fn() -> Result<()>,
-    ) -> Result<()> {
+    ) -> Result<TimestampMs> {
         let request = encode(&proof.request)?;
-        let action = text_of(&proof.request.action)?;
+        let kind = text_of(&proof.request.action)?;
         let channel = proof.channel.as_str();
         let stored_proof = encode(proof)?;
+        let confirmation_id = proof.request.confirmation_id;
         self.directory.transaction(|transaction| {
             admission()?;
+            match claim_action(transaction, action)? {
+                None => {}
+                Some(recorded) if recorded == *action => {}
+                Some(_) => return Err(another_subject()),
+            }
             transaction
                 .execute(
                     "INSERT INTO owner_confirmations (
@@ -619,19 +731,26 @@ impl InvitationRows {
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL)
                      ON CONFLICT (confirmation_id) DO NOTHING",
                     params![
-                        proof.request.confirmation_id.get().as_bytes().as_slice(),
-                        action,
+                        confirmation_id.get().as_bytes().as_slice(),
+                        kind,
                         proof.request.action_digest.as_bytes().as_slice(),
                         request,
                         channel,
                         proof.signer_key_id.as_bytes().as_slice(),
                         to_sql(now.get()),
-                        answered_by.as_str(),
+                        action.actor.as_str(),
                         stored_proof,
                     ],
                 )
                 .map_err(ControllerError::registry)?;
-            Ok(())
+            let answered_at_ms = transaction
+                .query_row(
+                    "SELECT answered_at_ms FROM owner_confirmations WHERE confirmation_id = ?1",
+                    params![confirmation_id.get().as_bytes().as_slice()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(ControllerError::registry)?;
+            Ok(TimestampMs::new(from_sql(answered_at_ms)))
         })
     }
 
@@ -716,16 +835,26 @@ impl InvitationStore for InvitationRows {
         record: &InvitationRecord,
         issued_under: &OwnerConfirmationProof,
     ) -> kr_pairing::Result<()> {
-        let terms = self
+        let issuing = self
             .issue
             .as_deref()
             .ok_or_else(|| kr_pairing::PairingError::Store {
                 reason: "an invitation is issued through a handle that carries its terms"
                     .to_owned(),
             })?;
+        let terms = &issuing.terms;
+        let (action_id, digest) = issuing.action;
+        let action = PairingAction {
+            actor: terms.issuing_actor.clone(),
+            action_id,
+            digest,
+            subject: ActionSubject::Issued(record.invitation_id),
+        };
         let effect = format!("pair.invite {}", record.invitation_id);
         let created = self.directory.transaction(|transaction| {
             self.admission.check()?;
+            // The invitation is the action's effect, so the two are one write or neither.
+            claim_effect(transaction, &action)?;
             insert_invitation(transaction, record, terms, issued_under)?;
             consume(
                 transaction,
@@ -750,18 +879,33 @@ impl InvitationStore for InvitationRows {
         expected: &InvitationRecord,
         next: &InvitationRecord,
     ) -> kr_pairing::Result<TransitionOutcome> {
-        self.directory
-            .transaction(|transaction| {
-                self.admission.check()?;
-                let current = read_record(transaction, expected.invitation_id)?
-                    .ok_or_else(|| ControllerError::registry("that invitation has no record"))?;
-                if &current != expected {
-                    return Ok(TransitionOutcome::Stale(current));
-                }
-                write_record(transaction, next)?;
-                Ok(TransitionOutcome::Written)
-            })
-            .or_else(unwritten)
+        // Only the owner's own ending of an invitation is the effect of a withdrawal or a denial.
+        // A write the same call makes on the way, such as an expiry, records no action.
+        let action = match next.state {
+            InvitationState::Consumed {
+                reason: PairingConsumedReason::Cancelled | PairingConsumedReason::Denied,
+            } => self
+                .admission
+                .action_for(&ActionSubject::Ended(next.invitation_id)),
+            _ => None,
+        };
+        let written = self.directory.transaction(|transaction| {
+            self.admission.check()?;
+            let current = read_record(transaction, expected.invitation_id)?
+                .ok_or_else(|| ControllerError::registry("that invitation has no record"))?;
+            if &current != expected {
+                return Ok(TransitionOutcome::Stale(current));
+            }
+            if let Some(action) = &action {
+                claim_effect(transaction, action)?;
+            }
+            write_record(transaction, next)?;
+            Ok(TransitionOutcome::Written)
+        });
+        if action.is_some() && matches!(written, Ok(TransitionOutcome::Written)) {
+            self.admission.note_recorded();
+        }
+        written.or_else(unwritten)
     }
 
     fn commit(
@@ -770,11 +914,25 @@ impl InvitationStore for InvitationRows {
         next: &InvitationRecord,
         commitment: &PairingCommitment,
     ) -> kr_pairing::Result<TransitionOutcome> {
+        let action = self
+            .admission
+            .action_for(&ActionSubject::Confirmed(commitment.invitation_id));
         let committed = self.directory.transaction(|transaction| {
             self.admission.check()?;
-            commit_pairing(transaction, &self.lifetimes, expected, next, commitment)
+            let outcome = commit_pairing(transaction, &self.lifetimes, expected, next, commitment)?;
+            // The pairing is the confirmation's effect: recorded with it, and only when it is
+            // written.
+            if outcome == TransitionOutcome::Written
+                && let Some(action) = &action
+            {
+                claim_effect(transaction, action)?;
+            }
+            Ok(outcome)
         });
         self.lifetimes.settle();
+        if action.is_some() && matches!(committed, Ok(TransitionOutcome::Written)) {
+            self.admission.note_recorded();
+        }
         committed.or_else(unwritten)
     }
 
@@ -937,6 +1095,147 @@ fn commit_pairing(
         .map_err(ControllerError::registry)?;
     write_record(transaction, next)?;
     Ok(TransitionOutcome::Written)
+}
+
+/// Records `action` inside the caller's transaction, unless its identifier already has a record.
+///
+/// Returns the record already there, when it is for the same payload. An identifier recorded with
+/// another payload, for this pairing method or any other, is refused as `ID_CONFLICT`, which rolls
+/// the caller's transaction back with everything else it wrote.
+fn claim_action(transaction: &Connection, action: &PairingAction) -> Result<Option<PairingAction>> {
+    if let Some(raw) = read_action_row(transaction, &action.actor, action.action_id)
+        .map_err(ControllerError::registry)?
+    {
+        let recorded = decode_action(&action.actor, action.action_id, raw)?;
+        if recorded.digest != action.digest {
+            return Err(id_conflict(action.action_id));
+        }
+        return Ok(Some(recorded));
+    }
+    transaction
+        .execute(
+            "INSERT INTO pairing_actions
+                 (actor, action_id, method, mutation_digest, subject, challenge, recorded_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                action.actor.as_str(),
+                action.action_id.get().as_bytes().as_slice(),
+                action.subject.method().as_str(),
+                action.digest.as_bytes().as_slice(),
+                action.subject.identity().as_bytes().as_slice(),
+                match &action.subject {
+                    ActionSubject::Requested(request) => Some(encode(request.as_ref())?),
+                    _ => None,
+                },
+                to_sql(kr_ipc::now_ms().get()),
+            ],
+        )
+        .map_err(ControllerError::registry)?;
+    Ok(None)
+}
+
+/// Records the action a write is the effect of, inside that write's transaction.
+///
+/// The action is recorded with its effect or not at all, so any record already there refuses the
+/// write: another payload under the identifier is `ID_CONFLICT`, and the same one means the action
+/// already has its outcome, which is what a repeat of it is answered from. Neither can reach here
+/// from one caller's own repeat, which finds the record before it acts.
+fn claim_effect(transaction: &Connection, action: &PairingAction) -> Result<()> {
+    match claim_action(transaction, action)? {
+        None => Ok(()),
+        Some(_) => Err(ControllerError::Refused {
+            code: ErrorCode::IdConflict,
+            detail: format!(
+                "action {} already has an outcome, and a repeat of it is answered from that",
+                action.action_id
+            ),
+        }),
+    }
+}
+
+/// One row of `pairing_actions`, as the columns hold it.
+struct RawAction {
+    method: String,
+    digest: Vec<u8>,
+    subject: Vec<u8>,
+    challenge: Option<Vec<u8>>,
+}
+
+/// Reads the row of one actor's pairing action.
+fn read_action_row(
+    connection: &Connection,
+    actor: &ActorId,
+    action_id: ActionId,
+) -> rusqlite::Result<Option<RawAction>> {
+    connection
+        .query_row(
+            "SELECT method, mutation_digest, subject, challenge FROM pairing_actions
+             WHERE actor = ?1 AND action_id = ?2",
+            params![actor.as_str(), action_id.get().as_bytes().as_slice()],
+            |row| {
+                Ok(RawAction {
+                    method: row.get(0)?,
+                    digest: row.get(1)?,
+                    subject: row.get(2)?,
+                    challenge: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+}
+
+/// Decodes the row of one actor's pairing action.
+fn decode_action(actor: &ActorId, action_id: ActionId, raw: RawAction) -> Result<PairingAction> {
+    let identity = uuid(Some(&raw.subject))?;
+    let subject = match (raw.method.as_str(), raw.challenge) {
+        ("owner.confirmation.request", Some(challenge)) => {
+            let request: OwnerConfirmationRequest = decode(&challenge)?;
+            if request.confirmation_id.get() != identity {
+                return Err(ControllerError::registry(
+                    "a recorded confirmation request names another challenge than its own",
+                ));
+            }
+            ActionSubject::Requested(Box::new(request))
+        }
+        ("owner.confirmation.complete", None) => {
+            ActionSubject::Completed(ConfirmationId::new(identity))
+        }
+        ("pair.invite", None) => ActionSubject::Issued(InvitationId::new(identity)),
+        ("pair.confirm", None) => ActionSubject::Confirmed(InvitationId::new(identity)),
+        ("pair.cancel", None) => ActionSubject::Ended(InvitationId::new(identity)),
+        (other, _) => {
+            return Err(ControllerError::registry(format!(
+                "a recorded pairing action names {other:?}, which this host does not record"
+            )));
+        }
+    };
+    Ok(PairingAction {
+        actor: actor.clone(),
+        action_id,
+        digest: Digest256::from_bytes(
+            <[u8; 32]>::try_from(raw.digest.as_slice())
+                .map_err(|_| ControllerError::registry("a mutation digest is 32 bytes"))?,
+        ),
+        subject,
+    })
+}
+
+/// Returns the refusal of an action identifier reused with another payload.
+#[must_use]
+pub fn id_conflict(action_id: ActionId) -> ControllerError {
+    ControllerError::Refused {
+        code: ErrorCode::IdConflict,
+        detail: format!("action {action_id} was already used with a different request"),
+    }
+}
+
+/// Returns the failure of a record whose payload matches but whose subject is another's.
+///
+/// The digest covers the method and every parameter, so the same payload names the same subject;
+/// a record that does not is a record this host cannot account for.
+#[must_use]
+pub fn another_subject() -> ControllerError {
+    ControllerError::registry("the record of this action names another subject than its payload")
 }
 
 /// Records a confirmation's consumption inside the caller's transaction.
@@ -1115,8 +1414,6 @@ struct RawRow {
     proposed_grant: Vec<u8>,
     issuing_actor: String,
     issuing_ingress: String,
-    issuing_action_id: Option<Vec<u8>>,
-    mutation_digest: Option<Vec<u8>>,
     issued_at_ms: i64,
     confirmation_id: Vec<u8>,
 }
@@ -1129,8 +1426,8 @@ fn read_row(
         .query_row(
             "SELECT invitation_id, mode, locator, rendezvous_origin, state, locked_attempt,
                     consumed_reason, failed_confirmations, deadline_monotonic_ms, boot_identity,
-                    grant_kind, proposed_grant, issuing_actor, issuing_ingress, issuing_action_id,
-                    mutation_digest, issued_at_ms, confirmation_id
+                    grant_kind, proposed_grant, issuing_actor, issuing_ingress, issued_at_ms,
+                    confirmation_id
              FROM pairing_invitations WHERE invitation_id = ?1",
             params![invitation_id.get().as_bytes().as_slice()],
             |row| {
@@ -1149,10 +1446,8 @@ fn read_row(
                     proposed_grant: row.get(11)?,
                     issuing_actor: row.get(12)?,
                     issuing_ingress: row.get(13)?,
-                    issuing_action_id: row.get(14)?,
-                    mutation_digest: row.get(15)?,
-                    issued_at_ms: row.get(16)?,
-                    confirmation_id: row.get(17)?,
+                    issued_at_ms: row.get(14)?,
+                    confirmation_id: row.get(15)?,
                 })
             },
         )
@@ -1206,19 +1501,6 @@ fn decode_record(raw: &RawRow) -> Result<InvitationRecord> {
 
 fn decode_row(raw: RawRow) -> Result<InvitationRow> {
     let record = decode_record(&raw)?;
-    let action = match (
-        raw.issuing_action_id.as_deref(),
-        raw.mutation_digest.as_deref(),
-    ) {
-        (Some(action), Some(digest)) => Some((
-            ActionId::new(uuid(Some(action))?),
-            Digest256::from_bytes(
-                <[u8; 32]>::try_from(digest)
-                    .map_err(|_| ControllerError::registry("a parameter digest is 32 bytes"))?,
-            ),
-        )),
-        _ => None,
-    };
     Ok(InvitationRow {
         record,
         terms: IssueTerms {
@@ -1233,7 +1515,6 @@ fn decode_row(raw: RawRow) -> Result<InvitationRow> {
             proposed_grant: decode(&raw.proposed_grant)?,
             issuing_actor: ActorId::new(raw.issuing_actor).map_err(ControllerError::registry)?,
             issuing_ingress: from_text(&raw.issuing_ingress)?,
-            action,
             issued_at_ms: TimestampMs::new(from_sql(raw.issued_at_ms)),
         },
         confirmation_id: ConfirmationId::new(uuid(Some(&raw.confirmation_id))?),
@@ -1256,10 +1537,9 @@ fn insert_invitation(
             "INSERT INTO pairing_invitations (
                  invitation_id, mode, locator, rendezvous_origin, state, locked_attempt,
                  consumed_reason, failed_confirmations, deadline_monotonic_ms, boot_identity,
-                 grant_kind, proposed_grant, issuing_actor, issuing_ingress, issuing_action_id,
-                 mutation_digest, issued_at_ms, confirmation_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                       ?18)",
+                 grant_kind, proposed_grant, issuing_actor, issuing_ingress, issued_at_ms,
+                 confirmation_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 record.invitation_id.get().as_bytes().as_slice(),
                 text_of(&terms.mode)?,
@@ -1278,10 +1558,6 @@ fn insert_invitation(
                 encode(&terms.proposed_grant)?,
                 terms.issuing_actor.as_str(),
                 text_of(&terms.issuing_ingress)?,
-                terms
-                    .action
-                    .map(|(action, _)| action.get().as_bytes().to_vec()),
-                terms.action.map(|(_, digest)| digest.as_bytes().to_vec()),
                 to_sql(terms.issued_at_ms.get()),
                 issued_under
                     .request
@@ -1296,9 +1572,7 @@ fn insert_invitation(
             rusqlite::Error::SqliteFailure(failure, _)
                 if failure.code == rusqlite::ErrorCode::ConstraintViolation =>
             {
-                ControllerError::registry(
-                    "that invitation, or an invitation for that action, already exists",
-                )
+                ControllerError::registry("that invitation already exists")
             }
             other => ControllerError::registry(other),
         })

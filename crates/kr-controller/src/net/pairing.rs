@@ -47,7 +47,6 @@ use kr_protocol::invitation::{
     PairConfirmParams, PairConfirmResult, PairInviteParams, PairInviteResult, PairOwnerView,
     PairingApproval, QrText, RendezvousMessage, default_rendezvous_origin, issuance_digest,
 };
-use kr_protocol::method::Method;
 use kr_protocol::pairing::{
     BundleDirection, BundleMessageType, CodeQrPayload, DevicePublicKeys, MAX_CONFIRMATION_FAILURES,
     NetworkConfig, PairFinishRequest, PairStatus, PairingConsumedReason, ProposedGrant, QrPayload,
@@ -61,7 +60,10 @@ use kr_protocol::scalars::{Bytes, CanonicalSet, Digest256, Nullable};
 use kr_transport::preauth::{ConnectionPeer, PairingMethod, PairingSurface};
 use tokio::sync::watch;
 
-use super::invitations::{Admission, InvitationRow, InvitationRows, IssueTerms, WriteAdmission};
+use super::invitations::{
+    ActionSubject, Admission, InvitationRow, InvitationRows, IssueTerms, PairingAction,
+    WriteAdmission, another_subject,
+};
 use super::owner::{Caller, OwnerAuthority, Resolved, refusal};
 use super::rendezvous::{
     ClientFrame, Rendezvous, RoomOffer, RoomTicket, encode_message, serve_room,
@@ -122,7 +124,6 @@ struct Open {
     /// The answer `pair.invite` gave, returned again to a retry of the same action.
     answer: PairInviteResult,
     issued_by: ActorId,
-    action: (ActionId, Digest256),
     grant_kind: InviteGrantKind,
     proposed_grant: ProposedGrant,
 }
@@ -373,8 +374,8 @@ impl PairingHost {
     ) -> Result<OwnerConfirmationRequestResult> {
         // A retry is answered before anything about the subject is resolved again: the invitation
         // it named may be gone, and the answer it was owed is the challenge it was given.
-        if let Some(retained) = self.owner.retained_request(caller, action) {
-            return retained;
+        if let Some(requested) = self.owner.requested(caller, action) {
+            return requested;
         }
         let resolved = match &params.subject {
             ConfirmationSubject::IssueInvitation {
@@ -479,12 +480,13 @@ impl PairingHost {
         &self,
         caller: &Caller,
         params: &OwnerConfirmationCompleteParams,
+        action: (ActionId, Digest256),
         admission: &dyn Fn() -> Result<()>,
     ) -> Result<OwnerConfirmationCompleteResult> {
-        if let Some(retained) = self.owner.retained_answer(caller, params) {
-            return retained;
+        if let Some(completed) = self.owner.completed(caller, action) {
+            return completed;
         }
-        self.owner.complete(caller, params, admission)
+        self.owner.complete(caller, params, action, admission)
     }
 
     /// `pair.invite`: issues one invitation under a fresh owner confirmation naming its grant.
@@ -510,10 +512,11 @@ impl PairingHost {
                 detail: "an invitation is issued over local IPC only".to_owned(),
             });
         }
-        let (action, digest) = action;
         let mut open = self.open();
-        if let Some(retained) = self.retained_invite(&open, caller, action, digest) {
-            return retained;
+        // Under the invitation's lock, so two copies of one issue meet here and the second is given
+        // what the first issued.
+        if let Some(invited) = self.invited(&open, caller, action) {
+            return invited;
         }
         // An invitation nobody used before its deadline is not on offer any more, and does not
         // hold up the next one.
@@ -564,7 +567,6 @@ impl PairingHost {
             proposed_grant: params.proposed_grant.clone(),
             issuing_actor: caller.actor_id.clone(),
             issuing_ingress: caller.ingress,
-            action: Some((action, digest)),
             issued_at_ms: kr_ipc::now_ms(),
         };
         let owner = caller.owner_context();
@@ -577,10 +579,11 @@ impl PairingHost {
             InviteMode::Direct => {
                 let mut identity = self.identity.clone();
                 identity.network_config = network_config;
-                let rows = self.rows.issuing(terms);
+                let rows = self.rows.issuing(terms, action);
                 let slot = rows.write_admission().clone();
                 let (spendable, mut challenges) = self.owner.spend(&expectation)?;
-                let issued = admitted(&slot, admission, || {
+                // The action is recorded with the invitation, by the handle that issues it.
+                let (issued, _) = admitted(&slot, admission, None, || {
                     DirectInvitation::issue(
                         rows,
                         self.clock.clone(),
@@ -627,10 +630,10 @@ impl PairingHost {
                 })?;
                 let mut identity = self.identity.clone();
                 identity.network_config = network_config;
-                let rows = self.rows.issuing(terms);
+                let rows = self.rows.issuing(terms, action);
                 let slot = rows.write_admission().clone();
                 let (spendable, mut challenges) = self.owner.spend(&expectation)?;
-                let issued = admitted(&slot, admission, || {
+                let (issued, _) = admitted(&slot, admission, None, || {
                     HostInvitation::issue(
                         rows,
                         self.clock.clone(),
@@ -695,7 +698,6 @@ impl PairingHost {
             admission: slot,
             answer: answer.clone(),
             issued_by: caller.actor_id.clone(),
-            action: (action, digest),
             grant_kind: params.grant_kind,
             proposed_grant: params.proposed_grant.clone(),
         });
@@ -708,24 +710,42 @@ impl PairingHost {
 
     /// `pair.confirm`: commits the candidate the owner was shown, under a fresh confirmation.
     ///
+    /// The action is recorded with the pairing it commits. A confirmation of a pairing that had
+    /// already committed changes nothing and is answered with that pairing, and its action is
+    /// recorded before the answer is given, so the identifier cannot be spent twice.
+    ///
     /// # Errors
     ///
     /// Returns the refusal: another caller than the issuing owner, an approval naming another
-    /// candidate, no answered confirmation for exactly this candidate, or a store failure.
+    /// candidate, no answered confirmation for exactly this candidate, `ID_CONFLICT` for a reused
+    /// action, or a store failure.
     pub fn confirm(
         &self,
         caller: &Caller,
         params: &PairConfirmParams,
+        action: (ActionId, Digest256),
         authority_revision: AuthorityRevision,
         admission: &Admission,
     ) -> Result<PairConfirmResult> {
+        let recorded = PairingAction {
+            actor: caller.actor_id.clone(),
+            action_id: action.0,
+            digest: action.1,
+            subject: ActionSubject::Confirmed(params.invitation_id),
+        };
         let mut open = self.open();
+        // Under the invitation's lock, so two copies of one confirmation meet here and the second
+        // is given what the first did.
+        if let Some(confirmed) = self.confirmed(caller, action) {
+            return confirmed;
+        }
         let Some(offered) = open
             .as_mut()
             .filter(|offered| offered.invitation_id() == params.invitation_id)
         else {
-            drop(open);
-            return self.committed_answer(caller, params.invitation_id);
+            let answer = self.committed_answer(caller, params.invitation_id)?;
+            self.rows.record_action(&recorded)?;
+            return Ok(answer);
         };
         if offered.issued_by != caller.actor_id {
             return Err(refusal(kr_pairing::PairingError::NotIssuingOwner));
@@ -754,14 +774,14 @@ impl PairingHost {
         admission()?;
         let slot = offered.admission.clone();
         let (spendable, mut challenges) = self.owner.spend(&expectation)?;
-        let committed = match (&mut offered.mode, params.approval) {
+        let (committed, written) = match (&mut offered.mode, params.approval) {
             (
                 OpenMode::Direct(invitation),
                 PairingApproval::Direct {
                     transcript_digest,
                     client_key_digest,
                 },
-            ) => admitted(&slot, admission, || {
+            ) => admitted(&slot, admission, Some(recorded.clone()), || {
                 invitation.confirm(
                     &spendable.approval(&owner),
                     challenges.ledger(),
@@ -780,7 +800,7 @@ impl PairingHost {
                     host_bundle_hash,
                     client_bundle_hash,
                 },
-            ) => admitted(&slot, admission, || {
+            ) => admitted(&slot, admission, Some(recorded.clone()), || {
                 offer.invitation.confirm(
                     &spendable.approval(&owner),
                     challenges.ledger(),
@@ -794,15 +814,21 @@ impl PairingHost {
                 )
             }),
             (OpenMode::Direct(_), PairingApproval::Code { .. })
-            | (OpenMode::Code(_), PairingApproval::Direct { .. }) => {
+            | (OpenMode::Code(_), PairingApproval::Direct { .. }) => (
                 Err(refusal(kr_pairing::PairingError::ContextMismatch {
                     what: "the mode of the approval",
-                }))
-            }
+                })),
+                false,
+            ),
         };
         challenges.forget(spendable.request());
         drop(challenges);
         let commitment = committed?;
+        // A pairing kr-pairing found committed already was not written by this call, and neither
+        // was this action's record.
+        if !written {
+            self.rows.record_action(&recorded)?;
+        }
         let event = self
             .rows
             .event_for(commitment.invitation_id)?
@@ -828,17 +854,35 @@ impl PairingHost {
 
     /// `pair.cancel`: consumes the invitation without a grant, as a withdrawal or as a denial.
     ///
+    /// The action is recorded with the ending it writes. A withdrawal of an invitation that had
+    /// already ended changes nothing and is answered with how it ended, and its action is recorded
+    /// before the answer is given.
+    ///
     /// # Errors
     ///
-    /// Returns the refusal: another caller than the issuing owner, or a store failure.
+    /// Returns the refusal: another caller than the issuing owner, `ID_CONFLICT` for a reused
+    /// action, or a store failure.
     pub fn cancel(
         &self,
         caller: &Caller,
         params: &PairCancelParams,
+        action: (ActionId, Digest256),
         admission: &Admission,
     ) -> Result<PairStatusResult> {
+        let recorded = PairingAction {
+            actor: caller.actor_id.clone(),
+            action_id: action.0,
+            digest: action.1,
+            subject: ActionSubject::Ended(params.invitation_id),
+        };
         let mut open = self.open();
+        // Under the invitation's lock, so two copies of one withdrawal meet here and the second is
+        // given what the first did.
+        if let Some(ended) = self.ended(caller, action) {
+            return ended;
+        }
         let mut room = None;
+        let mut written = false;
         if let Some(offered) = open
             .as_mut()
             .filter(|offered| offered.invitation_id() == params.invitation_id)
@@ -852,32 +896,45 @@ impl PairingHost {
             let owner = caller.owner_context();
             admission()?;
             let slot = offered.admission.clone();
-            match &mut offered.mode {
-                OpenMode::Direct(invitation) => admitted(&slot, admission, || {
-                    if params.deny {
-                        invitation.deny(&owner)
-                    } else {
-                        invitation.cancel(&owner)
-                    }
-                }),
-                OpenMode::Code(offer) => admitted(&slot, admission, || {
+            let (ended, recorded_by_ending) = match &mut offered.mode {
+                OpenMode::Direct(invitation) => {
+                    admitted(&slot, admission, Some(recorded.clone()), || {
+                        if params.deny {
+                            invitation.deny(&owner)
+                        } else {
+                            invitation.cancel(&owner)
+                        }
+                    })
+                }
+                OpenMode::Code(offer) => admitted(&slot, admission, Some(recorded.clone()), || {
                     if params.deny {
                         offer.invitation.deny(&owner)
                     } else {
                         offer.invitation.cancel(&owner)
                     }
                 }),
-            }?;
+            };
+            ended?;
+            written = recorded_by_ending;
             room = offered.code_mut().and_then(CodeOffer::end);
             // The ended invitation stays: its candidate authenticated itself, and asking what
             // happened is how it learns it was denied or withdrawn. The next invitation replaces
             // it here and keeps it among the ended ones, where the candidate can still ask.
         }
+        // What the invitation is now is the answer, and an invitation that had already ended, or
+        // that another writer ended first, is answered with that and records the action itself.
+        let answer = self.recorded_status(caller, params.invitation_id);
+        let kept = match (&answer, written) {
+            (Ok(_), false) => self.rows.record_action(&recorded),
+            _ => Ok(()),
+        };
         drop(open);
+        // The room has nothing left to relay whatever the answer, so its locator goes either way.
         if let Some(room) = room {
             self.release_room(&room);
         }
-        self.recorded_status(caller, params.invitation_id)
+        kept?;
+        answer
     }
 
     /// `pair.status` for the issuing owner: the invitation's state and everything the owner is
@@ -1066,6 +1123,11 @@ impl PairingHost {
 
     /// Returns what a repeated mutation is owed, when its action already has an outcome.
     ///
+    /// The action's own record is what says so, and the only thing: an answer is given for the
+    /// same verified actor, the same action identifier and the same payload digest, and the same
+    /// identifier with another payload is `ID_CONFLICT`, whichever pairing method spent it. What
+    /// the answer then says is read from the subject the record names.
+    ///
     /// This is asked before a first admission's freshness is: a caller that reconnects and repeats
     /// an action it already submitted gets that action's own result, not a refusal about a window
     /// that has since been replaced. Nothing here writes.
@@ -1073,87 +1135,113 @@ impl PairingHost {
     pub fn retained(
         &self,
         caller: &Caller,
-        method: Method,
         mutation: &MutationRequest,
         digest: Digest256,
     ) -> Option<Result<ParamsValue>> {
-        match method {
-            Method::PairInvite => {
-                let open = self.open();
-                self.retained_invite(&open, caller, mutation.action_id, digest)
-                    .map(|retained| retained.and_then(|answer| encode(&answer)))
-            }
-            Method::OwnerConfirmationRequest => self
+        let subject = match self
+            .rows
+            .answered(&caller.actor_id, mutation.action_id, digest)?
+        {
+            Ok(subject) => subject,
+            Err(error) => return Some(Err(error)),
+        };
+        Some(match subject {
+            ActionSubject::Requested(request) => self
                 .owner
-                .retained_request(caller, (mutation.action_id, digest))
-                .map(|retained| retained.and_then(|answer| encode(&answer))),
-            Method::OwnerConfirmationComplete => {
-                let params: OwnerConfirmationCompleteParams = mutation.params.to_typed().ok()?;
-                self.owner
-                    .retained_answer(caller, &params)
-                    .map(|retained| retained.and_then(|answer| encode(&answer)))
+                .answer_requested(*request)
+                .and_then(|answer| encode(&answer)),
+            ActionSubject::Completed(confirmation_id) => self
+                .owner
+                .answer_completed(confirmation_id)
+                .and_then(|answer| encode(&answer)),
+            ActionSubject::Issued(invitation_id) => {
+                let open = self.open();
+                self.answer_issued(&open, invitation_id)
+                    .and_then(|answer| encode(&answer))
             }
-            Method::PairConfirm => {
-                let params: PairConfirmParams = mutation.params.to_typed().ok()?;
-                kr_pairing::platform::InvitationStore::commitment(&self.rows, params.invitation_id)
-                    .ok()??;
-                Some(
-                    self.committed_answer(caller, params.invitation_id)
-                        .and_then(|answer| encode(&answer)),
-                )
-            }
-            Method::PairCancel => {
-                let params: PairCancelParams = mutation.params.to_typed().ok()?;
-                let row = self.rows.row(params.invitation_id).ok()??;
-                let wanted = if params.deny {
-                    PairingConsumedReason::Denied
-                } else {
-                    PairingConsumedReason::Cancelled
-                };
-                (row.record.state == InvitationState::Consumed { reason: wanted }).then(|| {
-                    self.recorded_status(caller, params.invitation_id)
-                        .and_then(|answer| encode(&answer))
-                })
-            }
-            _ => None,
-        }
+            ActionSubject::Confirmed(invitation_id) => self
+                .committed_answer(caller, invitation_id)
+                .and_then(|answer| encode(&answer)),
+            ActionSubject::Ended(invitation_id) => self
+                .recorded_status(caller, invitation_id)
+                .and_then(|answer| encode(&answer)),
+        })
     }
 
-    /// The answer a repeated `pair.invite` is owed: the open invitation's, or what became of it.
-    fn retained_invite(
+    /// The answer a repeated `pair.invite` is owed, when its action already issued an invitation.
+    fn invited(
         &self,
         open: &Option<Open>,
         caller: &Caller,
-        action: ActionId,
-        digest: Digest256,
+        action: (ActionId, Digest256),
     ) -> Option<Result<PairInviteResult>> {
-        if let Some(offered) = open.as_ref()
-            && offered.issued_by == caller.actor_id
-            && offered.action.0 == action
-        {
-            if offered.action.1 != digest {
-                return Some(Err(id_conflict()));
-            }
-            // An invitation that ended stays in memory for its candidate's sake; its issuer is
-            // told what became of it from the durable row, like after a restart.
-            if matches!(
+        let subject = match self.rows.answered(&caller.actor_id, action.0, action.1)? {
+            Ok(subject) => subject,
+            Err(error) => return Some(Err(error)),
+        };
+        Some(match subject {
+            ActionSubject::Issued(invitation_id) => self.answer_issued(open, invitation_id),
+            _ => Err(another_subject()),
+        })
+    }
+
+    /// What an action that issued `invitation_id` is answered with: the invitation's own answer
+    /// while it is on offer, and what became of it once it is not.
+    ///
+    /// An invitation that ended stays in memory for its candidate's sake; its issuer is told what
+    /// became of it from the durable row, like after a restart.
+    fn answer_issued(
+        &self,
+        open: &Option<Open>,
+        invitation_id: InvitationId,
+    ) -> Result<PairInviteResult> {
+        if let Some(offered) = open
+            .as_ref()
+            .filter(|offered| offered.invitation_id() == invitation_id)
+            && matches!(
                 offered.state(),
                 InvitationState::Open | InvitationState::Locked { .. }
-            ) {
-                return Some(Ok(offered.answer.clone()));
-            }
+            )
+        {
+            return Ok(offered.answer.clone());
         }
-        match self.rows.row_for_action(&caller.actor_id, action) {
-            Ok(Some(row)) => Some(Err(
-                if row.terms.action.map(|(_, recorded)| recorded) == Some(digest) {
-                    no_longer_open(&row)
-                } else {
-                    id_conflict()
-                },
-            )),
-            Ok(None) => None,
-            Err(error) => Some(Err(error)),
-        }
+        let row = self
+            .rows
+            .row(invitation_id)?
+            .ok_or_else(|| ControllerError::registry("an issued invitation has no record"))?;
+        Err(no_longer_open(&row))
+    }
+
+    /// The answer a repeated `pair.confirm` is owed, when its action already has one.
+    fn confirmed(
+        &self,
+        caller: &Caller,
+        action: (ActionId, Digest256),
+    ) -> Option<Result<PairConfirmResult>> {
+        let subject = match self.rows.answered(&caller.actor_id, action.0, action.1)? {
+            Ok(subject) => subject,
+            Err(error) => return Some(Err(error)),
+        };
+        Some(match subject {
+            ActionSubject::Confirmed(invitation_id) => self.committed_answer(caller, invitation_id),
+            _ => Err(another_subject()),
+        })
+    }
+
+    /// The answer a repeated `pair.cancel` is owed, when its action already has one.
+    fn ended(
+        &self,
+        caller: &Caller,
+        action: (ActionId, Digest256),
+    ) -> Option<Result<PairStatusResult>> {
+        let subject = match self.rows.answered(&caller.actor_id, action.0, action.1)? {
+            Ok(subject) => subject,
+            Err(error) => return Some(Err(error)),
+        };
+        Some(match subject {
+            ActionSubject::Ended(invitation_id) => self.recorded_status(caller, invitation_id),
+            _ => Err(another_subject()),
+        })
     }
 
     /// `pair.status` from a paired device: the device's own committed pairing, and nothing else.
@@ -1550,6 +1638,9 @@ impl PairingSurface for PairingHost {
 /// Runs one owner-driven write of an invitation with the mutation's admission asked inside the
 /// write's own transaction, and reports a lapse as the lapse it is.
 ///
+/// `action` is the mutation's action, which the write that is its effect records in its own
+/// transaction. The flag returned says whether that write committed and recorded it.
+///
 /// Only a refusal is reinterpreted. The store refused before writing anything, which is what an
 /// admission that lapsed inside the write looks like, and a lapse is final: a withdrawn
 /// registration is not restored and a passed deadline does not come back, so asking once more
@@ -1558,14 +1649,17 @@ impl PairingSurface for PairingHost {
 fn admitted<T>(
     slot: &WriteAdmission,
     admission: &Admission,
+    action: Option<PairingAction>,
     call: impl FnOnce() -> kr_pairing::Result<T>,
-) -> Result<T> {
-    slot.during(admission, call).map_err(|error| match error {
+) -> (Result<T>, bool) {
+    let (outcome, recorded) = slot.during(admission, action, call);
+    let outcome = outcome.map_err(|error| match error {
         kr_pairing::PairingError::Refused { .. } => {
             admission().err().unwrap_or_else(|| refusal(error))
         }
         other => refusal(other),
-    })
+    });
+    (outcome, recorded)
 }
 
 /// Returns the kr-pairing grant kind a protocol kind names.
@@ -1612,13 +1706,6 @@ fn encode<T: serde::Serialize>(value: &T) -> Result<ParamsValue> {
 fn qr_text(payload: &QrPayload) -> Result<QrText> {
     let text = payload.to_text().map_err(ControllerError::registry)?;
     QrText::new(text.as_str()).map_err(ControllerError::registry)
-}
-
-fn id_conflict() -> ControllerError {
-    ControllerError::Refused {
-        code: ErrorCode::IdConflict,
-        detail: "this action already issued an invitation with other parameters".to_owned(),
-    }
 }
 
 fn not_offering(invitation_id: InvitationId) -> ControllerError {
@@ -1714,12 +1801,13 @@ mod tests {
     fn a_failed_write_is_not_reported_as_the_admission_lapsing() {
         let slot = WriteAdmission::default();
         let admission = lapsing_after(1);
-        let failed = admitted::<()>(&slot, &admission, || {
+        let (failed, recorded) = admitted::<()>(&slot, &admission, None, || {
             admission().expect("admitted inside the write");
             Err(kr_pairing::PairingError::Store {
                 reason: "the disk is full".to_owned(),
             })
         });
+        assert!(!recorded, "nothing was written");
         let error = failed.expect_err("the write failed");
         assert_eq!(error.code(), ErrorCode::StorageUnavailable, "{error}");
     }
@@ -1730,7 +1818,7 @@ mod tests {
     fn a_refused_write_is_reported_as_the_lapse_it_was() {
         let slot = WriteAdmission::default();
         let admission = lapsing_after(0);
-        let refused = admitted::<()>(&slot, &admission, || {
+        let (refused, _) = admitted::<()>(&slot, &admission, None, || {
             Err(kr_pairing::PairingError::Refused {
                 code: ErrorCode::PermissionDenied,
                 reason: "the deadline passed".to_owned(),

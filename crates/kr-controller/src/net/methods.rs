@@ -132,7 +132,7 @@ impl Controller {
             Err(error) => return Some(Err(error)),
         };
         let mutation = mutation.clone();
-        tokio::task::spawn_blocking(move || pairing.retained(&caller, method, &mutation, digest))
+        tokio::task::spawn_blocking(move || pairing.retained(&caller, &mutation, digest))
             .await
             .unwrap_or_else(|_| {
                 Some(Err(ControllerError::Uncertain {
@@ -167,7 +167,7 @@ impl Controller {
             Method::OwnerConfirmationComplete => {
                 let params: OwnerConfirmationCompleteParams = decode(&mutation.params)?;
                 blocking(move || {
-                    pairing.complete_confirmation(&caller, &params, admission.as_ref())
+                    pairing.complete_confirmation(&caller, &params, action, admission.as_ref())
                 })
                 .await
             }
@@ -186,11 +186,12 @@ impl Controller {
                 let params: PairConfirmParams = decode(&mutation.params)?;
                 // The grant is issued at the authority revision in force when it is written.
                 let revision = self.authority_revision().await?;
-                blocking(move || pairing.confirm(&caller, &params, revision, &admission)).await
+                blocking(move || pairing.confirm(&caller, &params, action, revision, &admission))
+                    .await
             }
             Method::PairCancel => {
                 let params: PairCancelParams = decode(&mutation.params)?;
-                blocking(move || pairing.cancel(&caller, &params, &admission)).await
+                blocking(move || pairing.cancel(&caller, &params, action, &admission)).await
             }
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a mutation the pairing service serves",

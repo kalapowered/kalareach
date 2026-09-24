@@ -1415,12 +1415,22 @@ the destination keys and the rights itself. `owner.confirmation.pending` lists w
 still answer, with the full grant and, for a device, its keys and verification value, to the local
 owner and to paired devices holding `host.manage`. `owner.confirmation.complete` verifies a proof
 against an enrolled signer (a live paired device holding `host.manage`, on an owner-device channel)
-and records the answer, with the caller that completed it and the proof itself; a repeat of that
-completion is answered again only for that caller and exactly that proof. The sensitive effect then
-spends the oldest answered challenge whose members equal its own expectation and whose signer is
-still an owner device, exactly once; no method takes a confirmation reference. Session, plugin and
-contact-tool channels are refused. Confirmations live for two minutes on the monotonic clock and
-end with the daemon.
+and records the answer, with the caller that completed it and the proof itself. A proof is accepted
+once: the same proof completed again under another action, while its challenge is outstanding, is
+answered with the acceptance as it stands, and once the challenge is spent it answers nothing. The
+sensitive effect then spends the oldest answered challenge whose members equal its own expectation
+and whose signer is still an owner device, exactly once; no method takes a confirmation reference.
+Session, plugin and contact-tool channels are refused. Confirmations live for two minutes on the
+monotonic clock and end with the daemon.
+
+**One action identifier, one answer.** The five pairing mutations, `owner.confirmation.request`,
+`owner.confirmation.complete`, `pair.invite`, `pair.confirm` and `pair.cancel`, keep one record of
+the actions they answered, keyed by the verified caller and the action identifier, with the digest
+of the whole mutation and what it acted on. Each mutation writes its record in the transaction that
+writes its effect; an answer that changes nothing, such as a withdrawal of an invitation that had
+already ended, writes it before it is given. A repeat is answered from that record and only for the
+same payload: the identifier reused with another payload is `ID_CONFLICT`, whichever of the five
+methods it was first spent on, and nothing is done under it.
 
 **Authority when an answer is spent.** An owner device's grant is in force under the same time
 contract the network admits devices under: a deadline anchored on the continuous clock, a wall

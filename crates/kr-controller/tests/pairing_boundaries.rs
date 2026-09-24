@@ -346,10 +346,10 @@ async fn an_admission_that_lapses_inside_the_write_writes_nothing() {
     assert!(
         pairing
             .rows()
-            .row_for_action(&actor, action)
+            .action(&actor, action)
             .expect("readable")
             .is_none(),
-        "no invitation was written"
+        "no invitation was written, and no record of the action"
     );
     let acceptance = pairing
         .rows()

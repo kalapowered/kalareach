@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use kr_controller::service::net::devices::DeviceDirectory;
 use kr_controller::service::net::invitations::{
-    HostOwner, InvitationRows, IssueTerms, device_record, prepare,
+    ActionSubject, HostOwner, InvitationRows, IssueTerms, PairingAction, device_record, prepare,
 };
 use kr_controller::service::net::lifetimes::GrantLifetimes;
 use kr_crypto::keys::DeviceKeys;
@@ -313,7 +313,7 @@ impl Harness {
         }
     }
 
-    fn terms(&self, action: Option<(ActionId, Digest256)>) -> IssueTerms {
+    fn terms(&self) -> IssueTerms {
         IssueTerms {
             mode: InviteModeKind::Code,
             rendezvous_origin: Some(origin()),
@@ -324,7 +324,6 @@ impl Harness {
             proposed_grant: self.grant.clone(),
             issuing_actor: self.owner.actor_id.clone(),
             issuing_ingress: self.owner.ingress,
-            action,
             issued_at_ms: TimestampMs::new(self.clock_wall()),
         }
     }
@@ -334,7 +333,11 @@ impl Harness {
         self.clock.wall_clock_ms()
     }
 
-    fn issue_under(&self, action: Option<(ActionId, Digest256)>) -> Host<'_> {
+    fn issue_under(&self, action: (ActionId, Digest256)) -> Host<'_> {
+        self.try_issue_under(action).expect("an invitation")
+    }
+
+    fn try_issue_under(&self, action: (ActionId, Digest256)) -> Result<Host<'_>, PairingError> {
         let approval = self.approval(
             SensitiveAction::IssueInvitation,
             kr_protocol::invitation::issuance_digest(
@@ -347,7 +350,7 @@ impl Harness {
             None,
         );
         HostInvitation::issue(
-            self.rows.issuing(self.terms(action)),
+            self.rows.issuing(self.terms(), action),
             &self.clock,
             &self.service,
             InvitationProposal {
@@ -359,11 +362,13 @@ impl Harness {
             &self.by(&approval, self.owner_keys.authorisation.public()),
             &mut self.ledger.lock().expect("the ledger"),
         )
-        .expect("an invitation")
     }
 
     fn issue(&self) -> Host<'_> {
-        self.issue_under(None)
+        self.issue_under((
+            ActionId::new(kr_ipc::new_uuid()),
+            Digest256::from_bytes([3; 32]),
+        ))
     }
 
     fn identities(&self) -> GrantIdentities {
@@ -834,8 +839,20 @@ fn a_spent_confirmation_cannot_be_spent_again() {
         None,
     );
     let owner = ActorId::new("local:501").expect("a principal");
-    rows.record_answered(&approval.proof, &owner, TimestampMs::new(10), &|| Ok(()))
+    let answered_at = rows
+        .record_answered(
+            &approval.proof,
+            &PairingAction {
+                actor: owner,
+                action_id: ActionId::new(kr_ipc::new_uuid()),
+                digest: Digest256::from_bytes([4; 32]),
+                subject: ActionSubject::Completed(approval.request.confirmation_id),
+            },
+            TimestampMs::new(10),
+            &|| Ok(()),
+        )
         .expect("answered");
+    assert_eq!(answered_at, TimestampMs::new(10));
     let acceptance = rows
         .acceptance(approval.request.confirmation_id)
         .expect("readable")
@@ -851,8 +868,8 @@ fn a_spent_confirmation_cannot_be_spent_again() {
 }
 
 /// An invitation is recorded with the action that issued it and never with its secret. A retry of
-/// that action finds the invitation after a restart; nothing in the database file carries the six
-/// secret characters.
+/// that action finds the invitation after a restart, through the action's own record; nothing in
+/// the database file carries the six secret characters.
 #[test]
 fn an_invitation_is_found_by_its_action_and_its_secret_is_never_written() {
     let temp = tempfile::TempDir::new().expect("a directory on the internal disk");
@@ -861,7 +878,7 @@ fn an_invitation_is_found_by_its_action_and_its_secret_is_never_written() {
     let harness = Harness::new(rows.clone());
     let action = ActionId::new(Uuid::from_bytes([7; 16]));
     let digest = Digest256::from_bytes([8; 32]);
-    let host = harness.issue_under(Some((action, digest)));
+    let host = harness.issue_under((action, digest));
     let code = host.code().display_text().to_string();
     let invitation_id = host.invitation_id();
     drop(host);
@@ -869,20 +886,21 @@ fn an_invitation_is_found_by_its_action_and_its_secret_is_never_written() {
     drop(rows);
 
     let (_, rows) = open(&path);
+    let recorded = rows
+        .action(&harness.owner.actor_id, action)
+        .expect("readable")
+        .expect("the action's record");
+    assert_eq!(recorded.digest, digest);
+    assert_eq!(recorded.subject, ActionSubject::Issued(invitation_id));
     let row = rows
-        .row_for_action(&harness.owner.actor_id, action)
+        .row(invitation_id)
         .expect("readable")
         .expect("the invitation");
-    assert_eq!(row.record.invitation_id, invitation_id);
-    assert_eq!(row.terms.action, Some((action, digest)));
+    assert_eq!(row.terms.issuing_actor, harness.owner.actor_id);
     assert_eq!(row.terms.mode, InviteModeKind::Code);
     assert_eq!(row.terms.proposed_grant, viewer_grant());
     let other = ActorId::new("local:502").expect("a principal");
-    assert!(
-        rows.row_for_action(&other, action)
-            .expect("readable")
-            .is_none()
-    );
+    assert!(rows.action(&other, action).expect("readable").is_none());
 
     let secret: String = code
         .chars()
@@ -898,6 +916,155 @@ fn an_invitation_is_found_by_its_action_and_its_secret_is_never_written() {
             "the code's secret half is on disk"
         );
     }
+}
+
+/// Section 9, KR-REQ-09.07: the pairing mutations are one record keyed by the verified actor and
+/// the action identifier. The payload recorded under an identifier is the only one it answers: the
+/// same identifier with another payload is `ID_CONFLICT` whichever pairing method asks, and a write
+/// that would record it rolls back with everything else it wrote. Another actor's identical
+/// identifier is its own.
+#[test]
+fn an_action_identifier_is_spent_on_one_payload_across_the_pairing_methods() {
+    let temp = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.sqlite3");
+    let (_, rows) = open(&path);
+    let harness = Harness::new(rows.clone());
+    let actor = harness.owner.actor_id.clone();
+    let action = ActionId::new(Uuid::from_bytes([9; 16]));
+    let digest = Digest256::from_bytes([5; 32]);
+    let other = Digest256::from_bytes([6; 32]);
+    let conflict = |outcome: kr_controller::error::Result<()>| outcome.expect_err("refused").code();
+
+    let approval = harness.approval(
+        SensitiveAction::ChangeHostAuthority,
+        Digest256::from_bytes([2; 32]),
+        None,
+    );
+    let completed = PairingAction {
+        actor: actor.clone(),
+        action_id: action,
+        digest,
+        subject: ActionSubject::Completed(approval.request.confirmation_id),
+    };
+    rows.record_answered(
+        &approval.proof,
+        &completed,
+        TimestampMs::new(10),
+        &|| Ok(()),
+    )
+    .expect("answered");
+    assert_eq!(
+        rows.answered(&actor, action, digest)
+            .expect("recorded")
+            .expect("readable"),
+        completed.subject
+    );
+    assert_eq!(
+        rows.answered(&actor, action, other)
+            .expect("recorded")
+            .expect_err("another payload")
+            .code(),
+        ErrorCode::IdConflict
+    );
+
+    // Each other pairing method, under the spent identifier with another payload.
+    let asked = harness
+        .approval(
+            SensitiveAction::ChangeHostAuthority,
+            Digest256::from_bytes([7; 32]),
+            None,
+        )
+        .request;
+    assert_eq!(
+        conflict(
+            rows.record_requested(
+                &PairingAction {
+                    actor: actor.clone(),
+                    action_id: action,
+                    digest: other,
+                    subject: ActionSubject::Requested(Box::new(asked)),
+                },
+                &|| Ok(()),
+            )
+            .map(|_| ())
+        ),
+        ErrorCode::IdConflict
+    );
+    for subject in [
+        ActionSubject::Confirmed(InvitationId::new(Uuid::from_bytes([10; 16]))),
+        ActionSubject::Ended(InvitationId::new(Uuid::from_bytes([11; 16]))),
+    ] {
+        assert_eq!(
+            conflict(rows.record_action(&PairingAction {
+                actor: actor.clone(),
+                action_id: action,
+                digest: other,
+                subject,
+            })),
+            ErrorCode::IdConflict
+        );
+    }
+    let refused = harness.try_issue_under((action, other));
+    assert!(
+        matches!(
+            refused,
+            Err(PairingError::Refused {
+                code: ErrorCode::IdConflict,
+                ..
+            })
+        ),
+        "{:?}",
+        refused.map(|host| host.invitation_id())
+    );
+    assert!(
+        rows.unfinished().expect("readable").is_empty(),
+        "the invitation was not written"
+    );
+    assert_eq!(
+        rows.action(&actor, action)
+            .expect("readable")
+            .expect("the record"),
+        completed,
+        "the identifier's one record is as it was"
+    );
+
+    // The same request twice under one identifier is given the challenge recorded first.
+    let requested = ActionId::new(Uuid::from_bytes([12; 16]));
+    let challenge = |digest_byte| {
+        harness
+            .approval(
+                SensitiveAction::ChangeHostAuthority,
+                Digest256::from_bytes([digest_byte; 32]),
+                None,
+            )
+            .request
+    };
+    let first = challenge(13);
+    let asking = |request| PairingAction {
+        actor: actor.clone(),
+        action_id: requested,
+        digest,
+        subject: ActionSubject::Requested(Box::new(request)),
+    };
+    assert_eq!(
+        rows.record_requested(&asking(first.clone()), &|| Ok(()))
+            .expect("recorded"),
+        None
+    );
+    assert_eq!(
+        rows.record_requested(&asking(challenge(14)), &|| Ok(()))
+            .expect("recorded"),
+        Some(first)
+    );
+
+    // Another actor's identical identifier is its own.
+    rows.record_action(&PairingAction {
+        actor: ActorId::new("local:502").expect("a principal"),
+        action_id: action,
+        digest: other,
+        subject: ActionSubject::Ended(InvitationId::new(Uuid::from_bytes([11; 16]))),
+    })
+    .expect("another actor's own identifier");
 }
 
 /// The owner record: a device holding host management that is already on record when the record

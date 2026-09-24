@@ -14,7 +14,8 @@ use kr_client::error::ClientError;
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::confirmation::{
     ConfirmationDisplay, ConfirmationSubject, DescribedAction, OwnerConfirmationCompleteParams,
-    OwnerConfirmationPendingParams, OwnerConfirmationPendingResult,
+    OwnerConfirmationCompleteResult, OwnerConfirmationPendingParams,
+    OwnerConfirmationPendingResult, OwnerConfirmationRequestParams, OwnerConfirmationRequestResult,
 };
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::{ErrorCode, ProtocolError};
@@ -29,7 +30,7 @@ use kr_protocol::pairing::{
     ConfirmationChannel, INVITATION_LIFETIME_MS, PairStatus, PairingConsumedReason, ProposedGrant,
     SensitiveAction,
 };
-use kr_protocol::preauth::PairStatusParams;
+use kr_protocol::preauth::{PairStatusParams, PairStatusResult};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable};
 use kr_protocol::sharing::DeviceRevokeParams;
@@ -962,5 +963,326 @@ async fn an_invitation_is_issued_once_per_action() {
         ),
         ErrorCode::PairingRejected
     );
+    host.stop().await;
+}
+
+/// The parameters of a completion that answers a challenge with `proof`.
+fn completing(
+    proof: kr_protocol::pairing::OwnerConfirmationProof,
+) -> OwnerConfirmationCompleteParams {
+    OwnerConfirmationCompleteParams {
+        proof,
+        bootstrap_signer: Nullable::null(),
+    }
+}
+
+/// Section 9, KR-REQ-09.07: an owner device's completion is answered again for its own action and
+/// payload, and for nothing else.
+///
+/// The owner device answers two challenges under two actions of its own. Each proof, accepted and
+/// on record, submitted under the other one's action is a reused identifier with another payload,
+/// and is refused as `ID_CONFLICT` rather than given the answer its own acceptance holds. The exact
+/// repeat of each is answered from its record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_devices_completion_is_answered_again_only_under_its_own_action() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner_record = host.owner.clone().expect("the owner device");
+    let owner_device = host.owner_device.as_ref().expect("the owner device");
+    let raw = RawDevice::connect(&host, owner_device, &owner_record).await;
+    let target = ActionTarget::environment(environment);
+
+    let first = calls::request(
+        environment,
+        &mut client,
+        issue_subject(InviteGrantKind::SessionInvitation, &viewer()),
+    )
+    .await
+    .expect("a challenge");
+    let second = calls::request(
+        environment,
+        &mut client,
+        issue_subject(
+            InviteGrantKind::SessionInvitation,
+            &proposal(&[ActionRight::SessionView, ActionRight::TerminalInput]),
+        ),
+    )
+    .await
+    .expect("another challenge");
+    let (p, _) = calls::sign(&first.request, &Signer::OwnerDevice(&owner_keys));
+    let (q, _) = calls::sign(&second.request, &Signer::OwnerDevice(&owner_keys));
+    let (a, b) = (
+        ActionId::new(kr_ipc::new_uuid()),
+        ActionId::new(kr_ipc::new_uuid()),
+    );
+    let answered_p = raw
+        .mutate(
+            Method::OwnerConfirmationComplete,
+            a,
+            target.clone(),
+            &completing(p.clone()),
+        )
+        .await
+        .expect("the owner device answers the first under its action");
+    let answered_q = raw
+        .mutate(
+            Method::OwnerConfirmationComplete,
+            b,
+            target.clone(),
+            &completing(q.clone()),
+        )
+        .await
+        .expect("and the second under another");
+
+    // Each accepted proof under the other's action: another payload under an identifier already
+    // spent.
+    for (action, proof) in [(a, q.clone()), (b, p.clone())] {
+        let swapped = raw
+            .mutate(
+                Method::OwnerConfirmationComplete,
+                action,
+                target.clone(),
+                &completing(proof),
+            )
+            .await;
+        assert_eq!(code(swapped), ErrorCode::IdConflict);
+    }
+    // The exact repeats are answered from their own records.
+    assert_eq!(
+        raw.mutate(
+            Method::OwnerConfirmationComplete,
+            a,
+            target.clone(),
+            &completing(p),
+        )
+        .await
+        .expect("the first's own repeat"),
+        answered_p
+    );
+    assert_eq!(
+        raw.mutate(Method::OwnerConfirmationComplete, b, target, &completing(q))
+            .await
+            .expect("the second's own repeat"),
+        answered_q
+    );
+    host.stop().await;
+}
+
+/// Section 9, KR-REQ-09.07: one action identifier of the owner's is spent on one pairing answer,
+/// across all five pairing methods, and an answer that changed nothing spends it too.
+///
+/// An identifier that asked for a challenge cannot withdraw an invitation. One that withdrew an
+/// invitation already ended, which changed nothing, cannot withdraw another. Two answered proofs
+/// swapped between their actions are refused. Every exact repeat is answered from its record, a
+/// completion's after its challenge was spent as well, and the spent proof under a new action is a
+/// completion of its own with nothing left to answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_action_identifier_is_spent_on_one_pairing_answer() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let grant = viewer();
+    let withdrawal = |invitation_id| PairCancelParams {
+        invitation_id,
+        deny: false,
+    };
+    let still_offered = |status: &PairStatusResult| {
+        matches!(
+            status.status,
+            PairStatus::Open { .. } | PairStatus::AwaitingApproval { .. }
+        )
+    };
+
+    // An identifier spent on asking for a challenge.
+    let asked = ActionId::new(kr_ipc::new_uuid());
+    let asking = OwnerConfirmationRequestParams {
+        subject: issue_subject(InviteGrantKind::SessionInvitation, &grant),
+    };
+    let challenge: OwnerConfirmationRequestResult = calls::mutate_as(
+        environment,
+        &mut client,
+        asked,
+        Method::OwnerConfirmationRequest,
+        &asking,
+    )
+    .await
+    .expect("a challenge");
+    let first = calls::invite_direct(
+        environment,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &grant,
+        &owner,
+    )
+    .await
+    .expect("an invitation");
+    assert_eq!(
+        code(
+            calls::mutate_as::<_, PairStatusResult>(
+                environment,
+                &mut client,
+                asked,
+                Method::PairCancel,
+                &withdrawal(first.invitation_id),
+            )
+            .await
+        ),
+        ErrorCode::IdConflict
+    );
+    assert!(
+        still_offered(
+            &calls::owner_status(&mut client, first.invitation_id)
+                .await
+                .expect("the owner's view")
+        ),
+        "the refused withdrawal withdrew nothing"
+    );
+    let again: OwnerConfirmationRequestResult = calls::mutate_as(
+        environment,
+        &mut client,
+        asked,
+        Method::OwnerConfirmationRequest,
+        &asking,
+    )
+    .await
+    .expect("the request's own repeat");
+    assert_eq!(again.request, challenge.request);
+
+    // A withdrawal that changed nothing spends its identifier all the same.
+    let withdrawn = calls::cancel(environment, &mut client, first.invitation_id, false)
+        .await
+        .expect("withdrawn");
+    let second = calls::invite_direct(
+        environment,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &grant,
+        &owner,
+    )
+    .await
+    .expect("another invitation");
+    let late = ActionId::new(kr_ipc::new_uuid());
+    let told: PairStatusResult = calls::mutate_as(
+        environment,
+        &mut client,
+        late,
+        Method::PairCancel,
+        &withdrawal(first.invitation_id),
+    )
+    .await
+    .expect("told how the first ended");
+    assert_eq!(told.status, withdrawn.status);
+    assert_eq!(
+        code(
+            calls::mutate_as::<_, PairStatusResult>(
+                environment,
+                &mut client,
+                late,
+                Method::PairCancel,
+                &withdrawal(second.invitation_id),
+            )
+            .await
+        ),
+        ErrorCode::IdConflict
+    );
+    assert!(
+        still_offered(
+            &calls::owner_status(&mut client, second.invitation_id)
+                .await
+                .expect("the owner's view")
+        ),
+        "the second invitation is still on offer"
+    );
+    calls::cancel(environment, &mut client, second.invitation_id, false)
+        .await
+        .expect("withdrawn");
+
+    // Two answered proofs swapped between their actions.
+    let one = calls::request(
+        environment,
+        &mut client,
+        issue_subject(InviteGrantKind::SessionInvitation, &grant),
+    )
+    .await
+    .expect("a challenge");
+    let other = calls::request(
+        environment,
+        &mut client,
+        issue_subject(
+            InviteGrantKind::SessionInvitation,
+            &proposal(&[ActionRight::SessionView, ActionRight::TerminalInput]),
+        ),
+    )
+    .await
+    .expect("another challenge");
+    let (p, _) = calls::sign(&one.request, &owner);
+    let (q, _) = calls::sign(&other.request, &owner);
+    let (a, b) = (
+        ActionId::new(kr_ipc::new_uuid()),
+        ActionId::new(kr_ipc::new_uuid()),
+    );
+    let by_a: OwnerConfirmationCompleteResult = calls::mutate_as(
+        environment,
+        &mut client,
+        a,
+        Method::OwnerConfirmationComplete,
+        &completing(p.clone()),
+    )
+    .await
+    .expect("the first proof under its action");
+    let _: OwnerConfirmationCompleteResult = calls::mutate_as(
+        environment,
+        &mut client,
+        b,
+        Method::OwnerConfirmationComplete,
+        &completing(q.clone()),
+    )
+    .await
+    .expect("the second under another");
+    assert_eq!(
+        code(
+            calls::mutate_as::<_, OwnerConfirmationCompleteResult>(
+                environment,
+                &mut client,
+                a,
+                Method::OwnerConfirmationComplete,
+                &completing(q),
+            )
+            .await
+        ),
+        ErrorCode::IdConflict
+    );
+
+    // The first proof is spent by the invitation it approves; its exact repeat is still answered
+    // from its record, and the same proof under a new action has nothing left to answer.
+    let spent: PairInviteResult = calls::mutate(
+        environment,
+        &mut client,
+        Method::PairInvite,
+        &invite_params(InviteGrantKind::SessionInvitation, &grant),
+    )
+    .await
+    .expect("the invitation spends the first proof");
+    let repeated: OwnerConfirmationCompleteResult = calls::mutate_as(
+        environment,
+        &mut client,
+        a,
+        Method::OwnerConfirmationComplete,
+        &completing(p.clone()),
+    )
+    .await
+    .expect("the first proof's own repeat");
+    assert_eq!(repeated, by_a);
+    assert_eq!(
+        code(calls::complete(environment, &mut client, p, None).await),
+        ErrorCode::OwnerConfirmationRequired
+    );
+    calls::cancel(environment, &mut client, spent.invitation_id, false)
+        .await
+        .expect("withdrawn");
     host.stop().await;
 }

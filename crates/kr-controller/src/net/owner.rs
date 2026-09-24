@@ -37,7 +37,7 @@ use kr_protocol::confirmation::{
     OwnerConfirmationPendingResult, OwnerConfirmationRequestResult, PendingConfirmation,
 };
 use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::{ActionId, ActorId, DeviceId};
+use kr_protocol::ids::{ActionId, ActorId, ConfirmationId, DeviceId};
 use kr_protocol::pairing::{
     ConfirmationChannel, DevicePublicKeys, KeyPurpose, OwnerConfirmationProof,
     OwnerConfirmationRequest, SensitiveAction,
@@ -46,7 +46,7 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, Digest256, EndpointKey, KeyId};
 
 use super::devices::{DeviceDirectory, DeviceRecord};
-use super::invitations::InvitationRows;
+use super::invitations::{ActionSubject, InvitationRows, PairingAction, another_subject};
 use super::lifetimes::GrantLifetimes;
 use super::pairing::HostPairingClock;
 use crate::error::{ControllerError, Result};
@@ -264,9 +264,10 @@ impl OwnerAuthority {
     /// Issues the challenge for one resolved action.
     ///
     /// `action` is the caller's action and the digest of its whole mutation. The challenge an
-    /// action asked for is recorded before it is issued, so a retry of that mutation gets the same
-    /// challenge, outstanding or not and across a restart, and the same action with another
-    /// payload is `ID_CONFLICT`. `admission` is asked immediately before anything is written.
+    /// action asked for is recorded with the action before it is issued, so a retry of that
+    /// mutation gets the same challenge, outstanding or not and across a restart, and the same
+    /// identifier with another payload is `ID_CONFLICT`, whichever pairing method it was spent on.
+    /// `admission` is asked immediately before anything is written.
     ///
     /// # Errors
     ///
@@ -285,11 +286,13 @@ impl OwnerAuthority {
                 detail: "only this host's owner asks for an owner confirmation".to_owned(),
             });
         }
-        if let Some(retained) = self.retained_request(caller, action) {
-            return retained;
-        }
         let initial_bootstrap = self.enrolment()? == HostEnrolment::InitialBootstrap;
         let mut state = self.state();
+        // Asked under the lock every challenge is issued under, so two copies of one request meet
+        // here and the second is given the challenge the first recorded.
+        if let Some(requested) = self.requested(caller, action) {
+            return requested;
+        }
         self.sweep(&mut state);
         let request = request_confirmation(
             &self.clock,
@@ -303,8 +306,21 @@ impl OwnerAuthority {
         .map_err(refusal)?;
         // The admission is asked inside the transaction that records the request, after every wait
         // before it; nothing is issued unless that record is written.
-        self.rows
-            .record_requested(&caller.actor_id, action.0, action.1, &request, admission)?;
+        let recorded = self.rows.record_requested(
+            &PairingAction {
+                actor: caller.actor_id.clone(),
+                action_id: action.0,
+                digest: action.1,
+                subject: ActionSubject::Requested(Box::new(request.clone())),
+            },
+            admission,
+        )?;
+        if let Some(request) = recorded {
+            return Ok(OwnerConfirmationRequestResult {
+                request,
+                initial_bootstrap,
+            });
+        }
         state.ledger.issue(&request, &self.clock);
         state.issued += 1;
         let order = state.issued;
@@ -328,67 +344,85 @@ impl OwnerAuthority {
     ///
     /// # Errors
     ///
-    /// The inner result is `ID_CONFLICT` when the same action asked with another payload, and a
-    /// registry error when the record cannot be read.
-    pub fn retained_request(
+    /// The inner result is `ID_CONFLICT` when the identifier was used with another payload, for
+    /// this method or any other pairing method, and a registry error when the record cannot be
+    /// read.
+    #[must_use]
+    pub fn requested(
         &self,
         caller: &Caller,
         action: (ActionId, Digest256),
     ) -> Option<Result<OwnerConfirmationRequestResult>> {
-        let recorded = match self.rows.requested(&caller.actor_id, action.0) {
-            Ok(recorded) => recorded?,
+        let subject = match self.rows.answered(&caller.actor_id, action.0, action.1)? {
+            Ok(subject) => subject,
             Err(error) => return Some(Err(error)),
         };
-        let (digest, request) = recorded;
-        if digest != action.1 {
-            return Some(Err(ControllerError::Refused {
-                code: ErrorCode::IdConflict,
-                detail: "this action already asked for a confirmation of something else".to_owned(),
-            }));
-        }
-        Some(
-            self.enrolment()
-                .map(|enrolment| OwnerConfirmationRequestResult {
-                    request,
-                    initial_bootstrap: enrolment == HostEnrolment::InitialBootstrap,
-                }),
-        )
+        Some(match subject {
+            ActionSubject::Requested(request) => self.answer_requested(*request),
+            _ => Err(another_subject()),
+        })
     }
 
-    /// Returns the answer a repeated completion is owed, when this caller already completed this
-    /// exact proof.
+    /// Returns what an action that asked for `request` is answered with.
     ///
-    /// The acceptance record is what says so, so this holds after the challenge was spent and
-    /// across a restart. It answers the caller that completed the proof and nobody else, and only
-    /// for the proof exactly as it was accepted: a repeat with anything changed, the signature
-    /// included, is a new completion and is checked as one.
+    /// # Errors
+    ///
+    /// Returns a registry error when the owner record cannot be read.
+    pub fn answer_requested(
+        &self,
+        request: OwnerConfirmationRequest,
+    ) -> Result<OwnerConfirmationRequestResult> {
+        Ok(OwnerConfirmationRequestResult {
+            request,
+            initial_bootstrap: self.enrolment()? == HostEnrolment::InitialBootstrap,
+        })
+    }
+
+    /// Returns the answer an action that already completed a confirmation is owed, when it did.
+    ///
+    /// The action's record says which confirmation, and the acceptance record says what was
+    /// accepted, so this holds after the challenge was spent and across a restart. It is given for
+    /// the same action and payload and nothing else: the same proof under another action is a
+    /// completion of its own, checked as one.
+    ///
+    /// # Errors
+    ///
+    /// The inner result is `ID_CONFLICT` when the identifier was used with another payload, for
+    /// this method or any other pairing method, and a registry error when a record cannot be read.
     #[must_use]
-    pub fn retained_answer(
+    pub fn completed(
         &self,
         caller: &Caller,
-        params: &OwnerConfirmationCompleteParams,
+        action: (ActionId, Digest256),
     ) -> Option<Result<OwnerConfirmationCompleteResult>> {
-        let proof = &params.proof;
-        let presented_signer_matches = params
-            .bootstrap_signer
-            .0
-            .as_ref()
-            .is_none_or(|signer| key_id(signer) == proof.signer_key_id);
-        match self.rows.acceptance(proof.request.confirmation_id) {
-            Ok(Some(acceptance))
-                if acceptance.answered_by.as_ref() == Some(&caller.actor_id)
-                    && &acceptance.proof == proof
-                    && presented_signer_matches =>
-            {
-                Some(Ok(OwnerConfirmationCompleteResult {
-                    confirmation_id: proof.request.confirmation_id,
-                    channel: proof.channel,
-                    answered_at_ms: acceptance.answered_at_ms,
-                }))
-            }
-            Ok(_) => None,
-            Err(error) => Some(Err(error)),
-        }
+        let subject = match self.rows.answered(&caller.actor_id, action.0, action.1)? {
+            Ok(subject) => subject,
+            Err(error) => return Some(Err(error)),
+        };
+        Some(match subject {
+            ActionSubject::Completed(confirmation_id) => self.answer_completed(confirmation_id),
+            _ => Err(another_subject()),
+        })
+    }
+
+    /// Returns what an action that completed `confirmation_id` is answered with, from the
+    /// acceptance record.
+    ///
+    /// # Errors
+    ///
+    /// Returns a registry error when the acceptance record cannot be read or has no row for it.
+    pub fn answer_completed(
+        &self,
+        confirmation_id: ConfirmationId,
+    ) -> Result<OwnerConfirmationCompleteResult> {
+        let acceptance = self.rows.acceptance(confirmation_id)?.ok_or_else(|| {
+            ControllerError::registry("a completed confirmation has no acceptance record")
+        })?;
+        Ok(OwnerConfirmationCompleteResult {
+            confirmation_id,
+            channel: acceptance.proof.channel,
+            answered_at_ms: acceptance.answered_at_ms,
+        })
     }
 
     /// Lists the challenges an owner can still answer, oldest first.
@@ -418,17 +452,24 @@ impl OwnerAuthority {
         })
     }
 
-    /// Verifies a proof for an outstanding challenge and records the answer.
+    /// Verifies a proof for an outstanding challenge and records the answer, with the action that
+    /// completed it.
+    ///
+    /// A proof is accepted once. The same proof completed again under another action, while its
+    /// challenge is outstanding, records that action and is answered with the acceptance as it
+    /// already stands; once the challenge is spent it answers nothing.
     ///
     /// # Errors
     ///
     /// Returns `OWNER_CONFIRMATION_REQUIRED` when the proof answers no outstanding challenge,
     /// arrived through a channel that is never a confirmation, or comes from a signer this host
-    /// does not accept for that channel, and `PAIRING_AUTH_FAILED` when its signature fails.
+    /// does not accept for that channel, `PAIRING_AUTH_FAILED` when its signature fails, and
+    /// `ID_CONFLICT` for a reused action.
     pub fn complete(
         &self,
         caller: &Caller,
         params: &OwnerConfirmationCompleteParams,
+        action: (ActionId, Digest256),
         admission: &dyn Fn() -> Result<()>,
     ) -> Result<OwnerConfirmationCompleteResult> {
         let proof = &params.proof;
@@ -447,6 +488,11 @@ impl OwnerAuthority {
         }
         let enrolment = self.enrolment()?;
         let mut state = self.state();
+        // Asked under the lock every answer is recorded under, so two copies of one completion meet
+        // here and the second is given what the first recorded.
+        if let Some(completed) = self.completed(caller, action) {
+            return completed;
+        }
         self.sweep(&mut state);
         let key = *proof.request.confirmation_id.get().as_bytes();
         let entry = state.entries.get(&key).ok_or_else(|| {
@@ -466,11 +512,19 @@ impl OwnerAuthority {
                 "that challenge has already been answered with another proof",
             ));
         }
-        let now = kr_ipc::now_ms();
         // The admission is asked inside the transaction that records the answer, after every wait
         // before it.
-        self.rows
-            .record_answered(proof, &caller.actor_id, now, admission)?;
+        let answered_at_ms = self.rows.record_answered(
+            proof,
+            &PairingAction {
+                actor: caller.actor_id.clone(),
+                action_id: action.0,
+                digest: action.1,
+                subject: ActionSubject::Completed(proof.request.confirmation_id),
+            },
+            kr_ipc::now_ms(),
+            admission,
+        )?;
         if let Some(entry) = state.entries.get_mut(&key) {
             entry.answer = Some(Answer {
                 proof: proof.clone(),
@@ -480,7 +534,7 @@ impl OwnerAuthority {
         Ok(OwnerConfirmationCompleteResult {
             confirmation_id: proof.request.confirmation_id,
             channel: proof.channel,
-            answered_at_ms: now,
+            answered_at_ms,
         })
     }
 
