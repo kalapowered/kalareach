@@ -16,6 +16,10 @@ jiff.workspace = true
 kr-crypto.workspace = true
 kr-plugin-sdk.workspace = true
 kr-protocol.workspace = true
+# Reads a delegated role's name back out of the file the update client fetches its document from,
+# so a role past the depth bound is refused before its document is asked for. The same release the
+# client and the URL parser encode with.
+percent-encoding = "=2.3.2"
 # The catalogue's records and receipts: one transactional owner, written with full durability.
 rusqlite = { workspace = true, features = ["bundled"] }
 serde.workspace = true

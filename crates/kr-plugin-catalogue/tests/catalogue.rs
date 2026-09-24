@@ -342,6 +342,80 @@ async fn kr_req_11_08_terminating_miss_in_leaf_fails_package_resolution() {
     );
 }
 
+/// A delegation chain at the bound verifies and resolves its package through every level. One role
+/// deeper is refused before the client asks for that role's document, so a repository cannot make
+/// a host fetch and verify a level it would refuse anyway. Both hold whether or not the root
+/// publishes consistent snapshots, which name every role's document with its version in front.
+#[tokio::test]
+async fn kr_req_11_08_a_role_past_the_depth_bound_is_refused_before_its_document_is_fetched() {
+    for consistent_snapshot in [false, true] {
+        for (depth, permitted) in [(3usize, true), (4, false)] {
+            let home = tempfile::tempdir().expect("a temporary directory");
+            let generation = Generation::build(
+                home.path(),
+                GenerationSpec {
+                    delegation_chain: depth,
+                    consistent_snapshot,
+                    ..GenerationSpec::default()
+                },
+            )
+            .await;
+            let mut catalogue = enrolled(
+                home.path(),
+                &generation,
+                RepositoryBudgets::defaults(),
+                CapabilityCeiling::default_ceiling(),
+            )
+            .await;
+            let watched = Watched::default();
+            catalogue.set_transport(Arc::new(watched.clone()));
+            let outcome = catalogue.sync(&repository()).await;
+            let fetched = watched.fetched.lock().expect("the list").clone();
+            let requested = |role: &str| {
+                let file = if consistent_snapshot {
+                    format!("/1.{role}.json")
+                } else {
+                    format!("/{role}.json")
+                };
+                fetched.iter().any(|url| url.path().ends_with(&file))
+            };
+            let case = format!("depth {depth}, consistent snapshots {consistent_snapshot}");
+            let deepest = format!("level-{depth}");
+            if permitted {
+                let outcome = outcome.unwrap_or_else(|refusal| panic!("{case}: {refusal}"));
+                assert_eq!(outcome.delegations.len(), depth, "{case}");
+                assert!(requested(&deepest), "{case}: {fetched:?}");
+                catalogue
+                    .activate_package(
+                        &repository(),
+                        &plugin(),
+                        &version(),
+                        FetchReason::ExplicitInstall,
+                    )
+                    .await
+                    .unwrap_or_else(|refusal| panic!("{case}: {refusal}"));
+                continue;
+            }
+            let refusal = outcome.expect_err("a chain past the bound is refused");
+            assert_eq!(refusal.code(), ErrorCode::RepositoryUntrusted, "{case}");
+            assert!(
+                refusal.to_string().contains("deeper than 3 roles"),
+                "{case}: {refusal}"
+            );
+            assert!(requested("level-3"), "{case}: the chain was followed");
+            assert!(
+                !requested(&deepest),
+                "{case}: the role past the bound was fetched: {fetched:?}"
+            );
+            assert_eq!(
+                catalogue.active(&repository()).expect("enrolled"),
+                None,
+                "{case}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn kr_req_11_07_root_key_rotation_advances_and_withholding_rotated_root_fails() {
     let home = tempfile::tempdir().expect("a temporary directory");
@@ -4014,78 +4088,148 @@ async fn an_installation_keeps_its_payloads_when_room_is_made() {
     }
 }
 
-/// The metadata and the index are held under one allowance, so two that each fit can together be
-/// refused.
-#[tokio::test]
-async fn metadata_and_index_are_counted_against_one_allowance() {
-    let home = tempfile::tempdir().expect("a temporary directory");
-    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+/// Returns the bytes a sync of `generation` fetches while it loads the metadata, and the index's.
+///
+/// The client asks for the next root and finds none, then fetches the timestamp, the snapshot and
+/// the targets metadata once each.
+fn metadata_and_index(generation: &Generation) -> (u64, u64) {
     let size = |path: std::path::PathBuf| std::fs::metadata(path).expect("a file").len();
     let metadata: u64 = ["timestamp.json", "snapshot.json", "targets.json"]
         .into_iter()
         .map(|name| size(generation.metadata_dir().join(name)))
         .sum();
-    let index = size(generation.targets_dir().join("index.json"));
-    let mut budgets = RepositoryBudgets::defaults();
-    budgets.metadata_bytes = U64::new(metadata + index - 1);
-    assert!(metadata < budgets.metadata_bytes.get() && index < budgets.metadata_bytes.get());
-    let mut catalogue = enrolled(
-        home.path(),
-        &generation,
-        budgets,
-        CapabilityCeiling::default_ceiling(),
-    )
-    .await;
-    let refusal = catalogue
-        .sync(&repository())
-        .await
-        .expect_err("together they are past the allowance");
-    assert!(
-        matches!(&refusal, CatalogueError::ResourceLimit(limit) if limit.resource == Resource::MetadataBytes),
-        "{refusal:?}"
-    );
-    assert_eq!(catalogue.active(&repository()).expect("enrolled"), None);
+    (metadata, size(generation.targets_dir().join("index.json")))
 }
 
-/// The index is counted once where the targets sit inside the metadata location, and the
-/// generation that fits its allowance exactly is accepted.
+/// Enrols `generation` from the given locations under a metadata allowance of `allowance` bytes,
+/// in a catalogue of its own that fetches through `transport`.
+fn enrolled_at(
+    root: &std::path::Path,
+    generation: &Generation,
+    metadata_url: url::Url,
+    targets_url: url::Url,
+    allowance: u64,
+    transport: &Watched,
+) -> Catalogue {
+    let mut budgets = RepositoryBudgets::defaults();
+    budgets.metadata_bytes = U64::new(allowance);
+    let mut catalogue = Catalogue::open(root).expect("an openable catalogue");
+    catalogue
+        .enrol(
+            Enrolment::new(
+                repository(),
+                RepositoryKind::Official,
+                metadata_url,
+                targets_url,
+                generation.root_bytes(),
+                budgets,
+                CapabilityCeiling::default_ceiling(),
+            )
+            .expect("an enrollable repository"),
+            true,
+        )
+        .expect("the owner adopted the root");
+    catalogue.set_transport(Arc::new(transport.clone()));
+    catalogue
+}
+
+/// The metadata and the index are held under one allowance, and the index is counted once
+/// wherever the targets are published: apart from the metadata, in the metadata location itself,
+/// or inside it. A generation that fits exactly is accepted. One byte past it is refused against
+/// the declared length before the index is asked for, and activates nothing.
 #[tokio::test]
-async fn an_index_inside_the_metadata_location_is_counted_once() {
+async fn the_index_is_counted_once_in_every_layout_and_refused_before_it_is_fetched() {
     let home = tempfile::tempdir().expect("a temporary directory");
     let generation = Generation::build(home.path(), GenerationSpec::default()).await;
-    // The targets move inside the metadata location.
+    support::copy_tree(&generation.targets_dir(), &generation.metadata_dir());
     support::copy_tree(
         &generation.targets_dir(),
         &generation.metadata_dir().join("targets"),
     );
-    let size = |path: std::path::PathBuf| std::fs::metadata(path).expect("a file").len();
-    let metadata: u64 = ["timestamp.json", "snapshot.json", "targets.json"]
-        .into_iter()
-        .map(|name| size(generation.metadata_dir().join(name)))
-        .sum();
-    let index = size(generation.targets_dir().join("index.json"));
+    let (metadata, index) = metadata_and_index(&generation);
+    for (layout, targets_url) in [
+        ("separate", generation.targets_url()),
+        ("identical", generation.metadata_url()),
+        (
+            "nested",
+            support::directory_url(&generation.metadata_dir().join("targets")),
+        ),
+    ] {
+        for (allowance, fits) in [(metadata + index, true), (metadata + index - 1, false)] {
+            assert!(metadata < allowance && index < allowance);
+            let watched = Watched::default();
+            let mut catalogue = enrolled_at(
+                &home.path().join(format!("catalogue-{layout}-{allowance}")),
+                &generation,
+                generation.metadata_url(),
+                targets_url.clone(),
+                allowance,
+                &watched,
+            );
+            let outcome = catalogue.sync(&repository()).await;
+            let index_requested = watched
+                .fetched
+                .lock()
+                .expect("the list")
+                .iter()
+                .any(|url| url.path().ends_with("/index.json"));
+            if fits {
+                outcome.unwrap_or_else(|refusal| panic!("{layout}: {refusal}"));
+                assert!(index_requested, "{layout}");
+                continue;
+            }
+            let refusal = outcome.expect_err("together they are past the allowance");
+            let CatalogueError::ResourceLimit(limit) = &refusal else {
+                panic!("{layout}: {refusal:?}");
+            };
+            assert_eq!(limit.resource, Resource::MetadataBytes, "{layout}");
+            assert_eq!(limit.stage, Stage::Declared, "{layout}");
+            assert_eq!(limit.requested, metadata + index, "{layout}");
+            assert!(!index_requested, "{layout}: the index was asked for");
+            assert_eq!(
+                catalogue.active(&repository()).expect("enrolled"),
+                None,
+                "{layout}"
+            );
+        }
+    }
+}
+
+/// Metadata is counted by what the client fetches it for, not by where it lives.
+///
+/// The client drops a location's fragment when it resolves a document against it, so documents
+/// fetched from `metadata/#x` are not under that text at all. They are still metadata, and a
+/// generation whose metadata and index together pass the allowance is refused.
+#[tokio::test]
+async fn metadata_under_a_location_with_a_fragment_is_counted_all_the_same() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let (metadata, index) = metadata_and_index(&generation);
+    let mut located = generation.metadata_url();
+    located.set_fragment(Some("x"));
     for (allowance, fits) in [(metadata + index, true), (metadata + index - 1, false)] {
-        let mut budgets = RepositoryBudgets::defaults();
-        budgets.metadata_bytes = U64::new(allowance);
-        let root = home.path().join(format!("catalogue-{allowance}"));
-        let mut catalogue = Catalogue::open(&root).expect("an openable catalogue");
-        catalogue
-            .enrol(
-                Enrolment::new(
-                    repository(),
-                    RepositoryKind::Official,
-                    generation.metadata_url(),
-                    support::directory_url(&generation.metadata_dir().join("targets")),
-                    generation.root_bytes(),
-                    budgets,
-                    CapabilityCeiling::default_ceiling(),
-                )
-                .expect("an enrollable repository"),
-                true,
-            )
-            .expect("the owner adopted the root");
+        let watched = Watched::default();
+        let mut catalogue = enrolled_at(
+            &home.path().join(format!("catalogue-{allowance}")),
+            &generation,
+            located.clone(),
+            generation.targets_url(),
+            allowance,
+            &watched,
+        );
         let outcome = catalogue.sync(&repository()).await;
-        assert_eq!(outcome.is_ok(), fits, "{allowance}: {outcome:?}");
+        if fits {
+            outcome.expect("the generation fits its allowance exactly");
+            continue;
+        }
+        let refusal = outcome.expect_err("together they are past the allowance");
+        assert!(
+            matches!(&refusal, CatalogueError::ResourceLimit(limit)
+                if limit.resource == Resource::MetadataBytes
+                    && limit.requested == metadata + index),
+            "{refusal:?}"
+        );
+        assert_eq!(catalogue.active(&repository()).expect("enrolled"), None);
     }
 }
 

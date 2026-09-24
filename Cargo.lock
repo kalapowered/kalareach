@@ -4458,6 +4458,7 @@ dependencies = [
  "kr-ipc",
  "kr-plugin-sdk",
  "kr-protocol",
+ "percent-encoding",
  "rusqlite",
  "rustix",
  "serde",

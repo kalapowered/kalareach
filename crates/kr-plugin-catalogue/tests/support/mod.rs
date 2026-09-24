@@ -109,11 +109,20 @@ impl KeySet {
         ]
     }
 
-    fn root_document(&self, expires: jiff::Timestamp) -> Root {
-        self.root_document_with_version(NonZeroU64::new(1).expect("one is not zero"), expires)
+    fn root_document(&self, expires: jiff::Timestamp, consistent_snapshot: bool) -> Root {
+        self.root_document_with_version(
+            NonZeroU64::new(1).expect("one is not zero"),
+            expires,
+            consistent_snapshot,
+        )
     }
 
-    fn root_document_with_version(&self, version: NonZeroU64, expires: jiff::Timestamp) -> Root {
+    fn root_document_with_version(
+        &self,
+        version: NonZeroU64,
+        expires: jiff::Timestamp,
+        consistent_snapshot: bool,
+    ) -> Root {
         let mut keys = HashMap::new();
         let mut roles = HashMap::new();
         for (role, key) in [
@@ -136,7 +145,7 @@ impl KeySet {
         }
         Root {
             spec_version: "1.0.0".to_owned(),
-            consistent_snapshot: false,
+            consistent_snapshot,
             version,
             expires,
             keys,
@@ -173,8 +182,14 @@ pub struct GenerationSpec {
     pub expired: bool,
     /// Whether to build a nested two-level delegation (top -> vendor -> vendor-leaf).
     pub nested_delegation: bool,
+    /// How deep a chain of delegations to build (top -> level-1 -> ... -> level-n), each role
+    /// delegating to the next and the last signing the package's targets. None where zero.
+    pub delegation_chain: usize,
     /// Whether the leaf role carries no package targets (for terminating-miss test).
     pub empty_leaf: bool,
+    /// Whether the root publishes consistent snapshots: every metadata document but the timestamp
+    /// named with its version in front, and every target with its SHA-256.
+    pub consistent_snapshot: bool,
     /// A change made to the package's index entry after it is derived from the manifest, before
     /// the index is signed: an index that says something the manifest does not.
     pub edit_entry: Option<fn(&mut IndexEntry)>,
@@ -192,7 +207,9 @@ impl Default for GenerationSpec {
             keys: None,
             expired: false,
             nested_delegation: false,
+            delegation_chain: 0,
             empty_leaf: false,
+            consistent_snapshot: false,
             edit_entry: None,
         }
     }
@@ -320,10 +337,14 @@ impl Generation {
             "2036-01-01T00:00:00Z".parse().expect("a literal instant");
         let expires = root_expires;
 
-        let root_v2 = new_keys
-            .root_document_with_version(NonZeroU64::new(2).expect("two is not zero"), root_expires);
+        let consistent_snapshot = self.spec.consistent_snapshot;
+        let root_v2 = new_keys.root_document_with_version(
+            NonZeroU64::new(2).expect("two is not zero"),
+            root_expires,
+            consistent_snapshot,
+        );
 
-        let old_root_doc = self.keys.root_document(root_expires);
+        let old_root_doc = self.keys.root_document(root_expires, consistent_snapshot);
         let old_signed = SignedRole::new(
             root_v2.clone(),
             &KeyHolder::Root(old_root_doc),
@@ -409,6 +430,9 @@ impl Generation {
 
         let signed = editor.sign(&new_keys.sources()).await.expect("signed");
         signed.write(&metadata).await.expect("written");
+        if consistent_snapshot {
+            publish_consistent(&targets, names.iter().map(|(name, _)| name.as_str()));
+        }
         std::fs::write(metadata.join("root.json"), &root_v2_bytes).expect("writable");
 
         root_v2_bytes
@@ -446,7 +470,7 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
     // republishes, which is what section 11's rule is about.
     let root_expires: jiff::Timestamp = "2036-01-01T00:00:00Z".parse().expect("a literal instant");
 
-    let root = keys.root_document(root_expires);
+    let root = keys.root_document(root_expires, spec.consistent_snapshot);
     let signed_root = SignedRole::new(
         root.clone(),
         &KeyHolder::Root(root),
@@ -513,7 +537,19 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
         .timestamp_version(version)
         .timestamp_expires(expires);
 
-    if spec.nested_delegation {
+    // A chain of delegations: each role delegates the publisher's packages to the next, and the
+    // last one signs the package's targets. The index stays with the top-level targets role.
+    let chain: Vec<(String, bool)> = if spec.nested_delegation {
+        vec![
+            ("vendor".to_owned(), false),
+            ("vendor-leaf".to_owned(), true),
+        ]
+    } else {
+        (1..=spec.delegation_chain)
+            .map(|level| (format!("level-{level}"), false))
+            .collect()
+    };
+    if !chain.is_empty() {
         let index_target = Target::from_path(targets.join("index.json"))
             .await
             .expect("an index target");
@@ -521,69 +557,46 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
             .add_target("index.json", index_target)
             .expect("added");
 
-        let vendor_key = TestKey::generate();
-        let vendor_sources: Vec<Box<dyn KeySource>> = vec![Box::new(vendor_key.clone())];
-        editor
-            .delegate_role(
-                "vendor",
-                &vendor_sources,
-                PathSet::Paths(vec![
-                    PathPattern::new(format!("packages/{}/*/*/*", manifest.publisher_id))
-                        .expect("a parsable pattern"),
-                ]),
-                false,
-                NonZeroU64::new(1).expect("one is not zero"),
-                expires,
-                version,
-            )
-            .await
-            .expect("delegated vendor");
-
-        editor
-            .sign_targets_editor(&keys.sources())
-            .await
-            .expect("signed top level");
-
-        editor
-            .change_delegated_targets("vendor")
-            .expect("change to vendor");
-        editor
-            .targets_version(version)
-            .expect("version")
-            .targets_expires(expires)
-            .expect("expiry");
-
-        let leaf_key = TestKey::generate();
-        let leaf_sources: Vec<Box<dyn KeySource>> = vec![Box::new(leaf_key.clone())];
-        editor
-            .delegate_role(
-                "vendor-leaf",
-                &leaf_sources,
-                PathSet::Paths(vec![
-                    PathPattern::new(format!("packages/{}/*/*/*", manifest.publisher_id))
-                        .expect("a parsable pattern"),
-                ]),
-                true,
-                NonZeroU64::new(1).expect("one is not zero"),
-                expires,
-                version,
-            )
-            .await
-            .expect("delegated vendor-leaf");
-
-        editor
-            .sign_targets_editor(&vendor_sources)
-            .await
-            .expect("signed vendor");
-
-        editor
-            .change_delegated_targets("vendor-leaf")
-            .expect("change to vendor-leaf");
-        editor
-            .targets_version(version)
-            .expect("version")
-            .targets_expires(expires)
-            .expect("expiry");
+        // Whoever signs the role being edited: the top-level targets key, then each delegate.
+        let mut signer: Option<TestKey> = None;
+        for (role, terminating) in &chain {
+            let delegate = TestKey::generate();
+            let sources: Vec<Box<dyn KeySource>> = vec![Box::new(delegate.clone())];
+            editor
+                .delegate_role(
+                    role,
+                    &sources,
+                    PathSet::Paths(vec![
+                        PathPattern::new(format!("packages/{}/*/*/*", manifest.publisher_id))
+                            .expect("a parsable pattern"),
+                    ]),
+                    *terminating,
+                    NonZeroU64::new(1).expect("one is not zero"),
+                    expires,
+                    version,
+                )
+                .await
+                .expect("a delegated role");
+            let signing: Vec<Box<dyn KeySource>> = match &signer {
+                None => keys.sources(),
+                Some(key) => vec![Box::new(key.clone())],
+            };
+            editor
+                .sign_targets_editor(&signing)
+                .await
+                .expect("the delegating role signed");
+            editor
+                .change_delegated_targets(role)
+                .expect("the delegated role is editable");
+            editor
+                .targets_version(version)
+                .expect("version")
+                .targets_expires(expires)
+                .expect("expiry");
+            signer = Some(delegate);
+        }
+        let leaf_sources: Vec<Box<dyn KeySource>> =
+            vec![Box::new(signer.expect("a chain has a last role"))];
 
         if !spec.empty_leaf {
             for (name, _) in &files {
@@ -599,7 +612,7 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
         editor
             .sign_targets_editor(&leaf_sources)
             .await
-            .expect("signed vendor-leaf");
+            .expect("the last role signed");
     } else {
         let mut names: Vec<(String, PathBuf)> =
             vec![("index.json".to_owned(), targets.join("index.json"))];
@@ -638,6 +651,11 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
         .expect("a signed repository");
     signed.write(&metadata).await.expect("written");
     std::fs::write(metadata.join("root.json"), &root_bytes).expect("writable");
+    if spec.consistent_snapshot {
+        let mut names = vec!["index.json".to_owned()];
+        names.extend(files.iter().map(|(name, _)| format!("{prefix}/{name}")));
+        publish_consistent(&targets, names.iter().map(String::as_str));
+    }
 
     if let Some(dropped) = &spec.drop_payload {
         // The metadata still pins it. The bytes are gone, which is what a host finds when a
@@ -647,6 +665,22 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
     }
 
     manifest_digest
+}
+
+/// Publishes every named target a second time under the name a consistent snapshot fetches it by:
+/// its SHA-256 in hexadecimal, a dot, then the whole target name.
+fn publish_consistent<'a>(targets: &Path, names: impl Iterator<Item = &'a str>) {
+    for name in names {
+        let bytes = std::fs::read(targets.join(name)).expect("a published target");
+        let digest: String = PayloadDigest::of(&bytes)
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let path = targets.join(format!("{digest}.{name}"));
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("writable");
+        std::fs::write(&path, &bytes).expect("writable");
+    }
 }
 
 /// Returns the manifest and the files of the package a generation publishes.

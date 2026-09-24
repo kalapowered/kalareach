@@ -51,12 +51,18 @@ published. That is the thing the metadata exists to replace.
    one document.
 2. Check every vendor delegation's scope. A delegated role in a KalaReach catalogue may sign
    `packages/<publisher>/…` for one publisher and nothing else; a role that claims the index,
-   another publisher's prefix, a bare wildcard or a hash-prefix bin is refused, and a delegation
-   chain deeper than three roles is refused with it.
+   another publisher's prefix, a bare wildcard or a hash-prefix bin is refused. A delegation chain
+   deeper than three roles is refused while the client walks it: the transport a sync fetches
+   through learns each role's depth from the document that delegates to it, and refuses a role
+   past the bound before its document is asked for. A role delegated to twice would have two
+   depths and two scopes, and is refused as the second delegation arrives.
 3. Read the index, inside the metadata budget together with the metadata that pins it, and check
    what each entry declares: safe paths, no two names that collide on a case-insensitive
    filesystem, a manifest that does not declare itself, and declared sizes inside one package's
-   limits.
+   limits. The budget counts every document the client fetches while it loads the metadata, and
+   the index once, by what the sync fetched it for rather than by where it lives: targets
+   published inside the metadata location, or a location whose fragment the client drops, are
+   counted like any other.
 4. Refuse a generation older than the one already accepted, one that puts different bytes under a
    generation number this host already accepted, and one that is not the generation the owner
    pinned. A role whose metadata version went backwards has already been refused by the client, in

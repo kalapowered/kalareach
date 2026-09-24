@@ -13,7 +13,10 @@
 //!   A role that claims the index, another publisher's prefix or a bare wildcard is refused.
 //! * **Bounded depth.** A delegation tree can be arbitrarily deep, and each level is more
 //!   metadata to verify and more places a target can come from. The depth is bounded, and the
-//!   bound is stated rather than discovered when a sync stops answering.
+//!   bound is stated rather than discovered when a sync stops answering. It is held during the
+//!   client's own traversal: the transport a sync fetches through refuses a role past the bound
+//!   before the client asks for that role's document, and a role delegated to twice, which would
+//!   have two depths and two scopes, is refused as the second delegation arrives.
 //! * **Rollback across generations.** The client refuses metadata older than what it already
 //!   trusts. The catalogue index carries a generation of its own, and a snapshot that renumbered
 //!   its metadata would otherwise replay an old index under a new version, so the index's
@@ -375,14 +378,20 @@ pub async fn verify(
 ) -> CatalogueResult<VerifiedGeneration> {
     std::fs::create_dir_all(datastore)
         .map_err(|source| CatalogueError::storage(datastore, &source))?;
+    let accepted =
+        serde_json::from_slice::<tough::schema::Signed<tough::schema::Root>>(&enrolment.root)
+            .map_err(|source| CatalogueError::Untrusted {
+                detail: format!("the enrolled root could not be read: {source}"),
+            })?;
     // The client's own per-document ceilings are ignored wherever the snapshot declares a length,
-    // so the budget is enforced on the bytes instead: every metadata fetch this load makes is
-    // counted against the repository's approved metadata budget, whatever the metadata says about
-    // its own size.
-    let budgeted = BudgetedTransport::new(
+    // so the allowance is enforced on the bytes instead: every document this load fetches is
+    // counted against the repository's approved metadata allowance, whatever the metadata says
+    // about its own size. The same transport refuses a delegated role past the depth bound before
+    // the client asks for its document.
+    let sync = SyncTransport::new(
         std::sync::Arc::clone(transport),
-        &enrolment.metadata_url,
         enrolment.budgets.metadata_bytes.get(),
+        accepted.signed.consistent_snapshot,
     );
     let loader = RepositoryLoader::new(
         &enrolment.root,
@@ -391,7 +400,7 @@ pub async fn verify(
     )
     .datastore(datastore.to_path_buf())
     .expiration_enforcement(ExpirationEnforcement::Safe)
-    .transport(budgeted.clone())
+    .transport(sync.clone())
     .limits(tough::Limits {
         max_root_size: enrolment.budgets.metadata_bytes.get(),
         max_targets_size: enrolment.budgets.metadata_bytes.get(),
@@ -431,11 +440,6 @@ pub async fn verify(
     // bytes are not compared: the client's root holds its keys and roles in unordered maps, so the
     // same root can serialise differently from one load to the next, and keeping it again would be
     // a change that never happened.
-    let accepted =
-        serde_json::from_slice::<tough::schema::Signed<tough::schema::Root>>(&enrolment.root)
-            .map_err(|source| CatalogueError::Untrusted {
-                detail: format!("the enrolled root could not be read: {source}"),
-            })?;
     let root =
         serde_json::to_vec(repository.root()).map_err(|source| CatalogueError::Untrusted {
             detail: format!("the trusted root could not be recorded: {source}"),
@@ -453,17 +457,13 @@ pub async fn verify(
     let mut targets = BTreeMap::new();
     targets.insert(INDEX_TARGET.to_owned(), index_record);
 
-    // The index is held whole, because it is parsed and searched offline. Its signed length is
-    // checked against the metadata budget before it is read, so what is held is what this host
-    // said it was willing to hold.
-    // The index is held under the same allowance as the metadata that pins it, so the two are
-    // counted together: each can fit on its own and still be more than the allowance together.
-    // What the metadata spent is taken before the index is fetched, because where the targets sit
-    // inside the metadata location the transport counts the index as well, and the index is the
-    // only thing fetched from here to the final check.
-    let spent_before_index = budgeted.spent.load(std::sync::atomic::Ordering::Relaxed);
+    // The index is held whole, because it is parsed and searched offline, and it is held under
+    // the same allowance as the metadata that pins it: each can fit on its own and still be more
+    // than the allowance together. Its signed length is checked against what the metadata left
+    // before it is asked for, and the transport counts its bytes with the metadata's as they
+    // arrive, wherever the targets are published.
     ledger.check_metadata_bytes(
-        spent_before_index.saturating_add(index_record.length),
+        sync.spent().saturating_add(index_record.length),
         Stage::Declared,
         INDEX_TARGET,
     )?;
@@ -471,6 +471,7 @@ pub async fn verify(
         TargetName::new(INDEX_TARGET).map_err(|source| CatalogueError::InvalidArgument {
             detail: format!("{INDEX_TARGET} is not a target name: {source}"),
         })?;
+    sync.begin(Operation::Index);
     let bytes = repository
         .read_target(&index_name)
         .await
@@ -481,8 +482,10 @@ pub async fn verify(
         .into_vec()
         .await
         .map_err(|source| classify(&source))?;
+    // Whatever the client reads from here on is a payload, which the payload allowance holds.
+    sync.begin(Operation::Payload);
     let index_bytes = bytes.len() as u64;
-    ledger.check_metadata_bytes(index_bytes, Stage::Actual, INDEX_TARGET)?;
+    ledger.check_metadata_bytes(sync.spent(), Stage::Actual, "metadata and index")?;
     let index: CatalogueIndex =
         serde_json::from_slice(&bytes).map_err(|source| CatalogueError::Integrity {
             detail: format!("{INDEX_TARGET} is not a catalogue index: {source}"),
@@ -516,12 +519,6 @@ pub async fn verify(
         targets.insert(name, record);
     }
     check_index_against_targets(&index, &targets)?;
-
-    ledger.check_metadata_bytes(
-        spent_before_index.saturating_add(index_bytes),
-        Stage::Actual,
-        "metadata and index",
-    )?;
 
     Ok(VerifiedGeneration {
         generation: index.generation,
@@ -630,9 +627,25 @@ fn resolve_target(repository: &Repository, name: &str) -> CatalogueResult<Option
 }
 
 /// Checks every delegation's publisher and path scope, and the tree's depth.
+///
+/// The transport already held the traversal to the bound as the documents arrived. This reads the
+/// tree the client built from them, and refuses what the client never had to fetch: a role past
+/// the bound whose document the snapshot does not list, and a role delegated to twice.
 fn scope_delegations(targets: &Targets) -> CatalogueResult<Vec<DelegationScope>> {
     let mut scopes = Vec::new();
     walk_delegations(targets, 1, &mut scopes)?;
+    let mut roles = std::collections::BTreeSet::new();
+    for scope in &scopes {
+        if !roles.insert(scope.role.as_str()) {
+            return Err(CatalogueError::Untrusted {
+                detail: format!(
+                    "{} is delegated to twice; a role is delegated once, so it has one depth and \
+                     one publisher",
+                    scope.role
+                ),
+            });
+        }
+    }
     Ok(scopes)
 }
 
@@ -858,9 +871,15 @@ fn classify_transport(error: &tough::TransportError) -> CatalogueError {
         if let Some(inner) = cause.downcast_ref::<tough::error::Error>() {
             return classify(inner);
         }
-        // This host's own metadata budget, which the budgeted transport stops a stream with.
-        if let Some(exceeded) = cause.downcast_ref::<BudgetExceeded>() {
-            return CatalogueError::ResourceLimit(exceeded.0.clone());
+        // This host's own refusals, which the sync's transport stops a fetch or a stream with:
+        // the metadata allowance, and a delegation past the depth bound or named twice.
+        if let Some(refusal) = cause.downcast_ref::<Refusal>() {
+            return match refusal {
+                Refusal::Allowance(limit) => CatalogueError::ResourceLimit(limit.clone()),
+                Refusal::Delegation(detail) => CatalogueError::Untrusted {
+                    detail: detail.clone(),
+                },
+            };
         }
     }
     match error.kind() {
@@ -897,89 +916,375 @@ fn past_a_length(max_size: u64, specifier: &str) -> CatalogueError {
     }
 }
 
-/// The budget refusal the budgeted transport stops a stream with, carried as the error's cause.
+/// Why this host's transport stopped a document, carried as the transport error's cause.
 #[derive(Debug)]
-struct BudgetExceeded(crate::budget::ResourceLimit);
+enum Refusal {
+    /// The repository's metadata allowance ran out.
+    Allowance(crate::budget::ResourceLimit),
+    /// The document belongs to a delegation this host does not follow.
+    Delegation(String),
+}
 
-impl core::fmt::Display for BudgetExceeded {
+impl core::fmt::Display for Refusal {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        self.0.fmt(formatter)
+        match self {
+            Self::Allowance(limit) => limit.fmt(formatter),
+            Self::Delegation(detail) => formatter.write_str(detail),
+        }
     }
 }
 
-impl std::error::Error for BudgetExceeded {}
+impl std::error::Error for Refusal {}
 
-/// A transport that holds one load's metadata inside the repository's byte budget.
+/// What the client is fetching a document for, which decides the allowance that holds it.
 ///
-/// The client's own per-document ceilings apply only where the metadata does not declare a length.
-/// Where it does, the declared length wins, so a snapshot inside the budget can name a targets
-/// document of any size. Counting the bytes as they arrive is the only place that can be refused
-/// before they are held.
-#[derive(Clone, Debug)]
-struct BudgetedTransport {
-    inner: std::sync::Arc<dyn tough::Transport + Send + Sync>,
-    metadata_base: String,
-    budget: u64,
-    spent: std::sync::Arc<std::sync::atomic::AtomicU64>,
+/// A fetch is classified by the step of the sync that asks for it, never by where the document
+/// lives. A repository may publish its targets inside its metadata location, and the client drops a
+/// location's fragment when it resolves a document against it, so a location says nothing reliable
+/// about what a document is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Operation {
+    /// Loading the metadata: every root the chain of trust passes through, the timestamp, the
+    /// snapshot, the top-level targets and every delegated role.
+    Metadata,
+    /// Reading the index, which is held under the same allowance as the metadata that pins it.
+    Index,
+    /// Reading a payload, which the payload allowance bounds rather than the metadata one.
+    Payload,
 }
 
-impl BudgetedTransport {
-    fn new(
-        inner: std::sync::Arc<dyn tough::Transport + Send + Sync>,
-        metadata_base: &url::Url,
-        budget: u64,
-    ) -> Self {
-        Self {
-            inner,
-            metadata_base: metadata_base.as_str().to_owned(),
-            budget,
-            spent: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+/// What one fetch of the metadata load delivers, as far as this host is concerned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Document {
+    /// A root on the chain of trust, read for whether it publishes consistent snapshots.
+    Root,
+    /// The timestamp or the snapshot, which only the allowance counts.
+    Unread,
+    /// The top-level targets document.
+    Targets,
+    /// A delegated role's document, at its depth beneath the top-level targets role.
+    Delegated {
+        /// The role.
+        role: String,
+        /// How deep it sits.
+        depth: usize,
+    },
+    /// The index, which the allowance counts.
+    Index,
+}
+
+/// The parts of a metadata document this host reads for itself: its type, a root's snapshot
+/// setting and the roles a targets document delegates to.
+///
+/// The client reads the same fields of the same bytes before it trusts them, so a document it
+/// accepts says the same thing here. One it refuses ends the load whatever is read here.
+#[derive(serde::Deserialize)]
+struct Shape {
+    signed: SignedShape,
+}
+
+#[derive(serde::Deserialize)]
+struct SignedShape {
+    #[serde(rename = "_type")]
+    kind: String,
+    #[serde(default)]
+    consistent_snapshot: bool,
+    #[serde(default)]
+    delegations: Option<DelegationsShape>,
+}
+
+#[derive(serde::Deserialize)]
+struct DelegationsShape {
+    #[serde(default)]
+    roles: Vec<RoleShape>,
+}
+
+#[derive(serde::Deserialize)]
+struct RoleShape {
+    name: String,
+}
+
+/// The delegation tree as the targets documents of one load describe it.
+///
+/// The client fetches the top-level targets document before any delegated role's, and a role's
+/// document only after the document that delegates to it has arrived, so a role's depth is known
+/// before its document is asked for. A role is recognised by the file the client names its
+/// document with: the role's name percent-encoded, then `.json`, with the version in front where
+/// the root publishes consistent snapshots. A document that no delegation this load read names is
+/// not fetched at all.
+#[derive(Debug, Default)]
+struct DelegationTree {
+    /// Whether the root the client is on publishes consistent snapshots.
+    consistent_snapshot: bool,
+    /// Whether the top-level targets document has arrived, after which every document the load
+    /// asks for is a delegated role's.
+    top_level_arrived: bool,
+    /// Every role a document that arrived delegates to, with its depth.
+    depths: std::collections::HashMap<String, usize>,
+}
+
+impl DelegationTree {
+    /// Returns what a fetch of `url` is, refusing a role past the bound and a document no
+    /// delegation names.
+    fn classify(&self, url: &url::Url) -> Result<Document, String> {
+        let file = url
+            .path_segments()
+            .and_then(Iterator::last)
+            .unwrap_or_default();
+        if !self.top_level_arrived {
+            let versioned = |suffix: &str| {
+                file.strip_suffix(suffix).is_some_and(|version| {
+                    !version.is_empty() && version.bytes().all(|byte| byte.is_ascii_digit())
+                })
+            };
+            let targets = if self.consistent_snapshot {
+                versioned(".targets.json")
+            } else {
+                file == "targets.json"
+            };
+            return Ok(if targets {
+                Document::Targets
+            } else if versioned(".root.json") {
+                Document::Root
+            } else {
+                Document::Unread
+            });
+        }
+        let named = self
+            .role_of(file)
+            .and_then(|role| self.depths.get(&role).map(|depth| (role, *depth)));
+        match named {
+            Some((role, depth)) if depth > MAX_DELEGATION_DEPTH => Err(format!(
+                "the delegation chain is deeper than {MAX_DELEGATION_DEPTH} roles; {role} sits at \
+                 depth {depth}, so its document is not fetched"
+            )),
+            Some((role, depth)) => Ok(Document::Delegated { role, depth }),
+            None => Err(format!(
+                "{url} is not the document of a role any delegation of this generation names"
+            )),
         }
     }
 
-    /// Returns true when a fetch is metadata rather than a target.
-    ///
-    /// Metadata is everything under the repository's metadata location. A target comes from the
-    /// targets location and is bounded by the length its own signed metadata pins.
-    fn is_metadata(&self, url: &url::Url) -> bool {
-        url.as_str().starts_with(&self.metadata_base)
+    /// Returns the role whose document the client names `file`.
+    fn role_of(&self, file: &str) -> Option<String> {
+        let stem = file.strip_suffix(".json")?;
+        let encoded = if self.consistent_snapshot {
+            let (version, rest) = stem.split_once('.')?;
+            (!version.is_empty() && version.bytes().all(|byte| byte.is_ascii_digit()))
+                .then_some(rest)?
+        } else {
+            stem
+        };
+        percent_encoding::percent_decode_str(encoded)
+            .decode_utf8()
+            .ok()
+            .map(std::borrow::Cow::into_owned)
+    }
+
+    /// Records what one document that arrived says about the tree.
+    fn arrived(&mut self, document: &Document, bytes: &[u8]) -> Result<(), String> {
+        let depth = match document {
+            Document::Root => {
+                if let Ok(shape) = serde_json::from_slice::<Shape>(bytes)
+                    && shape.signed.kind == "root"
+                {
+                    self.consistent_snapshot = shape.signed.consistent_snapshot;
+                }
+                return Ok(());
+            }
+            Document::Unread | Document::Index => return Ok(()),
+            Document::Targets => 0,
+            Document::Delegated { depth, .. } => *depth,
+        };
+        let shape = serde_json::from_slice::<Shape>(bytes)
+            .ok()
+            .filter(|shape| shape.signed.kind == "targets")
+            .ok_or_else(|| "a targets document of this generation is not one".to_owned())?;
+        self.top_level_arrived = true;
+        for role in shape
+            .signed
+            .delegations
+            .map(|d| d.roles)
+            .unwrap_or_default()
+        {
+            if self.depths.insert(role.name.clone(), depth + 1).is_some() {
+                return Err(format!(
+                    "{} is delegated to twice; a role is delegated once, so it has one depth and \
+                     one publisher",
+                    role.name
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
-#[tough::async_trait]
-impl tough::Transport for BudgetedTransport {
-    async fn fetch(&self, url: url::Url) -> Result<tough::TransportStream, tough::TransportError> {
-        use futures::StreamExt as _;
+/// What one sync has fetched so far, shared by every clone of its transport.
+#[derive(Debug)]
+struct Load {
+    operation: Operation,
+    /// The repository's metadata allowance.
+    budget: u64,
+    /// The bytes of metadata and index fetched so far.
+    spent: u64,
+    tree: DelegationTree,
+}
 
-        let counted = self.is_metadata(&url);
+/// The transport one sync fetches through.
+///
+/// It holds the metadata and the index inside the repository's allowance, counting the bytes as
+/// they arrive: the client's own per-document ceilings apply only where the metadata declares no
+/// length, so a snapshot inside the allowance could otherwise name a targets document of any size.
+/// And it holds the delegation traversal to its bound, refusing a role past it before the client
+/// asks for that role's document.
+#[derive(Clone, Debug)]
+struct SyncTransport {
+    inner: std::sync::Arc<dyn tough::Transport + Send + Sync>,
+    load: std::sync::Arc<std::sync::Mutex<Load>>,
+}
+
+impl SyncTransport {
+    fn new(
+        inner: std::sync::Arc<dyn tough::Transport + Send + Sync>,
+        budget: u64,
+        consistent_snapshot: bool,
+    ) -> Self {
+        Self {
+            inner,
+            load: std::sync::Arc::new(std::sync::Mutex::new(Load {
+                operation: Operation::Metadata,
+                budget,
+                spent: 0,
+                tree: DelegationTree {
+                    consistent_snapshot,
+                    ..DelegationTree::default()
+                },
+            })),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, Load> {
+        lock(&self.load)
+    }
+
+    /// Moves the sync on to its next step.
+    fn begin(&self, operation: Operation) {
+        self.state().operation = operation;
+    }
+
+    /// Returns the bytes of metadata and index fetched so far.
+    fn spent(&self) -> u64 {
+        self.state().spent
+    }
+}
+
+/// Locks one sync's record of what it fetched. A panic elsewhere leaves counts that are still
+/// counts, so a poisoned lock is read as it is.
+fn lock(load: &std::sync::Mutex<Load>) -> std::sync::MutexGuard<'_, Load> {
+    load.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Returns the transport error that carries one of this host's refusals.
+fn refused(url: &url::Url, refusal: Refusal) -> tough::TransportError {
+    tough::TransportError::new_with_cause(tough::TransportErrorKind::Other, url.as_str(), refusal)
+}
+
+#[tough::async_trait]
+impl tough::Transport for SyncTransport {
+    async fn fetch(&self, url: url::Url) -> Result<tough::TransportStream, tough::TransportError> {
+        let document = {
+            let load = self.state();
+            match load.operation {
+                Operation::Payload => None,
+                Operation::Index => Some(Document::Index),
+                Operation::Metadata => Some(
+                    load.tree
+                        .classify(&url)
+                        .map_err(|detail| refused(&url, Refusal::Delegation(detail)))?,
+                ),
+            }
+        };
         let stream = self.inner.fetch(url.clone()).await?;
-        let budget = self.budget;
-        let spent = std::sync::Arc::clone(&self.spent);
-        let named = url;
-        Ok(Box::pin(stream.map(move |chunk| {
-            let chunk = chunk?;
-            if counted {
-                let total = spent
-                    .fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed)
-                    .saturating_add(chunk.len() as u64);
-                if total > budget {
-                    // The refusal is the error's cause, so whoever classifies the failure reads
-                    // the resource it names rather than a transport failure.
-                    return Err(tough::TransportError::new_with_cause(
-                        tough::TransportErrorKind::Other,
-                        named.clone(),
-                        BudgetExceeded(crate::budget::ResourceLimit {
-                            resource: crate::budget::Resource::MetadataBytes,
-                            limit: budget,
-                            requested: total,
-                            stage: Stage::Actual,
-                            subject: "this repository's metadata".to_owned(),
-                        }),
-                    ));
+        let Some(document) = document else {
+            return Ok(stream);
+        };
+        Ok(Box::pin(Counted {
+            inner: stream,
+            load: std::sync::Arc::clone(&self.load),
+            url,
+            document,
+            held: Vec::new(),
+            done: false,
+        }))
+    }
+}
+
+/// One document's bytes on their way to the client, counted against the allowance as they arrive
+/// and read once the last of them has.
+struct Counted {
+    inner: tough::TransportStream,
+    load: std::sync::Arc<std::sync::Mutex<Load>>,
+    url: url::Url,
+    document: Document,
+    held: Vec<u8>,
+    done: bool,
+}
+
+impl futures::Stream for Counted {
+    type Item = Result<tough::Bytes, tough::TransportError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+
+        if self.done {
+            return Poll::Ready(None);
+        }
+        let next = match self.inner.as_mut().poll_next(context) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(next) => next,
+        };
+        let this = &mut *self;
+        let mut load = lock(&this.load);
+        match next {
+            Some(Ok(chunk)) => {
+                load.spent = load.spent.saturating_add(chunk.len() as u64);
+                if load.spent > load.budget {
+                    // The refusal is the error's cause, so whoever classifies the failure reads the
+                    // allowance it names rather than a transport failure.
+                    let limit = crate::budget::ResourceLimit {
+                        resource: crate::budget::Resource::MetadataBytes,
+                        limit: load.budget,
+                        requested: load.spent,
+                        stage: Stage::Actual,
+                        subject: "this repository's metadata".to_owned(),
+                    };
+                    this.done = true;
+                    return Poll::Ready(Some(Err(refused(&this.url, Refusal::Allowance(limit)))));
+                }
+                if !matches!(this.document, Document::Unread | Document::Index) {
+                    this.held.extend_from_slice(&chunk);
+                }
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Some(Err(error)) => {
+                this.done = true;
+                Poll::Ready(Some(Err(error)))
+            }
+            None => {
+                this.done = true;
+                let held = std::mem::take(&mut this.held);
+                match load.tree.arrived(&this.document, &held) {
+                    Ok(()) => Poll::Ready(None),
+                    Err(detail) => {
+                        Poll::Ready(Some(Err(refused(&this.url, Refusal::Delegation(detail)))))
+                    }
                 }
             }
-            Ok(chunk)
-        })))
+        }
     }
 }
 
@@ -1165,6 +1470,171 @@ mod tests {
         );
     }
 
+    fn document_url(file: &str) -> url::Url {
+        url::Url::parse("https://example.test/metadata/")
+            .expect("a literal location")
+            .join(file)
+            .expect("a document location")
+    }
+
+    fn targets_document(roles: &[&str]) -> Vec<u8> {
+        let roles: Vec<serde_json::Value> = roles
+            .iter()
+            .map(|name| serde_json::json!({ "name": name }))
+            .collect();
+        serde_json::to_vec(&serde_json::json!({
+            "signed": { "_type": "targets", "delegations": { "keys": {}, "roles": roles } },
+            "signatures": []
+        }))
+        .expect("a literal document")
+    }
+
+    #[test]
+    fn the_top_level_documents_are_told_apart_by_the_clients_own_names() {
+        let tree = DelegationTree::default();
+        for (file, document) in [
+            ("2.root.json", Document::Root),
+            ("timestamp.json", Document::Unread),
+            ("snapshot.json", Document::Unread),
+            ("targets.json", Document::Targets),
+        ] {
+            assert_eq!(tree.classify(&document_url(file)), Ok(document), "{file}");
+        }
+        let consistent = DelegationTree {
+            consistent_snapshot: true,
+            ..DelegationTree::default()
+        };
+        assert_eq!(
+            consistent.classify(&document_url("7.targets.json")),
+            Ok(Document::Targets)
+        );
+        assert_eq!(
+            consistent.classify(&document_url("7.snapshot.json")),
+            Ok(Document::Unread)
+        );
+    }
+
+    #[test]
+    fn a_delegated_document_is_fetched_only_for_a_role_a_delegation_names() {
+        for consistent_snapshot in [false, true] {
+            let mut tree = DelegationTree {
+                consistent_snapshot,
+                ..DelegationTree::default()
+            };
+            tree.arrived(
+                &Document::Targets,
+                &targets_document(&["acme", "acme tools/stable", "1.x"]),
+            )
+            .expect("a targets document");
+            let file = |encoded: &str| {
+                if consistent_snapshot {
+                    format!("4.{encoded}.json")
+                } else {
+                    format!("{encoded}.json")
+                }
+            };
+            for (encoded, role) in [
+                ("acme", "acme"),
+                ("acme%20tools%2Fstable", "acme tools/stable"),
+                ("1.x", "1.x"),
+            ] {
+                assert_eq!(
+                    tree.classify(&document_url(&file(encoded))),
+                    Ok(Document::Delegated {
+                        role: role.to_owned(),
+                        depth: 1
+                    }),
+                    "{encoded}"
+                );
+            }
+            let unnamed = tree
+                .classify(&document_url(&file("other")))
+                .expect_err("no delegation names it");
+            assert!(unnamed.contains("any delegation"), "{unnamed}");
+        }
+    }
+
+    #[test]
+    fn a_role_past_the_bound_is_refused_before_its_document_is_fetched() {
+        let mut tree = DelegationTree::default();
+        tree.arrived(&Document::Targets, &targets_document(&["level-1"]))
+            .expect("the top-level targets document");
+        for depth in 1..=MAX_DELEGATION_DEPTH {
+            let role = format!("level-{depth}");
+            let document = tree
+                .classify(&document_url(&format!("{role}.json")))
+                .expect("inside the bound");
+            assert_eq!(
+                document,
+                Document::Delegated {
+                    role: role.clone(),
+                    depth
+                }
+            );
+            tree.arrived(
+                &document,
+                &targets_document(&[format!("level-{}", depth + 1).as_str()]),
+            )
+            .expect("a delegated document");
+        }
+        let refusal = tree
+            .classify(&document_url("level-4.json"))
+            .expect_err("past the bound");
+        assert!(refusal.contains("deeper than 3 roles"), "{refusal}");
+    }
+
+    #[test]
+    fn a_role_delegated_to_twice_is_refused_as_the_second_delegation_arrives() {
+        let mut tree = DelegationTree::default();
+        tree.arrived(&Document::Targets, &targets_document(&["acme", "other"]))
+            .expect("the top-level targets document");
+        let refusal = tree
+            .arrived(
+                &Document::Delegated {
+                    role: "other".to_owned(),
+                    depth: 1,
+                },
+                &targets_document(&["acme"]),
+            )
+            .expect_err("acme is already delegated to");
+        assert!(refusal.contains("delegated to twice"), "{refusal}");
+        let within = DelegationTree::default()
+            .arrived(&Document::Targets, &targets_document(&["acme", "acme"]))
+            .expect_err("one document naming a role twice");
+        assert!(within.contains("delegated to twice"), "{within}");
+    }
+
+    #[test]
+    fn the_root_the_client_moves_to_decides_how_role_documents_are_named() {
+        let mut tree = DelegationTree::default();
+        let root = serde_json::to_vec(&serde_json::json!({
+            "signed": { "_type": "root", "consistent_snapshot": true },
+            "signatures": []
+        }))
+        .expect("a literal document");
+        tree.arrived(&Document::Root, &root).expect("a root");
+        assert_eq!(
+            tree.classify(&document_url("targets.json")),
+            Ok(Document::Unread),
+            "a consistent root names its targets document with a version"
+        );
+        tree.arrived(&Document::Targets, &targets_document(&["acme"]))
+            .expect("the top-level targets document");
+        assert!(tree.classify(&document_url("acme.json")).is_err());
+        assert!(tree.classify(&document_url("2.acme.json")).is_ok());
+    }
+
+    #[test]
+    fn a_targets_document_that_is_not_one_is_refused() {
+        let refusal = DelegationTree::default()
+            .arrived(
+                &Document::Targets,
+                b"{\"signed\": {\"_type\": \"snapshot\"}}",
+            )
+            .expect_err("not a targets document");
+        assert!(refusal.contains("is not one"), "{refusal}");
+    }
+
     #[test]
     fn a_role_that_delegates_to_nobody_adds_no_level() {
         // A deepest role carrying an empty delegations object is a chain of the permitted depth,
@@ -1184,5 +1654,28 @@ mod tests {
             roles: Vec::new(),
         });
         assert!(scope_delegations(&deepest).is_ok());
+    }
+
+    #[test]
+    fn a_tree_that_names_one_role_twice_is_refused() {
+        let twice = targets_with(Some(tough::schema::Delegations {
+            keys: std::collections::HashMap::new(),
+            roles: vec![
+                role("acme", "packages/acme/*/*/*", None),
+                role(
+                    "vendor",
+                    "packages/acme/*/*/*",
+                    Some(targets_with(Some(tough::schema::Delegations {
+                        keys: std::collections::HashMap::new(),
+                        roles: vec![role("acme", "packages/acme/*/*/*", None)],
+                    }))),
+                ),
+            ],
+        }));
+        let refusal = scope_delegations(&twice).expect_err("acme is named twice");
+        assert!(
+            refusal.to_string().contains("delegated to twice"),
+            "{refusal}"
+        );
     }
 }
