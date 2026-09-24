@@ -215,6 +215,14 @@ where
         if !direct {
             let relays = route().await;
             followed.refresh();
+            // The attempt ran while the route was read, and an attempt that has ended is decided by
+            // how it ended: a relay-only endpoint gives up on refusals only while its attempt is
+            // still waiting on them.
+            let ended =
+                std::future::poll_fn(|context| Poll::Ready(attempt.as_mut().poll(context))).await;
+            if let Poll::Ready(outcome) = ended {
+                return decided(outcome, &mut followed, &mut route, direct).await;
+            }
             if let Some((relay, reason)) = followed.refusals().throughout(&relays) {
                 return Err(refused(relay, reason, direct));
             }
@@ -229,22 +237,40 @@ where
                 }
             }
             outcome = &mut attempt => {
-                let error = match outcome {
-                    Ok(connected) => return Ok(connected),
-                    Err(error) => error,
-                };
-                if !timed_out_unconnected(&error) {
-                    return Err(TransportError::Connect(error.to_string()));
-                }
-                let relays = route().await;
-                followed.refresh();
-                return Err(match followed.refusals().on(&relays) {
-                    Some((relay, reason)) => refused(relay, reason, direct),
-                    None => TransportError::Connect(error.to_string()),
-                });
+                return decided(outcome, &mut followed, &mut route, direct).await;
             }
         }
     }
+}
+
+/// Decides what an ended attempt comes to.
+///
+/// A connection is a connection. A failure is a relay's refusal only when the attempt timed out
+/// before connecting and a relay on its route, as the status stands now, had refused this endpoint.
+async fn decided<T, S, F, R>(
+    outcome: std::result::Result<T, ConnectingError>,
+    followed: &mut Followed<S>,
+    route: &mut F,
+    direct: bool,
+) -> Result<T>
+where
+    S: RelayStatuses,
+    F: FnMut() -> R,
+    R: Future<Output = BTreeSet<RelayUrl>>,
+{
+    let error = match outcome {
+        Ok(connected) => return Ok(connected),
+        Err(error) => error,
+    };
+    if !timed_out_unconnected(&error) {
+        return Err(TransportError::Connect(error.to_string()));
+    }
+    let relays = route().await;
+    followed.refresh();
+    Err(match followed.refusals().on(&relays) {
+        Some((relay, reason)) => refused(relay, reason, direct),
+        None => TransportError::Connect(error.to_string()),
+    })
 }
 
 /// Whether an attempt that was made failed by timing out before any connection was established.
@@ -990,6 +1016,55 @@ mod tests {
                 if refusal.kind == crate::error::RelayRefusalKind::Stopping),
             "{error}"
         );
+    }
+
+    /// KR-REQ-17.40: an attempt that ends while a relay-only endpoint reads its route is decided by
+    /// how it ended. A connection made then is a connection, and a failure in which something
+    /// answered is its own reason, although every relay on the route had refused the endpoint.
+    #[tokio::test]
+    async fn an_attempt_that_ends_while_the_route_is_read_is_decided_by_how_it_ended() {
+        let status = Scripted::default();
+        status.set(vec![refusing("relay-1", "allowance_spent: spent")]);
+        let (ended, ending) = tokio::sync::oneshot::channel::<()>();
+        let mut ended = Some(ended);
+        let connected = through_relays(
+            async move {
+                let _ = ending.await;
+                Ok::<_, ConnectingError>("a connection")
+            },
+            status.reader(),
+            false,
+            || {
+                if let Some(ended) = ended.take() {
+                    let _ = ended.send(());
+                }
+                async { relays(&["relay-1"]) }
+            },
+        )
+        .await;
+        assert_eq!(connected.ok(), Some("a connection"));
+
+        let status = Scripted::default();
+        status.set(vec![refusing("relay-1", "allowance_spent: spent")]);
+        let (ended, ending) = tokio::sync::oneshot::channel::<()>();
+        let mut ended = Some(ended);
+        let error = through_relays(
+            async move {
+                let _ = ending.await;
+                Err::<(), _>(ConnectingError::from(ConnectionError::Reset))
+            },
+            status.reader(),
+            false,
+            || {
+                if let Some(ended) = ended.take() {
+                    let _ = ended.send(());
+                }
+                async { relays(&["relay-1"]) }
+            },
+        )
+        .await
+        .expect_err("the attempt was reset");
+        assert!(matches!(error, TransportError::Connect(_)), "{error}");
     }
 
     /// KR-REQ-17.40: a failure in which something answered is its own reason, whatever a relay on
