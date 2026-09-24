@@ -54,9 +54,9 @@
 //! store's.
 //!
 //! Each file is written to a temporary name, flushed, and renamed over its name, so a reader never
-//! sees one half written. On Unix the directory entry is flushed afterwards; on Windows nothing
-//! here flushes a directory, and this store makes no claim there that a name it acknowledged
-//! survives losing power.
+//! sees one half written, and the directory entry is flushed afterwards, so a name this store
+//! acknowledged survives losing power. On Windows a directory is flushed through a handle opened
+//! with the backup semantics that let a program open one at all.
 
 use std::path::{Path, PathBuf};
 
@@ -126,11 +126,9 @@ const REPLAY_SPAN_MS: u64 = kr_protocol::service::SERVICE_REQUEST_FRESHNESS_MS;
 
 /// How many links the walk over a store's path follows before it gives up.
 ///
-/// The walk is Unix only, and so is this.
-#[cfg(unix)]
-///
 /// A backstop rather than the rule. Every kernel this runs on applies a limit of its own, usually
 /// lower, and refuses to open through a longer chain before the walk ever sees it.
+#[cfg(any(unix, windows))]
 const MAX_PATH_LINKS: usize = 40;
 
 /// Where an object has reached on the synchronisation service.
@@ -3195,7 +3193,7 @@ pub(super) fn private_directory(directory: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
-            sync_directory(parent)?;
+            sync_new_level(parent)?;
         }
     }
     #[cfg(unix)]
@@ -3281,8 +3279,100 @@ pub(super) fn flush_path_names(directory: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Flushes nothing, because this build flushes no directory on Windows.
-#[cfg(not(unix))]
+/// Flushes the directory entry of every name this store's path is made of that this account could
+/// have made.
+///
+/// The walk is the one Unix takes: one component at a time, continuing from a link's target when
+/// it meets a symbolic link or a junction, flushing the directory each name lives in and, at the
+/// end, the store's own directory. What differs is what a flush asks of a directory. Windows
+/// flushes a directory only through a handle that may change it, and a directory this account may
+/// not add a directory to, such as `C:\Users` for an account that does not administer the machine,
+/// holds no name an opener of this store made: every opener runs as this account. So a directory
+/// whose flush is refused for want of that right is passed over, and every other failure is
+/// reported, as it is on Unix.
+#[cfg(windows)]
+pub(super) fn flush_path_names(directory: &Path) -> std::io::Result<()> {
+    use std::collections::VecDeque;
+    use std::path::Component;
+
+    /// One component of a path, owned, so a link's target can be spliced into the walk.
+    enum Part {
+        /// The drive, share or root a path starts from, which is nobody's name.
+        Root(std::ffi::OsString),
+        /// `.`, which names nothing.
+        Current,
+        /// `..`, which leaves the directory reached so far.
+        Parent,
+        /// A name in the directory reached so far.
+        Name(std::ffi::OsString),
+    }
+
+    fn parts(path: &Path) -> Vec<Part> {
+        path.components()
+            .map(|component| match component {
+                Component::Prefix(_) | Component::RootDir => {
+                    Part::Root(component.as_os_str().to_os_string())
+                }
+                Component::CurDir => Part::Current,
+                Component::ParentDir => Part::Parent,
+                Component::Normal(name) => Part::Name(name.to_os_string()),
+            })
+            .collect()
+    }
+
+    let mut remaining: VecDeque<Part> = parts(&std::path::absolute(directory)?).into();
+    let mut resolved = PathBuf::new();
+    let mut flushed: Vec<PathBuf> = Vec::new();
+    let mut followed = 0_usize;
+
+    while let Some(part) = remaining.pop_front() {
+        let name = match part {
+            Part::Root(root) => {
+                resolved.push(root);
+                continue;
+            }
+            Part::Current => continue,
+            Part::Parent => {
+                resolved.pop();
+                continue;
+            }
+            Part::Name(name) => name,
+        };
+        let holder = resolved.clone();
+        if !flushed.contains(&holder) {
+            match sync_new_level(&holder) {
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+                other => other?,
+            }
+            flushed.push(holder.clone());
+        }
+        resolved.push(&name);
+        if !std::fs::symlink_metadata(&resolved)?
+            .file_type()
+            .is_symlink()
+        {
+            continue;
+        }
+        followed += 1;
+        if followed > MAX_PATH_LINKS {
+            return Err(std::io::Error::other(
+                "the store's path passes through too many links to follow",
+            ));
+        }
+        // The target is read the way the link names it: an absolute one starts again at its own
+        // root, one that starts at the root of a drive starts at the root of the link's drive, and
+        // a relative one continues from the directory the link lives in.
+        let target = holder.join(std::fs::read_link(&resolved)?);
+        resolved = PathBuf::new();
+        for part in parts(&target).into_iter().rev() {
+            remaining.push_front(part);
+        }
+    }
+    sync_directory(&resolved)
+}
+
+/// Flushes nothing, because this platform has no directory a program can flush.
+#[cfg(not(any(unix, windows)))]
 pub(super) fn flush_path_names(directory: &Path) -> std::io::Result<()> {
     let _ = directory;
     Ok(())
@@ -3309,21 +3399,73 @@ pub(super) fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     written
 }
 
-/// Flushes a directory entry, so a name that was replaced survives a crash.
+/// Flushes a directory entry, so a file name that was created, replaced or removed survives a
+/// crash.
 ///
-/// Unix only. This build flushes no directory on Windows and makes no claim there that a name it
-/// acknowledged survives losing power. What holds on both is that the new contents are written and
-/// flushed before anything renames them into place, so a reader never sees a file half written.
+/// The new contents are written and flushed before anything renames them into place, so a reader
+/// never sees a file half written; this is what makes the name itself durable. On Windows the
+/// handle holds the right to add a file, which this store holds in the directory it writes its
+/// files in.
 pub(super) fn sync_directory(directory: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         std::fs::File::open(directory)?.sync_all()?;
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        flush_directory(directory, FILE_ADD_FILE)?;
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = directory;
     }
     Ok(())
+}
+
+/// Flushes the entry of a directory just made inside `holder`, so the new level survives a crash.
+///
+/// On Windows the handle holds the right to add a directory, which is the right that made the
+/// level: an account may hold it without the right to add a file, as every account does at the root
+/// of the system drive.
+fn sync_new_level(holder: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        flush_directory(holder, FILE_ADD_SUBDIRECTORY)
+    }
+    #[cfg(not(windows))]
+    {
+        sync_directory(holder)
+    }
+}
+
+/// The flag that lets a program open a directory at all, rather than a file.
+#[cfg(windows)]
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+/// The right to add a file to a directory.
+#[cfg(windows)]
+const FILE_ADD_FILE: u32 = 0x0002;
+
+/// The right to add a directory to a directory.
+#[cfg(windows)]
+const FILE_ADD_SUBDIRECTORY: u32 = 0x0004;
+
+/// Flushes one directory through a handle that holds one right to change it.
+///
+/// A directory opens only with the backup semantics that say it is one, and `FlushFileBuffers`,
+/// which is what synchronising a handle calls, flushes only through a handle that may write. The
+/// handle asks for the one right the change being flushed used and for nothing more: more could be
+/// refused, and it could collide with another program's handle on the same directory, such as the
+/// one a process holds on the directory it is working in.
+#[cfg(windows)]
+fn flush_directory(directory: &Path, right: u32) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    std::fs::OpenOptions::new()
+        .access_mode(right)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(directory)?
+        .sync_all()
 }
 
 /// The one test here is about how Unix shares a lock between the descriptors of one open file, so
@@ -3393,5 +3535,145 @@ mod tests {
             "a dispatch that has ended is a request this device may ask about"
         );
         drop(inherited);
+    }
+}
+
+/// On Windows every flush opens the directory it flushes, and these check that it does: nothing
+/// else in this store would notice a flush that did nothing.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    /// Runs one command-line tool and fails the test when it fails.
+    fn run(program: &str, arguments: &[&std::ffi::OsStr]) -> String {
+        let output = std::process::Command::new(program)
+            .args(arguments)
+            .output()
+            .unwrap_or_else(|error| panic!("{program} starts: {error}"));
+        let printed = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "{program} failed: {printed}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        printed
+    }
+
+    /// This account's security identifier, as `whoami` gives it.
+    fn this_account() -> String {
+        let printed = run(
+            "whoami.exe",
+            &[
+                "/user".as_ref(),
+                "/fo".as_ref(),
+                "csv".as_ref(),
+                "/nh".as_ref(),
+            ],
+        );
+        printed
+            .trim()
+            .rsplit(',')
+            .next()
+            .map(|field| field.trim_matches('"').to_owned())
+            .filter(|sid| sid.starts_with("S-1-"))
+            .unwrap_or_else(|| panic!("whoami named this account: {printed:?}"))
+    }
+
+    #[test]
+    fn a_directory_is_flushed_through_a_handle_of_its_own() {
+        let root = tempfile::tempdir().expect("a directory");
+        sync_directory(root.path()).expect("a directory this account adds files to is flushed");
+        sync_new_level(root.path()).expect("and one it adds directories to");
+        // A flush that did nothing would pass both of the above. One that opens the directory it
+        // flushes cannot open one that is not there.
+        let missing = root.path().join("missing");
+        assert_eq!(
+            sync_directory(&missing)
+                .expect_err("nothing to flush")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            sync_new_level(&missing)
+                .expect_err("nothing to flush")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn a_store_path_is_flushed_through_a_junction_to_its_end() {
+        let root = tempfile::tempdir().expect("a directory");
+        let target = root.path().join("elsewhere");
+        std::fs::create_dir(&target).expect("a directory to link to");
+        let link = root.path().join("linked");
+        // A junction needs no privilege to make, unlike a symbolic link.
+        run(
+            "cmd.exe",
+            &[
+                "/d".as_ref(),
+                "/c".as_ref(),
+                "mklink".as_ref(),
+                "/J".as_ref(),
+                link.as_os_str(),
+                target.as_os_str(),
+            ],
+        );
+        let store = link.join("store").join("inner");
+        private_directory(&store).expect("the levels are made and flushed through the junction");
+        flush_path_names(&store).expect("every name on the way is flushed");
+        assert!(
+            target.join("store").join("inner").is_dir(),
+            "the levels are where the junction leads"
+        );
+    }
+
+    #[test]
+    fn a_directory_this_account_may_not_change_is_refused_a_flush_and_passed_over_by_the_walk() {
+        let root = tempfile::tempdir().expect("a directory");
+        let fixed = root.path().join("fixed");
+        let inner = fixed.join("inner");
+        std::fs::create_dir_all(&inner).expect("two levels");
+        let account = this_account();
+        // The inner level keeps what it inherited as a list of its own, and the outer one is
+        // narrowed to reading and traversing for this account, with nothing inherited.
+        run(
+            "icacls.exe",
+            &[inner.as_os_str(), "/inheritance:d".as_ref()],
+        );
+        run(
+            "icacls.exe",
+            &[
+                fixed.as_os_str(),
+                "/inheritance:r".as_ref(),
+                "/grant:r".as_ref(),
+                format!("*{account}:(RX)").as_ref(),
+            ],
+        );
+
+        assert_eq!(
+            sync_directory(&fixed)
+                .expect_err("no right to add a file there")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            sync_new_level(&fixed)
+                .expect_err("no right to add a directory there")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        // No opener running as this account made a name in it, so a store beneath it is flushed
+        // everywhere else on its path, and there is nothing to report.
+        flush_path_names(&inner).expect("the walk passes over it");
+
+        run(
+            "icacls.exe",
+            &[
+                fixed.as_os_str(),
+                "/grant".as_ref(),
+                format!("*{account}:(OI)(CI)F").as_ref(),
+            ],
+        );
     }
 }
