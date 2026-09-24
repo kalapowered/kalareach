@@ -235,7 +235,7 @@
     "retained_generations": "2",
     "retained_metadata_bytes": "134217728"
   },
-  "sdk_version": "0.1.0",
+  "sdk_version": "0.1.1",
   "wit_package": {
     "export_interface": "adapter",
     "exports": [

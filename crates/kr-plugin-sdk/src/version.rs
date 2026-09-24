@@ -15,7 +15,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 ///
 /// A package whose `sdk_range` does not admit this version is rejected before any payload is
 /// fetched, which is what keeps an old host from guessing at a manifest field it never learned.
-pub const SDK_VERSION: &str = "0.1.0";
+pub const SDK_VERSION: &str = "0.1.1";
 
 /// The WIT package version this crate publishes.
 pub const WIT_VERSION: &str = "0.1.0";
