@@ -12,6 +12,7 @@ members = [
     "crates/kr-crypto",
     "crates/kr-delivery",
     "crates/kr-describe",
+    "crates/kr-hook",
     "crates/kr-ipc",
     "crates/kr-pairing",
     "crates/kr-plugin-catalogue",

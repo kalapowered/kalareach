@@ -1161,15 +1161,32 @@ fn bind_component(broker: &Broker) {
         .expect("the component is bound");
 }
 
-/// The forwarder this host ships, as the test build put it on disk.
+/// The forwarder this host ships, as the build put it beside this test.
 ///
 /// The endpoint tests launch a real executable through the same composition production uses, so
 /// the process the kernel names on the accepted socket is a process this host started and not the
-/// test standing in for one.
+/// test standing in for one. The forwarder is its own package, so the build puts it in the
+/// directory above this test's own executable.
+///
+/// # Panics
+///
+/// Panics, naming where the forwarder should be and how to build it, when the build has not
+/// produced one. A test that returned early instead would report a pass for a launch it never
+/// made. A test run of the whole workspace builds the forwarder, because its own tests start it.
 #[cfg(unix)]
 fn forwarder() -> std::path::PathBuf {
-    let path = std::path::PathBuf::from(env!("CARGO_BIN_EXE_kr-hook"));
-    assert!(path.exists(), "the forwarder is built beside this test");
+    let mut directory = std::env::current_exe().expect("the test binary");
+    directory.pop();
+    if directory.file_name().is_some_and(|name| name == "deps") {
+        directory.pop();
+    }
+    let path = directory.join("kr-hook");
+    assert!(
+        path.is_file(),
+        "this test launches the forwarder and there is none at {}; build it with \
+         `cargo build -p kr-hook`, or run the whole workspace's tests, which build it",
+        path.display()
+    );
     path
 }
 
@@ -1185,7 +1202,7 @@ fn forwarder_profile() -> kr_protocol::broker::LaunchProfile {
             version: "0.9.0".to_owned(),
             distribution: "build".to_owned(),
         },
-        arguments: Vec::new(),
+        arguments: vec!["relay".to_owned()],
         authentication: kr_protocol::broker::AuthenticationState::Authenticated,
         mode: IntegrationMode::Gateway,
         resolved_at: TimestampMs::new(1),
@@ -3901,7 +3918,7 @@ async fn kr_req_07_67_a_dedicated_backend_that_closes_socket_stops_when_terminal
     // The backend is launched with `--close-after-hello` so it sends hello, closes its socket,
     // and stays alive.
     let mut profile = forwarder_profile();
-    profile.arguments = vec!["--close-after-hello".to_owned()];
+    profile.arguments = vec!["relay".to_owned(), "--close-after-hello".to_owned()];
     let intent = broker
         .prepare_launch(profile, kr_worker::broker::ForegroundMark::idle(4), None)
         .expect("the launch is prepared");

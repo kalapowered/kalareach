@@ -4396,6 +4396,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-hook"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "kr-crypto",
+ "kr-ipc",
+ "kr-protocol",
+ "kr-worker",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+]
+
+[[package]]
 name = "kr-ipc"
 version = "0.1.0"
 dependencies = [

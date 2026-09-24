@@ -12,10 +12,6 @@ publish.workspace = true
 name = "kr-worker"
 path = "src/bin/kr-worker.rs"
 
-[[bin]]
-name = "kr-hook"
-path = "src/bin/kr-hook.rs"
-
 [dependencies]
 clap.workspace = true
 kr-cbor.workspace = true
