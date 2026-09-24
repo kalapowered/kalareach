@@ -9,9 +9,10 @@
  * Signing in happens about once a month per device and the person's attention is in the browser
  * while it does, so nothing here is decorative. A change of state fades in over the existing state
  * duration with no travel, which reduced motion needs no second version of, and the keyboard rule
- * makes it instant. There is no spinner while the browser is open, because the application is
- * waiting for the person rather than working; a small indicator joins "Signing in…" only when the
- * exchange passes 400 ms, so a fast one never flashes it.
+ * makes it instant. There is no spinner: while the browser is open the application is waiting for
+ * the person rather than working, and the exchange after it is short and says "Signing in…" with
+ * the status marked busy. Every motion in the interface lasts 120 to 200 ms, which leaves no room
+ * for a looping one.
  *
  * Nothing to buy: no plan, no price, no balance, no link and no form. Usage is figures and meters.
  */
@@ -150,11 +151,14 @@ export function AccountPanel({
     <div className="account-panel" data-testid="account-panel">
       <Card>
         <div className="account-state" key={view.state}>
-          <div className="account-status" role="status" tabIndex={-1} ref={statusRef}>
-            <p className="account-lead">
-              {describeAccount(view)}
-              {view.state === 'finishing' ? <Working /> : null}
-            </p>
+          <div
+            className="account-status"
+            role="status"
+            tabIndex={-1}
+            ref={statusRef}
+            aria-busy={view.state === 'finishing'}
+          >
+            <p className="account-lead">{describeAccount(view)}</p>
             {view.state === 'unavailable' ? (
               <p className="account-note">{describeUnavailable(view.reason)}</p>
             ) : null}
@@ -216,23 +220,6 @@ export function AccountPanel({
       </Card>
     </div>
   )
-}
-
-/**
- * The small indicator beside "Signing in…". It appears only once the exchange has taken 400 ms,
- * so a fast one never flashes it, and it starts afresh each time the panel is finishing.
- */
-function Working(): ReactNode {
-  const [shown, setShown] = useState(false)
-  useEffect(() => {
-    const handle = setTimeout(() => {
-      setShown(true)
-    }, 400)
-    return () => {
-      clearTimeout(handle)
-    }
-  }, [])
-  return shown ? <span className="account-working" aria-hidden="true" /> : null
 }
 
 /** Usage: figures and meters, and words when there are none. */

@@ -914,9 +914,6 @@ textarea::placeholder {
 
 .account-lead {
   margin: 0;
-  display: flex;
-  align-items: center;
-  gap: var(--gap-2);
   font-size: 0.9375rem;
   line-height: 1.45;
   color: var(--text);
@@ -948,24 +945,6 @@ textarea::placeholder {
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--faint);
-}
-
-/* A small ring beside "Signing in…", shown only when the exchange passes 400 ms. */
-.account-working {
-  inline-size: 0.75rem;
-  block-size: 0.75rem;
-  flex: none;
-  border: 2px solid currentColor;
-  border-inline-end-color: transparent;
-  border-radius: 50%;
-  opacity: 0.6;
-  animation: account-turn 800ms linear infinite;
-}
-
-@keyframes account-turn {
-  to {
-    transform: rotate(360deg);
-  }
 }
 
 .account-usage {
