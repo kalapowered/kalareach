@@ -155,12 +155,6 @@ impl KeySet {
     }
 }
 
-/// Returns a fresh key set.
-#[must_use]
-pub fn key_set() -> KeySet {
-    KeySet::generate()
-}
-
 /// What one generation is made of.
 #[derive(Clone, Debug)]
 pub struct GenerationSpec {
@@ -918,12 +912,6 @@ fn package_files(spec: &GenerationSpec) -> (PluginManifest, Vec<(String, Vec<u8>
         files.push((extra.to_owned(), bytes.clone()));
     }
     (manifest, files)
-}
-
-/// Returns the example package as its files.
-#[must_use]
-pub fn example_package() -> Vec<(String, Vec<u8>)> {
-    package_files(&GenerationSpec::default()).1
 }
 
 /// Returns an index entry for the example package.
