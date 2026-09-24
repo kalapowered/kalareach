@@ -825,3 +825,155 @@ async fn a_catalogue_decision_is_confirmed_by_an_owner_device_and_by_nothing_els
     );
     host.stop().await;
 }
+
+/// KR-REQ-10.05: granting an installed package a capability is this host's owner's decision,
+/// confirmed on its owner device and on nothing else. The exact grant is refused under a proof
+/// signed with a stranger's key, under the owner's own key on the terminal bootstrap's channel,
+/// under the owner device's proof of another capability set, and under the owner device's proof of
+/// the exact grant once a grant has spent it. After each refusal the host has accepted no proof,
+/// and what the package may do reads the same. The owner device's own proof of the exact grant
+/// grants it, and the host records that proof as accepted from the owner device and spent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plugin_grant_is_confirmed_by_an_owner_device_and_by_nothing_else() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (_device, session) = net_support::paired_device(&host, &owner, CATALOGUE_RIGHTS).await;
+    let published = Published::create();
+    let environment_id = host.environment_id;
+
+    // Something to grant: a trusted repository, its generation, and a package installed from it.
+    let _: wire::CatalogueAddResult = typed(
+        &remote_mutation(
+            &session,
+            environment_id,
+            Method::CatalogueAdd,
+            &add_params(&host, &owner, &published),
+        )
+        .await
+        .expect("the owner device's proof trusts the repository"),
+    );
+    let _: wire::CatalogueSyncResult = typed(
+        &remote_mutation(
+            &session,
+            environment_id,
+            Method::CatalogueSync,
+            &wire::CatalogueSyncParams {
+                environment_id,
+                catalogue_id: "development".to_owned(),
+            },
+        )
+        .await
+        .expect("the generation verifies"),
+    );
+    let package_digest = published.manifest_digest(&plugin(), "0.1.0");
+    let _: wire::PluginInstallResult = typed(
+        &remote_mutation(
+            &session,
+            environment_id,
+            Method::PluginInstall,
+            &wire::PluginInstallParams {
+                environment_id,
+                catalogue_id: "development".to_owned(),
+                plugin_id: plugin(),
+                version: "0.1.0".to_owned(),
+                package_digest: package_digest.clone(),
+                grant: Vec::new(),
+                owner_confirmation: Nullable::null(),
+            },
+        )
+        .await
+        .expect("installed with nothing granted"),
+    );
+
+    // What the package may do: the installation and each capability's decision. The evidence
+    // beside them says when it was gathered, which is not a decision.
+    let read = || async {
+        let read: wire::PluginCapabilitiesResult = typed(
+            &remote_read::<_, ParamsValue>(
+                &session,
+                Method::PluginCapabilities,
+                &wire::PluginCapabilitiesParams {
+                    environment_id,
+                    plugin_id: plugin(),
+                },
+            )
+            .await
+            .expect("plugin.capabilities answers a device"),
+        );
+        (read.plugin, read.capabilities)
+    };
+    let accepted = |proof: &kr_protocol::pairing::OwnerConfirmationProof| {
+        host.network()
+            .pairing()
+            .rows()
+            .acceptance(proof.request.confirmation_id)
+            .expect("readable")
+    };
+    let refuses = |params: wire::PluginGrantParams, what: &'static str| {
+        let session = &session;
+        async move {
+            let refused = remote_mutation(session, environment_id, Method::PluginGrant, &params)
+                .await
+                .expect_err(what);
+            assert_eq!(
+                refused.code,
+                ErrorCode::PermissionDenied,
+                "{what}: {refused:?}"
+            );
+            params.owner_confirmation
+        }
+    };
+    let asked = vec!["broker.semantic_events".to_owned()];
+    let before = read().await;
+
+    // A key that is no owner device's.
+    let stranger = DeviceKeys::generate().expect("keys that are no owner device's");
+    let proof = refuses(
+        grant_params(&host, &stranger, &package_digest, asked.clone()),
+        "a stranger's key grants nothing",
+    )
+    .await;
+    assert!(accepted(&proof).is_none(), "the host accepted no proof");
+    assert_eq!(read().await, before);
+
+    // The owner's own key, on the channel only the first owner's terminal bootstrap may use.
+    let mut bootstrap = grant_params(&host, &owner, &package_digest, asked.clone());
+    bootstrap.owner_confirmation = kr_pairing::confirm::sign_confirmation(
+        &owner.authorisation,
+        &bootstrap.owner_confirmation.request,
+        kr_protocol::pairing::ConfirmationChannel::LocalBootstrapTerminal,
+    )
+    .expect("a proof");
+    let proof = refuses(bootstrap, "the bootstrap's channel grants nothing").await;
+    assert!(accepted(&proof).is_none(), "the host accepted no proof");
+    assert_eq!(read().await, before);
+
+    // The owner device's proof of another capability set, carried to this one.
+    let mut another = grant_params(&host, &owner, &package_digest, asked.clone());
+    another.owner_confirmation =
+        grant_params(&host, &owner, &package_digest, Vec::new()).owner_confirmation;
+    let proof = refuses(another, "a proof of another set grants nothing").await;
+    assert!(accepted(&proof).is_none(), "the host accepted no proof");
+    assert_eq!(read().await, before);
+
+    // The owner device's own proof of the exact grant grants it, and is spent doing so.
+    let exact = grant_params(&host, &owner, &package_digest, asked.clone());
+    let granted: wire::PluginGrantResult = typed(
+        &remote_mutation(&session, environment_id, Method::PluginGrant, &exact)
+            .await
+            .expect("the owner device's own proof grants it"),
+    );
+    assert_eq!(granted.plugin.package_digest, package_digest);
+    let spent = accepted(&exact.owner_confirmation).expect("the host accepted the owner's proof");
+    assert_eq!(spent.channel, "owner_device_presence");
+    assert!(spent.consumed_at_ms.is_some(), "the grant spent it");
+    let after = read().await;
+
+    // Once spent, the same proof grants nothing again, and its record stays as it was.
+    let proof = refuses(exact, "a spent proof grants nothing").await;
+    assert_eq!(accepted(&proof), Some(spent));
+    assert_eq!(read().await, after);
+
+    session.close();
+    host.stop().await;
+}
