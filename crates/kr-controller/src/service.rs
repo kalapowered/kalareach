@@ -352,6 +352,13 @@ pub struct Controller {
     /// In this process and no longer, because the connections it stands for end with the process.
     /// A daemon that starts again accepts any document it has not accepted before it serves.
     fence_unraised: std::sync::atomic::AtomicBool,
+    /// Held while a revocation's fence debt is read, fenced and cleared
+    /// ([`Self::complete_revocation`]).
+    ///
+    /// Two callers that both read one debt before either had fenced for it would both fence: two
+    /// revisions and every connection withdrawn twice for one withdrawal. The second caller now
+    /// reads the debt once the first has cleared it.
+    fence_settlement: tokio::sync::Mutex<()>,
     /// The environment's transfer service, whose methods this daemon admits and dispatches.
     transfer: Arc<crate::transfer::TransferModule>,
     /// The environment's project service, whose methods this daemon admits and dispatches.
@@ -818,6 +825,7 @@ impl Controller {
             started,
             rights_ceiling: std::sync::Mutex::new(rights_ceiling),
             fence_unraised: std::sync::atomic::AtomicBool::new(false),
+            fence_settlement: tokio::sync::Mutex::new(()),
             boot_identity: setup.boot_identity,
             boot_epoch,
             windows: ActionWindowIssuer::with_default_validity(Arc::clone(&clock) as Arc<_>),
@@ -1851,17 +1859,24 @@ impl Controller {
     /// then failed before the revision advanced leaves revoked authority and no fence, and a retry
     /// would see an empty set of *newly* revoked rows. So each half of a revocation writes its debt
     /// down by identity before the fence is attempted, and only a completed fence clears it.
+    ///
+    /// One debt is settled once. The debt is read, fenced and cleared by one caller at a time
+    /// ([`Self::fence_settlement`]), so a caller that read the debt while another was fencing for
+    /// it does not fence again: it reads the debt afterwards, finds it cleared, and answers with
+    /// the revision that fence advanced to.
     async fn complete_revocation(
         &self,
         revoked_grants: kr_protocol::scalars::CanonicalSet<kr_protocol::ids::GrantId>,
         now_ms: u64,
     ) -> Result<kr_protocol::sharing::RevocationResult> {
         let _ = now_ms;
+        let settling = self.fence_settlement.lock().await;
         // Captured before the fence starts. A revocation that arrives while this fence is waiting
         // on a worker records its own debt, and clearing the whole table afterwards would retire
         // that one without ever fencing it.
         let covered = self.sharing.grants().fence_owed()?;
         if covered.is_empty() {
+            drop(settling);
             // The work was already done and fenced. The answer is the revision in force and the
             // barrier as it stands, with nothing newly withdrawn. Both come from the barrier: it
             // reads the registry, which is where a revision is allocated, and a second reading
@@ -12056,7 +12071,7 @@ mod a_floor_owed_its_record {
         }
     }
 
-    async fn daemon(temp: &kr_ipc::testing::TempHost) -> Arc<Controller> {
+    pub(super) async fn daemon(temp: &kr_ipc::testing::TempHost) -> Arc<Controller> {
         let environment = temp.environment();
         let environment_id = temp.environment_id();
         let secrets = environment.secrets_dir();
@@ -12181,5 +12196,70 @@ mod a_floor_owed_its_record {
                 controller.continuous_now(),
             )
             .expect("once the floor is written down, the grant is decided on its merits");
+    }
+}
+
+#[cfg(test)]
+mod one_fence_for_one_debt {
+    //! A revocation's fence debt is settled once, however many callers settle it at once.
+
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use kr_protocol::ids::GrantId;
+
+    /// Two callers settling one withdrawal's debt at once fence the host once. Each reads the debt
+    /// and fences for it; the second does so only once the first has cleared it, so it finds
+    /// nothing owed and answers with the revision the first fence advanced to.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_settlements_of_one_debt_fence_once() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::a_floor_owed_its_record::daemon(&temp).await;
+        let before = controller.policy().authority_revision();
+        let withdrawn = GrantId::new(kr_ipc::new_uuid());
+        controller
+            .sharing()
+            .grants()
+            .owe_fence([withdrawn], kr_ipc::now_ms().get())
+            .expect("the debt is written");
+
+        // The registry is held, so a fence stops before it advances anything: a caller that has
+        // read the debt by now waits there with it.
+        let registry = controller.registry.lock().await;
+        let settle = |controller: Arc<super::Controller>| {
+            tokio::spawn(async move {
+                controller
+                    .complete_revocation([withdrawn].into_iter().collect(), kr_ipc::now_ms().get())
+                    .await
+            })
+        };
+        let first = settle(Arc::clone(&controller));
+        let second = settle(Arc::clone(&controller));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        drop(registry);
+
+        let first = first
+            .await
+            .expect("the first settlement ends")
+            .expect("it succeeds");
+        let second = second
+            .await
+            .expect("the second settlement ends")
+            .expect("it succeeds");
+        assert_eq!(
+            controller.policy().authority_revision().get(),
+            before.get() + 1,
+            "one withdrawal, one fence"
+        );
+        assert_eq!(first.authority_revision, second.authority_revision);
+        assert!(
+            controller
+                .sharing()
+                .grants()
+                .fence_owed()
+                .expect("readable")
+                .is_empty(),
+            "and nothing is owed"
+        );
     }
 }
