@@ -151,6 +151,18 @@ fn a_backend_runs_the_command_through_the_launcher_it_names() {
     shellpkg::a_backend_runs_the_command_through_the_launcher_it_names(ZSH);
 }
 
+/// KR-REQ-25.05
+#[test]
+fn each_line_reports_its_command_block_with_status_duration_and_directory() {
+    shellpkg::each_line_reports_its_block_with_status_duration_and_directory(ZSH);
+}
+
+/// KR-REQ-07.84
+#[test]
+fn a_line_exports_the_capability_minted_for_it_and_no_other() {
+    shellpkg::a_line_exports_the_capability_minted_for_it(ZSH);
+}
+
 /// KR-REQ-07.85, KR-REQ-26.11
 #[test]
 fn the_package_declares_the_managed_zsh_baseline_and_its_reproducible_identity() {

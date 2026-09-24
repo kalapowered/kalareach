@@ -215,10 +215,9 @@ Every package records, and the worker keeps with the session:
 
 Everything below comes from the reader itself, at the moment the reader does the thing. This is the
 contract a bridge speaks and the host answers; which of these a given package sends is that
-package's own declaration. The Zsh and Bash packages send every event in this table but
-`command_block`. The fish and PSReadLine packages send neither `command_resolve` nor
-`command_block`, so a command in one of those shells runs as it was typed, and no packaged shell
-reports a command block.
+package's own declaration. The Zsh and Bash packages send every event in this table. The fish and
+PSReadLine packages send neither `command_resolve` nor `command_block`, so a command in one of those
+shells runs as it was typed and reports no block.
 
 | Event | When | Fields |
 | --- | --- | --- |
@@ -293,9 +292,11 @@ stays in force and a null `detach_token`, and the line that started the command 
 both. A `continuation` acceptance is not this case: it is part of the line being typed, at the same
 prompt, and that line is the one that runs.
 
-The packaged shells do not export it, and a bare `kr detach` inside one of them is answered with
-the instruction to name the attachment, which is the refusal this contract asks for rather than
-an attachment the host cannot stand behind.
+The Zsh and Bash packages export it for a primary or continuation line, after waiting at most one
+second for the answer that carries it, and take it out of the environment again when the next
+primary reader starts. The fish and PSReadLine packages do not export it, so a bare `kr detach`
+inside one of those is answered with the instruction to name the attachment, which is the refusal
+this contract asks for rather than an attachment the host cannot stand behind.
 
 ### The command a line runs
 
@@ -323,8 +324,15 @@ None of this changes what the person sees: no key binding, function, alias or ho
 replaced, the history holds the line as it was typed, and `type` and `which` report the command as
 they did before.
 
+Each line also reports its command block from the reader's own boundaries. When a primary line is
+accepted, its block starts with the line as the editor accepted it, the directory and that
+directory's revision, and a continuation line joins it. When the next primary reader starts, the
+block ends with the status the shell itself holds for the line and how long the line ran. An empty
+line runs nothing and reports no block, and the input a running command reads through the editor
+belongs to that command.
+
 A session that names an absolute path in `KR_SHELL_BRIDGE_TRACE` gets one line of diagnostics in
-that file for each question and answer. Otherwise the integration writes no file of its own.
+that file for each question, answer and block. Otherwise the integration writes no file of its own.
 
 ## The reader-thread rules
 

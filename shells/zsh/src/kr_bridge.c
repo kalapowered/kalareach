@@ -49,6 +49,8 @@
 #define KR_TRACE_VARIABLE "KR_SHELL_BRIDGE_TRACE"
 /* Detaches submitted and not answered yet. A refusal belongs to a detach only if it answers one. */
 #define KR_DETACH_IDS_MAX 8
+/* The line capability is a UUID in its text form; anything longer is not one. */
+#define KR_TOKEN_MAX 128
 
 #define KR_UUID_LEN 16
 #define KR_SECRET_MAX 64
@@ -158,11 +160,28 @@ static struct {
      */
     unsigned long long owed;
 
+    /* The acceptance last reported, and the line capability its answer carried. */
+    unsigned long long accept_id;
+    int accept_answered;
+    int token_present;
+    char token[KR_TOKEN_MAX];
+
     /* The resolve last asked, and the encoded answer once it has come. */
     unsigned long long resolve_id;
     int resolve_answered;
     unsigned char *resolve_answer;
     size_t resolve_answer_len;
+
+    /* The command block of the line that is running. */
+    int block_open;
+    unsigned long block_prompt;
+    unsigned long long block_started_ms;
+    unsigned long long block_started_at;
+    char *block_command;
+    size_t block_command_len;
+    char *block_cwd;
+    size_t block_cwd_len;
+    unsigned long block_cwd_revision;
 
     /* Where diagnostics go, when the session asked for them. */
     char trace[512];
@@ -182,6 +201,18 @@ kr_now_ms(void)
         return (unsigned long long)now.tv_sec * 1000ull + (unsigned long long)now.tv_nsec / 1000000ull;
     }
 #endif
+    return 0;
+}
+
+/* Milliseconds since the epoch, which is what a command block reports its start in. */
+static unsigned long long
+kr_wall_ms(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_REALTIME, &now) == 0) {
+        return (unsigned long long)now.tv_sec * 1000ull + (unsigned long long)now.tv_nsec / 1000000ull;
+    }
     return 0;
 }
 
@@ -275,6 +306,48 @@ static int
 kr_utf8_text(const char *text)
 {
     return text != NULL && kr_utf8_valid((const unsigned char *)text, strlen(text));
+}
+
+/*
+ * A copy of `len` bytes as UTF-8 a reader can display, in memory the caller frees.
+ *
+ * A command line and a directory are the person's bytes, and the terminal's encoding need not be
+ * UTF-8. What a block reports is for a person to read, so a byte that is not part of a well-formed
+ * sequence is shown as U+FFFD rather than dropping the block.
+ */
+static char *
+kr_utf8_lossy(const char *text, size_t len, size_t *out_len)
+{
+    /* Each byte becomes at most the three bytes of U+FFFD. */
+    char *copy = (char *)malloc(len * 3 + 1);
+    size_t at = 0;
+    size_t used = 0;
+
+    if (copy == NULL) {
+        return NULL;
+    }
+    while (at < len) {
+        size_t take = 1;
+        unsigned char lead = (unsigned char)text[at];
+
+        if (lead >= 0x80) {
+            take = (lead >= 0xf0) ? 4 : (lead >= 0xe0) ? 3 : 2;
+            if (take > len - at ||
+                !kr_utf8_valid((const unsigned char *)text + at, take)) {
+                copy[used++] = (char)0xef;
+                copy[used++] = (char)0xbf;
+                copy[used++] = (char)0xbd;
+                at++;
+                continue;
+            }
+        }
+        memcpy(copy + used, text + at, take);
+        used += take;
+        at += take;
+    }
+    copy[used] = '\0';
+    *out_len = used;
+    return copy;
 }
 
 static int
@@ -1262,7 +1335,11 @@ kr_bridge_command_accepted(void)
     fenced = kr.fence_live && kr.fence_prompt == state.prompt_generation &&
              kr.fence_reader == state.reader_revision;
 
-    kr_open_event(&writer, "command_accepted");
+    /* The answer carries the capability this line's own execution presents, so it is the one
+     * answer a package waits for before the line runs. */
+    kr.accept_id = kr_open_event(&writer, "command_accepted");
+    kr.accept_answered = 0;
+    kr.token_present = 0;
     kr_cbor_map(&writer, 4);
     kr_cbor_key(&writer, "origin");
     if (fenced) {
@@ -1934,6 +2011,22 @@ kr_take_event_result(const kr_cbor_doc *doc, unsigned long long id, int result)
         }
         return;
     }
+    if (id != 0 && id == kr.accept_id) {
+        kr.accept_answered = 1;
+        kr.token_present = 0;
+        if (name_len == 16 && memcmp(name, "command_recorded", 16) == 0) {
+            int token = kr_cbor_get(doc, payload, "detach_token");
+            if (token >= 0 && doc->values[token].kind == KR_CBOR_TSTR &&
+                doc->values[token].payload_len > 0 &&
+                doc->values[token].payload_len < KR_TOKEN_MAX &&
+                memchr(doc->values[token].payload, '\0', doc->values[token].payload_len) == NULL) {
+                memcpy(kr.token, doc->values[token].payload, doc->values[token].payload_len);
+                kr.token[doc->values[token].payload_len] = '\0';
+                kr.token_present = 1;
+            }
+        }
+        return;
+    }
     if (id != 0 && id == kr.resolve_id) {
         kr.resolve_answered = 1;
         free(kr.resolve_answer);
@@ -1956,10 +2049,10 @@ kr_take_event_result(const kr_cbor_doc *doc, unsigned long long id, int result)
 /*
  * Takes the answer a package is waiting for out of what has already arrived.
  *
- * Only the answer to the resolve being waited for is taken, wherever it is among the frames
- * already read. Everything else stays where it is, in order, for the reader to take at its next
- * boundary: a request for the reader, a publication and a detach's answer all belong to a reader,
- * and none is running while a command starts.
+ * Only the answer to the acceptance or the resolve being waited for is taken, wherever it is among
+ * the frames already read. Everything else stays where it is, in order, for the reader to take at
+ * its next boundary: a request for the reader, a publication and a detach's answer all belong to a
+ * reader, and none is running while a command starts.
  */
 static void
 kr_take_answers(void)
@@ -1990,7 +2083,8 @@ kr_take_answers(void)
             int id_value = kr_cbor_get(&doc, payload, "id");
             if (id_value >= 0 && doc.values[id_value].kind == KR_CBOR_UINT) {
                 unsigned long long id = doc.values[id_value].number;
-                if (id == kr.resolve_id && !kr.resolve_answered) {
+                if ((id == kr.accept_id && !kr.accept_answered) ||
+                    (id == kr.resolve_id && !kr.resolve_answered)) {
                     kr_take_event_result(&doc, id, kr_cbor_get(&doc, payload, "result"));
                     taken = 1;
                 } else if (kr.owed != 0 && id >= kr.owed) {
@@ -2521,4 +2615,151 @@ kr_bridge_resolve(const char *const *argv, size_t argc, const char *executable, 
         return 0;
     }
     return kr_decide_launch(argv[0], executable, out);
+}
+
+const char *
+kr_bridge_line_token(void)
+{
+    if (kr.accept_id == 0 || !kr_bridge_root_process()) {
+        return NULL;
+    }
+    if (!kr.accept_answered) {
+        kr_take_answers();
+        if (!kr.accept_answered && kr.owed == 0) {
+            kr_await(kr.accept_id, &kr.accept_answered, kr_now_ms() + KR_ANSWER_WAIT_MS);
+        }
+    }
+    if (!kr.accept_answered) {
+        kr_trace("line %llu: no answer, so no capability", kr.accept_id);
+        return NULL;
+    }
+    kr_trace("line %llu: %s", kr.accept_id,
+             kr.token_present ? "a capability for this line" : "no capability for this line");
+    return kr.token_present ? kr.token : NULL;
+}
+
+/* Whether a line holds nothing but blanks, which runs no command. */
+static int
+kr_blank(const char *line, size_t len)
+{
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        if (line[i] != ' ' && line[i] != '\t' && line[i] != '\n' && line[i] != '\r') {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void
+kr_block_forget(void)
+{
+    free(kr.block_command);
+    free(kr.block_cwd);
+    kr.block_command = NULL;
+    kr.block_cwd = NULL;
+    kr.block_command_len = 0;
+    kr.block_cwd_len = 0;
+    kr.block_open = 0;
+}
+
+/* Sends the open block: running, or finished with `status` after `duration_ms`. */
+static void
+kr_send_block(int finished, int status, unsigned long long duration_ms)
+{
+    kr_cbor_writer writer;
+
+    kr_open_event(&writer, "command_block");
+    kr_cbor_map(&writer, 8);
+    kr_cbor_key(&writer, "cwd");
+    kr_cbor_tstr_len(&writer, kr.block_cwd, kr.block_cwd_len);
+    kr_cbor_key(&writer, "command");
+    kr_cbor_tstr_len(&writer, kr.block_command, kr.block_command_len);
+    kr_cbor_key(&writer, "session_id");
+    kr_cbor_bstr(&writer, kr.session, KR_UUID_LEN);
+    kr_cbor_key(&writer, "duration_ms");
+    if (finished) {
+        kr_cbor_uint(&writer, duration_ms);
+    } else {
+        kr_cbor_null(&writer);
+    }
+    kr_cbor_key(&writer, "exit_status");
+    if (finished) {
+        kr_cbor_uint(&writer, (unsigned long long)(status < 0 ? 255 : status));
+    } else {
+        kr_cbor_null(&writer);
+    }
+    kr_cbor_key(&writer, "cwd_revision");
+    kr_cbor_uint(&writer, kr.block_cwd_revision);
+    kr_cbor_key(&writer, "started_at_ms");
+    kr_cbor_uint(&writer, kr.block_started_ms);
+    kr_cbor_key(&writer, "prompt_generation");
+    kr_cbor_uint(&writer, kr.block_prompt);
+    kr_cbor_map_end(&writer);
+    kr_close_event(&writer);
+}
+
+void
+kr_bridge_block_started(unsigned long prompt_generation, const char *line, size_t len,
+                        const char *cwd, unsigned long cwd_revision)
+{
+    char *text;
+    size_t text_len = 0;
+
+    if (!kr_bridge_root_process() || line == NULL || cwd == NULL) {
+        return;
+    }
+    text = kr_utf8_lossy(line, len, &text_len);
+    if (text == NULL) {
+        return;
+    }
+    if (kr.block_open && kr.block_prompt == prompt_generation) {
+        /* A continuation line of the same prompt: the command is the lines together. */
+        char *joined = (char *)realloc(kr.block_command, kr.block_command_len + text_len + 2);
+        if (joined == NULL) {
+            free(text);
+            return;
+        }
+        joined[kr.block_command_len] = '\n';
+        memcpy(joined + kr.block_command_len + 1, text, text_len + 1);
+        kr.block_command = joined;
+        kr.block_command_len += text_len + 1;
+        free(text);
+    } else {
+        /* A block that never heard its line finish is not reported as finished by a later one. */
+        kr_block_forget();
+        if (kr_blank(line, len)) {
+            free(text);
+            return;
+        }
+        kr.block_cwd = kr_utf8_lossy(cwd, strlen(cwd), &kr.block_cwd_len);
+        if (kr.block_cwd == NULL) {
+            free(text);
+            return;
+        }
+        kr.block_command = text;
+        kr.block_command_len = text_len;
+        kr.block_prompt = prompt_generation;
+        kr.block_cwd_revision = cwd_revision;
+        kr.block_started_ms = kr_wall_ms();
+        kr.block_started_at = kr_now_ms();
+        kr.block_open = 1;
+    }
+    kr_send_block(0, 0, 0);
+    kr_trace("block %lu: started in %s at revision %lu", kr.block_prompt, kr.block_cwd,
+             kr.block_cwd_revision);
+}
+
+void
+kr_bridge_block_finished(int status)
+{
+    if (!kr.block_open) {
+        return;
+    }
+    if (kr_bridge_root_process()) {
+        kr_send_block(1, status, kr_now_ms() - kr.block_started_at);
+        kr_trace("block %lu: finished with %d", kr.block_prompt, status);
+    }
+    kr_block_forget();
 }

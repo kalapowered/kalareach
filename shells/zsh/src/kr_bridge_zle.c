@@ -69,6 +69,9 @@ static int kr_line_running;
 /* What the command being started now runs as, held until the next command asks. */
 static kr_resolution kr_resolution_now;
 
+/* The variable a line's own commands present to `kr detach`. */
+#define KR_DETACH_TOKEN_VARIABLE "KR_DETACH_TOKEN"
+
 static unsigned long
 kr_hash_line(void)
 {
@@ -372,6 +375,21 @@ kr_shell_unexport(const char *name)
     unsetparam((char *)name);
 }
 
+/*
+ * Puts one variable in the shell's own exported environment.
+ *
+ * The line's own commands inherit it, and nothing started after the line has ended does: the
+ * reader takes it out of the environment again at the next prompt.
+ */
+static void
+kr_shell_export(const char *name, const char *value)
+{
+    unsetparam((char *)name);
+    if (createparam((char *)name, PM_SCALAR | PM_EXPORTED) != NULL) {
+        setsparam((char *)name, ztrdup_metafy(value));
+    }
+}
+
 /* Whether the shell is running a command of the line itself: not one that a function, a sourced
  * or startup file, an eval, a trap, a hook or a widget runs. */
 static int
@@ -442,12 +460,40 @@ kr_zle_resolve(char **argv, char *path, char ***launch, char ***environment)
     return launching;
 }
 
-/* A line of the shell was accepted: what runs until the next primary reader is its commands. */
+/*
+ * A line of the shell was accepted and is about to run.
+ *
+ * Its command block starts, and the capability the worker minted for it goes into the exported
+ * environment of the commands it runs, which is the only place `kr detach` looks for it.
+ */
 static void
 kr_line_accepted(void)
 {
+    const char *token;
+    char *line;
+    char *cwd;
+    int len = 0;
+
+    kr_track_cwd();
+    if (pwd != NULL) {
+        pushheap();
+        line = zlelineasstring(zleline, zlell, 0, &len, NULL, 1);
+        unmetafy(line, &len);
+        cwd = dupstring(pwd);
+        unmetafy(cwd, NULL);
+        kr_bridge_block_started(kr_prompt_generation, line, (size_t)len, cwd, kr_cwd_revision);
+        popheap();
+    }
+    token = kr_bridge_line_token();
+    if (token != NULL) {
+        kr_shell_export(KR_DETACH_TOKEN_VARIABLE, token);
+    } else {
+        kr_shell_unexport(KR_DETACH_TOKEN_VARIABLE);
+    }
     kr_line_running = 1;
 }
+
+/* ---- the reader's boundaries ------------------------------------------------------------------ */
 
 void
 kr_zle_setup(void)
@@ -478,8 +524,13 @@ kr_zle_enter(void)
     }
     kr_reader_revision++;
     if (zlecontext == ZLCON_LINE_START) {
-        /* The line before this prompt has run, and nothing after this is one of its commands. */
-        kr_line_running = 0;
+        /* The line before this prompt has run: its block ends with the shell's own status for
+         * it, and its capability leaves the environment with it. */
+        if (kr_line_running) {
+            kr_line_running = 0;
+            kr_bridge_block_finished(lastval);
+            kr_shell_unexport(KR_DETACH_TOKEN_VARIABLE);
+        }
         kr_prompt_generation++;
     }
     kr_track_cwd();

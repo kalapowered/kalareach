@@ -549,3 +549,170 @@ pub fn a_backend_runs_the_command_through_the_launcher_it_names(kind: ShellKind)
     assert_eq!(ran.names(), control.names());
     assert!(!ran.environment.contains_key("KR_REGISTRATION"));
 }
+
+/// The shell's own `read` reading a line through the editor.
+fn reading_through_the_editor(kind: ShellKind) -> &'static str {
+    match kind {
+        ShellKind::Zsh => "vared -c kr_reply",
+        _ => "read -e -r kr_reply",
+    }
+}
+
+/// KR-REQ-25.05: each line reports one command block when it starts and again when it has
+/// finished, with the shell's own status for it, its duration and the directory it ran in. An
+/// empty line and the input a running command reads report none.
+pub fn each_line_reports_its_block_with_status_duration_and_directory(kind: ShellKind) {
+    let Some(package) = Package::found(kind) else {
+        return;
+    };
+    let probes = Probes::new();
+    let mut session = a_session_with_probes(&package, &probes);
+
+    let reported = session.commands.blocks.len();
+    let command = "kr-probe block; sh -c 'exit 3'";
+    assert!(session.run(command, "probe-ran"));
+    let entry = session.commands.last_line_reader().clone();
+    session.until("the line's finished block", |commands| {
+        commands.blocks[reported..]
+            .iter()
+            .any(|block| block.exit_status.0.is_some())
+    });
+    let blocks = session.commands.blocks[reported..].to_vec();
+    assert_eq!(
+        blocks.len(),
+        2,
+        "one block when the line started and one when it finished: {blocks:?}"
+    );
+    let (started, finished) = (&blocks[0], &blocks[1]);
+    assert_eq!(started.session_id, session.session_id);
+    assert_eq!(started.command, command);
+    assert_eq!(started.prompt_generation, entry.prompt_generation);
+    assert_eq!(started.cwd, session.home().display().to_string());
+    assert_eq!(started.cwd_revision, entry.cwd_revision);
+    assert!(
+        started.exit_status.0.is_none() && started.duration_ms.0.is_none(),
+        "a block that has just started has no status and no duration: {started:?}"
+    );
+    assert_eq!(finished.command, started.command);
+    assert_eq!(finished.prompt_generation, started.prompt_generation);
+    assert_eq!(finished.started_at_ms, started.started_at_ms);
+    assert_eq!(
+        finished.exit_status.0.map(|status| status.get()),
+        Some(3),
+        "the status the shell itself holds for the line"
+    );
+    assert!(finished.duration_ms.0.is_some(), "{finished:?}");
+    assert!(finished.completed_nonzero());
+
+    // A line that succeeds reports that it did.
+    let reported = session.commands.blocks.len();
+    assert!(session.run("kr-probe fine", "probe-ran"));
+    session.until("the line's finished block", |commands| {
+        commands.blocks[reported..]
+            .iter()
+            .any(|block| block.exit_status.0.is_some())
+    });
+    let blocks = session.commands.blocks[reported..].to_vec();
+    assert_eq!(blocks.len(), 2, "{blocks:?}");
+    assert_eq!(blocks[1].exit_status.0.map(|status| status.get()), Some(0));
+
+    // A continuation line is part of the line it continues: one block holds both.
+    let reported = session.commands.blocks.len();
+    session.type_line("kr-probe joined \\");
+    assert!(session.run("continued", "probe-ran"));
+    session.until("the joined line's finished block", |commands| {
+        commands.blocks[reported..]
+            .iter()
+            .any(|block| block.exit_status.0.is_some())
+    });
+    let finished = session.commands.blocks[reported..]
+        .iter()
+        .rev()
+        .find(|block| block.exit_status.0.is_some())
+        .cloned()
+        .expect("a finished block");
+    assert_eq!(finished.command, "kr-probe joined \\\ncontinued");
+    assert_eq!(last_run(&probes).arguments, ["joined", "continued"]);
+
+    // An empty line runs nothing and reports nothing: the next block is the next command's.
+    let reported = session.commands.blocks.len();
+    session.type_line("");
+    let marker_command = print_assembled(kind, "kr-after-empty");
+    assert!(session.run(&marker_command, "kr-after-empty"));
+    session.until("the next command's finished block", |commands| {
+        commands.blocks[reported..]
+            .iter()
+            .any(|block| block.exit_status.0.is_some())
+    });
+    let blocks = session.commands.blocks[reported..].to_vec();
+    assert!(
+        blocks.iter().all(|block| block.command == marker_command),
+        "an empty line reported a block: {blocks:?}"
+    );
+
+    // Input a running command reads through the editor is that command's, not a line of its
+    // own: the line that asked for it is the one block.
+    let reported = session.commands.blocks.len();
+    let reading = reading_through_the_editor(kind);
+    session.type_line(reading);
+    session.type_line("kr-typed-input");
+    session.until("the reading line's finished block", |commands| {
+        commands.blocks[reported..]
+            .iter()
+            .any(|block| block.command == reading && block.exit_status.0.is_some())
+    });
+    let commands: Vec<String> = session.commands.blocks[reported..]
+        .iter()
+        .map(|block| block.command.clone())
+        .collect();
+    assert!(
+        commands
+            .iter()
+            .all(|command| !command.contains("kr-typed-input")),
+        "the input a command read was reported as a line: {commands:?}"
+    );
+    assert!(
+        commands.iter().all(|command| command == reading),
+        "only the line that read the input is reported: {commands:?}"
+    );
+}
+
+/// KR-REQ-07.84: the commands a line runs are started with the capability the worker minted for
+/// that line and no other, which is what `kr detach` with no attachment presents, and a line the
+/// worker minted none for has none.
+pub fn a_line_exports_the_capability_minted_for_it(kind: ShellKind) {
+    let Some(package) = Package::found(kind) else {
+        return;
+    };
+    let probes = Probes::new();
+    let mut session = a_session_with_probes(&package, &probes);
+
+    let mut seen = Vec::new();
+    for word in ["first", "second"] {
+        assert!(session.run(&format!("kr-probe {word}"), "probe-ran"));
+        let minted = session
+            .commands
+            .tokens
+            .last()
+            .cloned()
+            .flatten()
+            .expect("the line was answered with a capability");
+        let ran = last_run(&probes);
+        assert_eq!(
+            ran.environment.get("KR_DETACH_TOKEN"),
+            Some(&minted),
+            "the command was started with its own line's capability"
+        );
+        seen.push(minted);
+    }
+    assert_ne!(seen[0], seen[1], "each line holds a capability of its own");
+
+    // A line the worker minted nothing for runs with nothing, not with the last line's.
+    session.commands.withhold_tokens = true;
+    assert!(session.run("kr-probe none", "probe-ran"));
+    let ran = last_run(&probes);
+    assert!(
+        !ran.environment.contains_key("KR_DETACH_TOKEN"),
+        "a line with no capability ran with one: {ran:?}"
+    );
+}

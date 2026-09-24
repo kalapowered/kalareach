@@ -75,6 +75,12 @@ int kr_rl_line_running (void);
 /* The working directory now and the revision it is at, or NULL when it cannot be read. */
 const char *kr_rl_cwd (unsigned long *revision);
 
+/* The status the last command line finished with, as the shell itself keeps it. */
+int kr_shell_last_status (void);
+
+/* Puts one variable in the shell's own exported environment. */
+void kr_shell_export (const char *name, const char *value);
+
 /* The shell's own word list, which only the shell's half of the bridge reads. */
 struct word_list;
 

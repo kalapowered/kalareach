@@ -244,7 +244,7 @@ adapter for that reader:
 | `kr_bridge_cbor.c`, `kr_bridge_cbor.h` | KR-CBOR-1: canonical encoding with map keys checked into order as they are written, and a bounded decoder |
 | `kr_bridge_crypto.c`, `kr_bridge_crypto.h` | SHA-256, HMAC-SHA-256 and base64url, for the one proof taken at startup |
 | `kr_bridge_zle.c` / `kr_bridge_rl.c` | The reader's own state, read in one operation at one instant, and the shell's own string representation |
-| `kr_bridge_bash.c` (Bash only) | What only the shell itself can do: remove a variable from its exported environment, say which prompt it is at, and decide whether a command is one of the line's own |
+| `kr_bridge_bash.c` (Bash only) | What only the shell itself can do: put a variable in its exported environment or take one out, say which prompt it is at and what the last line exited with, and decide whether a command is one of the line's own |
 
 The first three files are the same source in both packages, and a test in
 `crates/kr-shell-integration/tests/` asserts they have not drifted. They are duplicated because

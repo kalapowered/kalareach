@@ -197,7 +197,7 @@ int kr_bridge_launch_pending(void);
 /* ---- the command a line runs ----------------------------------------------------------------- */
 
 /*
- * The longest a shell waits for the worker to answer a resolve.
+ * The longest a shell waits for the worker to answer a resolve or an acceptance.
  *
  * A worker that is there answers in well under a millisecond. One that has stopped answering costs
  * this once: while an answer is owed nothing else waits, and every command runs as it was typed.
@@ -236,5 +236,23 @@ int kr_bridge_resolve(const char *const *argv, size_t argc, const char *executab
 
 /* Releases what a resolution holds. */
 void kr_bridge_resolution_free(kr_resolution *resolution);
+
+/*
+ * The capability the worker minted for the line just accepted, or NULL.
+ *
+ * Waits at most KR_ANSWER_WAIT_MS for the answer to the acceptance this bridge last reported. The
+ * shell exports it for the commands of that line and for nothing else.
+ */
+const char *kr_bridge_line_token(void);
+
+/*
+ * A line accepted at `prompt_generation` is about to run in `cwd`. A continuation line of the same
+ * prompt extends the command the block reports. A line with nothing but blanks is no command.
+ */
+void kr_bridge_block_started(unsigned long prompt_generation, const char *line, size_t len,
+                             const char *cwd, unsigned long cwd_revision);
+
+/* The line that started last has finished with the shell's own `status` for it. */
+void kr_bridge_block_finished(int status);
 
 #endif /* KR_BRIDGE_H */

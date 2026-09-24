@@ -71,6 +71,9 @@ static int kr_installed_chars;
 /* True from a line's acceptance until the next primary reader: its commands are running. */
 static int kr_line_running;
 
+/* The variable a line's own commands present to `kr detach`. */
+#define KR_DETACH_TOKEN_VARIABLE "KR_DETACH_TOKEN"
+
 static unsigned long
 kr_hash_line (void)
 {
@@ -413,8 +416,14 @@ kr_rl_enter (void)
   kr_reader_revision++;
   if (kr_context () == KR_CONTEXT_PRIMARY)
     {
-      /* The line before this prompt has run, and nothing after this is one of its commands. */
-      kr_line_running = 0;
+      /* The line before this prompt has run: its block ends with the shell's own status for it,
+	 and its capability leaves the environment with it. */
+      if (kr_line_running)
+	{
+	  kr_line_running = 0;
+	  kr_bridge_block_finished (kr_shell_last_status ());
+	  kr_shell_unexport (KR_DETACH_TOKEN_VARIABLE);
+	}
       kr_prompt_generation++;
     }
   kr_track_cwd ();
@@ -432,10 +441,28 @@ kr_rl_enter (void)
   kr_bridge_editor_enter ();
 }
 
-/* A line of the shell was accepted: what runs until the next primary reader is its commands. */
+/*
+ * A line of the shell was accepted and is about to run.
+ *
+ * Its command block starts, and the capability the worker minted for it goes into the exported
+ * environment of the commands it runs, which is the only place `kr detach` looks for it.
+ */
 static void
 kr_rl_line_accepted (void)
 {
+  const char *token;
+  const char *cwd;
+  unsigned long revision = 0;
+
+  cwd = kr_rl_cwd (&revision);
+  if (cwd)
+    kr_bridge_block_started (kr_prompt_generation, rl_line_buffer, (size_t) rl_end, cwd,
+			     revision);
+  token = kr_bridge_line_token ();
+  if (token)
+    kr_shell_export (KR_DETACH_TOKEN_VARIABLE, token);
+  else
+    kr_shell_unexport (KR_DETACH_TOKEN_VARIABLE);
   kr_line_running = 1;
 }
 

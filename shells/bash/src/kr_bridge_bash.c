@@ -66,6 +66,27 @@ kr_shell_unexport (name)
   unbind_variable ((char *) name);
 }
 
+int
+kr_shell_last_status ()
+{
+  return last_command_exit_value;
+}
+
+void
+kr_shell_export (name, value)
+     const char *name;
+     const char *value;
+{
+  SHELL_VAR *var;
+
+  /*
+   * The line's own commands inherit it, and nothing started after the line has ended does: the
+   * reader takes it out of the environment again at the next prompt.
+   */
+  var = bind_variable ((char *) name, (char *) value, 0);
+  if (var)
+    set_auto_export (var);
+}
 
 /* What the command being started now runs as, held until the next command asks. */
 static kr_resolution kr_resolution_now;

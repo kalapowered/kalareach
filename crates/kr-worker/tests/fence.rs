@@ -1671,8 +1671,9 @@ impl RealProbes {
         let root = std::fs::canonicalize(directory.path()).expect("the directory resolves");
         std::fs::create_dir(root.join("bin")).expect("a directory for the program");
         let program = root.join("bin").join("kr-probe");
-        // It records its arguments and every reserved variable it was started with, and prints a
-        // word it puts together from two pieces.
+        // It records its arguments and every reserved variable it was started with, waits while
+        // its first argument is `hold` and no release has been written, and prints a word it puts
+        // together from two pieces.
         std::fs::write(
             &program,
             format!(
@@ -1685,8 +1686,12 @@ impl RealProbes {
                  done\n\
                  printf 'end\\n'\n\
                  }} >> '{record}'\n\
+                 if [ \"$1\" = hold ]; then\n\
+                 while [ ! -e '{release}' ]; do sleep 0.05; done\n\
+                 fi\n\
                  printf '%s%s\\n' 'probe-' 'ran'\n",
                 record = root.join("record").display(),
+                release = root.join("release").display(),
             ),
         )
         .expect("the program");
@@ -1734,6 +1739,10 @@ impl RealProbes {
         self.root.join("script.sh")
     }
 
+    fn release(&self) {
+        std::fs::write(self.root.join("release"), "").expect("the release");
+    }
+
     /// Every start of the program: its arguments after its own name, and its reserved variables.
     fn runs(&self) -> Vec<(Vec<String>, std::collections::BTreeMap<String, String>)> {
         let text = std::fs::read_to_string(self.root.join("record")).unwrap_or_default();
@@ -1777,9 +1786,10 @@ impl RealProbes {
     }
 }
 
-/// KR-REQ-12.07, KR-REQ-07.45: a real package asks the real worker before each command of a line
-/// and runs a bypassed command exactly as it was typed; forms the root shell does not start
-/// itself ask nothing.
+/// KR-REQ-12.07, KR-REQ-07.45, KR-REQ-07.84, KR-REQ-25.05: a real package asks the real worker
+/// before each command of a line and runs a bypassed command exactly as it was typed; forms the
+/// root shell does not start itself ask nothing; the line's capability and its block reach the
+/// worker.
 ///
 /// This host establishes no command backend yet, so every answer here is a bypass: `not_integrated`
 /// for a session created with no integration, and `backend_unavailable` for one created with an
@@ -1885,6 +1895,55 @@ async fn asks_the_real_worker_before_each_command(
         printed += 1;
         shell.produced(b"probe-ran", printed).await;
         assert_eq!(probes.asked().len(), 1, "{}", probes.trace());
+
+        // The line's capability reaches the command, and the worker resolves it to the
+        // attachment that typed the line while the line runs.
+        keys.type_line(&shell, "kr-probe hold");
+        let token = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some((arguments, environment)) = probes.runs().last()
+                    && arguments.first().map(String::as_str) == Some("hold")
+                {
+                    return environment.get("KR_DETACH_TOKEN").cloned();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the held command started");
+        let token = token.expect("the command was started with its line's capability");
+        assert_eq!(
+            shell
+                .runtime
+                .session()
+                .fence()
+                .expect("a driver")
+                .detach_for_token(&token),
+            Some(keys.attachment_id),
+            "the capability names the attachment that typed the line"
+        );
+        probes.release();
+        printed += 1;
+        shell.produced(b"probe-ran", printed).await;
+
+        // The line's block reaches the worker with the shell's own status for it.
+        keys.type_line(&shell, "sh -c 'exit 7'");
+        let block = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(block) = shell.runtime.session().last_command_block()
+                    && block.command == "sh -c 'exit 7'"
+                    && block.finished()
+                {
+                    return block;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the line's finished block reached the worker");
+        assert_eq!(block.exit_status.0.map(|status| status.get()), Some(7));
+        assert_eq!(block.cwd, shell.home().display().to_string());
+        assert!(block.duration_ms.0.is_some());
 
         shell.close().await;
     }
