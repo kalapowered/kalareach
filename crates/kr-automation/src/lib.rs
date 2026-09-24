@@ -248,7 +248,9 @@ pub(crate) mod fixtures {
                     change_set_id: version.change_set_id,
                     version: version.version,
                     destination: kr_protocol::changeset::DestinationClass::Proposal,
-                    workspace_id: Nullable::null(),
+                    workspace_id: Nullable::some(kr_protocol::ids::WorkspaceId::new(
+                        Uuid::from_bytes([0x34; 16]),
+                    )),
                     expected_reference: Nullable::null(),
                     affected: Vec::new(),
                     paths: Vec::new(),

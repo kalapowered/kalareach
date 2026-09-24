@@ -16,9 +16,13 @@ use kr_protocol::automation::{
     RequestReviewParams, RunTestsParams, ShellCommandParams, WorkflowActionKind, WorkflowDeadlines,
     WorkflowDefinition, WorkflowEdge, WorkflowNode, WorkflowResourceScope, WorkflowTrigger,
 };
-use kr_protocol::changeset::{ChangesetCaptureParams, ChangesetMaterializeParams, DiffApplyParams};
+use kr_protocol::changeset::{
+    ChangesetCaptureParams, ChangesetMaterializeParams, DestinationClass, DiffApplyParams,
+    SourceConsistency,
+};
 use kr_protocol::grant::Grant;
 use kr_protocol::ids::{EnvironmentId, GrantId, WorkflowId, WorkspaceId};
+use kr_protocol::project::InclusionChoice;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::U64;
 use kr_protocol::session::SessionCreateParams;
@@ -169,8 +173,10 @@ fn validate_typed_action_params(
     check_no_template_values(node_id, &parsed)?;
 
     // Each kind takes exactly its own typed parameters. A change-set node or a session node asks
-    // for exactly what its method asks for, so its parameters are that method's own, and a node
-    // that would be refused when it ran is refused when it is installed.
+    // for exactly what its method asks for, so its parameters are that method's own, and every
+    // check that method makes on the request alone is made here too, so a node its method would
+    // refuse whatever the host's state is refused when it is installed. What the method checks
+    // against the host's live state is checked when the node runs.
     match action_kind {
         WorkflowActionKind::ShellCommand => {
             let params: ShellCommandParams = typed_params(node_id, action_kind, &parsed)?;
@@ -185,11 +191,7 @@ fn validate_typed_action_params(
         }
         WorkflowActionKind::CreateSession => {
             let params: SessionCreateParams = typed_params(node_id, action_kind, &parsed)?;
-            if let Some(reason) = params.palette_refusal() {
-                return Err(AutomationError::InvalidArgument(format!(
-                    "node {node_id} creates a session session.create would refuse: {reason}"
-                )));
-            }
+            session_request_refusal(node_id, &params)?;
         }
         WorkflowActionKind::AttentionNotice => {
             let params: AttentionNoticeParams = typed_params(node_id, action_kind, &parsed)?;
@@ -204,13 +206,106 @@ fn validate_typed_action_params(
             typed_params::<ChangesetMaterializeParams>(node_id, action_kind, &parsed)?;
         }
         WorkflowActionKind::ApplyDiff => {
-            typed_params::<DiffApplyParams>(node_id, action_kind, &parsed)?;
+            let params: DiffApplyParams = typed_params(node_id, action_kind, &parsed)?;
+            apply_request_refusal(node_id, &params)?;
         }
         WorkflowActionKind::CaptureChangeset => {
-            typed_params::<ChangesetCaptureParams>(node_id, action_kind, &parsed)?;
+            let params: ChangesetCaptureParams = typed_params(node_id, action_kind, &parsed)?;
+            capture_request_refusal(node_id, &params)?;
         }
     }
 
+    Ok(())
+}
+
+/// Refuses a session node whose parameters `session.create` refuses on the request alone: a
+/// palette its presentation cannot take, and a geometry the terminal cannot open at. Both are the
+/// checks the method itself makes.
+fn session_request_refusal(node_id: &str, params: &SessionCreateParams) -> Result<()> {
+    if let Some(reason) = params.palette_refusal() {
+        return Err(AutomationError::InvalidArgument(format!(
+            "node {node_id} creates a session session.create would refuse: {reason}"
+        )));
+    }
+    if let Some(dimensions) = params.dimensions.0
+        && let Err(refusal) = dimensions.validate()
+    {
+        return Err(AutomationError::InvalidArgument(format!(
+            "node {node_id} creates a session at a geometry the terminal refuses: {refusal}"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuses an apply node whose parameters `diff.apply` refuses on the request alone.
+///
+/// The method reads the destination's workspace for every class, a versioned reference needs the
+/// reference and the value it is expected to hold, and a direct apply to a shared working tree is
+/// chosen only after every limitation of that class has been shown. The limitations are the
+/// method's own words, read from it rather than restated here.
+fn apply_request_refusal(node_id: &str, params: &DiffApplyParams) -> Result<()> {
+    let refused = |why: &str| {
+        Err(AutomationError::InvalidArgument(format!(
+            "node {node_id} applies a version diff.apply would refuse: {why}"
+        )))
+    };
+    if params.workspace_id.0.is_none() {
+        return refused("an apply names the workspace whose destination it reads and writes");
+    }
+    match params.destination {
+        DestinationClass::VersionedReference => {
+            let Some(expected) = params.expected_reference.as_ref() else {
+                return refused(
+                    "an apply to a versioned reference names the reference and the value it \
+                     expects it to hold",
+                );
+            };
+            // The same rule the method holds a reference name to before any Git runs.
+            if expected.name.is_empty()
+                || expected.name.starts_with('-')
+                || !expected
+                    .name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"/_-.".contains(&byte))
+            {
+                return refused(
+                    "a reference is named with letters, digits and `/`, `_`, `-` and `.`",
+                );
+            }
+        }
+        DestinationClass::SharedExisting if !params.preflight_only => {
+            for limitation in kr_changeset::apply::limitations(DestinationClass::SharedExisting) {
+                if !params.acknowledged_limitations.contains(&limitation) {
+                    return refused(&format!(
+                        "a direct apply to a shared working tree acknowledges every limitation \
+                         of that destination, and this one is missing: {limitation}"
+                    ));
+                }
+            }
+        }
+        DestinationClass::Proposal | DestinationClass::SharedExisting => {}
+    }
+    Ok(())
+}
+
+/// Refuses a capture node whose parameters `changeset.capture` refuses on the request alone: an
+/// atomic snapshot is a capture of the base commit's own tree, so a policy that would include
+/// uncommitted work cannot be served one.
+fn capture_request_refusal(node_id: &str, params: &ChangesetCaptureParams) -> Result<()> {
+    if params.required_consistency.0 == Some(SourceConsistency::AtomicSnapshot) {
+        for (choice, what) in [
+            (params.policy.dirty_files, "uncommitted changes"),
+            (params.policy.untracked_files, "untracked files"),
+            (params.policy.generated_artefacts, "ignored files"),
+        ] {
+            if choice == InclusionChoice::Include {
+                return Err(AutomationError::InvalidArgument(format!(
+                    "node {node_id} requires an atomic snapshot and includes {what}, which are in \
+                     no Git object of the base commit"
+                )));
+            }
+        }
+    }
     Ok(())
 }
 

@@ -381,7 +381,7 @@ fn each_action_kind_takes_its_complete_typed_parameters() {
                 change_set_id: version.change_set_id,
                 version: version.version,
                 destination: DestinationClass::Proposal,
-                workspace_id: Nullable::null(),
+                workspace_id: Nullable::some(workspace_id),
                 expected_reference: Nullable::null(),
                 affected: Vec::new(),
                 paths: Vec::new(),
@@ -411,6 +411,127 @@ fn each_action_kind_takes_its_complete_typed_parameters() {
     for (kind, params) in &complete {
         validate_definition(&one_node_with(*kind, params.clone()), &grant)
             .unwrap_or_else(|error| panic!("{kind} takes {params}: {error}"));
+    }
+
+    // What a kind's method refuses on the request alone is refused at install too, and nothing
+    // the method would refuse only against the host's live state is.
+    let apply = |edit: &dyn Fn(&mut DiffApplyParams)| {
+        let mut params = DiffApplyParams {
+            change_set_id: version.change_set_id,
+            version: version.version,
+            destination: DestinationClass::Proposal,
+            workspace_id: Nullable::some(workspace_id),
+            expected_reference: Nullable::null(),
+            affected: Vec::new(),
+            paths: Vec::new(),
+            preflight_only: false,
+            acknowledged_limitations: Vec::new(),
+        };
+        edit(&mut params);
+        serde_json::to_value(params).expect("diff.apply's parameters")
+    };
+    let session = |edit: &dyn Fn(&mut SessionCreateParams)| {
+        let mut params: SessionCreateParams =
+            serde_json::from_value(complete[3].1.clone()).expect("the complete session parameters");
+        edit(&mut params);
+        serde_json::to_value(params).expect("session.create's parameters")
+    };
+    let capture = |edit: &dyn Fn(&mut ChangesetCaptureParams)| {
+        let mut params: ChangesetCaptureParams =
+            serde_json::from_value(complete[7].1.clone()).expect("the complete capture parameters");
+        edit(&mut params);
+        serde_json::to_value(params).expect("changeset.capture's parameters")
+    };
+    let accepted_by_the_method = [
+        (
+            WorkflowActionKind::ApplyDiff,
+            apply(&|params| {
+                params.destination = DestinationClass::VersionedReference;
+                params.expected_reference =
+                    Nullable::some(kr_protocol::changeset::ExpectedReference {
+                        name: "refs/heads/main".to_owned(),
+                        expected_old_value: Nullable::null(),
+                    });
+            }),
+        ),
+        (
+            WorkflowActionKind::ApplyDiff,
+            apply(&|params| {
+                params.destination = DestinationClass::SharedExisting;
+                params.acknowledged_limitations =
+                    kr_changeset::apply::limitations(DestinationClass::SharedExisting);
+            }),
+        ),
+        (
+            WorkflowActionKind::ApplyDiff,
+            apply(&|params| {
+                params.destination = DestinationClass::SharedExisting;
+                params.preflight_only = true;
+            }),
+        ),
+        (
+            WorkflowActionKind::CreateSession,
+            session(&|params| {
+                params.dimensions = Nullable::some(kr_protocol::session::Dimensions::new(120, 40));
+            }),
+        ),
+    ];
+    for (kind, params) in &accepted_by_the_method {
+        validate_definition(&one_node_with(*kind, params.clone()), &grant)
+            .unwrap_or_else(|error| panic!("{kind} takes {params}: {error}"));
+    }
+    let refused_by_the_method = [
+        (
+            WorkflowActionKind::ApplyDiff,
+            apply(&|params| params.workspace_id = Nullable::null()),
+            "workspace",
+        ),
+        (
+            WorkflowActionKind::ApplyDiff,
+            apply(&|params| params.destination = DestinationClass::VersionedReference),
+            "reference",
+        ),
+        (
+            WorkflowActionKind::ApplyDiff,
+            apply(&|params| {
+                params.destination = DestinationClass::VersionedReference;
+                params.expected_reference =
+                    Nullable::some(kr_protocol::changeset::ExpectedReference {
+                        name: "--upload-pack=true".to_owned(),
+                        expected_old_value: Nullable::null(),
+                    });
+            }),
+            "reference",
+        ),
+        (
+            WorkflowActionKind::ApplyDiff,
+            apply(&|params| params.destination = DestinationClass::SharedExisting),
+            "limitation",
+        ),
+        (
+            WorkflowActionKind::CreateSession,
+            session(&|params| {
+                params.dimensions = Nullable::some(kr_protocol::session::Dimensions::new(0, 40));
+            }),
+            "column",
+        ),
+        (
+            WorkflowActionKind::CaptureChangeset,
+            capture(&|params| {
+                params.required_consistency =
+                    Nullable::some(kr_protocol::changeset::SourceConsistency::AtomicSnapshot);
+            }),
+            "atomic snapshot",
+        ),
+    ];
+    for (kind, params, why) in &refused_by_the_method {
+        let error = validate_definition(&one_node_with(*kind, params.clone()), &grant)
+            .expect_err(&format!("{kind} does not take {params}"));
+        assert!(
+            matches!(error, kr_automation::AutomationError::InvalidArgument(_)),
+            "{kind}: {error}"
+        );
+        assert!(error.to_string().contains(why), "{kind}: {error}");
     }
 
     let refused: Vec<(WorkflowActionKind, serde_json::Value)> = vec![

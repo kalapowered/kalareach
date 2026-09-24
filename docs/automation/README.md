@@ -169,7 +169,13 @@ Install-time validation enforces:
   any other is refused when it is read.
 * **Typed parameters.** Each node carries exactly its kind's own typed parameters: every field the
   type has, no field it does not, identifiers that are identifiers, and every name non-empty and
-  within its bound. A node that would be refused when it ran is refused when it is installed.
+  within its bound. A kind whose parameters are a method's own is also held to every check that
+  method makes on the request alone: a session geometry the terminal cannot open at, an apply
+  with no workspace, a versioned reference with no expected value or a malformed name, a direct
+  apply to a shared working tree that has not acknowledged each of that destination's
+  limitations, or an atomic snapshot of a policy that includes uncommitted work is refused when
+  it is installed. What the method checks against the host's live state, such as whether a
+  version exists or a path is in it, is checked when the node runs.
 * **Typed outputs.** Each kind produces one output type, named by the kind, and a receipt holds
   that output and nothing else: identifiers and states the host observed, never text a node, a
   terminal or a model produced.
