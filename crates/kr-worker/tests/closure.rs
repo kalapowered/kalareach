@@ -390,10 +390,12 @@ const SEND_BUFFER: usize = 4 * 1024;
 #[cfg(unix)]
 const BATCH_BYTES: usize = 200 * 1024;
 
-/// How far apart two timers set to the same moment may end.
+/// The scheduling allowance between the worker's wait and a timer set to the same bound just after
+/// the wait took its own deadline.
 ///
-/// Their deadlines are microseconds apart and they wake the same task, so this is a little more
-/// than the timer's own tick and a scheduling moment.
+/// Their deadlines are microseconds apart and one task waits for both, so this covers the timer's
+/// own tick and a moment of scheduling with room to spare. It is an allowance measured against
+/// this suite's machines, not something the runtime promises.
 #[cfg(unix)]
 const TIMER_SLACK: Duration = Duration::from_millis(250);
 
@@ -430,9 +432,10 @@ async fn close(host: &Host) -> ClosureRecord {
 /// The transport each client holds is one this test sets, and each client stops part way through a
 /// frame far larger than it, so the notice queued behind that frame cannot be written until the
 /// client reads, on any platform. The wait is the one a worker makes before it exits, started
-/// here beside a timer set to the same bound from the same moment. So its start is known: it may
-/// not end before its bound, and it has to end when that timer fires, however busy the machine is,
-/// because the two wake together.
+/// here, so its start is known: it may not end before its bound, measured from before it began,
+/// and it is measured against a timer set to the same bound as soon as the wait has taken its own
+/// deadline, within a scheduling allowance. A machine busy enough to delay this test past both
+/// deadlines can hide a wait that ran a little long; it cannot fail a wait that kept its bound.
 ///
 /// Unix only, because the transport this sets is a Unix socket's buffer.
 #[cfg(unix)]
@@ -453,15 +456,26 @@ async fn a_client_that_stopped_reading_holds_the_worker_only_until_the_bound() {
     }
     let record = close(&host).await;
 
+    let wait = host.runtime.closure_delivered(CLOSURE_NOTICE_TIMEOUT);
+    tokio::pin!(wait);
     let started = tokio::time::Instant::now();
+    // The wait takes its deadline when it is first polled, and the timer is set just after that, so
+    // whatever holds up the wait's first steps holds up the timer's start as well.
+    let first =
+        std::future::poll_fn(|context| std::task::Poll::Ready(wait.as_mut().poll(context))).await;
+    assert!(
+        first.is_pending(),
+        "the wait did not end as it began: {first:?}"
+    );
+    let timer = tokio::time::sleep(CLOSURE_NOTICE_TIMEOUT);
     let ((delivered, waited), timed) = tokio::time::timeout(LIVENESS_DEADLINE, async {
         tokio::join!(
             async {
-                let delivered = host.runtime.closure_delivered(CLOSURE_NOTICE_TIMEOUT).await;
+                let delivered = wait.await;
                 (delivered, started.elapsed())
             },
             async {
-                tokio::time::sleep_until(started + CLOSURE_NOTICE_TIMEOUT).await;
+                timer.await;
                 started.elapsed()
             },
         )
@@ -476,12 +490,12 @@ async fn a_client_that_stopped_reading_holds_the_worker_only_until_the_bound() {
         waited >= CLOSURE_NOTICE_TIMEOUT,
         "the wait held for its bound of {CLOSURE_NOTICE_TIMEOUT:?}, and it ended after {waited:?}"
     );
-    // Both deadlines fall within a moment of each other and wake the one task that waits for both,
-    // so they end together whatever the machine is doing: a wait longer than its bound ends later.
+    // The two deadlines are microseconds apart and one task waits for both, so a wait that keeps
+    // its bound ends within a scheduling moment of the timer, and one with a longer bound later.
     assert!(
         waited.abs_diff(timed) < TIMER_SLACK,
-        "the wait ended when a timer set to its bound of {CLOSURE_NOTICE_TIMEOUT:?} fired: it \
-         ended after {waited:?}, and the timer after {timed:?}"
+        "the wait ended within {TIMER_SLACK:?} of a timer set to its bound of \
+         {CLOSURE_NOTICE_TIMEOUT:?}: it ended after {waited:?}, and the timer after {timed:?}"
     );
 
     let (output, sent) = until_the_closure(&mut resuming).await;

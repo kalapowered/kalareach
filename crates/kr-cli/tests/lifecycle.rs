@@ -2614,9 +2614,9 @@ const EXIT_ALLOWANCE: Duration = Duration::from_secs(2);
 ///
 /// The bound itself is measured in the worker's own closure tests
 /// (`crates/kr-worker/tests/closure.rs`, Unix only). They start the same wait the worker makes
-/// before it exits, so they know when it began: it holds for the whole bound, and it ends when a
-/// timer set to that bound from the same moment fires. This test keeps what only a real worker
-/// process shows: that it waits, and that it ends.
+/// before it exits, so they know when it began: it holds for the whole bound, and it ends within
+/// a scheduling allowance of a timer set to that bound as the wait began. This test keeps what
+/// only a real worker process shows: that it waits, and that it ends.
 const EXIT_LIMIT: Duration = Duration::from_secs(10);
 
 /// How closely the readings of `kr status` have to place the moment the session became closed for
