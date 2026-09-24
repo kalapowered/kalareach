@@ -222,6 +222,8 @@ pub enum CannotCheck {
     Unreadable,
     /// What it would authorise cannot be said in one line of the platform's prompt.
     CannotShow,
+    /// The value it shows is not a verification value.
+    Value,
 }
 
 /// Checks that what a challenge shows is what it would authorise, on the host it is for.
@@ -296,6 +298,11 @@ pub fn check(pending: &PendingConfirmation, host: &PairedHost) -> Result<Subject
             if request.destination_keys.as_ref() != Some(&candidate.keys) {
                 return Err(CannotCheck::Destination);
             }
+            // The value goes into the platform's own dialog as it is, so it has to be the value a
+            // host computes and nothing else.
+            if !is_verification_value(&candidate.verification_value) {
+                return Err(CannotCheck::Value);
+            }
             rights(&proposed_grant.actions)?;
             Ok(Subject::ConfirmDevice {
                 candidate: candidate.clone(),
@@ -331,52 +338,58 @@ pub fn check(pending: &PendingConfirmation, host: &PairedHost) -> Result<Subject
 
 /// The kinds of action a grant can let a device take, strongest first, as a prompt names them.
 ///
-/// Every right belongs to exactly one kind, and a prompt names every kind a grant holds, so an
-/// authority larger than viewing is never shown as viewing. Host management is the owner's and is
-/// named on its own.
-const KINDS: [(&str, &[ActionRight]); 9] = [
+/// Every right belongs to exactly one kind, and a prompt names every kind a grant holds, each in
+/// words that cover everything its rights allow, so no authority is shown as a smaller one. Host
+/// management is the owner's and is named on its own.
+const KINDS: [(&str, &[ActionRight]); 15] = [
     ("type in terminals", &[ActionRight::TerminalInput]),
     (
+        "install, enable, pause and run automations",
+        &[ActionRight::AutomationManage],
+    ),
+    (
+        "change files",
+        &[ActionRight::FilesUpload, ActionRight::FilesApplyDiff],
+    ),
+    (
         "direct agents",
+        &[ActionRight::AgentPrompt, ActionRight::AgentCancel],
+    ),
+    (
+        "answer agents' approval requests and questions",
         &[
-            ActionRight::AgentPrompt,
-            ActionRight::AgentCancel,
             ActionRight::AgentApprovalRespond,
             ActionRight::QuestionRespond,
         ],
     ),
+    ("share sessions with others", &[ActionRight::SessionShare]),
     (
-        "change files",
-        &[
-            ActionRight::FilesRead,
-            ActionRight::FilesUpload,
-            ActionRight::FilesApplyDiff,
-            ActionRight::ChangesetCreate,
-        ],
-    ),
-    ("run automations", &[ActionRight::AutomationManage]),
-    (
-        "manage projects",
-        &[ActionRight::ProjectCreate, ActionRight::WorkspaceManage],
+        "create projects from repositories",
+        &[ActionRight::ProjectCreate],
     ),
     (
-        "manage sessions",
+        "create and remove workspaces",
+        &[ActionRight::WorkspaceManage],
+    ),
+    (
+        "create, rename and close sessions",
         &[
             ActionRight::SessionCreate,
             ActionRight::SessionRename,
             ActionRight::SessionClose,
-            ActionRight::SessionShare,
         ],
     ),
+    ("capture change sets", &[ActionRight::ChangesetCreate]),
+    ("read files", &[ActionRight::FilesRead]),
     ("use voice", &[ActionRight::VoiceUse]),
     (
         "resize terminals",
         &[
             ActionRight::TerminalGeometry,
             ActionRight::TerminalGeometryTransfer,
-            ActionRight::TerminalPalette,
         ],
     ),
+    ("change terminal colours", &[ActionRight::TerminalPalette]),
     ("view sessions", &[ActionRight::SessionView]),
 ];
 
@@ -403,19 +416,33 @@ fn authority(rights: &kr_protocol::scalars::CanonicalSet<ActionRight>) -> Option
     })
 }
 
-/// How long a grant lasts, from `now_ms`, in words.
+/// How long a grant lasts, from `now_ms`, in words. Each unit is rounded up, so the words never
+/// say a grant ends sooner than it does: 71 hours is "for 3 days".
 fn duration(expiry: &GrantExpiry, now_ms: u64) -> String {
+    const MINUTE_MS: u64 = 60_000;
+    const HOUR_MS: u64 = 60 * MINUTE_MS;
+    const DAY_MS: u64 = 24 * HOUR_MS;
     let GrantExpiry::At { expires_at_ms } = expiry else {
         return "until it is revoked".to_owned();
     };
-    let minutes = expires_at_ms.get().saturating_sub(now_ms).div_ceil(60_000);
-    match minutes {
-        0 => "for no time at all".to_owned(),
-        1 => "for 1 minute".to_owned(),
-        2..=119 => format!("for {minutes} minutes"),
-        120..=2879 => format!("for {} hours", minutes / 60),
-        _ => format!("for {} days", minutes / (60 * 24)),
+    let left = expires_at_ms.get().saturating_sub(now_ms);
+    let minutes = left.div_ceil(MINUTE_MS);
+    let hours = left.div_ceil(HOUR_MS);
+    match (minutes, hours) {
+        (0, _) => "for no time at all".to_owned(),
+        (1, _) => "for 1 minute".to_owned(),
+        (2..=119, _) => format!("for {minutes} minutes"),
+        (_, ..=47) => format!("for {hours} hours"),
+        _ => format!("for {} days", left.div_ceil(DAY_MS)),
     }
+}
+
+/// True for a verification value as a host computes it: eight lower-case hexadecimal characters.
+fn is_verification_value(value: &str) -> bool {
+    value.len() == kr_protocol::pairing::VERIFICATION_VALUE_LEN
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// The first eight hexadecimal characters of a digest, grouped as a value is.
@@ -500,6 +527,17 @@ pub fn reason(subject: &Subject, host_name: &str, now_ms: u64) -> Result<String,
                 )
             }
         };
+        // Every part of the line is fixed text, a checked value or a name `shown` cleaned, so a
+        // character a dialog must not show here is a fault: no line is better than a wrong one.
+        if text
+            .chars()
+            .any(|character| character.is_control() || invisible(character))
+            || text
+                .chars()
+                .any(|character| character.is_whitespace() && character != ' ')
+        {
+            return Err(CannotCheck::CannotShow);
+        }
         if text.chars().count() <= MAX_REASON_CHARS {
             return Ok(text);
         }
@@ -789,13 +827,66 @@ mod tests {
         );
     }
 
-    /// Every right has words, so no right can be left out of a prompt for want of them.
+    /// Every right but the owner's belongs to exactly one kind, so no right can be left out of a
+    /// prompt for want of words, or be described twice.
     #[test]
     fn every_right_has_words() {
         for right in ActionRight::ALL {
+            let kinds = KINDS
+                .iter()
+                .filter(|(_, kind)| kind.contains(right))
+                .count();
+            let expected = usize::from(*right != ActionRight::HostManage);
+            assert_eq!(kinds, expected, "{right}");
             let rights = [*right].into_iter().collect::<CanonicalSet<_>>();
             assert!(authority(&rights).is_some(), "{right}");
         }
+    }
+
+    /// KR-REQ-10.06: a right on its own is named for everything it allows, never for less.
+    #[test]
+    fn each_right_is_named_for_what_it_allows() {
+        for (right, words) in [
+            (ActionRight::FilesRead, "read files"),
+            (ActionRight::FilesApplyDiff, "change files"),
+            (
+                ActionRight::AutomationManage,
+                "install, enable, pause and run automations",
+            ),
+            (ActionRight::TerminalPalette, "change terminal colours"),
+            (ActionRight::TerminalGeometry, "resize terminals"),
+            (ActionRight::SessionShare, "share sessions with others"),
+            (
+                ActionRight::AgentApprovalRespond,
+                "answer agents' approval requests and questions",
+            ),
+            (ActionRight::HostManage, "manage the host as an owner"),
+        ] {
+            let rights = [right].into_iter().collect::<CanonicalSet<_>>();
+            assert_eq!(authority(&rights).as_deref(), Some(words), "{right}");
+        }
+    }
+
+    /// KR-REQ-10.06: a grant's duration is rounded up in every unit, so the prompt never says it
+    /// ends sooner than it does.
+    #[test]
+    fn a_duration_is_never_shorter_than_the_grant() {
+        const MINUTE: u64 = 60_000;
+        const HOUR: u64 = 60 * MINUTE;
+        for (left, words) in [
+            (1, "for 1 minute"),
+            (61 * MINUTE, "for 61 minutes"),
+            (119 * MINUTE + 30_000, "for 2 hours"),
+            (24 * HOUR, "for 24 hours"),
+            (47 * HOUR + 30 * MINUTE, "for 2 days"),
+            (71 * HOUR, "for 3 days"),
+        ] {
+            let expiry = GrantExpiry::At {
+                expires_at_ms: TimestampMs::new(NOW + left),
+            };
+            assert_eq!(duration(&expiry, NOW), words, "{left} ms");
+        }
+        assert_eq!(duration(&GrantExpiry::Never, NOW), "until it is revoked");
     }
 
     /// KR-REQ-10.06: a dialog's line is one line whatever a candidate or a host calls itself: no
@@ -888,10 +979,12 @@ mod tests {
         }
     }
 
-    /// KR-REQ-10.06: a challenge whose authority no line of the prompt can show is never offered
-    /// to the ceremony, and nothing is signed or sent.
-    #[tokio::test]
-    async fn authority_no_line_can_show_is_not_offered_to_the_ceremony() {
+    /// A device confirmation for `shown` with `proposed`, as a host this device owns lists it, and
+    /// the service that reviews it.
+    fn listed_device(
+        shown: PairCandidateView,
+        proposed: ProposedGrant,
+    ) -> (OwnerConfirmations, Arc<Listing>) {
         let host_keys = DeviceKeys::generate().expect("keys").public_keys();
         let host = PairedHost {
             host_device_id: DeviceId::new(Uuid::from_bytes([1; 16])),
@@ -905,18 +998,11 @@ mod tests {
             name: Some("studio".to_owned()),
             paired_at_ms: NOW,
         };
-        let everything_but_the_host: Vec<ActionRight> = ActionRight::ALL
-            .iter()
-            .copied()
-            .filter(|right| *right != ActionRight::HostManage)
-            .collect();
-        let shown_candidate = candidate("Pixel 8");
-        let proposed = grant(&everything_but_the_host, an_hour());
         let request = OwnerConfirmationRequest {
             confirmation_id: ConfirmationId::new(Uuid::from_bytes([4; 16])),
             action: SensitiveAction::ConfirmDevice,
             action_digest: Digest256::from_bytes([5; 32]),
-            destination_keys: Nullable::some(shown_candidate.keys),
+            destination_keys: Nullable::some(shown.keys),
             destination_rights: proposed.actions.clone(),
             host_device_id: host.host_device_id,
             host_endpoint_id: host.host_endpoint_id,
@@ -928,7 +1014,7 @@ mod tests {
                 request,
                 display: ConfirmationDisplay::ConfirmDevice {
                     invitation_id: InvitationId::new(Uuid::from_bytes([7; 16])),
-                    candidate: shown_candidate,
+                    candidate: shown,
                     proposed_grant: proposed,
                 },
                 answered: false,
@@ -941,6 +1027,22 @@ mod tests {
             listing.clone(),
             Arc::new(Fixed(NOW)),
         );
+        (confirmations, listing)
+    }
+
+    /// KR-REQ-10.06: a challenge whose authority no line of the prompt can show is never offered
+    /// to the ceremony, and nothing is signed or sent.
+    #[tokio::test]
+    async fn authority_no_line_can_show_is_not_offered_to_the_ceremony() {
+        let everything_but_the_host: Vec<ActionRight> = ActionRight::ALL
+            .iter()
+            .copied()
+            .filter(|right| *right != ActionRight::HostManage)
+            .collect();
+        let (confirmations, listing) = listed_device(
+            candidate("Pixel 8"),
+            grant(&everything_but_the_host, an_hour()),
+        );
         let listed = confirmations.pending().await.expect("the listing");
         assert!(listed[0].subject.is_ok(), "the challenge itself checks");
         let asked = Asked(Mutex::new(Vec::new()));
@@ -950,5 +1052,39 @@ mod tests {
         );
         assert!(asked.0.lock().expect("the record").is_empty());
         assert_eq!(listing.completions.load(Ordering::SeqCst), 0);
+    }
+
+    /// KR-REQ-10.06: a device confirmation whose value is not a verification value as a host
+    /// computes it, eight lower-case hexadecimal characters, cannot be checked: it never reaches the
+    /// ceremony's dialog, and nothing is signed or sent.
+    #[tokio::test]
+    async fn a_value_that_is_not_a_verification_value_is_not_offered_to_the_ceremony() {
+        for value in [
+            "f3c1\n46f",
+            "f3c146f\u{202E}",
+            "f3c1 46fd",
+            "F3C146FD",
+            "f3c146fd0",
+            "",
+        ] {
+            let mut shown = candidate("Pixel 8");
+            shown.verification_value = value.to_owned();
+            let (confirmations, listing) =
+                listed_device(shown, grant(&[ActionRight::SessionView], an_hour()));
+            let listed = confirmations.pending().await.expect("the listing");
+            assert_eq!(
+                listed[0].subject.clone().err(),
+                Some(CannotCheck::Value),
+                "{value:?}"
+            );
+            let asked = Asked(Mutex::new(Vec::new()));
+            assert_eq!(
+                confirmations.review(&listed[0], &asked).await,
+                ReviewOutcome::CannotCheck,
+                "{value:?}"
+            );
+            assert!(asked.0.lock().expect("the record").is_empty(), "{value:?}");
+            assert_eq!(listing.completions.load(Ordering::SeqCst), 0, "{value:?}");
+        }
     }
 }
