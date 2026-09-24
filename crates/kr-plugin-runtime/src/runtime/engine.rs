@@ -623,4 +623,117 @@ mod tests {
         assert_eq!(first.compatibility(), second.compatibility());
         assert_eq!(first.target(), second.target());
     }
+
+    /// A module whose calls go through the two paths GHSA-m63x-6p34-q65x is about, in binary
+    /// form. `wasm-tools parse` and then `wasm-tools strip --all` turn this text into exactly
+    /// these bytes:
+    ///
+    /// ```text
+    /// (module
+    ///   (type $walk (func (param i32 i32)))
+    ///   (tag $thrown)
+    ///
+    ///   ;; `width` calls at each of `depth` levels, every one of them a `call_ref`.
+    ///   (func $through_call_ref (export "through-call-ref") (type $walk)
+    ///     (param $width i32) (param $depth i32)
+    ///     (local $left i32)
+    ///     (local.set $left (local.get $width))
+    ///     (if (local.get $depth)
+    ///       (then
+    ///         (local.set $depth (i32.sub (local.get $depth) (i32.const 1)))
+    ///         (loop $again
+    ///           (call_ref $walk
+    ///             (local.get $width) (local.get $depth) (ref.func $through_call_ref))
+    ///           (br_if $again (local.tee $left (i32.sub (local.get $left) (i32.const 1))))))))
+    ///
+    ///   ;; The same walk, with every call inside a `try_table` and every callee ending in a throw.
+    ///   (func $throwing (type $walk)
+    ///     (param $width i32) (param $depth i32)
+    ///     (local $left i32)
+    ///     (local.set $left (local.get $width))
+    ///     (if (local.get $depth)
+    ///       (then
+    ///         (local.set $depth (i32.sub (local.get $depth) (i32.const 1)))
+    ///         (loop $again
+    ///           (block $caught
+    ///             (try_table (catch $thrown $caught)
+    ///               (call $throwing (local.get $width) (local.get $depth))))
+    ///           (br_if $again (local.tee $left (i32.sub (local.get $left) (i32.const 1)))))))
+    ///     (throw $thrown))
+    ///
+    ///   (func (export "through-a-throw") (type $walk)
+    ///     (param $width i32) (param $depth i32)
+    ///     (block $caught
+    ///       (try_table (catch $thrown $caught)
+    ///         (call $throwing (local.get $width) (local.get $depth))))))
+    /// ```
+    const FUEL_PATHS: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x09, 0x02, 0x60, 0x02, 0x7f, 0x7f,
+        0x00, 0x60, 0x00, 0x00, 0x03, 0x04, 0x03, 0x00, 0x00, 0x00, 0x0d, 0x03, 0x01, 0x00, 0x01,
+        0x07, 0x26, 0x02, 0x10, 0x74, 0x68, 0x72, 0x6f, 0x75, 0x67, 0x68, 0x2d, 0x63, 0x61, 0x6c,
+        0x6c, 0x2d, 0x72, 0x65, 0x66, 0x00, 0x00, 0x0f, 0x74, 0x68, 0x72, 0x6f, 0x75, 0x67, 0x68,
+        0x2d, 0x61, 0x2d, 0x74, 0x68, 0x72, 0x6f, 0x77, 0x00, 0x02, 0x0a, 0x70, 0x03, 0x28, 0x01,
+        0x01, 0x7f, 0x20, 0x00, 0x21, 0x02, 0x20, 0x01, 0x04, 0x40, 0x20, 0x01, 0x41, 0x01, 0x6b,
+        0x21, 0x01, 0x03, 0x40, 0x20, 0x00, 0x20, 0x01, 0xd2, 0x00, 0x14, 0x00, 0x20, 0x02, 0x41,
+        0x01, 0x6b, 0x22, 0x02, 0x0d, 0x00, 0x0b, 0x0b, 0x0b, 0x32, 0x01, 0x01, 0x7f, 0x20, 0x00,
+        0x21, 0x02, 0x20, 0x01, 0x04, 0x40, 0x20, 0x01, 0x41, 0x01, 0x6b, 0x21, 0x01, 0x03, 0x40,
+        0x02, 0x40, 0x1f, 0x40, 0x01, 0x00, 0x00, 0x00, 0x20, 0x00, 0x20, 0x01, 0x10, 0x01, 0x0b,
+        0x0b, 0x20, 0x02, 0x41, 0x01, 0x6b, 0x22, 0x02, 0x0d, 0x00, 0x0b, 0x0b, 0x08, 0x00, 0x0b,
+        0x12, 0x00, 0x02, 0x40, 0x1f, 0x40, 0x01, 0x00, 0x00, 0x00, 0x20, 0x00, 0x20, 0x01, 0x10,
+        0x01, 0x0b, 0x0b, 0x0b,
+    ];
+
+    /// Fuel is charged for what a callee does, however the call reached it and however it came
+    /// back. Wasmtime before 48.0.3 lost what a callee spent when the call was a `call_ref`, or
+    /// when the callee came back to a `try_table` by a throw (GHSA-m63x-6p34-q65x). With fuel and
+    /// Cranelift both on, as this engine has them, a component could then do exponential work on
+    /// linear fuel, and fuel would no longer be the ceiling that holds while the epoch thread is
+    /// late.
+    ///
+    /// Each walk makes more than a hundred thousand calls, which costs many times the 10,000 units
+    /// it is given, so it has to end by running out of fuel. On an engine with the defect it
+    /// returns instead, charged for a hundred units or fewer.
+    #[test]
+    fn fuel_charges_a_callee_reached_by_call_ref_or_left_by_a_throw() {
+        const FUEL: u64 = 10_000;
+        let engine = RuntimeEngine::new().expect("an engine");
+        let module = wasmtime::Module::new(engine.engine(), FUEL_PATHS).expect("the module");
+        // Both walks run whatever the first one did, so a failure names every path that lost fuel.
+        let failures: Vec<String> = ["through-call-ref", "through-a-throw"]
+            .into_iter()
+            .filter_map(|walk| {
+                let mut store = wasmtime::Store::new(engine.engine(), ());
+                store.set_fuel(FUEL).expect("the fuel");
+                // Ten seconds of epoch, far more than either walk needs: what ends a walk here is
+                // its fuel, and an engine that lets one run on is still stopped.
+                store.set_epoch_deadline(10_000);
+                let instance =
+                    wasmtime::Instance::new(&mut store, &module, &[]).expect("an instance");
+                let run = instance
+                    .get_typed_func::<(i32, i32), ()>(&mut store, walk)
+                    .expect("the walk");
+                let outcome = {
+                    let _in_flight = engine.in_flight();
+                    run.call(&mut store, (10, 5))
+                };
+                let spent = FUEL - store.get_fuel().expect("the fuel left");
+                match outcome {
+                    Ok(()) => Some(format!(
+                        "{walk} returned after more than a hundred thousand calls, charged {spent} \
+                         of {FUEL} units"
+                    )),
+                    Err(error)
+                        if error.downcast_ref::<wasmtime::Trap>()
+                            == Some(&wasmtime::Trap::OutOfFuel) =>
+                    {
+                        None
+                    }
+                    Err(error) => Some(format!(
+                        "{walk} ended with {error:?} rather than by running out of fuel"
+                    )),
+                }
+            })
+            .collect();
+        assert!(failures.is_empty(), "{}", failures.join("; "));
+    }
 }
