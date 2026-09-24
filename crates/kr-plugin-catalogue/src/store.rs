@@ -1890,9 +1890,23 @@ fn flush_directory(directory: &Area) -> CatalogueResult<()> {
         });
     }
     #[cfg(unix)]
-    rustix::fs::fsync(&directory.dir).map_err(|source| {
-        CatalogueError::storage(&directory.path, &std::io::Error::from(source))
-    })?;
+    {
+        use rustix::fs::{Mode, OFlags};
+        let failed = |source: rustix::io::Errno| {
+            CatalogueError::storage(&directory.path, &std::io::Error::from(source))
+        };
+        // The handle is opened for finding names, which on Linux is a descriptor that cannot be
+        // flushed, so the directory is opened for reading through it first. `.` is the directory
+        // the handle holds, whatever its name reaches by now.
+        let readable = rustix::fs::openat(
+            &directory.dir,
+            ".",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(failed)?;
+        rustix::fs::fsync(&readable).map_err(failed)?;
+    }
     #[cfg(not(unix))]
     let _ = directory;
     Ok(())
