@@ -1018,23 +1018,29 @@ mod platform {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod platform {
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
 
-    fn look<T>(pid: u32, read: impl FnOnce(&sysinfo::Process) -> T) -> Option<T> {
+    /// Reads one process, asking for what `kind` names beyond what every reading carries.
+    fn look<T>(
+        pid: u32,
+        kind: ProcessRefreshKind,
+        read: impl FnOnce(&sysinfo::Process) -> T,
+    ) -> Option<T> {
         let mut system = sysinfo::System::new();
         let target = sysinfo::Pid::from_u32(pid);
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&[target]),
-            true,
-            ProcessRefreshKind::nothing(),
-        );
+        system.refresh_processes_specifics(ProcessesToUpdate::Some(&[target]), true, kind);
         system.process(target).map(read)
     }
 
+    /// Returns the executable one process is running.
+    ///
+    /// A reading carries a process's executable only when it is asked for, so this asks.
     pub(super) fn executable(pid: u32) -> Option<String> {
-        look(pid, |process| {
-            process.exe().map(|path| path.display().to_string())
-        })
+        look(
+            pid,
+            ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+            |process| process.exe().map(|path| path.display().to_string()),
+        )
         .flatten()
     }
 
@@ -1051,10 +1057,12 @@ mod platform {
     /// This platform has neither process groups nor controlling terminals: a session's boundary
     /// here is its job object.
     pub(super) fn placement(pid: u32) -> Result<super::Placement, String> {
-        look(pid, |process| super::Placement {
-            parent: process.parent().map_or(0, sysinfo::Pid::as_u32),
-            group: None,
-            terminal: None,
+        look(pid, ProcessRefreshKind::nothing(), |process| {
+            super::Placement {
+                parent: process.parent().map_or(0, sysinfo::Pid::as_u32),
+                group: None,
+                terminal: None,
+            }
         })
         .ok_or_else(|| format!("process {pid} is not in the process table"))
     }
