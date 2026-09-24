@@ -2668,3 +2668,468 @@ async fn a_workflow_chain_inherits_the_session_number_the_host_admits_when_it_be
 
     host.clients.abort();
 }
+
+// ---- KR-ACC-032 across a real daemon process restart --------------------------------------------
+
+/// A daemon this test started as a process of its own, ended when the test lets go of it.
+#[cfg(unix)]
+struct DaemonProcess(Option<std::process::Child>);
+
+#[cfg(unix)]
+impl DaemonProcess {
+    /// Starts the copied daemon on this test's own directories, with no worker program.
+    fn start(program: &Path, temp: &kr_ipc::testing::TempHost) -> Self {
+        // A bounded retry for one race only: a child another test in this binary forks holds a
+        // copy of the descriptor this copy of the daemon was written through, and the platform
+        // refuses to execute a file open for writing until that child reaches its own exec.
+        for attempt in 1..=100 {
+            let log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(temp.root().join("daemon.log"))
+                .expect("opens the daemon's log");
+            let started = std::process::Command::new(program)
+                .current_dir(temp.root())
+                .arg("--runtime-dir")
+                .arg(temp.root().join("r"))
+                .arg("--state-dir")
+                .arg(temp.root().join("s"))
+                .arg("--worker")
+                .arg(temp.root().join("no-such-worker"))
+                .arg("--secret-store")
+                .arg("file")
+                .stdin(std::process::Stdio::null())
+                .stdout(log.try_clone().expect("duplicates the log"))
+                .stderr(log)
+                .spawn();
+            match started {
+                Ok(child) => return Self(Some(child)),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 100 =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("the daemon starts: {error:?}"),
+            }
+        }
+        unreachable!("the loop returns or panics")
+    }
+
+    fn pid(&self) -> rustix::process::Pid {
+        let child = self.0.as_ref().expect("the daemon is running");
+        rustix::process::Pid::from_raw(i32::try_from(child.id()).expect("a process identifier"))
+            .expect("a process identifier")
+    }
+
+    /// Ends it now, as a crash or a power cut would, without giving it a chance to tidy up.
+    fn kill(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DaemonProcess {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Waits for a daemon process to answer on its control endpoint.
+#[cfg(unix)]
+async fn answering(
+    endpoint: &kr_ipc::paths::Endpoint,
+    temp: &kr_ipc::testing::TempHost,
+) -> LocalClient {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        if let Ok(client) = LocalClient::connect(endpoint, LocalClientKind::Cli, build()).await {
+            return client;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon did not answer within two minutes, and its log says: {}",
+            std::fs::read_to_string(temp.root().join("daemon.log"))
+                .unwrap_or_else(|error| format!("<unreadable: {error}>"))
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Writes one live grant into the registry of a daemon running as a process, as a person sharing
+/// work would have had it written.
+#[cfg(unix)]
+fn grant_in_registry(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    environment_id: EnvironmentId,
+    grant_id: GrantId,
+    rights: &[ActionRight],
+) {
+    let device_id = kr_protocol::ids::DeviceId::new(environment_id.get());
+    // The revision the host is at, as a grant it issued now would carry.
+    let registry = rusqlite::Connection::open_with_flags(
+        environment.registry_database(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("opens the registry");
+    registry
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    let revision: i64 = registry
+        .query_row("SELECT authority_revision FROM environment", [], |row| {
+            row.get(0)
+        })
+        .expect("the host's authority revision");
+    drop(registry);
+    let record = GrantRecord {
+        grant: Grant {
+            grant_id,
+            parent_grant_id: Nullable::null(),
+            issuer_device_id: device_id,
+            recipient_device_id: device_id,
+            authority_revision: AuthorityRevision::new(
+                u64::try_from(revision).expect("a revision"),
+            ),
+            environment_selector: EnvironmentSelector::Any,
+            session_selector: SessionSelector::Any,
+            actions: rights.iter().copied().collect(),
+            history: HistoryScope {
+                lower_bound_ms: Nullable::null(),
+                include_live_screen: false,
+                named_questions: CanonicalSet::new(),
+                named_approvals: CanonicalSet::new(),
+            },
+            expiry: GrantExpiry::Never,
+            organisation: Nullable::null(),
+        },
+        session_id: None,
+        issued_at_ms: 1_000,
+        activated_at_ms: Some(1_000),
+        revoked_at_ms: None,
+        revoked_by_parent: None,
+    };
+    // The daemon writes the same database, so a write that meets its lock waits and tries again.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let written =
+            kr_controller::grants::store::GrantDirectory::open(environment.registry_database())
+                .and_then(|directory| directory.issue(&record, || Ok(())));
+        match written {
+            Ok(()) => return,
+            Err(error) if std::time::Instant::now() < deadline => {
+                let _ = error;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(error) => panic!("the grant is written: {error}"),
+        }
+    }
+}
+
+/// How far one chain has got, read from the workflow journal: the runs of it that completed, and
+/// the nodes of it whose action is under way. `None` when the journal could not be read just now.
+#[cfg(unix)]
+fn chain_progress(journal: &Path, root: kr_protocol::ids::CausalRootId) -> Option<(i64, i64)> {
+    let connection =
+        rusqlite::Connection::open_with_flags(journal, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    let completed = connection
+        .query_row(
+            "SELECT COUNT(*) FROM workflow_runs WHERE causal_root_id = ?1 AND status = ?2",
+            rusqlite::params![root.to_string(), WorkflowRunStatus::Completed.as_str()],
+            |row| row.get(0),
+        )
+        .ok()?;
+    let under_way = connection
+        .query_row(
+            "SELECT COUNT(*) FROM node_receipts n JOIN workflow_runs r ON n.run_id = r.run_id
+             WHERE r.causal_root_id = ?1 AND n.status = ?2",
+            rusqlite::params![root.to_string(), NodeStatus::Running.as_str()],
+            |row| row.get(0),
+        )
+        .ok()?;
+    Some((completed, under_way))
+}
+
+/// Ends the daemon process once at least `completed` runs of the chain have completed, at a moment
+/// no action of the chain is under way: the process is frozen, the journal read, and the process
+/// killed if nothing was dispatched, or let go on and asked again if something was. A run killed
+/// between two of its nodes is taken up by the next daemon; one killed during an action is not
+/// known to have happened, which would end the chain rather than test its budget.
+#[cfg(unix)]
+async fn end_between_actions(
+    daemon: &mut DaemonProcess,
+    journal: &Path,
+    root: kr_protocol::ids::CausalRootId,
+    completed: i64,
+) -> i64 {
+    let pid = daemon.pid();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the chain reached {completed} runs between two actions within two minutes"
+        );
+        rustix::process::kill_process(pid, rustix::process::Signal::STOP)
+            .expect("the daemon can be frozen");
+        match chain_progress(journal, root) {
+            Some((done, 0)) if done >= completed => {
+                daemon.kill();
+                return done;
+            }
+            _ => {
+                rustix::process::kill_process(pid, rustix::process::Signal::CONT)
+                    .expect("the daemon can be let go on");
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+    }
+}
+
+/// KR-ACC-032 and KR-REQ-24.10 across a real restart of the daemon's process, not a reopened
+/// service. Two workflows, each a single node and neither cyclic on its own, trigger one another:
+/// a capture's success triggers a materialisation of a version, and a materialisation's success
+/// triggers a capture. The chain they make starts under one root the host mints. The daemon's
+/// process is killed part way through the chain, and a new process on the same state goes on with
+/// the same chain and the same budget, whose count the first process had spent part of, until the
+/// depth ceiling refuses the next descendant: one chain, one budget, exhausted once, with one
+/// attention item.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mutually_triggering_workflows_exhaust_one_budget_across_a_daemon_process_restart() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let program = temp.root().join("kr-controller");
+    kr_ipc::testing::place_program(Path::new(env!("CARGO_BIN_EXE_kr-controller")), &program);
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let work = tempfile::TempDir::new().expect("a working directory on the internal disk");
+    let journal = environment
+        .state_dir()
+        .join(kr_automation::store::WORKFLOW_DB_NAME);
+
+    let mut first = DaemonProcess::start(&program, &temp);
+    let mut control = answering(&endpoint, &temp).await;
+    let grant = grant_id(40);
+    grant_in_registry(
+        &environment,
+        environment_id,
+        grant,
+        &[ActionRight::ChangesetCreate, ActionRight::WorkspaceManage],
+    );
+    let workspace = adopted_workspace(&mut control, environment_id, work.path()).await;
+
+    // The version every materialisation in the chain copies, captured directly rather than by a
+    // workflow, so it triggers nothing.
+    let seed_params: ChangesetCaptureParams =
+        serde_json::from_str(&capture_node(workspace).action_params).expect("the parameters");
+    let seed: kr_protocol::changeset::ChangesetCaptureResult = typed(
+        &control
+            .mutate(
+                Method::ChangesetCapture,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(environment_id),
+                &seed_params,
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("changeset.capture succeeds"),
+    );
+
+    let mut captures = definition(
+        workflow_id(40),
+        grant,
+        "capture after a materialisation",
+        capture_node(workspace),
+    );
+    captures.trigger.event_type = "changeset.materialized".to_owned();
+    captures.explicit_recurrence = true;
+    let mut materialises = definition(
+        workflow_id(41),
+        grant,
+        "materialise after a capture",
+        WorkflowNode {
+            node_id: "materialise".to_owned(),
+            action_kind: WorkflowActionKind::MaterializeChangeset,
+            action_params: serde_json::to_string(
+                &kr_protocol::changeset::ChangesetMaterializeParams {
+                    change_set_id: seed.version.change_set_id,
+                    version: seed.version.version,
+                    purpose: kr_protocol::changeset::MaterialisationPurpose::Test,
+                    label: "the chain's copy".to_owned(),
+                },
+            )
+            .expect("the parameters"),
+            declared_environment: Nullable::null(),
+        },
+    );
+    materialises.trigger.event_type = "changeset.captured".to_owned();
+    materialises.explicit_recurrence = true;
+    for document in [&captures, &materialises] {
+        typed::<WorkflowInstallResult>(
+            &control
+                .mutate(
+                    Method::WorkflowInstall,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    ActionTarget::environment(environment_id),
+                    &WorkflowInstallParams {
+                        workflow_id: document.workflow_id,
+                        revision: document.revision,
+                        definition: document.clone(),
+                        grant_reference: document.grant_reference,
+                    },
+                )
+                .await
+                .expect("the call reaches the daemon")
+                .expect("workflow.install succeeds"),
+        );
+        typed::<WorkflowEnableResult>(
+            &control
+                .mutate(
+                    Method::WorkflowEnable,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    ActionTarget::environment(environment_id),
+                    &WorkflowEnableParams {
+                        workflow_id: document.workflow_id,
+                        revision: document.revision,
+                    },
+                )
+                .await
+                .expect("the call reaches the daemon")
+                .expect("workflow.enable succeeds"),
+        );
+    }
+
+    // The external trigger: the host mints the root.
+    let root_run: WorkflowRunResult = typed(
+        &control
+            .mutate(
+                Method::WorkflowRun,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(environment_id),
+                &WorkflowRunParams {
+                    workflow_id: captures.workflow_id,
+                    revision: captures.revision,
+                    event_id: "evt-acc-032".to_owned(),
+                    event_type: "manual".to_owned(),
+                    event_payload: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("workflow.run succeeds"),
+    );
+    assert_eq!(
+        root_run.status,
+        WorkflowRunStatus::Completed,
+        "{root_run:?}"
+    );
+    let root = root_run.causal_root_id;
+
+    // The first process goes on with the chain on its own, and is killed part way through it.
+    drop(control);
+    let before = end_between_actions(&mut first, &journal, root, 3).await;
+    let depth_limit =
+        i64::try_from(kr_protocol::automation::DEFAULT_CAUSAL_DEPTH_LIMIT).expect("a small limit");
+    assert!(
+        before < depth_limit,
+        "the restart came part way through the chain: {before} runs before it"
+    );
+
+    // A new process on the same state goes on with the same chain.
+    let _second = DaemonProcess::start(&program, &temp);
+    let mut control = answering(&endpoint, &temp).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let read = loop {
+        let read: WorkflowReadResult = typed(
+            &control
+                .request(
+                    Method::WorkflowRead,
+                    &WorkflowReadParams {
+                        workflow_id: Nullable::null(),
+                        revision: Nullable::null(),
+                        run_id: Nullable::null(),
+                        causal_root_id: Nullable::some(root),
+                    },
+                )
+                .await
+                .expect("the call reaches the daemon")
+                .expect("workflow.read succeeds"),
+        );
+        if read
+            .remaining_causal_budget
+            .0
+            .as_ref()
+            .is_some_and(|budget| budget.exhausted)
+        {
+            break read;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the chain exhausted its budget within two minutes of the restart: {read:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+
+    let budget = read.remaining_causal_budget.0.expect("the chain's budget");
+    assert!(budget.paused, "{budget:?}");
+    let chain: Vec<&kr_protocol::automation::WorkflowRunSummary> = read
+        .runs
+        .iter()
+        .filter(|run| run.causal_root_id == root)
+        .collect();
+    let mut depths: Vec<u64> = chain.iter().map(|run| run.depth.get()).collect();
+    depths.sort_unstable();
+    let limit = kr_protocol::automation::DEFAULT_CAUSAL_DEPTH_LIMIT;
+    assert_eq!(
+        depths,
+        (1..=limit).collect::<Vec<_>>(),
+        "one run at every depth to the ceiling and none past it"
+    );
+    assert!(
+        chain
+            .iter()
+            .all(|run| run.status == WorkflowRunStatus::Completed),
+        "{chain:?}"
+    );
+    assert_eq!(
+        budget.total_runs.get(),
+        limit,
+        "the second process spent the budget the first one had begun"
+    );
+    assert!(
+        i64::try_from(limit).expect("a small limit") > before,
+        "the second process ran part of the chain"
+    );
+
+    // One attention item for the exhausted chain.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let inbox: kr_protocol::attention::AttentionReadResult = typed(
+            &control
+                .request(
+                    Method::AttentionRead,
+                    &kr_protocol::attention::AttentionReadParams {
+                        session_id: Nullable::null(),
+                        include_acknowledged: true,
+                        max_items: U64::new(50),
+                        after: Nullable::null(),
+                    },
+                )
+                .await
+                .expect("the call reaches the daemon")
+                .expect("attention.read succeeds"),
+        );
+        if !inbox.items.is_empty() {
+            assert_eq!(inbox.items.len(), 1, "{:?}", inbox.items);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the exhausted chain raised its attention item within a minute"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
