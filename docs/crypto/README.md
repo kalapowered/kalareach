@@ -396,11 +396,14 @@ The recovery recipient is an ordinary stored-envelope `crypto_box` recipient. It
 purpose: what makes it different is that it is derived from the seed rather than generated on a
 device.
 
-What the seed opens is archives, and only archives: it is never a settings collection's key, and
-no collection key is inside anything it opens. A restore from the seed returns a device's settings
-and its data. It does not return a collection key, a key record, a membership or a device key, so
-the restored device joins its settings collection as a new device does, once the owner has paired
-it again and a member has authorised it.
+The seed opens the recovery bundle and the recovery-enabled archives, and it is never a settings
+collection's key. The archive layer carries opaque bytes, so what keeps a collection key out of
+what the seed opens is the paths that fill an archive: the table refuses a collection key in every
+backup and every restore, and the settings paths in `kr_client::recovery` carry the settings object
+and nothing else. A restore from the seed returns a device's settings and its data. It does not
+return a collection key, a key record, a membership or a device key, so the restored device joins
+its settings collection as a new device does, once the owner has paired it again and a member has
+authorised it.
 
 The seed's checksum is the first four bytes of its SHA-256, so a mistyped recovery kit fails before
 anything is decrypted.
