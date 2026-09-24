@@ -68,9 +68,8 @@ pub type Answer<T> = std::result::Result<T, ProtocolError>;
 struct Daemon {
     /// The daemon, once it is bound.
     bound: std::sync::OnceLock<Weak<Controller>>,
-    /// The reading of UTC automation's clock last took from the daemon, when that reading was
-    /// ahead of the clock's own count, and the continuous instant it was taken at.
-    anchor: std::sync::Mutex<Option<(u64, kr_transport::clock::ContinuousInstant)>>,
+    /// Where automation's clock counts from, once it has taken a reading.
+    anchor: std::sync::Mutex<Option<Anchor>>,
 }
 
 impl Daemon {
@@ -90,15 +89,10 @@ impl Daemon {
         })
     }
 
-    /// This host's reading of UTC for automation, which never runs slower than time does.
-    ///
-    /// It is the later of two readings: the daemon's own reading of UTC, which is the later of the
-    /// wall clock and its clock floor, and the last such reading this clock took advanced by the
-    /// time the suspend-aware continuous clock has counted since. A wall clock wound back
-    /// therefore neither moves it backwards nor stops it: a run's deadline and an action's wait
-    /// keep running through the hour a clock was set back by, and through a suspension. A wall
-    /// clock that moves forwards is followed. The wall clock alone before the daemon is bound and
-    /// after it has gone.
+    /// This host's reading of UTC for automation: the daemon's own reading, which is the later of
+    /// the wall clock and its clock floor, counted on by the suspend-aware continuous clock while
+    /// that reading is held back. See [`reading_at`]. The wall clock alone before the daemon is
+    /// bound and after it has gone.
     fn now_ms(&self) -> u64 {
         let Ok(daemon) = self.get() else {
             return kr_ipc::now_ms().get();
@@ -113,29 +107,89 @@ impl Daemon {
     }
 }
 
+/// How far the daemon's reading of UTC may fall behind automation's count and still be followed.
+///
+/// A wall clock set back by less than this holds automation's clock still for at most this long;
+/// one set back by more is counted past, so it holds nothing still for longer.
+const FOLLOW_WITHIN_MS: u64 = 1_000;
+
+/// Where automation's clock counts from.
+#[derive(Clone, Copy, Debug)]
+struct Anchor {
+    /// The reading the count starts from.
+    ms: u64,
+    /// The continuous instant that reading was taken at.
+    at: kr_transport::clock::ContinuousInstant,
+    /// The last reading given, which no later one is below.
+    last: u64,
+}
+
 /// Automation's reading of UTC, from the daemon's reading `settled` taken at the continuous
-/// instant `at` and the anchor the last reading kept: the later of `settled` and the anchor
-/// advanced by the continuous time counted since it. Answers the reading and the anchor to keep,
-/// which moves only when the daemon's reading is ahead, so no rounding of the count adds up.
+/// instant `at`, and the anchor to keep.
+///
+/// While the daemon's reading keeps pace with the continuous count, or runs ahead of it, it is the
+/// reading: a wall clock running on time or set forward is followed exactly, and a slow drift
+/// between the two clocks never adds up. When the daemon's reading falls behind the count by more
+/// than [`FOLLOW_WITHIN_MS`], which is a wall clock set back and held at the clock floor, the count
+/// is the reading, taken from the last reading the daemon's clock was followed at: a run's deadline
+/// and an action's wait keep running through the hour a clock was set back by, and through a
+/// suspension. The reading never goes backwards, and the anchor moves only when the daemon's
+/// reading does, so no rounding of the count adds up either.
 fn reading_at(
-    anchor: Option<(u64, kr_transport::clock::ContinuousInstant)>,
+    anchor: Option<Anchor>,
     settled: u64,
     at: kr_transport::clock::ContinuousInstant,
-) -> (u64, (u64, kr_transport::clock::ContinuousInstant)) {
-    if let Some((anchored_ms, anchored_at)) = anchor {
-        let counted = u64::try_from(at.saturating_duration_since(anchored_at).as_millis())
-            .unwrap_or(u64::MAX);
-        let advanced = anchored_ms.saturating_add(counted);
-        if advanced > settled {
-            return (advanced, (anchored_ms, anchored_at));
+) -> (u64, Anchor) {
+    let Some(anchor) = anchor else {
+        return (
+            settled,
+            Anchor {
+                ms: settled,
+                at,
+                last: settled,
+            },
+        );
+    };
+    let counted = anchor.ms.saturating_add(
+        u64::try_from(at.saturating_duration_since(anchor.at).as_millis()).unwrap_or(u64::MAX),
+    );
+    if settled.saturating_add(FOLLOW_WITHIN_MS) >= counted {
+        let now = settled.max(anchor.last);
+        if settled > anchor.ms {
+            // It moved, in step with the count: the count starts again from here.
+            return (
+                now,
+                Anchor {
+                    ms: now,
+                    at,
+                    last: now,
+                },
+            );
         }
+        // It has not moved: the count goes on from the anchor, and takes over once it is ahead
+        // by more than the daemon's reading is followed within.
+        return (
+            now,
+            Anchor {
+                last: now,
+                ..anchor
+            },
+        );
     }
-    (settled, (settled, at))
+    let now = counted.max(anchor.last);
+    (
+        now,
+        Anchor {
+            last: now,
+            ..anchor
+        },
+    )
 }
 
 /// The clock a workflow's deadlines, its action waits and its chain's lifetime are measured on:
-/// the daemon's own reading of UTC, advanced by the continuous clock whenever that is further on,
-/// so a wall clock wound back neither moves it backwards nor holds it still.
+/// the daemon's own reading of UTC, counted on by the continuous clock while a wall clock set back
+/// holds that reading at its floor, so it never moves backwards and a clock set back cannot stop
+/// a deadline.
 #[derive(Debug)]
 struct DaemonClock(Arc<Daemon>);
 
@@ -1110,31 +1164,67 @@ fn encode<T: serde::Serialize>(value: &T) -> Answer<ParamsValue> {
 mod tests {
     use super::*;
 
-    /// Automation's clock counts on through a wall clock wound back, which the daemon's own
-    /// reading holds at its floor, and follows a wall clock that moves ahead.
+    /// Automation's clock follows the daemon's reading of UTC while it keeps pace, counts on
+    /// through a wall clock set back an hour, which the daemon's reading holds at its floor, and
+    /// never goes backwards.
     #[test]
     fn automation_time_runs_on_through_a_wall_clock_wound_back() {
         use kr_transport::clock::ContinuousClock;
         let continuous = kr_transport::clock::ManualClock::new();
-        let (first, anchor) = reading_at(None, 10_000, continuous.now());
-        assert_eq!(first, 10_000, "the first reading is the daemon's");
+        let step = std::time::Duration::from_millis(250);
+        let mut anchor = None;
+        let mut read = |settled: u64| {
+            let (now, kept) = reading_at(anchor, settled, continuous.now());
+            anchor = Some(kept);
+            now
+        };
+        let mut wall = 10_000;
+        assert_eq!(read(wall), 10_000, "the first reading is the daemon's");
 
-        // The wall clock is wound back an hour, so the daemon's reading stays at its floor while
-        // a minute passes.
-        continuous.advance(std::time::Duration::from_secs(60));
-        let (held, anchor) = reading_at(Some(anchor), 10_000, continuous.now());
-        assert_eq!(held, 70_000, "the minute counts");
-        continuous.advance(std::time::Duration::from_millis(400));
-        let (on, anchor) = reading_at(Some(anchor), 10_000, continuous.now());
-        assert_eq!(on, 70_400, "and so does every part of the next one");
+        // In step: the daemon's reading is followed exactly, a little drift included.
+        for _ in 0..8 {
+            continuous.advance(step);
+            wall += 249;
+            assert_eq!(read(wall), wall);
+        }
+        let before = wall;
 
-        // A wall clock set ahead is followed, and the count goes on from it.
-        continuous.advance(std::time::Duration::from_secs(1));
-        let (ahead, anchor) = reading_at(Some(anchor), 500_000, continuous.now());
-        assert_eq!(ahead, 500_000);
-        continuous.advance(std::time::Duration::from_secs(2));
-        let (after, _) = reading_at(Some(anchor), 400_000, continuous.now());
-        assert_eq!(after, 502_000, "never backwards");
+        // The wall clock is set back an hour, so the daemon's reading stays at its floor. After at
+        // most a second held still, the count takes over, with the time held still in it.
+        let mut last = before;
+        let mut held = 0;
+        for _ in 0..240 {
+            continuous.advance(step);
+            let now = read(before);
+            assert!(now >= last, "never backwards");
+            if now == before {
+                held += 250;
+            }
+            last = now;
+        }
+        assert!(held <= FOLLOW_WITHIN_MS, "held still for {held} ms");
+        assert_eq!(last, before + 60_000, "the minute counted in full");
+
+        // The wall clock, an hour behind, moves again beneath the floor: the count goes on.
+        continuous.advance(step);
+        assert_eq!(read(before), before + 60_250);
+
+        // A wall clock set forward past the count is followed, and in step again from there.
+        continuous.advance(step);
+        assert_eq!(read(900_000), 900_000);
+        continuous.advance(step);
+        assert_eq!(read(900_250), 900_250);
+
+        // A wall clock set back by less than the follow margin holds the reading still, and
+        // briefly.
+        continuous.advance(step);
+        assert_eq!(read(900_000), 900_250, "held at the last reading");
+        continuous.advance(std::time::Duration::from_millis(600));
+        assert_eq!(
+            read(900_600),
+            900_600,
+            "followed again once it moves past it"
+        );
     }
 
     #[test]
