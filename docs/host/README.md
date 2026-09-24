@@ -3886,32 +3886,55 @@ refused as an operation this host does not perform rather than given a second wa
 
 ## Volatile-native mode
 
-When the journal faults during live traffic the gateway enters `native_only_volatile`, atomically:
-rich work is fenced, every unresolved resource is marked volatile, the identifiers that were
-already claimed or dispatched are counted and carried, and the gap is opened. What calls it is the
-worker's own storage-failure path, which is not wired to this yet; the mode, the fence and the gap
-are driven by their own suite until it is.
+The receipt journal and the broker's ledger live in one store, and they are behind one fence: the
+session's journal condition, `kr_worker::persistence::fault::JournalHealth`. The ledger reports
+every failure of its store there, where it happens, classified from the store's own result code,
+exactly as the receipt journal does. The broker applies the condition before every decision it
+takes, so a store that fails under either of them fences rich work on the receipt path and in the
+broker alike.
 
-What continues is the qualified native forwarding path and its in-memory arbitration. What stops is
-everything rich: a new interpretation, a rich mutation and a rich approval are all refused with
-`UPSTREAM_UNAVAILABLE`, because the caller needs to know that this operation cannot reach the
-upstream now and that no second backend was opened to make it look as though it did. Nothing is
-relabelled: a rich client is still a rich client and still cannot forward.
+When the store fails the gateway enters `native_only_volatile`, atomically and in memory: rich work
+is fenced, every unresolved resource is marked volatile, the identifiers already claimed or
+dispatched are counted and carried, and the gap is opened. Nothing is written on the way in, so
+nothing native that follows waits on the store that failed; the gap is written when the store
+recovers.
+
+What continues is the qualified native forwarding path and its in-memory arbitration. A native
+request, the terminal's answer to one, the terminal's own requests and this host's answers to
+reverse requests all go on, and a failure met under one of them is carried on in memory as a
+transition of the gap rather than refused. So is the record of something that has already
+happened, such as an answer whose bytes went before the store refused its settlement. What stops is
+everything rich: a new interpretation, a rich mutation, a rich approval and a rich answer that was
+admitted and not yet sent are all refused with `UPSTREAM_UNAVAILABLE`, because the caller needs to
+know that this operation cannot reach the upstream now and that no second backend was opened to
+make it look as though it did. A reverse write is refused too, because the marker that has to
+precede it cannot be recorded; a reverse read still runs. Nothing is relabelled: a rich client is
+still a rich client and still cannot forward.
 
 The gap is exposed while it is open, with when it started, why, how many native requests and
 responses passed through it, how many rich operations it refused, and how many claimed identifiers
 it carried.
 
-Recovery is two steps because it can fail, and rich work comes back at the end of the second.
-Storage returning commits the gap: one transaction over the gap and every resource the gap touched,
-in whatever state each actually reached, including the ones the upstream withdrew inside it. A
-failure part way leaves nothing committed and the fence back in place. The gateway is then
-*recovering*, which admits no rich work; what ends that is reconciling the pending identifiers with
-**every** upstream that still had one, and rich work returns with the last of them. A worker that
-dies between the commit and the reconciliation comes back recovering, because what ends a recovery
-is an upstream and no upstream has spoken to the new process. Volatile operations are never
-replayed to manufacture durable history: a resource that lived through a gap says so for the rest
-of its life, and its later transitions are written down like anything else.
+Recovery is two steps because it can fail, and rich work comes back at the end of the second. The
+host's maintenance drives both. When the store takes writes again the journal writes its own gap
+and only then calls the condition healthy; the broker then commits its gap and every resource the
+gap touched, in whatever state each actually reached, including the ones the upstream withdrew
+inside it. A failure part way leaves nothing committed and the fence back in place, and the next
+pass starts again. The gateway is then *recovering*, which admits no rich work; what ends that is
+reconciling the pending identifiers with **every** upstream that still had one, and rich work
+returns with the last of them, after the gap's final accounting is written.
+
+A connection that stayed open through the whole gap has carried every frame of it in both
+directions, so what its upstream still holds is what the host holds for it, unresolved; the host
+reconciles it with that once none of its answers is still in flight. A connection that closed at
+any point since the fence went up, including one later restored, is reconciled only when its
+upstream says what it still holds. A reconciliation prepared under a recovery that failed is
+refused before it writes anything, so it changes neither a live resource nor its record.
+
+A worker that dies between the commit and the reconciliation comes back recovering, because what
+ends a recovery is an upstream and no upstream has spoken to the new process. Volatile operations
+are never replayed to manufacture durable history: a resource that lived through a gap says so for
+the rest of its life, and its later transitions are written down like anything else.
 
 ## The local listener
 

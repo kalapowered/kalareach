@@ -1497,3 +1497,103 @@ async fn kr_req_09_a_request_that_went_and_was_never_answered_leaves_an_unknown_
     reading.abort();
     driving.abort();
 }
+
+/// KR-REQ-11.35 and KR-REQ-11.37: the receipt journal and the broker's ledger are behind one
+/// fence, and the host's own maintenance takes both out of it.
+///
+/// A fault of either store is the session's one journal condition. The receipt journal refusing an
+/// acceptance fences the broker at its next decision, and the broker's ledger refusing a write
+/// fences the receipt path: a prompt is refused before its marker either way. When the store takes
+/// writes again, the maintenance pass writes the journal's gap first and then the broker's, and a
+/// prompt is applied again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_37_one_fence_covers_the_receipt_journal_and_the_ledger_and_maintenance_lifts_it()
+{
+    let host = host().await;
+    let upstream = Arc::new(SlowUpstream {
+        holds: std::time::Duration::ZERO,
+        carried: std::sync::atomic::AtomicUsize::new(0),
+    });
+    register(
+        &host,
+        Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
+    );
+    let broker = Arc::clone(host.service.broker());
+    let mut client = cli(&host).await;
+    let mutation = prompt_mutation(&client, &host, 31);
+    let applied = send(&mut client, mutation).await;
+    assert!(matches!(applied, Outcome::Ok(_)), "{applied:?}");
+
+    // The receipt journal refuses an acceptance: the store is full.
+    let mut next = 0_u16;
+    {
+        let mut session = host.service.runtime().session();
+        let journal = session.journal_mut().expect("the session journals");
+        common::refuse_acceptance(journal, &mut next);
+    }
+    assert_eq!(
+        broker.mode(),
+        kr_protocol::gateway::GatewayMode::NativeOnlyVolatile,
+        "the broker reads the journal's own condition, so it is behind the fence at once"
+    );
+    let mutation = prompt_mutation(&client, &host, 32);
+    let refused = send(&mut client, mutation).await;
+    let Outcome::Error(error) = refused else {
+        panic!("a prompt is refused while the store is faulted: {refused:?}");
+    };
+    assert_eq!(error.code, ErrorCode::StorageUnavailable);
+
+    // The store takes writes again. Maintenance writes the journal's gap, then the broker's, and
+    // with no upstream owing a reconciliation rich work is back.
+    {
+        let mut session = host.service.runtime().session();
+        session
+            .journal_mut()
+            .expect("the session journals")
+            .release_size_cap()
+            .expect("the store may grow again");
+    }
+    host.service.recover_storage_now();
+    assert_eq!(broker.mode(), kr_protocol::gateway::GatewayMode::Normal);
+    let mutation = prompt_mutation(&client, &host, 33);
+    let applied = send(&mut client, mutation).await;
+    assert!(matches!(applied, Outcome::Ok(_)), "{applied:?}");
+
+    // Now the ledger refuses a write. That failure is the same condition, so the receipt path is
+    // fenced by it before any prompt reaches the broker.
+    broker
+        .refuse_ledger_writes(true)
+        .expect("the ledger's store is put in query-only mode");
+    let failed = broker
+        .checkpoint(
+            instance(),
+            kr_protocol::ids::StreamCursor::new(1),
+            TimestampMs::new(40),
+        )
+        .expect_err("the ledger's store refuses the write");
+    assert_eq!(failed.code(), ErrorCode::StorageUnavailable);
+    let mutation = prompt_mutation(&client, &host, 34);
+    let refused = send(&mut client, mutation).await;
+    let Outcome::Error(error) = refused else {
+        panic!("a prompt is refused while the ledger is faulted: {refused:?}");
+    };
+    assert_eq!(error.code, ErrorCode::StorageUnavailable);
+    assert_eq!(
+        broker.mode(),
+        kr_protocol::gateway::GatewayMode::NativeOnlyVolatile
+    );
+
+    broker
+        .refuse_ledger_writes(false)
+        .expect("the ledger takes writes again");
+    host.service.recover_storage_now();
+    assert_eq!(broker.mode(), kr_protocol::gateway::GatewayMode::Normal);
+    let mutation = prompt_mutation(&client, &host, 35);
+    let applied = send(&mut client, mutation).await;
+    assert!(matches!(applied, Outcome::Ok(_)), "{applied:?}");
+    assert_eq!(
+        upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "only the prompts admitted outside the fence reached the upstream"
+    );
+}

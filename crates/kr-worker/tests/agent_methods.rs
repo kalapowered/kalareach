@@ -27,6 +27,9 @@ use kr_protocol::ids::{
 use kr_protocol::method::{Method, MethodVersion, decide};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Bytes, Digest256, Nullable, TimestampMs, U64, Uuid};
+use kr_worker::persistence::JournalHealth;
+
+mod common;
 use kr_worker::broker::{
     Broker, BrokerError, BrokerTransport, Caller, Credential, GrantLowerBound, ManagedProcess,
     PendingTransmission, RegisteredAction, TransportHandle, UpstreamBody, UpstreamDispatch,
@@ -281,7 +284,15 @@ impl UpstreamDispatch for RefusingUpstream {
 
 /// A broker with every capability the agent mutations need, and a transport that records.
 fn agent_broker_with(upstream: std::sync::Arc<RecordingUpstream>) -> Broker {
-    let broker = agent_broker();
+    agent_broker_sharing(upstream, JournalHealth::shared())
+}
+
+/// The same, reading a session's journal condition.
+fn agent_broker_sharing(
+    upstream: std::sync::Arc<RecordingUpstream>,
+    health: std::sync::Arc<JournalHealth>,
+) -> Broker {
+    let broker = agent_broker_on(health);
     broker
         .bind_dispatch(instance(), std::sync::Arc::clone(&upstream) as _)
         .expect("the transport is bound");
@@ -293,7 +304,12 @@ fn agent_broker_with(upstream: std::sync::Arc<RecordingUpstream>) -> Broker {
 
 /// A broker with every capability the agent mutations need.
 fn agent_broker() -> Broker {
-    let broker = Broker::open(None, session()).expect("the broker opens");
+    agent_broker_on(JournalHealth::shared())
+}
+
+/// The same, reading a given journal condition.
+fn agent_broker_on(health: std::sync::Arc<JournalHealth>) -> Broker {
+    let broker = Broker::open(None, session(), health).expect("the broker opens");
     broker
         .register_instance(instance(), IntegrationMode::Gateway, None, Some(managed()))
         .expect("the instance is registered");
@@ -998,7 +1014,8 @@ fn kr_req_24_24_a_replay_starts_after_the_consumed_cursor_and_an_eviction_shows_
     let path = directory.join("session.sqlite");
 
     let consumed = {
-        let broker = Broker::open(Some(&path), session()).expect("the broker opens");
+        let broker = Broker::open(Some(&path), session(), JournalHealth::shared())
+            .expect("the broker opens");
         broker
             .register_instance(instance(), IntegrationMode::Gateway, None, None)
             .expect("the instance is registered");
@@ -1030,7 +1047,8 @@ fn kr_req_24_24_a_replay_starts_after_the_consumed_cursor_and_an_eviction_shows_
     };
 
     // A restart replays from the cursor that was consumed, and nothing before it.
-    let restarted = Broker::open(Some(&path), session()).expect("the broker reopens");
+    let restarted =
+        Broker::open(Some(&path), session(), JournalHealth::shared()).expect("the broker reopens");
     assert_eq!(
         restarted
             .consumed_cursor(instance())
@@ -1066,7 +1084,7 @@ fn kr_req_24_24_a_replay_starts_after_the_consumed_cursor_and_an_eviction_shows_
     assert!(!replay.history_gap);
 
     // An evicted range rebuilds from what is verifiably retained, and says there is a gap.
-    let broker = Broker::open(None, session()).expect("the broker opens");
+    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
     broker
         .register_instance(instance(), IntegrationMode::Gateway, None, None)
         .expect("the instance is registered");
@@ -1960,8 +1978,9 @@ fn kr_req_11_35_a_fence_refuses_a_plan_that_arrives_after_it() {
 }
 
 fn a_fence_refuses_a_plan_that_arrives_after_it(recovered: bool) {
+    let mut store = common::SharedStore::open();
     let upstream = std::sync::Arc::new(RecordingUpstream::default());
-    let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
+    let broker = agent_broker_sharing(std::sync::Arc::clone(&upstream), store.health());
     broker
         .register_actions(
             binding(),
@@ -1990,13 +2009,17 @@ fn a_fence_refuses_a_plan_that_arrives_after_it(recovered: bool) {
         )
         .expect("the invocation is admitted");
 
-    // The journal faults while the component is preparing its plan.
-    broker
-        .enter_volatile("the journal could not be written", TimestampMs::new(3))
-        .expect("the fence comes down");
+    // The receipt journal faults while the component is preparing its plan. The broker is behind
+    // the fence at its next decision.
+    store.fault_acceptance();
+    assert_eq!(
+        broker.mode(),
+        kr_protocol::gateway::GatewayMode::NativeOnlyVolatile
+    );
     if recovered {
         // Storage came back and the gap was committed. Rich work is still fenced: the upstreams
         // have not said what they still hold, so an answer or an effect could be a second one.
+        store.recover_journal(4);
         broker
             .recover(TimestampMs::new(4))
             .expect("the gap is committed");

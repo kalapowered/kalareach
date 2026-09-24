@@ -46,6 +46,7 @@ use kr_protocol::session::Durability;
 use rusqlite::{Connection, OptionalExtension as _, params};
 
 use crate::broker::error::{BrokerError, Result};
+use crate::persistence::fault::JournalHealth;
 use crate::persistence::stores::ContentClass;
 
 /// The schema version this build reads.
@@ -327,7 +328,11 @@ fn state_from(text: &str) -> Result<PendingState> {
 }
 
 /// Writes one transition event inside the transaction that commits the transition.
-fn write_event(transaction: &rusqlite::Transaction<'_>, event: &TransitionEvent) -> Result<()> {
+fn write_event(
+    health: &JournalHealth,
+    transaction: &rusqlite::Transaction<'_>,
+    event: &TransitionEvent,
+) -> Result<()> {
     transaction
         .execute(
             "INSERT INTO broker_events
@@ -358,17 +363,19 @@ fn write_event(transaction: &rusqlite::Transaction<'_>, event: &TransitionEvent)
                 i64::try_from(event.recorded_at.get()).unwrap_or(i64::MAX),
             ],
         )
-        .map_err(BrokerError::ledger)?;
+        .map_err(|error| store_fault(health, error))?;
     Ok(())
 }
 
 /// Writes one pending resource's row, on a connection or inside a transaction.
 fn put_pending_in(
+    health: &JournalHealth,
     connection: &Connection,
     resource: &PendingResource,
     decoder: Option<BrokerBindingId>,
     dispatched: bool,
 ) -> Result<()> {
+    let record = encode(resource)?;
     connection
         .execute(
             "INSERT INTO broker_pending
@@ -388,13 +395,13 @@ fn put_pending_in(
                 resource.request.upstream.as_str(),
                 resource.state.as_str(),
                 resource.durability.as_str(),
-                encode(resource)?,
+                record,
                 i64::from(dispatched),
                 decoder.map(|binding| binding.get().as_bytes().to_vec()),
                 i64::try_from(resource.recorded_at.get()).unwrap_or(i64::MAX),
             ],
         )
-        .map_err(BrokerError::ledger)?;
+        .map_err(|error| store_fault(health, error))?;
     Ok(())
 }
 
@@ -448,9 +455,26 @@ fn outcome_from(text: &str) -> Result<ClientRequestOutcome> {
 }
 
 /// The broker's durable records, in the worker's own journal file.
+///
+/// It reports every failure of the store itself to the session's journal condition, where the
+/// failure happens, exactly as the receipt journal does. That condition is the one fence the
+/// receipt path and the broker both read, so a ledger that stops answering fences rich work
+/// everywhere, and a receipt journal that stops answering fences it here.
 #[derive(Debug)]
 pub struct Ledger {
     connection: Connection,
+    health: std::sync::Arc<JournalHealth>,
+}
+
+/// Turns one failure of the store into the fault it is, and reports it to the journal condition.
+///
+/// The condition classifies the store's own result code, so a full store and a failing one are
+/// told apart by what the store said rather than by its message.
+fn store_fault(health: &JournalHealth, error: rusqlite::Error) -> BrokerError {
+    health.observe(&error, kr_ipc::now_ms().get());
+    BrokerError::StoreFault {
+        detail: error.to_string(),
+    }
 }
 
 impl Ledger {
@@ -460,27 +484,52 @@ impl Ledger {
     ///
     /// Returns [`BrokerError::LedgerUnavailable`] when the file cannot be opened or its schema
     /// cannot be created.
-    pub fn open(path: Option<&std::path::Path>) -> Result<Self> {
+    pub fn open(
+        path: Option<&std::path::Path>,
+        health: std::sync::Arc<JournalHealth>,
+    ) -> Result<Self> {
         let connection = match path {
             Some(path) => Connection::open(path),
             None => Connection::open_in_memory(),
         }
-        .map_err(BrokerError::ledger)?;
-        let ledger = Self { connection };
+        .map_err(|error| store_fault(&health, error))?;
+        let ledger = Self { connection, health };
         ledger.prepare()?;
         Ok(ledger)
+    }
+
+    /// Turns one failure of this ledger's store into the fault it is, reported where it happened.
+    fn fault(&self, error: rusqlite::Error) -> BrokerError {
+        store_fault(&self.health, error)
+    }
+
+    /// Makes every later write to this ledger fail, or lets writes through again.
+    ///
+    /// The refusal is the store's own: in query-only mode SQLite answers every write with
+    /// `SQLITE_READONLY`, which is what a store that has stopped taking writes says. It is how
+    /// this host's own tests fault the ledger in the middle of live traffic without taking a disk
+    /// away. It is compiled away in every shipped build.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::StoreFault`] when the setting cannot be applied.
+    #[cfg(feature = "testing")]
+    pub fn refuse_writes(&self, refuse: bool) -> Result<()> {
+        self.connection
+            .pragma_update(None, "query_only", refuse)
+            .map_err(|error| self.fault(error))
     }
 
     fn prepare(&self) -> Result<()> {
         self.connection
             .busy_timeout(BUSY_TIMEOUT)
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         self.connection
             .pragma_update(None, "journal_mode", "WAL")
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         self.connection
             .pragma_update(None, "synchronous", "FULL")
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         self.connection
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS broker_schema (version INTEGER NOT NULL);
@@ -580,12 +629,12 @@ impl Ledger {
                  CREATE INDEX IF NOT EXISTS broker_events_by_resource
                      ON broker_events (resource_id, sequence);",
             )
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         let recorded: Option<i64> = self
             .connection
             .query_row("SELECT version FROM broker_schema", [], |row| row.get(0))
             .optional()
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         match recorded {
             None => {
                 self.connection
@@ -593,7 +642,7 @@ impl Ledger {
                         "INSERT INTO broker_schema (version) VALUES (?1)",
                         params![SCHEMA_VERSION],
                     )
-                    .map_err(BrokerError::ledger)?;
+                    .map_err(|error| self.fault(error))?;
             }
             Some(version) if version == SCHEMA_VERSION => {}
             // Not every change this build has made is one a `CREATE TABLE IF NOT EXISTS` brings
@@ -640,7 +689,7 @@ impl Ledger {
                     i64::try_from(record.bound_at.get()).unwrap_or(i64::MAX),
                 ],
             )
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         Ok(())
     }
 
@@ -666,7 +715,7 @@ impl Ledger {
                 },
             )
             .optional()
-            .map_err(BrokerError::ledger)?
+            .map_err(|error| self.fault(error))?
             .map(|(instance, grants, trust, bound_at)| {
                 Ok(BindingRecord {
                     binding_id,
@@ -694,7 +743,7 @@ impl Ledger {
                 "SELECT binding_id, grants, trust, bound_at_ms FROM broker_bindings
                  WHERE application_instance_id = ?1 ORDER BY bound_at_ms, binding_id",
             )
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         let rows = statement
             .query_map(
                 params![application_instance_id.get().as_bytes().as_slice()],
@@ -707,9 +756,9 @@ impl Ledger {
                     ))
                 },
             )
-            .map_err(BrokerError::ledger)?
+            .map_err(|error| self.fault(error))?
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         rows.into_iter()
             .map(|(binding, grants, trust, bound_at)| {
                 Ok(BindingRecord {
@@ -737,7 +786,7 @@ impl Ledger {
                 "DELETE FROM broker_bindings WHERE binding_id = ?1",
                 params![binding_id.get().as_bytes().as_slice()],
             )
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         Ok(())
     }
 
@@ -763,7 +812,7 @@ impl Ledger {
                     i64::try_from(entry.decoded_at.get()).unwrap_or(i64::MAX),
                 ],
             )
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         Ok(())
     }
 
@@ -780,7 +829,7 @@ impl Ledger {
                 |row| row.get::<_, Vec<u8>>(0),
             )
             .optional()
-            .map_err(BrokerError::ledger)?
+            .map_err(|error| self.fault(error))?
             .map(|bytes| decode(&bytes))
             .transpose()
     }
@@ -798,10 +847,10 @@ impl Ledger {
         let transaction = self
             .connection
             .unchecked_transaction()
-            .map_err(BrokerError::ledger)?;
-        put_pending_in(&transaction, resource, None, false)?;
-        write_event(&transaction, event)?;
-        transaction.commit().map_err(BrokerError::ledger)
+            .map_err(|error| self.fault(error))?;
+        put_pending_in(&self.health, &transaction, resource, None, false)?;
+        write_event(&self.health, &transaction, event)?;
+        transaction.commit().map_err(|error| self.fault(error))
     }
 
     /// Admits one decoded interpretation of a request this ledger already holds: consumes its
@@ -827,7 +876,11 @@ impl Ledger {
         now: TimestampMs,
         event: &TransitionEvent,
     ) -> Result<bool> {
-        let transaction = self.connection.transaction().map_err(BrokerError::ledger)?;
+        let health = std::sync::Arc::clone(&self.health);
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| store_fault(&health, error))?;
         let consumed = transaction
             .execute(
                 "INSERT OR IGNORE INTO broker_consumed_sources
@@ -843,11 +896,13 @@ impl Ledger {
                     i64::try_from(now.get()).unwrap_or(i64::MAX),
                 ],
             )
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| store_fault(&health, error))?;
         if consumed != 1 {
             // Nothing was written, and the rollback makes that true of the whole transaction
             // rather than only of this statement.
-            transaction.rollback().map_err(BrokerError::ledger)?;
+            transaction
+                .rollback()
+                .map_err(|error| store_fault(&health, error))?;
             return Ok(false);
         }
         transaction
@@ -860,7 +915,7 @@ impl Ledger {
                     i64::try_from(entry.decoded_at.get()).unwrap_or(i64::MAX),
                 ],
             )
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| store_fault(&health, error))?;
         let updated = transaction
             .execute(
                 "UPDATE broker_pending
@@ -872,12 +927,14 @@ impl Ledger {
                     binding_id.get().as_bytes().as_slice(),
                 ],
             )
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| store_fault(&health, error))?;
         if updated != 1 {
             // The request this interpretation is about is not one this ledger holds as pending.
             // Consuming its source and recording a decoder against it would leave evidence about
             // nothing, so the whole transaction goes back.
-            transaction.rollback().map_err(BrokerError::ledger)?;
+            transaction
+                .rollback()
+                .map_err(|error| store_fault(&health, error))?;
             return Err(BrokerError::PreconditionFailed {
                 detail: format!(
                     "pending resource {} is not a pending row this ledger holds",
@@ -885,8 +942,10 @@ impl Ledger {
                 ),
             });
         }
-        write_event(&transaction, event)?;
-        transaction.commit().map_err(BrokerError::ledger)?;
+        write_event(&self.health, &transaction, event)?;
+        transaction
+            .commit()
+            .map_err(|error| store_fault(&health, error))?;
         Ok(true)
     }
 
@@ -907,7 +966,13 @@ impl Ledger {
         decoder: Option<BrokerBindingId>,
         dispatched: bool,
     ) -> Result<()> {
-        put_pending_in(&self.connection, resource, decoder, dispatched)
+        put_pending_in(
+            &self.health,
+            &self.connection,
+            resource,
+            decoder,
+            dispatched,
+        )
     }
 
     /// Moves one pending resource from the state it is in to the state it is going to.
@@ -935,7 +1000,7 @@ impl Ledger {
         let transaction = self
             .connection
             .unchecked_transaction()
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         let updated = transaction
             .execute(
                 "UPDATE broker_pending
@@ -954,9 +1019,9 @@ impl Ledger {
                     i64::try_from(now.get()).unwrap_or(i64::MAX),
                 ],
             )
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         if updated != 1 {
-            transaction.rollback().map_err(BrokerError::ledger)?;
+            transaction.rollback().map_err(|error| self.fault(error))?;
             let held: Option<String> = self
                 .connection
                 .query_row(
@@ -965,15 +1030,15 @@ impl Ledger {
                     |row| row.get(0),
                 )
                 .optional()
-                .map_err(BrokerError::ledger)?;
+                .map_err(|error| self.fault(error))?;
             return Err(BrokerError::ledger(format!(
                 "pending resource {} is {} in the ledger and the write expected {expected}",
                 resource.resource_id,
                 held.unwrap_or_else(|| "absent".to_owned())
             )));
         }
-        write_event(&transaction, event)?;
-        transaction.commit().map_err(BrokerError::ledger)
+        write_event(&self.health, &transaction, event)?;
+        transaction.commit().map_err(|error| self.fault(error))
     }
 
     /// Returns the highest event sequence this ledger holds.
@@ -992,7 +1057,7 @@ impl Ledger {
                 [],
                 |row| row.get(0),
             )
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         Ok(u64::try_from(highest).unwrap_or_default())
     }
 
@@ -1014,7 +1079,7 @@ impl Ledger {
                  WHERE sequence IN (SELECT MAX(sequence) FROM broker_events GROUP BY resource_id)
                  ORDER BY sequence",
             )
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         let rows = statement
             .query_map([], |row| {
                 Ok((
@@ -1023,9 +1088,9 @@ impl Ledger {
                     row.get::<_, String>(2)?,
                 ))
             })
-            .map_err(BrokerError::ledger)?
+            .map_err(|error| self.fault(error))?
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         let mut latest = Vec::new();
         for (resource, sequence, state) in rows {
             if state_from(&state)?.is_terminal() {
@@ -1067,7 +1132,7 @@ impl Ledger {
                         actor_id, causal_root, parent_sequence, recorded_at_ms
                  FROM broker_events WHERE sequence > ?1 ORDER BY sequence LIMIT ?2",
             )
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         let rows = statement
             .query_map(
                 params![
@@ -1094,9 +1159,9 @@ impl Ledger {
                     })
                 },
             )
-            .map_err(BrokerError::ledger)?
+            .map_err(|error| self.fault(error))?
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         let mut more = rows.len() > max_events;
         let mut events = Vec::with_capacity(rows.len().min(max_events));
         let mut measured = 0_usize;
@@ -1169,7 +1234,7 @@ impl Ledger {
         let transaction = self
             .connection
             .unchecked_transaction()
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         let updated = transaction
             .execute(
                 "UPDATE broker_pending SET dispatched = 1
@@ -1179,16 +1244,16 @@ impl Ledger {
                     resource.state.as_str(),
                 ],
             )
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         if updated != 1 {
-            transaction.rollback().map_err(BrokerError::ledger)?;
+            transaction.rollback().map_err(|error| self.fault(error))?;
             return Err(BrokerError::ledger(format!(
                 "pending resource {} is not an undispatched {} row in the ledger",
                 resource.resource_id, resource.state
             )));
         }
-        write_event(&transaction, event)?;
-        transaction.commit().map_err(BrokerError::ledger)
+        write_event(&self.health, &transaction, event)?;
+        transaction.commit().map_err(|error| self.fault(error))
     }
 
     /// Commits an evidence gap and everything that happened inside it, in one transaction.
@@ -1211,7 +1276,11 @@ impl Ledger {
         gap: &EvidenceGap,
         row: Option<i64>,
     ) -> Result<i64> {
-        let transaction = self.connection.transaction().map_err(BrokerError::ledger)?;
+        let health = std::sync::Arc::clone(&self.health);
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| store_fault(&health, error))?;
         for (resource, decoder, dispatched) in records {
             transaction
                 .execute(
@@ -1238,7 +1307,7 @@ impl Ledger {
                         i64::try_from(resource.recorded_at.get()).unwrap_or(i64::MAX),
                     ],
                 )
-                .map_err(BrokerError::ledger)?;
+                .map_err(|error| store_fault(&health, error))?;
         }
         let sequence = match row {
             Some(row) => {
@@ -1253,7 +1322,7 @@ impl Ledger {
                             encode(gap)?,
                         ],
                     )
-                    .map_err(BrokerError::ledger)?;
+                    .map_err(|error| store_fault(&health, error))?;
                 row
             }
             None => {
@@ -1269,11 +1338,13 @@ impl Ledger {
                             encode(gap)?,
                         ],
                     )
-                    .map_err(BrokerError::ledger)?;
+                    .map_err(|error| store_fault(&health, error))?;
                 transaction.last_insert_rowid()
             }
         };
-        transaction.commit().map_err(BrokerError::ledger)?;
+        transaction
+            .commit()
+            .map_err(|error| store_fault(&health, error))?;
         Ok(sequence)
     }
 
@@ -1290,7 +1361,7 @@ impl Ledger {
                 |row| row.get::<_, Vec<u8>>(0),
             )
             .optional()
-            .map_err(BrokerError::ledger)?
+            .map_err(|error| self.fault(error))?
             .map(|bytes| decode(&bytes))
             .transpose()
     }
@@ -1310,7 +1381,7 @@ impl Ledger {
                 "SELECT record, dispatched, decoder_binding_id FROM broker_pending
                  WHERE state IN ('pending', 'claimed') ORDER BY recorded_at_ms, resource_id",
             )
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         let rows = statement
             .query_map([], |row| {
                 Ok((
@@ -1319,9 +1390,9 @@ impl Ledger {
                     row.get::<_, Option<Vec<u8>>>(2)?,
                 ))
             })
-            .map_err(BrokerError::ledger)?
+            .map_err(|error| self.fault(error))?
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         rows.into_iter()
             .map(|(bytes, dispatched, decoder)| {
                 Ok(UnresolvedRecord {
@@ -1366,7 +1437,7 @@ impl Ledger {
                     i64::try_from(intent.recorded_at.get()).unwrap_or(i64::MAX),
                 ],
             )
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         Ok(())
     }
 
@@ -1387,7 +1458,7 @@ impl Ledger {
                 "UPDATE broker_client_requests SET outcome = ?2 WHERE intent_id = ?1",
                 params![intent_id.as_bytes().as_slice(), outcome.as_str()],
             )
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         if updated == 1 {
             Ok(())
         } else {
@@ -1410,7 +1481,7 @@ impl Ledger {
                         method, class, declared, source_handle, outcome, recorded_at_ms
                  FROM broker_client_requests ORDER BY recorded_at_ms, rowid",
             )
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         let rows = statement
             .query_map([], |row| {
                 Ok((
@@ -1426,9 +1497,9 @@ impl Ledger {
                     row.get::<_, i64>(9)?,
                 ))
             })
-            .map_err(BrokerError::ledger)?
+            .map_err(|error| self.fault(error))?
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         rows.into_iter()
             .map(
                 |(
@@ -1500,7 +1571,7 @@ impl Ledger {
                     i64::try_from(profile.resolved_at.get()).unwrap_or(i64::MAX),
                 ],
             )
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         Ok(())
     }
 
@@ -1513,35 +1584,16 @@ impl Ledger {
         let mut statement = self
             .connection
             .prepare("SELECT profile FROM broker_profiles ORDER BY resolved_at_ms, profile_id")
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         let rows = statement
             .query_map([], |row| row.get::<_, Vec<u8>>(0))
-            .map_err(BrokerError::ledger)?
+            .map_err(|error| self.fault(error))?
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         rows.iter().map(|bytes| decode(bytes)).collect()
     }
 
     // -- evidence gaps ------------------------------------------------------------------------
-
-    /// Records a gap that has just opened, returning its row.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::LedgerUnavailable`] when the write fails.
-    pub fn open_gap(&self, gap: &EvidenceGap) -> Result<i64> {
-        self.connection
-            .execute(
-                "INSERT INTO broker_gaps (opened_at_ms, closed_at_ms, record)
-                 VALUES (?1, NULL, ?2)",
-                params![
-                    i64::try_from(gap.opened_at.get()).unwrap_or(i64::MAX),
-                    encode(gap)?,
-                ],
-            )
-            .map_err(BrokerError::ledger)?;
-        Ok(self.connection.last_insert_rowid())
-    }
 
     /// Commits a gap that has closed.
     ///
@@ -1564,7 +1616,7 @@ impl Ledger {
                     encode(gap)?,
                 ],
             )
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         Ok(())
     }
 
@@ -1584,7 +1636,7 @@ impl Ledger {
                 "UPDATE broker_gaps SET reconciled = 1 WHERE sequence = ?1",
                 params![row],
             )
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         Ok(())
     }
 
@@ -1605,7 +1657,7 @@ impl Ledger {
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
             )
             .optional()
-            .map_err(BrokerError::ledger)?
+            .map_err(|error| self.fault(error))?
             .map(|(row, bytes)| Ok((row, decode(&bytes)?)))
             .transpose()
     }
@@ -1626,7 +1678,7 @@ impl Ledger {
                 row.get(0)
             })
             .optional()
-            .map_err(BrokerError::ledger)?
+            .map_err(|error| self.fault(error))?
             .flatten();
         Ok(highest.map_or(0, |value| u64::try_from(value).unwrap_or(0)))
     }
@@ -1640,12 +1692,12 @@ impl Ledger {
         let mut statement = self
             .connection
             .prepare("SELECT record FROM broker_gaps ORDER BY sequence")
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         let rows = statement
             .query_map([], |row| row.get::<_, Vec<u8>>(0))
-            .map_err(BrokerError::ledger)?
+            .map_err(|error| self.fault(error))?
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         rows.iter().map(|bytes| decode(bytes)).collect()
     }
 
@@ -1673,7 +1725,7 @@ impl Ledger {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         let next = current.map_or(1, |generation| generation.saturating_add(1));
         self.connection
             .execute(
@@ -1687,7 +1739,7 @@ impl Ledger {
                     i64::try_from(kr_ipc::now_ms().get()).unwrap_or(i64::MAX)
                 ],
             )
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         Ok(u64::try_from(next).unwrap_or(1))
     }
 
@@ -1716,7 +1768,7 @@ impl Ledger {
                     i64::try_from(now.get()).unwrap_or(i64::MAX),
                 ],
             )
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         Ok(())
     }
 
@@ -1737,7 +1789,7 @@ impl Ledger {
                 |row| row.get::<_, i64>(0),
             )
             .optional()
-            .map_err(BrokerError::ledger)?
+            .map_err(|error| self.fault(error))?
             .map(|cursor| StreamCursor::new(u64::try_from(cursor).unwrap_or(0))))
     }
 
@@ -1754,7 +1806,7 @@ impl Ledger {
                 params![durability.as_str(), state.as_str()],
                 |row| row.get(0),
             )
-            .map_err(BrokerError::ledger)?;
+            .map_err(|error| self.fault(error))?;
         Ok(u64::try_from(count).unwrap_or(0))
     }
 }
@@ -1957,10 +2009,12 @@ mod tests {
             bound_at: TimestampMs::new(5),
         };
         {
-            let ledger = Ledger::open(Some(&file)).expect("the ledger opens");
+            let ledger =
+                Ledger::open(Some(&file), JournalHealth::shared()).expect("the ledger opens");
             ledger.put_binding(&record).expect("the binding is written");
         }
-        let reopened = Ledger::open(Some(&file)).expect("the ledger reopens");
+        let reopened =
+            Ledger::open(Some(&file), JournalHealth::shared()).expect("the ledger reopens");
         let read = reopened
             .binding(record.binding_id)
             .expect("the read succeeds")
@@ -1972,7 +2026,7 @@ mod tests {
 
     #[test]
     fn a_failure_part_way_through_admission_leaves_the_source_unconsumed() {
-        let mut ledger = Ledger::open(None).expect("the ledger opens");
+        let mut ledger = Ledger::open(None, JournalHealth::shared()).expect("the ledger opens");
         let recorded = resource(7, "11", PendingState::Pending);
         ledger
             .record_opaque(&recorded, &event(90, &recorded))
@@ -2026,11 +2080,24 @@ mod tests {
     /// the resource as it was, and the broker's parent map retains the event it would have
     /// followed, so the next event about that resource names the same parent it would have named
     /// before without the caller supplying it.
+    /// A transition whose event the store will not take goes back whole in the ledger, and the
+    /// failure raises the fence rather than losing what happened.
+    ///
+    /// The state change and its event are one transaction, so the ledger holds neither of them.
+    /// What happened is still what happened: the upstream withdrew its request, so the broker
+    /// keeps that in memory as a transition of the gap, behind the fence the failure raised, and
+    /// the recovery that commits the gap commits it once the journal has written its own.
     #[test]
     fn a_transition_whose_event_cannot_be_written_goes_back_whole() {
         let path = ledger_path();
-        let broker = Broker::open(Some(&path), SessionId::new(Uuid::from_bytes([1; 16])))
-            .expect("the broker opens");
+        let journal = crate::journal::Journal::open(path.with_extension("journal"))
+            .expect("the receipt journal opens");
+        let broker = Broker::open(
+            Some(&path),
+            SessionId::new(Uuid::from_bytes([1; 16])),
+            std::sync::Arc::clone(journal.health()),
+        )
+        .expect("the broker opens");
         broker
             .register_instance(
                 instance(),
@@ -2061,13 +2128,10 @@ mod tests {
             )
             .expect("the request is forwarded");
         assert!(forwarded.request.is_some());
-        assert!(recorded.is_some());
-        let initial_events = outbox_of(&broker);
-        assert_eq!(initial_events.len(), 1);
-        let first_seq = initial_events[0].sequence;
-        assert_eq!(initial_events[0].parent_sequence, None);
+        let resource_id = recorded.expect("it expects a response").resource_id;
+        assert_eq!(outbox_of(&broker).len(), 1);
 
-        // Inject an SQLite trigger so that inserting the next event (sequence 2) fails and aborts.
+        // The store refuses the next event, inside the transaction that would record the change.
         let injector = rusqlite::Connection::open(&path).expect("injector connection opens");
         injector
             .execute(
@@ -2077,51 +2141,65 @@ mod tests {
             )
             .expect("trigger is installed");
 
-        // An upstream response that attempts to settle the resource fails when writing the event.
-        let failed = broker.upstream_response(
-            connection,
-            br#"{"id":71,"result":{"outcome":"deny"}}"#,
-            TimestampMs::new(11),
-        );
-        assert!(
-            failed.is_err(),
-            "an event the outbox will not take rolls back the transition"
-        );
-
-        let outbox_after_failure = outbox_of(&broker);
-        assert_eq!(
-            outbox_after_failure.len(),
-            1,
-            "nothing was announced for the failed transition"
-        );
-
-        // Remove the injected failure.
-        injector
-            .execute("DROP TRIGGER fail_seq_2", [])
-            .expect("trigger is removed");
-
-        // The next transition on that resource through the broker automatically looks up the parent
-        // in the broker's announced parent map and names the first sequence, without the test
-        // supplying it.
-        let retried = broker
+        // The upstream withdraws its request. The ledger takes neither the change nor its event.
+        let withdrawn = broker
             .upstream_response(
                 connection,
                 br#"{"id":71,"result":{"outcome":"deny"}}"#,
-                TimestampMs::new(12),
+                TimestampMs::new(11),
             )
-            .expect("the retry succeeds");
-        assert!(retried.is_some());
-
-        let outbox = outbox_of(&broker);
-        assert_eq!(outbox.len(), 2);
+            .expect("what the upstream did is kept")
+            .expect("it resolved a recorded request");
+        assert_eq!(outbox_of(&broker).len(), 1, "no event was recorded for it");
         assert_eq!(
-            outbox[1].parent_sequence,
-            Some(first_seq),
-            "the broker's announced parent map survived rollback and supplied the parent sequence"
+            broker
+                .recorded(resource_id)
+                .expect("the ledger reads")
+                .expect("the row is there")
+                .state,
+            PendingState::Pending,
+            "and the row went back whole"
         );
-        assert!(outbox[1].state.is_terminal());
+        // In memory it is what happened, marked as living through a gap, behind the fence the
+        // failure raised in the same condition the receipt path reads.
+        assert_eq!(withdrawn.state, PendingState::Cancelled);
+        assert_eq!(withdrawn.durability, Durability::Volatile);
+        assert_eq!(
+            broker.mode(),
+            kr_protocol::gateway::GatewayMode::NativeOnlyVolatile
+        );
+        assert!(!journal.health().is_healthy());
 
-        let _ = std::fs::remove_file(&path);
+        // The store recovers: the journal writes its gap, the broker commits its own and what
+        // lived in it, and with nothing left owed the recovery finishes.
+        injector
+            .execute("DROP TRIGGER fail_seq_2", [])
+            .expect("trigger is removed");
+        let mut journal = journal;
+        journal
+            .recover(TimestampMs::new(12))
+            .expect("the journal writes its gap")
+            .expect("a fault was open");
+        broker
+            .recover(TimestampMs::new(12))
+            .expect("the broker commits its gap");
+        assert!(
+            broker.reconcile_connected(TimestampMs::new(13)).is_some(),
+            "nothing unresolved was owed a reconciliation"
+        );
+        assert_eq!(broker.mode(), kr_protocol::gateway::GatewayMode::Normal);
+        assert_eq!(
+            broker
+                .recorded(resource_id)
+                .expect("the ledger reads")
+                .expect("the row is there")
+                .state,
+            PendingState::Cancelled,
+            "the gap committed what happened inside it"
+        );
+
+        drop(broker);
+        drop(journal);
         let _ = std::fs::remove_dir_all(path.parent().expect("parent dir"));
     }
 
@@ -2161,7 +2239,7 @@ mod tests {
 
     #[test]
     fn a_settle_built_from_a_stale_copy_is_refused() {
-        let mut ledger = Ledger::open(None).expect("the ledger opens");
+        let mut ledger = Ledger::open(None, JournalHealth::shared()).expect("the ledger opens");
         let pending = resource(7, "11", PendingState::Pending);
         ledger
             .record_opaque(&pending, &event(91, &pending))
@@ -2231,7 +2309,8 @@ mod tests {
         let file = ledger_path();
         let claimed = resource(7, "11", PendingState::Claimed);
         {
-            let mut ledger = Ledger::open(Some(&file)).expect("the ledger opens");
+            let mut ledger =
+                Ledger::open(Some(&file), JournalHealth::shared()).expect("the ledger opens");
             let opaque = resource(7, "11", PendingState::Pending);
             ledger
                 .record_opaque(&opaque, &event(92, &opaque))
@@ -2265,7 +2344,8 @@ mod tests {
                 .mark_dispatched(&claimed, &event(93, &claimed))
                 .expect("the marker is committed");
         }
-        let reopened = Ledger::open(Some(&file)).expect("the ledger reopens");
+        let reopened =
+            Ledger::open(Some(&file), JournalHealth::shared()).expect("the ledger reopens");
         let unresolved = reopened.unresolved().expect("the read succeeds");
         assert_eq!(unresolved.len(), 1);
         assert!(unresolved[0].dispatched);
@@ -2275,7 +2355,7 @@ mod tests {
 
     #[test]
     fn a_decoder_entry_outlives_the_binding_that_wrote_it() {
-        let mut ledger = Ledger::open(None).expect("the ledger opens");
+        let mut ledger = Ledger::open(None, JournalHealth::shared()).expect("the ledger opens");
         let pending = resource(7, "11", PendingState::Pending);
         ledger
             .record_opaque(&pending, &event(91, &pending))
@@ -2313,7 +2393,7 @@ mod tests {
     /// finished. Otherwise every later restart comes back fenced over a recovery that ended.
     #[test]
     fn a_gap_first_written_during_recovery_can_still_be_finished() {
-        let mut ledger = Ledger::open(None).expect("the ledger opens");
+        let mut ledger = Ledger::open(None, JournalHealth::shared()).expect("the ledger opens");
         let mut gap = EvidenceGap::open("the journal faulted", TimestampMs::new(1), 0);
         gap.closed_at = Nullable::some(TimestampMs::new(2));
         let row = ledger
@@ -2338,7 +2418,7 @@ mod tests {
 
     #[test]
     fn a_checkpoint_never_moves_backwards() {
-        let ledger = Ledger::open(None).expect("the ledger opens");
+        let ledger = Ledger::open(None, JournalHealth::shared()).expect("the ledger opens");
         ledger
             .put_checkpoint(instance(), StreamCursor::new(40), TimestampMs::new(1))
             .expect("the checkpoint is written");

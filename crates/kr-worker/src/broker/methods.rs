@@ -561,7 +561,7 @@ impl AnswerInFlight<'_> {
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
-                let _ = self.broker.uncertain(&claim, now);
+                crate::broker::settled(self.broker.uncertain(&claim, now));
                 return Err(error);
             }
         };
@@ -587,7 +587,7 @@ impl Drop for AnswerInFlight<'_> {
         // Nobody waited, or whoever did was cancelled. The marker is committed, so the answer may
         // have gone and nothing can establish whether it did. The time is now, because that is
         // when this host gave up on learning.
-        let _ = self.broker.uncertain(&claim, kr_ipc::now_ms());
+        crate::broker::settled(self.broker.uncertain(&claim, kr_ipc::now_ms()));
     }
 }
 
@@ -1004,7 +1004,7 @@ impl Broker {
         let dispatch = match state.admit_dispatch_in(&claim, &params.option_id) {
             Ok(dispatch) => dispatch,
             Err(error) => {
-                let _ = state.release_claim_in(&claim, now);
+                crate::broker::settled(state.release_claim_in(&claim, now));
                 return Err(error);
             }
         };
@@ -1023,7 +1023,7 @@ impl Broker {
         // the lock this admission already holds: going back to the broker for it here would be a
         // second acquisition of a lock this frame never let go of.
         if let Err(error) = admitted.check_transport() {
-            let _ = state.release_claim_in(&claim, now);
+            crate::broker::settled(state.release_claim_in(&claim, now));
             return Err(error);
         }
         Ok(admitted)
@@ -1083,13 +1083,13 @@ impl Broker {
         // failure, which is what uncertainty is for. A marker this host could not write has sent
         // nothing, so the reservation goes back and the resource stays answerable.
         if let Err(error) = self.commit_dispatch(&claim, now) {
-            let _ = self.release_claim(&claim, now);
+            crate::broker::settled(self.release_claim(&claim, now));
             return Err(error);
         }
         let pending = match permit.dispatch.submit(&permit.request) {
             Ok(pending) => pending,
             Err(error) => {
-                let _ = self.uncertain(&claim, now);
+                crate::broker::settled(self.uncertain(&claim, now));
                 return Err(error);
             }
         };
@@ -1252,7 +1252,7 @@ impl Broker {
             return;
         };
         if let Some(claim) = permit.settlement.as_ref() {
-            let _ = self.release_claim(claim, admitted.admitted_at());
+            crate::broker::settled(self.release_claim(claim, admitted.admitted_at()));
         }
         if let Some(token) = permit.token.as_ref() {
             self.state().tokens.retire(&token.token_id);

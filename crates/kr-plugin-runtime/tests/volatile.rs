@@ -9,7 +9,6 @@
 //! disabled, fenced or simply absent must not be able to stop a terminal.
 
 use kr_protocol::broker::{BrokerGrant, BrokerGrants, DecodingTrust};
-use kr_protocol::error::ErrorCode;
 use kr_protocol::gateway::{
     DeclarativeEntry, DeclarativeTable, GatewayMode, NativeFraming, NativeMethodClass,
     PendingState, check_transition,
@@ -101,10 +100,15 @@ fn kr_req_11_35_the_declarative_path_depends_on_no_component() {
     assert!(trust.covers(&method("session/request_permission")));
 }
 
-/// KR-REQ-11.35: the mode admits no rich work until the gap is committed, and what it writes while
-/// it is open says so.
+/// The gateway mode vocabulary: only normal operation admits rich work, a record written in any
+/// other mode says it is volatile, and the fence is left through recovery and never directly.
+///
+/// This is the vocabulary and nothing more. The fence itself, what it keeps working, the gap it
+/// leaves and the recovery that lifts it are driven live by the worker's suites, where a store
+/// really refuses a write: `crates/kr-worker/tests/gateway.rs`, `transport.rs` and
+/// `agent_service.rs`.
 #[test]
-fn kr_req_11_35_no_rich_work_returns_until_the_gap_is_committed() {
+fn the_gateway_modes_admit_rich_work_only_in_normal_operation_and_leave_the_fence_by_recovery() {
     assert!(GatewayMode::Normal.admits_rich_work());
     assert!(!GatewayMode::NativeOnlyVolatile.admits_rich_work());
     assert!(
@@ -129,28 +133,15 @@ fn kr_req_11_35_no_rich_work_returns_until_the_gap_is_committed() {
     );
 }
 
-/// KR-REQ-11.36: a claimed identifier carried across a gap is never answered twice, and the
-/// refusal a caller gets is `UPSTREAM_UNAVAILABLE` rather than a quietly substituted backend.
+/// The resource state vocabulary: an uncertain resource is terminal, so nothing claims it again.
+///
+/// That a claimed identifier carried across a gap is never answered twice is the worker's to prove
+/// with a live fault, and its suites do (`crates/kr-worker/tests/transport.rs` and `gateway.rs`).
+/// This is the transition table that proof rests on.
 #[test]
-fn kr_req_11_36_a_carried_identifier_is_never_answered_twice() {
-    // A resource that was claimed and dispatched before the fault is uncertain afterwards, and
-    // uncertain is terminal: nothing claims it again.
+fn an_uncertain_resource_is_terminal_and_is_never_claimed_again() {
     assert!(check_transition(PendingState::Claimed, PendingState::Uncertain).is_ok());
     assert!(PendingState::Uncertain.is_terminal());
     assert!(PendingState::Uncertain.permitted_transitions().is_empty());
     assert!(check_transition(PendingState::Uncertain, PendingState::Claimed).is_err());
-
-    // The code a fenced caller is told is the one that says the upstream cannot be reached now,
-    // not one that says this host lost some storage, because what the caller needs to decide is
-    // whether to try again and where.
-    let fenced = kr_worker_error_for_a_fenced_rich_call();
-    assert_eq!(fenced, ErrorCode::UpstreamUnavailable);
-}
-
-/// The code the host answers a fenced rich call with.
-///
-/// It is stated here rather than reached through the worker, because this crate does not depend on
-/// the worker; the worker's own suite drives the live refusal and asserts the same code.
-const fn kr_worker_error_for_a_fenced_rich_call() -> ErrorCode {
-    ErrorCode::UpstreamUnavailable
 }

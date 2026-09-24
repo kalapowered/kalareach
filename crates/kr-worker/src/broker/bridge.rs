@@ -1132,6 +1132,7 @@ mod tests {
         let broker = crate::broker::Broker::open(
             None,
             kr_protocol::ids::SessionId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16])),
+            crate::persistence::fault::JournalHealth::shared(),
         )
         .expect("a broker");
         for instance in instances {

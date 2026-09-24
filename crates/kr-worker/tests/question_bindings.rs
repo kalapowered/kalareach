@@ -32,6 +32,7 @@ use kr_worker::broker::{
     Broker, BrokerTransport, Credential, InstanceEnding, ManagedProcess, TransportHandle,
 };
 use kr_worker::ownership::OwnershipBoundary;
+use kr_worker::persistence::JournalHealth;
 use kr_worker::questions::{Now, Questions, SessionBoundary, VerifiedSource};
 
 fn session() -> SessionId {
@@ -114,7 +115,8 @@ fn launched(broker: &Broker, instance: ApplicationInstanceId, process: ProcessSt
 
 /// The broker, an agent it launched as this test process, and the ledger with the broker attached.
 fn bridged() -> (Arc<Broker>, ApplicationInstanceId, Questions) {
-    let broker = Arc::new(Broker::open(None, session()).expect("a broker"));
+    let broker =
+        Arc::new(Broker::open(None, session(), JournalHealth::shared()).expect("a broker"));
     let instance = ApplicationInstanceId::new(Uuid::from_bytes([9; 16]));
     launched(&broker, instance, this_process());
     let questions = Questions::open(None, session(), SessionEpoch::V1)
@@ -562,7 +564,7 @@ fn a_request_identifier_two_questions_of_one_instance_share_places_neither_in_a_
 #[cfg(unix)]
 #[test]
 fn a_helper_under_an_agent_the_broker_launched_is_bound_through_the_broker() {
-    let broker = Broker::open(None, session()).expect("a broker");
+    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("a broker");
     let instance = ApplicationInstanceId::new(Uuid::from_bytes([3; 16]));
     let me = this_process();
     // A boundary that holds nothing, read and found empty, and a root shell that is nobody's
@@ -676,7 +678,7 @@ fn an_ended_agents_record_hides_no_live_agent_that_holds_its_identifier() {
         ([(first, ended.clone()), (second, parent.clone())], second),
         ([(first, parent.clone()), (second, ended.clone())], first),
     ] {
-        let broker = Broker::open(None, session()).expect("a broker");
+        let broker = Broker::open(None, session(), JournalHealth::shared()).expect("a broker");
         for (instance, process) in records {
             launched(&broker, instance, process);
         }
@@ -797,7 +799,7 @@ fn a_helper_an_agent_started_is_bound_through_the_job_the_agent_was_started_in()
         )
     };
 
-    let broker = Broker::open(None, session()).expect("a broker");
+    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("a broker");
     let refused = verify(started.helper_pid(), &started.helper, Some(&broker))
         .expect_err("the broker has launched nothing yet");
     assert_eq!(refused.code(), ErrorCode::NotInKrSession, "{refused}");
@@ -843,7 +845,7 @@ fn a_helper_an_agent_started_is_bound_through_the_job_the_agent_was_started_in()
             first,
         ),
     ] {
-        let broker = Broker::open(None, session()).expect("a broker");
+        let broker = Broker::open(None, session(), JournalHealth::shared()).expect("a broker");
         for (instance, process) in records {
             launched(&broker, instance, process);
         }
@@ -864,7 +866,7 @@ fn a_helper_an_agent_started_is_bound_through_the_job_the_agent_was_started_in()
 #[test]
 fn an_agent_started_in_no_job_places_nothing_below_it() {
     let (_session_job, boundary) = an_empty_session(0xF000_0102);
-    let broker = Broker::open(None, session()).expect("a broker");
+    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("a broker");
     let instance = ApplicationInstanceId::new(Uuid::from_bytes([6; 16]));
     let parent = parent_process();
     launched(&broker, instance, parent.clone());

@@ -34,6 +34,9 @@ use kr_worker::broker::{
     ManagedProcess, MutationAdmission, PendingTransmission, Probe, ReconcileScope, TransportHandle,
     UpstreamBody, UpstreamDispatch, UpstreamOutcome, UpstreamRequest, subject,
 };
+use kr_worker::persistence::JournalHealth;
+
+mod common;
 
 const CREDENTIAL: [u8; 32] = [9; 32];
 
@@ -407,7 +410,7 @@ fn broker_recording(
     grants: BrokerGrants,
     decoding: Option<DecodingTrust>,
 ) -> (Broker, std::sync::Arc<RecordingUpstream>) {
-    let broker = Broker::open(None, session()).expect("the broker opens");
+    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
     broker
         .register_instance(
             instance(2),
@@ -638,7 +641,7 @@ fn kr_req_11_25_decoding_trust_is_explicit_and_display_only_creates_no_approval(
     assert!(matches!(refusal, BrokerError::PermissionDenied { .. }));
 
     // Trust without the grant it depends on is refused when it is offered, not stored.
-    let broker = Broker::open(None, session()).expect("the broker opens");
+    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
     broker
         .register_instance(instance(2), IntegrationMode::Gateway, None, None)
         .expect("the instance is registered");
@@ -681,7 +684,8 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
     let path = directory.join("session.sqlite");
 
     let resource_id = {
-        let broker = Broker::open(Some(&path), session()).expect("the broker opens");
+        let broker = Broker::open(Some(&path), session(), JournalHealth::shared())
+            .expect("the broker opens");
         broker
             .register_instance(
                 instance(2),
@@ -816,7 +820,8 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
 
     // The ledger is retained across a restart, and it says whose interpretation this was, over
     // which bytes, and exactly which decisions were offered.
-    let restarted = Broker::open(Some(&path), session()).expect("the broker reopens");
+    let restarted =
+        Broker::open(Some(&path), session(), JournalHealth::shared()).expect("the broker reopens");
     let entry = restarted
         .decoding(resource_id)
         .expect("the read succeeds")
@@ -1012,7 +1017,7 @@ fn kr_req_11_28_an_action_token_binds_actor_grant_revision_action_and_parameters
 /// argument vector, authentication state and integration mode.
 #[test]
 fn kr_req_12_02_a_launch_profile_records_what_was_resolved() {
-    let broker = Broker::open(None, session()).expect("the broker opens");
+    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
     let intent = broker
         .prepare_launch(
             profile(IntegrationMode::Gateway, [3; 32], "0.9.1"),
@@ -1046,7 +1051,7 @@ fn kr_req_12_02_a_launch_profile_records_what_was_resolved() {
 /// end-to-end demonstration of an untouched terminal belongs to the gateway suite.
 #[test]
 fn kr_req_12_03_a_stale_launch_is_refused_and_starts_nothing() {
-    let broker = Broker::open(None, session()).expect("the broker opens");
+    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
     let intent = broker
         .prepare_launch(
             profile(IntegrationMode::Gateway, [3; 32], "0.9.1"),
@@ -1085,7 +1090,7 @@ fn kr_req_12_03_a_stale_launch_is_refused_and_starts_nothing() {
 /// and selecting another conversation moves the reservation rather than leaving both taken.
 #[test]
 fn kr_req_12_05_no_second_process_runs_against_one_saved_conversation() {
-    let broker = Broker::open(None, session()).expect("the broker opens");
+    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
     let first = broker
         .prepare_launch(
             profile(IntegrationMode::Gateway, [3; 32], "0.9.1"),
@@ -1145,7 +1150,7 @@ fn kr_req_12_05_no_second_process_runs_against_one_saved_conversation() {
 /// and measuring its deadline is the acceptance owner's, because it needs an upstream to probe.
 #[test]
 fn kr_req_11_16_a_probe_is_bounded_and_disclosed_before_it_runs() {
-    let broker = Broker::open(None, session()).expect("the broker opens");
+    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
     broker
         .register_instance(
             instance(2),
@@ -1344,7 +1349,7 @@ fn kr_req_11_17_an_action_rechecks_its_capability_and_an_upgrade_spares_a_pinned
 /// here can say it works here.
 #[test]
 fn kr_req_01_02_the_capability_map_is_per_installation() {
-    let broker = Broker::open(None, session()).expect("the broker opens");
+    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
     broker
         .register_instance(
             instance(2),
@@ -1418,7 +1423,7 @@ fn kr_req_07_67_a_native_exit_names_its_backend_and_closing_an_attachment_leaves
     let pid = u64::from(child.id());
     let identity = process_identity(pid, 12_345);
 
-    let broker = Broker::open(None, session()).expect("the broker opens");
+    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
     broker
         .register_instance(
             instance(2),
@@ -1456,7 +1461,8 @@ fn kr_req_07_67_a_native_exit_names_its_backend_and_closing_an_attachment_leaves
     let _ = child.kill();
     let _ = child.wait();
 
-    let bypassed = Broker::open(None, session()).expect("the broker opens");
+    let bypassed =
+        Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
     bypassed
         .register_instance(instance(4), IntegrationMode::NativeTerminal, None, None)
         .expect("the instance is registered");
@@ -1514,7 +1520,8 @@ fn kr_req_24_24_a_consumed_cursor_survives_a_restart() {
     std::fs::create_dir_all(&directory).expect("the directory is created");
     let path = directory.join("session.sqlite");
     {
-        let broker = Broker::open(Some(&path), session()).expect("the broker opens");
+        let broker = Broker::open(Some(&path), session(), JournalHealth::shared())
+            .expect("the broker opens");
         broker
             .register_instance(instance(2), IntegrationMode::Gateway, None, None)
             .expect("the instance is registered");
@@ -1529,7 +1536,8 @@ fn kr_req_24_24_a_consumed_cursor_survives_a_restart() {
             .checkpoint(instance(2), StreamCursor::new(40), TimestampMs::new(2))
             .expect("the checkpoint is written");
     }
-    let restarted = Broker::open(Some(&path), session()).expect("the broker reopens");
+    let restarted =
+        Broker::open(Some(&path), session(), JournalHealth::shared()).expect("the broker reopens");
     assert_eq!(
         restarted
             .consumed_cursor(instance(2))
@@ -1539,19 +1547,23 @@ fn kr_req_24_24_a_consumed_cursor_survives_a_restart() {
     let _ = std::fs::remove_dir_all(&directory);
 }
 
-/// A gap commits everything that happened inside it, including endings, and normal operation
-/// afterwards writes every later transition down.
+/// KR-REQ-11.37: a gap commits everything that happened inside it, including endings, and normal
+/// operation afterwards writes every later transition down.
 ///
-/// This is the durability half of `native_only_volatile`. The fence itself, the native
-/// arbitration that continues through it and `UPSTREAM_UNAVAILABLE` are the gateway's.
+/// This is the durability half of `native_only_volatile`, and the fault here is the broker's own
+/// ledger: its store refuses a write in the middle of native traffic, the failure is reported to
+/// the session's journal condition where it happens, and the receipt path and the broker are both
+/// behind the fence from that moment. The fence itself, the native arbitration that continues
+/// through it and `UPSTREAM_UNAVAILABLE` are the gateway's.
 #[tokio::test]
-async fn a_committed_gap_records_what_happened_inside_it_and_restores_durable_writes() {
-    let directory = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
-    std::fs::create_dir_all(&directory).expect("the directory is created");
-    let path = directory.join("session.sqlite");
+async fn kr_req_11_37_a_committed_gap_records_what_happened_inside_it_and_restores_durable_writes()
+{
+    let mut store = common::SharedStore::open();
+    let path = store.path.clone();
 
     let (surviving, withdrawn) = {
-        let broker = Broker::open(Some(&path), session()).expect("the broker opens");
+        let broker =
+            Broker::open(Some(&path), session(), store.health()).expect("the broker opens");
         broker
             .register_instance(
                 instance(2),
@@ -1592,13 +1604,37 @@ async fn a_committed_gap_records_what_happened_inside_it_and_restores_durable_wr
         let withdrawn =
             offer(&broker, instance(2), binding(9), "12", 4).expect("the offer is accepted");
 
-        // The journal faults. No new rich approval is created while it is fenced.
+        // The ledger's store stops taking writes. The next native request meets it: the request
+        // is still recorded, in memory, and its interpretation is refused because rich work is
+        // now fenced.
         broker
-            .enter_volatile("the journal could not be written", TimestampMs::new(6))
-            .expect("the fence is entered");
+            .refuse_ledger_writes(true)
+            .expect("the store is put in query-only mode");
+        let during = forward(&broker, "13", 7).expect("the native request is still recorded");
+        assert_eq!(
+            during.durability,
+            kr_protocol::session::Durability::Volatile
+        );
         assert!(
-            offer(&broker, instance(2), binding(9), "13", 7).is_err(),
-            "rich approvals are fenced while the journal is faulted"
+            !store.journal.health().is_healthy(),
+            "the ledger's failure is the session's journal condition, which the receipt path reads"
+        );
+        assert_eq!(
+            broker.mode(),
+            kr_protocol::gateway::GatewayMode::NativeOnlyVolatile
+        );
+        let fenced = broker
+            .interpret(
+                binding(9),
+                during.resource_id,
+                projection(),
+                None,
+                TimestampMs::new(8),
+            )
+            .expect_err("rich approvals are fenced while the store is faulted");
+        assert_eq!(
+            fenced.code(),
+            kr_protocol::error::ErrorCode::UpstreamUnavailable
         );
 
         // The upstream withdraws one of them inside the gap. That ending is what a recovery that
@@ -1607,6 +1643,12 @@ async fn a_committed_gap_records_what_happened_inside_it_and_restores_durable_wr
             .upstream_resolved(&request(1, "12"), TimestampMs::new(8))
             .expect("the upstream answered it itself");
 
+        // The store takes writes again. The journal writes its own gap and calls the condition
+        // healthy, which is what lets the broker commit its own.
+        broker
+            .refuse_ledger_writes(false)
+            .expect("the store takes writes again");
+        store.recover_journal(9);
         broker
             .recover(TimestampMs::new(9))
             .expect("the gap is committed");
@@ -1622,10 +1664,16 @@ async fn a_committed_gap_records_what_happened_inside_it_and_restores_durable_wr
             .reconcile_recovered(
                 broker.recovery_generation(),
                 scope(instance(2), 1),
-                &[Broker::downstream(
-                    GatewayConnectionId::new(1),
-                    UpstreamRequestId::new("11").expect("valid"),
-                )],
+                &[
+                    Broker::downstream(
+                        GatewayConnectionId::new(1),
+                        UpstreamRequestId::new("11").expect("valid"),
+                    ),
+                    Broker::downstream(
+                        GatewayConnectionId::new(1),
+                        UpstreamRequestId::new("13").expect("valid"),
+                    ),
+                ],
                 TimestampMs::new(11),
             )
             .expect("the upstream said what it still holds, and rich work resumes");
@@ -1640,7 +1688,8 @@ async fn a_committed_gap_records_what_happened_inside_it_and_restores_durable_wr
     };
 
     // A restart reads back what the gap committed and what happened after it.
-    let restarted = Broker::open(Some(&path), session()).expect("the broker reopens");
+    let restarted =
+        Broker::open(Some(&path), session(), JournalHealth::shared()).expect("the broker reopens");
     assert!(
         restarted.pending(surviving).is_none(),
         "a resolved resource is not one a restart offers again"
@@ -1649,7 +1698,6 @@ async fn a_committed_gap_records_what_happened_inside_it_and_restores_durable_wr
         restarted.pending(withdrawn).is_none(),
         "an ending inside the gap was committed rather than left pending for ever"
     );
-    let _ = std::fs::remove_dir_all(&directory);
 }
 
 /// The broker holds a bounded number of unconsumed source frames.
@@ -1765,7 +1813,7 @@ fn kr_req_11_17_evidence_names_the_package_publisher_schema_and_binary_it_was_ga
 
     // An instance with no launch profile and no managed process has no binary identity, so
     // evidence about a binary is refused instead of accepted unchecked.
-    let adopted = Broker::open(None, session()).expect("the broker opens");
+    let adopted = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
     adopted
         .register_instance(instance(4), IntegrationMode::Gateway, None, None)
         .expect("the instance is registered");

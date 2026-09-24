@@ -288,6 +288,16 @@ impl JournalHealth {
         DurabilityPosture::of(&self.condition())
     }
 
+    /// Returns true while every durable write this session needs is available.
+    ///
+    /// It reads the condition without copying it, because a consumer asks it before each of its
+    /// own decisions: the broker applies the condition before every operation it takes, and a
+    /// fault it finds there is the fence it raises.
+    #[must_use]
+    pub fn is_healthy(&self) -> bool {
+        self.sender.borrow().is_healthy()
+    }
+
     /// Subscribes to every change of condition.
     ///
     /// The receiver starts holding the condition now, so a consumer that subscribes after a fault

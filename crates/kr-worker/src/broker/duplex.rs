@@ -44,7 +44,6 @@ use kr_protocol::ids::{
 use kr_protocol::scalars::TimestampMs;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-use crate::broker::Broker;
 use crate::broker::error::{BrokerError, Result};
 use crate::broker::framing::Framing;
 use crate::broker::host::Performed;
@@ -52,6 +51,7 @@ use crate::broker::ledger::ClientRequestOutcome;
 use crate::broker::methods::{
     PendingTransmission, UpstreamBody, UpstreamDispatch, UpstreamOutcome, UpstreamRequest,
 };
+use crate::broker::{Broker, settled};
 
 /// How many bytes may be waiting to be written to one end of a connection.
 ///
@@ -1983,9 +1983,10 @@ impl Duplex {
             .outstanding
             .forwarding(&upstream_request_id, client_identifier.clone())
         {
-            let _ = self
-                .broker
-                .client_request_settled(&admitted, ClientRequestOutcome::Unsent);
+            settled(
+                self.broker
+                    .client_request_settled(&admitted, ClientRequestOutcome::Unsent),
+            );
             // Refused in place, and the terminal is told under its own identifier: a request this
             // connection cannot carry is an answer the person gets now rather than a wait that
             // never ends.
@@ -2025,7 +2026,7 @@ impl Duplex {
         let queued = self.ends.upstream.queue_then(
             encoded,
             Some(Completion::new(move |delivery| {
-                let _ = broker.client_request_settled(&admitted, outcome_of(delivery));
+                settled(broker.client_request_settled(&admitted, outcome_of(delivery)));
                 if delivery != Delivery::Transmitted
                     && let Some(id) = forwarded.as_ref()
                 {
@@ -2377,9 +2378,9 @@ impl AdmittedAnswer {
         };
         let now = kr_ipc::now_ms();
         if delivery == Delivery::Transmitted {
-            let _ = self.broker.native_answer_sent(&answer, now);
+            settled(self.broker.native_answer_sent(&answer, now));
         } else {
-            let _ = self.broker.native_answer_uncertain(&answer, now);
+            settled(self.broker.native_answer_uncertain(&answer, now));
         }
     }
 }
@@ -2389,9 +2390,10 @@ impl Drop for AdmittedAnswer {
         let Some(answer) = self.answer.take() else {
             return;
         };
-        let _ = self
-            .broker
-            .native_answer_uncertain(&answer, kr_ipc::now_ms());
+        settled(
+            self.broker
+                .native_answer_uncertain(&answer, kr_ipc::now_ms()),
+        );
     }
 }
 
@@ -2427,7 +2429,7 @@ impl HostAnswer {
         } else {
             PendingState::Uncertain
         };
-        let _ = self.broker.reverse_answered(&request, to, kr_ipc::now_ms());
+        settled(self.broker.reverse_answered(&request, to, kr_ipc::now_ms()));
     }
 }
 
@@ -2436,9 +2438,10 @@ impl Drop for HostAnswer {
         let Some(request) = self.request.take() else {
             return;
         };
-        let _ = self
-            .broker
-            .reverse_answered(&request, PendingState::Uncertain, kr_ipc::now_ms());
+        settled(
+            self.broker
+                .reverse_answered(&request, PendingState::Uncertain, kr_ipc::now_ms()),
+        );
     }
 }
 

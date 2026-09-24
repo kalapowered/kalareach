@@ -290,15 +290,17 @@ impl WorkerService {
         binding: ServiceBinding,
     ) -> Result<Self> {
         let boot_epoch = kr_ipc::identity::boot_epoch(&binding.boot_identity)?;
-        let (session_id, session_epoch) = {
+        let (session_id, session_epoch, health) = {
             let session = runtime.session();
-            (session.id(), session.epoch())
+            (session.id(), session.epoch(), Arc::clone(session.health()))
         };
         // The broker's records live in the same journal file, beside the receipts and the
-        // questions, with their own version row.
+        // questions, with their own version row. It reads the session's own journal condition, and
+        // reports its own store's failures there: one fence for the receipt path and the broker.
         let broker = Arc::new(crate::broker::Broker::open(
             binding.journal_path.as_deref(),
             session_id,
+            health,
         )?);
         // The broker is the bridge that says which launched agent a question's source belongs to
         // and the binding it asks under, so a switch it detects invalidates what was asked under
@@ -536,7 +538,7 @@ impl WorkerService {
                     let mut session = self.runtime.session();
                     // A store that has started answering again is a store this host may call
                     // durable, and the interval it could not is written down before it says so.
-                    session.recover_journal();
+                    self.recover_storage(&mut session);
                     session.collect_expired();
                     // Output retention is separate from receipt retention and runs on the same
                     // tick: section 20 budgets the two stores apart, so history pressure never
@@ -555,6 +557,55 @@ impl WorkerService {
             }
             tick.tick().await;
         }
+    }
+
+    /// Takes the store out of a fault it has stopped failing with: the journal first, then the
+    /// broker.
+    ///
+    /// The journal writes its gap and only then calls the condition healthy, and the broker's
+    /// records are in the same store behind the same condition, so its half follows: it commits
+    /// its own gap and reconciles the upstreams it can, and rich work returns with the last of
+    /// them. It runs under the session and the dispatch barrier, so no mutation is decided between
+    /// the journal's recovery and the broker's.
+    fn recover_storage(&self, session: &mut crate::session::Session) {
+        session.recover_journal();
+        self.recover_broker();
+    }
+
+    /// Runs the storage half of one maintenance pass now.
+    ///
+    /// Maintenance does this on its own cadence, once a minute. This exists so that this host's
+    /// own tests can reach the end of a storage fault without waiting for that pass, through the
+    /// same barrier and the same order. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn recover_storage_now(&self) {
+        let _barrier = self
+            .dispatch
+            .lock()
+            .expect("the dispatch barrier is not poisoned");
+        let mut session = self.runtime.session();
+        self.recover_storage(&mut session);
+    }
+
+    /// Takes the broker through its half of a recovery the journal has finished.
+    ///
+    /// It commits the broker's gap and owes each upstream with an unresolved resource a
+    /// reconciliation, then reconciles every one whose connection is open. A store that fails
+    /// again has already raised the fence where it failed, and the next pass starts again.
+    fn recover_broker(&self) {
+        let now = kr_ipc::now_ms();
+        let mode = self.broker.mode();
+        if mode == kr_protocol::gateway::GatewayMode::Normal {
+            return;
+        }
+        if mode == kr_protocol::gateway::GatewayMode::NativeOnlyVolatile
+            && self.broker.recover(now).is_err()
+        {
+            return;
+        }
+        // Whether this pass finished the recovery or left upstreams still owed, the next pass
+        // looks again; there is nothing further to do with the answer here.
+        let _finished = self.broker.reconcile_connected(now);
     }
 
     /// Looks at the host's clocks, and revalidates what a discontinuity invalidated.

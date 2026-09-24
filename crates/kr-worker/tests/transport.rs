@@ -27,6 +27,7 @@ use kr_worker::broker::{
     Broker, BrokerTransport, Carried, Credential, Duplex, FileAccess, Framing, HostFiles,
     ManagedProcess, TransportHandle,
 };
+use kr_worker::persistence::JournalHealth;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
 mod common;
@@ -332,14 +333,14 @@ fn outbox_after(broker: &Broker, sequence: u64) -> Vec<kr_worker::broker::Transi
 /// ledger has seen, so the one this opens is not the one the process before it had.
 fn broker_at(journal: &std::path::Path) -> (Arc<Broker>, GatewayConnectionId) {
     broker_from(
-        Broker::open(Some(journal), session()).expect("the broker opens"),
+        Broker::open(Some(journal), session(), JournalHealth::shared()).expect("the broker opens"),
         rich(),
     )
 }
 
 fn broker_with_rich(rich: RichMethodTable) -> Arc<Broker> {
     broker_from(
-        Broker::open(None, session()).expect("the broker opens"),
+        Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens"),
         rich,
     )
     .0
@@ -1610,17 +1611,22 @@ async fn kr_req_11_32_a_connection_runs_a_bounded_number_of_reverse_operations()
 
 /// KR-REQ-11.35 and KR-REQ-11.23: while the journal is faulted a reverse write is refused, because
 /// its marker cannot be recorded, and a reverse read still runs under the in-memory arbitration.
+///
+/// The fault is the receipt journal's own: the store refuses an acceptance, and the broker reads
+/// the same condition, so the request that follows is decided behind the fence.
 #[tokio::test]
 async fn kr_req_11_35_a_faulted_journal_refuses_reverse_writes_and_keeps_reads() {
-    let broker = broker();
+    let mut store = common::SharedStore::open();
+    let (broker, _) = broker_from(
+        Broker::open(None, session(), store.health()).expect("the broker opens"),
+        rich(),
+    );
     let (owner, upstream, _client, drained) = duplex_over_sockets(&broker).await;
     let mut upstream_reader = tokio::io::BufReader::new(upstream);
     let directory = private_directory();
     std::fs::write(directory.join("r.txt"), "readable").expect("the file is written");
     grant_files(&broker, &directory, FileAccess::ReadWrite);
-    broker
-        .enter_volatile("the journal could not be written", TimestampMs::new(2))
-        .expect("the gateway is fenced");
+    store.fault_acceptance();
 
     ask(
         &owner,
@@ -1971,7 +1977,7 @@ async fn kr_req_12_08_each_operation_encodes_as_the_method_its_table_names_with_
     // A table that names no method for an operation refuses the operation at admission, before
     // anything is marked and before any byte. So does one whose method this build lists as
     // unsupported.
-    let bare = Broker::open(None, session()).expect("the broker opens");
+    let bare = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
     bare.register_instance(instance(), IntegrationMode::Gateway, None, Some(managed()))
         .expect("the instance is registered");
     let mut narrowed = rich();
@@ -2136,7 +2142,7 @@ async fn kr_req_11_33_an_answer_needs_no_rich_method_of_its_own() {
 /// started. Nothing here pretends to have launched anything.
 #[cfg(unix)]
 fn broker_for_launch() -> Arc<Broker> {
-    Arc::new(Broker::open(None, session()).expect("the broker opens"))
+    Arc::new(Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens"))
 }
 
 /// A broker that expects this process on its connections, for the tests that stand in for a bridge.
@@ -2147,7 +2153,7 @@ fn broker_for_launch() -> Arc<Broker> {
 #[cfg(unix)]
 fn broker_expecting_this_process() -> (Arc<Broker>, ProcessStartIdentity) {
     let running = kr_ipc::identity::current_process_start_identity().expect("a process identity");
-    let broker = Broker::open(None, session()).expect("the broker opens");
+    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
     broker
         .register_instance(
             instance(),
@@ -3783,9 +3789,11 @@ async fn kr_req_12_11_a_position_from_an_earlier_run_replays_the_stream_again() 
     );
     assert_eq!(durable[0].sequence, 1);
 
+    // The store stops taking writes. The next request meets that refusal, and the fence goes up
+    // under it.
     first_run
-        .enter_volatile("the journal could not be written", TimestampMs::new(3))
-        .expect("the gateway enters volatile-native mode");
+        .refuse_ledger_writes(true)
+        .expect("the store is put in query-only mode");
     for (id, at) in [(102, 4), (103, 5)] {
         first_run
             .forward_native(
@@ -5750,10 +5758,11 @@ async fn kr_req_12_11_a_recovery_that_cannot_cover_the_interval_tells_the_views_
             .expect("the request is carried");
         let _ = next_line(&mut upstream_client).await;
     }
-    // Then a journal that cannot be written.
+    // Then a store that cannot be written. The next request meets that refusal, and the fence goes
+    // up under it.
     broker
-        .enter_volatile("the journal could not be written", TimestampMs::new(3))
-        .expect("the gateway enters volatile-native mode");
+        .refuse_ledger_writes(true)
+        .expect("the store is put in query-only mode");
 
     // More transitions than the observation queue holds, with nothing reading it. None of them is
     // recorded, so none of them can be replayed.
@@ -6905,4 +6914,450 @@ async fn wait_for_resync(
             _ => {}
         }
     }
+}
+
+/// The caller every rich answer in this suite's fault tests comes from.
+fn device() -> kr_worker::broker::Caller {
+    kr_worker::broker::Caller {
+        actor_id: ActorId::new("device-1").expect("valid"),
+        grant_id: None,
+    }
+}
+
+/// A rich answer to one resource.
+fn respond_to(
+    resource_id: kr_protocol::ids::PendingResourceId,
+) -> kr_protocol::agent::AgentApprovalRespondParams {
+    kr_protocol::agent::AgentApprovalRespondParams {
+        target: target(),
+        resource_id,
+        option_id: "allow".to_owned(),
+    }
+}
+
+/// Sends one upstream request and returns the resource it was recorded as.
+async fn upstream_asks(owner: &Arc<Duplex>, id: u32) -> kr_protocol::ids::PendingResourceId {
+    let frame = format!(r#"{{"id":{id},"method":"session/request_permission","params":{{}}}}"#);
+    match owner
+        .from_upstream(frame.as_bytes(), TimestampMs::new(2))
+        .await
+        .expect("the request is carried")
+    {
+        Carried::UpstreamRequest {
+            resource_id: Some(resource_id),
+            ..
+        } => resource_id,
+        other => panic!("a request is what this was: {other:?}"),
+    }
+}
+
+/// KR-REQ-11.35, KR-REQ-11.36 and KR-REQ-11.37: the receipt journal faults while native traffic
+/// and competing rich answers are live. Native traffic goes on in both directions, rich work is
+/// fenced at the next decision, no identifier that was carried across the fault is answered
+/// twice, and rich work comes back only once the gap is committed and the upstream is reconciled.
+///
+/// Before the fault one request has a rich answer admitted and not yet sent, one is answerable, and
+/// one has been answered by the terminal. The fault is the receipt journal's own: the store refuses
+/// an acceptance, and the broker reads that same condition.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_35_a_journal_fault_under_live_traffic_keeps_native_progress_and_fences_rich_work()
+ {
+    let mut store = common::SharedStore::open();
+    let (broker, _) = broker_from(
+        Broker::open(Some(&store.path), session(), store.health()).expect("the broker opens"),
+        rich(),
+    );
+    let (owner, upstream, client, drained) = duplex_over_sockets(&broker).await;
+    let upstream_reader = tokio::io::BufReader::new(upstream);
+    let mut client_reader = tokio::io::BufReader::new(client);
+    broker.bind_connection_dispatch(
+        GatewayConnectionId::new(1),
+        owner.dispatch().expect("the connection carries operations"),
+    );
+
+    // Request 1 has a rich answer admitted and encoded, and not yet sent: the reply is racing.
+    let one = upstream_asks(&owner, 1).await;
+    let _ = next_line(&mut client_reader).await;
+    broker
+        .interpret(binding(), one, projection(), None, TimestampMs::new(2))
+        .expect("interpreted");
+    let racing = broker
+        .admit_approval(&device(), &respond_to(one), TimestampMs::new(3))
+        .expect("the rich answer is admitted");
+    // Request 2 is answerable, and request 3 the terminal has already answered.
+    let two = upstream_asks(&owner, 2).await;
+    let _ = next_line(&mut client_reader).await;
+    broker
+        .interpret(binding(), two, projection(), None, TimestampMs::new(3))
+        .expect("interpreted");
+    let three = upstream_asks(&owner, 3).await;
+    let _ = next_line(&mut client_reader).await;
+    owner
+        .from_client(
+            br#"{"id":3,"result":{"behavior":"allow"}}"#,
+            TimestampMs::new(4),
+        )
+        .await
+        .expect("the terminal's answer is carried");
+    assert_eq!(
+        settled_within(&broker, three, LIVENESS_DEADLINE).await,
+        Some(PendingState::Resolved)
+    );
+
+    // The receipt journal faults.
+    store.fault_acceptance();
+    assert!(!store.journal.health().is_healthy());
+
+    // Rich work is fenced at the broker's very next decision: the racing answer is not sent, a new
+    // one is refused, and neither is a second backend or a quiet downgrade.
+    let Err(fenced) = broker.record_approval(&racing, TimestampMs::new(5)) else {
+        panic!("the racing rich answer is fenced");
+    };
+    assert_eq!(
+        fenced.code(),
+        kr_protocol::error::ErrorCode::UpstreamUnavailable
+    );
+    let refused = broker
+        .agent_approval_respond(&device(), &respond_to(two), TimestampMs::new(5))
+        .await
+        .expect_err("a new rich answer is fenced");
+    assert_eq!(
+        refused.code(),
+        kr_protocol::error::ErrorCode::UpstreamUnavailable
+    );
+    assert_eq!(
+        broker.mode(),
+        kr_protocol::gateway::GatewayMode::NativeOnlyVolatile
+    );
+
+    // Native traffic goes on, both ways, arbitrated in memory.
+    let four = upstream_asks(&owner, 4).await;
+    assert!(next_line(&mut client_reader).await.contains("\"id\":4"));
+    assert_eq!(
+        broker.pending(four).expect("recorded").durability,
+        kr_protocol::session::Durability::Volatile,
+        "a request the gap recorded says so"
+    );
+    owner
+        .from_client(
+            br#"{"id":4,"result":{"behavior":"allow"}}"#,
+            TimestampMs::new(6),
+        )
+        .await
+        .expect("the terminal's answer is carried through the fault");
+    // The racing rich answer never went, so the claim it held came back and the terminal answers.
+    owner
+        .from_client(
+            br#"{"id":1,"result":{"behavior":"deny"}}"#,
+            TimestampMs::new(6),
+        )
+        .await
+        .expect("the terminal answers the request the rich answer never reached");
+    owner
+        .from_client(
+            br#"{"id":9,"method":"session/update","params":{"from":"the terminal"}}"#,
+            TimestampMs::new(6),
+        )
+        .await
+        .expect("the terminal's own request is carried");
+    owner
+        .from_upstream(
+            br#"{"method":"session/update","params":{"n":1}}"#,
+            TimestampMs::new(6),
+        )
+        .await
+        .expect("the upstream's notification is carried");
+    assert!(
+        next_line(&mut client_reader)
+            .await
+            .contains("session/update")
+    );
+    for resource in [one, four] {
+        assert_eq!(
+            settled_within(&broker, resource, LIVENESS_DEADLINE).await,
+            Some(PendingState::Resolved)
+        );
+    }
+
+    // What was answered before the fault, or through it, is not answered again by anyone.
+    for answered in [3, 1] {
+        assert!(
+            owner
+                .from_client(
+                    format!(r#"{{"id":{answered},"result":{{"behavior":"allow"}}}}"#).as_bytes(),
+                    TimestampMs::new(7),
+                )
+                .await
+                .is_err(),
+            "{answered} is answered once"
+        );
+    }
+
+    // The gap says what passed through it.
+    let gap = broker.gap().expect("the gap is open");
+    assert_eq!(
+        gap.carried_pending.get(),
+        1,
+        "the request whose rich answer was admitted was carried"
+    );
+    assert!(gap.native_requests.get() >= 2);
+    assert!(gap.native_responses.get() >= 2);
+    assert!(gap.fenced_rich_operations.get() >= 1);
+
+    // Storage returns. The journal writes its gap, the broker its own; request 2 is still open at
+    // the upstream, and this connection carried all of the gap, so reconciling it is what it
+    // holds. Rich work is back only once that has happened.
+    store.recover_journal(20);
+    broker
+        .recover(TimestampMs::new(20))
+        .expect("the broker commits its gap");
+    assert!(
+        broker
+            .agent_approval_respond(&device(), &respond_to(two), TimestampMs::new(21))
+            .await
+            .is_err(),
+        "a committed gap is not a reconciled upstream"
+    );
+    assert!(
+        broker.reconcile_connected(TimestampMs::new(21)).is_some(),
+        "the one upstream owed is reconciled from what its connection carried"
+    );
+    let resumed = broker
+        .agent_approval_respond(&device(), &respond_to(two), TimestampMs::new(22))
+        .await
+        .expect("rich work is back")
+        .0;
+    assert_eq!(resumed.state, PendingState::Resolved);
+
+    // Every answer reached the upstream once, and the one the fence stopped never did.
+    assert_eq!(owner.reverse_operations_running(), 0);
+    let sent = everything_sent_upstream(owner, drained, upstream_reader).await;
+    for id in [1, 2, 3, 4] {
+        assert_eq!(answers_for(&sent, id), 1, "{id} was answered once");
+    }
+    assert_eq!(
+        sent.iter()
+            .filter(
+                |frame| frame["result"]["behavior"] == serde_json::json!("allow")
+                    && frame["id"] == serde_json::json!(1)
+            )
+            .count(),
+        0,
+        "the fenced rich answer to 1 never reached the upstream"
+    );
+    assert!(
+        sent.iter().any(|frame| frame.get("method").is_some()),
+        "the terminal's own request reached the upstream"
+    );
+}
+
+/// KR-REQ-11.35 and KR-REQ-11.37: the broker's own ledger refuses the marker of the terminal's
+/// answer under live traffic. The failure raises the one fence the receipt path reads too, the
+/// answer still goes once, the terminal's own request and the upstream's next request still flow,
+/// and the gap commits the answer's settlement once the store recovers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_35_a_ledger_refusing_a_marker_under_live_traffic_raises_the_one_fence() {
+    let mut store = common::SharedStore::open();
+    let (broker, _) = broker_from(
+        Broker::open(Some(&store.path), session(), store.health()).expect("the broker opens"),
+        rich(),
+    );
+    let (owner, upstream, client, drained) = duplex_over_sockets(&broker).await;
+    let upstream_reader = tokio::io::BufReader::new(upstream);
+    let mut client_reader = tokio::io::BufReader::new(client);
+
+    let eleven = upstream_asks(&owner, 11).await;
+    let _ = next_line(&mut client_reader).await;
+    broker
+        .refuse_ledger_writes(true)
+        .expect("the store is put in query-only mode");
+
+    // The terminal answers. Its marker is refused by the store, and the answer goes regardless.
+    owner
+        .from_client(
+            br#"{"id":11,"result":{"behavior":"allow"}}"#,
+            TimestampMs::new(3),
+        )
+        .await
+        .expect("the answer is carried through the store's refusal");
+    assert!(
+        !store.journal.health().is_healthy(),
+        "the ledger's failure is the session's condition, which the receipt path reads"
+    );
+    assert_eq!(
+        broker.mode(),
+        kr_protocol::gateway::GatewayMode::NativeOnlyVolatile
+    );
+    assert_eq!(
+        settled_within(&broker, eleven, LIVENESS_DEADLINE).await,
+        Some(PendingState::Resolved)
+    );
+    assert!(
+        owner
+            .from_client(
+                br#"{"id":11,"result":{"behavior":"deny"}}"#,
+                TimestampMs::new(4),
+            )
+            .await
+            .is_err(),
+        "and it is answered once"
+    );
+
+    // Native traffic goes on: the terminal's own request, and the upstream's next one.
+    owner
+        .from_client(
+            br#"{"id":5,"method":"session/update","params":{"from":"the terminal"}}"#,
+            TimestampMs::new(4),
+        )
+        .await
+        .expect("the terminal's own request is carried");
+    let twelve = upstream_asks(&owner, 12).await;
+    assert!(next_line(&mut client_reader).await.contains("\"id\":12"));
+    let fenced = broker
+        .interpret(binding(), twelve, projection(), None, TimestampMs::new(5))
+        .expect_err("rich interpretation is fenced");
+    assert_eq!(
+        fenced.code(),
+        kr_protocol::error::ErrorCode::UpstreamUnavailable
+    );
+
+    // The store recovers. The gap commits the answer's settlement, and the connection, which
+    // carried all of the gap, is reconciled with what it holds: request 12.
+    broker
+        .refuse_ledger_writes(false)
+        .expect("the store takes writes again");
+    store.recover_journal(30);
+    broker
+        .recover(TimestampMs::new(30))
+        .expect("the broker commits its gap");
+    assert!(broker.reconcile_connected(TimestampMs::new(31)).is_some());
+    assert_eq!(
+        broker
+            .recorded(eleven)
+            .expect("the ledger reads")
+            .expect("recorded")
+            .state,
+        PendingState::Resolved
+    );
+    assert_eq!(
+        broker.pending(twelve).expect("held").state,
+        PendingState::Pending,
+        "the upstream still holds 12, so it stays answerable"
+    );
+
+    let sent = everything_sent_upstream(owner, drained, upstream_reader).await;
+    assert_eq!(
+        answers_for(&sent, 11),
+        1,
+        "the answer reached the upstream once"
+    );
+    assert!(
+        sent.iter().any(|frame| frame.get("method").is_some()),
+        "the terminal's own request reached the upstream"
+    );
+}
+
+/// KR-REQ-11.37: the host reconciles a connection from its own record only when that record is
+/// the whole of what its upstream saw, and only once none of its answers is still in flight.
+///
+/// Connection 1 stays open through the gap with a rich answer admitted and not yet sent; it is
+/// reconciled once that answer is given up. Connection 2 closes during the gap and is restored: its
+/// upstream was out of reach for part of it, so the host does not speak for it, and rich work waits
+/// for that upstream to say what it still holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_37_reconciliation_waits_for_answers_in_flight_and_for_an_interrupted_upstream() {
+    let mut store = common::SharedStore::open();
+    let (broker, first) = broker_from(
+        Broker::open(Some(&store.path), session(), store.health()).expect("the broker opens"),
+        rich(),
+    );
+    let second = broker
+        .open_native_connection(
+            instance(),
+            &CREDENTIAL,
+            &process_identity(),
+            &package(),
+            "1",
+        )
+        .expect("a second native connection");
+    let (owner, _upstream, client, drained) = duplex_over_sockets(&broker).await;
+    let mut client_reader = tokio::io::BufReader::new(client);
+    let other = duplex_watched_on(&broker, second).await;
+    broker.bind_connection_dispatch(first, owner.dispatch().expect("it carries operations"));
+
+    let held = upstream_asks(&owner, 1).await;
+    let _ = next_line(&mut client_reader).await;
+    broker
+        .interpret(binding(), held, projection(), None, TimestampMs::new(2))
+        .expect("interpreted");
+    let admitted = broker
+        .admit_approval(&device(), &respond_to(held), TimestampMs::new(3))
+        .expect("a rich answer is admitted and not sent");
+    let elsewhere = upstream_asks(&other.owner, 2).await;
+
+    store.fault_acceptance();
+    assert_eq!(
+        broker.mode(),
+        kr_protocol::gateway::GatewayMode::NativeOnlyVolatile
+    );
+    // Connection 2 ends inside the gap and its upstream comes back to it.
+    broker.close_connection(second);
+    broker
+        .restore_native_connection(
+            second,
+            instance(),
+            &CREDENTIAL,
+            &process_identity(),
+            &package(),
+            "1",
+        )
+        .expect("the connection is restored");
+
+    store.recover_journal(10);
+    broker
+        .recover(TimestampMs::new(10))
+        .expect("the broker commits its gap");
+    assert!(
+        broker.reconcile_connected(TimestampMs::new(11)).is_none(),
+        "an answer in flight on 1 and an interrupted upstream on 2 are both still owed"
+    );
+    assert_eq!(broker.mode(), kr_protocol::gateway::GatewayMode::Recovering);
+
+    // The answer in flight is given up: connection 1 carried all of the gap and is reconciled now.
+    broker.abandon(&admitted);
+    assert!(
+        broker.reconcile_connected(TimestampMs::new(12)).is_none(),
+        "connection 2's upstream has still not said what it holds"
+    );
+    assert_eq!(broker.mode(), kr_protocol::gateway::GatewayMode::Recovering);
+    assert_eq!(
+        broker.pending(held).expect("held").state,
+        PendingState::Pending
+    );
+
+    // Connection 2's upstream says it still holds its request, and rich work returns.
+    let (_, finished) = broker
+        .reconcile_recovered(
+            broker.recovery_generation(),
+            kr_worker::broker::ReconcileScope {
+                application_instance_id: instance(),
+                connection: second,
+            },
+            &[Broker::downstream(
+                second,
+                kr_protocol::ids::UpstreamRequestId::new("2").expect("valid"),
+            )],
+            TimestampMs::new(13),
+        )
+        .expect("the restored upstream reconciles");
+    assert!(finished.is_some());
+    assert_eq!(broker.mode(), kr_protocol::gateway::GatewayMode::Normal);
+    assert_eq!(
+        broker.pending(elsewhere).expect("held").state,
+        PendingState::Pending
+    );
+    owner.shutdown();
+    other.owner.shutdown();
+    let _ = tokio::time::timeout(LIVENESS_DEADLINE, drained).await;
+    let _ = tokio::time::timeout(LIVENESS_DEADLINE, other.drained).await;
 }

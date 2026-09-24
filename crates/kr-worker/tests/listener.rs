@@ -10,6 +10,7 @@ use kr_worker::broker::{
     BoundBinary, BridgeHello, Broker, BrokerTransport, Credential, ListenerAddress, ManagedProcess,
     PeerIdentity, Registration, TransportHandle, listener::BROWSER_HEADERS,
 };
+use kr_worker::persistence::JournalHealth;
 
 const CREDENTIAL: [u8; 32] = [9; 32];
 
@@ -340,7 +341,7 @@ fn kr_req_12_15_a_bound_binary_identity_is_the_one_a_running_binding_acts_under(
 
     // And the live broker agrees: the connection the running process authenticated is still its
     // own after the file on disk changed.
-    let broker = Broker::open(None, session()).expect("the broker opens");
+    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
     broker
         .register_instance(
             instance(),

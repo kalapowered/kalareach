@@ -299,6 +299,14 @@ impl Gateway {
             .map(|_| ActionProvenance::UpstreamTypedRpc)
     }
 
+    /// Returns every open connection a worker-launched native terminal made.
+    pub fn native_connections(&self) -> impl Iterator<Item = GatewayConnectionId> + '_ {
+        self.connections
+            .values()
+            .filter(|connection| connection.origin.may_forward_natively())
+            .map(|connection| connection.connection)
+    }
+
     /// Returns every connection to one instance, so a resolution can be fanned out.
     pub fn observers(
         &self,

@@ -100,7 +100,12 @@ impl Launch {
                 .expect("made private");
         }
         let broker = Arc::new(
-            Broker::open(None, SessionId::new(Uuid::from_bytes([1; 16]))).expect("a broker"),
+            Broker::open(
+                None,
+                SessionId::new(Uuid::from_bytes([1; 16])),
+                kr_worker::persistence::JournalHealth::shared(),
+            )
+            .expect("a broker"),
         );
         let mut gateway = NativeGateway::bind(
             Arc::clone(&broker),

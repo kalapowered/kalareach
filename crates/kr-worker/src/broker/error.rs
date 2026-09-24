@@ -101,6 +101,19 @@ pub enum BrokerError {
         /// What went wrong.
         detail: String,
     },
+    /// The durable store failed under this operation.
+    ///
+    /// The store's own answer was reported to the session's journal condition where it happened,
+    /// and that condition is the broker's fence: from here every decision is taken in
+    /// `native_only_volatile` until the store recovers and the gap is committed. It is kept apart
+    /// from [`BrokerError::LedgerUnavailable`], which also covers a record this build cannot read
+    /// and a write that found the record in another state, because only a failing store raises the
+    /// fence.
+    #[error("the broker's durable store failed: {detail}")]
+    StoreFault {
+        /// What the store said.
+        detail: String,
+    },
     /// A launch intent was refused.
     #[error("{0}")]
     Launch(#[from] kr_protocol::broker::LaunchRefusal),
@@ -164,7 +177,9 @@ impl BrokerError {
             Self::UpstreamRefused { .. } => ErrorCode::InvalidArgument,
             Self::UnknownSubject { .. } | Self::StaleBinding { .. } => ErrorCode::StaleSession,
             Self::AlreadyTransmitted | Self::PreconditionFailed { .. } => ErrorCode::DraftConflict,
-            Self::LedgerUnavailable { .. } => ErrorCode::StorageUnavailable,
+            Self::LedgerUnavailable { .. } | Self::StoreFault { .. } => {
+                ErrorCode::StorageUnavailable
+            }
             Self::Launch(refusal) => match refusal {
                 kr_protocol::broker::LaunchRefusal::ForegroundChanged
                 | kr_protocol::broker::LaunchRefusal::PromptMoved => ErrorCode::DraftConflict,

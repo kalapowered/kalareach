@@ -207,3 +207,103 @@ impl Keys {
         self.type_bytes(runtime, b"\n");
     }
 }
+
+/// A session's receipt journal on the internal disk, whose condition a broker opened beside it
+/// shares.
+///
+/// It is what a worker has: the broker reads the journal's own condition, so a fault of either
+/// store fences both, and only the journal's own recovery, which writes its gap down first, calls
+/// the condition healthy again. A test that needs a store to fail makes the store itself refuse:
+/// the journal is filled until it refuses an acceptance, and the broker's ledger is put into the
+/// store's query-only mode. Nothing here tells the condition anything the stores did not say.
+pub struct SharedStore {
+    /// The receipt journal.
+    pub journal: kr_worker::journal::Journal,
+    /// Where it is, which is also where a broker opened beside it keeps its ledger.
+    pub path: std::path::PathBuf,
+    next_action: u16,
+}
+
+impl SharedStore {
+    /// Opens a fresh journal in a directory of its own on the internal disk.
+    pub fn open() -> Self {
+        let directory = std::env::temp_dir().join(format!("kr-store-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&directory).expect("the store's directory is created");
+        let path = directory.join("session.sqlite");
+        let journal = kr_worker::journal::Journal::open(&path).expect("the journal opens");
+        Self {
+            journal,
+            path,
+            next_action: 0,
+        }
+    }
+
+    /// The condition the journal publishes, for a broker to be opened with.
+    pub fn health(&self) -> std::sync::Arc<kr_worker::persistence::JournalHealth> {
+        std::sync::Arc::clone(self.journal.health())
+    }
+
+    /// Makes the receipt journal refuse an acceptance, the way a full disk does.
+    ///
+    /// The journal is held at its current size and filled until the store answers `SQLITE_FULL`
+    /// for the next acceptance, which is the receipt path's own fault: the condition every broker
+    /// sharing it reads is faulted from that moment.
+    pub fn fault_acceptance(&mut self) -> kr_worker::WorkerError {
+        refuse_acceptance(&mut self.journal, &mut self.next_action)
+    }
+
+    /// Lets the journal take writes again and write its own gap down, which is what the host's
+    /// maintenance does before anything else may call the store healthy.
+    pub fn recover_journal(&mut self, now: u64) -> kr_worker::persistence::RecoveryGap {
+        self.journal
+            .release_size_cap()
+            .expect("the store may grow again");
+        self.journal
+            .recover(kr_protocol::scalars::TimestampMs::new(now))
+            .expect("the journal writes its gap")
+            .expect("a fault was open")
+    }
+}
+
+impl Drop for SharedStore {
+    fn drop(&mut self) {
+        if let Some(directory) = self.path.parent() {
+            let _ = std::fs::remove_dir_all(directory);
+        }
+    }
+}
+
+/// Holds a receipt journal at its current size and fills it until the store refuses an acceptance.
+///
+/// `next` numbers the acceptances, so a journal filled more than once is never asked to accept an
+/// identifier it already holds. The refusal is the store's own `SQLITE_FULL`.
+pub fn refuse_acceptance(
+    journal: &mut kr_worker::journal::Journal,
+    next: &mut u16,
+) -> kr_worker::WorkerError {
+    journal
+        .cap_at_current_size()
+        .expect("the store is held at its size");
+    loop {
+        *next = next.checked_add(1).expect("a store held at its size fills");
+        let bytes = next.to_be_bytes();
+        let mut action = [0xee_u8; 16];
+        action[..2].copy_from_slice(&bytes);
+        let submission = kr_worker::journal::Submission {
+            actor_id: kr_protocol::ids::ActorId::new("store-filler").expect("valid"),
+            action_id: kr_worker::journal::action_id_from(action),
+            method: Method::AgentPromptSubmit.into(),
+            method_version: kr_protocol::method::MethodVersion::V1,
+            payload_digest: kr_protocol::scalars::Digest256::from_bytes([bytes[1]; 32]),
+            subject_digest: kr_protocol::scalars::Digest256::from_bytes([bytes[1]; 32]),
+            intent: vec![0xa0; 64],
+            accepted_deadline_ms: Some(kr_protocol::scalars::TimestampMs::new(
+                kr_ipc::now_ms().get() + 120_000,
+            )),
+            now_ms: kr_ipc::now_ms(),
+        };
+        if let Err(error) = journal.accept(&submission) {
+            return error;
+        }
+    }
+}

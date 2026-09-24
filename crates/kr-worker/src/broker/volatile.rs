@@ -294,6 +294,19 @@ impl VolatileState {
         })
     }
 
+    /// Raises the fence from whichever mode this is in, and says whether it was raised now.
+    ///
+    /// From normal operation it opens the gap, and from a recovery it falls back and reopens the
+    /// gap that recovery was closing. A fence that is already up stays as it is. Every mode may
+    /// become the fence, so raising it cannot be refused.
+    pub fn raise(&mut self, reason: &str, carried_pending: u64, now: TimestampMs) -> bool {
+        match self.mode {
+            GatewayMode::Normal => self.enter(reason, carried_pending, now).is_ok(),
+            GatewayMode::Recovering => self.fall_back(reason, carried_pending, now).is_ok(),
+            GatewayMode::NativeOnlyVolatile => false,
+        }
+    }
+
     /// Begins recovery: storage is back, and the gap has not been committed yet.
     ///
     /// Rich work does not resume here. It resumes after the gap is committed and the pending
