@@ -28,7 +28,8 @@
 use kr_crypto::secret::SymmetricKey;
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{
-    ActorId, ApplicationInstanceId, DeviceId, QuestionId, QuestionRevision, SessionEpoch, SessionId,
+    ActorId, AgentBindingRevision, AgentThreadId, ApplicationInstanceId, DeviceId, QuestionId,
+    QuestionRevision, SessionEpoch, SessionId,
 };
 use kr_protocol::question::{
     Alert, AlertCreateParams, AnswerRecord, CallerToken, Question, QuestionAnswer, QuestionChoice,
@@ -185,6 +186,11 @@ impl Store {
                      question_id             BLOB PRIMARY KEY,
                      application_instance_id BLOB    NOT NULL,
                      revision                INTEGER
+                 );
+                 CREATE TABLE IF NOT EXISTS question_origins (
+                     question_id BLOB PRIMARY KEY,
+                     thread      TEXT    NOT NULL,
+                     revision    INTEGER NOT NULL
                  );",
             )
             .map_err(QuestionError::unavailable)?;
@@ -295,6 +301,7 @@ impl Store {
         source: &VerifiedSource,
         header: &QuestionSource,
         binding: Option<AgentBinding>,
+        origin: Option<&(AgentThreadId, AgentBindingRevision)>,
         params: &QuestionCreateParams,
         choices: &[QuestionChoice],
         expiry_ms: u64,
@@ -379,6 +386,22 @@ impl Store {
                 ],
             )
             .map_err(QuestionError::unavailable)?;
+        // The thread a bridge vouched was selected when this question was asked, recorded once,
+        // with the question. An exact retry returns the question above and never reaches here, so
+        // a retry asked in another thread cannot replace the context the question was asked in.
+        if let (Some(_), Some((thread, revision))) = (binding, origin) {
+            transaction
+                .execute(
+                    "INSERT INTO question_origins (question_id, thread, revision)
+                     VALUES (?1, ?2, ?3)",
+                    params![
+                        question_id.get().as_bytes().as_slice(),
+                        thread.as_str(),
+                        count(revision.get()),
+                    ],
+                )
+                .map_err(QuestionError::unavailable)?;
+        }
         // The agent binding goes in the same transaction as the question, so a question that was
         // asked under a bridged agent is never on record without the instance it ends with.
         if let Some(binding) = binding {
@@ -562,10 +585,12 @@ impl Store {
             .prepare(
                 "SELECT questions.question_id, expires_at_ms, expires_at_boot_ms, source_process,
                         question_bindings.application_instance_id, question_bindings.revision,
-                        questions.request_id
+                        questions.request_id, question_origins.thread, question_origins.revision
                  FROM questions
                  LEFT JOIN question_bindings
                         ON question_bindings.question_id = questions.question_id
+                 LEFT JOIN question_origins
+                        ON question_origins.question_id = questions.question_id
                  WHERE state = 'pending'",
             )
             .map_err(QuestionError::unavailable)?;
@@ -579,6 +604,8 @@ impl Store {
                     row.get::<_, Option<Vec<u8>>>(4)?,
                     row.get::<_, Option<i64>>(5)?,
                     row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
                 ))
             })
             .map_err(QuestionError::unavailable)?
@@ -594,6 +621,8 @@ impl Store {
             instance,
             revision,
             request_id,
+            origin_thread,
+            origin_revision,
         ) in candidates
         {
             let question_id = QuestionId::new(uuid_from(&identifier)?);
@@ -608,27 +637,30 @@ impl Store {
                 ),
                 Err(_) => false,
             };
-            // A question asked under a bridged agent with no revision yet may have one now: the
-            // application's bridge reports which thread ran the call that asked it once the call
-            // has finished. That revision is recorded once, and it is what a switch is judged by
-            // from then on.
-            let revision = match (agents, instance.as_deref(), revision) {
-                (Some(agents), Some(bound), None) => {
-                    let attested = agents
-                        .attested(ApplicationInstanceId::new(uuid_from(bound)?), &request_id)
-                        .map(|attested| count(attested.get()));
-                    if let Some(attested) = attested {
+            // A question asked under a bridged agent with no revision yet may have one now. It was
+            // asked while the bridge vouched for one thread (its origin); once the application's
+            // own hook reports that the call that asked it ran in that same thread, the question is
+            // bound to the revision recorded when it was asked. That is recorded once, and it is
+            // what a switch is judged by from then on. A report naming another thread, or reports
+            // that disagree, bind it to nothing: it stays application-scoped.
+            let revision = match (agents, instance.as_deref(), revision, origin_thread) {
+                (Some(agents), Some(bound), None, Some(origin)) => {
+                    let ran_in =
+                        agents.attested(ApplicationInstanceId::new(uuid_from(bound)?), &request_id);
+                    let bound_to = origin_revision
+                        .filter(|_| ran_in.as_ref().is_some_and(|ran| ran.as_str() == origin));
+                    if let Some(bound_to) = bound_to {
                         self.connection
                             .execute(
                                 "UPDATE question_bindings SET revision = ?1
                                  WHERE question_id = ?2 AND revision IS NULL",
-                                params![attested, identifier.as_slice()],
+                                params![bound_to, identifier.as_slice()],
                             )
                             .map_err(QuestionError::unavailable)?;
                     }
-                    attested
+                    bound_to
                 }
-                (_, _, recorded) => recorded,
+                (_, _, recorded, _) => recorded,
             };
             // An agent instance that ended takes its binding with it, and a detected switch
             // invalidates the unanswered questions asked under the binding it left. Only a question
@@ -1197,7 +1229,16 @@ mod tests {
             .expect("a header");
         let choices = build_choices(params.kind, &params.choices).expect("choices");
         store
-            .create(&source, &header, None, params, &choices, 60_000, now(at))
+            .create(
+                &source,
+                &header,
+                None,
+                None,
+                params,
+                &choices,
+                60_000,
+                now(at),
+            )
             .expect("creates")
     }
 
@@ -1230,6 +1271,7 @@ mod tests {
             .create(
                 &source,
                 &header,
+                None,
                 None,
                 &params,
                 &choices,
@@ -1324,6 +1366,7 @@ mod tests {
             .create(
                 &source,
                 &header,
+                None,
                 None,
                 &params,
                 &choices,

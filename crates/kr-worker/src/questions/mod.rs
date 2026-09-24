@@ -126,11 +126,27 @@ impl Questions {
         let expiry = bounded_expiry(params.requested_expiry_ms.as_ref().copied()).get();
         // Read before the ledger is locked: it walks the process table.
         let binding = self.agent_of(source);
+        // The thread the bridge vouches is selected now, as the context this question is asked in.
+        // It binds the question only once the bridge reports its request ran in that same thread.
+        let origin = binding.and_then(|binding| {
+            self.agents
+                .as_ref()
+                .and_then(|agents| agents.selection(binding.application_instance_id))
+        });
         let mut store = self.locked()?;
         let mut events = expiry_events(store.expire_due(now, self.agents.as_deref())?, now);
         let header =
             store.source_header(source, params.agent_name.as_ref().cloned(), binding, now)?;
-        let created = store.create(source, &header, binding, params, &choices, expiry, now)?;
+        let created = store.create(
+            source,
+            &header,
+            binding,
+            origin.as_ref(),
+            params,
+            &choices,
+            expiry,
+            now,
+        )?;
         if !created.deduplicated {
             events.push(QuestionEvent {
                 kind: QuestionEventKind::Created,

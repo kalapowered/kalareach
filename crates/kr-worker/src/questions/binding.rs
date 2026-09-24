@@ -68,12 +68,13 @@
 //! threads a request came from, so it attests no revision when a question is asked: a helper under
 //! a launched agent asks application-scoped questions, and they end with the agent's instance. An
 //! application's native bridge can say more once the tool call that asked has finished, because the
-//! application's own hook reports which thread ran it; that per-request context reaches the ledger
-//! through [`AgentBindings::attested`], and from then on a switch of thread invalidates the
-//! question. A source that no bridge describes is application-scoped as well.
+//! application's own hook reports which thread ran it: when that thread is the one the bridge had
+//! selected when the question was asked ([`AgentBindings::selection`], recorded then), the question
+//! is bound to the revision recorded then ([`AgentBindings::attested`]), and from then on a switch
+//! of thread invalidates it. A source that no bridge describes is application-scoped as well.
 
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
-use kr_protocol::ids::{AgentBindingRevision, ApplicationInstanceId, ConnectionId};
+use kr_protocol::ids::{AgentBindingRevision, AgentThreadId, ApplicationInstanceId, ConnectionId};
 
 use crate::ownership::OwnershipBoundary;
 use crate::questions::error::{QuestionError, Result};
@@ -182,18 +183,32 @@ pub trait AgentBindings: Send + Sync + std::fmt::Debug {
         application_instance_id: ApplicationInstanceId,
     ) -> Option<AgentBindingRevision>;
 
-    /// Returns the binding revision a request was made under, when a bridge reported the thread
-    /// that request came from after it was made.
+    /// Returns the thread one instance has selected and the revision it was selected at, while a
+    /// bridge vouches for it.
+    ///
+    /// The ledger records it when a question is asked, as the context the question was asked in. It
+    /// is not the question's binding: a helper shared by several threads can be asked from one of
+    /// them while another is selected. It becomes the binding only when [`Self::attested`] names
+    /// the same thread for the question's own request.
+    fn selection(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+    ) -> Option<(AgentThreadId, AgentBindingRevision)> {
+        let _ = application_instance_id;
+        None
+    }
+
+    /// Returns the thread a bridge reported running one request, when every report of it agrees.
     ///
     /// A bridge that sees the application's own tool calls can say which thread ran a call only
     /// once the call has finished, which is after the question it asked exists. What it says then
-    /// is still per-request source context, and it is recorded for that question. None when no
-    /// bridge said anything about the request.
+    /// is per-request source context. None when no bridge said anything about the request, or when
+    /// two reports disagree.
     fn attested(
         &self,
         application_instance_id: ApplicationInstanceId,
         request_id: &str,
-    ) -> Option<AgentBindingRevision> {
+    ) -> Option<AgentThreadId> {
         let _ = (application_instance_id, request_id);
         None
     }

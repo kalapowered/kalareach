@@ -11,14 +11,15 @@
 //! thread binding only with verified per-request source context, so membership attests none: when
 //! a question is asked it is application-scoped.
 //!
-//! What can say which thread a request came from is the application's own native bridge. A hook
-//! reports the thread that ran each finished tool call, so when that call asked a contact question
-//! the broker records the binding revision it was made under, and the ledger reads it through
-//! [`AgentBindings::attested`]. From then on a switch of thread invalidates that question. See
-//! [`crate::broker::bridge`].
+//! What can say which thread a request came from is the application's own native bridge. When a
+//! question is asked, the ledger records the thread the bridge last reported selected, with its
+//! revision, through [`AgentBindings::selection`]. A hook then reports the thread that ran each
+//! finished tool call, and the ledger reads that through [`AgentBindings::attested`]: when the two
+//! name the same thread, the question is bound to the revision recorded when it was asked, and from
+//! then on a switch of thread invalidates it. See [`crate::broker::bridge`].
 
 use kr_protocol::identity::ProcessStartIdentity;
-use kr_protocol::ids::{AgentBindingRevision, ApplicationInstanceId};
+use kr_protocol::ids::{AgentBindingRevision, AgentThreadId, ApplicationInstanceId};
 
 use crate::broker::Broker;
 use crate::questions::binding::{
@@ -73,11 +74,18 @@ impl AgentBindings for Broker {
             .map(|state| state.binding_revision)
     }
 
+    fn selection(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+    ) -> Option<(AgentThreadId, AgentBindingRevision)> {
+        self.verified_selection(application_instance_id)
+    }
+
     fn attested(
         &self,
         application_instance_id: ApplicationInstanceId,
         request_id: &str,
-    ) -> Option<AgentBindingRevision> {
-        self.attested_request(application_instance_id, request_id)
+    ) -> Option<AgentThreadId> {
+        self.attested_thread(application_instance_id, request_id)
     }
 }

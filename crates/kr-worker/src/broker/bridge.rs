@@ -25,6 +25,16 @@
 //! Section 5: "An environment variable can identify a candidate session to an integration. It is
 //! not a credential. The host validates the integration's local peer, installation and session
 //! binding before accepting events or actions."
+//!
+//! # What an admitted hook reports
+//!
+//! One observation, in the host's own terms. A thread starting or ending moves the instance's
+//! binding, and so invalidates the questions asked under the binding it left. Hooks are separate
+//! processes on separate connections, so their reports are ordered by when each hook started
+//! ([`ReportOrder`]) rather than by when they arrive; what cannot be ordered moves nothing and
+//! suspends rich mutations, as section 12 asks when a native selection cannot be observed
+//! reliably. A finished contact question names its request, which is how a question is placed in
+//! the thread that asked it: see [`crate::questions::AgentBindings::attested`].
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -315,7 +325,7 @@ impl crate::broker::Broker {
     }
 }
 
-/// How many threads one instance remembers having had selected, with the revision each one had.
+/// How many threads one instance keeps its bridge's last reports of.
 pub const MAX_REMEMBERED_THREADS: usize = 64;
 
 /// How many contact requests one instance remembers a bridge placing in a thread.
@@ -331,44 +341,82 @@ pub const MAX_OBSERVATION_TEXT_BYTES: usize = 4096;
 /// own request identifier may be.
 pub const MAX_CONTACT_REQUEST_BYTES: usize = 256;
 
-/// What an instance's native bridge has reported about its threads.
+/// Where one hook's report stands in the order of reports.
 ///
 /// Hooks are separate processes on separate connections, so their reports can arrive in any order.
-/// What orders them is the kernel's start value of the process that made each one, because an
-/// application starts the hook for a later event later. A report from a process older than the one
-/// whose report is in force cannot undo it.
+/// An application starts the hook for a later event later, so reports are ordered by when their
+/// hook process started: first by the start value the kernel reports for the process, which the
+/// host reads itself, and then, between two processes the kernel's clock cannot tell apart, by the
+/// boot-clock reading the forwarder took when it started. Two reports equal in both are not ordered
+/// at all, and a decision that would need that order is not taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ReportOrder {
+    /// The kernel's start value for the hook process.
+    pub kernel: u64,
+    /// The boot-clock reading, in milliseconds, the forwarder took when it started.
+    pub started: u64,
+}
+
+/// What one instance's bridge last reported about one thread.
+#[derive(Clone, Copy, Debug, Default)]
+struct ThreadReports {
+    /// The newest report of the thread starting.
+    started: Option<ReportOrder>,
+    /// The newest report of the thread ending.
+    ended: Option<ReportOrder>,
+}
+
+/// What an instance's native bridge has reported about its threads.
+///
+/// The selection moves only on a report newer than the one in force, and a report of a thread
+/// starting is set against the newest report of that same thread ending, whichever arrived first.
+/// When the order two reports would need cannot be read, the binding is not moved on a guess: the
+/// instance's rich mutations are suspended until a report settles it, and no question is placed in
+/// a thread meanwhile.
 #[derive(Debug, Default)]
 pub(crate) struct BridgeThreads {
-    /// The start value of the bridge process whose report decided the selection in force.
-    decided_by: Option<u64>,
-    /// Threads this instance has had selected, oldest first, with the revision each was selected at.
-    selected: std::collections::VecDeque<(AgentThreadId, AgentBindingRevision)>,
-    /// Contact requests a bridge placed in a thread, oldest first, with the revision each was made
-    /// under.
-    attested: std::collections::VecDeque<(String, AgentBindingRevision)>,
+    /// The order of the report that decided the selection in force.
+    in_force: Option<ReportOrder>,
+    /// What was last reported about each thread, least recently reported first.
+    threads: std::collections::VecDeque<(AgentThreadId, ThreadReports)>,
+    /// The suspension this bridge placed on rich mutations, while it stands.
+    suspended: Option<String>,
+    /// Contact requests a hook reported finishing, oldest first, with the thread that ran each.
+    attested: std::collections::VecDeque<(String, AgentThreadId)>,
 }
 
 impl BridgeThreads {
-    fn remember_selection(&mut self, thread: AgentThreadId, revision: AgentBindingRevision) {
-        self.selected.push_back((thread, revision));
-        while self.selected.len() > MAX_REMEMBERED_THREADS {
-            self.selected.pop_front();
+    /// Returns the record of one thread, as the most recently reported one.
+    fn reports(&mut self, thread: &AgentThreadId) -> &mut ThreadReports {
+        let held = self
+            .threads
+            .iter()
+            .position(|(reported, _)| reported == thread)
+            .and_then(|at| self.threads.remove(at))
+            .map_or_else(ThreadReports::default, |(_, reports)| reports);
+        self.threads.push_back((thread.clone(), held));
+        while self.threads.len() > MAX_REMEMBERED_THREADS {
+            self.threads.pop_front();
         }
+        &mut self.threads.back_mut().expect("just pushed").1
     }
 
-    fn remember_request(&mut self, request_id: String, revision: AgentBindingRevision) {
-        self.attested.push_back((request_id, revision));
+    fn remember_request(&mut self, request_id: String, thread: AgentThreadId) {
+        self.attested.push_back((request_id, thread));
         while self.attested.len() > MAX_ATTESTED_REQUESTS {
             self.attested.pop_front();
         }
     }
 
-    fn selected_at(&self, thread: &AgentThreadId) -> Option<AgentBindingRevision> {
-        self.selected
+    /// The one thread every report of this request names, when they agree.
+    fn attested_thread(&self, request_id: &str) -> Option<AgentThreadId> {
+        let mut named = self
+            .attested
             .iter()
-            .rev()
-            .find(|(selected, _)| selected == thread)
-            .map(|(_, revision)| *revision)
+            .filter(|(request, _)| request == request_id)
+            .map(|(_, thread)| thread);
+        let first = named.next()?;
+        named.all(|thread| thread == first).then(|| first.clone())
     }
 }
 
@@ -414,6 +462,11 @@ pub struct Observation {
     pub event: ObservedEvent,
     /// The application's own identifier of the thread it happened in.
     pub thread: AgentThreadId,
+    /// The boot-clock reading, in milliseconds, the forwarder took when it started.
+    ///
+    /// It orders two reports whose hook processes the kernel's clock cannot tell apart. It is the
+    /// bridge's claim, like everything else here, and one from the future is refused.
+    pub started: u64,
     /// A short detail: how a thread started, why it ended, which tool, which notification.
     #[serde(default)]
     pub detail: Option<String>,
@@ -422,9 +475,9 @@ pub struct Observation {
     pub text: Option<String>,
     /// The request identifier of a contact question the finished tool call asked.
     ///
-    /// It is what places a question in the thread its request was made in: the application's own
-    /// hook reports which thread ran the call, which is the per-request source context section 11
-    /// asks of a bridge before a question records a thread binding.
+    /// It is the application's own report of which thread ran the call that asked, which is the
+    /// per-request source context section 11 asks of a bridge before a question records a thread
+    /// binding.
     #[serde(default)]
     pub contact_request: Option<String>,
 }
@@ -508,8 +561,11 @@ pub enum ThreadChange {
     /// The binding already said what the observation says, or the observation says nothing
     /// about threads.
     Unchanged,
-    /// The observation came from a bridge process older than the one whose report is in force.
+    /// A newer report already decided what this one would have: this one changes nothing.
     Stale,
+    /// The report cannot be ordered against the one it would have to overrule, so the binding
+    /// was not moved and rich mutations are suspended until a report settles it.
+    Unordered,
     /// Selecting the thread was refused, and rich mutations are suspended until it is verified.
     Refused(String),
 }
@@ -521,12 +577,13 @@ pub struct HookReport {
     pub observation: Observation,
     /// What it did to the thread binding.
     pub thread: ThreadChange,
-    /// The revision the contact request it placed in its thread was recorded under, when it placed
-    /// one.
-    pub attested: Option<AgentBindingRevision>,
     /// Where it sits in the instance's observed history.
     pub cursor: StreamCursor,
 }
+
+/// The suspension a bridge places on rich mutations when the application's thread cannot be read.
+const UNORDERED: &str = "the application's bridge reported threads in an order this host cannot \
+                         read, so its thread is not verified";
 
 impl crate::broker::Broker {
     /// Applies what one of an instance's native bridge hooks observed.
@@ -534,96 +591,96 @@ impl crate::broker::Broker {
     /// This is the production caller of the binding's advance. A hook that reports a thread the
     /// binding does not have selects it; a hook that reports the selected thread ending leaves the
     /// instance with none; both advance the binding revision, which is what invalidates the
-    /// questions asked under the binding that was left. A report older than the one in force, by
-    /// its process's start, is recorded and changes nothing.
+    /// questions asked under the binding that was left. A report older than the one in force
+    /// changes nothing, and so does a report of a thread starting that an equally new or newer
+    /// report of the same thread ending already overrules. A report that cannot be ordered against
+    /// the one it would overrule moves nothing and suspends rich mutations. A finished tool call
+    /// that asked a contact question is recorded with its thread.
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::UnknownSubject`] when this broker holds no such instance.
+    /// Returns [`BrokerError::UnknownSubject`] when this broker holds no such instance, and
+    /// [`BrokerError::InvalidArgument`] for a report that says it started in the future.
     pub fn observe_bridge(
         &self,
         application_instance_id: ApplicationInstanceId,
         reporter: &ProcessStartIdentity,
         observation: &Observation,
         now: TimestampMs,
-    ) -> Result<(ThreadChange, Option<AgentBindingRevision>, StreamCursor)> {
-        let mut state = self.state();
-        let reported = reporter.start_value.get();
-        let (current, decided_by) = {
-            let instance = state
-                .instances
-                .get(&application_instance_id)
-                .ok_or_else(|| crate::broker::unknown_instance(application_instance_id))?;
-            (instance.thread_id.clone(), instance.bridge.decided_by)
+    ) -> Result<(ThreadChange, StreamCursor)> {
+        if observation.started > kr_ipc::clock::boot_elapsed_ms() {
+            return Err(BrokerError::invalid(
+                "this report says its hook started later than now",
+            ));
+        }
+        let order = ReportOrder {
+            kernel: reporter.start_value.get(),
+            started: observation.started,
         };
-        let newer = decided_by.is_none_or(|decided| reported > decided);
-        let is_current = current.as_ref() == Some(&observation.thread);
+        let mut state = self.state();
         let thread = match observation.event {
-            ObservedEvent::ThreadStarted if is_current => {
-                if newer {
-                    instance_of(&mut state, application_instance_id)?
-                        .bridge
-                        .decided_by = Some(reported);
-                }
-                ThreadChange::Unchanged
-            }
-            ObservedEvent::ThreadStarted if !newer => ThreadChange::Stale,
-            ObservedEvent::ThreadStarted => select(
+            ObservedEvent::ThreadStarted => started(
                 &mut state,
                 application_instance_id,
                 &observation.thread,
-                reported,
+                order,
                 now,
             )?,
-            ObservedEvent::ThreadEnded if is_current && newer => {
-                match state.advance_binding(application_instance_id, None, now) {
-                    Ok(revision) => {
-                        instance_of(&mut state, application_instance_id)?
-                            .bridge
-                            .decided_by = Some(reported);
-                        ThreadChange::Ended(revision)
-                    }
-                    Err(error) => ThreadChange::Refused(error.to_string()),
-                }
-            }
-            ObservedEvent::ThreadEnded if is_current => ThreadChange::Stale,
-            _ => ThreadChange::Unchanged,
-        };
-        let attested = match (observation.event, &observation.contact_request) {
-            (ObservedEvent::ToolFinished, Some(request)) => Some(attest(
+            ObservedEvent::ThreadEnded => ended(
                 &mut state,
                 application_instance_id,
-                request,
                 &observation.thread,
-                reported,
+                order,
                 now,
-            )?),
-            _ => None,
+            )?,
+            _ => ThreadChange::Unchanged,
         };
         let instance = instance_of(&mut state, application_instance_id)?;
+        if let (ObservedEvent::ToolFinished, Some(request)) =
+            (observation.event, &observation.contact_request)
+        {
+            instance
+                .bridge
+                .remember_request(request.clone(), observation.thread.clone());
+        }
         let cursor = instance
             .semantic
             .append(observation.event.kind(), observation.summary(), now);
-        Ok((thread, attested, cursor))
+        Ok((thread, cursor))
     }
 
-    /// Returns the revision a bridge recorded one contact request under, where it recorded one.
+    /// Returns the thread every report of one contact request names, when the reports agree.
+    ///
+    /// A request two reports place in two threads is placed in none.
     #[must_use]
-    pub fn attested_request(
+    pub fn attested_thread(
         &self,
         application_instance_id: ApplicationInstanceId,
         request_id: &str,
-    ) -> Option<AgentBindingRevision> {
-        let state = self.state();
-        state
+    ) -> Option<AgentThreadId> {
+        self.state()
             .instances
             .get(&application_instance_id)?
             .bridge
-            .attested
-            .iter()
-            .rev()
-            .find(|(request, _)| request == request_id)
-            .map(|(_, revision)| *revision)
+            .attested_thread(request_id)
+    }
+
+    /// Returns the thread an instance has selected and the revision it was selected at, while the
+    /// instance's bridge can vouch for it.
+    #[must_use]
+    pub fn verified_selection(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+    ) -> Option<(AgentThreadId, AgentBindingRevision)> {
+        let state = self.state();
+        let instance = state.instances.get(&application_instance_id)?;
+        if instance.bridge.suspended.is_some() {
+            return None;
+        }
+        instance
+            .thread_id
+            .clone()
+            .map(|thread| (thread, instance.binding_revision))
     }
 }
 
@@ -637,70 +694,122 @@ fn instance_of(
         .ok_or_else(|| crate::broker::unknown_instance(application_instance_id))
 }
 
-/// Selects one thread for an instance, as its bridge reported it, under the lock the caller holds.
-fn select(
+/// How one report stands against the report in force.
+fn against(in_force: Option<ReportOrder>, order: ReportOrder) -> std::cmp::Ordering {
+    in_force.map_or(std::cmp::Ordering::Greater, |in_force| order.cmp(&in_force))
+}
+
+/// Applies a report of one thread starting, under the lock the caller holds.
+fn started(
     state: &mut crate::broker::BrokerState,
     application_instance_id: ApplicationInstanceId,
     thread: &AgentThreadId,
-    reported: u64,
+    order: ReportOrder,
     now: TimestampMs,
 ) -> Result<ThreadChange> {
-    match state.advance_binding(application_instance_id, Some(thread.clone()), now) {
-        Ok(revision) => {
+    let instance = instance_of(state, application_instance_id)?;
+    let current = instance.thread_id.as_ref() == Some(thread);
+    let in_force = instance.bridge.in_force;
+    let reports = instance.bridge.reports(thread);
+    reports.started = reports.started.max(Some(order));
+    // The same thread ending, reported by a hook that started no earlier, overrules this start
+    // whichever arrived first.
+    match reports.ended.map(|ended| ended.cmp(&order)) {
+        Some(std::cmp::Ordering::Greater) => return Ok(ThreadChange::Stale),
+        Some(std::cmp::Ordering::Equal) => return Ok(unordered(state, application_instance_id)),
+        _ => {}
+    }
+    match against(in_force, order) {
+        std::cmp::Ordering::Less => Ok(ThreadChange::Stale),
+        std::cmp::Ordering::Equal if current => Ok(ThreadChange::Unchanged),
+        std::cmp::Ordering::Equal => Ok(unordered(state, application_instance_id)),
+        std::cmp::Ordering::Greater if current => {
             let instance = instance_of(state, application_instance_id)?;
-            instance.bridge.decided_by = Some(reported);
-            instance.bridge.remember_selection(thread.clone(), revision);
-            Ok(ThreadChange::Selected(revision))
+            instance.bridge.in_force = Some(order);
+            settle(instance);
+            Ok(ThreadChange::Unchanged)
         }
-        Err(error @ BrokerError::UnknownSubject { .. }) => Err(error),
-        Err(error) => {
-            // The application is in a thread this instance cannot own, so its binding cannot be
-            // verified. Section 12: suspend rich mutations until it is; the terminal stays.
-            let reason = format!("the application selected a thread this host refused: {error}");
-            instance_of(state, application_instance_id)?.rich_suspension = Some(reason.clone());
-            Ok(ThreadChange::Refused(reason))
+        std::cmp::Ordering::Greater => {
+            match state.advance_binding(application_instance_id, Some(thread.clone()), now) {
+                Ok(revision) => {
+                    let instance = instance_of(state, application_instance_id)?;
+                    instance.bridge.in_force = Some(order);
+                    settle(instance);
+                    Ok(ThreadChange::Selected(revision))
+                }
+                Err(error @ BrokerError::UnknownSubject { .. }) => Err(error),
+                Err(error) => {
+                    // The application is in a thread this instance cannot own, so its binding
+                    // cannot be verified. Section 12: suspend rich mutations until it is.
+                    let reason =
+                        format!("the application selected a thread this host refused: {error}");
+                    suspend(instance_of(state, application_instance_id)?, reason.clone());
+                    Ok(ThreadChange::Refused(reason))
+                }
+            }
         }
     }
 }
 
-/// Records the thread one contact request was made in, and returns the revision it was made under.
-///
-/// A request made in the selected thread was made under the binding in force. One made in a thread
-/// that is no longer selected was made under a binding that has already been left, so it is
-/// recorded under a revision that is not current, and the question ledger invalidates it. When no
-/// thread is selected and the reported one was never left, the report is the first word of the
-/// thread in use, and it selects it.
-fn attest(
+/// Applies a report of one thread ending, under the lock the caller holds.
+fn ended(
     state: &mut crate::broker::BrokerState,
     application_instance_id: ApplicationInstanceId,
-    request_id: &str,
     thread: &AgentThreadId,
-    reported: u64,
+    order: ReportOrder,
     now: TimestampMs,
-) -> Result<AgentBindingRevision> {
-    let (current, revision, known) = {
-        let instance = instance_of(state, application_instance_id)?;
-        (
-            instance.thread_id.clone(),
-            instance.binding_revision,
-            instance.bridge.selected_at(thread),
-        )
-    };
-    let behind = AgentBindingRevision::new(revision.get().saturating_sub(1));
-    let made_under = if current.as_ref() == Some(thread) {
-        revision
-    } else if current.is_none() && known.is_none() {
-        match select(state, application_instance_id, thread, reported, now)? {
-            ThreadChange::Selected(selected) => selected,
-            _ => behind,
+) -> Result<ThreadChange> {
+    let instance = instance_of(state, application_instance_id)?;
+    let current = instance.thread_id.as_ref() == Some(thread);
+    let in_force = instance.bridge.in_force;
+    let reports = instance.bridge.reports(thread);
+    reports.ended = reports.ended.max(Some(order));
+    if !current {
+        // Kept above, so a report of this thread starting that arrives later and is older is
+        // overruled by it.
+        return Ok(ThreadChange::Unchanged);
+    }
+    match against(in_force, order) {
+        std::cmp::Ordering::Less => Ok(ThreadChange::Stale),
+        std::cmp::Ordering::Equal => Ok(unordered(state, application_instance_id)),
+        std::cmp::Ordering::Greater => {
+            let revision = state.advance_binding(application_instance_id, None, now)?;
+            let instance = instance_of(state, application_instance_id)?;
+            instance.bridge.in_force = Some(order);
+            settle(instance);
+            Ok(ThreadChange::Ended(revision))
         }
-    } else {
-        known.unwrap_or(behind)
-    };
-    instance_of(state, application_instance_id)?
-        .bridge
-        .remember_request(request_id.to_owned(), made_under);
-    Ok(made_under)
+    }
+}
+
+/// Leaves the binding where it is and suspends rich mutations, because the report cannot be
+/// ordered against the one it would overrule.
+fn unordered(
+    state: &mut crate::broker::BrokerState,
+    application_instance_id: ApplicationInstanceId,
+) -> ThreadChange {
+    if let Ok(instance) = instance_of(state, application_instance_id) {
+        suspend(instance, UNORDERED.to_owned());
+    }
+    ThreadChange::Unordered
+}
+
+/// Suspends rich mutations for a reason of this bridge's, unless something else already has.
+fn suspend(instance: &mut crate::broker::Instance, reason: String) {
+    if instance.rich_suspension.is_none() {
+        instance.rich_suspension = Some(reason.clone());
+    }
+    instance.bridge.suspended = Some(reason);
+}
+
+/// Lifts the suspension this bridge placed, now that a report has settled the thread. A
+/// suspension something else placed is not this bridge's to lift.
+fn settle(instance: &mut crate::broker::Instance) {
+    if let Some(reason) = instance.bridge.suspended.take()
+        && instance.rich_suspension.as_deref() == Some(reason.as_str())
+    {
+        instance.rich_suspension = None;
+    }
 }
 
 #[cfg(test)]
@@ -848,29 +957,38 @@ mod tests {
         }
     }
 
-    fn observed(event: ObservedEvent, thread: &str) -> Observation {
+    fn observed(event: ObservedEvent, thread: &str, started: u64) -> Observation {
         Observation {
             event,
             thread: AgentThreadId::new(thread).expect("valid"),
+            started,
             detail: None,
             text: None,
             contact_request: None,
         }
     }
 
+    fn start(thread: &str, started: u64) -> Observation {
+        observed(ObservedEvent::ThreadStarted, thread, started)
+    }
+
+    fn end(thread: &str, started: u64) -> Observation {
+        observed(ObservedEvent::ThreadEnded, thread, started)
+    }
+
     fn asked(thread: &str, request: &str) -> Observation {
         Observation {
             contact_request: Some(request.to_owned()),
-            ..observed(ObservedEvent::ToolFinished, thread)
+            ..observed(ObservedEvent::ToolFinished, thread, 1)
         }
     }
 
-    /// A bridge process that started at `start`, as the kernel would report it.
-    fn reporter(start: u64) -> ProcessStartIdentity {
+    /// A bridge process whose start the kernel reports as `kernel`.
+    fn reporter(kernel: u64) -> ProcessStartIdentity {
         ProcessStartIdentity::new(
-            4_000 + start,
+            4_000 + kernel,
             kr_protocol::identity::ProcessStartSource::LinuxProcStat,
-            start,
+            kernel,
         )
     }
 
@@ -897,116 +1015,80 @@ mod tests {
         ApplicationInstanceId::new(kr_protocol::scalars::Uuid::from_bytes([byte; 16]))
     }
 
+    fn apply(
+        broker: &crate::broker::Broker,
+        id: ApplicationInstanceId,
+        kernel: u64,
+        observation: &Observation,
+    ) -> ThreadChange {
+        broker
+            .observe_bridge(id, &reporter(kernel), observation, TimestampMs::new(1))
+            .expect("applied")
+            .0
+    }
+
+    fn selected(broker: &crate::broker::Broker, id: ApplicationInstanceId) -> Option<String> {
+        broker
+            .binding_state(id)
+            .expect("known")
+            .thread_id
+            .as_ref()
+            .map(|thread| thread.as_str().to_owned())
+    }
+
     fn revision(broker: &crate::broker::Broker, id: ApplicationInstanceId) -> AgentBindingRevision {
         broker.binding_state(id).expect("known").binding_revision
     }
 
     /// KR-REQ-11.62: a hook that reports a thread selects it and advances the binding, a hook that
-    /// reports it ending leaves no thread selected, and a report from a bridge process older than
-    /// the one in force cannot undo it, whatever order the reports arrive in.
+    /// reports it ending leaves no thread selected, and a report from a hook process that started
+    /// before the one in force cannot undo it, whatever order the reports arrive in. A thread's own
+    /// end overrules an older report of it starting, even when the end arrived first; a later
+    /// start of the same thread, as a resume makes, is a new selection.
     #[test]
-    fn kr_req_11_62_the_newest_bridge_report_decides_the_thread() {
+    fn kr_req_11_62_the_newest_report_decides_the_thread() {
         let id = instance(2);
         let broker = broker_with(&[id]);
-        let now = TimestampMs::new(1);
         let first = revision(&broker, id);
 
-        let (change, _, _) = broker
-            .observe_bridge(
-                id,
-                &reporter(10),
-                &observed(ObservedEvent::ThreadStarted, "t1"),
-                now,
-            )
-            .expect("applied");
-        let selected = AgentBindingRevision::new(first.get() + 1);
-        assert_eq!(change, ThreadChange::Selected(selected));
         assert_eq!(
-            broker
-                .binding_state(id)
-                .expect("known")
-                .thread_id
-                .as_ref()
-                .map(AgentThreadId::as_str),
-            Some("t1")
+            apply(&broker, id, 10, &start("t1", 1)),
+            ThreadChange::Selected(AgentBindingRevision::new(first.get() + 1))
         );
-
-        // The same thread again, from a later process: nothing to change.
-        let (change, _, _) = broker
-            .observe_bridge(
-                id,
-                &reporter(11),
-                &observed(ObservedEvent::ThreadStarted, "t1"),
-                now,
-            )
-            .expect("applied");
-        assert_eq!(change, ThreadChange::Unchanged);
-
-        // A later process selects another thread.
-        let (change, _, _) = broker
-            .observe_bridge(
-                id,
-                &reporter(30),
-                &observed(ObservedEvent::ThreadStarted, "t2"),
-                now,
-            )
-            .expect("applied");
         assert_eq!(
-            change,
-            ThreadChange::Selected(AgentBindingRevision::new(selected.get() + 1))
+            apply(&broker, id, 11, &start("t1", 2)),
+            ThreadChange::Unchanged
         );
+        assert!(matches!(
+            apply(&broker, id, 30, &start("t2", 3)),
+            ThreadChange::Selected(_)
+        ));
         // An older process's report of the first thread arrives late, and changes nothing.
-        let (change, _, _) = broker
-            .observe_bridge(
-                id,
-                &reporter(20),
-                &observed(ObservedEvent::ThreadStarted, "t1"),
-                now,
-            )
-            .expect("applied");
-        assert_eq!(change, ThreadChange::Stale);
+        assert_eq!(apply(&broker, id, 20, &start("t1", 4)), ThreadChange::Stale);
         // Nor does an older report of the current thread ending.
-        let (change, _, _) = broker
-            .observe_bridge(
-                id,
-                &reporter(25),
-                &observed(ObservedEvent::ThreadEnded, "t2"),
-                now,
-            )
-            .expect("applied");
-        assert_eq!(change, ThreadChange::Stale);
-        // A thread that is not the selected one ending says nothing about the binding.
-        let (change, _, _) = broker
-            .observe_bridge(
-                id,
-                &reporter(40),
-                &observed(ObservedEvent::ThreadEnded, "t1"),
-                now,
-            )
-            .expect("applied");
-        assert_eq!(change, ThreadChange::Unchanged);
+        assert_eq!(apply(&broker, id, 25, &end("t2", 5)), ThreadChange::Stale);
+        assert_eq!(selected(&broker, id).as_deref(), Some("t2"));
+
+        // A thread that is not selected ending is kept: its older start arriving afterwards is
+        // overruled by it, and a newer start of it is a resume.
+        assert_eq!(
+            apply(&broker, id, 40, &end("t3", 6)),
+            ThreadChange::Unchanged
+        );
+        assert_eq!(apply(&broker, id, 35, &start("t3", 7)), ThreadChange::Stale);
+        assert_eq!(selected(&broker, id).as_deref(), Some("t2"));
+        assert!(matches!(
+            apply(&broker, id, 45, &start("t3", 8)),
+            ThreadChange::Selected(_)
+        ));
+
         // The selected thread ending, reported by a newer process, leaves none selected.
         let before = revision(&broker, id);
-        let (change, _, _) = broker
-            .observe_bridge(
-                id,
-                &reporter(50),
-                &observed(ObservedEvent::ThreadEnded, "t2"),
-                now,
-            )
-            .expect("applied");
         assert_eq!(
-            change,
+            apply(&broker, id, 50, &end("t3", 9)),
             ThreadChange::Ended(AgentBindingRevision::new(before.get() + 1))
         );
-        assert!(
-            broker
-                .binding_state(id)
-                .expect("known")
-                .thread_id
-                .as_ref()
-                .is_none()
-        );
+        assert_eq!(selected(&broker, id), None);
         // And a tool or a notification never moves the binding.
         let at = revision(&broker, id);
         for event in [
@@ -1014,117 +1096,177 @@ mod tests {
             ObservedEvent::ToolFailed,
             ObservedEvent::Notification,
         ] {
-            let (change, _, _) = broker
-                .observe_bridge(id, &reporter(60), &observed(event, "t3"), now)
-                .expect("applied");
-            assert_eq!(change, ThreadChange::Unchanged);
+            assert_eq!(
+                apply(&broker, id, 60, &observed(event, "t4", 10)),
+                ThreadChange::Unchanged
+            );
         }
         assert_eq!(revision(&broker, id), at);
     }
 
-    /// KR-REQ-11.62: a contact request is recorded under the binding of the thread its call ran
-    /// in: the current revision when that thread is the selected one, the revision the thread had
-    /// when it has been left, and one behind the current revision when a thread this host never
-    /// saw selected is not the one in force. With nothing selected and a thread never left, the
-    /// report selects the thread in use.
+    /// KR-REQ-11.62: two reports the kernel's clock cannot tell apart are ordered by the boot-clock
+    /// reading each forwarder took when it started. Reports equal in both are not ordered at all:
+    /// the binding is not moved on a guess, rich mutations are suspended and no selection is
+    /// vouched for, until a report the host can order settles it. A suspension something else
+    /// placed is not lifted by the bridge.
     #[test]
-    fn kr_req_11_62_a_contact_request_is_recorded_under_its_threads_binding() {
+    fn kr_req_11_62_reports_the_host_cannot_order_move_nothing_and_suspend_rich_mutations() {
         let id = instance(3);
         let broker = broker_with(&[id]);
-        let now = TimestampMs::new(1);
-
-        // Nothing selected yet: the first word of a thread selects it.
-        let (change, attested, _) = broker
-            .observe_bridge(id, &reporter(10), &asked("t1", "r-1"), now)
-            .expect("applied");
-        assert_eq!(change, ThreadChange::Unchanged);
-        let t1 = revision(&broker, id);
-        assert_eq!(attested, Some(t1));
-        assert_eq!(broker.attested_request(id, "r-1"), Some(t1));
-
-        // In the selected thread: the current revision.
-        let (_, attested, _) = broker
-            .observe_bridge(id, &reporter(11), &asked("t1", "r-2"), now)
-            .expect("applied");
-        assert_eq!(attested, Some(t1));
-
-        // Another thread is selected; a late report from the first thread records the revision it
-        // had, which is no longer current.
-        broker
-            .observe_bridge(
-                id,
-                &reporter(20),
-                &observed(ObservedEvent::ThreadStarted, "t2"),
-                now,
-            )
-            .expect("applied");
-        let t2 = revision(&broker, id);
-        assert_ne!(t1, t2);
-        let (_, attested, _) = broker
-            .observe_bridge(id, &reporter(21), &asked("t1", "r-3"), now)
-            .expect("applied");
-        assert_eq!(attested, Some(t1));
-        // A thread this host never saw selected, while another is: behind the current revision.
-        let (_, attested, _) = broker
-            .observe_bridge(id, &reporter(22), &asked("t9", "r-4"), now)
-            .expect("applied");
-        assert_eq!(attested, Some(AgentBindingRevision::new(t2.get() - 1)));
+        assert!(matches!(
+            apply(&broker, id, 10, &start("t1", 500)),
+            ThreadChange::Selected(_)
+        ));
+        // The same kernel start value, a later forwarder start: ordered, and it selects.
+        assert!(matches!(
+            apply(&broker, id, 10, &start("t2", 501)),
+            ThreadChange::Selected(_)
+        ));
+        let at = revision(&broker, id);
+        // Equal in both: not ordered.
         assert_eq!(
-            revision(&broker, id),
-            t2,
-            "a request report selects nothing here"
+            apply(&broker, id, 10, &start("t3", 501)),
+            ThreadChange::Unordered
         );
-        assert_eq!(broker.attested_request(id, "r-5"), None);
+        let state = broker.binding_state(id).expect("known");
+        assert_eq!(state.binding_revision, at, "the binding did not move");
+        assert_eq!(selected(&broker, id).as_deref(), Some("t2"));
+        assert!(state.rich_mutations_suspended);
+        assert_eq!(broker.verified_selection(id), None);
+        // The same for an end the host cannot order against the start in force.
+        assert_eq!(
+            apply(&broker, id, 10, &end("t2", 501)),
+            ThreadChange::Unordered
+        );
+        // A report the host can order settles it and lifts the bridge's own suspension.
+        assert!(matches!(
+            apply(&broker, id, 11, &start("t3", 502)),
+            ThreadChange::Selected(_)
+        ));
+        let state = broker.binding_state(id).expect("known");
+        assert!(!state.rich_mutations_suspended);
+        assert_eq!(
+            broker
+                .verified_selection(id)
+                .map(|(thread, _)| thread.as_str().to_owned())
+                .as_deref(),
+            Some("t3")
+        );
+
+        // A thread's end and a start of it that the host cannot order: not ordered either.
+        assert_eq!(
+            apply(&broker, id, 20, &end("t9", 7)),
+            ThreadChange::Unchanged
+        );
+        assert_eq!(
+            apply(&broker, id, 20, &start("t9", 7)),
+            ThreadChange::Unordered
+        );
+
+        // A suspension placed by something else stays when a report settles the thread.
+        let other = instance(4);
+        let broker = broker_with(&[other]);
+        broker
+            .suspend_rich_mutations(other, "something else")
+            .expect("suspended");
+        assert!(matches!(
+            apply(&broker, other, 10, &start("t1", 5)),
+            ThreadChange::Selected(_)
+        ));
+        assert!(
+            broker
+                .binding_state(other)
+                .expect("known")
+                .rich_mutations_suspended
+        );
+    }
+
+    /// KR-REQ-11.62: a finished contact question's report places its request in the thread that
+    /// ran it and selects nothing; a request two reports place in two threads is placed in none;
+    /// and a report that says its hook started in the future is refused.
+    #[test]
+    fn kr_req_11_62_a_contact_request_is_placed_in_the_thread_every_report_names() {
+        let id = instance(5);
+        let broker = broker_with(&[id]);
+        assert_eq!(
+            apply(&broker, id, 10, &asked("t1", "r-1")),
+            ThreadChange::Unchanged
+        );
+        assert_eq!(
+            selected(&broker, id),
+            None,
+            "a tool's report selects nothing"
+        );
+        assert_eq!(
+            broker
+                .attested_thread(id, "r-1")
+                .map(|thread| thread.as_str().to_owned())
+                .as_deref(),
+            Some("t1")
+        );
+        assert_eq!(
+            apply(&broker, id, 11, &asked("t1", "r-1")),
+            ThreadChange::Unchanged
+        );
+        assert!(
+            broker.attested_thread(id, "r-1").is_some(),
+            "two agreeing reports"
+        );
+        apply(&broker, id, 12, &asked("t2", "r-1"));
+        assert_eq!(
+            broker.attested_thread(id, "r-1"),
+            None,
+            "two threads for one request"
+        );
+        assert_eq!(broker.attested_thread(id, "r-2"), None);
+
+        let future = Observation {
+            started: u64::MAX,
+            ..start("t1", 0)
+        };
+        assert!(
+            broker
+                .observe_bridge(id, &reporter(13), &future, TimestampMs::new(1))
+                .is_err()
+        );
     }
 
     /// KR-REQ-11.62: a thread another live execution already owns is not selected; the binding
     /// stays where it was and rich mutations are suspended until it is verified.
     #[test]
     fn kr_req_11_62_a_thread_another_execution_owns_suspends_rich_mutations() {
-        let (first, second) = (instance(4), instance(5));
+        let (first, second) = (instance(6), instance(7));
         let broker = broker_with(&[first, second]);
-        let now = TimestampMs::new(1);
-        broker
-            .observe_bridge(
-                first,
-                &reporter(10),
-                &observed(ObservedEvent::ThreadStarted, "shared"),
-                now,
-            )
-            .expect("applied");
+        apply(&broker, first, 10, &start("shared", 1));
         let before = revision(&broker, second);
-        let (change, _, _) = broker
-            .observe_bridge(
-                second,
-                &reporter(11),
-                &observed(ObservedEvent::ThreadStarted, "shared"),
-                now,
-            )
-            .expect("applied");
+        let change = apply(&broker, second, 11, &start("shared", 2));
         assert!(matches!(change, ThreadChange::Refused(_)), "{change:?}");
         let state = broker.binding_state(second).expect("known");
         assert_eq!(state.binding_revision, before);
         assert!(state.rich_mutations_suspended);
+        assert_eq!(broker.verified_selection(second), None);
     }
 
     #[test]
     fn an_observation_frame_is_exactly_one_and_bounded() {
         let parsed = Observation::from_frame(
-            br#"{"kr_observation":{"event":"tool_finished","thread":"t1","detail":"Bash","contact_request":"r-1"}}"#,
+            br#"{"kr_observation":{"event":"tool_finished","thread":"t1","started":7,"detail":"Bash","contact_request":"r-1"}}"#,
         )
         .expect("an observation");
         assert_eq!(parsed.contact_request.as_deref(), Some("r-1"));
+        assert_eq!(parsed.started, 7);
         let long_detail = format!(
-            r#"{{"kr_observation":{{"event":"notification","thread":"t1","detail":"{}"}}}}"#,
+            r#"{{"kr_observation":{{"event":"notification","thread":"t1","started":1,"detail":"{}"}}}}"#,
             "x".repeat(MAX_OBSERVATION_DETAIL_BYTES + 1)
         );
         for refused in [
-            &br#"{"kr_observation":{"event":"tool_finished","thread":"t1","extra":1}}"#[..],
-            &br#"{"kr_observation":{"event":"session_started","thread":"t1"}}"#[..],
-            &br#"{"kr_observation":{"event":"thread_started","thread":""}}"#[..],
-            &br#"{"kr_observation":{"event":"thread_started","thread":"t1","contact_request":"r"}}"#[..],
-            &br#"{"kr_observation":{"event":"tool_finished","thread":"t1","contact_request":"  "}}"#[..],
-            &br#"{"kr_observation":{"event":"tool_finished","thread":"t1"},"more":1}"#[..],
+            &br#"{"kr_observation":{"event":"tool_finished","thread":"t1","started":1,"extra":1}}"#[..],
+            &br#"{"kr_observation":{"event":"tool_finished","thread":"t1"}}"#[..],
+            &br#"{"kr_observation":{"event":"session_started","thread":"t1","started":1}}"#[..],
+            &br#"{"kr_observation":{"event":"thread_started","thread":"","started":1}}"#[..],
+            &br#"{"kr_observation":{"event":"thread_started","thread":"t1","started":1,"contact_request":"r"}}"#[..],
+            &br#"{"kr_observation":{"event":"tool_finished","thread":"t1","started":1,"contact_request":"  "}}"#[..],
+            &br#"{"kr_observation":{"event":"tool_finished","thread":"t1","started":1},"more":1}"#[..],
             long_detail.as_bytes(),
         ] {
             assert!(

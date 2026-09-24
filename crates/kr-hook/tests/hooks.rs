@@ -226,12 +226,15 @@ fn state_of(
         .state
 }
 
-/// KR-REQ-11.62: the application's own hooks say which thread ran the `ask_user` call that asked a
-/// question, so the question records the binding revision it was asked under; when a later
-/// `SessionStart` hook reports another thread, the binding advances in production code and the
-/// question asked under the old thread is invalidated for every client, with a person's answer
-/// refused. A question asked in the new thread stays open, and one no hook placed in a thread stays
-/// application-scoped.
+/// KR-REQ-11.62: a question is asked in the thread the application's bridge last reported
+/// selected, and the application's own hook later says which thread ran the `ask_user` call that
+/// asked it. When the two agree, the question is bound to the revision it was asked under; a later
+/// `SessionStart` hook reporting another thread advances the binding in production code, and the
+/// question from the old thread is invalidated for every client, with a person's answer refused.
+/// A question asked in the new thread stays open, and one no hook placed in a thread stays
+/// application-scoped. A report of the call that arrives after the thread was left and selected
+/// again still binds the question to the revision it was asked under, not to the later one; and a
+/// question whose reports disagree, as a retry from another thread makes them, is bound to nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_11_62_a_thread_switch_the_hooks_report_invalidates_the_questions_asked_under_the_old_thread()
  {
@@ -253,9 +256,11 @@ async fn kr_req_11_62_a_thread_switch_the_hooks_report_invalidates_the_questions
     };
 
     let (started, _, _) = hook(&mut launch, &session_start(FIRST_THREAD, "startup")).await;
-    let ThreadChange::Selected(first_binding) = started.thread else {
-        panic!("the first thread is selected: {:?}", started.thread);
-    };
+    assert!(
+        matches!(started.thread, ThreadChange::Selected(_)),
+        "{:?}",
+        started.thread
+    );
 
     let (old, _) = questions
         .create(&helper, &ask("asked-in-the-first-thread"), now(1_000))
@@ -271,12 +276,11 @@ async fn kr_req_11_62_a_thread_switch_the_hooks_report_invalidates_the_questions
             .is_none(),
         "when it is asked, nothing yet says which thread asked it"
     );
-    let (placed_in_first, outcome, _) = hook(
+    let (_, outcome, _) = hook(
         &mut launch,
         &asked(FIRST_THREAD, "asked-in-the-first-thread"),
     )
     .await;
-    assert_eq!(placed_in_first.attested, Some(first_binding));
     assert_eq!(outcome.stdout, b"{}\n");
     assert!(questions.sweep(now(1_100)).expect("sweeps").is_empty());
     assert_eq!(
@@ -286,9 +290,22 @@ async fn kr_req_11_62_a_thread_switch_the_hooks_report_invalidates_the_questions
     );
 
     // The person runs `/clear`: Claude Code ends the first thread and starts another.
+    let (ended, _, _) = hook(
+        &mut launch,
+        &serde_json::json!({"session_id": FIRST_THREAD, "hook_event_name": "SessionEnd",
+            "reason": "clear"})
+        .to_string()
+        .into_bytes(),
+    )
+    .await;
+    assert!(
+        matches!(ended.thread, ThreadChange::Ended(_)),
+        "{:?}",
+        ended.thread
+    );
     let (switched, outcome, _) = hook(&mut launch, &session_start(SECOND_THREAD, "clear")).await;
     assert!(
-        matches!(switched.thread, ThreadChange::Selected(revision) if revision > first_binding),
+        matches!(switched.thread, ThreadChange::Selected(_)),
         "{:?}",
         switched.thread
     );
@@ -297,12 +314,11 @@ async fn kr_req_11_62_a_thread_switch_the_hooks_report_invalidates_the_questions
     let (new, _) = questions
         .create(&helper, &ask("asked-in-the-second-thread"), now(2_000))
         .expect("asked");
-    let (placed_in_second, _, _) = hook(
+    hook(
         &mut launch,
         &asked(SECOND_THREAD, "asked-in-the-second-thread"),
     )
     .await;
-    assert!(matches!(placed_in_second.attested, Some(revision) if revision > first_binding));
 
     // Every client reads the question from the old thread invalidated.
     assert_eq!(
@@ -335,15 +351,54 @@ async fn kr_req_11_62_a_thread_switch_the_hooks_report_invalidates_the_questions
         .expect_err("an answer to the invalidated question is refused");
     assert_eq!(refused.code(), ErrorCode::QuestionExpired);
 
-    // A report of a call from the first thread that arrives after the switch places its question
-    // in a binding that has already been left, so it is invalidated at once.
+    // Asked in the second thread; the person resumes the first and returns to the second before
+    // the call's report arrives. The report binds the question to the second thread's revision
+    // when it was asked, which has been left, so it is invalidated, although the second thread is
+    // selected again.
     let (late, _) = questions
         .create(&helper, &ask("reported-late"), now(3_000))
         .expect("asked");
-    let (placed_late, _, _) = hook(&mut launch, &asked(FIRST_THREAD, "reported-late")).await;
-    assert_eq!(placed_late.attested, Some(first_binding));
+    hook(&mut launch, &session_start(FIRST_THREAD, "resume")).await;
+    let (back, _, _) = hook(&mut launch, &session_start(SECOND_THREAD, "resume")).await;
+    assert!(
+        matches!(back.thread, ThreadChange::Selected(_)),
+        "{:?}",
+        back.thread
+    );
+    hook(&mut launch, &asked(SECOND_THREAD, "reported-late")).await;
     assert_eq!(
         state_of(&questions, late.question.question_id, 3_100),
         QuestionState::Expired
     );
+
+    // Asked in the second thread, and reported both from another thread (a retry the agent made
+    // there, which returns this same question) and from its own: the reports disagree, so the
+    // question is bound to nothing and a switch does not invalidate it.
+    let (retried, _) = questions
+        .create(&helper, &ask("retried"), now(4_000))
+        .expect("asked");
+    let (again, _) = questions
+        .create(&helper, &ask("retried"), now(4_001))
+        .expect("the exact retry");
+    assert!(
+        again.deduplicated,
+        "a retry returns the question it asked before"
+    );
+    hook(&mut launch, &asked(FIRST_THREAD, "retried")).await;
+    hook(&mut launch, &asked(SECOND_THREAD, "retried")).await;
+    // Asked while the first thread is selected, and reported only from the second: the report
+    // does not name the thread it was asked in, so it binds nothing either.
+    hook(&mut launch, &session_start(FIRST_THREAD, "resume")).await;
+    let (elsewhere, _) = questions
+        .create(&helper, &ask("reported-from-elsewhere"), now(4_050))
+        .expect("asked");
+    hook(
+        &mut launch,
+        &asked(SECOND_THREAD, "reported-from-elsewhere"),
+    )
+    .await;
+    hook(&mut launch, &session_start(SECOND_THREAD, "resume")).await;
+    for unbound in [retried.question.question_id, elsewhere.question.question_id] {
+        assert_eq!(state_of(&questions, unbound, 4_100), QuestionState::Pending);
+    }
 }

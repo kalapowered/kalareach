@@ -882,7 +882,7 @@ impl NativeGateway {
             BrokerError::invalid("the hook closed its connection without an observation")
         })?;
         let observation = crate::broker::bridge::Observation::from_frame(&body)?;
-        let (thread, attested, cursor) = self.broker.observe_bridge(
+        let (thread, cursor) = self.broker.observe_bridge(
             self.launch.application_instance_id,
             &admitted.process,
             &observation,
@@ -892,7 +892,6 @@ impl NativeGateway {
         Ok(crate::broker::bridge::HookReport {
             observation,
             thread,
-            attested,
             cursor,
         })
     }
