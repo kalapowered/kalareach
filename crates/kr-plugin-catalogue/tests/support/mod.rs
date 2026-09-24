@@ -203,6 +203,13 @@ pub struct GenerationSpec {
     /// presentation's bytes, in place of its real one: two signed statements that agree with each
     /// other and not with the bytes.
     pub understated_presentation: Option<u64>,
+    /// The version every role's metadata is signed at, where it is not the generation number: a
+    /// repository that starts its roles again from lower versions after a key change.
+    pub metadata_version: Option<u64>,
+    /// Targets the top-level targets role signs beyond the index and the package, by name and
+    /// bytes. A name may need encoding in a location, or leave the targets location altogether;
+    /// its bytes are written where a client inside the location would find them.
+    pub extra_targets: Vec<(String, Vec<u8>)>,
     /// A change made to the package's index entry after it is derived from the manifest, before
     /// the index is signed: an index that says something the manifest does not.
     pub edit_entry: Option<fn(&mut IndexEntry)>,
@@ -228,6 +235,8 @@ impl Default for GenerationSpec {
             root_extra: Vec::new(),
             asset_copy: false,
             understated_presentation: None,
+            metadata_version: None,
+            extra_targets: Vec::new(),
             edit_entry: None,
         }
     }
@@ -616,8 +625,26 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
     };
     let index_bytes = index.canonical_json().expect("serialisable").into_bytes();
     std::fs::write(targets.join("index.json"), &index_bytes).expect("writable");
+    // Each extra target is written where a client inside the targets location addresses it: the
+    // file transport reads a location's path as it stands, encoding and all. A name that leaves
+    // the location is written as if it did not, since no client inside the location fetches it.
+    let extra: Vec<(String, PathBuf)> = spec
+        .extra_targets
+        .iter()
+        .map(|(name, bytes)| {
+            let path = if name.starts_with('/') {
+                targets.join(name.trim_start_matches('/'))
+            } else {
+                targets.join(addressed(name))
+            };
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("writable");
+            std::fs::write(&path, bytes).expect("writable");
+            (name.clone(), path)
+        })
+        .collect();
 
-    let version = NonZeroU64::new(spec.generation).expect("a generation starts at one");
+    let version = NonZeroU64::new(spec.metadata_version.unwrap_or(spec.generation))
+        .expect("a version starts at one");
     let mut editor = RepositoryEditor::new(directory.join("root.json"))
         .await
         .expect("an editor over the root");
@@ -650,6 +677,10 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
         editor
             .add_target("index.json", index_target)
             .expect("added");
+        for (name, path) in &extra {
+            let target = Target::from_path(path).await.expect("a target");
+            editor.add_target(name.as_str(), target).expect("added");
+        }
 
         // Whoever signs the role being edited: the top-level targets key, then each delegate.
         let mut signer: Option<TestKey> = None;
@@ -716,6 +747,7 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
         for (name, _) in &files {
             names.push((format!("{prefix}/{name}"), targets.join(&prefix).join(name)));
         }
+        names.extend(extra.iter().cloned());
         names.sort();
         for (name, path) in &names {
             let target = declared(name, Target::from_path(path).await.expect("a target"));
@@ -753,6 +785,17 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
         let mut names = vec!["index.json".to_owned()];
         names.extend(files.iter().map(|(name, _)| format!("{prefix}/{name}")));
         publish_consistent(&targets, names.iter().map(String::as_str));
+        for (name, path) in &extra {
+            let bytes = std::fs::read(path).expect("an extra target");
+            let digest: String = PayloadDigest::of(&bytes)
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            let published = targets.join(addressed(&format!("{digest}.{name}")));
+            std::fs::create_dir_all(published.parent().expect("a parent")).expect("writable");
+            std::fs::write(&published, &bytes).expect("writable");
+        }
     }
 
     if let Some(dropped) = &spec.drop_payload {
@@ -763,6 +806,19 @@ async fn write_generation(directory: &Path, keys: &KeySet, spec: &GenerationSpec
     }
 
     manifest_digest
+}
+
+/// Returns the path, relative to the targets directory, that a location inside it addresses the
+/// target `name` by: the name joined onto the location, encoded as the join encodes it.
+fn addressed(name: &str) -> PathBuf {
+    let base = url::Url::parse("file:///targets/").expect("a literal location");
+    let location = base.join(name).expect("a name inside the location");
+    PathBuf::from(
+        location
+            .path()
+            .strip_prefix("/targets/")
+            .expect("inside the location"),
+    )
 }
 
 /// Publishes every named target a second time under the name a consistent snapshot fetches it by:

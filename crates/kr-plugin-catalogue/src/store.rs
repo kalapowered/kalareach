@@ -496,6 +496,15 @@ impl Store {
             }
         };
         for relative in &verified {
+            #[cfg(test)]
+            if publish_fault::stops_at(changed) {
+                return Err(stopped(
+                    changed,
+                    CatalogueError::StorageUnavailable {
+                        detail: "the publication was made to stop".to_owned(),
+                    },
+                ));
+            }
             let from = working.path.join(relative);
             let bytes = std::fs::read(&from)
                 .map_err(|source| stopped(changed, CatalogueError::storage(&from, &source)))?;
@@ -1482,6 +1491,42 @@ fn flush_directory(path: &Path) -> CatalogueResult<()> {
     Ok(())
 }
 
+/// Where the unit tests make a checkpoint publication stop: after a number of documents were
+/// replaced, or at the commit that records the reset it carries as settled.
+#[cfg(test)]
+pub(crate) mod publish_fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+        static RESET: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Makes the next publications on this thread stop once `documents` documents were replaced.
+    pub(crate) fn stop_after(documents: usize) {
+        AFTER.with(|after| after.set(Some(documents)));
+    }
+
+    /// Makes the commit that settles a published checkpoint's reset fail on this thread.
+    pub(crate) fn fail_reset() {
+        RESET.with(|reset| reset.set(true));
+    }
+
+    /// Lets every publication go through again.
+    pub(crate) fn clear() {
+        AFTER.with(|after| after.set(None));
+        RESET.with(|reset| reset.set(false));
+    }
+
+    pub(crate) fn stops_at(replaced: usize) -> bool {
+        AFTER.with(|after| after.get() == Some(replaced))
+    }
+
+    pub(crate) fn reset_fails() -> bool {
+        RESET.with(Cell::get)
+    }
+}
+
 /// What the unit tests run just before an index document is opened, to reach a reader whose records
 /// were read before a sync removed the document they name.
 #[cfg(test)]
@@ -2126,6 +2171,25 @@ mod tests {
                 .package_payloads(PayloadDigest::of(b"never activated"))
                 .expect("readable"),
             None
+        );
+        // A manifest that reads, and names other files, but is not the one the hash names: another
+        // release of the same package, written where this one's manifest was.
+        let mut foreign = kr_plugin_sdk::example::example_manifest_for(presentation.as_bytes());
+        foreign.version =
+            kr_plugin_sdk::version::PackageVersion::parse("9.9.9").expect("a version");
+        foreign.payloads[0].digest = PayloadDigest::of(b"another component");
+        let foreign = serde_json::to_vec(&foreign).expect("serialisable");
+        assert!(serde_json::from_slice::<PluginManifest>(&foreign).is_ok());
+        assert_ne!(PayloadDigest::of(&foreign), digest);
+        std::fs::write(
+            directory.join(kr_plugin_sdk::package::MANIFEST_FILE),
+            &foreign,
+        )
+        .expect("writable");
+        assert_eq!(
+            store.package_payloads(digest).expect("readable"),
+            None,
+            "a manifest that is not the one its hash names says nothing, however well it reads"
         );
         std::fs::write(
             directory.join(kr_plugin_sdk::package::MANIFEST_FILE),

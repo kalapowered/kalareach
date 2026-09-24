@@ -168,56 +168,21 @@ pub struct VerifiedGeneration {
 }
 
 impl VerifiedGeneration {
-    /// Returns every target this generation pins, each with the location it is fetched from.
-    ///
-    /// The location follows the client's own rule for this repository's root: the targets location
-    /// with a trailing slash, joined with the target's name, which is prefixed by its SHA-256 where
-    /// the root publishes consistent snapshots. A name that would leave the targets location is
-    /// refused, as the client refuses it.
+    /// Returns every target this generation pins, each with the location it is fetched from, by
+    /// [`target_location`].
     ///
     /// # Errors
     ///
     /// Returns [`CatalogueError::Untrusted`] for a name the client would not fetch.
     pub fn accepted_targets(&self, targets_url: &url::Url) -> CatalogueResult<Vec<AcceptedTarget>> {
-        let base = if targets_url.as_str().ends_with('/') {
-            targets_url.clone()
-        } else {
-            url::Url::parse(&format!("{targets_url}/")).map_err(|source| {
-                CatalogueError::Untrusted {
-                    detail: format!("{targets_url} is not a targets location: {source}"),
-                }
-            })?
-        };
         let consistent = self.repository.root().signed.consistent_snapshot;
         self.targets
             .iter()
             .map(|(name, record)| {
-                let target =
-                    TargetName::new(name.as_str()).map_err(|source| CatalogueError::Untrusted {
-                        detail: format!("{name} is not a target name the client fetches: {source}"),
-                    })?;
-                let file = if consistent {
-                    let digest: String = record
-                        .digest
-                        .as_bytes()
-                        .iter()
-                        .map(|byte| format!("{byte:02x}"))
-                        .collect();
-                    format!("{digest}.{}", target.resolved())
-                } else {
-                    target.resolved().to_owned()
-                };
-                let location = base
-                    .join(&file)
-                    .ok()
-                    .filter(|location| location.as_str().starts_with(base.as_str()))
-                    .ok_or_else(|| CatalogueError::Untrusted {
-                        detail: format!("{name} does not name a file inside {base}"),
-                    })?;
                 Ok(AcceptedTarget {
                     name: name.clone(),
                     record: *record,
-                    location,
+                    location: target_location(targets_url, consistent, name, record.digest)?,
                 })
             })
             .collect()
@@ -299,6 +264,51 @@ impl VerifiedGeneration {
         ledger.check_payload_bytes(actual, Stage::Actual, name)?;
         Ok(bytes)
     }
+}
+
+/// Returns where the client fetches the target `name` from, by its own rule.
+///
+/// The targets location with a trailing slash, joined with the target's resolved name, which is
+/// prefixed by its SHA-256 in hexadecimal and a dot where the root publishes consistent snapshots.
+/// A name that would leave the targets location is refused, as the client refuses it. The rule is
+/// stated once, here, so the location kept with an accepted generation is the one the client would
+/// have fetched the bytes from.
+///
+/// # Errors
+///
+/// Returns [`CatalogueError::Untrusted`] for a name the client would not fetch.
+pub fn target_location(
+    targets_url: &url::Url,
+    consistent_snapshot: bool,
+    name: &str,
+    digest: PayloadDigest,
+) -> CatalogueResult<url::Url> {
+    let base = if targets_url.as_str().ends_with('/') {
+        targets_url.clone()
+    } else {
+        url::Url::parse(&format!("{targets_url}/")).map_err(|source| CatalogueError::Untrusted {
+            detail: format!("{targets_url} is not a targets location: {source}"),
+        })?
+    };
+    let target = TargetName::new(name).map_err(|source| CatalogueError::Untrusted {
+        detail: format!("{name} is not a target name the client fetches: {source}"),
+    })?;
+    let file = if consistent_snapshot {
+        let digest: String = digest
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        format!("{digest}.{}", target.resolved())
+    } else {
+        target.resolved().to_owned()
+    };
+    base.join(&file)
+        .ok()
+        .filter(|location| location.as_str().starts_with(base.as_str()))
+        .ok_or_else(|| CatalogueError::Untrusted {
+            detail: format!("{name} does not name a file inside {base}"),
+        })
 }
 
 /// Fetches one target of an accepted generation from where it was accepted, reading no metadata.

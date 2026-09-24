@@ -100,6 +100,15 @@ pub use crate::store::{PackageCheck, ReadyPackage, Store};
 pub use crate::trust::{MetadataVersions, VerifiedGeneration};
 
 use crate::authority::committed;
+
+/// The suite's own generations, signed in memory, for the tests that reach inside a publication.
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod test_support;
+
+/// The suite names this crate by its name, as every other user of it does.
+#[cfg(test)]
+extern crate self as kr_plugin_catalogue;
 use crate::db::{Changes, Db, Records};
 use crate::store::StoreLock;
 use crate::trust::{PACKAGE_PREFIX, TargetRecord};
@@ -1096,7 +1105,15 @@ impl Catalogue {
             committed(authority, &Effect::Checkpoint(id.clone()), |permit| {
                 store.publish_checkpoint(permit, &working)?;
                 pending
-                    .run(permit, |changes| changes.clear_trust_reset(key))
+                    .run(permit, |changes| {
+                        #[cfg(test)]
+                        if crate::store::publish_fault::reset_fails() {
+                            return Err(CatalogueError::StorageUnavailable {
+                                detail: "the reset was made not to settle".to_owned(),
+                            });
+                        }
+                        changes.clear_trust_reset(key)
+                    })
                     .map_err(|error| match error {
                         uncertain @ CatalogueError::PublicationUncertain { .. } => uncertain,
                         other => CatalogueError::PublicationUncertain {
@@ -2314,6 +2331,16 @@ fn reclaim(
             .ok_or_else(|| CatalogueError::NotFound {
                 detail: "the repository was removed while it was being fetched from".to_owned(),
             })?;
+        // A reclaim that has to remove nothing asks nothing about what is protected: a live
+        // package this host cannot name holds up only the removals it would have to be weighed
+        // against.
+        let ledger = ledger_of(store, &enrolled)?;
+        if ledger
+            .check_payload_bytes(length, Stage::Declared, subject)
+            .is_ok()
+        {
+            return Ok(store::ReclaimPlan::default());
+        }
         // A package's hash names its manifest. Protecting only that would leave the component and
         // the assets a live binding actually runs on evictable, so every payload of a protected
         // package is protected with it.
@@ -2338,7 +2365,7 @@ fn reclaim(
                 protected.extend(entry.payloads.iter().map(|payload| payload.digest));
             }
         }
-        store.plan_reclaim(length, &ledger_of(store, &enrolled)?, &protected, subject)
+        store.plan_reclaim(length, &ledger, &protected, subject)
     })?;
     if plan.is_empty() {
         return Ok(());
@@ -2759,6 +2786,207 @@ mod tests {
                     && detail.contains("retained_generations")),
             "{refusal:?}"
         );
+    }
+
+    /// Enrols a generation the suite signed into a catalogue of its own under `home`.
+    fn enrolled_generation(
+        home: &Path,
+        generation: &crate::test_support::Generation,
+    ) -> (Catalogue, RepositoryId) {
+        let id = RepositoryId::new("official").expect("a valid identifier");
+        let mut catalogue =
+            Catalogue::open(&home.join("catalogue")).expect("an openable catalogue");
+        catalogue
+            .enrol(
+                Enrolment::new(
+                    id.clone(),
+                    RepositoryKind::Official,
+                    generation.metadata_url(),
+                    generation.targets_url(),
+                    generation.root_bytes(),
+                    RepositoryBudgets::defaults(),
+                    CapabilityCeiling::default_ceiling(),
+                )
+                .expect("an enrolment"),
+                true,
+            )
+            .expect("the owner adopted the root");
+        (catalogue, id)
+    }
+
+    /// The versions of the timestamp and snapshot the accepted checkpoint holds: the floors the
+    /// next verification compares against.
+    fn floors(catalogue: &Catalogue, id: &RepositoryId) -> (u64, u64) {
+        let checkpoint = catalogue.store(id).expect("enrolled").datastore();
+        let read = |name: &str| std::fs::read(checkpoint.join(name)).expect("a floor");
+        let timestamp: tough::schema::Signed<tough::schema::Timestamp> =
+            serde_json::from_slice(&read("timestamp.json")).expect("a timestamp");
+        let snapshot: tough::schema::Signed<tough::schema::Snapshot> =
+            serde_json::from_slice(&read("snapshot.json")).expect("a snapshot");
+        (
+            timestamp.signed.version.get(),
+            snapshot.signed.version.get(),
+        )
+    }
+
+    /// A checkpoint publication stopped after any number of documents leaves each document whole,
+    /// from one generation or the other, and floors no lower than before. After a restart, a replay
+    /// of the generation before is refused exactly where a floor moved on, and the new generation
+    /// is accepted whatever the stop left.
+    #[tokio::test]
+    async fn a_publication_stopped_after_any_document_keeps_its_floors_and_refuses_a_rollback() {
+        use crate::test_support::{Generation, GenerationSpec, copy_tree};
+
+        // The root, the time, the snapshot, the targets and the timestamp, in the order they go.
+        for stop in 0..=5usize {
+            let home = tempfile::tempdir().expect("a temporary directory");
+            let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+            let first = home.path().join("first");
+            copy_tree(&generation.directory(), &first);
+            let (mut catalogue, id) = enrolled_generation(home.path(), &generation);
+            catalogue.sync(&id).await.expect("the first generation");
+            generation.rewrite_as(2).await;
+
+            crate::store::publish_fault::stop_after(stop);
+            let outcome = catalogue.sync(&id).await;
+            crate::store::publish_fault::clear();
+            match (stop, outcome) {
+                (5, outcome) => {
+                    outcome.expect("the whole checkpoint published");
+                }
+                (0, Err(CatalogueError::StorageUnavailable { .. })) => {}
+                (_, Err(CatalogueError::PublicationUncertain { .. })) => {}
+                (_, outcome) => panic!("stopped after {stop}: {outcome:?}"),
+            }
+
+            drop(catalogue);
+            let mut catalogue = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+            let (timestamp, snapshot) = floors(&catalogue, &id);
+            assert!(
+                [1, 2].contains(&timestamp) && [1, 2].contains(&snapshot),
+                "stopped after {stop}"
+            );
+            let moved = timestamp == 2 || snapshot == 2;
+
+            std::fs::remove_dir_all(generation.directory()).expect("removable");
+            copy_tree(&first, &generation.directory());
+            let replayed = catalogue.sync(&id).await;
+            assert_eq!(
+                replayed.is_err(),
+                moved,
+                "stopped after {stop}: floors {timestamp}, {snapshot}: {replayed:?}"
+            );
+            if let Err(refusal) = replayed {
+                assert!(
+                    matches!(refusal, CatalogueError::Untrusted { .. }),
+                    "stopped after {stop}: {refusal:?}"
+                );
+            }
+
+            generation.rewrite_as(2).await;
+            catalogue
+                .sync(&id)
+                .await
+                .unwrap_or_else(|refusal| panic!("stopped after {stop}: {refusal}"));
+            assert_eq!(
+                catalogue
+                    .active(&id)
+                    .expect("enrolled")
+                    .map(|active| active.generation),
+                Some(2)
+            );
+        }
+    }
+
+    /// A root that changes the timestamp key and keeps the others is kept through the rotation
+    /// callback, which records the floors it resets. Whether the publication that follows stops
+    /// after any document or at the commit that settles the reset, the reset stays owed across a
+    /// restart, the next sync accepts the lower versions the new key signs, and a replay of the
+    /// generation before the rotation, signed with the key the new root no longer trusts, is
+    /// refused.
+    #[tokio::test]
+    async fn a_partial_key_change_stays_owed_until_a_whole_checkpoint_settles_it() {
+        use crate::test_support::{Generation, GenerationSpec, KeySet, TestKey, copy_tree};
+
+        for stop in [None, Some(0usize), Some(1), Some(2), Some(3), Some(4)] {
+            let home = tempfile::tempdir().expect("a temporary directory");
+            let generation = Generation::build(
+                home.path(),
+                GenerationSpec {
+                    generation: 3,
+                    ..GenerationSpec::default()
+                },
+            )
+            .await;
+            let before = home.path().join("before");
+            copy_tree(&generation.directory(), &before);
+            let (mut catalogue, id) = enrolled_generation(home.path(), &generation);
+            catalogue.sync(&id).await.expect("the first generation");
+            let old = generation.keys();
+            let retained = KeySet {
+                timestamp: TestKey::generate(),
+                ..old.clone()
+            };
+            generation
+                .rotate_to(GenerationSpec {
+                    generation: 4,
+                    metadata_version: Some(2),
+                    keys: Some(retained),
+                    root_version: 2,
+                    ..GenerationSpec::default()
+                })
+                .await;
+
+            match stop {
+                None => crate::store::publish_fault::fail_reset(),
+                Some(documents) => crate::store::publish_fault::stop_after(documents),
+            }
+            let outcome = catalogue.sync(&id).await;
+            crate::store::publish_fault::clear();
+            assert!(outcome.is_err(), "{stop:?}: {outcome:?}");
+
+            drop(catalogue);
+            let mut catalogue = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+            let enrolled = catalogue.enrolled(&id).expect("enrolled");
+            let kept: tough::schema::Signed<tough::schema::Root> =
+                serde_json::from_slice(&enrolled.enrolment.root).expect("a root");
+            assert_eq!(
+                kept.signed.version.get(),
+                2,
+                "{stop:?}: the rotation is kept"
+            );
+            assert!(
+                catalogue
+                    .db
+                    .read(|records| records.trust_reset(&enrolled.key))
+                    .expect("readable"),
+                "{stop:?}: the reset the rotation recorded is still owed"
+            );
+
+            catalogue
+                .sync(&id)
+                .await
+                .unwrap_or_else(|refusal| panic!("{stop:?}: {refusal}"));
+            assert!(
+                !catalogue
+                    .db
+                    .read(|records| records.trust_reset(&enrolled.key))
+                    .expect("readable"),
+                "{stop:?}: a whole checkpoint settles it"
+            );
+            assert_eq!(floors(&catalogue, &id), (2, 2), "{stop:?}");
+
+            std::fs::remove_dir_all(generation.directory()).expect("removable");
+            copy_tree(&before, &generation.directory());
+            let refusal = catalogue
+                .sync(&id)
+                .await
+                .expect_err("the old timestamp key is no longer trusted");
+            assert!(
+                matches!(refusal, CatalogueError::Untrusted { .. }),
+                "{stop:?}: {refusal:?}"
+            );
+        }
     }
 
     /// A read that fails while no repository stopped keeping anything fails as it is.

@@ -2745,6 +2745,237 @@ async fn kr_req_11_13_an_upgrade_leaves_a_live_binding_on_its_exact_package_hash
     );
 }
 
+/// A broker that reports the packages its live bindings hold.
+#[derive(Debug)]
+struct Reporting(Vec<PayloadDigest>);
+
+impl kr_plugin_catalogue::BrokerBridge for Reporting {
+    fn live_evidence(
+        &self,
+        _request: &kr_plugin_catalogue::broker::EvidenceRequest,
+    ) -> Option<kr_plugin_sdk::capability::CapabilityEvidence> {
+        None
+    }
+
+    fn admit_proxy(
+        &self,
+        request: &kr_plugin_catalogue::broker::ProxyRequest,
+    ) -> CatalogueResult<kr_plugin_catalogue::broker::ProxyAdmission> {
+        kr_plugin_catalogue::UnboundBroker.admit_proxy(request)
+    }
+
+    fn live_packages(&self) -> Vec<PayloadDigest> {
+        self.0.clone()
+    }
+}
+
+/// What keeps the first release's package once an upgrade moved its installation on.
+#[derive(Clone, Copy, Debug)]
+enum Holder {
+    Nothing,
+    Broker,
+    Binding,
+    BrokerWithoutManifest,
+    BrokerWithAlteredManifest,
+}
+
+/// A package an upgrade moved its installation off is kept whole while the broker reports it live
+/// or a local binding holds it, and room for the next release is made with it only where nothing
+/// does. Where the broker reports it and its manifest is gone or altered, nothing can say what it
+/// consists of, and the reclaim is refused before anything is removed.
+///
+/// The budget holds the first two releases, installed, cached and extracted, and the third
+/// release's staging exactly once the first release's extracted copy is gone.
+#[tokio::test]
+async fn kr_req_11_12_an_upgraded_package_is_kept_while_the_broker_or_a_binding_holds_it() {
+    for holder in [
+        Holder::Nothing,
+        Holder::Broker,
+        Holder::Binding,
+        Holder::BrokerWithoutManifest,
+        Holder::BrokerWithAlteredManifest,
+    ] {
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let first = Generation::build(home.path(), GenerationSpec::default()).await;
+        let release = |generation: u64, version: &str| {
+            let home = home.path().join(version);
+            let keys = first.keys();
+            let version = version.to_owned();
+            async move {
+                Generation::build(
+                    &home,
+                    GenerationSpec {
+                        generation,
+                        package_version: version,
+                        keys: Some(keys),
+                        ..GenerationSpec::default()
+                    },
+                )
+                .await
+            }
+        };
+        let second = release(2, "0.2.0").await;
+        let third = release(3, "0.3.0").await;
+        let (a, b, c) = (
+            payloads_of(&first),
+            payloads_of(&second),
+            payloads_of(&third),
+        );
+        let presentation = presentation_size(&first);
+        assert_eq!(a.len(), 2);
+        assert!(
+            a.keys()
+                .filter(|digest| b.contains_key(digest) && c.contains_key(digest))
+                .count()
+                == 1
+        );
+        let (ma, mb, mc) = (
+            a[&first.manifest_digest()],
+            b[&second.manifest_digest()],
+            c[&third.manifest_digest()],
+        );
+        let mut budgets = RepositoryBudgets::defaults();
+        budgets.payload_cache_bytes = U64::new(ma + 2 * mb + 2 * mc + 3 * presentation);
+        let old = first.manifest_digest();
+        let broker: Arc<dyn kr_plugin_catalogue::BrokerBridge> = match holder {
+            Holder::Nothing | Holder::Binding => Arc::new(kr_plugin_catalogue::UnboundBroker),
+            _ => Arc::new(Reporting(vec![old])),
+        };
+        let mut catalogue = Catalogue::with_broker(&home.path().join("catalogue"), broker)
+            .expect("an openable catalogue");
+        catalogue
+            .enrol(
+                Enrolment::new(
+                    repository(),
+                    RepositoryKind::Official,
+                    first.metadata_url(),
+                    first.targets_url(),
+                    first.root_bytes(),
+                    budgets,
+                    CapabilityCeiling::default_ceiling(),
+                )
+                .expect("an enrollable repository"),
+                true,
+            )
+            .expect("the owner adopted the root");
+        let install = |version: &str, digest: PayloadDigest| {
+            (
+                PackageVersion::parse(version).expect("a valid version"),
+                digest,
+            )
+        };
+        for (number, (version, digest), next) in [
+            (1, install("0.1.0", old), Some(&second)),
+            (2, install("0.2.0", second.manifest_digest()), None),
+        ] {
+            catalogue
+                .sync(&repository())
+                .await
+                .unwrap_or_else(|refusal| panic!("{holder:?}: generation {number}: {refusal}"));
+            catalogue
+                .install(
+                    &repository(),
+                    environment(),
+                    &plugin(),
+                    &version,
+                    digest,
+                    InstallationGrant::none(),
+                )
+                .await
+                .unwrap_or_else(|refusal| panic!("{holder:?}: {version}: {refusal}"));
+            if number == 1 && matches!(holder, Holder::Binding) {
+                catalogue
+                    .set_enabled(environment(), &plugin(), true)
+                    .await
+                    .expect("enablable");
+                let entry = catalogue.index(&repository()).expect("an index").entries[0].clone();
+                catalogue
+                    .bind(environment(), &entry, "/usr/local/bin/example-agent")
+                    .expect("bound");
+            }
+            if let Some(next) = next {
+                first.replace_with(next);
+            }
+        }
+        let store = catalogue.store(&repository()).expect("enrolled");
+        let manifest = store
+            .package_dir(old)
+            .join(kr_plugin_sdk::package::MANIFEST_FILE);
+        match holder {
+            Holder::BrokerWithoutManifest => std::fs::remove_file(&manifest).expect("removable"),
+            Holder::BrokerWithAlteredManifest => {
+                std::fs::write(&manifest, b"{}").expect("writable");
+            }
+            _ => {}
+        }
+
+        first.replace_with(&third);
+        catalogue
+            .sync(&repository())
+            .await
+            .unwrap_or_else(|refusal| panic!("{holder:?}: generation 3: {refusal}"));
+        let outcome = catalogue
+            .install(
+                &repository(),
+                environment(),
+                &plugin(),
+                &PackageVersion::parse("0.3.0").expect("a valid version"),
+                third.manifest_digest(),
+                InstallationGrant::none(),
+            )
+            .await;
+        match holder {
+            Holder::Nothing => {
+                outcome.expect("the first release's extracted copy is the room the third needs");
+                assert!(!store.package_dir(old).exists(), "{holder:?}");
+                assert!(
+                    store.holds_payload(old, ma).expect("readable"),
+                    "{holder:?}"
+                );
+            }
+            Holder::Broker | Holder::Binding => {
+                let refusal = outcome.expect_err("the first release's package is held");
+                assert!(
+                    matches!(&refusal, CatalogueError::ResourceLimit(limit)
+                        if limit.resource == Resource::PayloadCacheBytes),
+                    "{holder:?}: {refusal:?}"
+                );
+                assert!(
+                    complete(&store, old),
+                    "{holder:?}: the extracted copy is whole"
+                );
+                for (digest, size) in &a {
+                    assert!(
+                        store.holds_payload(*digest, *size).expect("readable"),
+                        "{holder:?}"
+                    );
+                }
+            }
+            Holder::BrokerWithoutManifest | Holder::BrokerWithAlteredManifest => {
+                let refusal = outcome.expect_err("nothing can say what the live package needs");
+                assert!(
+                    matches!(&refusal, CatalogueError::StorageUnavailable { detail }
+                        if detail.contains("cannot name the files")),
+                    "{holder:?}: {refusal:?}"
+                );
+                assert!(
+                    store
+                        .package_dir(old)
+                        .join(kr_plugin_sdk::package::PRESENTATION_FILE)
+                        .is_file(),
+                    "{holder:?}: nothing was removed"
+                );
+                for (digest, size) in &a {
+                    assert!(
+                        store.holds_payload(*digest, *size).expect("readable"),
+                        "{holder:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // KR-REQ-11.14 and KR-ACC-017: ten thousand definitions, offline lookup, no input delay
 // ---------------------------------------------------------------------------------------------
@@ -3761,6 +3992,103 @@ impl tough::Transport for Watched {
     async fn fetch(&self, url: url::Url) -> Result<tough::TransportStream, tough::TransportError> {
         self.fetched.lock().expect("the list").push(url.clone());
         tough::FilesystemTransport.fetch(url).await
+    }
+}
+
+/// The location kept for each target of an accepted generation is the one the client fetches it
+/// from.
+///
+/// Both snapshot modes; targets published through two levels of delegation; a targets location
+/// given with and without its trailing slash; names the location encodes; and a name that leaves
+/// the location. For every target the metadata pins, the rule this host keeps locations by gives
+/// the URL the client asks its transport for, and refuses exactly where the client refuses.
+#[tokio::test]
+async fn kr_req_11_05_the_kept_location_of_every_target_is_where_the_client_fetches_it() {
+    for consistent_snapshot in [false, true] {
+        for trailing_slash in [true, false] {
+            let home = tempfile::tempdir().expect("a temporary directory");
+            let generation = Generation::build(
+                home.path(),
+                GenerationSpec {
+                    consistent_snapshot,
+                    nested_delegation: true,
+                    extra_targets: vec![
+                        ("extra/a name.json".to_owned(), b"spaced".to_vec()),
+                        (
+                            "extra/\u{fc}n\u{ef}code.json".to_owned(),
+                            b"encoded".to_vec(),
+                        ),
+                        ("/outside.json".to_owned(), b"outside".to_vec()),
+                    ],
+                    ..GenerationSpec::default()
+                },
+            )
+            .await;
+            let targets_url = if trailing_slash {
+                generation.targets_url()
+            } else {
+                url::Url::parse(generation.targets_url().as_str().trim_end_matches('/'))
+                    .expect("a location")
+            };
+            let watched = Watched::default();
+            let root = generation.root_bytes();
+            let repository =
+                tough::RepositoryLoader::new(&root, generation.metadata_url(), targets_url.clone())
+                    .transport(watched.clone())
+                    .load()
+                    .await
+                    .expect("the client loads the generation");
+            let case = format!("consistent {consistent_snapshot}, trailing slash {trailing_slash}");
+            let (mut compared, mut refused) = (0, 0);
+            for (name, target) in repository.all_targets() {
+                let digest = PayloadDigest::from_bytes(
+                    target
+                        .hashes
+                        .sha256
+                        .as_ref()
+                        .try_into()
+                        .expect("a SHA-256 digest"),
+                );
+                let kept = kr_plugin_catalogue::trust::target_location(
+                    &targets_url,
+                    consistent_snapshot,
+                    name.raw(),
+                    digest,
+                );
+                let before = watched.fetched.lock().expect("the list").len();
+                let read = repository.read_target(name).await;
+                let fetched: Vec<url::Url> =
+                    watched.fetched.lock().expect("the list")[before..].to_vec();
+                match (kept, read) {
+                    (Ok(location), Ok(Some(stream))) => {
+                        use tough::IntoVec as _;
+                        stream.into_vec().await.unwrap_or_else(|error| {
+                            panic!("{case}: {} did not read: {error}", name.raw())
+                        });
+                        assert_eq!(fetched, vec![location], "{case}: {}", name.raw());
+                        compared += 1;
+                    }
+                    (Err(_), Err(_)) => {
+                        assert!(fetched.is_empty(), "{case}: {} was fetched", name.raw());
+                        refused += 1;
+                    }
+                    (kept, read) => panic!(
+                        "{case}: {} is kept as {:?} and the client {}",
+                        name.raw(),
+                        kept.map(|location| location.to_string()),
+                        match read {
+                            Ok(Some(_)) => "fetches it".to_owned(),
+                            Ok(None) => "has no such target".to_owned(),
+                            Err(error) => format!("refuses it: {error}"),
+                        }
+                    ),
+                }
+            }
+            // The index, the package's two files and the extra targets, the one that leaves the
+            // location refused by both without consistent snapshots and fetched inside it with them.
+            assert_eq!(compared + refused, 6, "{case}");
+            assert_eq!(refused, usize::from(!consistent_snapshot), "{case}");
+        }
     }
 }
 
