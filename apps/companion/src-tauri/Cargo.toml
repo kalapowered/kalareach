@@ -77,7 +77,8 @@ objc2-local-authentication = { workspace = true, features = ["std", "LAContext",
 [target.'cfg(target_os = "windows")'.dependencies]
 # Windows Hello, the owner's confirmation on Windows.
 windows = { workspace = true, features = ["Foundation", "Security_Credentials_UI", "Win32_Foundation", "Win32_System_WinRT"] }
-windows-future.workspace = true
+# `std` is what lets a ceremony await Windows Hello's answer rather than block on it.
+windows-future = { workspace = true, features = ["std"] }
 
 [features]
 # What `tauri build` turns on, and what a release build must have: the interface comes from the
@@ -97,6 +98,10 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 # The mock runtime, so a test can call a command the way the page does: through the invoke path.
 tauri = { workspace = true, features = ["test"] }
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+# A window of the test's own, with safe code, for Windows Hello's dialog to belong to.
+tao.workspace = true
 
 # The workspace forbids unsafe code, which the macOS user-verification ceremony cannot honour: it
 # is a call into Apple's LocalAuthentication runtime and there is no safe wrapper for it. This
