@@ -45,8 +45,8 @@
     {
       "role": "connector",
       "path": "connector.json",
-      "digest": "aa921771b39959ce35c0388b6908ff7c2beae8ee30960ce1c81c555485169177",
-      "size_bytes": "1903"
+      "digest": "8984729fc5c555e571600a98ec3fefebbcfdf4e1088596d512e74724cad53614",
+      "size_bytes": "1935"
     },
     {
       "role": "presentation",

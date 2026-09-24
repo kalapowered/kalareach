@@ -15,6 +15,12 @@
 //! * A transport handle binds the selected executable, launch, upstream identity and environment.
 //!   The manifest names a transport kind and its bounded parameters; it never names a URL, a
 //!   process or a filesystem path the broker would then open.
+//!
+//! A table that answers approvals also says where an answer goes: a [`DecisionDestination`] names
+//! the routed method that carries it, where the answer repeats the pending request's identifier,
+//! where the decision goes and the upstream's own value for each decision. An answer is then
+//! written from the table alone, by [`ConnectorManifest::answer`], and carries nothing a caller
+//! typed.
 
 use kr_protocol::scalars::Nullable;
 
@@ -22,7 +28,7 @@ use crate::scalars::U64;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{MethodName, PluginId};
+use crate::ids::{MethodName, ParameterName, PluginId};
 use crate::text::Summary;
 use crate::version::{PackageVersion, VersionRange};
 
@@ -31,6 +37,9 @@ pub const MAX_CLASSIFIED_METHODS: usize = 512;
 
 /// Maximum number of segments in a field path.
 pub const MAX_FIELD_PATH_DEPTH: usize = 8;
+
+/// Maximum length in bytes of the value an upstream reads for one decision.
+pub const MAX_DECISION_VALUE_BYTES: usize = 256;
 
 /// What a native method does to the upstream.
 #[derive(
@@ -230,6 +239,76 @@ pub struct ProtocolPin {
     pub tested_version: PackageVersion,
 }
 
+/// Where an answer to a pending approval goes, and what the upstream reads for each decision.
+///
+/// The broker answers a pending request by sending one routed method. This says which method,
+/// which requests it answers, where the answer repeats the identifier of the request it answers,
+/// where the decision goes, and the exact value the upstream reads for each decision a person can
+/// make. The identifier comes from the pending request and the value from this mapping, so an
+/// answer carries nothing a caller typed: a decision the mapping does not list is refused rather
+/// than sent, and an answer cannot name a request other than the one it resolves.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct DecisionDestination {
+    /// The routed method whose requests this destination answers.
+    ///
+    /// The upstream sends it; a message of this method is a pending approval. The table
+    /// otherwise could not say which of the messages it routes asks for a decision.
+    pub answers: MethodName,
+    /// The routed method that carries the answer.
+    pub method: MethodName,
+    /// Where the answer carries the identifier of the request it answers.
+    pub request_id_path: FieldPath,
+    /// Where the answer carries the decision.
+    pub decision_path: FieldPath,
+    /// Every decision a person can make, and the value the upstream reads for it.
+    pub decisions: Vec<DecisionValue>,
+}
+
+impl DecisionDestination {
+    /// Returns the value the upstream reads for one decision, when the mapping lists it.
+    #[must_use]
+    pub fn value_for(&self, decision: &ParameterName) -> Option<&str> {
+        self.decisions
+            .iter()
+            .find(|entry| &entry.decision == decision)
+            .map(|entry| entry.value.as_str())
+    }
+}
+
+/// One decision and the upstream's own value for it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct DecisionValue {
+    /// The decision, as a validated answer names it.
+    pub decision: ParameterName,
+    /// The value written at the decision path, exactly as the upstream reads it.
+    pub value: String,
+}
+
+/// Why an answer could not be written.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum AnswerError {
+    /// The table declares no decision destination, so it answers nothing.
+    #[error("the connector table declares no decision destination")]
+    NoDestination,
+    /// The decision is not one the destination maps.
+    #[error("{decision} is not a decision the connector table maps to an upstream value")]
+    UnknownDecision {
+        /// The decision that was asked for.
+        decision: ParameterName,
+    },
+    /// The identifier is not a string or a number, so it is not one a request carried.
+    #[error("a request identifier is a string or a number")]
+    RequestId,
+    /// The table cannot write this answer.
+    #[error("the connector table cannot write this answer: {detail}")]
+    Unwritable {
+        /// What stopped it.
+        detail: String,
+    },
+}
+
 /// The connector manifest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -254,6 +333,11 @@ pub struct ConnectorManifest {
     pub routes: Vec<Route>,
     /// What each method does.
     pub methods: Vec<MethodClassification>,
+    /// Where an answer to a pending approval goes, for a table that answers approvals.
+    ///
+    /// Null for a table that answers none. Without a destination nothing a package declares can
+    /// answer an approval on this connection, whatever trust it is granted.
+    pub decision_destination: Nullable<DecisionDestination>,
     /// Whether the connector has a tested volatile forwarding mode.
     ///
     /// Without one it is not a resilient managed gateway: on receipt-storage failure its
@@ -287,6 +371,117 @@ impl ConnectorManifest {
             .iter()
             .find(|route| route.wire_name == wire_name)
     }
+
+    /// Writes the answer to one pending request.
+    ///
+    /// The answer is the destination's method as the wire spells it, at the table's method path,
+    /// with the pending request's own identifier at the destination's identifier path and the
+    /// upstream's value for the decision at its decision path. `request_id` is the identifier the
+    /// table read from the request when it arrived, at [`Self::request_id_path`], and it is written
+    /// back exactly. Nothing else goes in.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnswerError::NoDestination`] when the table answers nothing,
+    /// [`AnswerError::UnknownDecision`] for a decision the mapping does not list,
+    /// [`AnswerError::RequestId`] for an identifier that is not a string or a number, and
+    /// [`AnswerError::Unwritable`] for a table validation refuses: an unrouted destination method,
+    /// a path with an index segment, or two paths that meet.
+    pub fn answer(
+        &self,
+        request_id: &serde_json::Value,
+        decision: &ParameterName,
+    ) -> Result<serde_json::Value, AnswerError> {
+        let destination = self
+            .decision_destination
+            .as_ref()
+            .ok_or(AnswerError::NoDestination)?;
+        let value =
+            destination
+                .value_for(decision)
+                .ok_or_else(|| AnswerError::UnknownDecision {
+                    decision: decision.clone(),
+                })?;
+        if !(request_id.is_string() || request_id.is_number()) {
+            return Err(AnswerError::RequestId);
+        }
+        let route = self
+            .routes
+            .iter()
+            .find(|route| route.method == destination.method)
+            .filter(|route| route.direction != RouteDirection::UpstreamToHost)
+            .ok_or_else(|| AnswerError::Unwritable {
+                detail: format!(
+                    "{} is not routed from the host to the application",
+                    destination.method
+                ),
+            })?;
+        let mut answer = serde_json::Value::Object(serde_json::Map::new());
+        write_member(
+            &mut answer,
+            &self.method_path,
+            serde_json::Value::String(route.wire_name.clone()),
+        )?;
+        write_member(
+            &mut answer,
+            &destination.request_id_path,
+            request_id.clone(),
+        )?;
+        write_member(
+            &mut answer,
+            &destination.decision_path,
+            serde_json::Value::String(value.to_owned()),
+        )?;
+        Ok(answer)
+    }
+}
+
+/// Writes one value at a path of member names, building the objects on the way.
+///
+/// A path that reaches a value already written, or that names an array element, is refused: an
+/// answer is built from nothing, so an index would leave the other elements to be invented, and a
+/// second write to one place would leave the first value unsent.
+fn write_member(
+    root: &mut serde_json::Value,
+    path: &FieldPath,
+    value: serde_json::Value,
+) -> Result<(), AnswerError> {
+    let Some((last, parents)) = path.segments.split_last() else {
+        return Err(AnswerError::Unwritable {
+            detail: "a field path with no segments names nothing".to_owned(),
+        });
+    };
+    let member = |segment: &FieldSegment| match segment {
+        FieldSegment::Member { name } => Ok(name.clone()),
+        FieldSegment::Index { index } => Err(AnswerError::Unwritable {
+            detail: format!("an answer is built from members, and the path names element {index}"),
+        }),
+    };
+    let mut current = root;
+    for segment in parents {
+        let name = member(segment)?;
+        let object = current
+            .as_object_mut()
+            .ok_or_else(|| AnswerError::Unwritable {
+                detail: format!("{name} is inside a value the answer already holds"),
+            })?;
+        current = object
+            .entry(name)
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    }
+    let name = member(last)?;
+    let object = current
+        .as_object_mut()
+        .ok_or_else(|| AnswerError::Unwritable {
+            detail: format!("{name} is inside a value the answer already holds"),
+        })?;
+    if object.contains_key(&name) {
+        return Err(AnswerError::Unwritable {
+            detail: format!("two paths write {name}"),
+        });
+    }
+    object.insert(name, value);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -345,6 +540,7 @@ mod tests {
                     evidence: Summary::new("Writes to the workspace").expect("valid summary"),
                 },
             ],
+            decision_destination: Nullable(None),
             volatile_forwarding: false,
             qualification_note: Nullable(None),
         }
@@ -381,6 +577,238 @@ mod tests {
             .expect("the route is listed");
         assert_eq!(route.direction, RouteDirection::HostToUpstream);
         assert!(manifest.route_for_wire_name("status.read").is_none());
+    }
+
+    fn member_path(names: &[&str]) -> FieldPath {
+        FieldPath {
+            segments: names
+                .iter()
+                .map(|name| FieldSegment::Member {
+                    name: (*name).to_owned(),
+                })
+                .collect(),
+        }
+    }
+
+    fn decision(text: &str) -> ParameterName {
+        ParameterName::new(text).expect("valid decision")
+    }
+
+    /// The Channels surface's three notifications, with the permission answer as its destination.
+    fn channels() -> ConnectorManifest {
+        let route = |name: &str, wire: &str, direction| Route {
+            method: method(name),
+            wire_name: wire.to_owned(),
+            direction,
+        };
+        let classified = |name: &str| MethodClassification {
+            method: method(name),
+            class: MethodClass::Mutation,
+            evidence: Summary::new("Answering it runs or refuses a tool call").expect("valid"),
+        };
+        ConnectorManifest {
+            request_id_path: member_path(&["params", "request_id"]),
+            response_correlation: ResponseCorrelation::MatchingId {
+                id_path: member_path(&["params", "request_id"]),
+            },
+            routes: vec![
+                route(
+                    "channel.event",
+                    "notifications/claude/channel",
+                    RouteDirection::HostToUpstream,
+                ),
+                route(
+                    "channel.permission-request",
+                    "notifications/claude/channel/permission_request",
+                    RouteDirection::UpstreamToHost,
+                ),
+                route(
+                    "channel.permission",
+                    "notifications/claude/channel/permission",
+                    RouteDirection::HostToUpstream,
+                ),
+            ],
+            methods: vec![
+                classified("channel.event"),
+                classified("channel.permission-request"),
+                classified("channel.permission"),
+            ],
+            decision_destination: Nullable::some(DecisionDestination {
+                answers: method("channel.permission-request"),
+                method: method("channel.permission"),
+                request_id_path: member_path(&["params", "request_id"]),
+                decision_path: member_path(&["params", "behavior"]),
+                decisions: vec![
+                    DecisionValue {
+                        decision: decision("allow"),
+                        value: "allow".to_owned(),
+                    },
+                    DecisionValue {
+                        decision: decision("deny"),
+                        value: "deny".to_owned(),
+                    },
+                ],
+            }),
+            ..manifest()
+        }
+    }
+
+    /// KR-REQ-12.18 and KR-REQ-11.34: the table alone writes the answer, from the decision and
+    /// the pending request's own identifier, with no component on the path. It is byte for byte
+    /// the answer the upstream reads.
+    #[test]
+    fn kr_req_12_18_the_table_writes_an_answer_from_a_decision_and_the_exact_request() {
+        let table = channels();
+        assert_eq!(
+            table
+                .answer(&serde_json::json!("abcde"), &decision("allow"))
+                .expect("an answer"),
+            serde_json::json!({
+                "method": "notifications/claude/channel/permission",
+                "params": {"request_id": "abcde", "behavior": "allow"}
+            })
+        );
+        assert_eq!(
+            table
+                .answer(&serde_json::json!("fghij"), &decision("deny"))
+                .expect("an answer"),
+            serde_json::json!({
+                "method": "notifications/claude/channel/permission",
+                "params": {"request_id": "fghij", "behavior": "deny"}
+            })
+        );
+        // A numeric identifier goes back as the number it was.
+        assert_eq!(
+            table
+                .answer(&serde_json::json!(11), &decision("allow"))
+                .expect("an answer")["params"]["request_id"],
+            serde_json::json!(11)
+        );
+    }
+
+    /// KR-REQ-12.18: a decision the table does not map is refused rather than written, and so is
+    /// an identifier no request could have carried. Nothing falls through as some other message.
+    #[test]
+    fn kr_req_12_18_an_unmatched_decision_or_identifier_is_refused() {
+        let table = channels();
+        assert_eq!(
+            table.answer(&serde_json::json!("abcde"), &decision("allow-always")),
+            Err(AnswerError::UnknownDecision {
+                decision: decision("allow-always")
+            })
+        );
+        for identifier in [
+            serde_json::Value::Null,
+            serde_json::json!(true),
+            serde_json::json!({"request_id": "abcde"}),
+            serde_json::json!(["abcde"]),
+        ] {
+            assert_eq!(
+                table.answer(&identifier, &decision("allow")),
+                Err(AnswerError::RequestId),
+                "{identifier} was written as an identifier"
+            );
+        }
+        assert_eq!(
+            manifest().answer(&serde_json::json!("abcde"), &decision("allow")),
+            Err(AnswerError::NoDestination)
+        );
+    }
+
+    /// The value written is the upstream's, from the mapping, never the decision's own name.
+    #[test]
+    fn the_value_written_is_the_upstreams_own() {
+        let mut table = channels();
+        let destination = table
+            .decision_destination
+            .0
+            .as_mut()
+            .expect("a destination");
+        destination.decisions = vec![DecisionValue {
+            decision: decision("approve"),
+            value: "acceptForSession".to_owned(),
+        }];
+        assert_eq!(
+            table
+                .answer(&serde_json::json!("abcde"), &decision("approve"))
+                .expect("an answer")["params"]["behavior"],
+            serde_json::json!("acceptForSession")
+        );
+    }
+
+    /// A destination whose paths an answer cannot be built from is refused when it is written.
+    #[test]
+    fn an_answer_is_built_from_members_and_writes_each_place_once() {
+        let mut indexed = channels();
+        indexed
+            .decision_destination
+            .0
+            .as_mut()
+            .expect("a destination")
+            .decision_path = FieldPath {
+            segments: vec![
+                FieldSegment::Member {
+                    name: "params".to_owned(),
+                },
+                FieldSegment::Index { index: 0 },
+            ],
+        };
+        assert!(matches!(
+            indexed.answer(&serde_json::json!("abcde"), &decision("allow")),
+            Err(AnswerError::Unwritable { .. })
+        ));
+
+        let mut colliding = channels();
+        colliding
+            .decision_destination
+            .0
+            .as_mut()
+            .expect("a destination")
+            .decision_path = member_path(&["params", "request_id"]);
+        assert!(matches!(
+            colliding.answer(&serde_json::json!("abcde"), &decision("allow")),
+            Err(AnswerError::Unwritable { .. })
+        ));
+
+        let mut inside = channels();
+        inside
+            .decision_destination
+            .0
+            .as_mut()
+            .expect("a destination")
+            .decision_path = member_path(&["params", "request_id", "behavior"]);
+        assert!(matches!(
+            inside.answer(&serde_json::json!("abcde"), &decision("allow")),
+            Err(AnswerError::Unwritable { .. })
+        ));
+    }
+
+    /// The member is always present: null says the table answers nothing, and a table that
+    /// leaves it out is refused rather than read as answering nothing.
+    #[test]
+    fn a_table_says_whether_it_answers_approvals() {
+        let text = serde_json::to_value(channels()).expect("serialisable");
+        assert_eq!(
+            serde_json::from_value::<ConnectorManifest>(text.clone()).expect("reads back"),
+            channels()
+        );
+        let mut none = text.clone();
+        none["decision_destination"] = serde_json::Value::Null;
+        assert!(
+            !serde_json::from_value::<ConnectorManifest>(none)
+                .expect("null reads")
+                .decision_destination
+                .is_present()
+        );
+        let mut absent = text.clone();
+        absent
+            .as_object_mut()
+            .expect("an object")
+            .remove("decision_destination");
+        assert!(serde_json::from_value::<ConnectorManifest>(absent).is_err());
+        let mut extra = text;
+        extra["decision_destination"]["label"] = serde_json::json!("Answer");
+        assert!(serde_json::from_value::<ConnectorManifest>(extra).is_err());
     }
 
     #[test]

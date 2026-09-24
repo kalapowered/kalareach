@@ -82,6 +82,7 @@
       "evidence": "Carries the upstream token; the broker keeps it"
     }
   ],
+  "decision_destination": null,
   "volatile_forwarding": false,
   "qualification_note": "Qualified against example-agent 1.2.0 with the published protocol reference"
 }

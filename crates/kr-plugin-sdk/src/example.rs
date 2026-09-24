@@ -461,6 +461,7 @@ pub fn example_connector_table() -> crate::connector::ConnectorManifest {
                 evidence: summary("Carries the upstream token; the broker keeps it"),
             },
         ],
+        decision_destination: Nullable(None),
         volatile_forwarding: false,
         qualification_note: Nullable(Some(summary(
             "Qualified against example-agent 1.2.0 with the published protocol reference",

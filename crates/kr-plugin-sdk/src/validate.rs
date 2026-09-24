@@ -21,8 +21,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::capability::PluginCapability;
 use crate::connector::{
-    ConnectorManifest, FieldPath, Framing, MAX_CLASSIFIED_METHODS, MAX_FIELD_PATH_DEPTH,
-    MethodClass, RouteDirection,
+    ConnectorManifest, DecisionDestination, FieldPath, FieldSegment, Framing,
+    MAX_CLASSIFIED_METHODS, MAX_DECISION_VALUE_BYTES, MAX_FIELD_PATH_DEPTH, MethodClass,
+    RouteDirection,
 };
 use crate::digest::PayloadDigest;
 use crate::effect::{
@@ -2076,6 +2077,149 @@ fn check_connector(connector: &ConnectorManifest, report: &mut Report) {
                     "the table routes {} without classifying it; an unclassified method is treated as a mutation",
                     route.method
                 ),
+            ));
+        }
+    }
+    if let Some(destination) = connector.decision_destination.as_ref() {
+        check_decision_destination(connector, destination, report);
+    }
+}
+
+/// Checks where a table's answers go.
+///
+/// An answer is written from the table alone, so everything it needs is checked here. The method
+/// that carries it travels from the host to the application and is classified as a mutation; the
+/// method it answers travels the other way; its two paths are member names inside the depth bound
+/// that meet neither each other nor the method name; and every decision maps to its own value.
+fn check_decision_destination(
+    connector: &ConnectorManifest,
+    destination: &DecisionDestination,
+    report: &mut Report,
+) {
+    let mut invalid = |detail: String| {
+        report.push(Finding::at(
+            FindingCode::ConnectorTableInvalid,
+            CONNECTOR_FILE,
+            detail,
+        ));
+    };
+    let route = |method| {
+        connector
+            .routes
+            .iter()
+            .find(|route| &route.method == method)
+    };
+
+    let method = &destination.method;
+    match route(method) {
+        None => invalid(format!(
+            "the decision destination sends {method}, which the table does not route"
+        )),
+        Some(route) if route.direction == RouteDirection::UpstreamToHost => invalid(format!(
+            "the decision destination sends {method}, which the table routes from the application to the host"
+        )),
+        Some(_) => {}
+    }
+    let class = connector
+        .methods
+        .iter()
+        .find(|entry| &entry.method == method)
+        .map(|entry| entry.class);
+    if class != Some(MethodClass::Mutation) {
+        invalid(format!(
+            "the decision destination sends {method}, which the table does not classify as a mutation; an answer changes what the application does"
+        ));
+    }
+
+    let answers = &destination.answers;
+    match route(answers) {
+        None => invalid(format!(
+            "the decision destination answers {answers}, which the table does not route"
+        )),
+        Some(route) if route.direction == RouteDirection::HostToUpstream => invalid(format!(
+            "the decision destination answers {answers}, which the table routes from the host to the application; the application never asks it"
+        )),
+        Some(_) => {}
+    }
+    if connector.classify(answers) == MethodClass::Unsupported {
+        invalid(format!(
+            "the decision destination answers {answers}, which the table classifies as unsupported"
+        ));
+    }
+
+    let paths = [
+        ("request_id_path", &destination.request_id_path),
+        ("decision_path", &destination.decision_path),
+    ];
+    for (name, path) in paths {
+        check_field_path(path, &format!("the decision destination's {name}"), report);
+    }
+    let mut invalid = |detail: String| {
+        report.push(Finding::at(
+            FindingCode::ConnectorTableInvalid,
+            CONNECTOR_FILE,
+            detail,
+        ));
+    };
+    let indexed = |path: &FieldPath| {
+        path.segments
+            .iter()
+            .any(|segment| matches!(segment, FieldSegment::Index { .. }))
+    };
+    for (name, path) in paths {
+        if indexed(path) {
+            invalid(format!(
+                "the decision destination's {name} names an array element; an answer is built from member names"
+            ));
+        }
+        if paths_overlap(path, &connector.method_path) {
+            invalid(format!(
+                "the decision destination's {name} meets the method path, which carries the method's name"
+            ));
+        }
+    }
+    if indexed(&connector.method_path) {
+        invalid(
+            "the method path names an array element, so an answer's method name cannot be written"
+                .to_owned(),
+        );
+    }
+    if paths_overlap(&destination.request_id_path, &destination.decision_path) {
+        invalid(
+            "the decision destination writes the identifier and the decision to overlapping fields"
+                .to_owned(),
+        );
+    }
+
+    let decisions = &destination.decisions;
+    if decisions.is_empty() || decisions.len() > MAX_PARAMETER_CHOICES {
+        invalid(format!(
+            "the decision destination maps {} decisions; the range is 1 to {MAX_PARAMETER_CHOICES}",
+            decisions.len()
+        ));
+    }
+    let mut named = BTreeSet::new();
+    let mut values = BTreeSet::new();
+    for entry in decisions {
+        if !named.insert(&entry.decision) {
+            invalid(format!(
+                "the decision destination maps {} more than once",
+                entry.decision
+            ));
+        }
+        if !values.insert(entry.value.as_str()) {
+            invalid(format!(
+                "the decision destination maps two decisions to {:?}, so the upstream cannot tell them apart",
+                entry.value
+            ));
+        }
+        if entry.value.is_empty()
+            || entry.value.len() > MAX_DECISION_VALUE_BYTES
+            || entry.value.chars().any(char::is_control)
+        {
+            invalid(format!(
+                "the decision destination maps {} to a value that is empty, over {MAX_DECISION_VALUE_BYTES} bytes or holds a control character",
+                entry.decision
             ));
         }
     }
