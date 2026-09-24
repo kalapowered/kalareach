@@ -614,17 +614,22 @@ enum JobState {
     Unknown(String),
 }
 
-/// How long one question or removal put to launchd is given before it counts as unanswered.
+/// How long one question or removal put to launchd is given to answer.
 #[cfg(target_os = "macos")]
 const LAUNCHCTL_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Runs `launchctl` for no longer than [`LAUNCHCTL_BOUND`], and returns its answer or why there was
+/// How long a launchctl that did not answer is given to be collected once it has been ended.
+#[cfg(target_os = "macos")]
+const COLLECT_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Runs `launchctl`, gives it [`LAUNCHCTL_BOUND`] to answer, and returns its answer or why there was
 /// none.
 ///
 /// What it prints is read while it runs, so an answer of any size cannot stall it. It is this
-/// process's own child, so on every path out of here it has been collected: it ended by itself, or
-/// it was ended at the bound or when it could not be waited for, and a failure to end or collect it
-/// is part of what this returns.
+/// process's own child: one that did not answer, could not be waited for, or whose output could not
+/// be read is ended and given [`COLLECT_BOUND`] to be collected, so this returns within the two
+/// bounds together. A failure to end or collect it is part of what this returns, and the readers of
+/// a launchctl that was not collected are left to finish by themselves.
 #[cfg(target_os = "macos")]
 fn launchctl_within(arguments: &[&str]) -> std::result::Result<std::process::Output, String> {
     let asked = arguments.join(" ");
@@ -635,8 +640,20 @@ fn launchctl_within(arguments: &[&str]) -> std::result::Result<std::process::Out
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|error| format!("/bin/launchctl: {error}"))?;
-    let printed = child.stdout.take().map(read_to_the_end_aside);
-    let said = child.stderr.take().map(read_to_the_end_aside);
+    let printed = match child.stdout.take().map(read_to_the_end_aside).transpose() {
+        Ok(reader) => reader,
+        Err(error) => {
+            let detail = format!("launchctl {asked}: its answer could not be read: {error}");
+            return Err(end_and_collect(&mut child, detail).0);
+        }
+    };
+    let said = match child.stderr.take().map(read_to_the_end_aside).transpose() {
+        Ok(reader) => reader,
+        Err(error) => {
+            let detail = format!("launchctl {asked}: what it said could not be read: {error}");
+            return Err(end_and_collect(&mut child, detail).0);
+        }
+    };
     let deadline = std::time::Instant::now() + LAUNCHCTL_BOUND;
     let ended = loop {
         match child.try_wait() {
@@ -658,23 +675,12 @@ fn launchctl_within(arguments: &[&str]) -> std::result::Result<std::process::Out
     };
     let (ended, collected) = match ended {
         Ok(status) => (Ok(status), true),
-        Err(mut detail) => {
-            if let Err(error) = child.kill() {
-                detail.push_str(&format!("; ending it failed: {error}"));
-            }
-            let collected = match child.wait() {
-                Ok(_) => true,
-                Err(error) => {
-                    detail.push_str(&format!("; collecting it failed: {error}"));
-                    false
-                }
-            };
+        Err(detail) => {
+            let (detail, collected) = end_and_collect(&mut child, detail);
             (Err(detail), collected)
         }
     };
     // A collected launchctl has closed its pipes, so both readers have finished or are about to.
-    // One that could not be collected may still hold them, and its readers are left to finish by
-    // themselves rather than waited on here.
     let read = |reader: Option<std::thread::JoinHandle<Vec<u8>>>| {
         reader
             .filter(|_| collected)
@@ -689,16 +695,47 @@ fn launchctl_within(arguments: &[&str]) -> std::result::Result<std::process::Out
     })
 }
 
-/// Reads a pipe to its end on a thread of its own.
+/// Ends a launchctl this process started and has not collected, and collects it within
+/// [`COLLECT_BOUND`]. Returns `detail` with whatever of that failed added to it, and whether the
+/// launchctl was collected.
+#[cfg(target_os = "macos")]
+fn end_and_collect(child: &mut std::process::Child, mut detail: String) -> (String, bool) {
+    if let Err(error) = child.kill() {
+        detail.push_str(&format!("; ending it failed: {error}"));
+    }
+    let deadline = std::time::Instant::now() + COLLECT_BOUND;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return (detail, true),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(None) => {
+                detail.push_str(&format!(
+                    "; it was still running {COLLECT_BOUND:?} after it was ended"
+                ));
+                return (detail, false);
+            }
+            Err(error) => {
+                detail.push_str(&format!("; collecting it failed: {error}"));
+                return (detail, false);
+            }
+        }
+    }
+}
+
+/// Reads a pipe to its end on a thread of its own, or says why no thread could be made for it.
 #[cfg(target_os = "macos")]
 fn read_to_the_end_aside(
     mut pipe: impl std::io::Read + Send + 'static,
-) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = pipe.read_to_end(&mut bytes);
-        bytes
-    })
+) -> std::io::Result<std::thread::JoinHandle<Vec<u8>>> {
+    std::thread::Builder::new()
+        .name("launchctl output".to_owned())
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            bytes
+        })
 }
 
 /// Asks launchd about one job, `<domain>/<label>`.

@@ -631,15 +631,43 @@ fn finish_bounded(command: &mut Command) -> Result<(ExitStatus, String), String>
             }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("{command:?} did not finish within {TOOL_BOUND:?}"));
+                let failed = end_and_collect(&mut child);
+                return Err(format!(
+                    "{command:?} did not finish within {TOOL_BOUND:?}{failed}"
+                ));
             }
             // This process's own child, so it is ended and collected here too.
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("{command:?} could not be waited for: {error}"));
+                let failed = end_and_collect(&mut child);
+                return Err(format!(
+                    "{command:?} could not be waited for: {error}{failed}"
+                ));
+            }
+        }
+    }
+}
+
+/// Ends one of this process's own children that it has not collected, and collects it within
+/// [`PATIENCE`]; returns what of that failed, as text to add to a reason, or nothing.
+fn end_and_collect(child: &mut std::process::Child) -> String {
+    let mut failed = String::new();
+    if let Err(error) = child.kill() {
+        failed.push_str(&format!("; ending it failed: {error}"));
+    }
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return failed,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                failed.push_str(&format!(
+                    "; it was still running {PATIENCE:?} after it was ended"
+                ));
+                return failed;
+            }
+            Err(error) => {
+                failed.push_str(&format!("; collecting it failed: {error}"));
+                return failed;
             }
         }
     }

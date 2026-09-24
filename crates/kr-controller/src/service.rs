@@ -8063,8 +8063,9 @@ impl Controller {
                 }
             }
             // One look whatever the kernel said, then one each second, and none begun once the
-            // bound has passed.
-            let Some(mut left) = retire_worker_job_aside(jobs.clone(), reservation_id).await else {
+            // bound has passed, however long a look waits for a thread to run on.
+            let Some(mut left) = retire_worker_job_aside(jobs.clone(), reservation_id, None).await
+            else {
                 return;
             };
             loop {
@@ -8082,8 +8083,14 @@ impl Controller {
                 if tokio::time::Instant::now() >= deadline {
                     break;
                 }
-                let Some(next) = retire_worker_job_aside(jobs.clone(), reservation_id).await else {
-                    return;
+                let Some(next) = retire_worker_job_aside(
+                    jobs.clone(),
+                    reservation_id,
+                    Some(deadline.into_std()),
+                )
+                .await
+                else {
+                    break;
                 };
                 left = next;
             }
@@ -8449,16 +8456,24 @@ impl From<RecordedCreate> for SessionCreateParams {
 }
 
 /// Removes a worker's job on a thread that may block, since the platform is asked with commands
-/// of its own, and says what it found; `None` where that thread ended without saying.
+/// of its own, and says what it found.
+///
+/// `None` where the removal was not begun, because the thread it waited for ran only after
+/// `not_after`, or where that thread ended without saying.
 async fn retire_worker_job_aside(
     jobs: PathBuf,
     reservation_id: ReservationId,
+    not_after: Option<std::time::Instant>,
 ) -> Option<JobRetirement> {
     tokio::task::spawn_blocking(move || {
-        crate::supervision::retire_worker_job(&jobs, reservation_id)
+        if not_after.is_some_and(|not_after| std::time::Instant::now() >= not_after) {
+            return None;
+        }
+        Some(crate::supervision::retire_worker_job(&jobs, reservation_id))
     })
     .await
     .ok()
+    .flatten()
 }
 
 fn closed_summary(
