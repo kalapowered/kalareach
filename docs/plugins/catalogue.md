@@ -236,9 +236,12 @@ evicted is one that cannot run. An extracted package nothing holds goes before a
 it is a second copy of payloads, and having it again costs only an extraction. It leaves in one
 rename, so it is removed whole or not at all, and a copy set aside that cannot then be deleted stops
 the operation, since the room it takes is not free. What a live package consists of is read from the
-installation or the binding that holds it, or from its own manifest where it is activated here; one
-whose files this host cannot name stops the reclaim rather than being guessed at. When the only
-thing left to evict is one of those, the sync reports the limit instead.
+installation or the binding that holds it, or from its own manifest where it is activated here. A
+live package this repository holds nothing of, neither an extracted copy nor its manifest in the
+cache, is another repository's, and it does not stop this repository's reclaim: nothing here is its
+to lose. One this repository holds and whose files it cannot name stops the reclaim rather than
+being guessed at. When the only thing left to evict is one of those, the sync reports the limit
+instead.
 
 ## Matching, enabling and binding
 

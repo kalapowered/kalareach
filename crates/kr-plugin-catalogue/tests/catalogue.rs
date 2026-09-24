@@ -2777,12 +2777,16 @@ enum Holder {
     Binding,
     BrokerWithoutManifest,
     BrokerWithAlteredManifest,
+    /// The broker reports a live package this repository's store holds nothing of: a worker
+    /// runs a package another repository installed.
+    BrokerElsewhere,
 }
 
 /// A package an upgrade moved its installation off is kept whole while the broker reports it live
 /// or a local binding holds it, and room for the next release is made with it only where nothing
 /// does. Where the broker reports it and its manifest is gone or altered, nothing can say what it
-/// consists of, and the reclaim is refused before anything is removed.
+/// consists of, and the reclaim is refused before anything is removed. A live package this store
+/// holds nothing of is not this store's to keep, and does not stop the reclaim.
 ///
 /// The first release carries a payload no later release shares. The budget holds the first two
 /// releases, installed, cached and extracted, and the third release's staging exactly once that
@@ -2796,6 +2800,7 @@ async fn kr_req_11_12_an_upgraded_package_is_kept_while_the_broker_or_a_binding_
         Holder::Binding,
         Holder::BrokerWithoutManifest,
         Holder::BrokerWithAlteredManifest,
+        Holder::BrokerElsewhere,
     ] {
         let home = tempfile::tempdir().expect("a temporary directory");
         let first = Generation::build(
@@ -2857,6 +2862,9 @@ async fn kr_req_11_12_an_upgraded_package_is_kept_while_the_broker_or_a_binding_
         let old = first.manifest_digest();
         let broker: Arc<dyn kr_plugin_catalogue::BrokerBridge> = match holder {
             Holder::Nothing | Holder::Binding => Arc::new(kr_plugin_catalogue::UnboundBroker),
+            Holder::BrokerElsewhere => Arc::new(Reporting(vec![PayloadDigest::of(
+                b"a package another repository installed",
+            )])),
             _ => Arc::new(Reporting(vec![old])),
         };
         let mut catalogue = Catalogue::with_broker(&home.path().join("catalogue"), broker)
@@ -2946,8 +2954,13 @@ async fn kr_req_11_12_an_upgraded_package_is_kept_while_the_broker_or_a_binding_
             )
             .await;
         match holder {
-            Holder::Nothing => {
-                outcome.expect("the first release's extracted copy is the room the third needs");
+            Holder::Nothing | Holder::BrokerElsewhere => {
+                outcome.unwrap_or_else(|refusal| {
+                    panic!(
+                        "{holder:?}: the first release's extracted copy is the room the third \
+                         needs: {refusal}"
+                    )
+                });
                 assert!(!store.package_dir(old).exists(), "{holder:?}");
                 assert!(
                     store.holds_payload(old, ma).expect("readable"),

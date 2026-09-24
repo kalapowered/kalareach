@@ -96,7 +96,7 @@ pub use crate::repository::{
     CapabilityCeiling, Enrolment, EnrolmentKey, RepositoryId, RepositoryKind,
 };
 pub use crate::search::{Candidate, MatchIndex, Observation, Resolution};
-pub use crate::store::{PackageCheck, ReadyPackage, Store};
+pub use crate::store::{HeldPackage, PackageCheck, ReadyPackage, Store};
 pub use crate::trust::{MetadataVersions, VerifiedGeneration};
 
 use crate::authority::committed;

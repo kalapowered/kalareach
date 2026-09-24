@@ -307,6 +307,19 @@ fn files_under(directory: &Path) -> CatalogueResult<BTreeSet<PathBuf>> {
     Ok(files)
 }
 
+/// What one store holds of a package.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeldPackage {
+    /// Nothing: neither an extracted copy nor its manifest in the cache. The package is another
+    /// store's, and nothing here is its to lose.
+    Absent,
+    /// Its extracted copy, whose own manifest, under the package's hash, names these files.
+    Named(Vec<PayloadDigest>),
+    /// Its extracted copy or its cached manifest, and no manifest in an extracted copy here that
+    /// can say what it consists of.
+    Unnamed,
+}
+
 /// A package every file of which was checked, where it lies, against the manifest its digest names.
 ///
 /// Only [`Store::check_package`] makes one. What an installation records about a package, and what
@@ -809,38 +822,53 @@ impl Store {
         }
     }
 
-    /// Returns the files a package activated here consists of, read from its own manifest.
+    /// Returns what this store holds of one package, and the files it consists of where its own
+    /// manifest, in the package's extracted copy, can say.
     ///
-    /// `None` is a package that is not here, or whose manifest is not the one its hash names or does
-    /// not read: nothing about what it consists of can be said from it.
+    /// A manifest that is not the one the package's hash names, or does not read, says nothing
+    /// about what the package consists of.
     ///
     /// # Errors
     ///
-    /// Returns [`CatalogueError::StorageUnavailable`] when the manifest is there and cannot be read.
+    /// Returns [`CatalogueError::StorageUnavailable`] when the manifest, the extracted copy or the
+    /// cached manifest is there and cannot be read.
     pub(crate) fn package_payloads(
         &self,
         manifest_digest: PayloadDigest,
-    ) -> CatalogueResult<Option<Vec<PayloadDigest>>> {
-        let path = self
-            .package_dir(manifest_digest)
-            .join(kr_plugin_sdk::package::MANIFEST_FILE);
+    ) -> CatalogueResult<HeldPackage> {
+        let directory = self.package_dir(manifest_digest);
+        let path = directory.join(kr_plugin_sdk::package::MANIFEST_FILE);
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                // No manifest to read. What is held of the package is its extracted copy, or its
+                // manifest in the cache; with neither here, it is another store's.
+                for held in [directory, self.payload_path(manifest_digest)] {
+                    match std::fs::symlink_metadata(&held) {
+                        Ok(_) => return Ok(HeldPackage::Unnamed),
+                        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(source) => return Err(CatalogueError::storage(&held, &source)),
+                    }
+                }
+                return Ok(HeldPackage::Absent);
+            }
             Err(source) => return Err(CatalogueError::storage(&path, &source)),
         };
         if PayloadDigest::of(&bytes) != manifest_digest {
-            return Ok(None);
+            return Ok(HeldPackage::Unnamed);
         }
-        Ok(serde_json::from_slice::<PluginManifest>(&bytes)
-            .ok()
-            .map(|manifest| {
-                manifest
-                    .payloads
-                    .iter()
-                    .map(|payload| payload.digest)
-                    .collect()
-            }))
+        Ok(serde_json::from_slice::<PluginManifest>(&bytes).map_or(
+            HeldPackage::Unnamed,
+            |manifest| {
+                HeldPackage::Named(
+                    manifest
+                        .payloads
+                        .iter()
+                        .map(|payload| payload.digest)
+                        .collect(),
+                )
+            },
+        ))
     }
 
     /// Checks an activated package against the manifest its digest names, file by file.
@@ -2318,13 +2346,13 @@ mod tests {
         let presentation = kr_plugin_sdk::example::example_presentation_json();
         assert_eq!(
             store.package_payloads(digest).expect("readable"),
-            Some(vec![PayloadDigest::of(presentation.as_bytes())])
+            HeldPackage::Named(vec![PayloadDigest::of(presentation.as_bytes())])
         );
         assert_eq!(
             store
                 .package_payloads(PayloadDigest::of(b"never activated"))
                 .expect("readable"),
-            None
+            HeldPackage::Absent
         );
         // A manifest that reads, and names other files, but is not the one the hash names: another
         // release of the same package, written where this one's manifest was.
@@ -2342,7 +2370,7 @@ mod tests {
         .expect("writable");
         assert_eq!(
             store.package_payloads(digest).expect("readable"),
-            None,
+            HeldPackage::Unnamed,
             "a manifest that is not the one its hash names says nothing, however well it reads"
         );
         std::fs::write(
@@ -2352,8 +2380,29 @@ mod tests {
         .expect("writable");
         assert_eq!(
             store.package_payloads(digest).expect("readable"),
-            None,
+            HeldPackage::Unnamed,
             "a manifest that is not the one its hash names says nothing"
+        );
+        // An extracted copy without its manifest, and a manifest only in the cache, are both held
+        // here, and neither says what the package consists of.
+        std::fs::remove_file(directory.join(kr_plugin_sdk::package::MANIFEST_FILE))
+            .expect("removable");
+        assert_eq!(
+            store.package_payloads(digest).expect("readable"),
+            HeldPackage::Unnamed
+        );
+        std::fs::remove_dir_all(&directory).expect("removable");
+        assert_eq!(
+            store.package_payloads(digest).expect("readable"),
+            HeldPackage::Absent
+        );
+        let manifest = kr_plugin_sdk::example::example_manifest_for(presentation.as_bytes());
+        let manifest = serde_json::to_vec(&manifest).expect("serialisable");
+        let cached = PayloadDigest::of(&manifest);
+        std::fs::write(store.payload_path(cached), &manifest).expect("writable");
+        assert_eq!(
+            store.package_payloads(cached).expect("readable"),
+            HeldPackage::Unnamed
         );
     }
 

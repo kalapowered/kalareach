@@ -25,7 +25,7 @@ use kr_protocol::ids::EnvironmentId;
 use crate::ceiling::InstallationGrant;
 use crate::error::{CatalogueError, CatalogueResult};
 use crate::repository::{CapabilityCeiling, EnrolmentKey, RepositoryId};
-use crate::store::ReadyPackage;
+use crate::store::{HeldPackage, ReadyPackage};
 
 /// What an administrator has said should happen to a live binding whose package is revoked.
 ///
@@ -425,19 +425,20 @@ impl Bindings {
 /// binding or the broker says is live, and every file each of them consists of: a package's hash
 /// names its manifest, and protecting only that would leave the component and the assets a
 /// binding runs on evictable. What a package consists of is read from the installation or the
-/// binding that holds it, or else from its own manifest where it is activated here, through
-/// `manifest`. A live package this host cannot expand is not protected by guesswork: the answer is
-/// a refusal, and nothing is reclaimed.
+/// binding that holds it, or else from what the store holds of it, through `held`. A live package
+/// the store holds nothing of is another store's, and nothing here is its to lose. A live package
+/// the store holds and cannot expand is not protected by guesswork: the answer is a refusal, and
+/// nothing is reclaimed.
 ///
 /// # Errors
 ///
 /// Returns [`CatalogueError::StorageUnavailable`] when a live package's files cannot be named, and
-/// whatever `manifest` returns.
+/// whatever `held` returns.
 pub fn protected_payloads(
     installations: &[Installation],
     bindings: &Bindings,
     live: &[PayloadDigest],
-    manifest: impl Fn(PayloadDigest) -> CatalogueResult<Option<Vec<PayloadDigest>>>,
+    held: impl Fn(PayloadDigest) -> CatalogueResult<HeldPackage>,
 ) -> CatalogueResult<Vec<PayloadDigest>> {
     let mut packages: Vec<PayloadDigest> = live.to_vec();
     packages.extend(
@@ -468,14 +469,18 @@ pub fn protected_payloads(
             named = true;
         }
         if !named {
-            let payloads =
-                manifest(package)?.ok_or_else(|| CatalogueError::StorageUnavailable {
-                    detail: format!(
-                        "{package} is live and this host cannot name the files it consists of; \
-                     nothing is reclaimed without knowing what a live package needs"
-                    ),
-                })?;
-            protected.extend(payloads);
+            match held(package)? {
+                HeldPackage::Absent => {}
+                HeldPackage::Named(payloads) => protected.extend(payloads),
+                HeldPackage::Unnamed => {
+                    return Err(CatalogueError::StorageUnavailable {
+                        detail: format!(
+                            "{package} is live and this host cannot name the files it consists \
+                             of; nothing is reclaimed without knowing what a live package needs"
+                        ),
+                    });
+                }
+            }
         }
     }
     protected.sort_unstable();
@@ -627,7 +632,7 @@ mod tests {
         let installed = installation(&entry, false);
         let bindings = Bindings::new();
         let nothing =
-            |_: PayloadDigest| -> CatalogueResult<Option<Vec<PayloadDigest>>> { Ok(None) };
+            |_: PayloadDigest| -> CatalogueResult<HeldPackage> { Ok(HeldPackage::Absent) };
 
         // An installation is protected whether or not it is enabled, pinned or bound.
         let protected =
@@ -649,20 +654,36 @@ mod tests {
             std::slice::from_ref(&installed),
             &bindings,
             &[upgraded_from],
-            |package| Ok((package == upgraded_from).then(|| vec![its_file])),
+            |package| {
+                Ok(if package == upgraded_from {
+                    HeldPackage::Named(vec![its_file])
+                } else {
+                    HeldPackage::Absent
+                })
+            },
         )
         .expect("named from its manifest");
         assert!(protected.contains(&upgraded_from) && protected.contains(&its_file));
 
-        // And one nothing can name stops the reclaim instead of being guessed at.
+        // One held here that nothing can name stops the reclaim instead of being guessed at.
         let refusal = protected_payloads(
+            std::slice::from_ref(&installed),
+            &bindings,
+            &[upgraded_from],
+            |_| Ok(HeldPackage::Unnamed),
+        )
+        .expect_err("a live package whose files nothing names");
+        assert!(matches!(refusal, CatalogueError::StorageUnavailable { .. }));
+
+        // And one held nowhere here is another store's, which nothing here can take from it.
+        let protected = protected_payloads(
             std::slice::from_ref(&installed),
             &bindings,
             &[upgraded_from],
             nothing,
         )
-        .expect_err("a live package whose files nothing names");
-        assert!(matches!(refusal, CatalogueError::StorageUnavailable { .. }));
+        .expect("nothing of it is here");
+        assert!(!protected.contains(&its_file));
     }
 
     #[test]
