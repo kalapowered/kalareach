@@ -17,10 +17,18 @@ crate-type = ["lib", "cdylib", "staticlib"]
 name = "kalareach-companion"
 path = "src/main.rs"
 
+# Opens real windows to hold what the web view does with the navigation handlers, so it has its own
+# main thread.
+[[test]]
+name = "navigation"
+harness = false
+
 [build-dependencies]
 tauri-build = { workspace = true, features = [] }
 
 [dependencies]
+# The one secure store, the Android TLS verifier's start and the browser-backed sign-in session.
+companion-platform.workspace = true
 kr-cbor.workspace = true
 # The shared native client: sessions, cursors, drafts, controls and the upload path. The projected
 # screen it can also paint is a desktop window's; see the target table below.
@@ -37,7 +45,8 @@ tauri.workspace = true
 tauri-plugin-dialog.workspace = true
 tauri-plugin-opener.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+# The desktop sign-in's loopback listener reads one request and writes one page.
+tokio = { workspace = true, features = ["io-util", "net"] }
 tracing.workspace = true
 ureq.workspace = true
 

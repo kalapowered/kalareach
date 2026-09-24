@@ -19,3 +19,6 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+# The platform TLS verifier's Kotlin half is reached over JNI by class and member name, which a
+# minified build would otherwise rename or remove.
+-keep, includedescriptorclasses class org.rustls.platformverifier.** { *; }

@@ -167,6 +167,13 @@ targets:
       path: companion-tauri_iOS/companion-tauri_iOS.entitlements
       properties:
         aps-environment: development
+        # The sign-in's HTTPS callback, and the link a browser hands back, belong to this
+        # application only once reach.kala.to's association names it: `webcredentials` for the
+        # authentication session's callback, `applinks` for the callback address opened anywhere
+        # else.
+        com.apple.developer.associated-domains:
+          - applinks:reach.kala.to
+          - webcredentials:reach.kala.to
         # This application's own group first, and that order is the point: the platform adds an
         # item with no group named to the *first* group in this list. The extension is entitled to
         # the shared one, so a default write into it would put the device authorisation key where

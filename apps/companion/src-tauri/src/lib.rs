@@ -21,6 +21,7 @@
 //! has no command, so it cannot be reached from the page at all. [`commands::NAMED_COMMANDS`] is
 //! that list as data, and the crate's tests hold the handler list and the allowlist to each other.
 
+pub mod account;
 pub mod commands;
 pub mod connection;
 pub mod error;
@@ -53,15 +54,30 @@ pub use state::AppState;
 /// iOS and Android do not run a binary of their own: the system starts the process and calls
 /// into this library. [`mobile`] is where that call arrives.
 pub fn run() {
+    use tauri::Manager as _;
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(companion_platform::init())
         .manage(AppState::new())
         .invoke_handler(commands::handlers())
         .setup(|app| {
+            open_main_window(app.handle())?;
+            app.manage(account::AccountSlot::new(account_builder(
+                app.handle().clone(),
+            )));
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 reach_local_host(handle).await;
+            });
+            // The account is built off the thread the platform starts the application on: opening
+            // the secure store on a phone asks the native half, which runs on that thread.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = handle.state::<account::AccountSlot>().get().await {
+                    tracing::warn!(%error, "the account is not available on this device");
+                }
             });
             watch_drops(app.handle());
             Ok(())
@@ -91,6 +107,96 @@ pub mod mobile {
     pub fn start() {
         super::run();
     }
+}
+
+/// Opens the main window from its configuration, with the navigation guard.
+///
+/// The window's settings stay in `tauri.conf.json`, which marks it not to be created by itself, so
+/// it is built here with handlers that keep it on the bundled interface.
+fn open_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let configuration = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|window| window.label == "main")
+        .cloned()
+        .expect("the configuration describes the main window");
+    let development = if tauri::is_dev() {
+        app.config().build.dev_url.clone()
+    } else {
+        None
+    };
+    account::navigation::guard(
+        tauri::WebviewWindowBuilder::from_config(app, &configuration)?,
+        development,
+    )
+    .build()?;
+    Ok(())
+}
+
+/// Builds the account: the managed service on its fixed origin, the device's secure store, and
+/// the carrier this platform signs in through.
+fn account_builder(app: tauri::AppHandle) -> account::Build {
+    Box::new(move || {
+        let app = app.clone();
+        Box::pin(async move { build_account(&app) })
+    })
+}
+
+fn build_account(
+    app: &tauri::AppHandle,
+) -> std::result::Result<std::sync::Arc<account::Account>, String> {
+    use std::sync::Arc;
+
+    use kr_client::services::account::{
+        ACCOUNT_ORIGIN, AccountHttp, AccountService, Client, ManagedAccountService, SignedInAccount,
+    };
+    use kr_client::services::{HttpDeadlines, HttpService, managed_response_limits};
+    use tauri::Emitter as _;
+
+    let client = if cfg!(mobile) {
+        Client::Mobile
+    } else {
+        Client::Desktop
+    };
+    let origin = kr_protocol::service::GatewayOrigin::new(ACCOUNT_ORIGIN)
+        .map_err(|error| error.to_string())?;
+    let http = HttpService::with(origin, HttpDeadlines::default(), managed_response_limits())
+        .map_err(|error| error.to_string())?;
+    let service: Arc<dyn AccountService> = Arc::new(ManagedAccountService::new(
+        Arc::new(http) as Arc<dyn AccountHttp>,
+        client,
+    ));
+    let store = companion_platform::secrets::open(app).map_err(|error| error.to_string())?;
+    #[allow(unused_mut, reason = "a desktop also locks across processes")]
+    let mut signed_in = SignedInAccount::new(Arc::clone(&service), store, client);
+    #[cfg(desktop)]
+    {
+        use tauri::Manager as _;
+        let directory = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        signed_in = signed_in.with_shared_lock(directory.join("account.lock"));
+    }
+    #[cfg(desktop)]
+    let carrier: Arc<dyn account::carrier::Carrier> = Arc::new(account::carrier::Loopback::new(
+        Arc::new(account::carrier::SystemBrowser(app.clone())),
+    ));
+    #[cfg(mobile)]
+    let carrier: Arc<dyn account::carrier::Carrier> =
+        Arc::new(account::carrier::Session::new(app.clone()));
+    let emitter = app.clone();
+    Ok(Arc::new(account::Account::new(
+        Arc::new(signed_in),
+        service,
+        carrier,
+        Arc::new(move |view| {
+            let _ = emitter.emit(account::ACCOUNT_EVENT, view);
+        }),
+    )))
 }
 
 /// Records what the platform drops on this window, and tells the interface about it.

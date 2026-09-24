@@ -1281,6 +1281,7 @@ name = "companion-tauri"
 version = "0.1.0"
 dependencies = [
  "block2",
+ "companion-platform",
  "coreaudio-rs",
  "kr-cbor",
  "kr-client",

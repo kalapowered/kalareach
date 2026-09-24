@@ -105,6 +105,13 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("export_semantic_json", None),
     ("export_asciicast", None),
     ("connection_state", None),
+    // The account: this device signing in through the system browser. None is a host method and
+    // none takes an address; the page asks, and is told where it stands.
+    ("account_status", None),
+    ("account_sign_in", None),
+    ("account_sign_in_cancel", None),
+    ("account_sign_out", None),
+    ("account_usage", None),
 ];
 
 /// The command handlers, in the form Tauri registers.
@@ -164,6 +171,11 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         export_semantic_json,
         export_asciicast,
         connection_state,
+        account_status,
+        account_sign_in,
+        account_sign_in_cancel,
+        account_sign_out,
+        account_usage,
     ]
 }
 
@@ -1314,6 +1326,13 @@ mod tests {
                 // that would fail at exactly the moment a person needs it.
                 "voice_call_state",
                 "voice_set_muted",
+                // The account's five. Each reaches the account service or this device's secure
+                // store, and none reaches a host.
+                "account_sign_in",
+                "account_sign_in_cancel",
+                "account_sign_out",
+                "account_status",
+                "account_usage",
             ])
         );
     }
@@ -1635,4 +1654,46 @@ mod tests {
             "one field the method does not declare is refused"
         );
     }
+}
+
+/// Where this device stands with an account.
+#[tauri::command]
+pub async fn account_status(
+    account: State<'_, crate::account::AccountSlot>,
+) -> Result<crate::account::AccountView> {
+    Ok(account.get().await?.status().await)
+}
+
+/// Signs this device in through the system browser, and settles when the attempt ends.
+///
+/// The page names nothing: the address the browser opens, its state, verifier and code stay in
+/// this process, and the answer is only where the device now stands.
+#[tauri::command]
+pub async fn account_sign_in(
+    account: State<'_, crate::account::AccountSlot>,
+) -> Result<crate::account::AccountView> {
+    Ok(account.get().await?.sign_in().await)
+}
+
+/// Ends the sign-in that is waiting for the browser.
+#[tauri::command]
+pub async fn account_sign_in_cancel(account: State<'_, crate::account::AccountSlot>) -> Result<()> {
+    account.get().await?.cancel();
+    Ok(())
+}
+
+/// Signs this device out, and tells the service.
+#[tauri::command]
+pub async fn account_sign_out(
+    account: State<'_, crate::account::AccountSlot>,
+) -> Result<crate::account::AccountView> {
+    Ok(account.get().await?.sign_out().await)
+}
+
+/// The account's usage, in words and figures, and nothing about money.
+#[tauri::command]
+pub async fn account_usage(
+    account: State<'_, crate::account::AccountSlot>,
+) -> Result<crate::account::UsageView> {
+    Ok(account.get().await?.usage().await)
 }

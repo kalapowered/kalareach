@@ -187,26 +187,61 @@ fn the_capabilities_grant_no_shell_no_filesystem_and_no_general_http() {
     );
 }
 
+/// Section 13: external links require a user action and approved schemes. The page opens nothing
+/// itself: no opener command is granted to it, on any platform, so a script in the page cannot
+/// hand the system browser an address. A link opens through `open_external`, which applies the
+/// application's own scheme list, and the sign-in opens the browser from the backend alone.
 #[test]
-fn an_external_link_is_permitted_only_for_the_approved_schemes() {
-    let capabilities = capabilities();
-    let opener = capabilities["permissions"]
-        .as_array()
-        .expect("the capability file lists its permissions")
-        .iter()
-        .find(|permission| permission["identifier"] == "opener:allow-open-url")
-        .expect("opening a link is granted explicitly");
-    let allowed: Vec<String> = opener["allow"]
-        .as_array()
-        .expect("the grant names what may be opened")
-        .iter()
-        .map(|entry| entry["url"].as_str().expect("a URL pattern").to_owned())
-        .collect();
-    assert_eq!(allowed, vec!["https://*".to_owned(), "mailto:*".to_owned()]);
+fn the_page_opens_nothing_itself_and_a_link_goes_through_the_scheme_policy() {
+    for (file, capabilities) in [
+        ("default.json", capabilities()),
+        ("mobile.json", mobile_capabilities()),
+    ] {
+        let granted = granted(&capabilities);
+        assert!(
+            !granted.iter().any(|name| name.starts_with("opener:")),
+            "{file} lets the page open an address itself: {granted:?}"
+        );
+        assert!(
+            !granted
+                .iter()
+                .any(|name| name.starts_with("companion-platform:")),
+            "{file} lets the page reach the platform plugin's native methods: {granted:?}"
+        );
+    }
     assert_eq!(
-        allowed.len(),
-        companion_tauri::links::APPROVED_SCHEMES.len(),
-        "the platform grant and the application's own scheme list are the same list"
+        companion_tauri::links::APPROVED_SCHEMES,
+        ["https", "mailto"]
+    );
+    assert!(
+        NAMED_COMMANDS
+            .iter()
+            .any(|(command, method)| *command == "open_external" && method.is_none()),
+        "a link the person follows still opens, through the scheme policy"
+    );
+}
+
+/// KR-REQ-17.19: the account's commands are the application's own, and none of them is a host
+/// method or takes an address from the page.
+#[test]
+fn the_account_is_reached_through_five_named_commands() {
+    let account: Vec<&str> = NAMED_COMMANDS
+        .iter()
+        .filter(|(command, _)| command.starts_with("account_"))
+        .map(|(command, method)| {
+            assert!(method.is_none(), "{command} is not a host method");
+            *command
+        })
+        .collect();
+    assert_eq!(
+        account,
+        [
+            "account_status",
+            "account_sign_in",
+            "account_sign_in_cancel",
+            "account_sign_out",
+            "account_usage"
+        ]
     );
 }
 
