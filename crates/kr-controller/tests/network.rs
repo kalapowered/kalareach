@@ -2250,8 +2250,14 @@ async fn a_device_pairs_and_attaches_through_a_relay_and_losing_it_leaves_the_se
 /// What is left of a metered relay's allowance when the next command starts.
 const ALLOWANCE_LEFT: u64 = 32 * 1024;
 
-/// A command whose output is several times what is left of the allowance.
-const SPENDING_COMMAND: &str = "yes kalareach-spends-the-allowance | head -n 20000\n";
+/// A command that waits until `barrier` exists and then prints several times what is left of the
+/// allowance.
+fn spending_command(barrier: &Path) -> String {
+    format!(
+        "while [ ! -e '{}' ]; do sleep 0.05; done; yes kalareach-spends-the-allowance | head -n 20000\n",
+        barrier.display()
+    )
+}
 
 /// How long the host may take to see a connection that went quiet as ended.
 ///
@@ -2353,19 +2359,23 @@ async fn a_relay_quota_disconnect_leaves_the_terminal_worker_running() {
     .await;
     assert!(seen.contains(MARKER), "the relay carried the session");
 
-    // What is left of the allowance is less than the next command prints, so the session's own
-    // output is what spends it.
-    relay.allow_only(ALLOWANCE_LEFT);
+    // The command that spends the allowance waits at a barrier. The allowance is only limited once
+    // the device holds the command's acknowledgement, because output that spent it sooner could
+    // end the path before the acknowledgement came back. Then what is left of the allowance is less
+    // than the command prints, and the barrier is released, so the session's own output spends it.
+    let barrier = host.tree().root().join("spend-the-allowance");
     session
         .write_input(&InputWriteParams {
             session_id,
             attachment_id: attached.typing,
             epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
             sequence: kr_protocol::ids::InputSequence::new(1),
-            bytes: kr_protocol::scalars::Bytes::new(SPENDING_COMMAND.as_bytes().to_vec()),
+            bytes: kr_protocol::scalars::Bytes::new(spending_command(&barrier).into_bytes()),
         })
         .await
         .expect("the command is accepted");
+    relay.allow_only(ALLOWANCE_LEFT);
+    std::fs::write(&barrier, b"").expect("the barrier is released");
 
     // The relay refuses. It closes the path and turns the device away when it comes back, and the
     // device learns the relay's own reason from the relay. A relay that had stopped would have
