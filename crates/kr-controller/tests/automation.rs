@@ -2242,23 +2242,40 @@ fn issue_grant(
 /// The bounded offline validity holds a workflow's grant on the continuous clock it was anchored
 /// on, as it holds a device's own request. A decision taken after the wall clock was wound back
 /// reads UTC inside the bound again, and is refused all the same.
+///
+/// Nothing here races the machine. The synchronisation the bound is measured from is an hour ahead
+/// of this host's wall clock, as a feed whose clock runs ahead of this host's would report it, so
+/// every reading of UTC the test gives and every reading the host takes for itself is inside the
+/// bound for that hour: whatever refuses the grant here is the continuous clock. While the bound is
+/// an hour long, which no load outlasts, a decision is permitted, and so is the same decision under
+/// a wall clock wound back. The owner then narrows the bound to 100 ms on the same synchronisation,
+/// which keeps the time already spent, and the test waits on the daemon's own continuous clock
+/// until more than that has passed since the bound was anchored: the decision is refused, although
+/// UTC is still an hour inside it. Widening the bound again admits the same decision, which is the
+/// control: the refusal was the bound on the continuous clock and nothing the refusal left behind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_workflow_grant_is_held_to_the_offline_bound_on_the_continuous_clock() {
     use kr_automation::{AuthoritySource, AutomationError};
     use kr_controller::automation::HostGrants;
 
-    let host = host().await;
-    let synchronised = kr_ipc::now_ms().get();
-    host.controller
-        .update_policy(|policy| {
-            policy.set_offline_validity(Some(kr_protocol::sharing::OfflineValidityPolicy {
-                maximum_offline_ms: kr_protocol::scalars::DurationMs::new(200),
-                last_synchronised_at_ms: Nullable::some(kr_protocol::scalars::TimestampMs::new(
-                    synchronised,
-                )),
-            }));
+    const HOUR_MS: u64 = 60 * 60 * 1000;
+    let bounded = |maximum_offline_ms: u64, synchronised: u64| {
+        Some(kr_protocol::sharing::OfflineValidityPolicy {
+            maximum_offline_ms: kr_protocol::scalars::DurationMs::new(maximum_offline_ms),
+            last_synchronised_at_ms: Nullable::some(kr_protocol::scalars::TimestampMs::new(
+                synchronised,
+            )),
         })
-        .expect("the owner chooses an offline bound of a fifth of a second");
+    };
+
+    let host = host().await;
+    let now = kr_ipc::now_ms().get();
+    let synchronised = now + HOUR_MS;
+    host.controller
+        .update_policy(|policy| policy.set_offline_validity(bounded(HOUR_MS, synchronised)))
+        .expect("the owner chooses an offline bound of an hour");
+    // The bound is anchored while the policy is set, so every reading from here is at or after it.
+    let anchored_by = host.controller.continuous_now();
     let grant = issue_grant(
         &host,
         grant_id(21),
@@ -2267,20 +2284,40 @@ async fn a_workflow_grant_is_held_to_the_offline_bound_on_the_continuous_clock()
         GrantExpiry::Never,
     );
     let grants = HostGrants::for_daemon(&host.controller);
+    grants.grant(grant.grant_id, now).expect("inside the bound");
+    // The wall clock wound back five seconds is not, by itself, a reason to refuse.
     grants
-        .grant(grant.grant_id, synchronised)
-        .expect("inside the bound");
+        .grant(grant.grant_id, now - 5_000)
+        .expect("inside the bound, under a wall clock wound back");
 
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    // The wall clock has been wound back five seconds. With the floor this host holds, UTC is
-    // still inside the bound.
+    // The same synchronisation, so the time already spent is kept: the bound now runs out 100 ms
+    // after it was anchored, on the continuous clock.
+    host.controller
+        .update_policy(|policy| policy.set_offline_validity(bounded(100, synchronised)))
+        .expect("the owner narrows the bound to 100 milliseconds");
+    while host
+        .controller
+        .continuous_now()
+        .saturating_duration_since(anchored_by)
+        <= std::time::Duration::from_millis(150)
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     let refused = grants
-        .grant(grant.grant_id, synchronised - 5_000)
+        .grant(grant.grant_id, now - 5_000)
         .expect_err("the bound ran out on the continuous clock");
     assert!(
         matches!(&refused, AutomationError::PermissionDenied(detail) if detail.contains("offline")),
         "{refused}"
     );
+
+    // The control: an hour again, on the same synchronisation, and the same decision is admitted.
+    host.controller
+        .update_policy(|policy| policy.set_offline_validity(bounded(HOUR_MS, synchronised)))
+        .expect("the owner widens the bound again");
+    grants
+        .grant(grant.grant_id, now - 5_000)
+        .expect("inside the widened bound, on the same continuous clock");
 
     host.clients.abort();
 }
