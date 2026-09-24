@@ -592,9 +592,14 @@ configuration /home/someone/.config/kalareach/environments/ab12cd34/config.json 
   state_directory belongs at $XDG_STATE_HOME/kalareach/environments/<prefix>, or
     ~/.local/state/kalareach/environments/<prefix> where that variable is not set
   sleep_inhibition = mains_only from host_configuration, applies immediately
-  worker_profile = headless_user from default, applies new_sessions_only
-  runtime_directory = /run/user/1000/kalareach/ab12cd34 from default, applies new_sessions_only
-  state_directory = /home/someone/.local/state/kalareach/environments/ab12cd34 from default, applies new_sessions_only
+  worker_profile = headless_user from default, applies to new sessions only
+  runtime_directory = /run/user/1000/kalareach/ab12cd34 from default, applies to new sessions only
+  state_directory = /home/someone/.local/state/kalareach/environments/ab12cd34 from default, applies to new sessions only
+  network.enabled = true from host_configuration, applies at the next start
+  network.relay_urls = https://relay.example.com from host_configuration, applies at the next start
+  network.dns_origin = none from default, applies at the next start
+  …
+  voice.broker_origin = none from default, applies at the next start
   session_limit ceiling 128
   enrolment ceiling 67108864 metadata bytes, 100000 entries, 5 generations retained, …;
     configured here: retained_generations
@@ -605,7 +610,7 @@ warning        Every published descriptor answered its challenge
                A quarantined descriptor is never used. Remove it once its session is known to be gone.
 not_applicable Catalogue metadata and its capability evidence
                no catalogue is synchronised on this host
-13 checks: 11 passed, 1 with something worth knowing, 0 failed, 1 not applicable
+14 checks: 12 passed, 1 with something worth knowing, 0 failed, 1 not applicable
 ```
 
 Each engineering default the product makes configurable is printed with the value in force and the
@@ -619,6 +624,12 @@ force is the one the host is enforcing, not the one the document asks for: where
 not be applied, the `configuration-in-force` check fails and says what stopped it, and the ceiling
 lines show both what was asked for and what is in force. `--json` carries the same two facts as
 `configuration.not_in_force` and `configuration.fence_outstanding`.
+
+The document's `network` and `voice` sections are printed the same way, one line for each of their
+eleven fields, and each says `applies at the next start`: the daemon reads them when it starts, and
+no environment variable reaches them. The `configuration-network` check says what the running host
+started with, and warns when the document now selects a different network or voice broker, which
+takes a restart to put into force.
 
 Asking for the diagnostics is what puts this host's configuration into force, so a ceiling somebody
 edited by hand takes effect during the run. One that changes what a caller may do withdraws the

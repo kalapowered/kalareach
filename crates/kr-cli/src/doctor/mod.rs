@@ -190,7 +190,7 @@ pub fn configurable_lines(effective: &EffectiveConfiguration) -> Vec<String> {
             value.key,
             value.value(),
             value.source.as_str(),
-            value.effect.as_str()
+            value.effect.describe()
         ));
     }
     for ceiling in &effective.ceilings {
@@ -209,7 +209,7 @@ pub fn configurable_lines(effective: &EffectiveConfiguration) -> Vec<String> {
             ceiling.key,
             ceiling.value,
             ceiling.source.as_str(),
-            ceiling.effect.as_str(),
+            ceiling.effect.describe(),
             if ceiling.refused {
                 ", the configured value was more permissive and was refused"
             } else {

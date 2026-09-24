@@ -97,7 +97,7 @@ pub const ACKNOWLEDGEMENT_TIMEOUT: std::time::Duration = std::time::Duration::fr
 
 /// Everything a daemon needs to put itself on the network.
 pub struct NetworkSetup {
-    /// The services this environment selected.
+    /// The services this host's configuration selected.
     pub settings: NetworkSettings,
     /// Where this host's own network device keys live.
     pub secrets: Arc<dyn SecretStore>,
@@ -118,23 +118,27 @@ impl std::fmt::Debug for NetworkSetup {
 }
 
 impl NetworkSetup {
-    /// Reads the selection and the credentials from this process's environment.
+    /// Builds the setup a configuration document's network section selects.
     ///
-    /// Returns `None` when the environment selects no network. Under
-    /// [`StoreSelection::Platform`] the key store is the platform's own credential store where
-    /// there is one, and the documented owner-only directory where there is not; the fallback is
-    /// taken deliberately rather than discovered at the first write. Under
+    /// Returns `None` when the section does not put this host on the network. The selection is
+    /// the document's alone ([`NetworkSettings::from_selection`]), and nothing here is read from
+    /// this process's environment: the owner is recorded by the pairing that establishes it.
+    ///
+    /// Under [`StoreSelection::Platform`] the key store is the platform's own credential store
+    /// where there is one, and the documented owner-only directory where there is not; the
+    /// fallback is taken deliberately rather than discovered at the first write. Under
     /// [`StoreSelection::File`] it is the directory this environment keeps its secrets in, which
     /// is what a test, a bench or a demonstration run is given so that its keys leave with it.
     ///
     /// # Errors
     ///
-    /// Returns a configuration error naming the variable or the store that could not be read.
-    pub fn from_environment(
+    /// Returns a configuration error naming the selection or the store that could not be read.
+    pub fn from_configuration(
+        network: &kr_protocol::hostinfo::configuration::NetworkSelection,
         paths: &kr_ipc::paths::EnvironmentPaths,
         selection: StoreSelection,
     ) -> Result<Option<Self>> {
-        let Some(settings) = NetworkSettings::from_environment()? else {
+        let Some(settings) = NetworkSettings::from_selection(network)? else {
             return Ok(None);
         };
         let secrets: Arc<dyn SecretStore> = match selection {
@@ -224,7 +228,7 @@ impl NetworkGuard {
     }
 
     /// Returns the addresses this endpoint is bound to, which are the hints a peer dials.
-    fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
+    pub(crate) fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
         self.listener
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1354,25 +1358,4 @@ impl Controller {
     pub fn network_guard(&self) -> Option<&Arc<NetworkGuard>> {
         self.network.get()
     }
-}
-
-/// Puts a daemon on the network, if its environment selects one.
-///
-/// This is the whole of the daemon's integration with the transport: one call, made once, at the
-/// end of startup. An environment that selects no network serves its local endpoint alone.
-///
-/// # Errors
-///
-/// Returns a configuration failure, a key-store failure or a bind failure.
-pub async fn register_from_environment(controller: &Arc<Controller>) -> Result<()> {
-    let Some(setup) =
-        NetworkSetup::from_environment(controller.paths(), controller.secret_store())?
-    else {
-        return Ok(());
-    };
-    // Registering records the host on the daemon and hands the listener to it, so the daemon owns
-    // both for as long as it runs and a revocation can reach the connections they serve. The handle
-    // returned here is for a caller that registers a network of its own.
-    register(controller, setup).await?;
-    Ok(())
 }

@@ -5251,7 +5251,7 @@
         },
         "effect": {
           "$ref": "#/$defs/ValueEffect",
-          "description": "Whether it applies immediately or only to sessions created afterwards."
+          "description": "When it applies: immediately, only to sessions created afterwards, or at the next start."
         },
         "key": {
           "description": "The key.",
@@ -6908,6 +6908,22 @@
           "default": null,
           "description": "The profile selected when a request and the allowlist name none."
         },
+        "network": {
+          "$ref": "#/$defs/NetworkSelection",
+          "default": {
+            "bind_address": null,
+            "dns_origin": null,
+            "enabled": null,
+            "local_discovery": null,
+            "mainline_dht": null,
+            "pkarr_publisher_url": null,
+            "pkarr_resolver_url": null,
+            "relay_only": null,
+            "relay_trust_anchors": null,
+            "relay_urls": null
+          },
+          "description": "Whether this host joins the network, and every service it selects there.\n\nRead when the daemon starts, so a change applies at the next start. No environment\nvariable reaches any of it."
+        },
         "preferences": {
           "$ref": "#/$defs/PreferenceSet",
           "default": {
@@ -6945,6 +6961,13 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "voice": {
+          "$ref": "#/$defs/VoiceSelection",
+          "default": {
+            "broker_origin": null
+          },
+          "description": "The managed voice broker this host names to its paired devices.\n\nRead when the daemon starts, so a change applies at the next start. No environment\nvariable reaches it."
         }
       },
       "type": "object"
@@ -10921,7 +10944,7 @@
         },
         "effect": {
           "$ref": "#/$defs/ValueEffect",
-          "description": "Whether it applies immediately or only to sessions created afterwards."
+          "description": "When it applies: immediately, only to sessions created afterwards, or at the next start."
         },
         "key": {
           "description": "The key, as the configuration document spells it.",
@@ -17308,6 +17331,139 @@
       "description": "One relay URL, discovery origin or direct-address hint: printable ASCII without spaces, 1 to 253 bytes.",
       "pattern": "^[!-~]{1,253}$",
       "type": "string"
+    },
+    "NetworkSelection": {
+      "additionalProperties": false,
+      "description": "Whether this host joins the network, and each service it selects there.\n\nSection 17 makes every service its own choice: the relay map, the Pkarr publisher, the Pkarr\nresolver and the DNS origin are separate selections, and a service this section does not\nname is a service this host does not use. There are no defaults to inherit, from a public\nservice or from the environment the daemon started in: a relay map, a discovery server, a\nDNS origin and a trust anchor are provider origins and a trust decision, which section 26\nkeeps out of reach of any inherited variable.\n\nEach field is absent unless this document chooses it, so a report can say which of them a\nperson wrote rather than inferring it from the value. The daemon reads the section when it\nstarts, which is when its endpoint is built, so a change applies at the next start.",
+      "properties": {
+        "bind_address": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The socket address the endpoint binds to, such as `0.0.0.0:4433`. Absent binds an\nunspecified address and a free port."
+        },
+        "dns_origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The DNS origin this host resolves peers from: a dotted domain name, with no scheme or\npath."
+        },
+        "enabled": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Whether this host joins the network at all. Without it the daemon serves its local\nendpoint alone, which is a complete deployment rather than a degraded one."
+        },
+        "local_discovery": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Discovery of peers on the local network."
+        },
+        "mainline_dht": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The public Mainline DHT for discovery. It publishes to a public network and carries no\nKalaReach service guarantee, which is why it is never on unless chosen."
+        },
+        "pkarr_publisher_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The Pkarr server this host publishes its signed record to."
+        },
+        "pkarr_resolver_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The Pkarr server this host resolves peers from."
+        },
+        "relay_only": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Every packet goes through the relay, and no direct path is used."
+        },
+        "relay_trust_anchors": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "DER certificate files, by absolute path, trusted for a relay's HTTPS beside the public\nanchors. A self-hosted relay with a private authority names it here; the public\nanchors stay in force, so this adds trust rather than replacing it."
+        },
+        "relay_urls": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The relay map, as absolute `https` or `http` relay URLs. Absent or empty selects no\nrelay."
+        }
+      },
+      "type": "object"
     },
     "NodeReceiptSummary": {
       "additionalProperties": false,
@@ -30065,7 +30221,7 @@
       "type": "string"
     },
     "ValueEffect": {
-      "description": "Whether a new value applies at once or only to sessions created afterwards.",
+      "description": "When a new value takes effect: at once, only for sessions created afterwards, or when the\nhost next starts.",
       "oneOf": [
         {
           "const": "immediately",
@@ -30075,6 +30231,11 @@
         {
           "const": "new_sessions_only",
           "description": "A running session keeps what it was created with; the new value applies to sessions\ncreated afterwards. Nothing migrates a worker.",
+          "type": "string"
+        },
+        {
+          "const": "next_start",
+          "description": "The running host keeps what it started with; the new value applies when it next\nstarts. A network endpoint and the services it selects are built once, at startup.",
           "type": "string"
         }
       ]
@@ -31381,6 +31542,25 @@
         "class",
         "text"
       ],
+      "type": "object"
+    },
+    "VoiceSelection": {
+      "additionalProperties": false,
+      "description": "The managed voice broker this host names to its paired devices.\n\nA provider origin, so it is this document's to choose and no inherited variable's. The\ndaemon reads it when it starts its voice service, so a change applies at the next start.\nAbsent means this host brokers no managed call, which is a complete host: a person's own\nprovider and the agent already running in a session both still work.",
+      "properties": {
+        "broker_origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The broker's origin: an absolute `https` or `http` address in lower case, with no path,\nno trailing slash and no port its scheme already implies."
+        }
+      },
       "type": "object"
     },
     "VoiceSessionDescriptor": {

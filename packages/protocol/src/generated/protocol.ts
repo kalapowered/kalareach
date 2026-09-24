@@ -8628,6 +8628,7 @@ export interface ConfigurationDocument {
    * The profile selected when a request and the allowlist name none.
    */
   default_profile?: string | null
+  network?: NetworkSelection
   preferences?: PreferenceSet
   /**
    * Named profiles, each a set of the same preferences.
@@ -8649,6 +8650,7 @@ export interface ConfigurationDocument {
    * The schema version this document is written against.
    */
   version?: number
+  voice?: VoiceSelection
 }
 /**
  * The ceilings this host configures. They intersect; they never raise anything.
@@ -8727,6 +8729,61 @@ export interface ConfiguredEnrolmentBudgets {
   transfer_bytes?: number | null
 }
 /**
+ * Whether this host joins the network, and every service it selects there.
+ *
+ * Read when the daemon starts, so a change applies at the next start. No environment
+ * variable reaches any of it.
+ */
+export interface NetworkSelection {
+  /**
+   * The socket address the endpoint binds to, such as `0.0.0.0:4433`. Absent binds an
+   * unspecified address and a free port.
+   */
+  bind_address?: string | null
+  /**
+   * The DNS origin this host resolves peers from: a dotted domain name, with no scheme or
+   * path.
+   */
+  dns_origin?: string | null
+  /**
+   * Whether this host joins the network at all. Without it the daemon serves its local
+   * endpoint alone, which is a complete deployment rather than a degraded one.
+   */
+  enabled?: boolean | null
+  /**
+   * Discovery of peers on the local network.
+   */
+  local_discovery?: boolean | null
+  /**
+   * The public Mainline DHT for discovery. It publishes to a public network and carries no
+   * KalaReach service guarantee, which is why it is never on unless chosen.
+   */
+  mainline_dht?: boolean | null
+  /**
+   * The Pkarr server this host publishes its signed record to.
+   */
+  pkarr_publisher_url?: string | null
+  /**
+   * The Pkarr server this host resolves peers from.
+   */
+  pkarr_resolver_url?: string | null
+  /**
+   * Every packet goes through the relay, and no direct path is used.
+   */
+  relay_only?: boolean | null
+  /**
+   * DER certificate files, by absolute path, trusted for a relay's HTTPS beside the public
+   * anchors. A self-hosted relay with a private authority names it here; the public
+   * anchors stay in force, so this adds trust rather than replacing it.
+   */
+  relay_trust_anchors?: string[] | null
+  /**
+   * The relay map, as absolute `https` or `http` relay URLs. Absent or empty selects no
+   * relay.
+   */
+  relay_urls?: string[] | null
+}
+/**
  * The ordinary preferences that apply when no profile is selected.
  */
 export interface PreferenceSet {
@@ -8772,6 +8829,19 @@ export interface SecretReference {
    * The secure store it lives in.
    */
   store: string
+}
+/**
+ * The managed voice broker this host names to its paired devices.
+ *
+ * Read when the daemon starts, so a change applies at the next start. No environment
+ * variable reaches it.
+ */
+export interface VoiceSelection {
+  /**
+   * The broker's origin: an absolute `https` or `http` address in lower case, with no path,
+   * no trailing slash and no port its scheme already implies.
+   */
+  broker_origin?: string | null
 }
 /**
  * What the host returns once both proofs verify.
@@ -10497,9 +10567,9 @@ export interface CeilingValue {
    */
   configured: string | null
   /**
-   * Whether it applies immediately or only to sessions created afterwards.
+   * When it applies: immediately, only to sessions created afterwards, or at the next start.
    */
-  effect: 'immediately' | 'new_sessions_only'
+  effect: 'immediately' | 'new_sessions_only' | 'next_start'
   /**
    * The key.
    */
@@ -10610,9 +10680,9 @@ export interface EffectiveValue {
     | 'variable'
     | 'name'
   /**
-   * Whether it applies immediately or only to sessions created afterwards.
+   * When it applies: immediately, only to sessions created afterwards, or at the next start.
    */
-  effect: 'immediately' | 'new_sessions_only'
+  effect: 'immediately' | 'new_sessions_only' | 'next_start'
   /**
    * The key, as the configuration document spells it.
    */

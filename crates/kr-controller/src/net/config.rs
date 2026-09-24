@@ -1,4 +1,4 @@
-//! What this environment selected for its network, read from the environment it runs in.
+//! What this host selected for its network, read from its configuration document.
 //!
 //! Section 17 is explicit that nothing is inherited: the relay map, the Pkarr publisher, the Pkarr
 //! resolver and the DNS origin are four separate selections, and a service this configuration does
@@ -6,32 +6,24 @@
 //! there are none in the transport: a KalaReach host that quietly fell back on somebody else's
 //! relay would be routing a user's terminal through a service they never chose.
 //!
+//! Every selection is the `network` section of this host's configuration document
+//! ([`NetworkSelection`]), which is validated with the rest of the document and reported by
+//! `kr doctor` with its source. The daemon reads it once, when it starts, because that is when its
+//! endpoint is built. No environment variable reaches any of it: section 26 keeps provider origins
+//! and trust decisions out of reach of whatever a process happened to inherit.
+//!
 //! A daemon that selects nothing serves its local endpoint alone. That is a supported deployment,
 //! not a degraded one: a host on the same machine as its clients needs no network at all.
-//!
-//! | Variable | What it selects |
-//! | --- | --- |
-//! | `KR_NETWORK` | `1`, `true`, `yes` or `on` puts this daemon on the network |
-//! | `KR_NETWORK_BIND` | The socket address the endpoint binds to |
-//! | `KR_NETWORK_RELAYS` | The relay map, as comma-separated relay URLs |
-//! | `KR_NETWORK_PKARR_PUBLISHER` | The Pkarr server this host publishes its signed record to |
-//! | `KR_NETWORK_PKARR_RESOLVER` | The Pkarr server this host resolves peers from |
-//! | `KR_NETWORK_DNS_ORIGIN` | The DNS origin this host resolves peers from |
-//! | `KR_NETWORK_RELAY_CA` | DER certificate files, comma separated, trusted for a relay's HTTPS |
-//! | `KR_NETWORK_RELAY_ONLY` | `1` sends every packet through the relay and uses no direct path |
-//! | `KR_NETWORK_LOCAL_DISCOVERY` | `1` selects local network discovery |
-//! | `KR_NETWORK_MAINLINE` | `1` selects the public Mainline DHT |
 
-use std::path::PathBuf;
-
+use kr_protocol::hostinfo::configuration::{
+    self, NETWORK_BIND_ADDRESS, NETWORK_PKARR_PUBLISHER_URL, NETWORK_PKARR_RESOLVER_URL,
+    NETWORK_RELAY_TRUST_ANCHORS, NETWORK_RELAY_URLS, NetworkSelection,
+};
 use kr_transport::config::{EndpointConfig, Url};
 use kr_transport::preauth::PreAuthLimits;
 use kr_transport::scheduler::SendLimits;
 
 use crate::error::{ControllerError, Result};
-
-/// The environment variable that puts a daemon on the network.
-pub const ENABLE: &str = "KR_NETWORK";
 
 /// Everything this daemon's endpoint is built from.
 #[derive(Clone, Debug, Default)]
@@ -45,44 +37,47 @@ pub struct NetworkSettings {
 }
 
 impl NetworkSettings {
-    /// Reads the selection from this process's environment.
+    /// Builds the endpoint a configuration document's network section selects.
     ///
-    /// Returns `None` when the environment selects no network. Every other failure is a
-    /// configuration error rather than a silent fallback: an operator who named a relay URL that
-    /// does not parse gets told so at startup instead of finding out that the host is unreachable.
+    /// Returns `None` when the section does not put this host on the network. Every other failure
+    /// is a configuration error rather than a silent fallback: an owner who named a relay that
+    /// cannot be used, or a certificate file that is not there, is told so when the daemon starts
+    /// instead of finding out that the host is unreachable.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::InvalidArgument`] naming the variable that could not be read.
-    pub fn from_environment() -> Result<Option<Self>> {
-        if !flag(ENABLE) {
+    /// Returns [`ControllerError::InvalidArgument`] naming the key whose value could not be used.
+    pub fn from_selection(selection: &NetworkSelection) -> Result<Option<Self>> {
+        if !selection.joins() {
             return Ok(None);
         }
         let mut settings = Self::default();
-        if let Some(bind) = value("KR_NETWORK_BIND") {
+        if let Some(bind) = selection.bind_address() {
             settings.endpoint.bind_addr = Some(
                 bind.parse()
-                    .map_err(|error| invalid("KR_NETWORK_BIND", &bind, &format!("{error}")))?,
+                    .map_err(|error| invalid(NETWORK_BIND_ADDRESS.key, None, &error))?,
             );
         }
-        if let Some(relays) = value("KR_NETWORK_RELAYS") {
-            for relay in relays.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                settings.endpoint.relay_urls.push(
-                    relay.parse().map_err(|error| {
-                        invalid("KR_NETWORK_RELAYS", relay, &format!("{error}"))
-                    })?,
-                );
-            }
+        for (index, relay) in selection.relay_urls().iter().enumerate() {
+            settings.endpoint.relay_urls.push(
+                relay
+                    .parse()
+                    .map_err(|error| invalid(NETWORK_RELAY_URLS.key, Some(index), &error))?,
+            );
         }
-        settings.endpoint.discovery.pkarr_publisher_url = url("KR_NETWORK_PKARR_PUBLISHER")?;
-        settings.endpoint.discovery.pkarr_resolver_url = url("KR_NETWORK_PKARR_RESOLVER")?;
-        settings.endpoint.discovery.dns_origin = value("KR_NETWORK_DNS_ORIGIN");
-        settings.endpoint.relay_only = flag("KR_NETWORK_RELAY_ONLY");
-        settings.endpoint.discovery.local_discovery = flag("KR_NETWORK_LOCAL_DISCOVERY");
-        settings.endpoint.discovery.mainline_dht = flag("KR_NETWORK_MAINLINE");
-        if let Some(paths) = value("KR_NETWORK_RELAY_CA") {
-            settings.endpoint.relay_ca_roots = read_trust_anchors(&paths)?;
-        }
+        settings.endpoint.discovery.pkarr_publisher_url = url(
+            selection.pkarr_publisher_url(),
+            NETWORK_PKARR_PUBLISHER_URL.key,
+        )?;
+        settings.endpoint.discovery.pkarr_resolver_url = url(
+            selection.pkarr_resolver_url(),
+            NETWORK_PKARR_RESOLVER_URL.key,
+        )?;
+        settings.endpoint.discovery.dns_origin = selection.dns_origin().map(str::to_owned);
+        settings.endpoint.relay_only = selection.relay_only();
+        settings.endpoint.discovery.local_discovery = selection.local_discovery();
+        settings.endpoint.discovery.mainline_dht = selection.mainline_dht();
+        settings.endpoint.relay_ca_roots = read_trust_anchors(selection.relay_trust_anchors())?;
         Ok(Some(settings))
     }
 }
@@ -91,69 +86,120 @@ impl NetworkSettings {
 ///
 /// Each path names one DER-encoded certificate. The public anchors stay in force alongside
 /// whatever this adds, so pinning a private authority adds trust rather than replacing it, and a
-/// deployment whose relay presents a publicly issued certificate names none of these.
-fn read_trust_anchors(paths: &str) -> Result<Vec<Vec<u8>>> {
-    let mut anchors = Vec::new();
-    for path in paths.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let der = std::fs::read(PathBuf::from(path))
-            .map_err(|error| invalid("KR_NETWORK_RELAY_CA", path, &format!("{error}")))?;
+/// deployment whose relay presents a publicly issued certificate names none of these. A file that
+/// cannot be read, or that is empty, is a configuration error rather than an anchor quietly left
+/// out: a relay the owner pinned and this host then failed to trust would look like a relay that
+/// is down.
+fn read_trust_anchors(paths: &[String]) -> Result<Vec<Vec<u8>>> {
+    let mut anchors = Vec::with_capacity(paths.len());
+    for (index, path) in paths.iter().enumerate() {
+        let der = std::fs::read(path)
+            .map_err(|error| invalid(NETWORK_RELAY_TRUST_ANCHORS.key, Some(index), &error))?;
         if der.is_empty() {
-            return Err(invalid("KR_NETWORK_RELAY_CA", path, "the file is empty"));
+            return Err(invalid(
+                NETWORK_RELAY_TRUST_ANCHORS.key,
+                Some(index),
+                &"the file is empty",
+            ));
         }
         anchors.push(der);
-    }
-    if anchors.is_empty() {
-        return Err(invalid(
-            "KR_NETWORK_RELAY_CA",
-            paths,
-            "no certificate path was named",
-        ));
     }
     Ok(anchors)
 }
 
-fn value(name: &str) -> Option<String> {
-    match std::env::var(name) {
-        Ok(value) if !value.trim().is_empty() => Some(value.trim().to_owned()),
-        Ok(_) | Err(_) => None,
-    }
-}
-
-fn url(name: &str) -> Result<Option<Url>> {
-    value(name)
-        .map(|value| {
-            value
-                .parse()
-                .map_err(|error| invalid(name, &value, &format!("{error}")))
-        })
+fn url(value: Option<&str>, key: &str) -> Result<Option<Url>> {
+    value
+        .map(|value| value.parse().map_err(|error| invalid(key, None, &error)))
         .transpose()
 }
 
-fn flag(name: &str) -> bool {
-    value(name).is_some_and(|value| {
-        matches!(
-            value.to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
-}
-
-fn invalid(name: &str, value: &str, reason: &str) -> ControllerError {
-    ControllerError::InvalidArgument(format!("{name}={value} is not usable: {reason}"))
+/// The error a selection that cannot be used is reported with.
+///
+/// It names the key and, for a list, which entry. The value itself is the owner's own and may be
+/// an address with a credential in it, so the reason is the parser's or the operating system's
+/// sentence about it rather than a copy of it.
+fn invalid(key: &str, index: Option<usize>, reason: &dyn std::fmt::Display) -> ControllerError {
+    let what = match index {
+        Some(index) => format!("{key} entry {}", index + 1),
+        None => key.to_owned(),
+    };
+    ControllerError::InvalidArgument(format!(
+        "{what} in this host's configuration document ({}) is not usable: {reason}",
+        configuration::FILE_NAME
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kr_protocol::scalars::Nullable;
 
-    #[test]
-    fn a_missing_trust_anchor_is_a_configuration_error_rather_than_no_anchor() {
-        let error = read_trust_anchors("/nonexistent/relay-ca.der").expect_err("a refusal");
-        assert!(error.to_string().contains("KR_NETWORK_RELAY_CA"));
+    fn joined(selection: NetworkSelection) -> NetworkSelection {
+        NetworkSelection {
+            enabled: Nullable::some(true),
+            ..selection
+        }
     }
 
     #[test]
-    fn naming_no_path_is_refused_rather_than_read_as_an_empty_selection() {
-        assert!(read_trust_anchors(" , ").is_err());
+    fn a_missing_trust_anchor_is_a_configuration_error_rather_than_no_anchor() {
+        let error = NetworkSettings::from_selection(&joined(NetworkSelection {
+            relay_trust_anchors: Nullable::some(vec!["/nonexistent/relay-ca.der".to_owned()]),
+            ..NetworkSelection::default()
+        }))
+        .expect_err("a refusal");
+        assert!(
+            error
+                .to_string()
+                .contains("network.relay_trust_anchors entry 1"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_section_that_does_not_join_selects_nothing_whatever_else_it_names() {
+        let selection = NetworkSelection {
+            relay_urls: Nullable::some(vec!["https://relay.example.com".to_owned()]),
+            relay_trust_anchors: Nullable::some(vec!["/nonexistent/relay-ca.der".to_owned()]),
+            ..NetworkSelection::default()
+        };
+        assert!(
+            NetworkSettings::from_selection(&selection)
+                .expect("nothing is read")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn every_selection_reaches_the_endpoint_it_builds() {
+        let settings = NetworkSettings::from_selection(&joined(NetworkSelection {
+            bind_address: Nullable::some("127.0.0.1:0".to_owned()),
+            relay_urls: Nullable::some(vec!["https://relay.example.com".to_owned()]),
+            pkarr_publisher_url: Nullable::some("https://discovery.example.com/pkarr".to_owned()),
+            pkarr_resolver_url: Nullable::some("https://discovery.example.com/pkarr".to_owned()),
+            dns_origin: Nullable::some("discovery.example.com".to_owned()),
+            relay_only: Nullable::some(true),
+            local_discovery: Nullable::some(true),
+            mainline_dht: Nullable::some(true),
+            ..NetworkSelection::default()
+        }))
+        .expect("a usable selection")
+        .expect("this host joins");
+        let endpoint = &settings.endpoint;
+        assert_eq!(
+            endpoint.bind_addr,
+            Some("127.0.0.1:0".parse().expect("an address"))
+        );
+        assert_eq!(endpoint.relay_urls.len(), 1);
+        assert!(endpoint.discovery.pkarr_publisher_url.is_some());
+        assert!(endpoint.discovery.pkarr_resolver_url.is_some());
+        assert_eq!(
+            endpoint.discovery.dns_origin.as_deref(),
+            Some("discovery.example.com")
+        );
+        assert!(endpoint.relay_only);
+        assert!(endpoint.discovery.local_discovery);
+        assert!(endpoint.discovery.mainline_dht);
+        assert!(endpoint.relay_ca_roots.is_empty());
     }
 }

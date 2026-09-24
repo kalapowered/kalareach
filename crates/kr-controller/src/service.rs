@@ -319,6 +319,11 @@ pub struct Controller {
     /// writer can publish between the two, and then an effect acts on one document while the
     /// report describes another. They read this instead, which acceptance writes.
     in_force: std::sync::Mutex<crate::config::InForce>,
+    /// The network and voice selections this daemon read when it started.
+    ///
+    /// Both are built once, at startup, from the document on disk then, so these are what the
+    /// daemon acts on until it next starts, and a later edit is reported as applying then.
+    started: crate::config::Started,
     /// True while a ceiling this host accepted asked for a fence it could not raise.
     ///
     /// Section 26 fences dispatch before a change affecting authority is acknowledged, so a fence
@@ -565,6 +570,10 @@ impl Controller {
             accepted_configuration.sessions = limit;
         }
         let in_force = crate::config::InForce::of(&startup_configuration);
+        // The network and the voice broker come from this same reading, and from nothing a
+        // process inherited: section 26 keeps a provider origin out of reach of an environment
+        // variable. They apply for as long as this daemon runs.
+        let started = crate::config::Started::of(startup_configuration.loaded().document.as_ref());
         drop(startup_configuration);
         let identity = (setup.identity)()?;
         let boot_epoch = kr_ipc::identity::boot_epoch(&setup.boot_identity)?;
@@ -701,6 +710,7 @@ impl Controller {
             catalogue_evidence: None,
             accepted_configuration: Mutex::new(accepted_configuration),
             in_force: std::sync::Mutex::new(in_force),
+            started,
             fence_unraised: std::sync::atomic::AtomicBool::new(false),
             boot_identity: setup.boot_identity,
             boot_epoch,
@@ -824,9 +834,15 @@ impl Controller {
         // recovered its reservations and rebuilt its worker directory, because it would be told
         // that sessions this host is running do not exist. Registering it also lends the project
         // service this host's owner, its owner devices, for its location decisions.
-        if let Some(setup) =
-            net::NetworkSetup::from_environment(&controller.paths, controller.secret_store())?
-        {
+        //
+        // What it joins is the configuration document's network section, read when this daemon
+        // started: a selection that cannot be used stops the start with its key named, rather than
+        // leaving a host that looks up and cannot be reached.
+        if let Some(setup) = net::NetworkSetup::from_configuration(
+            &controller.started.network,
+            &controller.paths,
+            controller.secret_store(),
+        )? {
             net::register(&controller, setup).await?;
         }
         // Unattended workflow execution starts last. The journal was recovered when the module
@@ -2763,9 +2779,10 @@ impl Controller {
     /// to it: a service built inside `Arc::new_cyclic` could not read a session or propose an
     /// effect, which is most of what those seams are for.
     ///
-    /// The managed broker is configured only when an origin is set. A host without one is a
-    /// complete host: a person's own provider credential and the agent already running in the
-    /// session both still work, and `voice.start` says so rather than failing obscurely.
+    /// The managed broker is configured only when the configuration document names its origin,
+    /// in the voice section this daemon read when it started. A host without one is a complete
+    /// host: a person's own provider credential and the agent already running in the session both
+    /// still work, and `voice.start` says so rather than failing obscurely.
     fn start_voice(self: &Arc<Self>) {
         let authority = Arc::new(crate::voice::GrantAuthority::new(
             Arc::clone(&self.sharing),
@@ -2784,7 +2801,11 @@ impl Controller {
             provider,
             self.sharing.host_device_id(),
             self.paths.environment_id(),
-            std::env::var(crate::voice::VOICE_BROKER_ORIGIN_VARIABLE).unwrap_or_default(),
+            self.started
+                .voice
+                .broker_origin()
+                .unwrap_or_default()
+                .to_owned(),
         );
         let _ = self.voice.set(Arc::new(module));
     }
@@ -6269,8 +6290,17 @@ impl Controller {
         // working from.
         let budgets = crate::config::catalogue::budgets(&accepted.resolver.ceilings());
         let effective = self.report_configuration(&accepted).await;
+        // What this daemon started with against what the same reading of the document selects,
+        // so an edit that applies at the next start says so.
+        let network = crate::config::network_check(
+            &self.started,
+            accepted.resolver.loaded().document.as_ref(),
+            self.network_guard()
+                .map_or(0, |guard| guard.bound_sockets().len()),
+        );
         drop(accepted);
         checks.extend(crate::config::checks(&effective));
+        checks.push(network);
         checks.push(DoctorCheck::new(
             "configuration-secrets",
             "Secrets are named references, never configuration exports",

@@ -11,8 +11,13 @@
 //! * **Validated edits** ([`apply`]). An edit is validated before a revision is applied, the
 //!   revision it was based on is checked again immediately before the write, and a change that
 //!   affects authority fences dispatch before the caller is told it took effect.
-//! * **The report** ([`effective`]). Each value, its source and whether it applies immediately or
-//!   only to new sessions, which is what `kr doctor` prints and what a support bundle carries.
+//! * **The report** ([`effective`]). Each value, its source and whether it applies immediately,
+//!   only to new sessions or at the next start, which is what `kr doctor` prints and what a support
+//!   bundle carries.
+//! * **What the daemon started with** ([`Started`], [`network_check`]). The network section and the
+//!   voice broker's origin are read once, when the daemon starts, from this document and from
+//!   nothing a process inherited; the check says what is in force and whether an edit waits for the
+//!   next start.
 //! * **The catalogue seam** ([`catalogue`]). The enrolment budgets and the shared capability
 //!   evidence, defined here so a catalogue client fills them rather than inventing its own.
 
@@ -239,6 +244,31 @@ impl InForce {
     }
 }
 
+/// The selections this daemon read when it started, which are what it acts on until it next starts.
+///
+/// The network endpoint and the voice service are built once, at startup, from the document on disk
+/// then. A later edit applies at the next start, and `kr doctor` compares the two so an owner who
+/// changed one can see that it is not in force yet.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Started {
+    /// The network section this daemon joined, or did not join, the network under.
+    pub network: configuration::NetworkSelection,
+    /// The voice broker this daemon names to its paired devices.
+    pub voice: configuration::VoiceSelection,
+}
+
+impl Started {
+    /// Reads both selections from one document, or the defaults of selecting nothing when this
+    /// host cannot use the document it found.
+    #[must_use]
+    pub fn of(document: Option<&configuration::ConfigurationDocument>) -> Self {
+        document.map_or_else(Self::default, |document| Self {
+            network: document.network.clone(),
+            voice: document.voice.clone(),
+        })
+    }
+}
+
 /// What one applied edit did.
 ///
 /// Every field but the first two is what the acceptance path observed, not what the request
@@ -403,7 +433,7 @@ pub fn effective(
     // own words; the two directories resolve to a path this host composed from a home directory,
     // an environment variable or an owner's own choice, and a path is not this build's to publish
     // to anybody but the owner.
-    let values: Vec<EffectiveValue> = vec![
+    let mut values: Vec<EffectiveValue> = vec![
         effective_value(&power, &Declared::term(power.value.as_str())),
         effective_value(&profile, &Declared::term(profile.value.as_str())),
         effective_value(
@@ -412,6 +442,13 @@ pub fn effective(
         ),
         effective_value(&state, &Declared::path(std::path::Path::new(&state.value))),
     ];
+    // The network and the voice broker: what the document selects, where it said so, and that it
+    // applies at the next start. A location and a path are each declared as what they are, so the
+    // owner reading their own report sees the address and an export carries its class and length.
+    values.extend(configuration::selection_rows(
+        resolver.loaded().document.as_ref(),
+        &resolver.document().display().to_string(),
+    ));
     // What the document asks for, narrowed by what this machine allows, and then replaced by the
     // number admission is actually enforcing. The two are the same on an ordinary host; where they
     // differ - an unusable document, or effects that failed - the report prints the one in force
@@ -704,11 +741,6 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
         .map(|entry| entry.variable.as_str())
         .collect();
     let ungoverned = configuration::ungoverned_here();
-    let authority_reaching: Vec<&str> = ungoverned
-        .iter()
-        .filter(|entry| entry.reaches_authority)
-        .map(|entry| entry.variable)
-        .collect();
     let mut overrides = Sentence::new();
     for (index, entry) in effective.overrides.iter().enumerate() {
         if index > 0 {
@@ -752,20 +784,12 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
     checks.push(DoctorCheck::new(
         "configuration-overrides",
         "Which environment variables participate",
-        // A variable that selects a provider origin or the owner signer is a warning wherever it
-        // is set, because section 26 says an inherited variable may not reach either. Saying so is
-        // what a diagnostic is for; saying nothing would make the line above it untrue.
-        if authority_reaching.is_empty() {
-            DoctorStatus::Ok
-        } else {
-            DoctorStatus::Warning
-        },
+        // What is read outside the precedence is the platform's naming of its locations and its
+        // login. Every provider origin this host uses is its configuration document's, and its
+        // owner is recorded by pairing, so no inherited variable here reaches authority.
+        DoctorStatus::Ok,
         overrides,
-        (!authority_reaching.is_empty()).then_some(
-            "An inherited variable selects a provider origin or the owner signing key. Start this \
-             host without it and choose the same thing through its own configuration or its \
-             pairing record.",
-        ),
+        None,
     ));
     let refused: Vec<&str> = effective
         .ceilings
@@ -801,6 +825,77 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
         ),
     ));
     checks
+}
+
+/// Whether this host is acting on the network and voice broker its configuration selects.
+///
+/// Both are read once, when the daemon starts, so what is in force is what it started with, and
+/// this check says what that was: whether it joined the network, how many sockets its endpoint
+/// holds and how many services it selected, and whether it names a managed voice broker to its
+/// devices. When the document now selects something else, the check warns that the edit applies
+/// at the next start, rather than leaving an owner to wonder why nothing changed.
+///
+/// `document` is the document the rest of the report was read from, and `bound_sockets` how many
+/// sockets the endpoint holds, which is zero on a host that is not on the network.
+#[must_use]
+pub fn network_check(
+    started: &Started,
+    document: Option<&configuration::ConfigurationDocument>,
+    bound_sockets: usize,
+) -> DoctorCheck {
+    let network = &started.network;
+    let mut detail = if network.joins() {
+        let discovery = [
+            network.pkarr_publisher_url().is_some(),
+            network.pkarr_resolver_url().is_some(),
+            network.dns_origin().is_some(),
+            network.local_discovery(),
+            network.mainline_dht(),
+        ]
+        .into_iter()
+        .filter(|selected| *selected)
+        .count();
+        Sentence::new()
+            .stated("this host joined the network when it started: its endpoint holds ")
+            .number(bound_sockets as u64)
+            .stated(" sockets, with ")
+            .number(network.relay_urls().len() as u64)
+            .stated(" relays and ")
+            .number(discovery as u64)
+            .stated(" discovery services selected")
+    } else {
+        Sentence::new().stated(
+            "this host selected no network when it started, and serves its local endpoint alone",
+        )
+    };
+    detail = detail.stated(if started.voice.broker_origin().is_some() {
+        "; it names a managed voice broker to its paired devices"
+    } else {
+        "; it names no managed voice broker"
+    });
+    // Compared with what the document says now. A document this host cannot use selects nothing,
+    // which is also what an owner who wrote no network section is told.
+    let moved = Started::of(document) != *started;
+    if moved {
+        detail = detail.stated(
+            "; the configuration document now selects a different network or voice broker, which \
+             applies at the next start",
+        );
+    }
+    DoctorCheck::new(
+        "configuration-network",
+        "This host started with the network and voice broker its configuration selects",
+        if moved {
+            DoctorStatus::Warning
+        } else {
+            DoctorStatus::Ok
+        },
+        detail,
+        moved.then_some(
+            "Restart this host to put the network and voice broker the document now selects into \
+             force.",
+        ),
+    )
 }
 
 /// The secure-store references this configuration names, as one line for a diagnostic.

@@ -313,7 +313,7 @@ pub struct EffectiveValue {
     pub origin: Nullable<String>,
     /// The allowlisted environment variable that supplied it, when one did.
     pub variable: Nullable<String>,
-    /// Whether it applies immediately or only to sessions created afterwards.
+    /// When it applies: immediately, only to sessions created afterwards, or at the next start.
     pub effect: configuration::ValueEffect,
 }
 
@@ -384,7 +384,7 @@ pub struct CeilingValue {
     pub source: configuration::ValueSource,
     /// The document's path, when the rung had one.
     pub origin: Nullable<String>,
-    /// Whether it applies immediately or only to sessions created afterwards.
+    /// When it applies: immediately, only to sessions created afterwards, or at the next start.
     pub effect: configuration::ValueEffect,
     /// What narrowed the configured value, when something did.
     pub narrowed_by: Nullable<export::Sentence>,
@@ -942,9 +942,21 @@ impl ComposedBundle {
 ///   "profiles": { "review": { "worker_profile": "headless_user" } },
 ///   "default_profile": null,
 ///   "ceilings": { "session_limit": 16 },
-///   "secrets": [{ "name": "relay", "store": "login_keychain", "item": "kalareach/relay" }]
+///   "secrets": [{ "name": "relay", "store": "login_keychain", "item": "kalareach/relay" }],
+///   "network": {
+///     "enabled": true,
+///     "relay_urls": ["https://relay.example.com"],
+///     "pkarr_publisher_url": "https://discovery.example.com/pkarr",
+///     "pkarr_resolver_url": "https://discovery.example.com/pkarr",
+///     "dns_origin": "discovery.example.com"
+///   },
+///   "voice": { "broker_origin": "https://voice.example.com" }
 /// }
 /// ```
+///
+/// The `network` and `voice` sections are the only place a network selection or the voice
+/// broker's origin is chosen, and the daemon reads them when it starts ([`NetworkSelection`],
+/// [`VoiceSelection`]). No environment variable reaches either.
 ///
 /// Its numbers are ordinary JSON numbers rather than the decimal strings the wire types use. This
 /// is a file a person may open and edit, not a message a JavaScript consumer parses, and the
@@ -1329,6 +1341,16 @@ pub mod configuration {
         /// in, which is what section 26's "named secure-store references, never config exports"
         /// looks like when it is enforced rather than promised.
         pub secrets: Vec<SecretReference>,
+        /// Whether this host joins the network, and every service it selects there.
+        ///
+        /// Read when the daemon starts, so a change applies at the next start. No environment
+        /// variable reaches any of it.
+        pub network: NetworkSelection,
+        /// The managed voice broker this host names to its paired devices.
+        ///
+        /// Read when the daemon starts, so a change applies at the next start. No environment
+        /// variable reaches it.
+        pub voice: VoiceSelection,
     }
 
     impl Default for ConfigurationDocument {
@@ -1345,6 +1367,8 @@ pub mod configuration {
                 default_profile: Nullable::null(),
                 ceilings: ConfigurationCeilings::default(),
                 secrets: Vec::new(),
+                network: NetworkSelection::default(),
+                voice: VoiceSelection::default(),
             }
         }
     }
@@ -1619,6 +1643,134 @@ pub mod configuration {
         pub store: String,
         /// Its name inside that store.
         pub item: String,
+    }
+
+    /// Whether this host joins the network, and each service it selects there.
+    ///
+    /// Section 17 makes every service its own choice: the relay map, the Pkarr publisher, the Pkarr
+    /// resolver and the DNS origin are separate selections, and a service this section does not
+    /// name is a service this host does not use. There are no defaults to inherit, from a public
+    /// service or from the environment the daemon started in: a relay map, a discovery server, a
+    /// DNS origin and a trust anchor are provider origins and a trust decision, which section 26
+    /// keeps out of reach of any inherited variable.
+    ///
+    /// Each field is absent unless this document chooses it, so a report can say which of them a
+    /// person wrote rather than inferring it from the value. The daemon reads the section when it
+    /// starts, which is when its endpoint is built, so a change applies at the next start.
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields, default)]
+    pub struct NetworkSelection {
+        /// Whether this host joins the network at all. Without it the daemon serves its local
+        /// endpoint alone, which is a complete deployment rather than a degraded one.
+        pub enabled: Nullable<bool>,
+        /// The socket address the endpoint binds to, such as `0.0.0.0:4433`. Absent binds an
+        /// unspecified address and a free port.
+        pub bind_address: Nullable<String>,
+        /// The relay map, as absolute `https` or `http` relay URLs. Absent or empty selects no
+        /// relay.
+        pub relay_urls: Nullable<Vec<String>>,
+        /// The Pkarr server this host publishes its signed record to.
+        pub pkarr_publisher_url: Nullable<String>,
+        /// The Pkarr server this host resolves peers from.
+        pub pkarr_resolver_url: Nullable<String>,
+        /// The DNS origin this host resolves peers from: a dotted domain name, with no scheme or
+        /// path.
+        pub dns_origin: Nullable<String>,
+        /// DER certificate files, by absolute path, trusted for a relay's HTTPS beside the public
+        /// anchors. A self-hosted relay with a private authority names it here; the public
+        /// anchors stay in force, so this adds trust rather than replacing it.
+        pub relay_trust_anchors: Nullable<Vec<String>>,
+        /// Every packet goes through the relay, and no direct path is used.
+        pub relay_only: Nullable<bool>,
+        /// Discovery of peers on the local network.
+        pub local_discovery: Nullable<bool>,
+        /// The public Mainline DHT for discovery. It publishes to a public network and carries no
+        /// KalaReach service guarantee, which is why it is never on unless chosen.
+        pub mainline_dht: Nullable<bool>,
+    }
+
+    impl NetworkSelection {
+        /// Whether this host joins the network.
+        #[must_use]
+        pub fn joins(&self) -> bool {
+            self.enabled.0.unwrap_or(false)
+        }
+
+        /// The socket address the endpoint binds to, when one is chosen.
+        #[must_use]
+        pub fn bind_address(&self) -> Option<&str> {
+            self.bind_address.as_ref().map(String::as_str)
+        }
+
+        /// The selected relay URLs.
+        #[must_use]
+        pub fn relay_urls(&self) -> &[String] {
+            self.relay_urls.as_ref().map_or(&[], Vec::as_slice)
+        }
+
+        /// The Pkarr server this host publishes to, when one is selected.
+        #[must_use]
+        pub fn pkarr_publisher_url(&self) -> Option<&str> {
+            self.pkarr_publisher_url.as_ref().map(String::as_str)
+        }
+
+        /// The Pkarr server this host resolves from, when one is selected.
+        #[must_use]
+        pub fn pkarr_resolver_url(&self) -> Option<&str> {
+            self.pkarr_resolver_url.as_ref().map(String::as_str)
+        }
+
+        /// The DNS origin this host resolves from, when one is selected.
+        #[must_use]
+        pub fn dns_origin(&self) -> Option<&str> {
+            self.dns_origin.as_ref().map(String::as_str)
+        }
+
+        /// The certificate files trusted for a relay's HTTPS beside the public anchors.
+        #[must_use]
+        pub fn relay_trust_anchors(&self) -> &[String] {
+            self.relay_trust_anchors.as_ref().map_or(&[], Vec::as_slice)
+        }
+
+        /// Whether every packet goes through the relay.
+        #[must_use]
+        pub fn relay_only(&self) -> bool {
+            self.relay_only.0.unwrap_or(false)
+        }
+
+        /// Whether local network discovery is selected.
+        #[must_use]
+        pub fn local_discovery(&self) -> bool {
+            self.local_discovery.0.unwrap_or(false)
+        }
+
+        /// Whether the public Mainline DHT is selected.
+        #[must_use]
+        pub fn mainline_dht(&self) -> bool {
+            self.mainline_dht.0.unwrap_or(false)
+        }
+    }
+
+    /// The managed voice broker this host names to its paired devices.
+    ///
+    /// A provider origin, so it is this document's to choose and no inherited variable's. The
+    /// daemon reads it when it starts its voice service, so a change applies at the next start.
+    /// Absent means this host brokers no managed call, which is a complete host: a person's own
+    /// provider and the agent already running in a session both still work.
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields, default)]
+    pub struct VoiceSelection {
+        /// The broker's origin: an absolute `https` or `http` address in lower case, with no path,
+        /// no trailing slash and no port its scheme already implies.
+        pub broker_origin: Nullable<String>,
+    }
+
+    impl VoiceSelection {
+        /// The broker's origin, when one is chosen.
+        #[must_use]
+        pub fn broker_origin(&self) -> Option<&str> {
+            self.broker_origin.as_ref().map(String::as_str)
+        }
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1990,11 +2142,117 @@ pub mod configuration {
                 }
             }
         }
+        problems.extend(network_problems(&document.network));
+        if let Some(origin) = document.voice.broker_origin()
+            && !is_broker_origin(origin)
+        {
+            problems.push(
+                Sentence::new()
+                    .stated("voice.broker_origin (")
+                    .withheld(super::export::ContentClass::Location, origin)
+                    .stated(
+                        ") is not an absolute https or http origin in lower case, with no path, \
+                         no trailing slash and no port its scheme implies",
+                    ),
+            );
+        }
         if problems.is_empty() {
             Ok(())
         } else {
             Err(problems)
         }
+    }
+
+    /// Returns what is wrong with a network section, value by value.
+    ///
+    /// Each value is named by its key and its class, never repeated: a relay URL can carry a
+    /// credential in its user part as easily as any other address.
+    fn network_problems(network: &NetworkSelection) -> Vec<Sentence> {
+        use super::export::ContentClass::{Location, Path};
+
+        let mut problems = Vec::new();
+        if let Some(bind) = network.bind_address()
+            && bind.parse::<std::net::SocketAddr>().is_err()
+        {
+            problems.push(
+                Sentence::new()
+                    .stated("network.bind_address (")
+                    .withheld(Location, bind)
+                    .stated(") is not a socket address such as 0.0.0.0:4433"),
+            );
+        }
+        for (key, values) in [
+            ("network.relay_urls", network.relay_urls()),
+            ("network.relay_trust_anchors", network.relay_trust_anchors()),
+        ] {
+            if values.len() > MAX_NETWORK_ENTRIES {
+                problems.push(
+                    Sentence::new()
+                        .stated(key)
+                        .stated(" names ")
+                        .number(values.len() as u64)
+                        .stated(", and an invitation carries at most ")
+                        .number(MAX_NETWORK_ENTRIES as u64),
+                );
+            }
+        }
+        for relay in network.relay_urls() {
+            if !is_http_address(relay) {
+                problems.push(
+                    Sentence::new()
+                        .stated("a relay in network.relay_urls (")
+                        .withheld(Location, relay)
+                        .stated(") is not an absolute https or http URL of at most 253 characters"),
+                );
+            }
+        }
+        for (key, value) in [
+            (
+                "network.pkarr_publisher_url (",
+                network.pkarr_publisher_url(),
+            ),
+            ("network.pkarr_resolver_url (", network.pkarr_resolver_url()),
+        ] {
+            if let Some(value) = value
+                && !is_http_address(value)
+            {
+                problems.push(
+                    Sentence::new()
+                        .stated(key)
+                        .withheld(Location, value)
+                        .stated(") is not an absolute https or http URL of at most 253 characters"),
+                );
+            }
+        }
+        if let Some(origin) = network.dns_origin()
+            && !is_dns_origin(origin)
+        {
+            problems.push(
+                Sentence::new()
+                    .stated("network.dns_origin (")
+                    .withheld(Location, origin)
+                    .stated(") is not a dotted domain name with no scheme, port or path"),
+            );
+        }
+        for anchor in network.relay_trust_anchors() {
+            if !is_anchor_path(anchor) {
+                problems.push(
+                    Sentence::new()
+                        .stated("a certificate in network.relay_trust_anchors (")
+                        .withheld(Path, anchor)
+                        .stated(") is not named by an absolute path"),
+                );
+            }
+        }
+        // A selection the transport would build and nothing could use: no direct path and no
+        // relay leaves this host unreachable by every device it has paired.
+        if network.relay_only() && network.relay_urls().is_empty() {
+            problems.push(Sentence::new().stated(
+                "network.relay_only removes every direct path, and network.relay_urls selects no \
+                 relay to use instead",
+            ));
+        }
+        problems
     }
 
     /// One change to a configuration document.
@@ -2488,7 +2746,8 @@ pub mod configuration {
         ValueSource::Default,
     ];
 
-    /// Whether a new value applies at once or only to sessions created afterwards.
+    /// When a new value takes effect: at once, only for sessions created afterwards, or when the
+    /// host next starts.
     #[derive(
         Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
     )]
@@ -2499,6 +2758,9 @@ pub mod configuration {
         /// A running session keeps what it was created with; the new value applies to sessions
         /// created afterwards. Nothing migrates a worker.
         NewSessionsOnly,
+        /// The running host keeps what it started with; the new value applies when it next
+        /// starts. A network endpoint and the services it selects are built once, at startup.
+        NextStart,
     }
 
     impl ValueEffect {
@@ -2508,6 +2770,17 @@ pub mod configuration {
             match self {
                 Self::Immediately => "immediately",
                 Self::NewSessionsOnly => "new_sessions_only",
+                Self::NextStart => "next_start",
+            }
+        }
+
+        /// Returns when it applies, in the words `kr doctor` prints after "applies".
+        #[must_use]
+        pub const fn describe(self) -> &'static str {
+            match self {
+                Self::Immediately => "immediately",
+                Self::NewSessionsOnly => "to new sessions only",
+                Self::NextStart => "at the next start",
             }
         }
     }
@@ -2571,6 +2844,175 @@ pub mod configuration {
             .iter()
             .find(|preference| preference.key == key)
             .copied()
+    }
+
+    /// One selection this host reads when it starts, rather than a preference it resolves.
+    ///
+    /// A selection has two rungs: this document, and the product default of selecting nothing.
+    /// No request, profile or environment variable reaches one, which is section 26's rule for a
+    /// provider origin and a trust decision, and it is why these are not [`Preference`]s: an
+    /// [`ALLOWLIST`] entry has to name a preference, so none can name one of these.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Selection {
+        /// The key, as `kr doctor` prints it: the section, then the field.
+        pub key: &'static str,
+        /// What it selects, for the person reading the report.
+        pub about: &'static str,
+    }
+
+    impl Selection {
+        /// When a new value takes effect. The endpoint and the voice service are built once, when
+        /// the daemon starts.
+        pub const EFFECT: ValueEffect = ValueEffect::NextStart;
+    }
+
+    /// Whether this host joins the network.
+    pub const NETWORK_ENABLED: Selection = Selection {
+        key: "network.enabled",
+        about: "whether this host joins the network at all",
+    };
+
+    /// The address the network endpoint binds to.
+    pub const NETWORK_BIND_ADDRESS: Selection = Selection {
+        key: "network.bind_address",
+        about: "the socket address the network endpoint binds to; none binds an unspecified \
+                address and a free port",
+    };
+
+    /// The relay map.
+    pub const NETWORK_RELAY_URLS: Selection = Selection {
+        key: "network.relay_urls",
+        about: "the relay map, which is a provider origin",
+    };
+
+    /// The Pkarr server this host publishes to.
+    pub const NETWORK_PKARR_PUBLISHER_URL: Selection = Selection {
+        key: "network.pkarr_publisher_url",
+        about: "the discovery server this host publishes its signed record to",
+    };
+
+    /// The Pkarr server this host resolves from.
+    pub const NETWORK_PKARR_RESOLVER_URL: Selection = Selection {
+        key: "network.pkarr_resolver_url",
+        about: "the discovery server this host resolves peers from",
+    };
+
+    /// The DNS origin this host resolves from.
+    pub const NETWORK_DNS_ORIGIN: Selection = Selection {
+        key: "network.dns_origin",
+        about: "the DNS origin this host resolves peers from",
+    };
+
+    /// The extra trust anchors for a relay's HTTPS.
+    pub const NETWORK_RELAY_TRUST_ANCHORS: Selection = Selection {
+        key: "network.relay_trust_anchors",
+        about: "certificate files trusted for a relay's HTTPS beside the public anchors",
+    };
+
+    /// Whether every packet goes through the relay.
+    pub const NETWORK_RELAY_ONLY: Selection = Selection {
+        key: "network.relay_only",
+        about: "whether every packet goes through the relay, with no direct path",
+    };
+
+    /// Whether this host discovers peers on the local network.
+    pub const NETWORK_LOCAL_DISCOVERY: Selection = Selection {
+        key: "network.local_discovery",
+        about: "whether this host discovers peers on the local network",
+    };
+
+    /// Whether this host uses the public Mainline DHT.
+    pub const NETWORK_MAINLINE_DHT: Selection = Selection {
+        key: "network.mainline_dht",
+        about: "whether this host uses the public Mainline DHT for discovery",
+    };
+
+    /// The managed voice broker this host names to its devices.
+    pub const VOICE_BROKER_ORIGIN: Selection = Selection {
+        key: "voice.broker_origin",
+        about: "the managed voice broker this host names to its paired devices",
+    };
+
+    /// Every selection this host reads when it starts, in the order `kr doctor` prints them.
+    pub const SELECTIONS: [Selection; 11] = [
+        NETWORK_ENABLED,
+        NETWORK_BIND_ADDRESS,
+        NETWORK_RELAY_URLS,
+        NETWORK_PKARR_PUBLISHER_URL,
+        NETWORK_PKARR_RESOLVER_URL,
+        NETWORK_DNS_ORIGIN,
+        NETWORK_RELAY_TRUST_ANCHORS,
+        NETWORK_RELAY_ONLY,
+        NETWORK_LOCAL_DISCOVERY,
+        NETWORK_MAINLINE_DHT,
+        VOICE_BROKER_ORIGIN,
+    ];
+
+    /// The words a selection's value is reported in when it is not a location or a path: the two
+    /// a switch takes, and the one that says nothing is selected.
+    pub const SELECTION_WORDS: [&str; 3] = ["true", "false", "none"];
+
+    /// The most relay URLs, and the most trust anchors, one document may name.
+    ///
+    /// The pairing bound: every invitation this host issues carries its relay map, and an
+    /// invitation carries at most this many.
+    pub const MAX_NETWORK_ENTRIES: usize = crate::pairing::MAX_NETWORK_HINTS;
+
+    /// The longest trust-anchor path this schema records.
+    pub const MAX_PATH_LEN: usize = 4096;
+
+    /// Whether `value` fits a network hint: 1 to 253 bytes of printable ASCII and no spaces.
+    ///
+    /// The form an invitation carries a relay URL or a discovery origin in, so a document that
+    /// validates is one whose selections this host can hand to a device.
+    fn is_network_hint(value: &str) -> bool {
+        crate::pairing::NetworkHint::new(value).is_ok()
+    }
+
+    /// Whether `value` is an absolute `https` or `http` address with a host, in the form a
+    /// network hint travels in.
+    fn is_http_address(value: &str) -> bool {
+        is_network_hint(value)
+            && value
+                .strip_prefix("https://")
+                .or_else(|| value.strip_prefix("http://"))
+                .is_some_and(|rest| {
+                    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+                    !authority.is_empty() && !authority.contains('@') && !authority.starts_with(':')
+                })
+    }
+
+    /// Whether `value` is a DNS origin: a dotted domain name with no scheme, port or path.
+    ///
+    /// The transport's own rule, so a document that validates names an origin the endpoint
+    /// accepts.
+    fn is_dns_origin(value: &str) -> bool {
+        is_network_hint(value)
+            && !value.contains(['/', ':', '@', '?', '#', ' '])
+            && !value.split('.').any(str::is_empty)
+    }
+
+    /// Whether `value` is an origin a managed broker is addressed at: an absolute address in
+    /// lower case, with no path, no trailing slash and no port its scheme already implies.
+    ///
+    /// The broker compares origins by their spelling, so a second spelling of one address would
+    /// be a second service to it.
+    fn is_broker_origin(value: &str) -> bool {
+        is_http_address(value)
+            && value.split_once("://").is_some_and(|(scheme, authority)| {
+                !authority.contains(['/', '?', '#'])
+                    && !authority.bytes().any(|byte| byte.is_ascii_uppercase())
+                    && !(scheme == "https" && authority.ends_with(":443"))
+                    && !(scheme == "http" && authority.ends_with(":80"))
+            })
+    }
+
+    /// Whether `value` is a trust anchor's path: absolute, and bounded.
+    fn is_anchor_path(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= MAX_PATH_LEN
+            && !value.contains('\0')
+            && std::path::Path::new(value).is_absolute()
     }
 
     /// A value one rung offered, and what inside that rung produced it.
@@ -2695,6 +3137,112 @@ pub mod configuration {
         }
     }
 
+    /// The rows the selections contribute to the effective-value report, in [`SELECTIONS`] order.
+    ///
+    /// Each carries its value, where it came from and "at the next start" as its effect. The
+    /// source is the per-user host configuration where `document` wrote the field and the product
+    /// default where it did not, and presence decides it rather than comparison: a switch written
+    /// as off was still chosen by whoever wrote it. A document this host cannot use is `None`, and
+    /// every row is then the default. `origin` is where the document is.
+    #[must_use]
+    pub fn selection_rows(
+        document: Option<&ConfigurationDocument>,
+        origin: &str,
+    ) -> Vec<super::EffectiveValue> {
+        use super::export::Declared;
+
+        let empty = ConfigurationDocument::empty();
+        let document = document.unwrap_or(&empty);
+        let network = &document.network;
+        let row = |selection: Selection, chosen: bool, value: Declared| {
+            super::EffectiveValue::new(
+                selection.key,
+                selection.about,
+                &value,
+                if chosen {
+                    ValueSource::HostConfiguration
+                } else {
+                    ValueSource::Default
+                },
+                Nullable(chosen.then(|| origin.to_owned())),
+                Nullable::null(),
+                Selection::EFFECT,
+            )
+        };
+        let switch = |on: bool| Declared::term(if on { "true" } else { "false" });
+        let location =
+            |value: Option<&str>| value.map_or_else(|| Declared::term("none"), Declared::location);
+        let locations = |values: &[String]| {
+            if values.is_empty() {
+                Declared::term("none")
+            } else {
+                Declared::locations(values.iter().map(String::as_str))
+            }
+        };
+        let anchors = network.relay_trust_anchors();
+        vec![
+            row(
+                NETWORK_ENABLED,
+                network.enabled.is_present(),
+                switch(network.joins()),
+            ),
+            row(
+                NETWORK_BIND_ADDRESS,
+                network.bind_address.is_present(),
+                location(network.bind_address()),
+            ),
+            row(
+                NETWORK_RELAY_URLS,
+                network.relay_urls.is_present(),
+                locations(network.relay_urls()),
+            ),
+            row(
+                NETWORK_PKARR_PUBLISHER_URL,
+                network.pkarr_publisher_url.is_present(),
+                location(network.pkarr_publisher_url()),
+            ),
+            row(
+                NETWORK_PKARR_RESOLVER_URL,
+                network.pkarr_resolver_url.is_present(),
+                location(network.pkarr_resolver_url()),
+            ),
+            row(
+                NETWORK_DNS_ORIGIN,
+                network.dns_origin.is_present(),
+                location(network.dns_origin()),
+            ),
+            row(
+                NETWORK_RELAY_TRUST_ANCHORS,
+                network.relay_trust_anchors.is_present(),
+                if anchors.is_empty() {
+                    Declared::term("none")
+                } else {
+                    Declared::paths(anchors.iter().map(String::as_str))
+                },
+            ),
+            row(
+                NETWORK_RELAY_ONLY,
+                network.relay_only.is_present(),
+                switch(network.relay_only()),
+            ),
+            row(
+                NETWORK_LOCAL_DISCOVERY,
+                network.local_discovery.is_present(),
+                switch(network.local_discovery()),
+            ),
+            row(
+                NETWORK_MAINLINE_DHT,
+                network.mainline_dht.is_present(),
+                switch(network.mainline_dht()),
+            ),
+            row(
+                VOICE_BROKER_ORIGIN,
+                document.voice.broker_origin.is_present(),
+                location(document.voice.broker_origin()),
+            ),
+        ]
+    }
+
     // ---------------------------------------------------------------------------------------
     // The environment
     // ---------------------------------------------------------------------------------------
@@ -2741,9 +3289,6 @@ pub mod configuration {
         pub variable: &'static str,
         /// What it selects.
         pub selects: &'static str,
-        /// True when what it selects is authority or a provider origin, which section 26 says no
-        /// inherited variable may reach.
-        pub reaches_authority: bool,
     }
 
     /// The variables this build still reads that are not part of the precedence.
@@ -2754,124 +3299,64 @@ pub mod configuration {
     /// exceptions to it are written down: `kr doctor` prints this list, so what a person is told
     /// about this host matches what this host actually does.
     ///
-    /// Three kinds are here. The platform directory variables are how the operating system itself
-    /// names its conventional locations, and reading them is what "native OS-appropriate
-    /// locations" means rather than an exception to it. The session variables are how the
-    /// platform describes the login this host is running in, which is a reading of the
-    /// environment rather than a choice about it. The network selections are the ones that do
-    /// reach a provider origin; they belong in the configuration document, and until they are
-    /// there this host says so out loud. No variable names this host's owner: the owner is recorded
-    /// through local IPC, by the pairing that establishes it.
+    /// Two kinds are here, and neither reaches authority or a provider origin. The platform
+    /// directory variables are how the operating system itself names its conventional locations,
+    /// and reading them is what "native OS-appropriate locations" means rather than an exception
+    /// to it. The session variables are how the platform describes the login this host is running
+    /// in, which is a reading of the environment rather than a choice about it. Every network
+    /// selection and the voice broker's origin are this host's configuration document's
+    /// ([`NetworkSelection`], [`VoiceSelection`]), and nothing reads them from the environment. No
+    /// variable names this host's owner: the owner is recorded through local IPC, by the pairing
+    /// that establishes it.
     ///
-    /// The list names what this build reads that decides something: a location, the login this
-    /// host describes, or a network selection. It is not an inventory of every variable a process
-    /// in this tree ever looks at, and it does not claim to be one. A name that is in neither this
-    /// table nor [`ALLOWLIST`] takes no part in the precedence.
-    pub const UNGOVERNED: [UngovernedVariable; 21] = [
+    /// The list names what this build reads that decides something: a location or the login this
+    /// host describes. It is not an inventory of every variable a process in this tree ever looks
+    /// at, and it does not claim to be one. A name that is in neither this table nor
+    /// [`ALLOWLIST`] takes no part in the precedence.
+    pub const UNGOVERNED: [UngovernedVariable; 11] = [
         UngovernedVariable {
             variable: "TMPDIR",
             selects: "the platform's per-user temporary directory, which is the macOS runtime root",
-            reaches_authority: false,
         },
         UngovernedVariable {
             variable: "XDG_RUNTIME_DIR",
             selects: "the platform's per-user runtime directory on Linux",
-            reaches_authority: false,
         },
         UngovernedVariable {
             variable: "XDG_STATE_HOME",
             selects: "the platform's per-user state directory on Linux",
-            reaches_authority: false,
         },
         UngovernedVariable {
             variable: "XDG_CONFIG_HOME",
             selects: "the platform's per-user configuration directory on Linux",
-            reaches_authority: false,
         },
         UngovernedVariable {
             variable: "HOME",
             selects: "the account's home directory, from which every default root is derived",
-            reaches_authority: false,
         },
         UngovernedVariable {
             variable: "PATH",
             selects: "where a capability probe looks for the tools it reports on",
-            reaches_authority: false,
         },
         UngovernedVariable {
             variable: "DISPLAY",
             selects: "the X display a desktop reading describes",
-            reaches_authority: false,
         },
         UngovernedVariable {
             variable: "XAUTHORITY",
             selects: "the X authority file a desktop reading describes",
-            reaches_authority: false,
         },
         UngovernedVariable {
             variable: "XDG_SESSION_ID",
             selects: "the login session a desktop reading describes on Linux",
-            reaches_authority: false,
         },
         UngovernedVariable {
             variable: "SESSIONNAME",
             selects: "the login session a desktop reading describes on Windows",
-            reaches_authority: false,
         },
         UngovernedVariable {
             variable: "LOCALAPPDATA",
             selects: "the account's local application data directory on Windows",
-            reaches_authority: false,
-        },
-        UngovernedVariable {
-            variable: "KR_NETWORK",
-            selects: "whether this daemon puts itself on the network at all",
-            reaches_authority: false,
-        },
-        UngovernedVariable {
-            variable: "KR_NETWORK_BIND",
-            selects: "the address the network endpoint binds to",
-            reaches_authority: false,
-        },
-        UngovernedVariable {
-            variable: "KR_NETWORK_RELAYS",
-            selects: "the relay map, which is a provider origin",
-            reaches_authority: true,
-        },
-        UngovernedVariable {
-            variable: "KR_NETWORK_PKARR_PUBLISHER",
-            selects: "the discovery server this host publishes to, which is a provider origin",
-            reaches_authority: true,
-        },
-        UngovernedVariable {
-            variable: "KR_NETWORK_PKARR_RESOLVER",
-            selects: "the discovery server this host resolves from, which is a provider origin",
-            reaches_authority: true,
-        },
-        UngovernedVariable {
-            variable: "KR_NETWORK_DNS_ORIGIN",
-            selects: "the DNS origin peers are resolved from, which is a provider origin",
-            reaches_authority: true,
-        },
-        UngovernedVariable {
-            variable: "KR_NETWORK_RELAY_CA",
-            selects: "extra certificates trusted for a relay's HTTPS, which is a trust decision",
-            reaches_authority: true,
-        },
-        UngovernedVariable {
-            variable: "KR_NETWORK_RELAY_ONLY",
-            selects: "whether every packet goes through the relay",
-            reaches_authority: false,
-        },
-        UngovernedVariable {
-            variable: "KR_NETWORK_LOCAL_DISCOVERY",
-            selects: "whether this host discovers peers on the local network",
-            reaches_authority: false,
-        },
-        UngovernedVariable {
-            variable: "KR_NETWORK_MAINLINE",
-            selects: "whether this host uses the public distributed hash table for discovery",
-            reaches_authority: false,
         },
     ];
 
@@ -2901,13 +3386,16 @@ pub mod configuration {
     ///
     /// The allowlist a sentence checks a runtime string against before printing it. Every entry
     /// comes from a table this module or the protocol already owns: the preference keys, the
-    /// ceiling keys, the enrolment budgets, the documented environment variables, the variables
-    /// this build reads outside the precedence, and the wire words of the closed enumerations a
-    /// report names. A string that is none of them is something somebody else wrote, and a
-    /// sentence carries its class and its length instead.
+    /// selection keys and the words their values are reported in, the ceiling keys, the enrolment
+    /// budgets, the documented environment variables, the variables this build reads outside the
+    /// precedence, and the wire words of the closed enumerations a report names. A string that is
+    /// none of them is something somebody else wrote, and a sentence carries its class and its
+    /// length instead.
     #[must_use]
     pub fn is_known_term(value: &str) -> bool {
         PREFERENCES.iter().any(|preference| preference.key == value)
+            || SELECTIONS.iter().any(|selection| selection.key == value)
+            || SELECTION_WORDS.contains(&value)
             || CEILINGS.contains(&value)
             || BUDGETS.contains(&value)
             || ALLOWLIST
@@ -2944,7 +3432,7 @@ pub mod configuration {
     /// Each one is the `as_str` of an enumeration in this crate. They are listed rather than
     /// derived because a `const` cannot call those methods, and a test asserts the list is exactly
     /// what those methods return.
-    pub const WIRE_WORDS: [&str; 17] = [
+    pub const WIRE_WORDS: [&str; 18] = [
         "ok",
         "warning",
         "failed",
@@ -2960,6 +3448,7 @@ pub mod configuration {
         "default",
         "immediately",
         "new_sessions_only",
+        "next_start",
         "desktop_bound",
         "headless_user",
     ];
@@ -3822,6 +4311,34 @@ pub mod export {
             Self {
                 class: ContentClass::Path,
                 value: value.display().to_string(),
+            }
+        }
+
+        /// Several filesystem paths as one value, in the order given, wherever they came from.
+        #[must_use]
+        pub fn paths<'a>(values: impl IntoIterator<Item = &'a str>) -> Self {
+            Self {
+                class: ContentClass::Path,
+                value: values.into_iter().collect::<Vec<_>>().join(", "),
+            }
+        }
+
+        /// A network location - a URL, an origin, a domain name or a socket address - wherever it
+        /// came from.
+        #[must_use]
+        pub fn location(value: &str) -> Self {
+            Self {
+                class: ContentClass::Location,
+                value: value.to_owned(),
+            }
+        }
+
+        /// Several network locations as one value, in the order given, wherever they came from.
+        #[must_use]
+        pub fn locations<'a>(values: impl IntoIterator<Item = &'a str>) -> Self {
+            Self {
+                class: ContentClass::Location,
+                value: values.into_iter().collect::<Vec<_>>().join(", "),
             }
         }
 
@@ -5625,7 +6142,9 @@ mod tests {
         assert!(configuration::still_current(&prepared, &absent).is_ok());
     }
 
-    /// KR-REQ-26.14: what this build reads outside the precedence is written down, not implied.
+    /// KR-REQ-26.14: what this build reads outside the precedence is written down, not implied,
+    /// and it is the platform's own naming of its locations and its login: a variable of this
+    /// product's own either takes part in the precedence or is not read at all.
     #[test]
     fn every_variable_this_build_reads_outside_the_precedence_is_named() {
         for entry in &configuration::UNGOVERNED {
@@ -5639,15 +6158,10 @@ mod tests {
                 "{} cannot be both governed and ungoverned",
                 entry.variable
             );
-        }
-        for reaching in ["KR_NETWORK_RELAYS", "KR_NETWORK_RELAY_CA"] {
-            let entry = configuration::UNGOVERNED
-                .iter()
-                .find(|entry| entry.variable == reaching)
-                .unwrap_or_else(|| panic!("{reaching} is recorded"));
             assert!(
-                entry.reaches_authority,
-                "{reaching} reaches authority or a provider origin and says so"
+                !entry.variable.starts_with("KR_"),
+                "{} is this product's own variable, read outside the precedence",
+                entry.variable
             );
         }
         // KR-REQ-10.04: a host's owner is recorded through local IPC and nothing names it from
@@ -5658,6 +6172,345 @@ mod tests {
                 .all(|entry| !entry.variable.contains("OWNER")),
             "no variable names this host's owner"
         );
+    }
+
+    /// The variables that used to select this host's network and its voice broker.
+    const FORMER_SELECTION_VARIABLES: [&str; 11] = [
+        "KR_NETWORK",
+        "KR_NETWORK_BIND",
+        "KR_NETWORK_RELAYS",
+        "KR_NETWORK_PKARR_PUBLISHER",
+        "KR_NETWORK_PKARR_RESOLVER",
+        "KR_NETWORK_DNS_ORIGIN",
+        "KR_NETWORK_RELAY_CA",
+        "KR_NETWORK_RELAY_ONLY",
+        "KR_NETWORK_LOCAL_DISCOVERY",
+        "KR_NETWORK_MAINLINE",
+        "KR_VOICE_BROKER_ORIGIN",
+    ];
+
+    /// KR-REQ-26.14: a network selection and the voice broker's origin are this document's, and
+    /// no environment variable is recorded as selecting one.
+    ///
+    /// Neither table names any of the variables that used to select them, and no allowlist entry
+    /// can name a selection: an entry has to name a preference, and a selection is not one.
+    #[test]
+    fn no_inherited_variable_selects_the_network_or_the_voice_broker() {
+        for variable in FORMER_SELECTION_VARIABLES {
+            assert!(
+                configuration::allowlisted(variable).is_none(),
+                "{variable} is not an override"
+            );
+            assert!(
+                configuration::UNGOVERNED
+                    .iter()
+                    .all(|entry| entry.variable != variable),
+                "{variable} is not something this build reads"
+            );
+        }
+        for selection in &configuration::SELECTIONS {
+            assert!(
+                configuration::preference(selection.key).is_none(),
+                "{} is a selection, so no allowlist entry can supply it",
+                selection.key
+            );
+            assert!(
+                configuration::ALLOWLIST
+                    .iter()
+                    .all(|entry| entry.preference != selection.key),
+                "{} is reached by an environment variable",
+                selection.key
+            );
+        }
+    }
+
+    /// KR-REQ-26.14: the network section and the voice broker's origin are validated with the
+    /// rest of the document, each value is named by its key and its class rather than repeated,
+    /// and an edit to any section of a document that does not validate writes nothing.
+    #[test]
+    fn a_network_selection_is_validated_with_the_document_it_is_in() {
+        let mut document = ConfigurationDocument::empty();
+        document.network = configuration::NetworkSelection {
+            enabled: Nullable::some(true),
+            bind_address: Nullable::some("127.0.0.1:4433".to_owned()),
+            relay_urls: Nullable::some(vec!["https://relay.example.com".to_owned()]),
+            pkarr_publisher_url: Nullable::some("https://discovery.example.com/pkarr".to_owned()),
+            pkarr_resolver_url: Nullable::some("http://127.0.0.1:8080/pkarr".to_owned()),
+            dns_origin: Nullable::some("discovery.example.com".to_owned()),
+            relay_trust_anchors: Nullable::some(vec!["/etc/kalareach/relay-ca.der".to_owned()]),
+            relay_only: Nullable::some(true),
+            local_discovery: Nullable::some(false),
+            mainline_dht: Nullable::some(false),
+        };
+        document.voice.broker_origin = Nullable::some("https://voice.example.com".to_owned());
+        configuration::validate(&document).expect("a complete selection");
+        let written = configuration::contents(&document);
+        let loaded = configuration::load(Some(written.as_bytes()));
+        assert_eq!(loaded.status.state, DocumentState::Loaded);
+        assert_eq!(
+            loaded.document.as_ref(),
+            Some(&document),
+            "it reads back as written"
+        );
+
+        let secret = "hunter2";
+        for (broken, key) in [
+            (
+                configuration::NetworkSelection {
+                    bind_address: Nullable::some(format!("{secret}:4433")),
+                    ..configuration::NetworkSelection::default()
+                },
+                "network.bind_address",
+            ),
+            (
+                configuration::NetworkSelection {
+                    relay_urls: Nullable::some(vec![format!("ftp://{secret}@relay.example.com")]),
+                    ..configuration::NetworkSelection::default()
+                },
+                "network.relay_urls",
+            ),
+            (
+                configuration::NetworkSelection {
+                    relay_urls: Nullable::some(vec![format!("https://{secret}@relay.example.com")]),
+                    ..configuration::NetworkSelection::default()
+                },
+                "network.relay_urls",
+            ),
+            (
+                configuration::NetworkSelection {
+                    pkarr_publisher_url: Nullable::some(format!("{secret}.example.com/pkarr")),
+                    ..configuration::NetworkSelection::default()
+                },
+                "network.pkarr_publisher_url",
+            ),
+            (
+                configuration::NetworkSelection {
+                    pkarr_resolver_url: Nullable::some(format!("https:// {secret}")),
+                    ..configuration::NetworkSelection::default()
+                },
+                "network.pkarr_resolver_url",
+            ),
+            (
+                configuration::NetworkSelection {
+                    dns_origin: Nullable::some(format!("https://{secret}.example.com")),
+                    ..configuration::NetworkSelection::default()
+                },
+                "network.dns_origin",
+            ),
+            (
+                configuration::NetworkSelection {
+                    relay_trust_anchors: Nullable::some(vec![format!("{secret}/relay-ca.der")]),
+                    ..configuration::NetworkSelection::default()
+                },
+                "network.relay_trust_anchors",
+            ),
+            (
+                configuration::NetworkSelection {
+                    relay_urls: Nullable::some(vec![
+                        "https://relay.example.com".to_owned();
+                        configuration::MAX_NETWORK_ENTRIES + 1
+                    ]),
+                    ..configuration::NetworkSelection::default()
+                },
+                "network.relay_urls",
+            ),
+            (
+                configuration::NetworkSelection {
+                    relay_only: Nullable::some(true),
+                    ..configuration::NetworkSelection::default()
+                },
+                "network.relay_only",
+            ),
+        ] {
+            let mut document = ConfigurationDocument::empty();
+            document.network = broken;
+            let problems = configuration::validate(&document).expect_err("a value it refuses");
+            let said: Vec<&str> = problems.iter().map(export::Sentence::as_str).collect();
+            assert!(
+                said.iter().any(|problem| problem.contains(key)),
+                "{key} is named: {said:?}"
+            );
+            assert!(
+                said.iter().all(|problem| !problem.contains(secret)),
+                "and its value is not repeated: {said:?}"
+            );
+        }
+        for origin in [
+            "voice.example.com",
+            "https://voice.example.com/",
+            "https://voice.example.com/path",
+            "https://Voice.example.com",
+            "https://voice.example.com:443",
+            "http://voice.example.com:80",
+        ] {
+            let mut document = ConfigurationDocument::empty();
+            document.voice.broker_origin = Nullable::some(origin.to_owned());
+            let problems = configuration::validate(&document).expect_err("an origin it refuses");
+            assert!(
+                problems
+                    .iter()
+                    .any(|problem| problem.as_str().contains("voice.broker_origin")),
+                "{origin}: {problems:?}"
+            );
+        }
+
+        // A document whose network section does not validate is not this host's to rewrite, so an
+        // edit to any other section of it is refused rather than applied on top.
+        let invalid = br#"{"version": 1, "network": {"enabled": true, "bind_address": "nowhere"}}"#;
+        let loaded = configuration::load(Some(invalid));
+        assert_eq!(loaded.status.state, DocumentState::Invalid);
+        assert!(
+            loaded
+                .status
+                .detail
+                .as_str()
+                .contains("network.bind_address"),
+            "{:?}",
+            loaded.status
+        );
+        assert!(
+            configuration::edit(&loaded, &Change::SessionLimit(Some(4))).is_err(),
+            "and an edit writes nothing"
+        );
+    }
+
+    /// KR-REQ-26.14: each selection is reported with its value, its source and "at the next
+    /// start", and the source is what the document wrote rather than what the value looks like.
+    #[test]
+    fn a_selection_is_reported_from_the_document_it_was_written_in() {
+        let origin = "/home/someone/.config/kalareach/config.json";
+        let defaults = configuration::selection_rows(None, origin);
+        assert_eq!(
+            defaults
+                .iter()
+                .map(|row| row.key.as_str())
+                .collect::<Vec<_>>(),
+            configuration::SELECTIONS
+                .iter()
+                .map(|selection| selection.key)
+                .collect::<Vec<_>>()
+        );
+        for row in &defaults {
+            assert_eq!(row.source, ValueSource::Default, "{}", row.key);
+            assert_eq!(row.effect, configuration::ValueEffect::NextStart);
+            assert!(row.origin.0.is_none());
+            assert!(row.variable.0.is_none(), "no variable supplies a selection");
+        }
+        let enabled = |rows: &[EffectiveValue], key: &str| {
+            rows.iter()
+                .find(|row| row.key == key)
+                .map(|row| (row.value().to_owned(), row.source, row.class()))
+                .expect("the row")
+        };
+        assert_eq!(
+            enabled(&defaults, "network.enabled"),
+            (
+                "false".to_owned(),
+                ValueSource::Default,
+                export::ContentClass::Term
+            )
+        );
+
+        let mut document = ConfigurationDocument::empty();
+        document.network.enabled = Nullable::some(false);
+        document.network.relay_urls = Nullable::some(vec![
+            "https://a.example.com".to_owned(),
+            "https://b.example.com".to_owned(),
+        ]);
+        let rows = configuration::selection_rows(Some(&document), origin);
+        assert_eq!(
+            enabled(&rows, "network.enabled"),
+            (
+                "false".to_owned(),
+                ValueSource::HostConfiguration,
+                export::ContentClass::Term
+            ),
+            "a switch written off was chosen by whoever wrote it"
+        );
+        assert_eq!(
+            enabled(&rows, "network.relay_urls"),
+            (
+                "https://a.example.com, https://b.example.com".to_owned(),
+                ValueSource::HostConfiguration,
+                export::ContentClass::Location
+            )
+        );
+        assert_eq!(
+            enabled(&rows, "network.dns_origin"),
+            (
+                "none".to_owned(),
+                ValueSource::Default,
+                export::ContentClass::Term
+            )
+        );
+
+        // What leaves this host carries each location as its class and its length.
+        let mut effective = EffectiveConfiguration::unread();
+        effective.values = rows;
+        let exported = export::ForExport::for_export(effective);
+        let relays = exported
+            .get()
+            .values
+            .iter()
+            .find(|row| row.key == "network.relay_urls")
+            .expect("the row");
+        assert_eq!(relays.value(), "[location withheld, 44 bytes]");
+        assert!(
+            relays
+                .origin
+                .as_ref()
+                .is_some_and(|origin| origin.starts_with("[name withheld,")),
+            "{relays:?}"
+        );
+        let switch = exported
+            .get()
+            .values
+            .iter()
+            .find(|row| row.key == "network.enabled")
+            .expect("the row");
+        assert_eq!(
+            switch.value(),
+            "false",
+            "a switch is a word of this build's own"
+        );
+    }
+
+    /// The wire words a report names are exactly the ones the enumerations spell.
+    #[test]
+    fn the_wire_words_are_the_enumerations_own() {
+        let mut spelled: Vec<&str> = Vec::new();
+        spelled.extend(
+            [
+                DoctorStatus::Ok,
+                DoctorStatus::Warning,
+                DoctorStatus::Failed,
+                DoctorStatus::NotApplicable,
+            ]
+            .map(DoctorStatus::as_str),
+        );
+        spelled.extend(
+            [
+                DocumentState::Absent,
+                DocumentState::Loaded,
+                DocumentState::UnknownVersion,
+                DocumentState::Unreadable,
+                DocumentState::Invalid,
+            ]
+            .map(DocumentState::as_str),
+        );
+        spelled.extend(configuration::PRECEDENCE.map(ValueSource::as_str));
+        spelled.extend(
+            [
+                configuration::ValueEffect::Immediately,
+                configuration::ValueEffect::NewSessionsOnly,
+                configuration::ValueEffect::NextStart,
+            ]
+            .map(configuration::ValueEffect::as_str),
+        );
+        spelled.extend(
+            [WorkerProfile::DesktopBound, WorkerProfile::HeadlessUser].map(WorkerProfile::as_str),
+        );
+        assert_eq!(spelled, configuration::WIRE_WORDS);
     }
 
     /// KR-REQ-26.13: a document declaring a version this build does not know is left alone.

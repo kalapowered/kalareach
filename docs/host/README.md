@@ -82,7 +82,9 @@ configuration file this host reads.
     "grant_rights": null,
     "enrolment": { "retained_generations": 5 }
   },
-  "secrets": [{ "name": "relay", "store": "login_keychain", "item": "kalareach/relay" }]
+  "secrets": [{ "name": "relay", "store": "login_keychain", "item": "kalareach/relay" }],
+  "network": { "enabled": true, "relay_urls": ["https://relay.example.com"] },
+  "voice": { "broker_origin": "https://voice.example.com" }
 }
 ```
 
@@ -131,6 +133,60 @@ hearing the last answer comes back still owing it, announces the revision again 
 reconnects to, and keeps refusing to call the change complete. An effect that fails afterwards, a
 configuration document that later becomes unreadable, and a restart are none of them a worker
 answering, and none of them settles it.
+
+### The network and the voice broker
+
+Whether this host joins the network, and every service it uses there, is the document's `network`
+section. The managed voice broker it names to its paired devices is the `voice` section. Nothing
+else chooses either. No environment variable reaches them, so a daemon started with the variables
+an older build read joins nothing because of them.
+
+```json
+"network": {
+  "enabled": true,
+  "bind_address": "0.0.0.0:4433",
+  "relay_urls": ["https://relay.example.com"],
+  "pkarr_publisher_url": "https://discovery.example.com/pkarr",
+  "pkarr_resolver_url": "https://discovery.example.com/pkarr",
+  "dns_origin": "discovery.example.com",
+  "relay_trust_anchors": ["/etc/kalareach/relay-ca.der"],
+  "relay_only": false,
+  "local_discovery": false,
+  "mainline_dht": false
+},
+"voice": { "broker_origin": "https://voice.example.com" }
+```
+
+| Field | What it selects | What it accepts |
+| --- | --- | --- |
+| `network.enabled` | whether the daemon joins the network; without it the host serves its local endpoint alone | `true` or `false` |
+| `network.bind_address` | the socket address the endpoint binds to; absent binds an unspecified address and a free port | a socket address |
+| `network.relay_urls` | the relay map | at most 32 absolute `https` or `http` URLs |
+| `network.pkarr_publisher_url` | the discovery server this host publishes its signed record to | an absolute `https` or `http` URL |
+| `network.pkarr_resolver_url` | the discovery server this host resolves peers from | an absolute `https` or `http` URL |
+| `network.dns_origin` | the DNS origin this host resolves peers from | a dotted domain name with no scheme, port or path |
+| `network.relay_trust_anchors` | DER certificate files trusted for a relay's HTTPS, beside the public anchors | at most 32 absolute paths |
+| `network.relay_only` | every packet through the relay, and no direct path | `true` or `false`; `true` needs at least one relay |
+| `network.local_discovery` | discovery of peers on the local network | `true` or `false` |
+| `network.mainline_dht` | the public Mainline DHT, which carries no KalaReach service guarantee | `true` or `false` |
+| `voice.broker_origin` | the managed broker a device's voice session talks to | an absolute `https` or `http` origin in lower case, with no path and no port its scheme already implies |
+
+A field the document does not write selects nothing, because there is no public relay or discovery
+server to fall back on. The URLs and origins are also held to the 253 bytes of printable ASCII that
+an invitation carries them in. A value outside these rules makes the whole document invalid, as it
+would in any other section: the host keeps its product defaults, `kr doctor` names the key and
+withholds the value, and an edit to another section is refused until the document is fixed.
+
+The daemon reads both sections once, when it starts, because that is when its endpoint and its
+voice service are built. `kr doctor` prints each field with its value, its source
+(`host_configuration` where the document wrote it and `default` where it did not) and
+`applies at the next start`. The `configuration-network` check says what the running host started
+with: whether it joined, how many sockets its endpoint holds, how many relays and discovery services
+it selected, and whether it names a voice broker. When the document now selects something else,
+the check warns that the edit applies at the next start. A selection the daemon cannot use when it
+starts, such as a missing or empty trust anchor file, a relay URL the transport refuses or an
+address already in use, stops the start with the key named, rather than leaving a host that appears
+to run and cannot be reached.
 
 ### What leaves this host
 
@@ -267,20 +323,17 @@ No other inherited variable takes part in the precedence. No entry in that table
 organisation restriction, a grant ceiling, a hard resource limit or a provider origin, and none can:
 each entry has to name an ordinary preference, and those are not.
 
-Three other groups of variables this build reads are outside the precedence, and `kr doctor` lists
+Two other groups of variables this build reads are outside the precedence, and `kr doctor` lists
 all of them rather than leaving the sentence above to be read as more than it says.
 
 | Group | Variables | What they select |
 | --- | --- | --- |
 | platform locations | `TMPDIR`, `XDG_RUNTIME_DIR`, `XDG_STATE_HOME`, `XDG_CONFIG_HOME`, `HOME`, `LOCALAPPDATA` | the operating system's own conventional directories, which is what the native locations above are derived from |
 | session readings | `PATH`, `DISPLAY`, `XAUTHORITY`, `XDG_SESSION_ID`, `SESSIONNAME` | what the platform says about the login this host is running in and where a capability probe looks for the tools it reports on |
-| network selections | `KR_NETWORK`, `KR_NETWORK_BIND`, `KR_NETWORK_RELAYS`, `KR_NETWORK_PKARR_PUBLISHER`, `KR_NETWORK_PKARR_RESOLVER`, `KR_NETWORK_DNS_ORIGIN`, `KR_NETWORK_RELAY_CA`, `KR_NETWORK_RELAY_ONLY`, `KR_NETWORK_LOCAL_DISCOVERY`, `KR_NETWORK_MAINLINE` | whether and how this daemon joins a network |
 
-Five of the network selections reach a provider origin or a trust decision: `KR_NETWORK_RELAYS`,
-`KR_NETWORK_PKARR_PUBLISHER`, `KR_NETWORK_PKARR_RESOLVER`, `KR_NETWORK_DNS_ORIGIN` and
-`KR_NETWORK_RELAY_CA`. `kr doctor` warns whenever one of those is set on this host and names what
-it selects, because a provider origin belongs in this host's configuration rather than in the
-environment a process happened to inherit. No variable names this host's owner: the owner is
+Neither group reaches authority or a provider origin. No variable selects a network service or the
+voice broker: those are provider origins and a trust decision, and they are the configuration
+document's `network` and `voice` sections. No variable names this host's owner either: the owner is
 recorded through local IPC, by the pairing that establishes it (see "Pairing and the host's owner"
 below).
 
@@ -1379,12 +1432,14 @@ reports, because a lease running out is not a barrier holding and the two are re
 
 ## The network path
 
-The daemon joins the network once, at the end of its startup, when its environment selects one.
-`KR_NETWORK` turns it on and the variables in `crates/kr-controller/src/net/config.rs` select the
-relay map, the Pkarr publisher, the Pkarr resolver and the DNS origin, each on its own and none
-inherited. `KR_NETWORK_RELAY_ONLY` removes the direct paths altogether, for a deployment where one
-is not available or not wanted. A daemon that selects no network serves its local endpoint alone,
-which is a supported deployment rather than a degraded one, and pairs nothing.
+The daemon joins the network once, at the end of its startup, when the `network` section of its
+configuration document selects one; the section and its rules are under Configuration above.
+`network.enabled` turns it on, and the relay map, the Pkarr publisher, the Pkarr resolver and the
+DNS origin are each selected on their own, with nothing inherited from a public service or from
+the environment the daemon started in. `network.relay_only` removes the direct paths altogether,
+for a deployment where one is not available or not wanted. An edit to the section applies at the
+next start. A daemon that selects no network serves its local endpoint alone, which is a supported
+deployment rather than a degraded one, and pairs nothing.
 
 ### Pairing and the host's owner
 

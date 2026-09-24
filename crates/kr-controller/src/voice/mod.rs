@@ -39,13 +39,6 @@ pub use submit::{HostDispatch, ProposalSubmitter};
 
 use crate::error::{ControllerError, Result};
 
-/// The environment variable that names the managed voice broker's origin.
-///
-/// Absent means this host brokers no managed call. It is a complete host: a person's own provider
-/// credential and the agent already running in the session both still work, and `voice.start`
-/// says so rather than failing obscurely.
-pub const VOICE_BROKER_ORIGIN_VARIABLE: &str = "KR_VOICE_BROKER_ORIGIN";
-
 /// Who is asking, as this host resolved the actor.
 ///
 /// Section 23 gives four of the five voice methods `PairedDevice` ingress and gives `voice.grant`
@@ -79,6 +72,11 @@ pub struct VoiceModule {
 
 impl VoiceModule {
     /// Builds the service over this host's own stores and connections.
+    ///
+    /// `broker_origin` is the managed broker the configuration document's voice section names,
+    /// which a started session's descriptor tells the device, and empty where it names none. It
+    /// is a provider origin, so the daemon takes it from that document and never from the
+    /// environment it inherited.
     #[must_use]
     pub fn new(
         facts: Arc<dyn SessionFacts>,

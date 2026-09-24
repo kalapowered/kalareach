@@ -23,10 +23,11 @@ use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::WorkerIdentity;
 use kr_protocol::hello::PROTOCOL_VERSION;
+use kr_protocol::hostinfo::configuration::ConfigurationDocument;
 use kr_protocol::identity::{DesktopBinding, WorkerProfile};
 use kr_protocol::ids::{BuildId, ControllerGeneration, SessionEpoch, SessionId};
 use kr_protocol::local::LocalClientKind;
-use kr_protocol::scalars::TimestampMs;
+use kr_protocol::scalars::{Nullable, TimestampMs};
 use kr_protocol::session::{Dimensions, DisplayNumber, LaunchProfile, ShellMode};
 use kr_protocol::worker::WorkerDescriptor;
 use kr_worker::pty::ShellCommand;
@@ -76,14 +77,26 @@ impl Host {
             return None;
         };
         let temp = kr_ipc::testing::TempHost::create();
+        // The configuration document is what puts a host on the network: this one joins on
+        // loopback alone, and selects no relay and no discovery.
+        let mut document = ConfigurationDocument::empty();
+        document.revision = 1;
+        document.network.enabled = Nullable::some(true);
+        document.network.bind_address = Nullable::some("127.0.0.1:0".to_owned());
+        let path = kr_worker::config::document_path(&temp.environment());
+        std::fs::create_dir_all(path.parent().expect("the document has a directory"))
+            .expect("the state directory");
+        kr_ipc::paths::write_owner_only_file(
+            &path,
+            kr_protocol::hostinfo::configuration::contents(&document).as_bytes(),
+        )
+        .expect("the configuration document");
         let bin = temp.root().join("bin");
         std::fs::create_dir_all(&bin).expect("a directory for the executable");
         let controller = copy_into(&controller, &bin);
         let log = std::fs::File::create(temp.root().join("daemon.log")).expect("the daemon's log");
         let child = std::process::Command::new(&controller)
             .current_dir(temp.root())
-            .env("KR_NETWORK", "1")
-            .env("KR_NETWORK_BIND", "127.0.0.1:0")
             .arg("--runtime-dir")
             .arg(temp.root().join("r"))
             .arg("--state-dir")

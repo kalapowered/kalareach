@@ -324,7 +324,21 @@ fn the_effective_report_names_every_value_its_source_and_its_effect() {
     assert_eq!(report.status.state, DocumentState::Loaded);
     assert_eq!(report.precedence.len(), 4);
     assert_eq!(report.overrides.len(), 2);
-    assert_eq!(report.values.len(), 4, "two preferences and two locations");
+    assert_eq!(
+        report.values.len(),
+        4 + configuration::SELECTIONS.len(),
+        "two preferences, two locations and every selection read at the next start"
+    );
+    for (row, selection) in report.values[4..].iter().zip(configuration::SELECTIONS) {
+        assert_eq!(row.key, selection.key);
+        assert_eq!(row.effect, ValueEffect::NextStart);
+        assert_eq!(
+            row.source,
+            kr_protocol::hostinfo::configuration::ValueSource::Default,
+            "{} is not in this document",
+            row.key
+        );
+    }
 
     let power = report
         .values
@@ -857,5 +871,51 @@ fn each_enrolment_budget_keeps_whether_it_was_configured_or_defaulted() {
             .contains("configured here: metadata_bytes"),
         "{}",
         enrolment.value
+    );
+}
+
+/// KR-REQ-26.14: the network and the voice broker this host started with are what it reports as in
+/// force, and a document that now selects something else is reported as applying at the next start.
+#[test]
+fn the_network_check_says_what_this_host_started_with_and_what_waits_for_the_next_start() {
+    let mut document = ConfigurationDocument::empty();
+    document.network.enabled = Nullable::some(true);
+    document.network.relay_urls = Nullable::some(vec!["https://relay.example.com".to_owned()]);
+    document.network.dns_origin = Nullable::some("discovery.example.com".to_owned());
+    let started = Started::of(Some(&document));
+
+    let check = network_check(&started, Some(&document), 2);
+    assert_eq!(check.id(), "configuration-network");
+    assert_eq!(check.status, DoctorStatus::Ok, "{check:?}");
+    assert_eq!(
+        check.detail(),
+        "this host joined the network when it started: its endpoint holds 2 sockets, with 1 \
+         relays and 1 discovery services selected; it names no managed voice broker"
+    );
+
+    // The owner turns the network off in the document while the host runs.
+    let mut edited = document.clone();
+    edited.network.enabled = Nullable::some(false);
+    edited.voice.broker_origin = Nullable::some("https://voice.example.com".to_owned());
+    let check = network_check(&started, Some(&edited), 2);
+    assert_eq!(check.status, DoctorStatus::Warning);
+    assert!(
+        check.detail().ends_with("which applies at the next start"),
+        "{check:?}"
+    );
+    assert!(
+        check
+            .remedy()
+            .is_some_and(|remedy| remedy.contains("Restart"))
+    );
+
+    // A host that selected nothing says so, and a document it cannot use selects nothing too.
+    let quiet = network_check(&Started::default(), None, 0);
+    assert_eq!(quiet.status, DoctorStatus::Ok);
+    assert!(
+        quiet
+            .detail()
+            .starts_with("this host selected no network when it started"),
+        "{quiet:?}"
     );
 }

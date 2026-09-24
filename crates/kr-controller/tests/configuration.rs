@@ -3,7 +3,9 @@
 //! What these demonstrate. KR-REQ-26.13: `host.doctor` reports the schema version, the OS
 //! appropriate locations, the precedence order and each effective value with its source.
 //! KR-REQ-26.14: only the documented allowlist participates, at the position it declares, and an
-//! inherited variable outside it changes nothing. KR-REQ-26.15: the configured ceilings intersect
+//! inherited variable outside it changes nothing; the network and the voice broker are the
+//! document's selections, and a daemon started with every variable that used to select them
+//! selects nothing from them. KR-REQ-26.15: the configured ceilings intersect
 //! and a more permissive one is refused; a secret is a named reference and no value is exported.
 //! KR-REQ-26.16: an edit is validated before a revision is applied, and a change that affects
 //! authority advances the revision before the caller is told it is in force. KR-REQ-01.23: every
@@ -281,6 +283,278 @@ async fn only_the_documented_overrides_participate_and_they_say_where() {
 
     session.close();
     host.stop().await;
+}
+
+/// Every variable that used to select this host's network or its voice broker, with a value that
+/// would have changed what the daemon did had it been read.
+///
+/// The trust anchor names a file that does not exist, which a daemon still reading it would have
+/// refused to start over.
+#[cfg(unix)]
+const FORMER_SELECTIONS: [(&str, &str); 11] = [
+    ("KR_NETWORK", "1"),
+    ("KR_NETWORK_BIND", "127.0.0.1:0"),
+    ("KR_NETWORK_RELAYS", "https://relay.invalid"),
+    (
+        "KR_NETWORK_PKARR_PUBLISHER",
+        "https://discovery.invalid/pkarr",
+    ),
+    (
+        "KR_NETWORK_PKARR_RESOLVER",
+        "https://discovery.invalid/pkarr",
+    ),
+    ("KR_NETWORK_DNS_ORIGIN", "discovery.invalid"),
+    ("KR_NETWORK_RELAY_CA", "/nonexistent/relay-ca.der"),
+    ("KR_NETWORK_RELAY_ONLY", "1"),
+    ("KR_NETWORK_LOCAL_DISCOVERY", "1"),
+    ("KR_NETWORK_MAINLINE", "1"),
+    ("KR_VOICE_BROKER_ORIGIN", "https://voice.invalid"),
+];
+
+/// The daemon binary this test launches, and the process it becomes.
+#[cfg(unix)]
+struct Daemon(Option<std::process::Child>);
+
+#[cfg(unix)]
+impl Daemon {
+    /// Starts the daemon binary, copied to the internal disk, on `host`'s own directories, with
+    /// every former selection variable in its environment.
+    fn start(program: &std::path::Path, host: &kr_ipc::testing::TempHost) -> Self {
+        let home = host.root().join("home");
+        std::fs::create_dir_all(&home).expect("a home directory");
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(host.root().join("daemon.log"))
+            .expect("opens the daemon's log");
+        let mut command = std::process::Command::new(program);
+        command
+            .current_dir(host.root())
+            .env("HOME", &home)
+            .arg("--runtime-dir")
+            .arg(host.root().join("r"))
+            .arg("--state-dir")
+            .arg(host.root().join("s"))
+            .arg("--worker")
+            .arg(host.root().join("no-such-worker"))
+            .arg("--secret-store")
+            .arg("file")
+            .stdin(std::process::Stdio::null())
+            .stdout(log.try_clone().expect("duplicates the log"))
+            .stderr(log);
+        for (variable, value) in FORMER_SELECTIONS {
+            command.env(variable, value);
+        }
+        Self(Some(command.spawn().expect("the daemon starts")))
+    }
+
+    /// Ends the daemon and waits for it.
+    fn stop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Asks the daemon on `host` for its diagnostics on its own socket, once it answers.
+#[cfg(unix)]
+async fn diagnostics(host: &kr_ipc::testing::TempHost) -> HostDoctorResult {
+    let endpoint = host
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut client = loop {
+        if let Ok(client) = kr_ipc::client::LocalClient::connect(
+            &endpoint,
+            kr_protocol::local::LocalClientKind::Cli,
+            net_support::build(),
+        )
+        .await
+        {
+            break client;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon did not answer within two minutes; its log says: {}",
+            std::fs::read_to_string(host.root().join("daemon.log"))
+                .unwrap_or_else(|error| format!("<unreadable: {error}>"))
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    typed(
+        &client
+            .request(Method::HostDoctor, &())
+            .await
+            .expect("the call reaches the daemon")
+            .expect("host.doctor is served on the local socket"),
+    )
+}
+
+/// One selection's row: its value, its source and its effect.
+#[cfg(unix)]
+fn selection(result: &HostDoctorResult, key: &str) -> (String, ValueSource, ValueEffect) {
+    let row = result
+        .configuration
+        .values
+        .iter()
+        .find(|row| row.key == key)
+        .unwrap_or_else(|| panic!("{key} is reported"));
+    (row.value().to_owned(), row.source, row.effect)
+}
+
+/// KR-REQ-26.14: no inherited variable selects this host's network or its voice broker; the
+/// configuration document does, and what it selects is what is in force.
+///
+/// The real daemon binary, started with every variable that used to select them set in its
+/// environment. With no document it selects nothing: it does not join the network, it names no
+/// voice broker, and it does not even read the trust anchor file those variables name. With a
+/// document that selects a network and a broker, those are what it starts with, and each is
+/// reported with the document as its source and as applying at the next start.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_network_and_the_voice_broker_are_the_documents_and_no_variables() {
+    let host = kr_ipc::testing::TempHost::create();
+    let program = host.root().join("kr-controller");
+    kr_ipc::testing::place_program(
+        std::path::Path::new(env!("CARGO_BIN_EXE_kr-controller")),
+        &program,
+    );
+
+    let mut daemon = Daemon::start(&program, &host);
+    let result = diagnostics(&host).await;
+    for selection_key in kr_protocol::hostinfo::configuration::SELECTIONS
+        .iter()
+        .map(|selection| selection.key)
+    {
+        let (_, source, effect) = selection(&result, selection_key);
+        assert_eq!(source, ValueSource::Default, "{selection_key}");
+        assert_eq!(effect, ValueEffect::NextStart, "{selection_key}");
+    }
+    assert_eq!(
+        selection(&result, "network.enabled").0,
+        "false",
+        "KR_NETWORK=1 in the environment joins nothing"
+    );
+    assert_eq!(selection(&result, "network.relay_urls").0, "none");
+    assert_eq!(selection(&result, "voice.broker_origin").0, "none");
+    let network = result
+        .checks
+        .iter()
+        .find(|check| check.id() == "configuration-network")
+        .expect("the network check");
+    assert_eq!(
+        network.detail(),
+        "this host selected no network when it started, and serves its local endpoint alone; it \
+         names no managed voice broker",
+        "and what is in force is nothing"
+    );
+    let overrides = result
+        .checks
+        .iter()
+        .find(|check| check.id() == "configuration-overrides")
+        .expect("the overrides check");
+    for (variable, _) in FORMER_SELECTIONS {
+        assert!(
+            !overrides.detail().contains(variable),
+            "{variable} is not something this host reads: {}",
+            overrides.detail()
+        );
+    }
+    daemon.stop();
+
+    // The document selects a loopback endpoint and a broker. The same variables are still in the
+    // daemon's environment, and they still change nothing.
+    let environment = host.environment();
+    let mut document = ConfigurationDocument::empty();
+    document.revision = 1;
+    document.network.enabled = Nullable::some(true);
+    document.network.bind_address = Nullable::some("127.0.0.1:0".to_owned());
+    document.voice.broker_origin = Nullable::some("https://voice.example.com".to_owned());
+    write_document(&environment, &document);
+    let path = kr_worker::config::document_path(&environment)
+        .display()
+        .to_string();
+
+    let mut daemon = Daemon::start(&program, &host);
+    let result = diagnostics(&host).await;
+    for (key, value) in [
+        ("network.enabled", "true"),
+        ("network.bind_address", "127.0.0.1:0"),
+        ("voice.broker_origin", "https://voice.example.com"),
+    ] {
+        assert_eq!(
+            selection(&result, key),
+            (
+                value.to_owned(),
+                ValueSource::HostConfiguration,
+                ValueEffect::NextStart
+            ),
+            "{key}"
+        );
+        let row = result
+            .configuration
+            .values
+            .iter()
+            .find(|row| row.key == key)
+            .expect("the row");
+        assert_eq!(row.origin.0.as_deref(), Some(path.as_str()), "{key}");
+    }
+    for key in [
+        "network.relay_urls",
+        "network.pkarr_publisher_url",
+        "network.dns_origin",
+        "network.relay_trust_anchors",
+        "network.relay_only",
+    ] {
+        let (_, source, _) = selection(&result, key);
+        assert_eq!(
+            source,
+            ValueSource::Default,
+            "{key} is not in the document, whatever the environment says"
+        );
+    }
+    let network = result
+        .checks
+        .iter()
+        .find(|check| check.id() == "configuration-network")
+        .expect("the network check");
+    assert_eq!(
+        network.status,
+        kr_protocol::hostinfo::DoctorStatus::Ok,
+        "{network:?}"
+    );
+    assert!(
+        network
+            .detail()
+            .starts_with("this host joined the network when it started: its endpoint holds "),
+        "{network:?}"
+    );
+    assert!(
+        !network.detail().contains("holds 0 sockets"),
+        "the endpoint the document selected is bound: {network:?}"
+    );
+    assert!(
+        network
+            .detail()
+            .contains("with 0 relays and 0 discovery services selected"),
+        "and none of the relays or discovery services the environment named: {network:?}"
+    );
+    assert!(
+        network
+            .detail()
+            .ends_with("it names a managed voice broker to its paired devices"),
+        "{network:?}"
+    );
+    daemon.stop();
 }
 
 /// KR-REQ-26.15: a configured budget more permissive than section 11 allows never applies.
