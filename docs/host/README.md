@@ -3318,14 +3318,24 @@ notification-preview key, an expiry, and a collapse identifier that is a keyed d
 locked screen shows is one of six fixed sentences. There is no field for text a producer supplies.
 
 The daemon sends on its own. Its start path recovers what an earlier daemon left on the wire and
-takes back what is no longer authorised, then a pass runs every second. Every exchange goes through
-the managed transport of the origin it is for: the gateway a delivery credential names, or the
-address a webhook's owner configured.
+takes back what is no longer authorised, then a pass runs every second. Every HTTP exchange goes
+through the managed transport of the origin it is for: the gateway a delivery credential names, the
+address a webhook's owner configured, or Slack's, Discord's or Telegram's own. Mail goes to the
+submission server the owner's account names, over TLS the operating system's verifier checks.
 
 External destinations are different in the way that matters: their recipients can read what
 arrives, every message says so, and nothing in this host claims otherwise. A destination needs a
 configured address **and** an explicit rule or grant, and the content is intersected with the
 recipient's own authority rather than assumed from the address.
+
+A Slack, Discord, Telegram or email destination sends with a credential: a webhook address that is
+itself a bearer secret, a bot token, or a mail submission account. The owner hands it over with
+`delivery.destination.secret.set` on this host's own socket, never from a paired device, and the
+answer says who will be able to read what the destination delivers. The daemon keeps the credential
+in its secret store under the destination's identifier, beside its own keys and nowhere else: not in
+the delivery journal, an answer, a log or an error. The journal holds a random stamp in its place,
+so a credential replaced under a configured destination never carries a notification admitted
+under the old one, and removing the destination deletes the credential with it.
 
 Privacy mode fences the delivery outbox at once, takes back what was never dispatched, removes the
 queued content, and does not report complete while a send is still on the wire. Notifications that

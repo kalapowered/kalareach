@@ -135,15 +135,6 @@ External delivery runs on the host. Two things have to be true before any conten
 destination is configured, and an explicit rule or grant admits the content. They are separate
 facts, and writing down an address is not authority over session content.
 
-The host delivers to webhooks: a message is the composed document, sent as JSON to the address the
-owner configured, and a destination that deduplicates by a delivery identifier receives it under
-the header that destination names. A webhook's status code never counts as "already delivered": a
-2xx is delivered, a request for later is nothing taken, and any other refusal, a 409 included, is a
-refusal. A Slack, Discord, Telegram or email destination is refused when
-it is configured, with the reason. Each needs a credential from the host's secret store - a Slack or
-Discord webhook address is itself a bearer secret, Telegram sends through a bot token and email
-through a mail account - and a destination's address is never a credential.
-
 **Recipients of an external message can read it.** Encrypted KalaReach routing does not change that,
 and every message says so in its own text. The content is intersected with the recipient's own
 authority, which is the grant the destination's rule names, read from the host's grants and
@@ -156,10 +147,98 @@ decides which interval of history the grant reaches, and the producer checks tha
 session is one the grant covers. A line that fails either is left out, and the message says how
 many were left out and why.
 
+### Five kinds
+
+| Kind | What the host sends | Who can read it |
+| --- | --- | --- |
+| Webhook | The composed message as JSON, POSTed to the address the owner configured | Whoever runs the service at that address, and anyone that service passes it to |
+| Slack | The message as text, POSTed to the incoming webhook's address with Slack's formatting and link unfurling off | Everyone who can read the channel the webhook posts to, and Slack |
+| Discord | The message as text, POSTed to the webhook's address with `wait=true`, no mention allowed and link embeds suppressed | Everyone who can read the channel the webhook posts to, and Discord |
+| Telegram | `sendMessage` to the chat the destination names, as plain text with link previews off | Everyone in that chat, and Telegram |
+| Email | A plain-text message submitted over TLS under the owner's mail account, to the address the destination names | Everyone who can read that mailbox, and every mail server that carries the message |
+
+Whatever the kind, the message ends with the sentence that says anyone who can read its destination
+can read it, and configuring a Slack, Discord, Telegram or email destination's credential answers
+with the same fact in that kind's own words. Session text reaches a chat service as text and never
+as markup: Slack's `&`, `<` and `>` are escaped, Discord is told to ping nobody, and Telegram parses
+no entities, so a line of terminal output cannot mention a channel, notify everyone or turn into a
+link the service fetches. Discord takes 2,000 characters and Telegram 4,096, and a Slack message is
+held well inside Slack's own limit; a longer message keeps its opening, says it was shortened, and
+still ends with that sentence.
+
+A webhook's status code never counts as "already delivered": a 2xx is delivered, a request for later
+is nothing taken, and any other refusal, a 409 included, is a refusal. A webhook that deduplicates by
+a delivery identifier receives one, under the header it names. The chat services read the same way:
+a 2xx is delivered (for Telegram, a 2xx that says `"ok": true`), a 429 is nothing taken, any other
+4xx is a refusal, and a 5xx is an outcome nobody knows. The request's address can hold the
+credential, so a failure is recorded by what kind of failure it was and never with the transport's
+own message, which names the address.
+
+### Credentials
+
+A webhook's address is where it sends and nothing more. The other four send with a credential: a
+Slack or Discord webhook address is itself a bearer secret (whoever holds it can post to the channel
+it was made for), Telegram sends through a bot token, and email through a mail submission account. A
+destination's endpoint is never a credential. For those four it names the channel a webhook posts
+to, the Telegram chat (its number or a public chat's `@username`), or the email recipient.
+
+The owner hands a credential to the host with `delivery.destination.secret.set`, on the host's own
+local socket. A paired device cannot, whatever its grant, host management included: a credential
+decides who reads session content, so handing one over is the owner's act at the machine. The host
+checks that the credential has the shape its service issues (a Slack address on Slack's webhook
+host, a Discord address on Discord's, a Telegram token, a mail account with a server, a port and a
+plain sender address) and keeps it in its secret store under the destination's identifier: the
+platform's own credential store, or the owner-only directory where there is none. The answer names
+the destination, the kind, whether the credential is in force, and who can read what the
+destination delivers. Nothing ever answers with the credential. It is never written to the delivery
+journal, a log or an error, and a refusal of a malformed request says what shape was expected
+without repeating anything the request carried.
+
+A destination of one of those kinds is configured only once its credential is kept, and without a
+delivery identifier: none of the four services recognises a repeat by one. The journal records a
+random stamp in place of the credential, and the stamp is part of what binds a notification to its
+destination. Storing a new credential under a configured destination changes that binding, so a
+notification admitted while the old credential was in force is taken back at its claim rather than
+sent with the new one, which may reach somewhere else. A pass reads the credential as it sends and
+sends nothing when the credential it finds is not the one the destination was configured with.
+
+The credential goes with its destination. Removing a destination deletes the credential first; then,
+in one journal transaction, everything queued for the destination is taken back (revoked when
+nothing was dispatched, recorded as an outcome nobody can settle when an earlier attempt was), an
+attempt on the wire keeps its answer but can never be followed by another, and the record goes, or
+stays out of service as the name of what was already sent. Configuring a webhook or a paired device
+under an identifier deletes any credential kept there, so a destination configured under it later
+cannot pick up a credential nobody gave it.
+
+### Email
+
+Email goes over TLS and nothing else: implicit TLS for an account set to it (port 465), STARTTLS for
+one set to that (port 587). Over STARTTLS the host says `EHLO` and `STARTTLS` in the clear and
+nothing more. A server that does not offer STARTTLS is not sent to, and neither is one that sends
+anything between agreeing to TLS and starting it. The server's certificate is verified by the
+operating system's own verifier, the one the managed HTTPS transport uses, and nothing turns that
+off. The host signs in with AUTH PLAIN, or AUTH LOGIN where the server offers only that.
+
+The addresses and the subject are checked before they are written, and none may carry a line break,
+so nothing a destination or an event supplies can add a header or a mail command. The body is
+quoted-printable, every line ends in CR LF, and a line that begins with a dot is sent with a second
+one in front of it.
+
+What a server's answer means depends on when it came. Before the line that ends the message is
+written, nothing was sent: a 4xx is a request for later, and a 5xx, a server with no STARTTLS or a
+certificate that does not verify is an answer about the destination, so the attempt is abandoned
+rather than marked uncertain. Once that line is written, a 2xx is delivered, a 5xx is a refusal, and
+anything else, silence included, is an outcome nobody knows. A reply's own words are never written
+down, only its code and its enhanced status code, because a server's words can repeat what it was
+sent.
+
+### Retries and uncertainty
+
 Retry follows from the destination rather than from optimism. A destination that deduplicates by a
 delivery identifier the host chooses is presented again after an unknown outcome. One that does not
 is not: the record says the message may have arrived and may arrive twice if it is sent again, and a
-person is told that rather than a guess.
+person is told that rather than a guess. That is every Slack, Discord, Telegram and email
+destination, and a webhook configured without an identifier.
 
 ## Privacy mode
 
