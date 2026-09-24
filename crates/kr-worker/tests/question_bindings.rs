@@ -168,18 +168,17 @@ impl Attesting {
 }
 
 impl kr_worker::questions::AgentBindings for Attesting {
-    fn binding_of(
-        &self,
-        process: &ProcessStartIdentity,
-    ) -> Option<kr_worker::questions::AgentBinding> {
-        process
-            .matches(&self.agent)
-            .then(|| kr_worker::questions::AgentBinding {
+    fn binding_of(&self, process: &ProcessStartIdentity) -> kr_worker::questions::AgentPlacement {
+        if process.matches(&self.agent) {
+            kr_worker::questions::AgentPlacement::Bound(kr_worker::questions::AgentBinding {
                 application_instance_id: self.instance,
                 revision: Some(AgentBindingRevision::new(
                     *self.revision.lock().expect("the lock"),
                 )),
             })
+        } else {
+            kr_worker::questions::AgentPlacement::Unbound
+        }
     }
 
     fn current(
@@ -406,16 +405,26 @@ fn a_switch_an_attesting_bridge_detects_invalidates_the_questions_asked_under_th
 
 /// A helper that an agent the broker launched started is bound to the session through the broker,
 /// although the backend runs outside the terminal's boundary and the root shell's tree; without the
-/// broker's word it is refused as outside the session.
+/// broker's word it is refused as outside the session. Where the session's own boundary cannot be
+/// read, nothing establishes it outside, and the broker's word still binds it.
 #[test]
 fn a_helper_under_an_agent_the_broker_launched_is_bound_through_the_broker() {
     let broker = Broker::open(None, session()).expect("a broker");
     let instance = ApplicationInstanceId::new(Uuid::from_bytes([3; 16]));
     let me = this_process();
-    // A boundary that holds nothing, and a root shell that is nobody's ancestor.
+    // A boundary that holds nothing, read and found empty, and a root shell that is nobody's
+    // ancestor.
+    let group = tempfile::tempdir().expect("a control group directory");
+    std::fs::write(group.path().join("cgroup.procs"), "").expect("an empty membership list");
     let mut stranger = me.clone();
     stranger.start_value = kr_protocol::scalars::U64::new(stranger.start_value.get() ^ 0xFFFF);
     let boundary = SessionBoundary {
+        boundary: OwnershipBoundary::ControlGroup {
+            path: group.path().to_path_buf(),
+        },
+        root: stranger.clone(),
+    };
+    let unreadable = SessionBoundary {
         boundary: OwnershipBoundary::ControlGroup {
             path: std::path::PathBuf::from("/nonexistent/kalareach-test-group"),
         },
@@ -446,11 +455,20 @@ fn a_helper_under_an_agent_the_broker_launched_is_bound_through_the_broker() {
     .expect("admitted through the broker");
     assert!(!admitted.session_member);
     assert!(!admitted.ancestry);
-    assert_eq!(
-        kr_worker::questions::AgentBindings::binding_of(&broker, &admitted.process)
-            .map(|binding| binding.application_instance_id),
-        Some(instance)
-    );
+    assert!(matches!(
+        kr_worker::questions::AgentBindings::binding_of(&broker, &admitted.process),
+        kr_worker::questions::AgentPlacement::Bound(binding)
+            if binding.application_instance_id == instance
+    ));
+    // The session's own boundary unreadable: the broker's word binds it all the same.
+    kr_worker::questions::binding::verify(
+        Some(pid),
+        Some(&me),
+        connection,
+        Some(&unreadable),
+        Some(&broker),
+    )
+    .expect("admitted through the broker");
 
     let without = kr_worker::questions::binding::verify(
         Some(pid),
@@ -461,4 +479,14 @@ fn a_helper_under_an_agent_the_broker_launched_is_bound_through_the_broker() {
     )
     .expect_err("without the broker's word it is outside the session");
     assert_eq!(without.code(), ErrorCode::NotInKrSession);
+    // And without it where the boundary cannot be read, nothing establishes where it is.
+    let unknown = kr_worker::questions::binding::verify(
+        Some(pid),
+        Some(&me),
+        connection,
+        Some(&unreadable),
+        None,
+    )
+    .expect_err("nothing establishes where it is");
+    assert_eq!(unknown.code(), ErrorCode::ResourceUnavailable);
 }

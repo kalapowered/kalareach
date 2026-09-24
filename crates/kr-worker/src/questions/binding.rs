@@ -29,7 +29,8 @@
 //!
 //! The answer has three values, not two. A caller is inside when any check finds it there. It is
 //! outside, `NOT_IN_KR_SESSION`, only when membership and ancestry both read everything they
-//! needed and found it in neither, and the broker does not place it under an agent it launched. A reading that failed, or that changed while it was taken, establishes nothing, so
+//! needed and found it in neither, and the broker, walking the same chain to the agents it
+//! launched, establishes that it is under none of them. A reading that failed, or that changed while it was taken, establishes nothing, so
 //! a caller whose answer rests on one is neither: it is refused as
 //! [`QuestionError::Undetermined`]. Both refusals create nothing. They differ for a caller that has
 //! to refuse whatever it cannot establish, such as the guard in front of a host's first-owner
@@ -144,16 +145,29 @@ pub struct AgentBinding {
     pub revision: Option<AgentBindingRevision>,
 }
 
+/// Where a qualified bridge places one calling process.
+///
+/// Three answers, for the same reason the session's own checks give three: a bridge that could not
+/// read what it needed has established nothing, and a caller it may have placed under an agent is
+/// not taken for one outside the session on the strength of that.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentPlacement {
+    /// Under this bridged instance.
+    Bound(AgentBinding),
+    /// Under none of the instances the bridge describes.
+    Unbound,
+    /// Whether it is under one could not be established, for the reason given.
+    Undetermined(String),
+}
+
 /// What a qualified bridge says about the agents in this session.
 ///
 /// Implemented by the worker's broker. A ledger with none of these binds no question to an agent,
 /// which is the application-scoped case section 11 allows for a helper no bridge describes.
 pub trait AgentBindings: Send + Sync + std::fmt::Debug {
-    /// Returns the bridged instance a calling process belongs to, with the revision its request was
-    /// made under when the bridge can attest that.
-    ///
-    /// None when no bridged instance holds the process.
-    fn binding_of(&self, process: &ProcessStartIdentity) -> Option<AgentBinding>;
+    /// Returns where a calling process is: under a bridged instance, with the revision its request
+    /// was made under when the bridge can attest that; under none; or not established.
+    fn binding_of(&self, process: &ProcessStartIdentity) -> AgentPlacement;
 
     /// Returns the revision one instance's binding is at now, or None when the instance has ended.
     fn current(
@@ -238,13 +252,17 @@ fn bind(
         cfg!(windows) && matches!(session.boundary, OwnershipBoundary::JobObject { .. }),
     );
     // The broker places a process under an agent it launched, which runs outside the terminal and
-    // its process group. Its answer admits a caller and puts none outside, so it is asked only for
-    // a caller the two checks above do not place inside, and a caller it does not place is decided
-    // by them.
+    // its process group. It is asked only for a caller the two checks above do not place inside. Its
+    // placement admits the caller; its established "under none" leaves the two checks to decide;
+    // and a placement it could not establish establishes nothing, so a caller it may have placed is
+    // not taken for one outside the session.
     let decided = match checked {
         Finding::Inside => Finding::Inside,
-        _ if agents.is_some_and(|agents| agents.binding_of(&process).is_some()) => Finding::Inside,
-        other => other,
+        checked => match agents.map(|agents| agents.binding_of(&process)) {
+            Some(AgentPlacement::Bound(_)) => Finding::Inside,
+            None | Some(AgentPlacement::Unbound) => checked,
+            Some(AgentPlacement::Undetermined(why)) => checked.either(Finding::Undetermined(why)),
+        },
     };
     // Everything above read the operating system while this function ran, and the evidence is
     // only about the caller if the caller is still the caller, whichever way it points. Read once
@@ -508,6 +526,18 @@ enum Link {
     Parent(ProcessStartIdentity),
 }
 
+/// Where the parent chain from one process leads, among a set of processes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Ancestry {
+    /// The chain reaches the one at this index first: the process itself, or its nearest ancestor
+    /// among them.
+    Reaches(usize),
+    /// The chain ends without reaching any of them.
+    ReachesNone,
+    /// Where it leads could not be established, for the reason given.
+    Undetermined(String),
+}
+
 /// Returns whether the parent chain from this process reaches the session's root shell.
 ///
 /// Each link is checked by start identity, so a parent identifier that has been recycled since the
@@ -521,51 +551,111 @@ fn descends_from(
     from: &ProcessStartIdentity,
     root: &ProcessStartIdentity,
 ) -> Finding {
-    // A root shell that had ended before the kernel would describe it is nothing a running process
-    // can be found descending from.
-    if root.start_value.get() == kr_ipc::identity::START_VALUE_UNREAD {
-        return Finding::Outside;
+    match walk(table, from, std::slice::from_ref(root)) {
+        Ancestry::Reaches(_) => Finding::Inside,
+        Ancestry::ReachesNone => Finding::Outside,
+        Ancestry::Undetermined(why) => Finding::Undetermined(why),
     }
-    let root_pid = u32::try_from(root.pid.get()).unwrap_or(u32::MAX);
-    // When the root shell started, where the platform keeps a clock that never goes back and it
-    // can be read. A reading that fails establishes nothing, so the walk then does without it.
-    let root_started = table.monotonic_start(root).ok().flatten();
+}
+
+/// Returns where the parent chain from `from` leads among `candidates`: the nearest of them it
+/// reaches, none, or not established.
+///
+/// This is the walk the session's own ancestry check takes, over the processes the broker launched
+/// rather than the root shell alone, so a placement is established on the same terms: every link
+/// read from the kernel and checked, and a reading that failed or changed establishing nothing.
+pub(crate) fn nearest_of(
+    from: &ProcessStartIdentity,
+    candidates: &[ProcessStartIdentity],
+) -> Ancestry {
+    walk(&Kernel, from, candidates)
+}
+
+/// Walks the parent chain from `from` until it meets one of `candidates`.
+///
+/// Only a candidate itself completes the chain: another process holding a candidate's identifier
+/// is not it, and that candidate is not further up either, because two running processes never
+/// hold one identifier, so it has ended. The chain reaches none of them where it ends before
+/// meeting one: at the top, at a parent that has ended, at a process that started before every one
+/// of them, or once every candidate has been passed that way.
+fn walk(
+    table: &impl ProcessTable,
+    from: &ProcessStartIdentity,
+    candidates: &[ProcessStartIdentity],
+) -> Ancestry {
+    // A candidate that had ended before the kernel would describe it is nothing a running process
+    // can be found descending from.
+    let mut open: Vec<usize> = (0..candidates.len())
+        .filter(|&index| {
+            candidates[index].start_value.get() != kr_ipc::identity::START_VALUE_UNREAD
+        })
+        .collect();
+    if open.is_empty() {
+        return Ancestry::ReachesNone;
+    }
+    // When the earliest of them started, where the platform keeps a clock that never goes back and
+    // every one of them can be read on it. A reading that fails establishes nothing, so the walk
+    // then does without it.
+    let earliest = open
+        .iter()
+        .map(|&index| table.monotonic_start(&candidates[index]).ok().flatten())
+        .collect::<Option<Vec<u64>>>()
+        .and_then(|starts| starts.into_iter().min());
+    let first_process_is_candidate = open
+        .iter()
+        .any(|&index| is_first_process(pid_of(&candidates[index])));
     let mut current = from.clone();
     for _ in 0..MAX_ANCESTRY_DEPTH {
-        let current_pid = u32::try_from(current.pid.get()).unwrap_or(u32::MAX);
-        if current_pid == root_pid {
-            // Only the root shell itself completes the chain. Another process holding its
-            // identifier is not it, and the root shell is not further up: two running processes
-            // never hold one identifier.
-            return Finding::found(current.matches(root));
+        let current_pid = pid_of(&current);
+        if let Some(position) = open
+            .iter()
+            .position(|&index| pid_of(&candidates[index]) == current_pid)
+        {
+            let held = open[position];
+            if current.matches(&candidates[held]) {
+                return Ancestry::Reaches(held);
+            }
+            open.remove(position);
+            if open.is_empty() {
+                return Ancestry::ReachesNone;
+            }
         }
-        if current.source != root.source {
-            return Finding::Undetermined(format!(
-                "process {current_pid} and the root shell were read from different sources"
+        if let Some(&other) = open
+            .iter()
+            .find(|&&index| candidates[index].source != current.source)
+        {
+            return Ancestry::Undetermined(format!(
+                "process {current_pid} and process {} were read from different sources",
+                pid_of(&candidates[other])
             ));
         }
-        // A process that started before the root shell is not one of its descendants, and nor is
-        // anything further up, which started earlier still. Stopping here also means the walk
-        // never has to read the processes above this one, some of which the kernel may not
+        // A process that started before every candidate is not a descendant of any of them, and
+        // nor is anything further up, which started earlier still. Stopping here also means the
+        // walk never has to read the processes above this one, some of which the kernel may not
         // describe to this user at all.
-        if let Some(root_started) = root_started
+        if let Some(earliest) = earliest
             && let Ok(Some(started)) = table.monotonic_start(&current)
-            && started < root_started
+            && started < earliest
         {
-            return Finding::Outside;
+            return Ancestry::ReachesNone;
         }
-        let link = match read_link(table, &current, root_pid) {
+        let link = match read_link(table, &current, first_process_is_candidate) {
             Ok(link) => link,
-            Err(why) => return Finding::Undetermined(why),
+            Err(why) => return Ancestry::Undetermined(why),
         };
         match link {
-            Link::Top | Link::Ended => return Finding::Outside,
+            Link::Top | Link::Ended => return Ancestry::ReachesNone,
             Link::Parent(parent) => current = parent,
         }
     }
-    Finding::Undetermined(format!(
+    Ancestry::Undetermined(format!(
         "the chain of parents is longer than the {MAX_ANCESTRY_DEPTH} links that are followed"
     ))
+}
+
+/// Returns the process identifier an identity names, or one no process holds.
+fn pid_of(identity: &ProcessStartIdentity) -> u32 {
+    u32::try_from(identity.pid.get()).unwrap_or(u32::MAX)
 }
 
 /// Reads where one process's parent link leads, and checks that the reading is about that process
@@ -573,7 +663,7 @@ fn descends_from(
 fn read_link(
     table: &impl ProcessTable,
     current: &ProcessStartIdentity,
-    root_pid: u32,
+    first_process_is_candidate: bool,
 ) -> std::result::Result<Link, String> {
     let current_pid = u32::try_from(current.pid.get()).unwrap_or(u32::MAX);
     let parent_pid = table
@@ -584,7 +674,7 @@ fn read_link(
         Link::Top
     } else if parent_pid == current_pid {
         return Err(format!("process {current_pid} names itself as its parent"));
-    } else if is_first_process(parent_pid, root_pid) {
+    } else if is_first_process(parent_pid) && !first_process_is_candidate {
         Link::Top
     } else if !table.parent_follows_exit() {
         return Err(format!(
@@ -627,70 +717,16 @@ fn read_link(
     }
 }
 
-/// Returns the nearest of `candidates` that is `from` itself or one of its ancestors.
-///
-/// Every link is read from the kernel, and a candidate matches only by its full start identity, so
-/// an identifier recycled since the candidate's process started is not it. The answer is one of
-/// two: a candidate found, or none, whether because the chain ends without one or because a link
-/// could not be read. The broker places a caller under an agent with it, and a caller it does not
-/// place is decided by the session's own checks.
-pub(crate) fn nearest_of(
-    from: &ProcessStartIdentity,
-    candidates: &[ProcessStartIdentity],
-) -> Option<usize> {
-    let table = Kernel;
-    let mut current = from.clone();
-    for _ in 0..MAX_ANCESTRY_DEPTH {
-        if let Some(found) = candidates
-            .iter()
-            .position(|candidate| candidate.matches(&current))
-        {
-            return Some(found);
-        }
-        let current_pid = u32::try_from(current.pid.get()).unwrap_or(u32::MAX);
-        let parent_pid = table.placement(current_pid).ok()?.parent;
-        if parent_pid == 0 || parent_pid == current_pid {
-            return None;
-        }
-        let Reading::Found(parent) = table.identity(parent_pid) else {
-            return None;
-        };
-        // A parent starts before its child. Every source's start value increases with time within
-        // one boot, so a candidate parent that started later is an identifier the kernel has
-        // handed to something else since this child was created, and the chain stops there rather
-        // than climbing through a stranger.
-        if parent.source != current.source || parent.start_value.get() > current.start_value.get() {
-            return None;
-        }
-        // The child is read again, identity and parent together. If its identifier changed owners
-        // between the first read and this one, both parent readings describe the replacement's
-        // family rather than this one's, and the chain stops rather than climbing somebody else's.
-        let Reading::Found(again) = table.identity(current_pid) else {
-            return None;
-        };
-        if !again.matches(&current)
-            || table
-                .placement(current_pid)
-                .ok()
-                .map(|placed| placed.parent)
-                != Some(parent_pid)
-        {
-            return None;
-        }
-        current = parent;
-    }
-    None
-}
-
-/// Returns whether an identifier names the system's first process, where the root shell is not it.
+/// Returns whether an identifier names the system's first process, which ends a chain unread
+/// unless it is one of the processes the walk is looking for.
 #[cfg(unix)]
-const fn is_first_process(pid: u32, root_pid: u32) -> bool {
-    pid == FIRST_PROCESS && root_pid != FIRST_PROCESS
+const fn is_first_process(pid: u32) -> bool {
+    pid == FIRST_PROCESS
 }
 
 /// No identifier is special on this platform: its system processes describe themselves.
 #[cfg(not(unix))]
-const fn is_first_process(_pid: u32, _root_pid: u32) -> bool {
+const fn is_first_process(_pid: u32) -> bool {
     false
 }
 
@@ -1398,16 +1434,21 @@ mod tests {
         assert!(!error.to_string().contains("kr new --attach"), "{error}");
     }
 
-    /// A bridge that places every process under one agent it launched.
+    /// A bridge that places every process where it is told to.
     #[derive(Debug)]
-    struct Launched;
+    struct Bridge(AgentPlacement);
 
-    impl AgentBindings for Launched {
-        fn binding_of(&self, _process: &ProcessStartIdentity) -> Option<AgentBinding> {
-            Some(AgentBinding {
-                application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([7; 16])),
-                revision: None,
-            })
+    /// A bridge that places every process under one agent it launched.
+    fn launched() -> Bridge {
+        Bridge(AgentPlacement::Bound(AgentBinding {
+            application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([7; 16])),
+            revision: None,
+        }))
+    }
+
+    impl AgentBindings for Bridge {
+        fn binding_of(&self, _process: &ProcessStartIdentity) -> AgentPlacement {
+            self.0.clone()
         }
 
         fn current(
@@ -1427,7 +1468,7 @@ mod tests {
             Some(&identity(300, 30)),
             connection(),
             Some(&session(on_terminal(5))),
-            Some(&Launched),
+            Some(&launched()),
         )
         .expect("bound under the agent");
         assert!(!source.session_member && !source.ancestry);
@@ -1442,9 +1483,39 @@ mod tests {
             Some(&identity(300, 30)),
             connection(),
             Some(&unread),
-            Some(&Launched),
+            Some(&launched()),
         )
         .expect("bound under the agent");
+    }
+
+    #[test]
+    fn a_placement_the_broker_could_not_establish_puts_no_caller_outside() {
+        // Established outside by the session's own checks, and the broker could not read the chain
+        // to its agents: the caller may be under one, so it is not outside.
+        let error = bind(
+            &outsider(),
+            Some(300),
+            Some(&identity(300, 30)),
+            connection(),
+            Some(&session(on_terminal(5))),
+            Some(&Bridge(AgentPlacement::Undetermined(
+                "the parent of process 300 could not be read".to_owned(),
+            ))),
+        )
+        .expect_err("undetermined");
+        assert_eq!(error.code(), ErrorCode::ResourceUnavailable, "{error}");
+        assert!(error.to_string().contains("could not be read"), "{error}");
+        // The broker established that it is under none of its agents: it is outside.
+        let error = bind(
+            &outsider(),
+            Some(300),
+            Some(&identity(300, 30)),
+            connection(),
+            Some(&session(on_terminal(5))),
+            Some(&Bridge(AgentPlacement::Unbound)),
+        )
+        .expect_err("outside");
+        assert_eq!(error.code(), ErrorCode::NotInKrSession, "{error}");
     }
 
     #[test]
@@ -1821,14 +1892,62 @@ mod tests {
             .parent;
         let parent = kr_ipc::identity::process_start_identity(parent_pid).expect("its identity");
         // This process is its own nearest candidate, and its parent is found when it is not one.
-        assert_eq!(nearest_of(&mine, &[parent.clone(), mine.clone()]), Some(1));
-        assert_eq!(nearest_of(&mine, std::slice::from_ref(&parent)), Some(0));
+        assert_eq!(
+            nearest_of(&mine, &[parent.clone(), mine.clone()]),
+            Ancestry::Reaches(1)
+        );
+        assert_eq!(
+            nearest_of(&mine, std::slice::from_ref(&parent)),
+            Ancestry::Reaches(0)
+        );
         // The same identifiers with start values the kernel never reported are nobody's.
         let mut recycled = parent;
         recycled.start_value = kr_protocol::scalars::U64::new(recycled.start_value.get() ^ 0xFFFF);
         let mut stranger = mine.clone();
         stranger.start_value = kr_protocol::scalars::U64::new(stranger.start_value.get() ^ 0xFFFF);
-        assert_eq!(nearest_of(&mine, &[recycled, stranger]), None);
+        assert_eq!(
+            nearest_of(&mine, &[recycled, stranger]),
+            Ancestry::ReachesNone
+        );
+    }
+
+    #[test]
+    fn the_walk_reaches_the_nearest_of_several_processes() {
+        let table = Scripted::default()
+            .found(&identity(300, 30))
+            .placement(300, &[placed(250)])
+            .found(&identity(250, 25))
+            .placement(250, &[placed(200)])
+            .found(&identity(200, 20))
+            .placement(200, &[placed(100)])
+            .found(&root());
+        // Both are up the chain; the nearer one is the answer, whichever order they are named in.
+        assert_eq!(
+            walk(&table, &identity(300, 30), &[root(), identity(200, 20)]),
+            Ancestry::Reaches(1)
+        );
+        // One whose identifier the chain meets held by another process has ended, so the walk
+        // goes on to the other.
+        assert_eq!(
+            walk(&table, &identity(300, 30), &[identity(250, 99), root()]),
+            Ancestry::Reaches(1)
+        );
+        // None of them up the chain, which reaches the top.
+        let top = Scripted::default()
+            .found(&identity(300, 30))
+            .placement(300, &[placed(0)]);
+        assert_eq!(
+            walk(&top, &identity(300, 30), &[root(), identity(200, 20)]),
+            Ancestry::ReachesNone
+        );
+        // A link that cannot be read establishes nothing about any of them.
+        let unread = Scripted::default()
+            .found(&identity(300, 30))
+            .placement(300, &[Err("Operation not permitted".to_owned())]);
+        assert!(matches!(
+            walk(&unread, &identity(300, 30), &[root(), identity(200, 20)]),
+            Ancestry::Undetermined(why) if why.contains("Operation not permitted")
+        ));
     }
 
     #[test]

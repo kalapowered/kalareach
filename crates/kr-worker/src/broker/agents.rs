@@ -14,10 +14,12 @@ use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{AgentBindingRevision, ApplicationInstanceId};
 
 use crate::broker::Broker;
-use crate::questions::binding::{AgentBinding, AgentBindings, nearest_of};
+use crate::questions::binding::{
+    AgentBinding, AgentBindings, AgentPlacement, Ancestry, nearest_of,
+};
 
 impl AgentBindings for Broker {
-    fn binding_of(&self, process: &ProcessStartIdentity) -> Option<AgentBinding> {
+    fn binding_of(&self, process: &ProcessStartIdentity) -> AgentPlacement {
         // The launched processes are read under the lock and the walk happens after it is
         // released: the walk reads the process table, and nothing that holds the broker waits on
         // that. An instance that ends between the two is found ended by the next sweep.
@@ -37,12 +39,21 @@ impl AgentBindings for Broker {
             .iter()
             .map(|(_, identity)| identity.clone())
             .collect();
-        let nearest = nearest_of(process, &identities)?;
-        let (application_instance_id, _) = launched.get(nearest)?;
-        Some(AgentBinding {
-            application_instance_id: *application_instance_id,
-            revision: None,
-        })
+        // The walk answers three ways, and so does this: a chain that could not be read places
+        // the caller nowhere it can be taken to be, under an agent or outside every one.
+        match nearest_of(process, &identities) {
+            Ancestry::Reaches(nearest) => launched.get(nearest).map_or(
+                AgentPlacement::Unbound,
+                |(application_instance_id, _)| {
+                    AgentPlacement::Bound(AgentBinding {
+                        application_instance_id: *application_instance_id,
+                        revision: None,
+                    })
+                },
+            ),
+            Ancestry::ReachesNone => AgentPlacement::Unbound,
+            Ancestry::Undetermined(why) => AgentPlacement::Undetermined(why),
+        }
     }
 
     fn current(

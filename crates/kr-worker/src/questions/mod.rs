@@ -36,7 +36,9 @@ use kr_protocol::question::{
     QuestionResolveResult, QuestionState, bounded_expiry, build_choices, check_answer, check_text,
 };
 
-pub use crate::questions::binding::{AgentBinding, AgentBindings, SessionBoundary, VerifiedSource};
+pub use crate::questions::binding::{
+    AgentBinding, AgentBindings, AgentPlacement, SessionBoundary, VerifiedSource,
+};
 pub use crate::questions::error::{QuestionError, Result, SETUP_INSTRUCTION};
 pub use crate::questions::store::Now;
 
@@ -86,10 +88,16 @@ impl Questions {
     }
 
     /// Returns what the bridge says about the agent this source belongs to.
+    ///
+    /// A source the bridge places under none of its agents asks application-scoped questions, and
+    /// so does one whose placement it could not establish: section 11 records an agent binding
+    /// only where a bridge supplies one, and without it the question claims no binding at all.
+    /// The source is in the session either way; that was settled before this is asked.
     fn agent_of(&self, source: &VerifiedSource) -> Option<AgentBinding> {
-        self.agents
-            .as_ref()
-            .and_then(|agents| agents.binding_of(&source.process))
+        match self.agents.as_ref()?.binding_of(&source.process) {
+            AgentPlacement::Bound(binding) => Some(binding),
+            AgentPlacement::Unbound | AgentPlacement::Undetermined(_) => None,
+        }
     }
 
     /// Wakes every waiter when a sweep moved something, so a wait on an invalidated or expired
