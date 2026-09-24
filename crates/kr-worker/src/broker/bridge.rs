@@ -154,6 +154,15 @@ impl InstalledBridge {
 }
 
 /// A bridge this host admitted.
+///
+/// A hook is then served by [`NativeGateway::observe_hook`], which reads and applies its one
+/// observation. A channel's connection is handed to whatever serves the application's Channels
+/// traffic: its stream carries the application's own notifications as JSON lines, both ways, each
+/// within the gateway's native frame bound, in the connector's own shapes (`method` and `params`,
+/// correlated at `params.request_id`). Turning a relayed approval into a pending resource and an
+/// answer into a verdict is the arbitration's, not the stream's.
+///
+/// [`NativeGateway::observe_hook`]: crate::broker::attach::NativeGateway::observe_hook
 #[derive(Debug)]
 pub struct AdmittedBridge {
     /// Which registration it is.

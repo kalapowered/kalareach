@@ -52,12 +52,21 @@ while IFS= read -r request; do
 done
 "#;
 
+/// The stand-in application for a channel: the channel server runs as its child, on its standard
+/// streams, and the application ends with the server's exit code.
+const CHANNEL_APPLICATION: &str = r#"
+"$1" claude-code channel
+code=$?
+exit "$code"
+"#;
+
 /// One launch this host made of the stand-in application, with its bridge installed.
 pub struct Launch {
     pub broker: Arc<Broker>,
     pub gateway: NativeGateway,
     pub application: std::process::Child,
-    pub requests: std::process::ChildStdin,
+    /// The application's input, until a test closes it.
+    pub requests: Option<std::process::ChildStdin>,
     pub runtime: PathBuf,
     pub inbox: PathBuf,
     next: u32,
@@ -67,6 +76,21 @@ impl Launch {
     /// Launches the stand-in application, whose hooks run `hook_program`, against an
     /// installation of `installed`.
     pub fn start(placed: &Placed, hook_program: &Path, installed: InstalledBridge) -> Self {
+        Self::start_running(placed, APPLICATION, hook_program, installed)
+    }
+
+    /// Launches a stand-in application that starts `kr-hook claude-code channel` over its own
+    /// standard input and output, as Claude Code starts a channel server, and ends with its code.
+    pub fn channel(placed: &Placed, installed: InstalledBridge) -> Self {
+        Self::start_running(placed, CHANNEL_APPLICATION, &placed.forwarder, installed)
+    }
+
+    fn start_running(
+        placed: &Placed,
+        script: &str,
+        program: &Path,
+        installed: InstalledBridge,
+    ) -> Self {
         use std::os::unix::fs::PermissionsExt as _;
         let runtime = placed.host.root().join("l");
         let inbox = placed.host.root().join("h");
@@ -107,9 +131,9 @@ impl Launch {
             },
             arguments: vec![
                 "-c".to_owned(),
-                APPLICATION.to_owned(),
+                script.to_owned(),
                 "application".to_owned(),
-                hook_program.to_string_lossy().into_owned(),
+                program.to_string_lossy().into_owned(),
             ],
             authentication: AuthenticationState::Authenticated,
             mode: IntegrationMode::NativeBridge,
@@ -135,7 +159,7 @@ impl Launch {
             broker,
             gateway,
             application: launched.child,
-            requests,
+            requests: Some(requests),
             runtime,
             inbox,
             next: 0,
@@ -149,8 +173,12 @@ impl Launch {
         self.next += 1;
         let request = self.inbox.join(format!("r{}", self.next));
         std::fs::write(&request, payload).expect("the request is written");
-        writeln!(self.requests, "{}", request.display()).expect("the application is asked");
-        self.requests.flush().expect("and it goes");
+        let requests = self
+            .requests
+            .as_mut()
+            .expect("the application's input is open");
+        writeln!(requests, "{}", request.display()).expect("the application is asked");
+        requests.flush().expect("and it goes");
         request
     }
 
