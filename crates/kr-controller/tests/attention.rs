@@ -23,20 +23,22 @@ use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::attention::{
-    AttentionAcknowledgeParams, AttentionAcknowledgeResult, AttentionItem, AttentionItemRevision,
-    AttentionQuietHoursParams, AttentionQuietHoursResult, AttentionReadParams, AttentionReadResult,
-    AttentionRule, AttentionSource, LogViewState, QuietHours, ReviewAcknowledgeParams,
-    ReviewAcknowledgeResult, ReviewReadParams, ReviewReadResult, ReviewState, ReviewSubject,
-    VisitAcknowledgeParams, VisitAcknowledgeResult, VisitChangedParams, VisitChangedResult,
+    AttentionAcknowledgeParams, AttentionAcknowledgeResult, AttentionAutomationSubject,
+    AttentionGap, AttentionItem, AttentionItemRevision, AttentionLevel, AttentionQuietHoursParams,
+    AttentionQuietHoursResult, AttentionReadParams, AttentionReadResult, AttentionRule,
+    AttentionSource, LogViewState, QuietHours, ReviewAcknowledgeParams, ReviewAcknowledgeResult,
+    ReviewReadParams, ReviewReadResult, ReviewState, ReviewSubject, VisitAcknowledgeParams,
+    VisitAcknowledgeResult, VisitChangedParams, VisitChangedResult,
 };
+use kr_protocol::automation::WorkflowDefinition;
 use kr_protocol::envelope::{ActionTarget, ControlFrame, ParamsValue, Request};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::grant::SessionSelector;
 use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::identity::{DesktopBinding, WorkerProfile};
 use kr_protocol::ids::{
-    ActionId, ActorId, AgentTurnId, BuildId, ConnectionId, ControllerGeneration, RequestId,
-    SessionEpoch, SessionId,
+    ActionId, ActorId, AgentTurnId, BuildId, CausalRootId, ConnectionId, ControllerGeneration,
+    GrantId, RequestId, SessionEpoch, SessionId, WorkflowId, WorkflowRunId,
 };
 use kr_protocol::local::{ControllerConnectionRole, LocalClientKind};
 use kr_protocol::method::{Method, MethodGroup, MethodVersion, REGISTRY};
@@ -2878,4 +2880,801 @@ async fn text_held_across_enable_disable_and_enable_is_withheld() {
         "{:?}",
         read.items
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The workflow journal's alerts
+// ---------------------------------------------------------------------------------------------
+
+/// The limit each paused revision here is paused for.
+const BREACH: &str = "concurrency limit 4 exceeded";
+
+/// The workflow journal of a test environment, opened where the daemon keeps it, as a daemon opens
+/// it.
+fn workflow_journal(temp: &kr_ipc::testing::TempHost) -> Arc<kr_automation::WorkflowStore> {
+    let state = temp.environment().state_dir().to_path_buf();
+    std::fs::create_dir_all(&state).expect("the state directory");
+    Arc::new(kr_automation::WorkflowStore::open(&state).expect("the workflow journal opens"))
+}
+
+/// The workflow journal's database file, for a test that stands in for a fault.
+fn journal_file(temp: &kr_ipc::testing::TempHost) -> PathBuf {
+    temp.environment()
+        .state_dir()
+        .join(kr_automation::store::WORKFLOW_DB_NAME)
+}
+
+/// Installs one revision of a workflow naming `grant`, as the owner at this machine installs one.
+fn install(
+    journal: &kr_automation::WorkflowStore,
+    workflow_id: WorkflowId,
+    revision: u64,
+    grant: GrantId,
+) -> WorkflowDefinition {
+    let definition = kr_automation::create_workflow_definition(
+        workflow_id,
+        revision,
+        "a workflow",
+        grant,
+        Vec::new(),
+        Vec::new(),
+    );
+    journal
+        .save_definition(&definition, kr_ipc::now_ms().get())
+        .expect("the revision installs");
+    definition
+}
+
+/// Installs the first revision of a new workflow naming `grant`.
+fn workflow(journal: &kr_automation::WorkflowStore, grant: GrantId) -> WorkflowDefinition {
+    install(journal, WorkflowId::new(kr_ipc::new_uuid()), 1, grant)
+}
+
+/// The sequence of the newest attention record the journal holds.
+fn newest_record(journal: &kr_automation::WorkflowStore) -> u64 {
+    journal
+        .events_after(0, kr_automation::store::ATTENTION_EVENTS, usize::MAX)
+        .expect("the stream reads")
+        .last()
+        .expect("an attention record")
+        .sequence
+}
+
+/// Pauses a revision for a breach of one of its own limits, which records the attention record the
+/// pause owes. Returns that record's sequence.
+fn pause(journal: &kr_automation::WorkflowStore, definition: &WorkflowDefinition) -> u64 {
+    journal
+        .pause_workflow_on_breach(
+            definition.workflow_id,
+            definition.revision.get(),
+            BREACH,
+            kr_ipc::now_ms().get(),
+        )
+        .expect("the pause is recorded");
+    newest_record(journal)
+}
+
+/// Enables a paused revision again, which records the end of its item's condition. Returns that
+/// record's sequence.
+fn resume(journal: &kr_automation::WorkflowStore, definition: &WorkflowDefinition) -> u64 {
+    journal
+        .resume_workflow(
+            definition.workflow_id,
+            definition.revision.get(),
+            kr_ipc::now_ms().get(),
+        )
+        .expect("the resumption is recorded");
+    newest_record(journal)
+}
+
+/// Records a run of the revision under a causal root of its own, which commits the run's events to
+/// the journal's stream and gives the chain its budget. Returns the chain's root.
+fn run(journal: &kr_automation::WorkflowStore, definition: &WorkflowDefinition) -> CausalRootId {
+    let causal = kr_automation::CausalContext::new_root();
+    journal
+        .commit_trigger_and_run(
+            WorkflowRunId::new(kr_ipc::new_uuid()),
+            definition,
+            &format!("event-{}", kr_ipc::new_uuid()),
+            &causal,
+            kr_ipc::now_ms().get(),
+        )
+        .expect("the run is recorded");
+    causal.root_id
+}
+
+/// Asks a chain's budget for an action after the chain's lifetime has run out, which exhausts it and
+/// records the chain's one attention record. Returns that record's sequence.
+fn exhaust(journal: &kr_automation::WorkflowStore, root: CausalRootId) -> u64 {
+    let later = kr_ipc::now_ms().get() + kr_protocol::automation::DEFAULT_CAUSAL_LIFETIME_MS + 1;
+    journal
+        .reserve_budget_action(root, 0, later)
+        .expect_err("the chain has outlived its budget");
+    newest_record(journal)
+}
+
+/// How far the journal records the attention store as having read.
+fn journal_position(journal: &kr_automation::WorkflowStore) -> u64 {
+    journal
+        .consumer_position(kr_automation::store::ATTENTION_CONSUMER)
+        .expect("the journal reads")
+        .unwrap_or_default()
+}
+
+fn workflow_subject(definition: &WorkflowDefinition) -> AttentionAutomationSubject {
+    AttentionAutomationSubject::Workflow {
+        workflow_id: definition.workflow_id,
+        revision: definition.revision,
+    }
+}
+
+const fn chain_subject(causal_root_id: CausalRootId) -> AttentionAutomationSubject {
+    AttentionAutomationSubject::CausalChain { causal_root_id }
+}
+
+/// What each automation item among `items` is about, in order.
+fn automation_subjects(items: &[AttentionItem]) -> Vec<AttentionAutomationSubject> {
+    let mut subjects: Vec<_> = of_rule(items, AttentionRule::AutomationPaused)
+        .into_iter()
+        .map(|item| {
+            item.automation
+                .0
+                .expect("an automation item names its subject")
+        })
+        .collect();
+    subjects.sort();
+    subjects
+}
+
+fn sorted<T: Ord>(mut values: Vec<T>) -> Vec<T> {
+    values.sort();
+    values
+}
+
+/// The gap a store that lost what it had read records: the range after its cursor up to what the
+/// journal records it as having read.
+fn automation_gap(kept: u64, recorded: u64) -> AttentionGap {
+    AttentionGap {
+        source: AttentionSource::Automation,
+        session_id: Nullable::null(),
+        from_sequence: U64::new(kept + 1),
+        to_sequence: Nullable::some(U64::new(recorded + 1)),
+    }
+}
+
+/// The store's files as they stand while no daemon holds the store.
+fn store_copy(temp: &kr_ipc::testing::TempHost) -> Vec<(PathBuf, Vec<u8>)> {
+    std::fs::read_dir(temp.environment().state_dir())
+        .expect("the state directory reads")
+        .map(|entry| entry.expect("an entry").path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("attention.sqlite3"))
+        })
+        .map(|path| {
+            let bytes = std::fs::read(&path).expect("the store's file reads");
+            (path, bytes)
+        })
+        .collect()
+}
+
+/// Puts the store back to an earlier copy of its files, as a restore from a backup does.
+fn put_back(temp: &kr_ipc::testing::TempHost, copy: &[(PathBuf, Vec<u8>)]) {
+    for (path, _) in store_copy(temp) {
+        std::fs::remove_file(path).expect("the store's file is removed");
+    }
+    for (path, bytes) in copy {
+        std::fs::write(path, bytes).expect("the store's file is put back");
+    }
+}
+
+/// KR-REQ-17.57 and KR-REQ-25.16: a workflow revision one of its own limits paused is one item in
+/// the environment's inbox, raised from the workflow journal's record and announced, and a daemon
+/// that restarts finds the same one item rather than raising it again. The journal learns that the
+/// record was taken, so it no longer shows it as an alert nobody took, and the item stays after the
+/// journal lets the record go.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paused_workflow_raises_one_item_across_a_daemon_restart() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let reach = TestReach::default();
+    let before = {
+        let journal = workflow_journal(&temp);
+        let definition = workflow(&journal, GrantId::new(kr_ipc::new_uuid()));
+        pause(&journal, &definition);
+        let module = store_at(&temp);
+        module
+            .take_automation(&journal)
+            .await
+            .expect("the store takes the journal's records");
+        let items = inbox(&module, &reach).await.items;
+        let paused = of_rule(&items, AttentionRule::AutomationPaused);
+        assert_eq!(paused.len(), 1, "{items:?}");
+        let item = &paused[0];
+        assert_eq!(
+            item.automation,
+            Nullable::some(workflow_subject(&definition))
+        );
+        assert_eq!(item.source, AttentionSource::Automation);
+        assert_eq!(item.session_id, Nullable::null());
+        assert_eq!(item.level, AttentionLevel::Notable);
+        assert!(item.trusted);
+        assert!(!item.uncertain);
+        assert_eq!(
+            item.summary,
+            Nullable::some(format!(
+                "workflow {} revision 1 paused: {BREACH}",
+                definition.workflow_id
+            ))
+        );
+        assert!(
+            item.awaiting_delivery,
+            "announced once the read reached the end of the journal's records"
+        );
+        assert!(
+            journal
+                .pending_attention()
+                .expect("the journal reads")
+                .is_empty(),
+            "the journal knows the record was taken"
+        );
+        items
+    };
+
+    // The daemon restarts, and both stores are opened again from their files.
+    let journal = workflow_journal(&temp);
+    let module = reopen(&temp).await;
+    module
+        .take_automation(&journal)
+        .await
+        .expect("the store takes the journal's records");
+    let after = inbox(&module, &reach).await;
+    assert_eq!(keys(&after.items), keys(&before));
+    assert!(after.gaps.is_empty(), "{:?}", after.gaps);
+
+    // Every consumer of the record has passed it, so the journal lets it go; the item stays.
+    assert_eq!(journal.prune().expect("the journal prunes"), 1);
+    module
+        .take_automation(&journal)
+        .await
+        .expect("the store takes the journal's records");
+    let pruned = inbox(&module, &reach).await;
+    assert_eq!(keys(&pruned.items), keys(&before));
+    assert!(pruned.gaps.is_empty(), "{:?}", pruned.gaps);
+}
+
+/// KR-REQ-24.11: a daemon that stops after reading the journal's records and before the store
+/// commits them leaves the journal where it was. The next daemon takes the same records with no
+/// later one to prompt it, and raises their item once, with no gap.
+///
+/// The first daemon stops at its commit because the store is taken from it there, which is what a
+/// daemon that had crashed would leave to the next.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_that_stops_before_the_store_commits_leaves_the_records_to_the_next() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let reach = TestReach::default();
+    let journal = workflow_journal(&temp);
+    let definition = workflow(&journal, GrantId::new(kr_ipc::new_uuid()));
+    let paused = pause(&journal, &definition);
+    let first = store_at(&temp);
+    let gone = |_: &kr_protocol::identity::ProcessStartIdentity| kr_attention::Liveness::Ended;
+    let taker = kr_attention::Attention::open(
+        temp.environment().state_dir().join("attention.sqlite3"),
+        kr_attention::HostReading::new(
+            kr_attention::time::BootMark::of(b"another daemon"),
+            kr_ipc::clock::boot_elapsed_ms(),
+            kr_ipc::now_ms().get(),
+            true,
+        ),
+        &kr_attention::Claimant::new(
+            kr_ipc::identity::current_process_start_identity().expect("the kernel answers"),
+            &gone,
+        ),
+    )
+    .expect("the store is taken from a daemon this opener is told has gone");
+    first
+        .take_automation(&journal)
+        .await
+        .expect_err("a store this daemon no longer holds commits nothing");
+    assert_eq!(
+        journal_position(&journal),
+        0,
+        "the journal is told nothing the store did not commit"
+    );
+    assert_eq!(
+        journal
+            .pending_attention()
+            .expect("the journal reads")
+            .len(),
+        1
+    );
+    drop(first);
+    drop(taker);
+
+    let next = reopen(&temp).await;
+    next.take_automation(&journal)
+        .await
+        .expect("the store takes the journal's records");
+    let read = inbox(&next, &reach).await;
+    assert_eq!(
+        automation_subjects(&read.items),
+        vec![workflow_subject(&definition)]
+    );
+    assert!(read.items.iter().all(|item| !item.uncertain));
+    assert!(read.gaps.is_empty(), "{:?}", read.gaps);
+    assert_eq!(journal_position(&journal), paused);
+}
+
+/// KR-REQ-24.11: a daemon that stops after the store commits the journal's records and before the
+/// journal is told leaves nothing for the next to take, and the next tells the journal all the same,
+/// with no later record to prompt it. The item is still the one item it was.
+///
+/// The first daemon stops there because the journal refuses the position it is told, which is what
+/// a daemon that crashed between the two writes would leave to the next.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_that_stops_before_the_journal_is_told_leaves_the_next_to_tell_it() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let reach = TestReach::default();
+    let journal = workflow_journal(&temp);
+    let definition = workflow(&journal, GrantId::new(kr_ipc::new_uuid()));
+    let paused = pause(&journal, &definition);
+    let fault = rusqlite::Connection::open(journal_file(&temp)).expect("the journal's file opens");
+    fault
+        .execute_batch(
+            "CREATE TRIGGER the_daemon_stops_here BEFORE UPDATE ON event_consumers
+             WHEN NEW.consumer = 'attention'
+             BEGIN SELECT RAISE(ABORT, 'the daemon stopped here'); END;",
+        )
+        .expect("the fault is put in place");
+    let committed = {
+        let first = store_at(&temp);
+        first
+            .take_automation(&journal)
+            .await
+            .expect_err("the journal is not told");
+        let items = inbox(&first, &reach).await.items;
+        assert_eq!(
+            automation_subjects(&items),
+            vec![workflow_subject(&definition)],
+            "the store committed the record"
+        );
+        assert_eq!(journal_position(&journal), 0);
+        items
+    };
+    fault
+        .execute_batch("DROP TRIGGER the_daemon_stops_here;")
+        .expect("the fault is taken away");
+
+    let journal = workflow_journal(&temp);
+    let next = reopen(&temp).await;
+    next.take_automation(&journal)
+        .await
+        .expect("the store takes the journal's records");
+    assert_eq!(
+        journal_position(&journal),
+        paused,
+        "told with no later record"
+    );
+    let read = inbox(&next, &reach).await;
+    assert_eq!(keys(&read.items), keys(&committed));
+    assert!(read.gaps.is_empty(), "{:?}", read.gaps);
+}
+
+/// A store put back to an earlier copy while the journal keeps every record since: the store's
+/// cursor stands at `kept`, where `first` was paused, and the journal records the store as having
+/// read through `recorded`, where `first` was enabled again. `third` and then `second` were paused
+/// in between, with a run's events among them.
+struct RolledBack {
+    temp: kr_ipc::testing::TempHost,
+    journal: Arc<kr_automation::WorkflowStore>,
+    first: WorkflowDefinition,
+    second: WorkflowDefinition,
+    third: WorkflowDefinition,
+    kept: u64,
+    recorded: u64,
+}
+
+async fn rolled_back() -> RolledBack {
+    let temp = kr_ipc::testing::TempHost::create();
+    let journal = workflow_journal(&temp);
+    let grant = GrantId::new(kr_ipc::new_uuid());
+    let first = workflow(&journal, grant);
+    let second = workflow(&journal, grant);
+    let third = workflow(&journal, grant);
+    let kept = pause(&journal, &first);
+    store_at(&temp)
+        .take_automation(&journal)
+        .await
+        .expect("the store takes the journal's records");
+    let copy = store_copy(&temp);
+    let module = reopen(&temp).await;
+    pause(&journal, &third);
+    run(&journal, &first);
+    pause(&journal, &second);
+    let recorded = resume(&journal, &first);
+    module
+        .take_automation(&journal)
+        .await
+        .expect("the store takes the journal's records");
+    assert_eq!(journal_position(&journal), recorded);
+    drop(module);
+    put_back(&temp, &copy);
+    RolledBack {
+        temp,
+        journal,
+        first,
+        second,
+        third,
+        kept,
+        recorded,
+    }
+}
+
+/// KR-REQ-24.11: a store put back to an earlier copy is behind what the journal records it as
+/// having read. The daemon reads again what the journal still keeps of that range and records the
+/// whole range as a gap, in one write: the revision enabled again leaves the inbox, the revisions
+/// paused since come in, and every automation item left is uncertain, because the journal may have
+/// let records of that range go. A gap is never taken for a resumption.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_put_back_to_an_earlier_copy_reads_the_range_again_as_a_gap() {
+    let rolled = rolled_back().await;
+    let reach = TestReach::default();
+    let module = reopen(&rolled.temp).await;
+    assert_eq!(
+        automation_subjects(&inbox(&module, &reach).await.items),
+        vec![workflow_subject(&rolled.first)],
+        "the copy held the first pause alone"
+    );
+    module
+        .take_automation(&rolled.journal)
+        .await
+        .expect("the store takes the journal's records");
+    let read = inbox(&module, &reach).await;
+    assert_eq!(
+        automation_subjects(&read.items),
+        sorted(vec![
+            workflow_subject(&rolled.second),
+            workflow_subject(&rolled.third)
+        ])
+    );
+    assert!(read.items.iter().all(|item| item.uncertain), "{read:?}");
+    assert_eq!(
+        read.gaps,
+        vec![automation_gap(rolled.kept, rolled.recorded)]
+    );
+    assert_eq!(journal_position(&rolled.journal), rolled.recorded);
+
+    // The recovery is done: a later pass finds nothing more to read again.
+    module
+        .take_automation(&rolled.journal)
+        .await
+        .expect("the store takes the journal's records");
+    let again = inbox(&module, &reach).await;
+    assert_eq!(keys(&again.items), keys(&read.items));
+    assert_eq!(again.gaps, read.gaps);
+}
+
+/// KR-REQ-24.11: a recovery that stops part way writes nothing, so the next daemon does it again,
+/// whole.
+///
+/// The pass stops after it has read the first record of the range, at the next one, whose grant the
+/// journal cannot read until it is repaired: where a daemon that crashed there would stop. Nothing
+/// of the range is in the store afterwards and the journal is told nothing; the next daemon's
+/// recovery raises everything the range raised and records the gap.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recovery_stopped_part_way_writes_nothing_and_is_done_again_whole() {
+    let rolled = rolled_back().await;
+    let reach = TestReach::default();
+    let file =
+        rusqlite::Connection::open(journal_file(&rolled.temp)).expect("the journal's file opens");
+    let second = rolled.second.workflow_id.to_string();
+    let installed: String = file
+        .query_row(
+            "SELECT definition_json FROM workflow_definitions WHERE workflow_id = ?1",
+            [&second],
+            |row| row.get(0),
+        )
+        .expect("the second revision is installed");
+    file.execute(
+        "UPDATE workflow_definitions SET definition_json = '{' WHERE workflow_id = ?1",
+        [&second],
+    )
+    .expect("the second revision cannot be read");
+    {
+        let module = reopen(&rolled.temp).await;
+        let before = inbox(&module, &reach).await;
+        module
+            .take_automation(&rolled.journal)
+            .await
+            .expect_err("the recovery stops at the grant it cannot read");
+        let after = inbox(&module, &reach).await;
+        assert_eq!(
+            keys(&after.items),
+            keys(&before.items),
+            "nothing of the range is written"
+        );
+        assert_eq!(
+            automation_subjects(&after.items),
+            vec![workflow_subject(&rolled.first)]
+        );
+        assert!(after.items.iter().all(|item| !item.uncertain));
+        assert!(after.gaps.is_empty(), "{:?}", after.gaps);
+        assert_eq!(journal_position(&rolled.journal), rolled.recorded);
+    }
+    file.execute(
+        "UPDATE workflow_definitions SET definition_json = ?1 WHERE workflow_id = ?2",
+        [&installed, &second],
+    )
+    .expect("the second revision is repaired");
+
+    let module = reopen(&rolled.temp).await;
+    module
+        .take_automation(&rolled.journal)
+        .await
+        .expect("the store takes the journal's records");
+    let read = inbox(&module, &reach).await;
+    assert_eq!(
+        automation_subjects(&read.items),
+        sorted(vec![
+            workflow_subject(&rolled.second),
+            workflow_subject(&rolled.third)
+        ])
+    );
+    assert!(read.items.iter().all(|item| item.uncertain), "{read:?}");
+    assert_eq!(
+        read.gaps,
+        vec![automation_gap(rolled.kept, rolled.recorded)]
+    );
+    assert_eq!(journal_position(&rolled.journal), rolled.recorded);
+}
+
+/// KR-REQ-24.11 and KR-REQ-25.16: the workflow journal numbers every event in one stream, so a
+/// run's events sit between two attention records. The store reads past them to its own records, so
+/// neither a pass that finds none of its records nor the next record is a gap, and nothing is
+/// uncertain.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_events_between_alert_records_record_no_gap() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let reach = TestReach::default();
+    let journal = workflow_journal(&temp);
+    let grant = GrantId::new(kr_ipc::new_uuid());
+    let first = workflow(&journal, grant);
+    let second = workflow(&journal, grant);
+    let paused = pause(&journal, &first);
+    let module = store_at(&temp);
+    module
+        .take_automation(&journal)
+        .await
+        .expect("the store takes the journal's records");
+    run(&journal, &first);
+    run(&journal, &second);
+    module
+        .take_automation(&journal)
+        .await
+        .expect("a pass with no record of its own");
+    let root = run(&journal, &second);
+    let exhausted = exhaust(&journal, root);
+    assert!(exhausted > paused + 1, "a run's events sit between the two");
+    module
+        .take_automation(&journal)
+        .await
+        .expect("the store takes the journal's records");
+    let read = inbox(&module, &reach).await;
+    assert_eq!(
+        automation_subjects(&read.items),
+        sorted(vec![workflow_subject(&first), chain_subject(root)])
+    );
+    assert!(read.items.iter().all(|item| !item.uncertain), "{read:?}");
+    assert!(read.gaps.is_empty(), "{:?}", read.gaps);
+    assert_eq!(journal_position(&journal), exhausted);
+}
+
+/// KR-REQ-17.57: enabling a paused revision again ends its item, and only its item: another
+/// revision of the same workflow paused beside it, and a chain one of its limits stopped, stay. A
+/// revision paused again is outstanding again, under a later revision of the item.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revision_enabled_again_leaves_the_inbox() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let reach = TestReach::default();
+    let journal = workflow_journal(&temp);
+    let grant = GrantId::new(kr_ipc::new_uuid());
+    let workflow_id = WorkflowId::new(kr_ipc::new_uuid());
+    let first = install(&journal, workflow_id, 1, grant);
+    let second = install(&journal, workflow_id, 2, grant);
+    pause(&journal, &first);
+    pause(&journal, &second);
+    let root = run(&journal, &first);
+    exhaust(&journal, root);
+    let module = store_at(&temp);
+    module
+        .take_automation(&journal)
+        .await
+        .expect("the store takes the journal's records");
+    let raised = inbox(&module, &reach).await.items;
+    assert_eq!(
+        automation_subjects(&raised),
+        sorted(vec![
+            workflow_subject(&first),
+            workflow_subject(&second),
+            chain_subject(root)
+        ])
+    );
+
+    resume(&journal, &first);
+    module
+        .take_automation(&journal)
+        .await
+        .expect("the store takes the journal's records");
+    let items = inbox(&module, &reach).await.items;
+    assert_eq!(
+        automation_subjects(&items),
+        sorted(vec![workflow_subject(&second), chain_subject(root)])
+    );
+
+    pause(&journal, &first);
+    module
+        .take_automation(&journal)
+        .await
+        .expect("the store takes the journal's records");
+    let again = inbox(&module, &reach).await.items;
+    let revision_of = |items: &[AttentionItem]| {
+        of_rule(items, AttentionRule::AutomationPaused)
+            .into_iter()
+            .find(|item| item.automation == Nullable::some(workflow_subject(&first)))
+            .map(|item| item.revision.get())
+    };
+    let latest = raised
+        .iter()
+        .map(|item| item.revision.get())
+        .max()
+        .expect("items");
+    assert!(
+        revision_of(&again).is_some_and(|revision| revision > latest),
+        "{again:?}"
+    );
+}
+
+/// Pairs a device under a grant carrying `rights`, and connects it. Returns the grant it holds.
+async fn device_under(
+    host: &net_support::Host,
+    owner_keys: &DeviceKeys,
+    rights: &[ActionRight],
+) -> (net_support::Device, GrantId, kr_client::session::Session) {
+    let device = net_support::Device::create().await;
+    let record =
+        net_support::pair_with(host, &device, owner_keys, net_support::proposal(rights)).await;
+    let session = net_support::connect(host, &device, &record).await;
+    (device, record.grant.grant_id, session)
+}
+
+/// Reads the owner's inbox at the daemon until `done` holds, or ten seconds pass.
+async fn owner_inbox_until(
+    control: &mut LocalClient,
+    done: impl Fn(&[AttentionItem]) -> bool,
+) -> Vec<AttentionItem> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let items = owner_inbox(control).await;
+        if done(&items) {
+            return items;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the inbox did not get there in ten seconds: {items:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// KR-REQ-25.16, KR-REQ-17.57 and KR-REQ-23.45: the daemon reads its own workflow journal into the
+/// environment's inbox, and a paired device is shown an automation item only when its grant carries
+/// `automation.manage` and the paused revision or chain acts under that same grant. A chain whose
+/// grant the journal cannot name is the owner's alone, a grant without `automation.manage` is shown
+/// none of them, and a device's acknowledgement of an item under another grant is stale and records
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_sees_an_automation_item_only_under_its_grant() {
+    let owner_keys = DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner_keys).await;
+    let (_first_device, first_grant, first) =
+        device_under(&host, &owner_keys, &[ActionRight::AutomationManage]).await;
+    let (_second_device, second_grant, second) =
+        device_under(&host, &owner_keys, &[ActionRight::AutomationManage]).await;
+    let (_manager, managing) =
+        net_support::paired_device(&host, &owner_keys, &[ActionRight::HostManage]).await;
+
+    let journal = Arc::clone(host.controller().automation().journal());
+    let mine = workflow(&journal, first_grant);
+    let theirs = workflow(&journal, second_grant);
+    pause(&journal, &mine);
+    pause(&journal, &theirs);
+    let chain = run(&journal, &mine);
+    exhaust(&journal, chain);
+    let nobodys = CausalRootId::new(kr_ipc::new_uuid());
+    journal
+        .get_or_create_budget(nobodys, kr_ipc::now_ms().get())
+        .expect("a chain with no run of its own");
+    exhaust(&journal, nobodys);
+
+    let mut control = host.client().await;
+    let everything =
+        owner_inbox_until(&mut control, |items| automation_subjects(items).len() == 4).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !journal
+        .pending_attention()
+        .expect("the journal reads")
+        .is_empty()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the journal is told the records were taken"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let first_read = device_inbox(&first).await;
+    assert_eq!(
+        automation_subjects(&first_read.items),
+        sorted(vec![workflow_subject(&mine), chain_subject(chain)])
+    );
+    assert!(
+        first_read.items.iter().all(|item| item.summary.0.is_some()),
+        "the host's own words about its own journal are served to a device"
+    );
+    assert_eq!(
+        automation_subjects(&device_inbox(&second).await.items),
+        vec![workflow_subject(&theirs)]
+    );
+    assert!(
+        device_inbox(&managing).await.items.is_empty(),
+        "host management alone shows no automation item"
+    );
+
+    let batch: AttentionAcknowledgeResult = device_mutation(
+        &first,
+        ActionTarget::environment(host.environment_id),
+        Method::AttentionAcknowledge,
+        &AttentionAcknowledgeParams {
+            items: everything
+                .iter()
+                .map(|item| AttentionItemRevision {
+                    key: item.key.clone(),
+                    revision: item.revision,
+                })
+                .collect(),
+        },
+    )
+    .await
+    .expect("the batch is answered");
+    let key_of = |subject: &AttentionAutomationSubject| {
+        everything
+            .iter()
+            .find(|item| item.automation.0.as_ref() == Some(subject))
+            .expect("the owner sees every item")
+            .key
+            .clone()
+    };
+    let by_key = |mut keys: Vec<kr_protocol::attention::AttentionKey>| {
+        keys.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        keys
+    };
+    assert_eq!(
+        by_key(batch.acknowledged),
+        by_key(vec![
+            key_of(&workflow_subject(&mine)),
+            key_of(&chain_subject(chain))
+        ])
+    );
+    assert_eq!(
+        by_key(batch.stale),
+        by_key(vec![
+            key_of(&workflow_subject(&theirs)),
+            key_of(&chain_subject(nobodys))
+        ])
+    );
+    let owner_view = owner_inbox(&mut control).await;
+    assert!(
+        owner_view.iter().all(|item| !item.acknowledged),
+        "a device's acknowledgement is its own"
+    );
+    host.stop().await;
 }

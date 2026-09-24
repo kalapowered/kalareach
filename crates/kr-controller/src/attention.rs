@@ -24,6 +24,17 @@
 //! over a worker this host could not confirm had ended opens nothing: its sources are marked as
 //! gaps with no known end and its items stay, uncertain.
 //!
+//! # The workflow journal's alerts
+//!
+//! The environment's own source is the workflow journal's attention records: a workflow revision or
+//! a causal chain that one of its own limits paused, and a revision enabled again. The store reads
+//! them as the journal's registered attention consumer. Each pass registers, reads the records past
+//! the store's own cursor, commits what they raise or end, and only then tells the journal how far
+//! the store has read, so a daemon that stops between the two neither loses a record nor counts one
+//! twice. A journal that says the store has read further than the store's cursor holds is a store
+//! that lost what it had written: what the journal still keeps of that range is read again and the
+//! whole range is recorded as a gap, in one write.
+//!
 //! # Text
 //!
 //! The store keeps none of a session's text. A read that serves text asks the record's owner for
@@ -44,7 +55,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use kr_attention::host::{ActionKey, Answer as Answered, Mutation, Performed};
@@ -52,13 +63,15 @@ use kr_attention::{
     Attention, Claimant, Content, DeviceScope, EventCursor, EventKind, HostReading, Liveness,
     Origin, SourceEvent, Viewer,
 };
+use kr_automation::store::{ATTENTION_CONSUMER, ATTENTION_EVENTS};
+use kr_automation::{AttentionOutboxRecord, AttentionSubject, JournalEvent, WorkflowStore};
 use kr_ipc::client::LocalClient;
 use kr_ipc::framed::CheckedWrite;
 use kr_protocol::attention::{
-    AttentionAcknowledgeParams, AttentionBarrier, AttentionBarrierAcknowledged,
-    AttentionHostRecord, AttentionQuestionRecord, AttentionQuietHoursParams,
-    AttentionQuietHoursResult, AttentionReadParams, AttentionRecordRef, AttentionSource,
-    AttentionSourcePage, AttentionSourcesRequest, AttentionTextRequest,
+    AttentionAcknowledgeParams, AttentionAutomationSubject, AttentionBarrier,
+    AttentionBarrierAcknowledged, AttentionHostRecord, AttentionQuestionRecord,
+    AttentionQuietHoursParams, AttentionQuietHoursResult, AttentionReadParams, AttentionRecordRef,
+    AttentionSource, AttentionSourcePage, AttentionSourcesRequest, AttentionTextRequest,
     MAX_ATTENTION_SOURCE_RECORDS, MAX_ATTENTION_SOURCE_WAIT_MS, MAX_ATTENTION_TEXT_RECORDS,
     MAX_LOG_VIEW_FILTER_LEN, MAX_LOG_VIEW_ID_LEN, MAX_RETAINED_LOG_VIEWS, ReviewAcknowledgeParams,
     ReviewReadParams, ReviewReadResult, ReviewSubject, VisitAcknowledgeParams, VisitChangedParams,
@@ -70,7 +83,7 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ActorId, GrantId, RequestId, SessionId};
 use kr_protocol::method::{Method, MethodGroup};
 use kr_protocol::question::QuestionEventKind;
-use kr_protocol::scalars::{Nullable, SecretBytes32, U64};
+use kr_protocol::scalars::{Nullable, SecretBytes32, TimestampMs, U64};
 
 use crate::directory::KnownWorker;
 use crate::error::{ControllerError, Result};
@@ -125,6 +138,15 @@ const MAX_ZONE_LEN: usize = 128;
 
 /// The largest number this store writes down exactly.
 const MAX_STORED_COUNTER: u64 = i64::MAX as u64;
+
+/// How often the workflow journal is read for its attention records.
+///
+/// The automation service wakes one waiter when a run stops, and that is its trigger dispatcher, so
+/// the store reads on a cadence of its own, the same as the dispatcher's.
+const AUTOMATION_EVERY: Duration = Duration::from_secs(2);
+
+/// The workflow journal's attention records one read takes.
+const AUTOMATION_PAGE: usize = 256;
 
 /// Who is asking, in a form that can travel to a task of its own.
 #[derive(Clone, Debug)]
@@ -245,6 +267,9 @@ struct Origins {
     /// Each live session's latest certificate: the moment of its latest page that reached the
     /// head of both sources.
     certified: BTreeMap<SessionId, u64>,
+    /// The environment's latest certificate: the moment of its latest read that reached the end of
+    /// the workflow journal's attention records.
+    environment_certified: Option<u64>,
     /// Each live session's oldest retained output position, from its latest page.
     output_floor: BTreeMap<SessionId, u64>,
     /// Sessions whose closure this daemon recorded and whose journals are being read to the end.
@@ -253,6 +278,32 @@ struct Origins {
     unaccounted: BTreeSet<SessionId>,
     /// Closed sessions the store could not finish yet, which the maintenance loop tries again.
     unfinished: BTreeSet<SessionId>,
+}
+
+/// How far the store has read each origin, as a timer pass is told it: the moment up to which it
+/// has read every record the origin committed.
+#[derive(Clone, Debug, Default)]
+struct Certificates {
+    /// Each live session's.
+    sessions: BTreeMap<SessionId, u64>,
+    /// The environment's.
+    environment: Option<u64>,
+}
+
+impl Certificates {
+    fn of(origins: &Origins) -> Self {
+        Self {
+            sessions: origins.certified.clone(),
+            environment: origins.environment_certified,
+        }
+    }
+
+    fn at(&self, origin: &Origin) -> Option<u64> {
+        match origin {
+            Origin::Session(session_id) => self.sessions.get(session_id).copied(),
+            Origin::Environment => self.environment,
+        }
+    }
 }
 
 /// What this daemon knows of one session's privacy fence.
@@ -412,6 +463,14 @@ pub struct AttentionModule {
     origins: std::sync::Mutex<Origins>,
     /// Wakes the maintenance loop when a timer may have moved.
     wake: Arc<tokio::sync::Notify>,
+    /// Held for the whole of one pass over the workflow journal, so the store is that journal's one
+    /// reader whoever asks for a pass.
+    automation_pass: std::sync::Mutex<()>,
+    /// Set once the workflow journal is being read, so it is read by one loop.
+    automation_started: std::sync::OnceLock<()>,
+    /// Whether the last pass over the workflow journal stopped short, so a failure that persists is
+    /// reported once rather than at every pass.
+    automation_failing: AtomicBool,
     /// Where this host's own tests stop an action once its admission has been asked and stood,
     /// before it takes the store. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -496,6 +555,9 @@ impl AttentionModule {
             time_saving: std::sync::Mutex::new(()),
             origins: std::sync::Mutex::new(Origins::default()),
             wake: Arc::new(tokio::sync::Notify::new()),
+            automation_pass: std::sync::Mutex::new(()),
+            automation_started: std::sync::OnceLock::new(),
+            automation_failing: AtomicBool::new(false),
             #[cfg(feature = "testing")]
             before_store: Pause::default(),
             #[cfg(test)]
@@ -1768,10 +1830,10 @@ impl AttentionModule {
             if let Some(floor) = page.output_floor.0 {
                 origins.output_floor.insert(session_id, floor.get());
             }
-            origins.certified.clone()
+            Certificates::of(&origins)
         };
         store
-            .tick(reading, &|origin| certified_at(&certified, origin))
+            .tick(reading, &|origin| certified.at(origin))
             .map_err(refusal)?;
         drop(store);
         // A certificate that moved may let a timer be decided that the maintenance loop had put
@@ -1784,8 +1846,8 @@ impl AttentionModule {
         })
     }
 
-    fn certificates(&self) -> BTreeMap<SessionId, u64> {
-        self.origins().certified.clone()
+    fn certificates(&self) -> Certificates {
+        Certificates::of(&self.origins())
     }
 
     // ----- Sessions that end -----------------------------------------------------------------
@@ -2002,6 +2064,205 @@ impl AttentionModule {
             .collect()
     }
 
+    // ----- The workflow journal's alerts ----------------------------------------------------
+
+    /// Reads the workflow journal's attention records for as long as the module is held: one pass
+    /// now, and then one every [`AUTOMATION_EVERY`].
+    ///
+    /// The first pass has run when this returns, so a daemon that waits for it at its start has put
+    /// right whatever the last daemon left between the store and the journal before it serves
+    /// anything. A second call starts nothing further.
+    pub async fn consume_automation(self: &Arc<Self>, journal: Arc<WorkflowStore>) {
+        if self.automation_started.set(()).is_err() {
+            return;
+        }
+        let taken = self.take_automation(&journal).await;
+        self.report_automation(taken);
+        let module = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(AUTOMATION_EVERY).await;
+                // Held for one pass and let go of across the wait, so a module its owner has let
+                // go of goes, with its store's claim.
+                let Some(held) = module.upgrade() else {
+                    return;
+                };
+                let taken = held.take_automation(&journal).await;
+                held.report_automation(taken);
+            }
+        });
+    }
+
+    /// Makes one pass over the workflow journal's attention records.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the pass stopped short: the journal or the store could not be read or written.
+    /// The journal is not told the store has read anything the store has not committed, and the
+    /// next pass starts again from the store's own cursor.
+    pub async fn take_automation(self: &Arc<Self>, journal: &Arc<WorkflowStore>) -> Answer<()> {
+        let module = Arc::clone(self);
+        let journal = Arc::clone(journal);
+        match tokio::task::spawn_blocking(move || module.automation_pass(&journal)).await {
+            Ok(taken) => taken,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(_) => Err(ProtocolError::new(
+                ErrorCode::StorageUnavailable,
+                "the pass over the workflow journal was stopped",
+            )),
+        }
+    }
+
+    /// Reports a pass that stopped short, once for as long as passes keep stopping.
+    fn report_automation(&self, taken: Answer<()>) {
+        match taken {
+            Ok(()) => self.automation_failing.store(false, Ordering::Relaxed),
+            Err(error) => {
+                if !self.automation_failing.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "kr-controller: the attention store could not take the workflow journal's \
+                         alerts: {error}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// One pass: the registration, the recovery a journal ahead of the store owes, the records past
+    /// the store's cursor, and then the journal told how far the store has read.
+    fn automation_pass(&self, journal: &WorkflowStore) -> Answer<()> {
+        let _one = self
+            .automation_pass
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Registering is idempotent, and it answers how far the journal has recorded this store as
+        // having read. A record of an attention type leaves the journal only once every consumer
+        // registered for its type has passed it.
+        let recorded = journal
+            .register_consumer(ATTENTION_CONSUMER, ATTENTION_EVENTS, kr_ipc::now_ms().get())
+            .map_err(journal_error)?;
+        let mut cursor = self.automation_cursor()?;
+        if recorded > cursor {
+            self.recover_automation(journal, cursor, recorded)?;
+            cursor = recorded;
+        }
+        loop {
+            // Taken before the read, so every record the journal committed by then is on this read
+            // or an earlier one.
+            let before = self.reading().continuous_ms;
+            let page = journal
+                .events_after(cursor, ATTENTION_EVENTS, AUTOMATION_PAGE)
+                .map_err(journal_error)?;
+            if let Some(last) = page.last() {
+                let events = page
+                    .iter()
+                    .map(|event| automation_event(journal, event))
+                    .collect::<kr_automation::Result<Vec<_>>>()
+                    .map_err(journal_error)?;
+                let reading = self.reading();
+                self.store()?.rebuild(&events, reading).map_err(refusal)?;
+                cursor = last.sequence;
+            }
+            if page.len() < AUTOMATION_PAGE {
+                self.certify_environment(before)?;
+                break;
+            }
+        }
+        // Only after the store's commit, and on every pass that finds the store past what the
+        // journal recorded, whether or not this pass read anything: a daemon that stopped between
+        // the commit and this has it done by the next pass, with no later record needed.
+        let consumed = self.automation_cursor()?;
+        if consumed > recorded {
+            journal
+                .acknowledge(ATTENTION_CONSUMER, consumed)
+                .map_err(journal_error)?;
+        }
+        Ok(())
+    }
+
+    /// Returns how far the store has read the workflow journal's attention records.
+    fn automation_cursor(&self) -> Answer<u64> {
+        Ok(self
+            .store()?
+            .engine()
+            .map_err(refusal)?
+            .consumed(Origin::Environment, AttentionSource::Automation)
+            .unwrap_or_default())
+    }
+
+    /// Reads again what the journal still keeps of a range the store has no record of reading, and
+    /// feeds it with the whole range recorded as a gap and the cursor moved to its end, in one
+    /// write.
+    ///
+    /// The journal records the store as having read through `through`, and the store's cursor
+    /// stands at `from`: the store lost what it had written, or was put back to an earlier copy.
+    /// Part of the range may have left the journal since, because a record every registered
+    /// consumer has passed is not kept, so every unresolved automation item is uncertain afterwards.
+    /// Nothing is written before the whole range has been read, so a pass that stops part way
+    /// leaves the recovery to be done again, whole.
+    fn recover_automation(&self, journal: &WorkflowStore, from: u64, through: u64) -> Answer<()> {
+        let mut retained = Vec::new();
+        let mut after = from;
+        'reading: loop {
+            let page = journal
+                .events_after(after, ATTENTION_EVENTS, AUTOMATION_PAGE)
+                .map_err(journal_error)?;
+            for event in &page {
+                if event.sequence > through {
+                    break 'reading;
+                }
+                retained.push(automation_event(journal, event).map_err(journal_error)?);
+                after = event.sequence;
+            }
+            if page.len() < AUTOMATION_PAGE {
+                break;
+            }
+        }
+        let reading = self.reading();
+        self.store()?
+            .recover_source(
+                Origin::Environment,
+                AttentionSource::Automation,
+                &retained,
+                through,
+                reading,
+            )
+            .map_err(refusal)?;
+        Ok(())
+    }
+
+    /// Records that the store has read every attention record the journal committed before `at`,
+    /// and decides what the environment's items are owed when one of them has had nothing decided.
+    ///
+    /// A record read from the journal announces nothing by itself: the timer pass decides what an
+    /// item it raised is owed, once a read has reached the end of the journal's records.
+    fn certify_environment(&self, at: u64) -> Answer<()> {
+        let reading = self.reading();
+        let mut store = self.store()?;
+        let certified = {
+            let mut origins = self.origins();
+            origins.environment_certified = Some(
+                origins
+                    .environment_certified
+                    .map_or(at, |earlier| earlier.max(at)),
+            );
+            Certificates::of(&origins)
+        };
+        let undecided = store
+            .engine()
+            .map_err(refusal)?
+            .items()
+            .any(|item| item.origin == Origin::Environment && item.since_notified.is_none());
+        if undecided {
+            store
+                .tick(reading, &|origin| certified.at(origin))
+                .map_err(refusal)?;
+            drop(store);
+            self.wake.notify_one();
+        }
+        Ok(())
+    }
+
     // ----- Maintenance -----------------------------------------------------------------------
 
     /// Runs the store's timers and its housekeeping for as long as the module is held, and finishes
@@ -2020,7 +2281,7 @@ impl AttentionModule {
                     // Read with the store held: a closure and a replacement take the store before
                     // they take a certificate away, so this tick never decides on one they took.
                     let certified = held.certificates();
-                    let _ = store.tick(reading, &|origin| certified_at(&certified, origin));
+                    let _ = store.tick(reading, &|origin| certified.at(origin));
                     // Expired records are let go of only on a wall clock this host can prove, so a
                     // rollback cannot make a live record look expired.
                     if held.time.may_collect_expired()
@@ -2076,7 +2337,7 @@ impl AttentionModule {
                     return Some(due);
                 }
                 let decidable = engine.is_finalised(&origin)
-                    || certified_at(certified, &origin).is_some_and(|at| at >= due);
+                    || certified.at(&origin).is_some_and(|at| at >= due);
                 decidable.then_some(due)
             })
             .min()
@@ -2422,19 +2683,69 @@ pub fn host_event(session_id: SessionId, record: &AttentionHostRecord) -> Source
     )
 }
 
+/// Turns one record of the workflow journal's stream into the event the store reads.
+///
+/// A record that raises an item carries the grant the paused revision or chain acts under, read
+/// from the journal now: the grant the revision names, or the one the chain's root run acts under,
+/// both facts that never change. An item whose grant the journal cannot name is left to the owner
+/// at this machine alone.
+fn automation_event(
+    journal: &WorkflowStore,
+    event: &JournalEvent,
+) -> kr_automation::Result<SourceEvent> {
+    let cursor = EventCursor::new(AttentionSource::Automation, event.sequence);
+    let at = TimestampMs::new(event.recorded_at_ms);
+    // The journal hands this reader only its own types, so every record is one; anything else
+    // would move the cursor and raise nothing.
+    let Some(record) = AttentionOutboxRecord::of(event) else {
+        return Ok(SourceEvent::new(cursor, at, EventKind::Observed));
+    };
+    let subject = match record.subject {
+        AttentionSubject::Workflow {
+            workflow_id,
+            revision,
+        } => AttentionAutomationSubject::Workflow {
+            workflow_id,
+            revision: U64::new(revision),
+        },
+        AttentionSubject::CausalRoot(causal_root_id) => {
+            AttentionAutomationSubject::CausalChain { causal_root_id }
+        }
+    };
+    let kind = if record.ends_condition {
+        EventKind::AutomationResumed { subject }
+    } else {
+        let grant_id = match record.subject {
+            AttentionSubject::Workflow {
+                workflow_id,
+                revision,
+            } => journal
+                .get_definition(workflow_id, revision)?
+                .map(|installed| installed.definition.grant_reference),
+            AttentionSubject::CausalRoot(causal_root_id) => journal.chain_grant(causal_root_id)?,
+        };
+        EventKind::AutomationPaused {
+            subject,
+            reason: record.reason,
+            grant_id,
+        }
+    };
+    Ok(SourceEvent::new(cursor, at, kind))
+}
+
+/// The refusal a workflow journal that could not be read or written is reported with.
+fn journal_error(error: kr_automation::AutomationError) -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::StorageUnavailable,
+        format!("the workflow journal: {error}"),
+    )
+}
+
 /// Whether one source's part of a page reached the source's head.
 const fn complete(cursor: u64, head: u64, last: Option<u64>) -> bool {
     match last {
         Some(last) => last >= head,
         None => cursor >= head,
-    }
-}
-
-fn certified_at(certified: &BTreeMap<SessionId, u64>, origin: &Origin) -> Option<u64> {
-    match origin {
-        Origin::Session(session_id) => certified.get(session_id).copied(),
-        // The environment has no source of its own yet, and so no certificate.
-        Origin::Environment => None,
     }
 }
 

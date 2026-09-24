@@ -2401,6 +2401,11 @@ impl Controller {
                 });
             }
         }
+        // The environment's own source: the workflow journal's attention records, taken up where
+        // the store and the journal left off before the timers run.
+        self.attention
+            .consume_automation(Arc::clone(self.automation.journal()))
+            .await;
         self.attention.maintain(reach);
     }
 
