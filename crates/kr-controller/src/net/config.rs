@@ -170,6 +170,75 @@ mod tests {
         );
     }
 
+    /// KR-REQ-26.14: a document that validates never stops the daemon over an address's syntax.
+    ///
+    /// Every address the configuration schema accepts is one the endpoint's own parser accepts,
+    /// and one an invitation can carry once that parser has written it. The addresses the schema
+    /// refuses are here too, so a rule loosened on one side and not the other fails this.
+    #[test]
+    fn every_address_the_document_accepts_is_one_the_endpoint_accepts() {
+        use kr_protocol::hostinfo::configuration::ConfigurationDocument;
+
+        // 252 bytes as written in the document, and 253 once the parser adds the path's `/`.
+        let longest = format!(
+            "https://{}.example",
+            [
+                "a".repeat(60),
+                "a".repeat(60),
+                "a".repeat(60),
+                "a".repeat(53)
+            ]
+            .join(".")
+        );
+        assert_eq!(longest.len(), 252);
+        let corpus = [
+            "https://relay.example.com",
+            "https://relay.example.com/",
+            "https://relay.example.com:8443/relay/v1",
+            "http://127.0.0.1:8080/pkarr",
+            "http://[::1]:8080",
+            "https://[2001:db8::1]",
+            "https://a1.be",
+            "https://relay.example.com/a-b_c.d~e",
+            longest.as_str(),
+            "https://resolver.example:99999",
+            "https://resolver.example:0443",
+            "http://127.1",
+            "http://[0:0:0:0:0:0:0:1]",
+            "https://xn--zz.example",
+            "https://resolver.example/a/../b",
+            "https://resolver.example/%70",
+            "https://Relay.example.com",
+        ];
+        let mut accepted = 0;
+        for address in corpus {
+            let mut document = ConfigurationDocument::empty();
+            document.network = joined(NetworkSelection {
+                relay_urls: Nullable::some(vec![address.to_owned()]),
+                pkarr_publisher_url: Nullable::some(address.to_owned()),
+                pkarr_resolver_url: Nullable::some(address.to_owned()),
+                ..NetworkSelection::default()
+            });
+            if configuration::validate(&document).is_err() {
+                continue;
+            }
+            accepted += 1;
+            let settings = NetworkSettings::from_selection(&document.network)
+                .unwrap_or_else(|error| {
+                    panic!("{address} validated and the endpoint refused it: {error}")
+                })
+                .expect("this host joins");
+            settings
+                .endpoint
+                .to_network_config()
+                .unwrap_or_else(|error| panic!("{address} does not fit an invitation: {error}"));
+        }
+        assert_eq!(
+            accepted, 9,
+            "the first nine addresses are the ones the schema accepts"
+        );
+    }
+
     #[test]
     fn every_selection_reaches_the_endpoint_it_builds() {
         let settings = NetworkSettings::from_selection(&joined(NetworkSelection {

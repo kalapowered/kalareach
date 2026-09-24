@@ -68,6 +68,11 @@ impl VoiceActor {
 #[derive(Debug)]
 pub struct VoiceModule {
     coordinator: Coordinator,
+    /// The managed broker's origin the coordinator was built with, empty where there is none.
+    ///
+    /// Kept beside the coordinator so `kr doctor` reports the broker this service is actually
+    /// naming to devices, rather than what some other record says it should be.
+    broker_origin: String,
 }
 
 impl VoiceModule {
@@ -95,9 +100,17 @@ impl VoiceModule {
                 provider,
                 host_device_id,
                 environment_id,
-                broker_origin,
+                broker_origin.clone(),
             ),
+            broker_origin,
         }
+    }
+
+    /// The managed broker's origin this service names to a device whose voice session starts,
+    /// or an empty string where it names none.
+    #[must_use]
+    pub fn broker_origin(&self) -> &str {
+        &self.broker_origin
     }
 
     /// Builds the managed broker client for a host that has one configured.
@@ -395,4 +408,72 @@ fn frame(request_id: kr_protocol::ids::RequestId, outcome: Result<ParamsValue>) 
             Err(error) => Outcome::Error(ProtocolError::new(error.code(), error.to_string())),
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kr_protocol::hostinfo::configuration::{self, ConfigurationDocument};
+    use kr_protocol::scalars::Nullable;
+
+    /// An exchange that is never made: building a broker client does not reach the network.
+    #[derive(Debug)]
+    struct NoExchange;
+
+    impl ServiceHttp for NoExchange {
+        fn post_json<'a>(
+            &'a self,
+            _url: &'a str,
+            _body: &'a [u8],
+            _headers: &'a [(&'a str, &'a str)],
+        ) -> kr_client::services::ServiceFuture<'a, kr_voice::broker::ServiceHttpAnswer> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// KR-REQ-26.14: a broker origin the configuration document accepts is one the managed broker
+    /// accepts, so a device is never handed an origin its own client would refuse.
+    ///
+    /// The origins the document refuses are here too, so a rule loosened on one side and not the
+    /// other fails this.
+    #[test]
+    fn every_broker_origin_the_document_accepts_is_one_the_broker_accepts() {
+        let root = tempfile::tempdir().expect("a directory for the token file");
+        let corpus = [
+            "https://voice.example.com",
+            "https://voice.example.com:8443",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+            "https://[2001:db8::1]",
+            "https://voice.example:0443",
+            "http://127.1",
+            "http://[0:0:0:0:0:0:0:1]",
+            "https://a1.be",
+            "https://Voice.example.com",
+            "https://voice.example.com/",
+            "https://xn--zz.example",
+        ];
+        let mut accepted = 0;
+        for origin in corpus {
+            let mut document = ConfigurationDocument::empty();
+            document.voice.broker_origin = Nullable::some(origin.to_owned());
+            if configuration::validate(&document).is_err() {
+                continue;
+            }
+            accepted += 1;
+            assert!(
+                VoiceModule::managed_provider(
+                    Some(origin.to_owned()),
+                    Arc::new(NoExchange),
+                    root.path(),
+                )
+                .is_some(),
+                "{origin} validated and the managed broker refused it"
+            );
+        }
+        assert_eq!(
+            accepted, 5,
+            "the first five origins are the ones the schema accepts"
+        );
+    }
 }

@@ -172,21 +172,27 @@ an older build read joins nothing because of them.
 | `voice.broker_origin` | the managed broker a device's voice session talks to | an absolute `https` or `http` origin in lower case, with no path and no port its scheme already implies |
 
 A field the document does not write selects nothing, because there is no public relay or discovery
-server to fall back on. The URLs and origins are also held to the 253 bytes of printable ASCII that
-an invitation carries them in. A value outside these rules makes the whole document invalid, as it
-would in any other section: the host keeps its product defaults, `kr doctor` names the key and
-withholds the value, and an edit to another section is refused until the document is fixed.
+server to fall back on. A URL or an origin names its host the one way the protocol spells every
+origin it compares: a lower-case name or the canonical form of an address, no port its scheme
+already implies, and no user information. A name in its `xn--` A-label form is refused, because the
+URL parser the endpoint uses decodes that punycode and this check cannot decode it the same way. A
+path is letters, digits and `- . _ ~ /`, with no `.` or `..` segment, and the whole URL fits the 253
+bytes of printable ASCII that an invitation carries it in, counting the `/` the parser adds to a URL
+with no path. Every address the document accepts is therefore one the endpoint accepts. A value
+outside these rules makes the whole document invalid, as it would in any other section: the host
+keeps its product defaults, `kr doctor` names the key and withholds the value, and an edit to
+another section is refused until the document is fixed.
 
 The daemon reads both sections once, when it starts, because that is when its endpoint and its
 voice service are built. `kr doctor` prints each field with its value, its source
 (`host_configuration` where the document wrote it and `default` where it did not) and
-`applies at the next start`. The `configuration-network` check says what the running host started
-with: whether it joined, how many sockets its endpoint holds, how many relays and discovery services
-it selected, and whether it names a voice broker. When the document now selects something else,
-the check warns that the edit applies at the next start. A selection the daemon cannot use when it
-starts, such as a missing or empty trust anchor file, a relay URL the transport refuses or an
-address already in use, stops the start with the key named, rather than leaving a host that appears
-to run and cannot be reached.
+`applies at the next start`. The `configuration-network` check reports what the running services
+are doing, read from them: whether the endpoint is up, how many sockets it holds, how many relays
+and discovery services it was built with, and whether the voice service names a broker. When the
+document now selects something other than what the daemon started with, the check warns that the
+edit applies at the next start. What only the start can find out, a trust anchor file that is
+missing or empty or a bind address somebody else holds, stops the start with the key named, rather
+than leaving a host that appears to run and cannot be reached.
 
 ### What leaves this host
 

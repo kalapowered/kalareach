@@ -2151,8 +2151,8 @@ pub mod configuration {
                     .stated("voice.broker_origin (")
                     .withheld(super::export::ContentClass::Location, origin)
                     .stated(
-                        ") is not an absolute https or http origin in lower case, with no path, \
-                         no trailing slash and no port its scheme implies",
+                        ") is not an https or http origin with a lower-case host or a canonical \
+                         address, no port its scheme implies, no path and no trailing slash",
                     ),
             );
         }
@@ -2162,6 +2162,11 @@ pub mod configuration {
             Err(problems)
         }
     }
+
+    /// What a relay or discovery URL is refused with.
+    const NOT_A_SERVICE_URL: &str = "is not an https or http URL with a lower-case host or a \
+         canonical address, no port its scheme implies, no user information, a path of letters, \
+         digits and - . _ ~ / only, and at most 253 characters as an invitation carries it";
 
     /// Returns what is wrong with a network section, value by value.
     ///
@@ -2197,12 +2202,13 @@ pub mod configuration {
             }
         }
         for relay in network.relay_urls() {
-            if !is_http_address(relay) {
+            if !is_service_url(relay) {
                 problems.push(
                     Sentence::new()
                         .stated("a relay in network.relay_urls (")
                         .withheld(Location, relay)
-                        .stated(") is not an absolute https or http URL of at most 253 characters"),
+                        .stated(") ")
+                        .stated(NOT_A_SERVICE_URL),
                 );
             }
         }
@@ -2214,13 +2220,14 @@ pub mod configuration {
             ("network.pkarr_resolver_url (", network.pkarr_resolver_url()),
         ] {
             if let Some(value) = value
-                && !is_http_address(value)
+                && !is_service_url(value)
             {
                 problems.push(
                     Sentence::new()
                         .stated(key)
                         .withheld(Location, value)
-                        .stated(") is not an absolute https or http URL of at most 253 characters"),
+                        .stated(") ")
+                        .stated(NOT_A_SERVICE_URL),
                 );
             }
         }
@@ -2961,7 +2968,12 @@ pub mod configuration {
     /// The longest trust-anchor path this schema records.
     pub const MAX_PATH_LEN: usize = 4096;
 
-    /// Whether `value` fits a network hint: 1 to 253 bytes of printable ASCII and no spaces.
+    /// The longest a relay URL, a discovery URL or origin, or a broker origin may be, as an
+    /// invitation carries it: a network hint is at most 253 bytes of printable ASCII.
+    pub const MAX_HINT_LEN: usize = 253;
+
+    /// Whether `value` fits a network hint: 1 to [`MAX_HINT_LEN`] bytes of printable ASCII and
+    /// no spaces.
     ///
     /// The form an invitation carries a relay URL or a discovery origin in, so a document that
     /// validates is one whose selections this host can hand to a device.
@@ -2969,17 +2981,54 @@ pub mod configuration {
         crate::pairing::NetworkHint::new(value).is_ok()
     }
 
-    /// Whether `value` is an absolute `https` or `http` address with a host, in the form a
-    /// network hint travels in.
-    fn is_http_address(value: &str) -> bool {
-        is_network_hint(value)
-            && value
-                .strip_prefix("https://")
-                .or_else(|| value.strip_prefix("http://"))
-                .is_some_and(|rest| {
-                    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-                    !authority.is_empty() && !authority.contains('@') && !authority.starts_with(':')
-                })
+    /// Splits an `https` or `http` address into its authority, its path and the port its scheme
+    /// implies.
+    fn service_address(value: &str) -> Option<(&str, &str, u16)> {
+        let (rest, implied) = if let Some(rest) = value.strip_prefix("https://") {
+            (rest, crate::pairing::HTTPS_DEFAULT_PORT)
+        } else {
+            (
+                value.strip_prefix("http://")?,
+                crate::pairing::HTTP_DEFAULT_PORT,
+            )
+        };
+        let (authority, path) = rest.find('/').map_or((rest, ""), |at| rest.split_at(at));
+        Some((authority, path, implied))
+    }
+
+    /// Whether an authority is one address spelled one way.
+    ///
+    /// The protocol's own rule for every origin it compares - lower-case names, canonical address
+    /// literals, no port the scheme implies, no user information - with one refusal beside it: a
+    /// name in its A-label form. A URL parser decodes that punycode and may refuse it, and this
+    /// crate cannot decode it the same way, so a document naming one could validate and then be
+    /// refused when the daemon starts.
+    fn is_canonical_authority(authority: &str, implied: u16) -> bool {
+        crate::pairing::validate_authority(authority, implied).is_ok()
+            && crate::pairing::split_authority(authority).is_ok_and(|(host, _, bracketed)| {
+                bracketed || !host.split('.').any(|label| label.starts_with("xn--"))
+            })
+    }
+
+    /// Whether `value` is a relay or discovery URL the transport reads exactly as written.
+    ///
+    /// An `https` or `http` scheme, a canonical authority, and a path of plain characters with no
+    /// `.` or `..` segment, so the URL parser the endpoint uses neither escapes nor resolves any
+    /// of it. Its length is measured as the transport writes it, with the `/` a URL with no path
+    /// gains, because that is the form an invitation carries.
+    fn is_service_url(value: &str) -> bool {
+        let Some((authority, path, implied)) = service_address(value) else {
+            return false;
+        };
+        let written = value.len() + usize::from(path.is_empty());
+        written <= MAX_HINT_LEN
+            && is_canonical_authority(authority, implied)
+            && path
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-._~/".contains(&byte))
+            && !path
+                .split('/')
+                .any(|segment| segment == "." || segment == "..")
     }
 
     /// Whether `value` is a DNS origin: a dotted domain name with no scheme, port or path.
@@ -2992,18 +3041,27 @@ pub mod configuration {
             && !value.split('.').any(str::is_empty)
     }
 
-    /// Whether `value` is an origin a managed broker is addressed at: an absolute address in
-    /// lower case, with no path, no trailing slash and no port its scheme already implies.
+    /// Whether `value` is an origin a managed broker is addressed at: an `https` or `http` scheme
+    /// and a canonical authority, with no path and no trailing slash.
     ///
     /// The broker compares origins by their spelling, so a second spelling of one address would
-    /// be a second service to it.
+    /// be a second service to it, and it reads a host made of the characters a number is written
+    /// in as an address. Such a host is refused here unless it is the canonical spelling of an
+    /// IPv4 address, which the authority rule has already required of an all-digit one.
     fn is_broker_origin(value: &str) -> bool {
-        is_http_address(value)
-            && value.split_once("://").is_some_and(|(scheme, authority)| {
-                !authority.contains(['/', '?', '#'])
-                    && !authority.bytes().any(|byte| byte.is_ascii_uppercase())
-                    && !(scheme == "https" && authority.ends_with(":443"))
-                    && !(scheme == "http" && authority.ends_with(":80"))
+        let Some((authority, path, implied)) = service_address(value) else {
+            return false;
+        };
+        value.len() <= MAX_HINT_LEN
+            && path.is_empty()
+            && is_canonical_authority(authority, implied)
+            && crate::pairing::split_authority(authority).is_ok_and(|(host, _, bracketed)| {
+                bracketed
+                    || !(host.contains(|character: char| character.is_ascii_digit())
+                        && host.contains(|character: char| matches!(character, 'a'..='f' | 'x'))
+                        && host.chars().all(|character| {
+                            character.is_ascii_hexdigit() || matches!(character, '.' | 'x')
+                        }))
             })
     }
 
@@ -5005,6 +5063,31 @@ mod tests {
         "contentSchema",
     ];
 
+    /// Whether a keyword only describes a value rather than constraining it.
+    ///
+    /// The metadata and content-annotation keywords of the 2020-12 vocabulary, `format` (an
+    /// annotation unless a validator opts in), and every extension keyword. A schema made of
+    /// nothing else admits any value.
+    fn is_annotation(keyword: &str) -> bool {
+        matches!(
+            keyword,
+            "title"
+                | "description"
+                | "default"
+                | "examples"
+                | "deprecated"
+                | "readOnly"
+                | "writeOnly"
+                | "$comment"
+                | "$schema"
+                | "$id"
+                | "$anchor"
+                | "format"
+                | "contentEncoding"
+                | "contentMediaType"
+        ) || keyword.starts_with("x-")
+    }
+
     /// The keywords that make an object a map, whose keys are text somebody chose.
     ///
     /// The map-key policy is that no export carries one. A member's name is a word this build
@@ -5045,7 +5128,14 @@ mod tests {
             let schema = match node {
                 // A schema nothing satisfies holds nothing.
                 serde_json::Value::Bool(false) => return Ok(()),
-                serde_json::Value::Object(schema) if !schema.is_empty() => schema,
+                // A schema whose every keyword only describes the value admits any value, however
+                // much it says about it: `{"description": "payload"}` is what a documented
+                // `serde_json::Value` member comes out as.
+                serde_json::Value::Object(schema)
+                    if schema.keys().any(|keyword| !is_annotation(keyword)) =>
+                {
+                    schema
+                }
                 _ => {
                     return Err(format!(
                         "an export reaches a value of any shape, which nothing classes: {node}"
@@ -5226,6 +5316,11 @@ mod tests {
             ),
             (serde_json::json!(true), "any shape"),
             (serde_json::json!({}), "any shape"),
+            (serde_json::json!({ "description": "payload" }), "any shape"),
+            (
+                serde_json::json!({ "title": "payload", "x-kalareach-read-only-metadata": true }),
+                "any shape",
+            ),
             (serde_json::json!({ "items": {} }), "any shape"),
             (
                 serde_json::json!({ "$ref": "https://example.com/elsewhere" }),
@@ -5303,6 +5398,29 @@ mod tests {
             let refused = reach(std::slice::from_ref(&root), &defined)
                 .expect_err("a map reached from an export");
             assert!(refused.contains("a map ("), "{refused}");
+        }
+
+        // A member that holds any JSON value at all, documented or not. Its schema is `true`, or
+        // an object of annotations alone, and either way nothing in it could be classed.
+        #[derive(Serialize, JsonSchema)]
+        struct Opaque {
+            /// Whatever the sender put here.
+            documented: serde_json::Value,
+        }
+        #[derive(Serialize, JsonSchema)]
+        struct Bare {
+            bare: serde_json::Value,
+        }
+        let mut generator = export_generator();
+        let roots = [
+            generator.subschema_for::<Opaque>().to_value(),
+            generator.subschema_for::<Bare>().to_value(),
+        ];
+        let defined = generator.take_definitions(false);
+        for root in roots {
+            let refused = reach(std::slice::from_ref(&root), &defined)
+                .expect_err("a member of any shape reached from an export");
+            assert!(refused.contains("any shape"), "{refused}");
         }
     }
 
@@ -6335,6 +6453,82 @@ mod tests {
                 "and its value is not repeated: {said:?}"
             );
         }
+        // Every address the transport would refuse or rewrite is refused here, so a document that
+        // validates never stops the daemon over its syntax.
+        for refused in [
+            "https://resolver.example:99999",
+            "https://resolver.example:0",
+            "https://resolver.example:0443",
+            "https://resolver.example:443",
+            "http://resolver.example:80",
+            "http://127.1",
+            "http://0x7f000001",
+            "http://[0:0:0:0:0:0:0:1]",
+            "http://[::ffff:192.0.2.1]",
+            "https://Resolver.example",
+            "https://resolver.example.",
+            "https://xn--zz.example",
+            "https://resolver.example/a/../pkarr",
+            "https://resolver.example/./pkarr",
+            "https://resolver.example/%70karr",
+            "https://resolver.example/pkarr?query",
+            "https://resolver.example/pkarr#fragment",
+            "https://resolver.example?query",
+            "https://@resolver.example",
+            "https://",
+        ] {
+            let mut document = ConfigurationDocument::empty();
+            document.network.pkarr_resolver_url = Nullable::some(refused.to_owned());
+            document.network.relay_urls = Nullable::some(vec![refused.to_owned()]);
+            let problems = configuration::validate(&document).expect_err("an address it refuses");
+            for key in ["network.pkarr_resolver_url", "network.relay_urls"] {
+                assert!(
+                    problems
+                        .iter()
+                        .any(|problem| problem.as_str().contains(key)),
+                    "{refused} in {key}: {problems:?}"
+                );
+            }
+        }
+        for accepted in [
+            "https://relay.example.com",
+            "https://relay.example.com/",
+            "https://relay.example.com:8443/relay",
+            "http://127.0.0.1:8080/pkarr",
+            "http://[::1]:8080",
+            "https://a1.be",
+        ] {
+            let mut document = ConfigurationDocument::empty();
+            document.network.relay_urls = Nullable::some(vec![accepted.to_owned()]);
+            configuration::validate(&document)
+                .unwrap_or_else(|problems| panic!("{accepted}: {problems:?}"));
+        }
+        // The length an invitation carries, which is the URL as the transport writes it: one with
+        // no path gains a `/`. The host is dotted labels of at most 60 characters, so the length
+        // is the only rule these two URLs test.
+        let host = |length: usize| {
+            let mut left = length - "https://".len() - ".example".len();
+            let mut labels: Vec<String> = Vec::new();
+            while left > 0 {
+                let dot = usize::from(!labels.is_empty());
+                let take = (left - dot).min(60);
+                assert!(take > 0, "a label is never empty");
+                labels.push("a".repeat(take));
+                left -= take + dot;
+            }
+            format!("https://{}.example", labels.join("."))
+        };
+        let longest_without_a_path = host(configuration::MAX_HINT_LEN - 1);
+        assert_eq!(
+            longest_without_a_path.len(),
+            configuration::MAX_HINT_LEN - 1
+        );
+        let mut document = ConfigurationDocument::empty();
+        document.network.relay_urls = Nullable::some(vec![longest_without_a_path]);
+        configuration::validate(&document).expect("252 bytes, and 253 as written");
+        document.network.relay_urls = Nullable::some(vec![host(configuration::MAX_HINT_LEN)]);
+        configuration::validate(&document).expect_err("253 bytes, and 254 as written");
+
         for origin in [
             "voice.example.com",
             "https://voice.example.com/",
@@ -6342,6 +6536,13 @@ mod tests {
             "https://Voice.example.com",
             "https://voice.example.com:443",
             "http://voice.example.com:80",
+            "https://voice.example:0443",
+            "http://127.1",
+            "http://[0:0:0:0:0:0:0:1]",
+            "https://xn--zz.example",
+            // Read by the broker as an address, and not the canonical spelling of one.
+            "https://a1.be",
+            "https://cafe.b0e",
         ] {
             let mut document = ConfigurationDocument::empty();
             document.voice.broker_origin = Nullable::some(origin.to_owned());

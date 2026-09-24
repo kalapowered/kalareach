@@ -827,59 +827,90 @@ pub fn checks(effective: &EffectiveConfiguration) -> Vec<DoctorCheck> {
     checks
 }
 
+/// What the running host's network and voice services are doing, read from the services
+/// themselves rather than from a record of what they were asked to do.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Running {
+    /// The endpoint this host is on the network with, when it is.
+    pub network: Option<RunningNetwork>,
+    /// Whether the voice service names a managed broker to paired devices.
+    pub names_a_broker: bool,
+}
+
+/// What the endpoint a running host built holds and selects.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RunningNetwork {
+    /// How many sockets it is bound to.
+    pub sockets: usize,
+    /// How many relays its relay map holds.
+    pub relays: usize,
+    /// How many discovery services it publishes to or resolves from: the Pkarr publisher and
+    /// resolver, the DNS origin, local discovery and the Mainline DHT.
+    pub discovery: usize,
+}
+
+impl RunningNetwork {
+    /// Reads the facts of an endpoint this host built, bound to `sockets` sockets.
+    #[must_use]
+    pub fn of(endpoint: &kr_transport::config::EndpointConfig, sockets: usize) -> Self {
+        let discovery = &endpoint.discovery;
+        Self {
+            sockets,
+            relays: endpoint.relay_urls.len(),
+            discovery: [
+                discovery.pkarr_publisher_url.is_some(),
+                discovery.pkarr_resolver_url.is_some(),
+                discovery.dns_origin.is_some(),
+                discovery.local_discovery,
+                discovery.mainline_dht,
+            ]
+            .into_iter()
+            .filter(|selected| *selected)
+            .count(),
+        }
+    }
+}
+
 /// Whether this host is acting on the network and voice broker its configuration selects.
 ///
-/// Both are read once, when the daemon starts, so what is in force is what it started with, and
-/// this check says what that was: whether it joined the network, how many sockets its endpoint
-/// holds and how many services it selected, and whether it names a managed voice broker to its
-/// devices. When the document now selects something else, the check warns that the edit applies
-/// at the next start, rather than leaving an owner to wonder why nothing changed.
+/// Both are read once, when the daemon starts, so what is in force is what the running services
+/// were built with, and `running` is read from those services: whether the endpoint is up, how
+/// many sockets it holds and how many relays and discovery services it was built with, and
+/// whether the voice service names a managed broker. When the document now selects something
+/// other than what this daemon started with, the check warns that the edit applies at the next
+/// start, rather than leaving an owner to wonder why nothing changed.
 ///
-/// `document` is the document the rest of the report was read from, and `bound_sockets` how many
-/// sockets the endpoint holds, which is zero on a host that is not on the network.
+/// `document` is the document the rest of the report was read from.
 #[must_use]
 pub fn network_check(
     started: &Started,
     document: Option<&configuration::ConfigurationDocument>,
-    bound_sockets: usize,
+    running: Running,
 ) -> DoctorCheck {
-    let network = &started.network;
-    let mut detail = if network.joins() {
-        let discovery = [
-            network.pkarr_publisher_url().is_some(),
-            network.pkarr_resolver_url().is_some(),
-            network.dns_origin().is_some(),
-            network.local_discovery(),
-            network.mainline_dht(),
-        ]
-        .into_iter()
-        .filter(|selected| *selected)
-        .count();
-        Sentence::new()
-            .stated("this host joined the network when it started: its endpoint holds ")
-            .number(bound_sockets as u64)
+    let mut detail = match running.network {
+        Some(network) => Sentence::new()
+            .stated("this host is on the network: its endpoint holds ")
+            .number(network.sockets as u64)
             .stated(" sockets, with ")
-            .number(network.relay_urls().len() as u64)
+            .number(network.relays as u64)
             .stated(" relays and ")
-            .number(discovery as u64)
-            .stated(" discovery services selected")
-    } else {
-        Sentence::new().stated(
-            "this host selected no network when it started, and serves its local endpoint alone",
-        )
+            .number(network.discovery as u64)
+            .stated(" discovery services selected"),
+        None => Sentence::new()
+            .stated("this host is not on the network, and serves its local endpoint alone"),
     };
-    detail = detail.stated(if started.voice.broker_origin().is_some() {
-        "; it names a managed voice broker to its paired devices"
+    detail = detail.stated(if running.names_a_broker {
+        "; its voice service names a managed broker to paired devices"
     } else {
-        "; it names no managed voice broker"
+        "; its voice service names no managed broker"
     });
     // Compared with what the document says now. A document this host cannot use selects nothing,
     // which is also what an owner who wrote no network section is told.
     let moved = Started::of(document) != *started;
     if moved {
         detail = detail.stated(
-            "; the configuration document now selects a different network or voice broker, which \
-             applies at the next start",
+            "; the configuration document now selects a different network or voice broker from the \
+             one this host started with, which applies at the next start",
         );
     }
     DoctorCheck::new(

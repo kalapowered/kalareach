@@ -453,9 +453,9 @@ async fn the_network_and_the_voice_broker_are_the_documents_and_no_variables() {
         .expect("the network check");
     assert_eq!(
         network.detail(),
-        "this host selected no network when it started, and serves its local endpoint alone; it \
-         names no managed voice broker",
-        "and what is in force is nothing"
+        "this host is not on the network, and serves its local endpoint alone; its voice service \
+         names no managed broker",
+        "and what the running services report is nothing"
     );
     let overrides = result
         .checks
@@ -535,7 +535,7 @@ async fn the_network_and_the_voice_broker_are_the_documents_and_no_variables() {
     assert!(
         network
             .detail()
-            .starts_with("this host joined the network when it started: its endpoint holds "),
+            .starts_with("this host is on the network: its endpoint holds "),
         "{network:?}"
     );
     assert!(
@@ -551,10 +551,47 @@ async fn the_network_and_the_voice_broker_are_the_documents_and_no_variables() {
     assert!(
         network
             .detail()
-            .ends_with("it names a managed voice broker to its paired devices"),
-        "{network:?}"
+            .ends_with("its voice service names a managed broker to paired devices"),
+        "the voice service was built with the document's broker: {network:?}"
     );
     daemon.stop();
+}
+
+/// KR-REQ-26.14: an address the document chose that cannot be bound stops the network with the key
+/// that chose it named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_address_the_document_chose_that_cannot_be_bound_is_named() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let controller = start_controller(&environment, temp.environment_id()).await;
+
+    // Somebody else holds the port the document names.
+    let taken = std::net::UdpSocket::bind("127.0.0.1:0").expect("a socket of this test's own");
+    let address = taken.local_addr().expect("its address");
+    let selection = kr_protocol::hostinfo::configuration::NetworkSelection {
+        enabled: Nullable::some(true),
+        bind_address: Nullable::some(address.to_string()),
+        ..kr_protocol::hostinfo::configuration::NetworkSelection::default()
+    };
+    let settings = kr_controller::service::net::config::NetworkSettings::from_selection(&selection)
+        .expect("a usable selection")
+        .expect("this host joins");
+    let refused = kr_controller::service::net::register(
+        &controller,
+        kr_controller::service::net::NetworkSetup {
+            settings,
+            secrets: std::sync::Arc::new(kr_crypto::store::MemoryStore::new()),
+            rendezvous: None,
+        },
+    )
+    .await
+    .expect_err("an address somebody else holds");
+    assert!(
+        refused.to_string().contains("network.bind_address"),
+        "{refused}"
+    );
+    drop(taken);
+    drop(controller);
 }
 
 /// KR-REQ-26.15: a configured budget more permissive than section 11 allows never applies.

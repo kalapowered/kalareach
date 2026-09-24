@@ -627,9 +627,9 @@ lines show both what was asked for and what is in force. `--json` carries the sa
 
 The document's `network` and `voice` sections are printed the same way, one line for each of their
 eleven fields, and each says `applies at the next start`: the daemon reads them when it starts, and
-no environment variable reaches them. The `configuration-network` check says what the running host
-started with, and warns when the document now selects a different network or voice broker, which
-takes a restart to put into force.
+no environment variable reaches them. The `configuration-network` check reports what the running
+network and voice services are doing, and warns when the document now selects a different network
+or voice broker, which takes a restart to put into force.
 
 Asking for the diagnostics is what puts this host's configuration into force, so a ceiling somebody
 edited by hand takes effect during the run. One that changes what a caller may do withdraws the

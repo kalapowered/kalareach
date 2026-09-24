@@ -227,6 +227,12 @@ impl NetworkGuard {
         Ok(config)
     }
 
+    /// Returns the configuration this host's endpoint was built from: its relay map and the
+    /// discovery services it publishes to and resolves from.
+    pub(crate) fn endpoint(&self) -> &kr_transport::config::EndpointConfig {
+        &self.host.endpoint
+    }
+
     /// Returns the addresses this endpoint is bound to, which are the hints a peer dials.
     pub(crate) fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
         self.listener
@@ -926,6 +932,9 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
         .enrol_owner(Arc::new(crate::project::HostOwner::new(Arc::clone(
             &host.pairing,
         ))))?;
+    // Whether the address the endpoint binds is one the configuration document chose, so a bind
+    // that fails names the key that chose it rather than only the operating system's reason.
+    let chosen_address = setup.settings.endpoint.bind_addr.is_some();
     let mut config = ListenerConfig::new(
         setup.settings.endpoint,
         HostEpochs {
@@ -944,7 +953,25 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
         clock,
     )
     .await
-    .map_err(|error| ControllerError::NotConfigured(error.to_string()))?;
+    .map_err(|error| match error {
+        kr_transport::TransportError::Bind(reason) if chosen_address => {
+            ControllerError::InvalidArgument(format!(
+                "{} in this host's configuration document ({}) could not be bound: {reason}",
+                kr_protocol::hostinfo::configuration::NETWORK_BIND_ADDRESS.key,
+                kr_protocol::hostinfo::configuration::FILE_NAME,
+            ))
+        }
+        kr_transport::TransportError::Configuration { kind, reason, .. }
+            if kind == "bind address" =>
+        {
+            ControllerError::InvalidArgument(format!(
+                "{} in this host's configuration document ({}) is not usable: {reason}",
+                kr_protocol::hostinfo::configuration::NETWORK_BIND_ADDRESS.key,
+                kr_protocol::hostinfo::configuration::FILE_NAME,
+            ))
+        }
+        other => ControllerError::NotConfigured(other.to_string()),
+    })?;
     *guard
         .listener
         .lock()

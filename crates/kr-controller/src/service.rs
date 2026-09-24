@@ -6290,13 +6290,18 @@ impl Controller {
         // working from.
         let budgets = crate::config::catalogue::budgets(&accepted.resolver.ceilings());
         let effective = self.report_configuration(&accepted).await;
-        // What this daemon started with against what the same reading of the document selects,
-        // so an edit that applies at the next start says so.
+        // What the running network and voice services are doing, read from them, against what
+        // the same reading of the document selects, so an edit that applies at the next start
+        // says so.
         let network = crate::config::network_check(
             &self.started,
             accepted.resolver.loaded().document.as_ref(),
-            self.network_guard()
-                .map_or(0, |guard| guard.bound_sockets().len()),
+            crate::config::Running {
+                network: self.network_guard().map(|guard| {
+                    crate::config::RunningNetwork::of(guard.endpoint(), guard.bound_sockets().len())
+                }),
+                names_a_broker: !self.voice().broker_origin().is_empty(),
+            },
         );
         drop(accepted);
         checks.extend(crate::config::checks(&effective));
