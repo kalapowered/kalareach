@@ -315,12 +315,26 @@ pub enum ActionImplementation {
     /// The broker sends one routed upstream method with the bound parameters.
     ///
     /// The method must be one the package's connector table routes and classifies, so what the
-    /// broker sends is something a reviewer read and a publisher qualified.
+    /// broker sends is something a reviewer read and a publisher qualified. It does not answer an
+    /// approval: an answer carries the identifier of the request it resolves and a value the
+    /// connector table maps, and neither is a parameter. That is
+    /// [`ActionImplementation::DecisionDestination`].
     UpstreamMethod {
         /// The method, as the connector table names it.
         method: MethodName,
         /// Which declared parameter supplies each field of the request.
         bindings: Vec<ParameterBinding>,
+    },
+    /// The broker answers the pending request the invocation names, through the connector table's
+    /// decision destination.
+    ///
+    /// The answer is the destination's method, carrying the named request's own identifier and the
+    /// upstream's value for the decision the named parameter holds. Nothing else goes in, so a
+    /// caller can neither choose which request is answered nor supply a value the table does not
+    /// map.
+    DecisionDestination {
+        /// The declared choice parameter that carries the decision.
+        decision: ParameterName,
     },
     /// The broker requests cancellation of the bound execution's current turn.
     UpstreamCancel {},
@@ -339,6 +353,7 @@ impl ActionImplementation {
             Self::Presentation {} => "presentation",
             Self::Component {} => "component",
             Self::UpstreamMethod { .. } => "upstream_method",
+            Self::DecisionDestination { .. } => "decision_destination",
             Self::UpstreamCancel {} => "upstream_cancel",
             Self::TerminalText { .. } => "terminal_text",
         }
@@ -356,10 +371,9 @@ impl ActionImplementation {
             Self::Component {} => true,
             Self::UpstreamMethod { .. } => matches!(
                 effect,
-                EffectClass::UpstreamPrompt
-                    | EffectClass::UpstreamAttachment
-                    | EffectClass::ApprovalRespond
+                EffectClass::UpstreamPrompt | EffectClass::UpstreamAttachment
             ),
+            Self::DecisionDestination { .. } => matches!(effect, EffectClass::ApprovalRespond),
             Self::UpstreamCancel {} => matches!(effect, EffectClass::UpstreamCancel),
             Self::TerminalText { .. } => matches!(effect, EffectClass::TerminalInput),
         }
@@ -374,7 +388,10 @@ impl ActionImplementation {
     /// Returns true when this form needs the package to ship a connector table.
     #[must_use]
     pub const fn needs_connector(&self) -> bool {
-        matches!(self, Self::UpstreamMethod { .. })
+        matches!(
+            self,
+            Self::UpstreamMethod { .. } | Self::DecisionDestination { .. }
+        )
     }
 
     /// Returns every declared parameter this form refers to.
@@ -384,6 +401,7 @@ impl ActionImplementation {
             Self::UpstreamMethod { bindings, .. } => {
                 bindings.iter().map(|binding| &binding.parameter).collect()
             }
+            Self::DecisionDestination { decision } => vec![decision],
             Self::TerminalText { template } => template
                 .iter()
                 .filter_map(|segment| match segment {
@@ -469,6 +487,25 @@ impl ActionDeclaration {
         self.parameters
             .check(invocation)
             .map_err(InvocationError::Arguments)
+    }
+
+    /// Returns the decision one invocation of an answering action carries.
+    ///
+    /// It is the choice the invocation supplies for the parameter the implementation names. An
+    /// action answered some other way, or an invocation without that choice, carries none.
+    #[must_use]
+    pub fn decision<'a>(&self, invocation: &'a ActionInvocation) -> Option<&'a ParameterName> {
+        let ActionImplementation::DecisionDestination { decision } = &self.implementation else {
+            return None;
+        };
+        invocation
+            .arguments
+            .iter()
+            .find(|argument| &argument.name == decision)
+            .and_then(|argument| match &argument.value {
+                ArgumentValue::Choice { choice_id } => Some(choice_id),
+                _ => None,
+            })
     }
 }
 

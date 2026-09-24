@@ -4,8 +4,8 @@
   "plugin_name": "example-connector",
   "version": "0.1.0",
   "display_name": "Example connector package",
-  "description": "Recognises the example agent, reads its protocol through a declarative table and sends prompts.",
-  "sdk_range": ">=0.1.0, <0.2.0",
+  "description": "Recognises the example agent, reads its protocol through a declarative table, sends prompts and answers its tool approvals.",
+  "sdk_range": ">=0.1.1, <0.2.0",
   "wit_range": ">=0.1.0, <0.2.0",
   "source": {
     "repository": "https://github.com/kalapowered/kalareach-plugins",
@@ -45,14 +45,14 @@
     {
       "role": "connector",
       "path": "connector.json",
-      "digest": "69b15753afb0c04d242e541596dccc1f25d34d5c8a5778f7cfb8370641dfec94",
-      "size_bytes": "1935"
+      "digest": "62bfe3f017bfe6b7938bb060d5deda151d82703770ccad21607df1f75428c6de",
+      "size_bytes": "3222"
     },
     {
       "role": "presentation",
       "path": "presentation.json",
-      "digest": "0deee388f08586e37025749675638b8ff447943b6ebab8af46829091f434be49",
-      "size_bytes": "2558"
+      "digest": "c51b6643a1f3d39a1b64ca042c5e19351ab688b2cc0e22a58275b3b7fb3d634e",
+      "size_bytes": "5649"
     }
   ],
   "capabilities": [
@@ -71,6 +71,10 @@
     {
       "capability": "upstream.action",
       "reason": "Send a prompt the person wrote to the bound application"
+    },
+    {
+      "capability": "approval.respond",
+      "reason": "Answer a tool approval the application is waiting on with the decision a person made"
     }
   ],
   "actions": [
@@ -137,6 +141,39 @@
         ]
       },
       "description": "Start a turn with the prompt the person wrote",
+      "confirmation_required": false
+    },
+    {
+      "id": "approval.answer",
+      "label": "Answer",
+      "effect": "approval.respond",
+      "implementation": {
+        "type": "decision_destination",
+        "decision": "decision"
+      },
+      "parameters": {
+        "parameters": [
+          {
+            "name": "decision",
+            "kind": {
+              "type": "choice",
+              "choices": [
+                {
+                  "id": "allow",
+                  "label": "Allow"
+                },
+                {
+                  "id": "deny",
+                  "label": "Deny"
+                }
+              ]
+            },
+            "label": "Decision",
+            "required": true
+          }
+        ]
+      },
+      "description": "Answer the tool approval the application is waiting on",
       "confirmation_required": false
     }
   ],

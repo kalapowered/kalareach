@@ -58,6 +58,16 @@
       "method": "credential.read",
       "wire_name": "credential/read",
       "direction": "upstream_to_host"
+    },
+    {
+      "method": "approval.request",
+      "wire_name": "approval/request",
+      "direction": "upstream_to_host"
+    },
+    {
+      "method": "approval.answer",
+      "wire_name": "approval/answer",
+      "direction": "host_to_upstream"
     }
   ],
   "methods": [
@@ -80,9 +90,56 @@
       "method": "credential.read",
       "class": "credential",
       "evidence": "Carries the upstream token; the broker keeps it"
+    },
+    {
+      "method": "approval.request",
+      "class": "mutation",
+      "evidence": "Asks for a decision on a tool call the agent is waiting on; answering it runs or refuses the call"
+    },
+    {
+      "method": "approval.answer",
+      "class": "mutation",
+      "evidence": "Answers the request named by params.request_id, which runs or refuses the tool call"
     }
   ],
-  "decision_destination": null,
+  "decision_destination": {
+    "answers": "approval.request",
+    "method": "approval.answer",
+    "request_id_path": {
+      "segments": [
+        {
+          "type": "member",
+          "name": "params"
+        },
+        {
+          "type": "member",
+          "name": "request_id"
+        }
+      ]
+    },
+    "decision_path": {
+      "segments": [
+        {
+          "type": "member",
+          "name": "params"
+        },
+        {
+          "type": "member",
+          "name": "decision"
+        }
+      ]
+    },
+    "decisions": [
+      {
+        "decision": "allow",
+        "value": "approved"
+      },
+      {
+        "decision": "deny",
+        "value": "denied"
+      }
+    ]
+  },
   "volatile_forwarding": false,
   "qualification_note": "Qualified against example-agent 1.2.0 with the published protocol reference"
 }

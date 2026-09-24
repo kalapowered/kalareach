@@ -40,7 +40,7 @@ fn a_manifest_declares_identity_ranges_match_rules_platforms_hashes_and_capabili
     assert_eq!(manifest["publisher_id"], "kalareach");
     assert_eq!(manifest["plugin_name"], "example-connector");
     assert_eq!(manifest["version"], "0.1.0");
-    assert_eq!(manifest["sdk_range"], ">=0.1.0, <0.2.0");
+    assert_eq!(manifest["sdk_range"], ">=0.1.1, <0.2.0");
     assert_eq!(manifest["wit_range"], ">=0.1.0, <0.2.0");
 
     // Match rules name both the executable and the distribution it came from.
@@ -119,7 +119,8 @@ fn a_manifest_declares_identity_ranges_match_rules_platforms_hashes_and_capabili
             "metadata.match",
             "presentation.declarative",
             "broker.semantic_events",
-            "upstream.action"
+            "upstream.action",
+            "approval.respond"
         ]
     );
     assert!(requested.iter().all(|(_, reason)| !reason.is_empty()));
@@ -127,6 +128,8 @@ fn a_manifest_declares_identity_ranges_match_rules_platforms_hashes_and_capabili
     // The actions it registers, each with its effect class.
     assert_eq!(manifest["actions"][0]["id"], "prompt.send");
     assert_eq!(manifest["actions"][0]["effect"], "upstream.prompt");
+    assert_eq!(manifest["actions"][1]["id"], "approval.answer");
+    assert_eq!(manifest["actions"][1]["effect"], "approval.respond");
 }
 
 /// KR-REQ-11.19: an unbounded SDK range, a payload whose bytes do not match its hash and an effect

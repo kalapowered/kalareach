@@ -322,6 +322,42 @@ pub fn example_connector_presentation() -> PresentationManifest {
         )),
     };
 
+    // One control per decision. Each narrows the answer's decision to its own choice, and each is
+    // shown only to an actor who may answer while an approval is waiting. Which approval a press
+    // answers is not the document's to say: the invocation names the pending resource.
+    let answer = |id: &str, choice: &str, text: &str, icon, priority| Control {
+        id: ControlId::new(id).expect("a literal control id"),
+        revision: NodeRevision::new(1),
+        label: label(text),
+        icon,
+        accessible_description: AccessibleDescription::new(format!(
+            "{text} the tool call the application is waiting on"
+        ))
+        .expect("a literal description"),
+        action_id: ActionName::new("approval.answer").expect("a literal action name"),
+        parameters: decision_parameters(&[(choice, text)]),
+        priority,
+        visible_when: Predicate::All {
+            terms: vec![
+                Predicate::Grant {
+                    right: crate::effect::ActionRight::AgentApprovalRespond,
+                },
+                Predicate::Flag {
+                    flag: PresentationFlag::PendingApproval,
+                },
+            ],
+        },
+        enabled_when: Predicate::Not {
+            term: Box::new(Predicate::Binding {
+                state: BindingState::NativeOnlyVolatile,
+            }),
+        },
+        disabled_reason: Nullable(Some(
+            crate::text::DisabledReason::new("Answers wait until this host can record them again")
+                .expect("a literal reason"),
+        )),
+    };
+
     PresentationManifest {
         manifest_version: 1,
         base_revision: NodeRevision::new(1),
@@ -343,12 +379,59 @@ pub fn example_connector_presentation() -> PresentationManifest {
                     state: ProgressState::Indeterminate {},
                 },
             },
+            DocumentNode {
+                id: NodeId::new("approval").expect("a literal node id"),
+                revision: NodeRevision::new(1),
+                body: NodeBody::ActionGroup {
+                    label: label("Tool approval"),
+                    controls: vec![
+                        answer(
+                            "allow",
+                            "allow",
+                            "Allow",
+                            StandardIcon::Check,
+                            SemanticPriority::Primary,
+                        ),
+                        answer(
+                            "deny",
+                            "deny",
+                            "Deny",
+                            StandardIcon::Cross,
+                            SemanticPriority::Secondary,
+                        ),
+                    ],
+                },
+            },
         ],
         voice: VoiceProjection {
             status_nodes: vec![NodeId::new("activity").expect("a literal node id")],
-            choice_controls: vec![ControlId::new("send").expect("a literal control id")],
+            choice_controls: vec![
+                ControlId::new("send").expect("a literal control id"),
+                ControlId::new("allow").expect("a literal control id"),
+                ControlId::new("deny").expect("a literal control id"),
+            ],
             detail_nodes: Vec::new(),
         },
+    }
+}
+
+/// The parameters of the example's answer: one required decision, from the choices given.
+fn decision_parameters(choices: &[(&str, &str)]) -> ParameterSchema {
+    ParameterSchema {
+        parameters: vec![ParameterDeclaration {
+            name: ParameterName::new("decision").expect("a literal parameter name"),
+            kind: ParameterKind::Choice {
+                choices: choices
+                    .iter()
+                    .map(|(id, text)| crate::effect::ParameterChoice {
+                        id: ParameterName::new(*id).expect("a literal choice id"),
+                        label: label(text),
+                    })
+                    .collect(),
+            },
+            label: label("Decision"),
+            required: true,
+        }],
     }
 }
 
@@ -388,8 +471,8 @@ fn member(name: &str) -> crate::connector::FieldSegment {
 #[must_use]
 pub fn example_connector_table() -> crate::connector::ConnectorManifest {
     use crate::connector::{
-        BrokerTransport, ConnectorManifest, FieldPath, Framing, MethodClass, MethodClassification,
-        ProtocolPin, ResponseCorrelation, Route, RouteDirection,
+        BrokerTransport, ConnectorManifest, DecisionDestination, DecisionValue, FieldPath, Framing,
+        MethodClass, MethodClassification, ProtocolPin, ResponseCorrelation, Route, RouteDirection,
     };
     use crate::ids::MethodName;
 
@@ -438,6 +521,16 @@ pub fn example_connector_table() -> crate::connector::ConnectorManifest {
                 wire_name: "credential/read".to_owned(),
                 direction: RouteDirection::UpstreamToHost,
             },
+            Route {
+                method: MethodName::new("approval.request").expect("a literal method name"),
+                wire_name: "approval/request".to_owned(),
+                direction: RouteDirection::UpstreamToHost,
+            },
+            Route {
+                method: MethodName::new("approval.answer").expect("a literal method name"),
+                wire_name: "approval/answer".to_owned(),
+                direction: RouteDirection::HostToUpstream,
+            },
         ],
         methods: vec![
             MethodClassification {
@@ -460,8 +553,41 @@ pub fn example_connector_table() -> crate::connector::ConnectorManifest {
                 class: MethodClass::Credential,
                 evidence: summary("Carries the upstream token; the broker keeps it"),
             },
+            MethodClassification {
+                method: MethodName::new("approval.request").expect("a literal method name"),
+                class: MethodClass::Mutation,
+                evidence: summary(
+                    "Asks for a decision on a tool call the agent is waiting on; answering it runs or refuses the call",
+                ),
+            },
+            MethodClassification {
+                method: MethodName::new("approval.answer").expect("a literal method name"),
+                class: MethodClass::Mutation,
+                evidence: summary(
+                    "Answers the request named by params.request_id, which runs or refuses the tool call",
+                ),
+            },
         ],
-        decision_destination: Nullable(None),
+        decision_destination: Nullable(Some(DecisionDestination {
+            answers: MethodName::new("approval.request").expect("a literal method name"),
+            method: MethodName::new("approval.answer").expect("a literal method name"),
+            request_id_path: FieldPath {
+                segments: vec![member("params"), member("request_id")],
+            },
+            decision_path: FieldPath {
+                segments: vec![member("params"), member("decision")],
+            },
+            decisions: vec![
+                DecisionValue {
+                    decision: ParameterName::new("allow").expect("a literal decision"),
+                    value: "approved".to_owned(),
+                },
+                DecisionValue {
+                    decision: ParameterName::new("deny").expect("a literal decision"),
+                    value: "denied".to_owned(),
+                },
+            ],
+        })),
         volatile_forwarding: false,
         qualification_note: Nullable(Some(summary(
             "Qualified against example-agent 1.2.0 with the published protocol reference",
@@ -490,10 +616,10 @@ pub fn example_connector_manifest(
         version: PackageVersion::parse("0.1.0").expect("a literal version"),
         display_name: label("Example connector package"),
         description: CompactDescription::new(
-            "Recognises the example agent, reads its protocol through a declarative table and sends prompts.",
+            "Recognises the example agent, reads its protocol through a declarative table, sends prompts and answers its tool approvals.",
         )
         .expect("a literal description"),
-        sdk_range: VersionRange::parse(">=0.1.0, <0.2.0").expect("a literal range"),
+        sdk_range: VersionRange::parse(">=0.1.1, <0.2.0").expect("a literal range"),
         wit_range: VersionRange::parse(">=0.1.0, <0.2.0").expect("a literal range"),
         source: SourcePin {
             repository: "https://github.com/kalapowered/kalareach-plugins".to_owned(),
@@ -554,8 +680,15 @@ pub fn example_connector_manifest(
                 capability: PluginCapability::UpstreamAction,
                 reason: summary("Send a prompt the person wrote to the bound application"),
             },
+            CapabilityRequest {
+                capability: PluginCapability::ApprovalRespond,
+                reason: summary(
+                    "Answer a tool approval the application is waiting on with the decision a person made",
+                ),
+            },
         ],
-        actions: vec![ActionDeclaration {
+        actions: vec![
+            ActionDeclaration {
             id: ActionName::new("prompt.send").expect("a literal action name"),
             label: label("Send prompt"),
             effect: EffectClass::UpstreamPrompt,
@@ -579,7 +712,19 @@ pub fn example_connector_manifest(
             parameters: prompt_parameters(),
             description: summary("Start a turn with the prompt the person wrote"),
             confirmation_required: false,
-        }],
+        },
+        ActionDeclaration {
+            id: ActionName::new("approval.answer").expect("a literal action name"),
+            label: label("Answer"),
+            effect: EffectClass::ApprovalRespond,
+            implementation: ActionImplementation::DecisionDestination {
+                decision: ParameterName::new("decision").expect("a literal parameter name"),
+            },
+            parameters: decision_parameters(&[("allow", "Allow"), ("deny", "Deny")]),
+            description: summary("Answer the tool approval the application is waiting on"),
+            confirmation_required: false,
+        },
+        ],
         attachments: Nullable(None),
         native_bridge: Nullable(None),
     }

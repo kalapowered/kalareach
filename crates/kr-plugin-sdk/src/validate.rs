@@ -1175,6 +1175,23 @@ fn check_implementation(
                             ),
                         ));
                     }
+                    // The destination's method carries answers, and an answer names the request it
+                    // resolves. Sent with parameters instead, it would answer whichever request its
+                    // bytes happened to name.
+                    if connector
+                        .decision_destination
+                        .as_ref()
+                        .is_some_and(|destination| &destination.method == method)
+                    {
+                        report.push(Finding::at(
+                            FindingCode::ImplementationUnsatisfied,
+                            MANIFEST_FILE,
+                            format!(
+                                "the action {} sends {method}, which the connector table keeps for answers; an answer is implemented as decision_destination",
+                                action.id
+                            ),
+                        ));
+                    }
                     for binding in bindings {
                         for reserved in [&connector.request_id_path, &connector.method_path] {
                             if paths_overlap(&binding.field, reserved) {
@@ -1232,6 +1249,9 @@ fn check_implementation(
                 }
             }
         }
+        ActionImplementation::DecisionDestination { decision } => {
+            check_answer(connector, action, decision, report);
+        }
         ActionImplementation::TerminalText { template }
             if template.is_empty() || template.len() > MAX_TEXT_SEGMENTS =>
         {
@@ -1246,6 +1266,77 @@ fn check_implementation(
             ));
         }
         _ => {}
+    }
+}
+
+/// Checks an action that answers through the connector table's decision destination.
+///
+/// The answer carries one decision and nothing else, so the action declares exactly one parameter:
+/// a required choice, each of whose choices the destination maps to an upstream value. A choice the
+/// table does not map would be a decision a person could make and the host could not send.
+fn check_answer(
+    connector: Option<&ConnectorManifest>,
+    action: &ActionDeclaration,
+    decision: &crate::ids::ParameterName,
+    report: &mut Report,
+) {
+    let mut unsatisfied = |detail: String| {
+        report.push(Finding::at(
+            FindingCode::ImplementationUnsatisfied,
+            MANIFEST_FILE,
+            detail,
+        ));
+    };
+    let destination = match connector {
+        None => {
+            unsatisfied(format!(
+                "the action {} answers through the connector table's decision destination and the package ships no connector table",
+                action.id
+            ));
+            None
+        }
+        Some(connector) => {
+            let destination = connector.decision_destination.as_ref();
+            if destination.is_none() {
+                unsatisfied(format!(
+                    "the action {} answers through the connector table's decision destination and the table declares none",
+                    action.id
+                ));
+            }
+            destination
+        }
+    };
+    for parameter in &action.parameters.parameters {
+        if &parameter.name != decision {
+            unsatisfied(format!(
+                "the action {} declares the parameter {}, which an answer does not carry",
+                action.id, parameter.name
+            ));
+            continue;
+        }
+        if !parameter.required {
+            unsatisfied(format!(
+                "the action {} answers with {decision}, which it does not require",
+                action.id
+            ));
+        }
+        let ParameterKind::Choice { choices } = &parameter.kind else {
+            unsatisfied(format!(
+                "the action {} answers with {decision}, which is not a choice",
+                action.id
+            ));
+            continue;
+        };
+        if let Some(destination) = destination {
+            for choice in choices {
+                if destination.value_for(&choice.id).is_none() {
+                    unsatisfied(format!(
+                        "the action {} offers the decision {}, which the decision destination does not map",
+                        action.id, choice.id
+                    ));
+                }
+            }
+        }
     }
 }
 

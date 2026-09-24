@@ -94,6 +94,112 @@
           "kind": "indeterminate"
         }
       }
+    },
+    {
+      "id": "approval",
+      "revision": "1",
+      "body": {
+        "kind": "action_group",
+        "label": "Tool approval",
+        "controls": [
+          {
+            "id": "allow",
+            "revision": "1",
+            "label": "Allow",
+            "icon": "check",
+            "accessible_description": "Allow the tool call the application is waiting on",
+            "action_id": "approval.answer",
+            "parameters": {
+              "parameters": [
+                {
+                  "name": "decision",
+                  "kind": {
+                    "type": "choice",
+                    "choices": [
+                      {
+                        "id": "allow",
+                        "label": "Allow"
+                      }
+                    ]
+                  },
+                  "label": "Decision",
+                  "required": true
+                }
+              ]
+            },
+            "priority": "primary",
+            "visible_when": {
+              "op": "all",
+              "terms": [
+                {
+                  "op": "grant",
+                  "right": "agent.approval.respond"
+                },
+                {
+                  "op": "flag",
+                  "flag": "pending_approval"
+                }
+              ]
+            },
+            "enabled_when": {
+              "op": "not",
+              "term": {
+                "op": "binding",
+                "state": "native_only_volatile"
+              }
+            },
+            "disabled_reason": "Answers wait until this host can record them again"
+          },
+          {
+            "id": "deny",
+            "revision": "1",
+            "label": "Deny",
+            "icon": "cross",
+            "accessible_description": "Deny the tool call the application is waiting on",
+            "action_id": "approval.answer",
+            "parameters": {
+              "parameters": [
+                {
+                  "name": "decision",
+                  "kind": {
+                    "type": "choice",
+                    "choices": [
+                      {
+                        "id": "deny",
+                        "label": "Deny"
+                      }
+                    ]
+                  },
+                  "label": "Decision",
+                  "required": true
+                }
+              ]
+            },
+            "priority": "secondary",
+            "visible_when": {
+              "op": "all",
+              "terms": [
+                {
+                  "op": "grant",
+                  "right": "agent.approval.respond"
+                },
+                {
+                  "op": "flag",
+                  "flag": "pending_approval"
+                }
+              ]
+            },
+            "enabled_when": {
+              "op": "not",
+              "term": {
+                "op": "binding",
+                "state": "native_only_volatile"
+              }
+            },
+            "disabled_reason": "Answers wait until this host can record them again"
+          }
+        ]
+      }
     }
   ],
   "voice": {
@@ -101,7 +207,9 @@
       "activity"
     ],
     "choice_controls": [
-      "send"
+      "send",
+      "allow",
+      "deny"
     ],
     "detail_nodes": []
   }
