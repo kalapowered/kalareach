@@ -356,8 +356,8 @@ pub struct Controller {
     /// ([`Self::complete_revocation`]).
     ///
     /// Two callers that both read one debt before either had fenced for it would both fence: two
-    /// revisions and every connection withdrawn twice for one withdrawal. The second caller now
-    /// reads the debt once the first has cleared it.
+    /// revisions and every connection withdrawn twice for one withdrawal. The second caller reads
+    /// the debt once the first has fenced for it and cleared it.
     fence_settlement: tokio::sync::Mutex<()>,
     /// The environment's transfer service, whose methods this daemon admits and dispatches.
     transfer: Arc<crate::transfer::TransferModule>,
@@ -1860,10 +1860,12 @@ impl Controller {
     /// would see an empty set of *newly* revoked rows. So each half of a revocation writes its debt
     /// down by identity before the fence is attempted, and only a completed fence clears it.
     ///
-    /// One debt is settled once. The debt is read, fenced and cleared by one caller at a time
-    /// ([`Self::fence_settlement`]), so a caller that read the debt while another was fencing for
-    /// it does not fence again: it reads the debt afterwards, finds it cleared, and answers with
-    /// the revision that fence advanced to.
+    /// Callers settling one debt at once fence for it once. The debt is read, fenced and cleared by
+    /// one caller at a time ([`Self::fence_settlement`]), so a caller that would have read the debt
+    /// while another was fencing for it reads it afterwards, finds it cleared, and answers with the
+    /// revision that fence advanced to. A fence whose clearing could not be written leaves the
+    /// debt owed, and the next caller fences again: a fence raised twice is safe, and a debt
+    /// dropped unfenced is not.
     async fn complete_revocation(
         &self,
         revoked_grants: kr_protocol::scalars::CanonicalSet<kr_protocol::ids::GrantId>,

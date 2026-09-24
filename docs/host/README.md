@@ -3573,9 +3573,11 @@ window has closed, or whose daemon has restarted since, is still told what happe
 No attempt takes over a claim, however long ago it was written: an attempt that is still running is
 not known to have stopped, and one that stopped may already have reached its effect. So a retry
 cannot perform a withdrawal a second time or start a second metered call, and an action identifier
-reused with different parameters is a conflict rather than a second change. A fence owed for one
-withdrawal is raised once: one caller at a time reads the debt, fences and clears it, and a caller
-that finds it cleared answers with the revision that fence advanced to.
+reused with different parameters is a conflict rather than a second change. Callers settling the
+fence one withdrawal owes at the same time raise it once: one caller at a time reads the debt,
+fences and clears it, and a caller that finds it cleared answers with the revision that fence
+advanced to. A fence whose clearing could not be written stays owed, and the next caller raises it
+again, because a fence raised twice is safe and a debt dropped unfenced is not.
 
 The fence this daemon takes is host-wide: every registration is withdrawn and the connections that
 kept their authority are re-admitted at the revision now in force. Withdrawing one device's
