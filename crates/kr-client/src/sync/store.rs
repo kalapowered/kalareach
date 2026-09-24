@@ -3602,6 +3602,26 @@ mod windows_tests {
     }
 
     #[test]
+    fn the_flush_itself_is_asked_of_the_operating_system() {
+        /// The right to read a file's attributes, which opens a directory and permits no flush.
+        const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+
+        // The operating system flushes only through a handle that may write, and says so when it
+        // is asked through one that may not. A directory opened with nothing more than the right to
+        // read its attributes opens, so what refuses here is the flush: a helper that opened the
+        // directory and never asked for the flush would return success instead.
+        let root = tempfile::tempdir().expect("a directory");
+        assert_eq!(
+            flush_directory(root.path(), FILE_READ_ATTRIBUTES)
+                .expect_err("a flush through a handle that may not write")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        flush_directory(root.path(), FILE_ADD_FILE)
+            .expect("and through one that may add a file, the flush is made");
+    }
+
+    #[test]
     fn a_store_path_is_flushed_through_a_junction_to_its_end() {
         let root = tempfile::tempdir().expect("a directory");
         let target = root.path().join("elsewhere");
