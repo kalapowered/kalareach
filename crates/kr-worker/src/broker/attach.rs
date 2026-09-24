@@ -553,6 +553,31 @@ pub struct NativeGateway {
     /// deadline a single write gets, and so tell a writer this supervision ended from a writer
     /// that ran out of its own time: with both at one value, either could be what happened.
     teardown: std::time::Duration,
+    /// The last process a launch of this gateway started, for this host's own tests.
+    ///
+    /// A launch that fails after its process started returns no process, and this is how a test
+    /// learns which one it has to find stopped.
+    #[cfg(feature = "testing")]
+    last_started: Option<ProcessStartIdentity>,
+}
+
+/// Stops a process a launch started, and waits for it, because the launch failed after it.
+///
+/// The process has not been told where to connect, so it has done nothing anyone depends on, and
+/// it is ended at once rather than given a grace period. It is waited for so that it is gone, not
+/// merely signalled, when the launch returns. On Windows its job is ended with it, which ends
+/// anything it started in the meantime.
+fn stop_started(mut child: std::process::Child, started: &ProcessStartIdentity) {
+    #[cfg(windows)]
+    if let Some(job) = crate::windows::job::agent_job(started) {
+        // Best effort: the child is ended below whatever this answers.
+        let _ = job.terminate(1);
+    }
+    #[cfg(not(windows))]
+    let _ = started;
+    // A process that has already exited cannot be killed, and that is the outcome wanted.
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Starts the agent `command` names and reads back what the kernel started.
@@ -642,7 +667,18 @@ impl NativeGateway {
             registration,
             bridge: None,
             runtime_directory: runtime_directory.to_path_buf(),
+            #[cfg(feature = "testing")]
+            last_started: None,
         })
+    }
+
+    /// Returns the last process a launch of this gateway started, for this host's own tests.
+    ///
+    /// It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub const fn last_started(&self) -> Option<&ProcessStartIdentity> {
+        self.last_started.as_ref()
     }
 
     /// Declares the native bridge the launched application was installed with.
@@ -674,21 +710,31 @@ impl NativeGateway {
     ///
     /// This is the whole of the production order, and the order is the point.
     ///
-    /// 1. The intent is checked against the foreground it was prepared against, because section 12
-    ///    refuses a launch an application took the foreground in front of.
+    /// 1. Everything that can refuse without starting anything is asked first: whether this
+    ///    platform can publish the launch credential as a file, whether the runtime directory is
+    ///    the owner's alone, whether a credential can be drawn, and whether the intent still holds
+    ///    against the foreground it was prepared against, because section 12 refuses a launch an
+    ///    application took the foreground in front of.
     /// 2. The executable is started, with the two file paths in its environment and nothing secret
     ///    in its argument vector.
     /// 3. The kernel is asked what it started, and that identity is what the registration names.
     ///    Nothing the process says about itself is used.
-    /// 4. The private exchange is generated, written to an owner-only file, and handed to the
-    ///    broker as the launch's own record.
+    /// 4. The private exchange is written to an owner-only file and handed to the broker as the
+    ///    launch's own record.
     /// 5. The registration file is written last, and published whole by a rename, so a forwarder
     ///    that reads it reads all of it or nothing, and the credential it names already exists.
     ///
+    /// A launch that fails after step 2 leaves nothing running and nothing reserved: the process
+    /// it started is ended and waited for, the files it wrote are removed, and the broker gives
+    /// back the instance and the conversation the launch took, so a retry is not refused for a
+    /// launch that never happened.
+    ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::Launch`] when the intent is stale, and
-    /// [`BrokerError::LedgerUnavailable`] when the process cannot be started or its files written.
+    /// Returns [`BrokerError::UnsupportedCapability`] on a platform that cannot publish the launch
+    /// credential as a file, [`BrokerError::Launch`] when the intent is stale, and
+    /// [`BrokerError::LedgerUnavailable`] when the directory is not private, or the process cannot
+    /// be started or its files written.
     pub fn launch(
         &mut self,
         intent: &crate::broker::profiles::LaunchIntent,
@@ -699,7 +745,18 @@ impl NativeGateway {
         let application_instance_id = self.launch.application_instance_id;
         let registration_path = self.runtime_directory.join("registration");
         let credential_path = self.runtime_directory.join("credential");
-        // Refused before anything is started. A stale intent must cost nothing.
+        // Refused before anything is started. A launch that cannot be finished must cost nothing,
+        // and on a platform without verifiable owner-only files the credential could never be
+        // published, so no process is started only to be stopped again.
+        if !ManagedProcess::publishes_credential_file() {
+            return Err(BrokerError::UnsupportedCapability {
+                detail: "this platform cannot prove a file is closed to other accounts, so the \
+                         launch credential cannot be published and nothing was started"
+                    .to_owned(),
+            });
+        }
+        crate::broker::process::check_private_directory(&self.runtime_directory)?;
+        let credential = Credential::generate()?;
         let profile = self
             .broker
             .execute_launch(intent, foreground, application_instance_id)?;
@@ -714,7 +771,62 @@ impl NativeGateway {
             // whatever the launched process says to the host that started it.
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped());
-        let (child, started) = start_agent(&mut command, &profile.binary.resolved_path)?;
+        let (child, started) = match start_agent(&mut command, &profile.binary.resolved_path) {
+            Ok(started) => started,
+            Err(error) => {
+                self.broker.abandon_launch(application_instance_id);
+                return Err(error);
+            }
+        };
+        #[cfg(feature = "testing")]
+        {
+            self.last_started = Some(started.clone());
+        }
+        let published = self.publish(
+            &profile,
+            &started,
+            credential,
+            mode,
+            now,
+            &credential_path,
+            &registration_path,
+        );
+        match published {
+            Ok(registration) => {
+                self.launch.expected_process = Some(started.clone());
+                self.registration = Some(registration);
+                Ok(Launched {
+                    child,
+                    process: started,
+                    profile,
+                })
+            }
+            Err(error) => {
+                stop_started(child, &started);
+                self.broker.abandon_launch(application_instance_id);
+                Err(error)
+            }
+        }
+    }
+
+    /// Hands a started process its private exchange, records it, and publishes the registration.
+    ///
+    /// The credential file is created new, so one already there makes this fail and is left alone.
+    /// Once this has written it, the file is this launch's own, and a later failure removes it
+    /// again: the name is free for a retry, and no secret is left behind for a process that was
+    /// stopped.
+    #[allow(clippy::too_many_arguments)]
+    fn publish(
+        &self,
+        profile: &kr_protocol::broker::LaunchProfile,
+        started: &ProcessStartIdentity,
+        credential: Credential,
+        mode: kr_protocol::broker::IntegrationMode,
+        now: kr_protocol::scalars::TimestampMs,
+        credential_path: &std::path::Path,
+        registration_path: &std::path::Path,
+    ) -> Result<Registration> {
+        let application_instance_id = self.launch.application_instance_id;
         let process = ManagedProcess::new(
             application_instance_id,
             started.clone(),
@@ -724,13 +836,32 @@ impl NativeGateway {
                 executable_digest: profile.binary.digest,
                 process: started.clone(),
             },
-            Credential::generate()?,
+            credential,
             // Dedicated: this host started it for this instance, so section 7 stops it when the
             // terminal intentionally exits.
             true,
             now,
         );
-        process.write_registration(&credential_path)?;
+        process.write_registration(credential_path)?;
+        let recorded = self.record(profile, started, process, mode, registration_path);
+        if recorded.is_err() {
+            // Best effort: a file that cannot be removed now is refused as a stale name by the
+            // next launch's create, which is the safe way round.
+            let _ = std::fs::remove_file(credential_path);
+        }
+        recorded
+    }
+
+    /// Records a started process with the broker and publishes the registration that names it.
+    fn record(
+        &self,
+        profile: &kr_protocol::broker::LaunchProfile,
+        started: &ProcessStartIdentity,
+        process: ManagedProcess,
+        mode: kr_protocol::broker::IntegrationMode,
+        registration_path: &std::path::Path,
+    ) -> Result<Registration> {
+        let application_instance_id = self.launch.application_instance_id;
         self.broker.register_instance(
             application_instance_id,
             mode,
@@ -752,7 +883,7 @@ impl NativeGateway {
         );
         // Whole or not at all: a forwarder that looks while it is being written must find nothing
         // rather than an empty or partial record.
-        kr_ipc::paths::write_owner_only_file(&registration_path, published.as_bytes()).map_err(
+        kr_ipc::paths::write_owner_only_file(registration_path, published.as_bytes()).map_err(
             |error| {
                 BrokerError::ledger(format!(
                     "could not write the registration file {}: {error}",
@@ -760,13 +891,7 @@ impl NativeGateway {
                 ))
             },
         )?;
-        self.launch.expected_process = Some(started.clone());
-        self.registration = Some(registration);
-        Ok(Launched {
-            child,
-            process: started,
-            profile,
-        })
+        Ok(registration)
     }
 
     /// Returns the address a launched process is told to connect to.

@@ -1070,6 +1070,20 @@ impl Broker {
         }
     }
 
+    /// Gives back everything one launch took, because it failed after the launch was executed.
+    ///
+    /// An executed launch has reserved its conversation and named its instance, and it may have
+    /// registered that instance, before the process it started can be used. A launch that fails
+    /// after that point gives all of it back, so a retry is not refused for a launch that never
+    /// happened and nothing is left describing a process that was stopped.
+    pub fn abandon_launch(&self, application_instance_id: ApplicationInstanceId) {
+        let mut state = self.state();
+        state.instances.remove(&application_instance_id);
+        state.tokens.withdraw(application_instance_id);
+        state.profiles.release(application_instance_id);
+        state.capabilities.forget(application_instance_id);
+    }
+
     // -- bindings, grants and decoding trust --------------------------------------------------
 
     /// Binds one component to one instance, with the grants and trust it was given.

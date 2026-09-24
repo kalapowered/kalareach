@@ -2247,6 +2247,166 @@ fn forwarder_profile() -> kr_protocol::broker::LaunchProfile {
     }
 }
 
+/// A launch profile whose backend is a process that sleeps, for the tests about the launch itself.
+#[cfg(unix)]
+fn sleeping_profile() -> kr_protocol::broker::LaunchProfile {
+    kr_protocol::broker::LaunchProfile {
+        profile_id: kr_protocol::ids::LaunchProfileId::new("lp-1").expect("valid"),
+        environment_id: EnvironmentId::new(Uuid::from_bytes([4; 16])),
+        binary: kr_protocol::broker::BinaryIdentity {
+            resolved_path: "/bin/sleep".to_owned(),
+            digest: Digest256::from_bytes([3; 32]),
+            version: "1".to_owned(),
+            distribution: "system".to_owned(),
+        },
+        arguments: vec!["600".to_owned()],
+        authentication: kr_protocol::broker::AuthenticationState::Authenticated,
+        mode: IntegrationMode::Gateway,
+        resolved_at: TimestampMs::new(1),
+    }
+}
+
+/// KR-REQ-12.02 and KR-REQ-07.61: a launch that fails after its process started leaves nothing
+/// running and nothing reserved.
+///
+/// The launch's last step publishes the registration, and its name is taken here by a directory,
+/// so that step fails after the backend has started. The launch stops the process it started and
+/// waits for it before it returns, removes the credential it wrote, and the broker gives back the
+/// instance and the conversation. The same launch then goes through once the name is free, which it
+/// would not if the failed one had kept its reservation.
+// Unix only: Windows refuses the launch before anything starts, which the next test covers.
+#[cfg(unix)]
+#[tokio::test]
+async fn kr_req_12_02_a_launch_that_fails_after_its_process_started_leaves_nothing_running() {
+    let directory = private_directory();
+    let broker = broker_for_launch();
+    let occupied = directory.join("registration");
+    std::fs::create_dir(&occupied).expect("the registration's name is taken");
+    std::fs::write(occupied.join("held"), b"held").expect("by a directory that is not empty");
+    let mut gateway = kr_worker::broker::NativeGateway::bind(
+        Arc::clone(&broker),
+        &directory,
+        launch_for(None, None),
+    )
+    .expect("the endpoint binds");
+    let intent = broker
+        .prepare_launch(
+            sleeping_profile(),
+            kr_worker::broker::ForegroundMark::idle(4),
+            Some("thread-9".to_owned()),
+        )
+        .expect("the launch is prepared");
+
+    let failed = gateway
+        .launch(
+            &intent,
+            &kr_worker::broker::ForegroundMark::idle(4),
+            IntegrationMode::Gateway,
+            TimestampMs::new(1),
+        )
+        .expect_err("the registration cannot be published");
+    assert!(
+        failed.to_string().contains("registration"),
+        "it fails at the registration, after the start: {failed}"
+    );
+    let started = gateway
+        .last_started()
+        .cloned()
+        .expect("the backend was started before the failure");
+    assert_eq!(
+        kr_ipc::identity::process_state(&started),
+        kr_ipc::identity::ProcessState::Ended,
+        "and it was stopped, and waited for, before the launch returned"
+    );
+    assert!(
+        !directory.join("credential").exists(),
+        "the credential the launch wrote is gone with it"
+    );
+    assert!(
+        broker.binding_state(instance()).is_err(),
+        "no instance is left describing it"
+    );
+    assert!(broker.profile_of(instance()).is_none());
+    assert_eq!(
+        broker.conversation_owner("thread-9"),
+        None,
+        "and the conversation it reserved is free"
+    );
+
+    std::fs::remove_dir_all(&occupied).expect("the name is freed");
+    let mut launched = gateway
+        .launch(
+            &intent,
+            &kr_worker::broker::ForegroundMark::idle(4),
+            IntegrationMode::Gateway,
+            TimestampMs::new(2),
+        )
+        .expect("the same launch goes through: the failed one took nothing it kept");
+    assert_eq!(
+        broker.conversation_owner("thread-9"),
+        Some(instance()),
+        "and this one holds the conversation"
+    );
+    let _ = launched.child.kill();
+    let _ = launched.child.wait();
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// KR-REQ-12.02: on a platform that cannot publish the launch credential as a file, a launch
+/// starts nothing.
+///
+/// Windows has no mode bits for the host to read back, so the credential is never written to a
+/// file there, and a launch that could not publish it is refused before any process starts rather
+/// than after one is running.
+#[cfg(windows)]
+#[tokio::test]
+async fn kr_req_12_02_a_launch_that_cannot_publish_its_credential_starts_nothing() {
+    let directory = private_directory();
+    let broker =
+        Arc::new(Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens"));
+    let mut gateway = kr_worker::broker::NativeGateway::bind(
+        Arc::clone(&broker),
+        &directory,
+        launch_for(None, None),
+    )
+    .expect("the endpoint binds");
+    let profile = kr_protocol::broker::LaunchProfile {
+        profile_id: kr_protocol::ids::LaunchProfileId::new("lp-1").expect("valid"),
+        environment_id: EnvironmentId::new(Uuid::from_bytes([4; 16])),
+        binary: kr_protocol::broker::BinaryIdentity {
+            resolved_path: "C:\\Windows\\System32\\cmd.exe".to_owned(),
+            digest: Digest256::from_bytes([3; 32]),
+            version: "1".to_owned(),
+            distribution: "system".to_owned(),
+        },
+        arguments: vec!["/c".to_owned(), "exit".to_owned()],
+        authentication: kr_protocol::broker::AuthenticationState::Authenticated,
+        mode: IntegrationMode::Gateway,
+        resolved_at: TimestampMs::new(1),
+    };
+    let intent = broker
+        .prepare_launch(profile, kr_worker::broker::ForegroundMark::idle(4), None)
+        .expect("the launch is prepared");
+    let refused = gateway
+        .launch(
+            &intent,
+            &kr_worker::broker::ForegroundMark::idle(4),
+            IntegrationMode::Gateway,
+            TimestampMs::new(1),
+        )
+        .expect_err("the credential cannot be published here");
+    assert_eq!(
+        refused.code(),
+        kr_protocol::error::ErrorCode::UnsupportedCapability
+    );
+    assert!(
+        gateway.last_started().is_none(),
+        "and no process was started only to be stopped"
+    );
+    assert!(broker.binding_state(instance()).is_err());
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
 /// The launch one of these endpoints publishes.
 fn launch_for(
     expected: Option<ProcessStartIdentity>,

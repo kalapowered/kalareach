@@ -3966,12 +3966,18 @@ the transport back, closes the connection and withdraws the subscription. It sto
 terminal's: what the terminal does is the terminal's own supervision's, and that is still running
 when the connection has gone.
 
-Launching is the other half of the same composition. It checks the launch intent against the
-foreground it was prepared against, starts the executable the profile names with the registration
-and credential paths in its environment and nothing secret in its arguments, reads back from the
-kernel what it actually started, generates the private exchange, writes the owner-only credential
-file, registers the instance against that record, and writes the registration file last, so a
-forwarder that reads it reads a complete one and the credential it names already exists.
+Launching is the other half of the same composition. It first asks everything that can refuse
+without starting anything: whether this platform can publish the credential file, whether the
+runtime directory is the owner's alone, whether a private exchange can be drawn, and whether the
+launch intent still holds against the foreground it was prepared against. Only then does it start
+the executable the profile names, with the registration and credential paths in its environment
+and nothing secret in its arguments, read back from the kernel what it actually started, write the
+owner-only credential file, register the instance against that record, and write the registration
+file last, so a forwarder that reads it reads a complete one and the credential it names already
+exists. A launch that fails after the start leaves nothing running and nothing reserved: the process
+is ended and waited for before the launch returns, the credential file it wrote is removed, and
+the broker gives back the instance and the conversation the launch took, so a retry is not refused
+for a launch that never happened.
 
 A connection carrying any header a browser adds — `origin`, `referer`, `sec-fetch-site`,
 `sec-fetch-mode`, `sec-websocket-key`, `access-control-request-method` — is refused. A page that
@@ -3986,8 +3992,8 @@ credential, and neither does any address a diagnostic prints or any argument vec
 The credential itself travels in an owner-only file the launched process opens. On a platform where
 the host cannot read back the owning user and the mode bits of the directory it wrote into, that
 file is **not written at all**: a secret in a file whose protection cannot be proved is worse than
-no file. There a launch publishes no credential, so a bridge has nothing to present and none is
-admitted.
+no file. There a launch is refused before any process starts, because a launched process that
+could never be told its credential is one that would only have to be stopped again.
 
 An executable upgrade affects new launches. An existing binding keeps the binary identity, schema
 and adapter version it was bound to, because the identity is pinned when the process starts and

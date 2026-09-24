@@ -288,9 +288,9 @@ impl ManagedProcess {
     /// by its owning user and its mode bits, and a platform that cannot answer those questions
     /// cannot establish that a file holding a secret is closed to other accounts. Rather than
     /// write the credential into a file whose protection this host cannot verify, the publication
-    /// is refused and the launch authenticates over the endpoint instead, whose access-control
-    /// list the transport sets and whose peer credentials it checks. See
-    /// [`ManagedProcess::publishes_credential_file`].
+    /// is refused, and [`crate::broker::NativeGateway::launch`] asks
+    /// [`ManagedProcess::publishes_credential_file`] before it starts anything, so such a launch
+    /// is refused with no process started.
     ///
     /// # Errors
     ///
