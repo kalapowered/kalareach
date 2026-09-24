@@ -4263,6 +4263,7 @@ dependencies = [
 name = "kr-client"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "iroh",
  "kr-cbor",
  "kr-crypto",
@@ -4277,6 +4278,8 @@ dependencies = [
  "schemars 1.2.2",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
+ "subtle",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",

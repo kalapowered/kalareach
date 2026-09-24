@@ -167,7 +167,9 @@ Brokering a managed call spends an account's balance, so the host presents an ac
 read from `account-token.json` under this host's runtime root, written by
 `kr account token import <path>`, and it is never printed: not by the command that imports it, not
 in a refusal, not in a log. The value lives in a type with no display, and the one place it is read
-is the authorisation header of the request it authorises.
+is the authorisation header of the request it authorises. The token lasts as long as the service
+said when it issued it, ten minutes for the managed service, and the host does not refresh it; a
+token issued without the `voice` scope is refused before any request carries it.
 
 A host with no token, and a host with no broker configured, are both complete hosts. A provider
 credential of your own and the agent already running in the session both still work.

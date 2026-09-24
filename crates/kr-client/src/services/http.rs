@@ -3,7 +3,8 @@
 //! [`relay::ServiceHttp`] is the exchange every managed-service client is written against, and this
 //! is the implementation a shipped client uses. It is asynchronous, so a call that is dropped stops
 //! rather than continuing on a thread nobody is waiting for, and it is deliberately small: one
-//! origin, one signed JSON body, one bounded answer.
+//! origin, one signed JSON body, one bounded answer. It is also the account client's
+//! [`AccountHttp`]: a form post and a bearer read, under every rule below.
 //!
 //! # What it will and will not do
 //!
@@ -81,6 +82,7 @@ use kr_protocol::service::GatewayOrigin;
 use url::{Host, Url};
 
 use super::ServiceFuture;
+use super::account::AccountHttp;
 use super::relay::{ServiceHttp, ServiceHttpAnswer};
 use crate::error::{ClientError, Result};
 
@@ -418,20 +420,24 @@ impl HttpService {
     }
 
     /// Sends one request and reads its answer under the bound the path states.
+    ///
+    /// `body` is the content type and the bytes, for a request that carries one.
     async fn exchange(
         &self,
+        method: reqwest::Method,
         target: Url,
-        body: &[u8],
+        body: Option<(&str, &[u8])>,
         headers: &[(&str, &str)],
     ) -> Result<ServiceHttpAnswer> {
         let limit = self.limits.of(target.path());
         let named = format!("{}{}", self.origin.as_str(), target.path());
 
-        let mut request = self
-            .client
-            .post(target)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body.to_vec());
+        let mut request = self.client.request(method, target);
+        if let Some((content_type, bytes)) = body {
+            request = request
+                .header(reqwest::header::CONTENT_TYPE, content_type)
+                .body(bytes.to_vec());
+        }
         for (name, value) in headers {
             // A header value can be a token, so neither the name's value nor the value itself
             // reaches this error.
@@ -492,7 +498,44 @@ impl ServiceHttp for HttpService {
             // rather than from a watchdog wrapped round the whole thing that could only say that
             // something somewhere took too long.
             let target = self.target(url)?;
-            self.exchange(target, body, headers).await
+            self.exchange(
+                reqwest::Method::POST,
+                target,
+                Some(("application/json", body)),
+                headers,
+            )
+            .await
+        })
+    }
+}
+
+impl AccountHttp for HttpService {
+    fn post_form<'a>(
+        &'a self,
+        url: &'a str,
+        body: &'a [u8],
+    ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        Box::pin(async move {
+            let target = self.target(url)?;
+            self.exchange(
+                reqwest::Method::POST,
+                target,
+                Some(("application/x-www-form-urlencoded", body)),
+                &[],
+            )
+            .await
+        })
+    }
+
+    fn get<'a>(
+        &'a self,
+        url: &'a str,
+        headers: &'a [(&'a str, &'a str)],
+    ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        Box::pin(async move {
+            let target = self.target(url)?;
+            self.exchange(reqwest::Method::GET, target, None, headers)
+                .await
         })
     }
 }
@@ -1552,6 +1595,62 @@ mod tests {
             "no cookie store"
         );
         assert_eq!(request.body, b"{\"body\":1}");
+    }
+
+    #[tokio::test]
+    async fn an_account_request_arrives_as_a_form_or_a_bearer_read() {
+        use crate::services::account::AccountHttp as _;
+
+        let gateway = Gateway::start(Behaviour::Answer {
+            status: 200,
+            body: b"{}".to_vec(),
+        })
+        .await;
+        let transport = gateway.transport();
+        transport
+            .post_form(
+                &gateway.url("/auth/oauth2/token"),
+                b"grant_type=refresh_token&client_id=kalareach-desktop",
+            )
+            .await
+            .expect("an answer");
+        transport
+            .get(
+                &gateway.url("/auth/oauth2/userinfo"),
+                &[("authorization", "Bearer opensesame")],
+            )
+            .await
+            .expect("an answer");
+
+        let received = gateway.received();
+        assert_eq!(received.len(), 2);
+        let form = &received[0];
+        assert!(form.head.starts_with("POST /auth/oauth2/token HTTP/1.1"));
+        let head = form.head.to_ascii_lowercase();
+        assert!(head.contains("content-type: application/x-www-form-urlencoded"));
+        assert!(
+            !head.contains("authorization"),
+            "a form post carries no header it was not given"
+        );
+        assert_eq!(
+            form.body,
+            b"grant_type=refresh_token&client_id=kalareach-desktop"
+        );
+        let read = &received[1];
+        assert!(read.head.starts_with("GET /auth/oauth2/userinfo HTTP/1.1"));
+        let head = read.head.to_ascii_lowercase();
+        assert!(head.contains("authorization: bearer opensesame"));
+        assert!(!head.contains("content-type"), "a read carries no body");
+        assert!(read.body.is_empty());
+
+        // The same rules as every other exchange: another origin is refused before anything is
+        // sent.
+        let refused = transport
+            .get("https://elsewhere.example/auth/oauth2/userinfo", &[])
+            .await
+            .expect_err("another origin");
+        assert_eq!(code(&refused), ErrorCode::InvalidArgument);
+        assert_eq!(gateway.received().len(), 2);
     }
 
     #[tokio::test]

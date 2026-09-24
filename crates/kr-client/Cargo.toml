@@ -9,6 +9,9 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The account sign-in: the S256 challenge is base64url of a SHA-256 digest, an ID token's payload
+# is base64url JSON, and a returned state is compared in constant time.
+base64.workspace = true
 iroh.workspace = true
 kr-cbor.workspace = true
 kr-crypto.workspace = true
@@ -27,6 +30,8 @@ reqwest.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -65,7 +70,8 @@ tempfile.workspace = true
 # The loopback server listens and reads, which the library itself has no need to do, and a test
 # that stalls the server in one phase of an exchange drives the clock itself rather than waiting
 # out a deadline in real time.
-tokio = { workspace = true, features = ["io-util", "net", "test-util"] }
+# The account lock is held across processes, so its test starts this test binary as two children.
+tokio = { workspace = true, features = ["io-util", "net", "process", "test-util"] }
 tokio-rustls.workspace = true
 
 [lints]

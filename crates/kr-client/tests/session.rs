@@ -1974,7 +1974,10 @@ async fn a_session_a_draft_and_a_control_need_no_managed_service_and_do_not_chan
                 .account
                 .as_ref()
                 .expect("an account client")
-                .sign_in("code")
+                .revoke(
+                    &kr_client::services::account::RefreshToken::new("a-refresh-token")
+                        .expect("a token"),
+                )
                 .await
                 .expect_err("a service that answers nothing");
             assert_eq!(refusal.code(), ErrorCode::HostNotConfigured);

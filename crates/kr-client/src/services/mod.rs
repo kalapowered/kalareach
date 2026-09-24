@@ -6,8 +6,10 @@
 //! storage, relay bandwidth and operation, and a fork can point these traits at its own
 //! infrastructure without changing anything else in the client.
 //!
-//! The traits and one null implementation live here, and seven modules hold the managed
-//! implementations this crate carries. [`relay`] is the relay-lease client, because a lease is the
+//! The traits and one null implementation live here, and eight modules hold the managed
+//! implementations this crate carries. [`account`] is the account sign-in: the request a system
+//! browser is handed, the checks on what comes back, and the grant a device keeps under one lock,
+//! with the account service's trait beside them. [`relay`] is the relay-lease client, because a lease is the
 //! one managed resource a client cannot do without and still use a relay at all. [`voice`] is the
 //! voice broker, because a managed call is created by one request whose exact shape both the host
 //! and the companion have to agree on. [`authority`] is the durable authority feed, where a remote
@@ -41,7 +43,9 @@
 //! | [`relay::RelayRequestSignature`] | A credential and its signature | The method, the signer kind |
 //! | [`relay::SignedRelayRequest`] | A credential and a request body | The method, the signer kind |
 //! | [`relay::RelayLeaseGrant`] | A lease signed by the issuer the relay pins | The lease, the relay, the payer |
-//! | [`voice::AccountToken`] | A bearer token | A placeholder |
+//! | [`account::AccountToken`], [`account::RefreshToken`] | A bearer token | A placeholder |
+//! | [`account::AuthorisationRequest`], [`account::AuthorisationGrant`] | A state, a verifier, a nonce and a code | The client, the redirect, the attempt |
+//! | [`account::IssuedGrant`], [`account::StoredGrant`] | Tokens and a nonce | The lifetime or the grant's identifier and revision, the client, the scopes |
 //! | [`voice::StoredAccountToken`], [`voice::AccountTokenFile`] | An address, which may carry a user name and a password before its host | The scheme, the host and the port |
 //! | [`voice::VoiceSessionRequest`], [`voice::VoiceSession`] | Session descriptions, which carry the connection's ICE credentials | What the call is and how long it lasts, and the description's length |
 //! | [`voice::VoiceContextFrame`] | What a person said to a call | The request, the command, the length |
@@ -55,11 +59,11 @@
 //! | [`sync::SyncHeldObject`] | A sealed object a collection holds | The object, its kind, where it stands, its key epoch |
 //! | [`sync::SyncHeldCopy`] | A sealed copy of a refused write | The copy, its object and kind, where the object stood, its key epoch |
 //!
-//! A type that holds one of these only through one of these, as [`AccountSession`] holds a token
-//! and [`relay::RelayLeaseAnswer`] holds a grant, is safe to derive, because the rendering it
-//! composes is the redacted one.
+//! A type that holds one of these only through one of these, as [`relay::RelayLeaseAnswer`] holds a
+//! grant, is safe to derive, because the rendering it composes is the redacted one.
 //!
-//! Seven tests are that rule's proof:
+//! Eight tests are that rule's proof:
+//! `a_rendering_of_a_request_a_grant_or_a_token_carries_none_of_them` in [`account`],
 //! `a_rendering_of_a_request_a_credential_or_an_answer_carries_none_of_it` and
 //! `a_rendering_of_an_issued_lease_carries_neither_the_lease_nor_its_signature` in [`relay`],
 //! `a_rendering_of_a_call_carries_neither_its_offer_its_answer_nor_what_was_said` in [`voice`],
@@ -85,6 +89,7 @@
 //! own message, which is written to be shown to a person, and that message is in the error this
 //! client returns. What is never in it is anything else of the answer.
 
+pub mod account;
 pub mod authority;
 pub mod http;
 pub mod mailbox;
@@ -102,6 +107,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ClientError, Result};
 
+pub use account::{
+    AccountHttp, AccountService, AccountToken, AccountTokenSource, ManagedAccountService,
+    SignedInAccount,
+};
 pub use authority::{
     AnnouncementOutcome, AnnouncementPlacement, AuthorityFeedClient, AuthorityFeedRecord,
     AuthorityFeedState, AuthorityFeedSummary, FeedAnnouncement, RejectionReason,
@@ -122,9 +131,9 @@ pub use sync::{
     SyncComparison, SyncHeldCopy, SyncHeldObject, SyncUsage,
 };
 pub use voice::{
-    AccountToken, AccountTokenSource, ManagedVoiceBroker, ManagedVoiceService, VoiceClosure,
-    VoiceCommand, VoiceContextFrame, VoiceControlEvent, VoiceRefusal, VoiceRefusalReason,
-    VoiceSession, VoiceSessionRequest, VoiceStart,
+    ManagedVoiceBroker, ManagedVoiceService, VoiceClosure, VoiceCommand, VoiceContextFrame,
+    VoiceControlEvent, VoiceRefusal, VoiceRefusalReason, VoiceSession, VoiceSessionRequest,
+    VoiceStart,
 };
 
 /// A boxed future, so every service client stays usable behind a trait object.
@@ -204,33 +213,6 @@ pub(crate) mod rendering {
         }
         assert_eq!(condensed(&plain), expected);
         assert_eq!(condensed(&indented), expected);
-    }
-}
-
-/// An account session obtained from the service.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AccountSession {
-    /// The opaque access token. It authorises managed resources only: a host still requires device
-    /// pairing and its own grant.
-    ///
-    /// Held so it cannot reach a log by accident: the token is not in this structure's
-    /// [`std::fmt::Debug`] rendering.
-    pub access_token: AccountToken,
-    /// How many seconds the access token lasts.
-    pub expires_in_seconds: u64,
-    /// The scopes the token was issued with.
-    ///
-    /// Each managed resource names its own, and a route refuses a token issued without it. A
-    /// client that held a session with no record of its scopes would discover what it may do by
-    /// being refused, which is an expensive way to read a field the token already carries.
-    pub scopes: Vec<String>,
-}
-
-impl AccountSession {
-    /// Returns true when this session carries `scope`.
-    #[must_use]
-    pub fn carries(&self, scope: &str) -> bool {
-        self.scopes.iter().any(|held| held == scope)
     }
 }
 
@@ -333,17 +315,6 @@ pub enum LeaseEndReason {
 pub struct PushRegistration {
     /// The installation this registration belongs to.
     pub installation_id: InstallationId,
-}
-
-/// Where a managed or self-hosted account is signed in.
-///
-/// Account tokens authorise managed resources only. Nothing here can grant host authority.
-pub trait AccountService: Send + Sync + std::fmt::Debug {
-    /// Signs in and returns a session.
-    fn sign_in<'a>(&'a self, authorisation_code: &'a str) -> ServiceFuture<'a, AccountSession>;
-
-    /// Exchanges a refresh token for a new session.
-    fn refresh<'a>(&'a self, refresh_token: &'a str) -> ServiceFuture<'a, AccountSession>;
 }
 
 /// Where relay leases are obtained.
@@ -939,11 +910,32 @@ fn unconfigured<T: Send + 'static>(what: &'static str) -> ServiceFuture<'static,
 }
 
 impl AccountService for NullService {
-    fn sign_in<'a>(&'a self, _authorisation_code: &'a str) -> ServiceFuture<'a, AccountSession> {
+    fn exchange<'a>(
+        &'a self,
+        _grant: &'a account::AuthorisationGrant,
+    ) -> ServiceFuture<'a, account::Exchanged> {
         unconfigured(ManagedService::AccountLogin.as_str())
     }
 
-    fn refresh<'a>(&'a self, _refresh_token: &'a str) -> ServiceFuture<'a, AccountSession> {
+    fn refresh<'a>(
+        &'a self,
+        _stored: &'a account::StoredGrant,
+    ) -> ServiceFuture<'a, account::Refreshed> {
+        unconfigured(ManagedService::AccountLogin.as_str())
+    }
+
+    fn revoke<'a>(&'a self, _refresh: &'a account::RefreshToken) -> ServiceFuture<'a, ()> {
+        unconfigured(ManagedService::AccountLogin.as_str())
+    }
+
+    fn identity<'a>(
+        &'a self,
+        _access: &'a AccountToken,
+    ) -> ServiceFuture<'a, account::AccountIdentity> {
+        unconfigured(ManagedService::AccountLogin.as_str())
+    }
+
+    fn usage<'a>(&'a self, _access: &'a AccountToken) -> ServiceFuture<'a, account::AccountUsage> {
         unconfigured(ManagedService::AccountLogin.as_str())
     }
 }
@@ -1043,10 +1035,12 @@ mod tests {
 
     #[tokio::test]
     async fn the_null_service_says_so_rather_than_pretending() {
-        let error = NullService
-            .sign_in("code")
-            .await
-            .expect_err("nothing is configured");
+        let error = AccountService::revoke(
+            &NullService,
+            &account::RefreshToken::new("a-refresh-token").expect("a token"),
+        )
+        .await
+        .expect_err("nothing is configured");
         assert_eq!(error.code(), ErrorCode::HostNotConfigured);
         assert!(error.to_string().contains("account login"));
 

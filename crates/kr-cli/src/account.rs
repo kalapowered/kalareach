@@ -1,9 +1,12 @@
 //! `kr account token import`: putting a managed-service account token where this host reads it.
 //!
-//! Managed voice spends an account's balance, so the host presents an account token when it brokers
-//! a call. Obtaining that token is the companion application's sign-in; this command is how an
-//! operator puts one on a host that has no browser, and it is deliberately the whole of what this
-//! command does.
+//! Managed voice spends an account's balance, so a host that brokers a call presents an account
+//! token. The document holds an access token the service issued, which the service accepts for as
+//! long as it said when it issued it (ten minutes for the managed service), and this host does not
+//! refresh it. The companion's own sign-in keeps its tokens in the device's secure storage and
+//! exports none: its refresh token rotates on every use, so a second holder would end the grant.
+//! This command is how an operator puts a token on a host, and it is deliberately the whole of what
+//! this command does.
 //!
 //! Two rules shape it.
 //!

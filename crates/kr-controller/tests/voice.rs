@@ -27,10 +27,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use kr_client::services::ServiceFuture;
+use kr_client::services::account::{AccountToken, AccountTokenSource};
 use kr_client::services::voice::{
-    AccountToken, AccountTokenSource, ManagedVoiceBroker, ManagedVoiceService, ServiceHttp,
-    ServiceHttpAnswer, VoiceClosure, VoiceHold, VoiceMetadata, VoiceRateQuote, VoiceSession,
-    VoiceSessionRequest, VoiceStart, VoiceStartLatency,
+    ManagedVoiceBroker, ManagedVoiceService, ServiceHttp, ServiceHttpAnswer, VoiceClosure,
+    VoiceHold, VoiceMetadata, VoiceRateQuote, VoiceSession, VoiceSessionRequest, VoiceStart,
+    VoiceStartLatency,
 };
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
@@ -1402,8 +1403,8 @@ impl ServiceHttp for ScriptedService {
 struct VoiceToken;
 
 impl AccountTokenSource for VoiceToken {
-    fn token(&self) -> kr_client::error::Result<AccountToken> {
-        AccountToken::new("a-voice-token")
+    fn token<'a>(&'a self, _scope: &'a str) -> ServiceFuture<'a, AccountToken> {
+        Box::pin(async { AccountToken::new("a-voice-token") })
     }
 }
 

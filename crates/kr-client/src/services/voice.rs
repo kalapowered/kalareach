@@ -45,6 +45,7 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use serde::{Deserialize, Serialize};
 
 use super::ServiceFuture;
+use super::account::{AccountToken, AccountTokenSource};
 pub use super::{ServiceHttp, ServiceHttpAnswer};
 use crate::error::{ClientError, Result};
 use crate::retry::UserAction;
@@ -123,68 +124,6 @@ fn encode_segment(value: &str) -> String {
 /* -------------------------------------------------------------------------- */
 /* The account token                                                           */
 /* -------------------------------------------------------------------------- */
-
-/// An account access token, held so it cannot reach a log by accident.
-///
-/// The value is never in a [`fmt::Debug`] rendering and there is no [`fmt::Display`]. A caller
-/// that needs the bytes asks for them by name, which is one line to find in a review rather than
-/// an interpolation to notice.
-#[derive(Clone, PartialEq, Eq)]
-pub struct AccountToken(String);
-
-impl AccountToken {
-    /// Wraps an access token, rejecting one that cannot be sent as a header value.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the token is empty or carries a character an HTTP header may not.
-    /// The refusal never quotes the token.
-    pub fn new(value: impl Into<String>) -> Result<Self> {
-        let value = value.into();
-        if value.is_empty() {
-            return Err(local("an account token is not empty"));
-        }
-        if value.len() > 8192 {
-            return Err(local("an account token is at most 8192 bytes"));
-        }
-        if !value
-            .bytes()
-            .all(|byte| (0x21..=0x7e).contains(&byte) || byte == b' ')
-        {
-            return Err(local(
-                "an account token is printable ASCII, as an authorisation header value is",
-            ));
-        }
-        Ok(Self(value))
-    }
-
-    /// Returns the token itself, for the one caller that has to send it.
-    #[must_use]
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for AccountToken {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("AccountToken(<not printed>)")
-    }
-}
-
-/// Where the current account token comes from.
-///
-/// A token expires and is replaced, so a client that was handed one at construction would keep
-/// presenting a dead one. The embedder answers with whatever it holds now: a file the operator
-/// imported, a keychain entry, or a sign-in the application performed.
-pub trait AccountTokenSource: Send + Sync + fmt::Debug {
-    /// Returns the token to present.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when no token is configured or the stored one cannot be read. The error
-    /// never carries the token.
-    fn token(&self) -> Result<AccountToken>;
-}
 
 /* -------------------------------------------------------------------------- */
 /* What a client sends                                                         */
@@ -1139,7 +1078,7 @@ impl ManagedVoiceBroker {
 
     /// Sends one authorised request and returns what came back.
     async fn exchange(&self, path: &str, body: Vec<u8>) -> Result<ServiceHttpAnswer> {
-        let token = self.tokens.token()?;
+        let token = self.tokens.token(VOICE_SCOPE).await?;
         // The one place the token is read. It goes into a header value and nowhere else: not into
         // the URL, not into the body, and not into any error this function returns.
         let authorisation = format!("Bearer {}", token.expose());
@@ -1693,33 +1632,34 @@ impl AccountTokenFile {
 }
 
 impl AccountTokenSource for AccountTokenFile {
-    fn token(&self) -> Result<AccountToken> {
-        let stored = self.stored()?;
-        if let Some(origin) = self.origin.as_deref()
-            && stored.origin != origin
-        {
-            // Refused before the request is built, so the token never reaches a service it was not
-            // issued for. Both origins are named the way a rendering names one: an address may
-            // carry a user name and a password in front of the host, and the token is not the only
-            // credential this refusal could otherwise print.
-            return Err(ClientError::Host(ProtocolError::new(
-                ErrorCode::HostNotConfigured,
-                format!(
-                    "the imported account token belongs to {} and this host is configured to \
-                     reach {}",
-                    addressed(&stored.origin),
-                    addressed(origin)
-                ),
-            )));
-        }
-        if !stored.carries(VOICE_SCOPE) {
-            return Err(ClientError::Host(ProtocolError::new(
-                ErrorCode::PermissionDenied,
-                "the imported account token was not issued with the scope managed voice needs"
-                    .to_owned(),
-            )));
-        }
-        Ok(stored.access_token)
+    fn token<'a>(&'a self, scope: &'a str) -> ServiceFuture<'a, AccountToken> {
+        Box::pin(async move {
+            let stored = self.stored()?;
+            if let Some(origin) = self.origin.as_deref()
+                && stored.origin != origin
+            {
+                // Refused before the request is built, so the token never reaches a service it was
+                // not issued for. Both origins are named the way a rendering names one: an address
+                // may carry a user name and a password in front of the host, and the token is not
+                // the only credential this refusal could otherwise print.
+                return Err(ClientError::Host(ProtocolError::new(
+                    ErrorCode::HostNotConfigured,
+                    format!(
+                        "the imported account token belongs to {} and this host is configured to \
+                         reach {}",
+                        addressed(&stored.origin),
+                        addressed(origin)
+                    ),
+                )));
+            }
+            if !stored.carries(scope) {
+                return Err(ClientError::Host(ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    format!("the imported account token was not issued with the {scope} scope"),
+                )));
+            }
+            Ok(stored.access_token)
+        })
     }
 }
 
@@ -2013,8 +1953,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_token_is_not_handed_to_an_origin_it_was_not_issued_for() {
+    #[tokio::test]
+    async fn a_token_is_not_handed_to_an_origin_it_was_not_issued_for() {
         let directory = std::env::temp_dir().join(format!("kr-token-{}", std::process::id()));
         std::fs::create_dir_all(&directory).expect("a directory on the internal disk");
         let path = account_token_path(&directory);
@@ -2028,7 +1968,8 @@ mod tests {
 
         let error = AccountTokenFile::at(path.clone())
             .for_origin("https://elsewhere.example")
-            .token()
+            .token(VOICE_SCOPE)
+            .await
             .expect_err("a token is not sent to another service");
         assert!(!error.to_string().contains("a-secret-value"), "{error}");
         assert!(error.to_string().contains("elsewhere.example"));
@@ -2049,7 +1990,8 @@ mod tests {
             .expect("the stored token");
         let error = AccountTokenFile::at(path.clone())
             .for_origin(format!("https://{NEVER_RENDERED}@elsewhere.example"))
-            .token()
+            .token(VOICE_SCOPE)
+            .await
             .expect_err("a token is not sent to another service");
         for rendering in [
             error.to_string(),
@@ -2064,7 +2006,8 @@ mod tests {
         assert!(
             AccountTokenFile::at(path.clone())
                 .for_origin("https://reach.example")
-                .token()
+                .token(VOICE_SCOPE)
+                .await
                 .is_ok()
         );
         std::fs::remove_file(&path).expect("the stored token is removed");
@@ -2147,8 +2090,9 @@ mod tests {
     struct Token;
 
     impl AccountTokenSource for Token {
-        fn token(&self) -> Result<AccountToken> {
-            AccountToken::new("a-voice-token")
+        fn token<'a>(&'a self, scope: &'a str) -> ServiceFuture<'a, AccountToken> {
+            assert_eq!(scope, VOICE_SCOPE, "the broker asks for the voice scope");
+            Box::pin(async { AccountToken::new("a-voice-token") })
         }
     }
 
@@ -2344,7 +2288,7 @@ mod tests {
         #[derive(Debug)]
         struct NoToken;
         impl AccountTokenSource for NoToken {
-            fn token(&self) -> Result<AccountToken> {
+            fn token<'a>(&'a self, _scope: &'a str) -> ServiceFuture<'a, AccountToken> {
                 panic!("no token is read")
             }
         }
