@@ -248,6 +248,23 @@ pub enum RecoveryError {
         /// The position the service answered with, under the same write sequence.
         found: SyncPosition,
     },
+    /// The service answered from another history of the bundle's collection than the one this
+    /// store read the bundle in: the collection was put back from an archive.
+    ///
+    /// Places compare only within one history, and a bundle put back can lack a writer this device
+    /// trusted or a generation it verified since, whatever place in the order it answers at. So
+    /// nothing is compared or adopted across the two, ahead, behind or at the same place, and the
+    /// owner's recovery is the explicit one: read the bundle from a store that knows nothing, and
+    /// judge what comes back.
+    #[error(
+        "the recovery bundle was read at {expected}, and that locator now answers {found} from a collection put back from an archive"
+    )]
+    BundlePutBack {
+        /// The position this device last saw.
+        expected: SyncPosition,
+        /// The position the service answered with, in another history.
+        found: SyncPosition,
+    },
     /// This device's record of a bundle write could not be read or written.
     #[error("the recovery bundle's write record at {path} could not be used: {source}")]
     Storage {

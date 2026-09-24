@@ -427,6 +427,13 @@ impl BundleStore {
         sent: Digest256,
     ) -> Result<()> {
         if let Some(baseline) = &self.baseline {
+            // A receipt in another history than the one this store read is not compared with it.
+            if baseline.position.recovery() != landed.recovery() {
+                return Err(RecoveryError::BundlePutBack {
+                    expected: baseline.position,
+                    found: landed,
+                });
+            }
             if baseline.position.write_sequence > landed.write_sequence {
                 return Ok(());
             }
@@ -435,6 +442,12 @@ impl BundleStore {
             }
         }
         let read = self.read(seed).await?;
+        if read.position.recovery() != landed.recovery() {
+            return Err(RecoveryError::BundlePutBack {
+                expected: landed,
+                found: read.position,
+            });
+        }
         if read.position.write_sequence < landed.write_sequence {
             return Err(RecoveryError::BundleWentBack {
                 expected: landed.write_sequence,
@@ -1401,6 +1414,11 @@ fn same_write(held: &Baseline, landed: SyncPosition, sent: Digest256) -> Result<
 /// already read, and the same sequence under another name is a history that forked. Either says
 /// the locator is not the collection this store has been talking to, and the owner's recovery is
 /// the explicit one: read the bundle from a store that knows nothing, and judge what comes back.
+///
+/// Before either, the history. Places compare only within one recovery, and a bundle put back
+/// under another can lack a writer this device trusted or a generation it verified since, at any
+/// place in the order it answers at. So an answer in another history is refused before anything is
+/// compared, with the same way out.
 fn diagnose(held: Option<SyncPosition>, found: SyncPosition) -> Result<()> {
     if found.is_removal() || found.write_sequence == 0 {
         return Err(RecoveryError::BundleNotAWrite { found });
@@ -1408,6 +1426,12 @@ fn diagnose(held: Option<SyncPosition>, found: SyncPosition) -> Result<()> {
     let Some(held) = held else {
         return Ok(());
     };
+    if held.recovery() != found.recovery() {
+        return Err(RecoveryError::BundlePutBack {
+            expected: held,
+            found,
+        });
+    }
     if found.write_sequence < held.write_sequence {
         return Err(RecoveryError::BundleWentBack {
             expected: held.write_sequence,

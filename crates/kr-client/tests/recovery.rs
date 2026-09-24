@@ -15,8 +15,8 @@ use kr_client::recovery::{
     parse_kit, qr_payload, render_kit,
 };
 use kr_client::services::{
-    ServiceFuture, SyncBackupService, SyncExchanged, SyncPosition, SyncRequestFence,
-    SyncRequestStatus, SyncRevision,
+    ServiceFuture, SyncBackupService, SyncExchanged, SyncPosition, SyncRecoveryId,
+    SyncRequestFence, SyncRequestStatus, SyncRevision,
 };
 use kr_crypto::backup::{
     ArchiveExpectation, ArchivePlan, ArchiveReader, ArchiveRecipients, CheckpointSource,
@@ -1722,6 +1722,79 @@ async fn a_locator_that_went_back_or_forked_is_refused_rather_than_written_over(
         fresh.fetch(&seed).await.expect("the bundle").revision.get(),
         2
     );
+}
+
+#[tokio::test]
+async fn a_bundle_put_back_under_another_recovery_is_refused_before_anything_is_compared() {
+    let service = ScriptedService::shared();
+    let seed = RecoverySeed::generate().expect("a seed");
+    let mut store = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    let mut bundle = BundleStore::empty(TimestampMs::new(1));
+    for write in 1..=5_u64 {
+        let writer = AuthorisationKeyPair::generate().expect("a writer key");
+        store
+            .enable_writer(
+                &seed,
+                &mut bundle,
+                trusted(&writer),
+                TimestampMs::new(write * 1_000),
+            )
+            .await
+            .expect("the write lands");
+    }
+    assert_eq!(store.position(), Some(at(5)));
+
+    // The service is put back from an archive, and answers in the history the restore began. A
+    // bundle put back can lack a writer this device trusted or a generation it verified since, so
+    // no place in that history is compared with the one this store read: not one behind, not the
+    // same place, and not one ahead.
+    let restored = Some(SyncRecoveryId::new(Uuid::from_bytes([0xb0; 16])));
+    let in_restored = |write_sequence: u64| {
+        SyncPosition::at(
+            write_sequence,
+            SyncRevision::new(Uuid::from_bytes([write_sequence as u8; 16])),
+            restored,
+        )
+    };
+    for found in [in_restored(3), in_restored(5), in_restored(6)] {
+        service.next_fetch_answers(found);
+        let refused = store
+            .fetch(&seed)
+            .await
+            .expect_err("a bundle put back is not compared");
+        assert!(
+            matches!(
+                refused,
+                RecoveryError::BundlePutBack { expected, found: answered }
+                    if expected == at(5) && answered == found
+            ),
+            "{refused}"
+        );
+        assert_eq!(store.position(), Some(at(5)), "nothing was adopted");
+    }
+
+    // Nor is a write this device makes held to a place in another history: the service applies
+    // it, and the place it answers is not one this store can follow from write five.
+    service.next_exchange_answers(in_restored(6));
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    assert!(matches!(
+        store
+            .enable_writer(
+                &seed,
+                &mut bundle,
+                trusted(&writer),
+                TimestampMs::new(6_000),
+            )
+            .await,
+        Err(RecoveryError::BundlePutBack { .. })
+    ));
+
+    // A store that knows nothing reads the bundle, which is the owner's way out: judge what comes
+    // back.
+    service.next_fetch_answers(in_restored(6));
+    let mut fresh = device(Arc::clone(&service) as Arc<_>, context(ORIGIN));
+    fresh.fetch(&seed).await.expect("the bundle");
+    assert_eq!(fresh.position(), Some(in_restored(6)));
 }
 
 #[tokio::test]
