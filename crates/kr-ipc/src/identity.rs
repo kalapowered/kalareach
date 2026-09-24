@@ -66,6 +66,34 @@ pub fn boot_epoch(identity: &BootIdentity) -> Result<BootEpoch> {
     Ok(BootEpoch::new(u64::from_be_bytes(head)))
 }
 
+/// What the operating system says about one process identifier.
+///
+/// Three answers, and only one of them is "gone". Each platform decides which of the three it has
+/// where it reads the process, from the reading itself: a missing `/proc` entry on Linux, the
+/// kernel's "no such process" on macOS, and on Windows a process table that was read and does not
+/// list the identifier. A query that failed is never turned into absence afterwards. It
+/// establishes nothing, and a host that read it as a process that had ended would release a session
+/// identity, take over a journal or pass over a live worker while the process was still running.
+#[derive(Debug)]
+pub enum ProcessQuery {
+    /// A process holds the identifier, and this is its start identity.
+    Present(ProcessStartIdentity),
+    /// The operating system answered, and no process holds the identifier.
+    Gone,
+    /// The operating system did not answer, or would not say when the process started, so
+    /// neither of the other answers is established.
+    CannotEstablish(IpcError),
+}
+
+/// Asks the operating system about one process identifier.
+///
+/// Every other process question in this module is answered from this one, so none of them can
+/// read a failed query as a process that has gone.
+#[must_use]
+pub fn query_process(pid: u32) -> ProcessQuery {
+    platform::query_process(pid)
+}
+
 /// Reads one process's start identity.
 ///
 /// # Errors
@@ -73,7 +101,14 @@ pub fn boot_epoch(identity: &BootIdentity) -> Result<BootEpoch> {
 /// Returns [`IpcError::IdentityUnavailable`] when the process does not exist or the operating
 /// system does not answer.
 pub fn process_start_identity(pid: u32) -> Result<ProcessStartIdentity> {
-    platform::process_start_identity(pid)
+    match query_process(pid) {
+        ProcessQuery::Present(identity) => Ok(identity),
+        ProcessQuery::Gone => Err(unavailable(
+            "process start identity",
+            format!("pid {pid} is gone"),
+        )),
+        ProcessQuery::CannotEstablish(error) => Err(error),
+    }
 }
 
 /// Returns the process identifiers currently in one process group.
@@ -169,10 +204,15 @@ pub fn ended_process_identity(pid: u32) -> ProcessStartIdentity {
 /// Returns [`IpcError::IdentityUnavailable`] when the operating system neither describes the
 /// process nor says it is absent.
 pub fn started_process_identity(pid: u32) -> Result<ProcessStartIdentity> {
-    match process_start_identity(pid) {
-        Ok(identity) => Ok(identity),
-        Err(error) if platform::is_absent(&error) => Ok(ended_process_identity(pid)),
-        Err(error) => Err(error),
+    started_from(pid, query_process(pid))
+}
+
+/// What a query about a process this host has just started says about it.
+fn started_from(pid: u32, query: ProcessQuery) -> Result<ProcessStartIdentity> {
+    match query {
+        ProcessQuery::Present(identity) => Ok(identity),
+        ProcessQuery::Gone => Ok(ended_process_identity(pid)),
+        ProcessQuery::CannotEstablish(error) => Err(error),
     }
 }
 
@@ -209,19 +249,25 @@ pub fn process_state(identity: &ProcessStartIdentity) -> ProcessState {
     let Ok(pid) = u32::try_from(identity.pid.get()) else {
         return ProcessState::Ended;
     };
-    match process_start_identity(pid) {
+    state_from(identity, pid, query_process(pid))
+}
+
+/// What a query about `pid` says about the process `identity` recorded.
+fn state_from(identity: &ProcessStartIdentity, pid: u32, query: ProcessQuery) -> ProcessState {
+    match query {
         // The identifier and the start value are the process that was recorded. Whether it is
         // still running is a second question on a platform that describes a process after it has
         // exited: Linux keeps the `/proc` entry of a process whose status nobody has collected, and
         // a process waiting to be collected has ended. The recorded start value goes with the
         // question, because a platform that has to look again has to know whether what it is
         // looking at is still the same process.
-        Ok(current) if current.matches(identity) => {
+        ProcessQuery::Present(current) if current.matches(identity) => {
             platform::liveness(pid, identity.start_value.get())
         }
-        Ok(_) => ProcessState::Ended,
-        Err(error) if platform::is_absent(&error) => ProcessState::Ended,
-        Err(error) => ProcessState::Unknown {
+        // Another process holds the identifier now, or none does: either way the recorded one has
+        // gone.
+        ProcessQuery::Present(_) | ProcessQuery::Gone => ProcessState::Ended,
+        ProcessQuery::CannotEstablish(error) => ProcessState::Unknown {
             detail: error.to_string(),
         },
     }
@@ -426,26 +472,33 @@ mod platform {
         })
     }
 
-    pub(super) fn is_absent(error: &crate::error::IpcError) -> bool {
-        // The only failure that proves absence on Linux is a missing /proc entry.
-        error.to_string().contains("No such file or directory")
-    }
-
-    pub(super) fn process_start_identity(pid: u32) -> Result<ProcessStartIdentity> {
+    pub(super) fn query_process(pid: u32) -> super::ProcessQuery {
         let path = format!("/proc/{pid}/stat");
-        let text = std::fs::read_to_string(&path)
-            .map_err(|error| unavailable("process start identity", format!("{path}: {error}")))?;
-        let start_ticks = parse_start_ticks(&text).ok_or_else(|| {
-            unavailable(
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            // The only failure that proves absence on Linux is a missing /proc entry. A permission,
+            // a descriptor limit or an entry that vanished part way through a read proves nothing.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return super::ProcessQuery::Gone;
+            }
+            Err(error) => {
+                return super::ProcessQuery::CannotEstablish(unavailable(
+                    "process start identity",
+                    format!("{path}: {error}"),
+                ));
+            }
+        };
+        match parse_start_ticks(&text) {
+            Some(start_ticks) => super::ProcessQuery::Present(ProcessStartIdentity::new(
+                u64::from(pid),
+                ProcessStartSource::LinuxProcStat,
+                start_ticks,
+            )),
+            None => super::ProcessQuery::CannotEstablish(unavailable(
                 "process start identity",
                 format!("{path}: field 22 is missing"),
-            )
-        })?;
-        Ok(ProcessStartIdentity::new(
-            u64::from(pid),
-            ProcessStartSource::LinuxProcStat,
-            start_ticks,
-        ))
+            )),
+        }
     }
 
     /// Reads field 22 of a `/proc/<pid>/stat` line.
@@ -646,34 +699,51 @@ mod platform {
         super::ProcessState::Running
     }
 
-    pub(super) fn is_absent(error: &crate::error::IpcError) -> bool {
-        // `proc_pidinfo` reports a process that is not there as "No such process"; every other
-        // failure leaves the question open. A process that has exited is one of those: this
-        // platform stops describing it at once, before its status has been collected.
-        let message = error.to_string();
-        message.contains("No such process") || message.contains("not a process identifier")
-    }
-
-    pub(super) fn process_start_identity(pid: u32) -> Result<ProcessStartIdentity> {
-        let pid = i32::try_from(pid).map_err(|_| {
-            unavailable(
-                "process start identity",
-                format!("{pid} is not a process identifier"),
-            )
-        })?;
-        let info: BSDInfo = pidinfo(pid, 0).map_err(|error| {
-            unavailable("process start identity", format!("pid {pid}: {error}"))
-        })?;
+    pub(super) fn query_process(pid: u32) -> super::ProcessQuery {
+        // The kernel's process identifiers are signed; nothing can hold one past their range.
+        let Ok(pid) = i32::try_from(pid) else {
+            return super::ProcessQuery::Gone;
+        };
+        let info: BSDInfo = match pidinfo(pid, 0) {
+            Ok(info) => info,
+            // `proc_pidinfo` answers a process that is not there with `ESRCH`, and so it answers a
+            // process that has exited: this platform stops describing it at once, before its
+            // status has been collected. Every other failure leaves the question open.
+            Err(message)
+                if error_number(&message) == Some(rustix::io::Errno::SRCH.raw_os_error()) =>
+            {
+                return super::ProcessQuery::Gone;
+            }
+            Err(message) => {
+                return super::ProcessQuery::CannotEstablish(unavailable(
+                    "process start identity",
+                    format!("pid {pid}: {message}"),
+                ));
+            }
+        };
         // Microseconds since the epoch, exactly as the kernel recorded them at execution.
         let start = info
             .pbi_start_tvsec
             .saturating_mul(1_000_000)
             .saturating_add(info.pbi_start_tvusec);
-        Ok(ProcessStartIdentity::new(
+        super::ProcessQuery::Present(ProcessStartIdentity::new(
             u64::from(info.pbi_pid),
             ProcessStartSource::MacosProcBsdInfo,
             start,
         ))
+    }
+
+    /// Returns the error number a `libproc` failure carries.
+    ///
+    /// `libproc` reports a failed call as text, `return code = …, errno = …, message = '…'`, read
+    /// from the thread's error number at the failure. The number is what is compared, rather than
+    /// the message, so a reading is never taken for absence because of how a message is worded.
+    pub(super) fn error_number(message: &str) -> Option<i32> {
+        let (_, after) = message.split_once("errno = ")?;
+        let digits = after
+            .find(|character: char| !character.is_ascii_digit())
+            .map_or(after, |end| &after[..end]);
+        digits.parse().ok()
     }
 }
 
@@ -690,7 +760,7 @@ mod platform {
 /// not available rather than handed one that was invented.
 #[cfg(all(target_vendor = "apple", not(target_os = "macos")))]
 mod platform {
-    use super::{BootIdentity, ProcessStartIdentity, ProcessStartSource, Result, unavailable};
+    use super::{BootIdentity, ProcessStartSource, Result, unavailable};
 
     /// What every refusal in this module says, after the name of what was asked for.
     const SANDBOXED: &str = "this Apple system sandboxes an application away from process and boot identity; there is \
@@ -700,8 +770,10 @@ mod platform {
         Err(unavailable("boot identity", SANDBOXED))
     }
 
-    pub(super) fn process_start_identity(pid: u32) -> Result<ProcessStartIdentity> {
-        Err(unavailable(
+    /// Establishes nothing, and never answers "gone": answering it would turn "this system will not
+    /// tell me" into "the process has ended", which is the one conversion section 9 forbids.
+    pub(super) fn query_process(pid: u32) -> super::ProcessQuery {
+        super::ProcessQuery::CannotEstablish(unavailable(
             "process start identity",
             format!("pid {pid}: {SANDBOXED}"),
         ))
@@ -742,22 +814,11 @@ mod platform {
             detail: String::new(),
         }
     }
-
-    /// Whether a failure means the process is gone. It never does here: nothing was ever read.
-    ///
-    /// Answering true would turn "this system will not tell me" into "the process has ended",
-    /// which is the one conversion section 9 forbids.
-    pub(super) const fn is_absent(_error: &crate::error::IpcError) -> bool {
-        false
-    }
 }
 
 #[cfg(windows)]
 mod platform {
-    use super::{
-        BootIdentity, BootIdentitySource, ProcessStartIdentity, ProcessStartSource, Result,
-        unavailable,
-    };
+    use super::{BootIdentity, BootIdentitySource, ProcessStartSource, Result, unavailable};
 
     pub(super) fn processes_in_group(_group: u32) -> Result<Vec<u32>> {
         // Windows has no process group to enumerate. A worker's descendants are held by its job
@@ -798,28 +859,58 @@ mod platform {
         super::ProcessState::Running
     }
 
-    pub(super) fn is_absent(error: &crate::error::IpcError) -> bool {
-        error.to_string().contains("is gone")
-    }
-
-    pub(super) fn process_start_identity(pid: u32) -> Result<ProcessStartIdentity> {
+    pub(super) fn query_process(pid: u32) -> super::ProcessQuery {
         use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
 
-        let mut system = sysinfo::System::new();
+        // The table is read with this process in it as well as the one asked about. `sysinfo`
+        // answers a table it could not read with nothing at all, which looks exactly like a table
+        // without the process asked about; a table that was read always lists the process reading
+        // it, so this is what tells the two apart.
+        let own = sysinfo::Pid::from_u32(std::process::id());
         let target = sysinfo::Pid::from_u32(pid);
+        let mut system = sysinfo::System::new();
         system.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&[target]),
+            ProcessesToUpdate::Some(&[target, own]),
             true,
             ProcessRefreshKind::nothing(),
         );
-        let process = system
-            .process(target)
-            .ok_or_else(|| unavailable("process start identity", format!("pid {pid} is gone")))?;
-        Ok(ProcessStartIdentity::new(
+        super::windows_answer(
+            pid,
+            system.process(own).is_some(),
+            system.process(target).map(sysinfo::Process::start_time),
+        )
+    }
+}
+
+/// Decides what one reading of the Windows process table says about `pid`.
+///
+/// `listed_self` is whether the reading listed the process that took it. Every reading that
+/// happened lists at least that one, so a reading that did not list it did not happen: the query
+/// failed, and a process missing from it says nothing. `start` is the start value of `pid` when the
+/// reading listed it. `sysinfo` gives zero when it could not open the process to ask when it
+/// started, and zero is no start value, so the identity is not established either.
+///
+/// It is its own function so the decision can be checked with a failed reading injected, on any
+/// platform, which no real process table produces on request.
+#[cfg(any(windows, test))]
+fn windows_answer(pid: u32, listed_self: bool, start: Option<u64>) -> ProcessQuery {
+    if !listed_self {
+        return ProcessQuery::CannotEstablish(unavailable(
+            "process start identity",
+            format!("pid {pid}: the process table could not be read"),
+        ));
+    }
+    match start {
+        None => ProcessQuery::Gone,
+        Some(0) => ProcessQuery::CannotEstablish(unavailable(
+            "process start identity",
+            format!("pid {pid}: the operating system would not say when it started"),
+        )),
+        Some(start) => ProcessQuery::Present(ProcessStartIdentity::new(
             u64::from(pid),
             ProcessStartSource::WindowsProcessStartSeconds,
-            process.start_time(),
-        ))
+            start,
+        )),
     }
 }
 
@@ -955,5 +1046,148 @@ mod tests {
             1,
         );
         assert_eq!(process_state(&impossible), ProcessState::Ended);
+    }
+
+    #[test]
+    fn the_operating_system_says_which_of_the_three_it_has() {
+        let own = std::process::id();
+        assert!(
+            matches!(
+                query_process(own),
+                ProcessQuery::Present(identity) if identity.pid.get() == u64::from(own)
+            ),
+            "this process is there"
+        );
+        // No process holds the largest identifier on any of these platforms, and the operating
+        // system says so rather than failing to answer.
+        assert!(
+            matches!(query_process(u32::MAX), ProcessQuery::Gone),
+            "an identifier nothing holds is gone"
+        );
+    }
+
+    /// A query the operating system did not answer, as each platform produces one.
+    fn failed_query() -> ProcessQuery {
+        ProcessQuery::CannotEstablish(unavailable(
+            "process start identity",
+            "the operating system did not answer",
+        ))
+    }
+
+    #[test]
+    fn a_failed_query_is_never_a_process_that_has_gone() {
+        // What a guard that asks whether a recorded worker is still running is told: neither
+        // running nor ended. A session guard refuses on this answer, as it does on any reading it
+        // could not take, rather than passing over the worker.
+        let recorded = current_process_start_identity().expect("the kernel answers");
+        let pid = std::process::id();
+        assert!(
+            matches!(
+                state_from(&recorded, pid, failed_query()),
+                ProcessState::Unknown { ref detail } if detail.contains("did not answer")
+            ),
+            "a failed query establishes nothing"
+        );
+        assert_eq!(
+            state_from(&recorded, pid, ProcessQuery::Gone),
+            ProcessState::Ended,
+            "only an answer that no process holds the identifier is an end"
+        );
+        // And a process this host has just started is not named as ended on a failed query: the
+        // failure is the answer.
+        assert!(
+            started_from(pid, failed_query()).is_err(),
+            "a failed query names nothing"
+        );
+        assert_eq!(
+            started_from(pid, ProcessQuery::Gone)
+                .expect("an absent process is named")
+                .start_value
+                .get(),
+            START_VALUE_UNREAD
+        );
+    }
+
+    #[test]
+    fn a_windows_table_that_could_not_be_read_is_not_an_absent_process() {
+        let pid = 4242;
+        // `sysinfo` answers a table it could not read with nothing at all. The process asking is
+        // missing from it too, and that is what marks the reading as one that did not happen.
+        let unread = windows_answer(pid, false, None);
+        assert!(
+            matches!(unread, ProcessQuery::CannotEstablish(_)),
+            "a failed reading is not an absent process: {unread:?}"
+        );
+        assert!(matches!(
+            windows_answer(pid, false, Some(1_700_000_000)),
+            ProcessQuery::CannotEstablish(_)
+        ));
+        // Carried through to what a session guard asks, the failed reading refuses rather than
+        // passing over the worker it was asked about.
+        let recorded = ProcessStartIdentity::new(
+            u64::from(pid),
+            ProcessStartSource::WindowsProcessStartSeconds,
+            1_700_000_000,
+        );
+        assert!(matches!(
+            state_from(&recorded, pid, windows_answer(pid, false, None)),
+            ProcessState::Unknown { .. }
+        ));
+        assert!(started_from(pid, windows_answer(pid, false, None)).is_err());
+
+        // A table that was read and does not list the process: it has gone.
+        assert!(matches!(
+            windows_answer(pid, true, None),
+            ProcessQuery::Gone
+        ));
+        assert_eq!(
+            state_from(&recorded, pid, windows_answer(pid, true, None)),
+            ProcessState::Ended
+        );
+        // Listed, but the operating system would not say when it started: zero is no start value,
+        // so the process is not identified and nothing is concluded from comparing it.
+        assert!(matches!(
+            windows_answer(pid, true, Some(0)),
+            ProcessQuery::CannotEstablish(_)
+        ));
+        assert!(matches!(
+            state_from(&recorded, pid, windows_answer(pid, true, Some(0))),
+            ProcessState::Unknown { .. }
+        ));
+        // Listed with its start value: the process, and the one recorded when the values agree.
+        assert!(matches!(
+            windows_answer(pid, true, Some(1_700_000_000)),
+            ProcessQuery::Present(identity) if identity == recorded
+        ));
+        assert_eq!(
+            state_from(
+                &recorded,
+                pid,
+                windows_answer(pid, true, Some(1_700_000_001))
+            ),
+            ProcessState::Ended,
+            "another start value is another process"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn libproc_failures_are_told_apart_by_their_error_number() {
+        use super::platform::error_number;
+
+        let absent = "return code = 0, errno = 3, message = 'No such process'";
+        assert_eq!(
+            error_number(absent),
+            Some(rustix::io::Errno::SRCH.raw_os_error())
+        );
+        assert_eq!(
+            error_number("return code = -1, errno = 1, message = 'Operation not permitted'"),
+            Some(1)
+        );
+        assert_eq!(
+            error_number("No such process"),
+            None,
+            "a message without the number says nothing"
+        );
     }
 }

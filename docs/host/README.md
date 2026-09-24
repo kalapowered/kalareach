@@ -385,6 +385,13 @@ so a recycled identifier reads as a different process. A query the operating sys
 reported as unknown, never as death: a recovery path that treated a failed query as a death would
 release a session identity while its worker was still running.
 
+A process query answers one of three things: the process and its start identity, gone, or cannot
+be established. Only an answer that no process holds the identifier is "gone": a missing
+`/proc/<pid>/stat` on Linux, `ESRCH` from `proc_pidinfo` on macOS, and on Windows a process table
+that was read and does not list the identifier. A Windows table read always lists the process
+reading it, so a reading that does not is a query that failed, and a process listed with a start
+time of zero is one the operating system would not describe; both cannot be established.
+
 ### Where the daemon keeps its keys
 
 `kr-controller --secret-store` chooses where the controller identity and this host's network
