@@ -299,7 +299,11 @@ fn kr_req_12_14_over_loopback_the_forwarder_presents_the_launch_credential() {
         let registration = files.join("registration");
         std::fs::write(
             &registration,
-            format!("endpoint=127.0.0.1:{port}\nprofile=lp-1\nframing=json_lines\n"),
+            format!(
+                "endpoint=127.0.0.1:{port}\nprofile=lp-1\n\
+                 instance=02020202-0202-0202-0202-020202020202\npid=1\nstart=1\n\
+                 framing=json_lines\n"
+            ),
         )
         .expect("the registration is written");
         let mut command = placed.command(&["claude-code", "hook"]);

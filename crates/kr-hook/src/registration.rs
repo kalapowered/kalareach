@@ -42,6 +42,11 @@ pub const CREDENTIAL_HEX_LENGTH: usize = 64;
 /// How often a file the worker has not written yet is looked for again.
 const LOOK_AGAIN: Duration = Duration::from_millis(20);
 
+/// Every field the worker's registration names, each on a line of its own; `framing` is written
+/// last.
+pub const REGISTRATION_FIELDS: [&str; 6] =
+    ["endpoint", "profile", "instance", "pid", "start", "framing"];
+
 /// Why a registration could not be used.
 #[derive(Debug)]
 pub enum RegistrationError {
@@ -49,6 +54,13 @@ pub enum RegistrationError {
     NoCredentialNamed,
     /// A file named by the environment did not appear in time.
     Missing {
+        /// The file.
+        path: PathBuf,
+        /// How long it was waited for.
+        waited: Duration,
+    },
+    /// The registration was there, and not yet a whole record, until the wait ended.
+    Incomplete {
         /// The file.
         path: PathBuf,
         /// How long it was waited for.
@@ -89,6 +101,12 @@ impl std::fmt::Display for RegistrationError {
             Self::Missing { path, waited } => write!(
                 formatter,
                 "{} did not appear within {} ms",
+                path.display(),
+                waited.as_millis()
+            ),
+            Self::Incomplete { path, waited } => write!(
+                formatter,
+                "{} was not a whole registration within {} ms",
                 path.display(),
                 waited.as_millis()
             ),
@@ -267,7 +285,9 @@ impl Registration {
     ///
     /// The worker writes the registration after it knows which process it started, so a process
     /// started with the registration's path in its environment can look before the file exists.
-    /// The wait is bounded, and it ends as soon as both files are there.
+    /// The worker publishes the registration whole, by a rename, and last, after the credential; a
+    /// read that finds the registration empty or cut short is still read again rather than acted
+    /// on. The wait is bounded, and it ends as soon as the registration is whole.
     ///
     /// # Errors
     ///
@@ -275,18 +295,10 @@ impl Registration {
     /// users, or does not say what a registration says.
     pub fn read(paths: &Paths, within: Duration) -> Result<Self, RegistrationError> {
         let deadline = Instant::now() + within;
-        let text = wait_for(
-            &paths.registration,
-            MAX_REGISTRATION_BYTES,
-            deadline,
-            within,
-        )?;
+        let text = wait_for_whole(&paths.registration, deadline, within)?;
         let credential = wait_for(&paths.credential, MAX_CREDENTIAL_BYTES, deadline, within)?;
         let credential = SecretVec::new(credential);
         check_owner_only(&paths.credential)?;
-        let text = String::from_utf8(text).map_err(|_| RegistrationError::Malformed {
-            detail: "is not text".to_owned(),
-        })?;
         let mut endpoint = None;
         let mut framing = FramingName::JsonLines;
         for line in text.lines() {
@@ -368,6 +380,60 @@ impl Registration {
         body.push(b'}');
         Ok(SecretVec::new(body))
     }
+}
+
+/// Reads the registration, waiting until the deadline for it to be a whole record.
+fn wait_for_whole(
+    path: &Path,
+    deadline: Instant,
+    within: Duration,
+) -> Result<String, RegistrationError> {
+    let mut seen = false;
+    loop {
+        match read_bounded(path, MAX_REGISTRATION_BYTES) {
+            Ok(content) => {
+                if let Some(text) = String::from_utf8(content).ok().filter(|text| whole(text)) {
+                    return Ok(text);
+                }
+                seen = true;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(RegistrationError::Unreadable {
+                    path: path.to_path_buf(),
+                    detail: error.to_string(),
+                });
+            }
+        }
+        if Instant::now() >= deadline {
+            let path = path.to_path_buf();
+            return Err(if seen {
+                RegistrationError::Incomplete {
+                    path,
+                    waited: within,
+                }
+            } else {
+                RegistrationError::Missing {
+                    path,
+                    waited: within,
+                }
+            });
+        }
+        std::thread::sleep(LOOK_AGAIN);
+    }
+}
+
+/// Whether registration text is a whole record: every field the worker writes, and the line break
+/// that ends the last one.
+#[must_use]
+pub fn whole(text: &str) -> bool {
+    text.ends_with('\n')
+        && REGISTRATION_FIELDS.iter().all(|field| {
+            text.lines().any(|line| {
+                line.split_once('=')
+                    .is_some_and(|(name, _)| name.trim() == *field)
+            })
+        })
 }
 
 /// Reads one file the worker writes, waiting for it until the deadline.
@@ -483,6 +549,22 @@ mod tests {
         ] {
             assert!(Endpoint::parse(refused).is_err(), "{refused:?} is refused");
         }
+    }
+
+    /// Only a whole record is a registration: every field, and the line break after the last.
+    #[test]
+    fn a_registration_is_whole_only_when_every_field_and_the_last_line_break_are_there() {
+        let complete = "endpoint=/run/kr/a.sock\nprofile=lp-1\ninstance=i\npid=1\nstart=2\n\
+                        framing=json_lines\n";
+        assert!(whole(complete));
+        assert!(!whole(""));
+        assert!(!whole(complete.trim_end()));
+        assert!(!whole(&complete[..complete.len() / 2]));
+        assert!(!whole(
+            complete
+                .strip_suffix("framing=json_lines\n")
+                .expect("the last line")
+        ));
     }
 
     #[test]
