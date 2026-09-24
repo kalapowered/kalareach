@@ -178,6 +178,41 @@ mod ios {
             "the iOS keychain, in this application's own access group".to_owned()
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The real keychain: an item is written, read back, replaced and deleted in the group the
+        /// run names. The process needs that group's entitlement, which only a simulator or device
+        /// run carries, so this is ignored in ordinary runs. Run it in a booted simulator:
+        /// `xcrun simctl spawn <device> <test binary> --ignored --exact <name>`, with
+        /// `SIMCTL_CHILD_KR_KEYCHAIN_GROUP` naming the group and the binary linked with an
+        /// `__entitlements` section that grants it.
+        #[test]
+        #[ignore = "needs a simulator or device, and the keychain group's entitlement"]
+        fn the_keychain_keeps_reads_back_replaces_and_deletes_one_item() {
+            let group =
+                std::env::var("KR_KEYCHAIN_GROUP").expect("KR_KEYCHAIN_GROUP names a group");
+            let store = KeychainStore { group };
+            let name = SecretName::new("test/round-trip").expect("a name");
+            store
+                .delete(&name)
+                .expect("a delete of an item that may be absent");
+            assert!(store.get(&name).expect("a read").is_none());
+            store.set(&name, b"a grant").expect("a write");
+            let read = store.get(&name).expect("a read").expect("the item");
+            assert_eq!(read.expose(), b"a grant");
+            store
+                .set(&name, b"a rotated grant")
+                .expect("a second write");
+            let read = store.get(&name).expect("a read").expect("the item");
+            assert_eq!(read.expose(), b"a rotated grant");
+            store.delete(&name).expect("a delete");
+            assert!(store.get(&name).expect("a read").is_none());
+            println!("keychain: written, read back, replaced and deleted");
+        }
+    }
 }
 
 #[cfg(target_os = "android")]

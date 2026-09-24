@@ -17,6 +17,8 @@ android {
     defaultConfig {
         minSdk = 24
         consumerProguardFiles("consumer-rules.pro")
+        // The secret store's device tests, which need the Android Keystore.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     compileOptions {
@@ -39,4 +41,6 @@ dependencies {
     // The platform TLS verifier's Kotlin half, from the local Maven repository inside its Rust
     // crate, which the application's root build declares for every project.
     implementation("rustls:rustls-platform-verifier:0.1.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
 }
