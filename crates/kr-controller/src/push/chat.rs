@@ -33,9 +33,12 @@
 //!
 //! None of these services takes an identifier it would recognise a repeat by, so each is
 //! configured without one, and [`kr_delivery::external::decide_external`] marks an unknown outcome
-//! as duplicate-delivery uncertainty rather than sending it again. The request's address can hold
-//! the credential, so a failure is reported by its class and phase and never with the transport's
-//! own message, which names the address.
+//! as duplicate-delivery uncertainty rather than sending it again.
+//!
+//! Every outcome is written in this host's own words. The request's address can hold the
+//! credential, so a failure is reported by its class and phase and never with the transport's own
+//! message, which names the address; and a service's answer is reported by its status, with nothing
+//! of what the service said but one of the error codes Slack documents ([`SLACK_ERROR_CODES`]).
 
 use std::sync::Arc;
 
@@ -256,9 +259,6 @@ pub const TELEGRAM_LIMIT: usize = 4_096;
 /// Discord's message flag that stops the links in a message from being fetched and embedded.
 const SUPPRESS_EMBEDS: u64 = 1 << 2;
 
-/// The longest part of a service's own answer this host repeats.
-const MAX_SERVICE_WORDS: usize = 120;
-
 /// The chat services' adapter: one HTTPS request per attempt, through the managed transport of
 /// the service's own origin.
 #[derive(Clone, Debug)]
@@ -317,7 +317,7 @@ impl ChatSender {
             Err(error) => ExternalOutcome::Unknown {
                 detail: format!("{service} did not answer{}", phase(&error)),
             },
-            Ok(answer) => read_answer(service, secret, answer.status, &answer.body),
+            Ok(answer) => read_answer(service, answer.status, &answer.body),
         }
     }
 }
@@ -409,13 +409,8 @@ fn request(
 }
 
 /// Reads one service's answer as what it says.
-fn read_answer(
-    service: &'static str,
-    secret: &DestinationSecret,
-    status: u16,
-    body: &[u8],
-) -> ExternalOutcome {
-    let said = service_words(service, secret, body);
+fn read_answer(service: &'static str, status: u16, body: &[u8]) -> ExternalOutcome {
+    let said = service_words(service, body);
     match status {
         200..=299 if service == "Telegram" => {
             let sent = serde_json::from_slice::<serde_json::Value>(body)
@@ -445,60 +440,42 @@ fn read_answer(
     }
 }
 
-/// What a service said about a refusal, in words this host can repeat, or nothing.
+/// The error codes Slack documents for an incoming webhook, which are the only words of a service's
+/// answer this host ever repeats.
 ///
-/// Slack answers with a short code (`channel_not_found`), Discord with a numbered error and
-/// Telegram with a description. Each is kept only when it is short, printable and holds no piece
-/// of the credential: a service's own words are the service's, and this host does not write down
-/// what it cannot vouch for.
-fn service_words(service: &str, secret: &DestinationSecret, body: &[u8]) -> String {
-    let text = String::from_utf8_lossy(body);
-    let words = match service {
-        "Slack" => Some(text.trim().to_owned()).filter(|code| {
-            !code.is_empty()
-                && code.len() <= 64
-                && code
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
-        }),
-        "Discord" => serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|value| value.get("code").and_then(serde_json::Value::as_u64))
-            .map(|code| format!("error {code}")),
-        _ => serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("description")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            })
-            .map(|description| {
-                description
-                    .chars()
-                    .filter(|character| character.is_ascii_graphic() || *character == ' ')
-                    .take(MAX_SERVICE_WORDS)
-                    .collect::<String>()
-            }),
-    };
-    words
-        .filter(|words| !words.is_empty() && !holds_a_piece_of(words, secret))
-        .map_or_else(String::new, |words| format!(": {words}"))
-}
+/// A service's own words are the service's, and one that repeats what it was sent can repeat the
+/// credential, which for these services is the address itself: a Telegram description has been
+/// seen to quote the request's path, and cutting such a description short can cut it anywhere in
+/// the token. So nothing a service says is written down unless it is one of these exact codes,
+/// which carry no part of any request. Discord's and Telegram's answers are read for their status
+/// and, for Telegram, for `"ok"`, and their words are not repeated at all.
+pub const SLACK_ERROR_CODES: [&str; 14] = [
+    "action_prohibited",
+    "channel_is_archived",
+    "channel_not_found",
+    "invalid_payload",
+    "invalid_token",
+    "no_active_hooks",
+    "no_service",
+    "no_service_id",
+    "no_team",
+    "no_text",
+    "posting_to_general_channel_denied",
+    "team_disabled",
+    "too_many_attachments",
+    "user_not_found",
+];
 
-/// Whether text holds any part of a credential long enough to matter.
-fn holds_a_piece_of(text: &str, secret: &DestinationSecret) -> bool {
-    let credential = match secret {
-        DestinationSecret::Slack { webhook_url } | DestinationSecret::Discord { webhook_url } => {
-            webhook_url.expose()
-        }
-        DestinationSecret::Telegram { bot_token } => bot_token.expose(),
-        DestinationSecret::Email { account } => account.password.expose(),
-    };
-    credential
-        .split(['/', ':', '?', '=', '&'])
-        .filter(|piece| piece.len() >= 8)
-        .any(|piece| text.contains(piece))
+/// What a service said about a refusal, as one of the codes this host repeats, or nothing.
+fn service_words(service: &str, body: &[u8]) -> String {
+    if service != "Slack" {
+        return String::new();
+    }
+    let said = String::from_utf8_lossy(body);
+    SLACK_ERROR_CODES
+        .iter()
+        .find(|code| said.trim() == **code)
+        .map_or_else(String::new, |code| format!(": {code}"))
 }
 
 /// The length of text in UTF-16 code units, the unit Discord and Telegram measure a message in.

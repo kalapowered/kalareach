@@ -1042,13 +1042,19 @@ fn a_chat_services_answer_is_read_as_what_it_says() {
             "500",
         ),
         (
+            DestinationKind::Slack,
+            (400, format!("invalid_payload for {SECRET_PART}")),
+            |outcome| matches!(outcome, ExternalOutcome::Refused { .. }),
+            "Slack answered 400",
+        ),
+        (
             DestinationKind::Discord,
             (
                 404,
                 "{\"message\":\"Unknown Webhook\",\"code\":10015}".to_owned(),
             ),
             |outcome| matches!(outcome, ExternalOutcome::Refused { .. }),
-            "error 10015",
+            "404",
         ),
         (
             DestinationKind::Telegram,
@@ -1058,7 +1064,7 @@ fn a_chat_services_answer_is_read_as_what_it_says() {
                     .to_owned(),
             ),
             |outcome| matches!(outcome, ExternalOutcome::Refused { .. }),
-            "chat not found",
+            "Telegram answered 400",
         ),
         (
             DestinationKind::Telegram,
@@ -1109,10 +1115,43 @@ fn a_chat_services_answer_is_read_as_what_it_says() {
         assert!(expected(&outcome), "{kind} {answer:?} read as {outcome:?}");
         let rendered = format!("{outcome:?}");
         assert!(rendered.contains(says), "{rendered}");
-        assert!(
-            !rendered.contains(SECRET_PART),
-            "the outcome repeats the credential: {rendered}"
-        );
+        // Only this host's own words: nothing of the credential, and nothing a service said but
+        // one of Slack's documented codes.
+        for piece in [
+            SECRET_PART,
+            "kept-in-the",
+            "the-secret",
+            "Unknown Webhook",
+            "chat not found",
+        ] {
+            assert!(!rendered.contains(piece), "{piece:?} in {rendered}");
+        }
+    }
+
+    // A service that quotes the credential back, even cut off part way through it, is not quoted.
+    let telegram = StandIn::start(vec![(
+        403,
+        format!(
+            "{{\"ok\":false,\"description\":\"{}{}\"}}",
+            "x".repeat(78),
+            telegram_token()
+        ),
+    )]);
+    let sender = chat_sender(&runtime, ToStandIns::default().with(TELEGRAM, &telegram));
+    let outcome = sender.send(
+        &external(DestinationKind::Telegram, "123456789"),
+        &DestinationSecret::Telegram {
+            bot_token: secret_text(&telegram_token()),
+        },
+        &message(DestinationKind::Telegram),
+    );
+    let rendered = format!("{outcome:?}");
+    assert!(
+        matches!(outcome, ExternalOutcome::Refused { .. }),
+        "{rendered}"
+    );
+    for piece in ["kept-in", "123456:", "xxxxxxxx"] {
+        assert!(!rendered.contains(piece), "{piece:?} in {rendered}");
     }
 
     // No service at all: nothing was sent, and the transport's own message, which names the

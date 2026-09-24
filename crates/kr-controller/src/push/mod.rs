@@ -1021,11 +1021,13 @@ impl DeliveryModule {
                         now_ms,
                     );
                 }
-                Err(error) => {
+                // The store's own account of a failure is not written down: the record says what
+                // this host knows, in its own words.
+                Err(_) => {
                     return self.settle(
                         delivery,
                         DeliveryState::Abandoned,
-                        &format!("this host's secret store could not be read: {error}"),
+                        "this host's secret store could not be read, so nothing was sent",
                         now_ms,
                     );
                 }
