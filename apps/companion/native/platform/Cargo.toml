@@ -1,0 +1,53 @@
+[package]
+name = "companion-platform"
+description = "The KalaReach companion's native platform services: one secure store, the Android TLS verifier's start, and the browser-backed sign-in session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+# Tauri finds a plugin's Swift package and Android library through the build script's metadata,
+# which needs a `links` key.
+links = "companion-platform"
+
+[dependencies]
+base64.workspace = true
+kr-crypto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# iOS keeps secrets in the protected keychain store, in this application's own access group, only
+# after first unlock, on this device only.
+[target.'cfg(target_os = "ios")'.dependencies]
+apple-native-keyring-store = { version = "=1.0.2", features = ["protected"] }
+keyring-core = "=1.0.0"
+
+# Windows binds the loopback listener with SO_EXCLUSIVEADDRUSE, which needs the socket before it
+# binds and one Winsock call.
+[target.'cfg(windows)'.dependencies]
+socket2 = "=0.6.5"
+windows-sys = { workspace = true, features = ["Win32_Networking_WinSock"] }
+
+# Android's TLS verifier is given the JVM and the application context through one native method.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "=0.22.4"
+rustls-platform-verifier.workspace = true
+
+[build-dependencies]
+tauri-plugin = { version = "=2.6.3", features = ["build"] }
+
+# The workspace forbids unsafe code, which two platform calls cannot honour: the Android TLS
+# verifier's start is a native method the JVM calls by its exported name, an unsafe attribute; and
+# the Windows loopback listener's SO_EXCLUSIVEADDRUSE is a Winsock call with a raw pointer. This
+# crate denies unsafe code and allows it on exactly those two functions, `tls`'s start and
+# `loopback`'s `exclusive`. Nothing else here may relax the rule.
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

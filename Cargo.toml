@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "apps/companion/src-tauri",
+    "apps/companion/native/platform",
     "crates/kr-attention",
     "crates/kr-automation",
     "crates/kr-cbor",
@@ -39,6 +40,9 @@ repository = "https://github.com/kalapowered/kalareach"
 publish = false
 
 [workspace.dependencies]
+# The companion's native platform services: its one secure store, the Android TLS verifier's start
+# and the browser-backed sign-in session.
+companion-platform = { path = "apps/companion/native/platform", version = "=0.1.0" }
 # The signing and verification primitives `tough` is built on. Declared here because the catalogue
 # tests build their own trust roots and generations, which needs the same random source and key
 # pair types that crate signs with.
