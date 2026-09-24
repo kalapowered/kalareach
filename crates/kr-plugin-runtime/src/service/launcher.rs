@@ -367,64 +367,96 @@ async fn retire_ended_hosts(environment: &EnvironmentPaths, supervisor: &Arc<dyn
 
 /// Takes the job of one launch away once its host has ended.
 ///
-/// Where the launch recorded a process, the kernel is asked about it until it has gone, however
-/// long the host serves. Then, and at once where no process was recorded, the supervisor is asked
-/// to retire the job, once and then each second until the job has gone or [`RETIREMENT_WINDOW`]
-/// has passed; what was left unsettled at the end is reported, and the next launch asks again.
+/// Where the launch recorded a process, the kernel is asked about it each [`HOST_WATCH_INTERVAL`]
+/// until it has gone, however long the host serves. Then, and at once where no process was
+/// recorded, the supervisor is asked to retire the job, once and then each second until the job
+/// has gone or [`RETIREMENT_WINDOW`] has passed; what was left unsettled at the end is reported, and
+/// the next launch asks again.
 ///
-/// A launch whose supervisor defined no job, as one that starts a detached process or a
-/// transient unit its manager collects by itself, has nothing to take away and nothing is watched.
+/// The watch ends early when the job's definition has gone, which is a later launch's sweep having
+/// retired it. A kernel that cannot say whether the host is running is not taken to mean it has
+/// ended: after [`RETIREMENT_WINDOW`] of such answers the supervisor is asked instead, and it leaves
+/// a job whose process is running exactly as it is.
+///
+/// A launch whose supervisor defined no job, as one that starts a detached process or a transient
+/// unit its manager collects by itself, has nothing to take away and nothing is watched.
 fn retire_when_ended(
     supervisor: Arc<dyn HostSupervisor>,
     jobs: PathBuf,
     label: String,
     launched: Option<ProcessStartIdentity>,
 ) {
-    if std::fs::symlink_metadata(jobs.join(format!("{label}.plist")))
-        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-    {
+    let definition = jobs.join(format!("{label}.plist"));
+    let undefined = |definition: &Path| {
+        std::fs::symlink_metadata(definition)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    };
+    if undefined(&definition) {
         return;
     }
     tokio::spawn(async move {
         if let Some(identity) = launched {
-            while !matches!(
-                kr_ipc::identity::process_state(&identity),
-                kr_ipc::identity::ProcessState::Ended
-            ) {
+            let mut unanswered_since: Option<tokio::time::Instant> = None;
+            loop {
+                if undefined(&definition) {
+                    return;
+                }
+                match kr_ipc::identity::process_state(&identity) {
+                    kr_ipc::identity::ProcessState::Ended => break,
+                    kr_ipc::identity::ProcessState::Running => unanswered_since = None,
+                    kr_ipc::identity::ProcessState::Unknown { .. } => {
+                        let since = *unanswered_since.get_or_insert_with(tokio::time::Instant::now);
+                        if since.elapsed() >= RETIREMENT_WINDOW {
+                            break;
+                        }
+                    }
+                }
                 tokio::time::sleep(HOST_WATCH_INTERVAL).await;
             }
         }
         let deadline = tokio::time::Instant::now() + RETIREMENT_WINDOW;
-        let left = loop {
+        // The first look always runs; a later one that waited for a thread past the deadline does
+        // not begin, so no look starts with a fresh command bound once the window has closed.
+        let mut not_after = None;
+        let mut left = None;
+        loop {
             let asked = {
                 let supervisor = Arc::clone(&supervisor);
                 let (jobs, label) = (jobs.clone(), label.clone());
-                tokio::task::spawn_blocking(move || supervisor.retire(&jobs, &label)).await
+                tokio::task::spawn_blocking(move || {
+                    if not_after.is_some_and(|not_after| std::time::Instant::now() >= not_after) {
+                        return None;
+                    }
+                    Some(supervisor.retire(&jobs, &label))
+                })
+                .await
             };
-            let answer = match asked {
-                Ok(HostJobRetirement::Gone) => return,
-                Ok(answer) => answer,
-                Err(error) => HostJobRetirement::Unsettled(error.to_string()),
-            };
+            match asked {
+                Ok(Some(HostJobRetirement::Gone)) => return,
+                Ok(Some(answer)) => left = Some(answer),
+                Ok(None) => break,
+                Err(error) => left = Some(HostJobRetirement::Unsettled(error.to_string())),
+            }
             let now = tokio::time::Instant::now();
             if now >= deadline {
-                break answer;
+                break;
             }
             tokio::time::sleep(
                 core::time::Duration::from_secs(1).min(deadline.saturating_duration_since(now)),
             )
             .await;
             if tokio::time::Instant::now() >= deadline {
-                break answer;
+                break;
             }
-        };
+            not_after = Some(deadline.into_std());
+        }
         match left {
-            HostJobRetirement::Gone => {}
-            HostJobRetirement::StillRunning => eprintln!(
+            None | Some(HostJobRetirement::Gone) => {}
+            Some(HostJobRetirement::StillRunning) => eprintln!(
                 "kr-plugin-runtime: the job {label} still had a process {RETIREMENT_WINDOW:?} \
-                 after its launch, so it is left for the next launch to look at"
+                 after its host was last known to run, so it is left for the next launch to look at"
             ),
-            HostJobRetirement::Unsettled(detail) => {
+            Some(HostJobRetirement::Unsettled(detail)) => {
                 eprintln!("kr-plugin-runtime: the job {label} could not be removed: {detail}");
             }
         }
@@ -1484,23 +1516,47 @@ mod tests {
         }
     }
 
-    /// Starts a process of this test's own that ends by itself a second later, and returns it
-    /// with the identity the kernel gives it.
-    fn a_process_that_ends_soon() -> (std::process::Child, ProcessStartIdentity) {
-        let child = std::process::Command::new("sleep")
-            .arg("1")
-            .spawn()
-            .expect("the process starts");
-        let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
-        loop {
-            match kr_ipc::identity::process_start_identity(child.id()) {
-                Ok(identity) => return (child, identity),
-                Err(error) => assert!(
-                    std::time::Instant::now() < deadline,
-                    "the kernel never described the process: {error}"
-                ),
+    /// A process of this test's own that runs until the test lets it go, with the identity the
+    /// kernel gives it.
+    ///
+    /// It reads its input to the end, so closing that input is what ends it, on every platform:
+    /// `cat` where there is one and `more` on Windows.
+    struct Held {
+        child: std::process::Child,
+        identity: ProcessStartIdentity,
+    }
+
+    impl Held {
+        fn start() -> Self {
+            let program = if cfg!(windows) { "more" } else { "cat" };
+            let child = std::process::Command::new(program)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("the process starts");
+            let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
+            loop {
+                match kr_ipc::identity::process_start_identity(child.id()) {
+                    Ok(identity) => return Self { child, identity },
+                    Err(error) => assert!(
+                        std::time::Instant::now() < deadline,
+                        "the kernel never described the process: {error}"
+                    ),
+                }
+                std::thread::sleep(core::time::Duration::from_millis(20));
             }
-            std::thread::sleep(core::time::Duration::from_millis(20));
+        }
+
+        /// Lets the process go, and waits for it to end.
+        fn release(&mut self) {
+            drop(self.child.stdin.take());
+            let _ = self.child.wait();
+        }
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            self.release();
         }
     }
 
@@ -1553,7 +1609,8 @@ mod tests {
     async fn the_job_of_a_host_is_taken_away_once_the_host_has_ended() {
         let host = kr_ipc::testing::TempHost::create();
         let environment = host.environment();
-        let (mut child, identity) = a_process_that_ends_soon();
+        let mut held = Held::start();
+        let identity = held.identity.clone();
         let told = Told::new(move |_plan| HostStartOutcome::Started(identity.clone()));
         let supervisor: Arc<dyn HostSupervisor> = told.clone();
         // The process never reports in, so the launch fails; its job is still one this launch
@@ -1571,6 +1628,14 @@ mod tests {
         let Some(Asked::Start(label)) = told.asked().first().cloned() else {
             panic!("the job was started: {:?}", told.asked());
         };
+        // However many times the watch looks while the host runs, its job is left as it is.
+        tokio::time::sleep(HOST_WATCH_INTERVAL * 3).await;
+        assert_eq!(
+            told.asked(),
+            vec![Asked::Start(label.clone())],
+            "nothing was retired while the host was running"
+        );
+        held.release();
         assert!(
             told.until_retired(&label).await,
             "the job was retired only once its host had ended: {:?}",
@@ -1588,7 +1653,6 @@ mod tests {
             "nothing of the job is left: {:?}",
             defined_host_jobs(&environment)
         );
-        let _ = child.wait();
     }
 
     /// A start that failed leaves no process to wait for, so its job is taken away at once, which
@@ -1624,7 +1688,8 @@ mod tests {
     async fn a_launch_that_defined_no_job_asks_for_no_retirement() {
         let host = kr_ipc::testing::TempHost::create();
         let environment = host.environment();
-        let (mut child, identity) = a_process_that_ends_soon();
+        let mut held = Held::start();
+        let identity = held.identity.clone();
         let told = Told::defining_nothing(move |_plan| HostStartOutcome::Started(identity.clone()));
         let supervisor: Arc<dyn HostSupervisor> = told.clone();
         let _ = start(
@@ -1637,7 +1702,7 @@ mod tests {
         .await
         .expect_err("nothing reported itself");
         // Well past the moment its process ended and a watch would have asked.
-        let _ = child.wait();
+        held.release();
         tokio::time::sleep(HOST_WATCH_INTERVAL * 3).await;
         assert!(
             told.asked()
@@ -1645,6 +1710,40 @@ mod tests {
                 .all(|asked| matches!(asked, Asked::Start(_))),
             "{:?}",
             told.asked()
+        );
+    }
+
+    /// A watch ends once the job it is watching for has gone some other way, as when a later
+    /// launch's sweep retired it: it asks for nothing more when the host then ends.
+    #[tokio::test]
+    async fn a_watch_ends_once_its_job_has_gone_some_other_way() {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let mut held = Held::start();
+        let identity = held.identity.clone();
+        let told = Told::new(move |_plan| HostStartOutcome::Started(identity.clone()));
+        let supervisor: Arc<dyn HostSupervisor> = told.clone();
+        let _ = start(
+            &environment,
+            "/nonexistent/kr-plugin-host",
+            std::path::Path::new("/var/packages"),
+            &supervisor,
+            core::time::Duration::from_millis(50),
+        )
+        .await
+        .expect_err("nothing reported itself");
+        let Some(Asked::Start(label)) = told.asked().first().cloned() else {
+            panic!("the job was started: {:?}", told.asked());
+        };
+        std::fs::remove_file(environment.jobs_dir().join(format!("{label}.plist")))
+            .expect("the job goes some other way");
+        tokio::time::sleep(HOST_WATCH_INTERVAL * 2).await;
+        held.release();
+        tokio::time::sleep(HOST_WATCH_INTERVAL * 3).await;
+        assert_eq!(
+            told.asked(),
+            vec![Asked::Start(label)],
+            "a job that had already gone was not asked about again"
         );
     }
 

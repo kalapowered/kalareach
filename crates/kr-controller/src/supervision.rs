@@ -632,20 +632,26 @@ impl LaunchdSupervisor {
             // Whether the removal took is read back from launchd rather than from this command's
             // own answer: a job something else removed a moment earlier is gone all the same.
             let failure = removal_failure(&target, &launchctl_within(&["bootout", &target]));
+            // Whatever the look after it says, what the removal itself said goes with the answer.
+            let removal_said = failure.as_deref().map_or_else(String::new, |failure| {
+                format!("; removing it said: {failure}")
+            });
             match job_state(&target) {
                 JobState::NotLoaded => {
                     said.extend(failure.map(|failure| {
                         format!("{target} is gone, and removing it said: {failure}")
                     }))
                 }
-                JobState::Unknown(detail) => return (JobRetirement::Unsettled(detail), said),
+                JobState::Unknown(detail) => {
+                    return (
+                        JobRetirement::Unsettled(format!("{detail}{removal_said}")),
+                        said,
+                    );
+                }
                 JobState::Running | JobState::Ended => {
                     return (
                         JobRetirement::Unsettled(format!(
-                            "{target} is still loaded after it was removed{}",
-                            failure.map_or_else(String::new, |failure| format!(
-                                "; removing it said: {failure}"
-                            ))
+                            "{target} is still loaded after it was removed{removal_said}"
                         )),
                         said,
                     );
@@ -1548,9 +1554,7 @@ mod tests {
         fn drop(&mut self) {
             let uid = kr_ipc::paths::current_uid();
             for domain in ["gui", "user"] {
-                let _ = std::process::Command::new("/bin/launchctl")
-                    .args(["bootout", &format!("{domain}/{uid}/{}", self.0)])
-                    .output();
+                let _ = launchctl_within(&["bootout", &format!("{domain}/{uid}/{}", self.0)]);
             }
         }
     }
@@ -1657,10 +1661,7 @@ mod tests {
         launchd_domains_are_here();
         // An account that never has a graphical login, so its graphical domain is never there.
         let absent = "gui/1".to_owned();
-        let asked = std::process::Command::new("/bin/launchctl")
-            .args(["print", &absent])
-            .output()
-            .expect("runs launchctl");
+        let asked = launchctl_within(&["print", &absent]).expect("launchctl answers");
         assert_eq!(
             asked.status.code(),
             Some(112),
