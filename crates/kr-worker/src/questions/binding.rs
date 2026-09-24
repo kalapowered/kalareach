@@ -449,6 +449,14 @@ impl ProcessTable for Kernel {
     }
 }
 
+/// Returns the executable one process is running, where the platform names it.
+///
+/// It is the same reading the identity header records for a verified source, and the broker uses
+/// it to check that a native bridge runs the forwarder its installation put in place.
+pub(crate) fn executable_of(pid: u32) -> Option<String> {
+    platform::executable(pid)
+}
+
 /// Returns whether the boundary this session owns holds this process.
 fn contains(table: &impl ProcessTable, boundary: &OwnershipBoundary, pid: u32) -> Finding {
     match boundary {

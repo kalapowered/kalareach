@@ -115,6 +115,12 @@ struct Hello {
     /// Anything the connecting side attached to the connection.
     #[serde(default)]
     headers: BTreeMap<String, String>,
+    /// Which native bridge the connecting side says it is, when it is one.
+    ///
+    /// A claim like everything else here: [`NativeGateway::accept_bridge`] validates it against
+    /// the installation this host recorded for the launch.
+    #[serde(default)]
+    bridge: Option<crate::broker::bridge::BridgeDeclaration>,
 }
 
 /// What one connection's ending meant, as the closure itself established it.
@@ -512,6 +518,8 @@ pub struct NativeGateway {
     observatory: Observatory,
     launch: NativeLaunch,
     registration: Option<Registration>,
+    /// The native bridge the launched application was installed with, where it has one.
+    bridge: Option<crate::broker::bridge::InstalledBridge>,
     runtime_directory: std::path::PathBuf,
     /// How long this gateway gives a connection's writers once its reading has ended.
     ///
@@ -607,8 +615,34 @@ impl NativeGateway {
             observatory,
             launch,
             registration,
+            bridge: None,
             runtime_directory: runtime_directory.to_path_buf(),
         })
+    }
+
+    /// Declares the native bridge the launched application was installed with.
+    ///
+    /// Section 11's bridges are installed per application, and a bridge that connects is validated
+    /// against this record: the application its registration invokes the forwarder for, the
+    /// surfaces the recipe registered, and the forwarder executable it points the application at.
+    /// A launch with no installed bridge admits none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::InvalidArgument`] when the bridge was installed from a package other
+    /// than the connector this launch was made for.
+    pub fn with_bridge(
+        mut self,
+        installed: crate::broker::bridge::InstalledBridge,
+    ) -> Result<Self> {
+        if installed.plugin_id != self.launch.plugin_id {
+            return Err(BrokerError::invalid(format!(
+                "the bridge installed from {} is not the connector {} this launch was made for",
+                installed.plugin_id, self.launch.plugin_id
+            )));
+        }
+        self.bridge = Some(installed);
+        Ok(self)
     }
 
     /// Starts the agent this launch names and publishes what its forwarder needs to reach here.
@@ -747,6 +781,71 @@ impl NativeGateway {
         self.admit(accepted, client_reader, client_writer).await
     }
 
+    /// Accepts one connection from a native bridge the launched application started, and admits it.
+    ///
+    /// The order is the one [`NativeGateway::accept`] keeps, with the bridge's own launch binding in
+    /// place of the launched process's:
+    ///
+    /// 1. **Accept.** The kernel names the peer, or the platform has no private socket and says so.
+    /// 2. **Hello.** One frame under [`HELLO_DEADLINE`], and nothing past it is read until the
+    ///    connection is admitted. It must declare which bridge it is.
+    /// 3. **Refuse a browser.** Anything a browser would have added disqualifies the connection.
+    /// 4. **Authenticate and validate.** The owner, the process the hello presents against the one
+    ///    the kernel named, the parent chain to the process this host launched, the installation
+    ///    this host recorded, and then the launch's private exchange.
+    /// 5. **Admit.** One admission frame, so the bridge knows it may speak.
+    ///
+    /// What the admitted bridge then says is its surface's business; see
+    /// [`crate::broker::bridge`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::PermissionDenied`] when any check fails, which closes the connection
+    /// without a word, and [`BrokerError::UpstreamUnavailable`] when the admission cannot be
+    /// written.
+    pub async fn accept_bridge(&self) -> Result<crate::broker::bridge::AdmittedBridge> {
+        let Accepted { peer, stream } = self.endpoint.accept().await?;
+        let (mut reader, writer) = split_stream(stream);
+        let (hello, credential, held) = self.hello(&mut reader).await?;
+        let credential = kr_crypto::secret::SecretVec::new(credential);
+        reject_browser_origin(
+            hello
+                .headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        )?;
+        let declared = hello.bridge.clone().ok_or_else(|| {
+            BrokerError::denied("this connection does not say which native bridge it is")
+        })?;
+        let installed = self.bridge.as_ref().ok_or_else(|| {
+            BrokerError::denied("no native bridge is installed for the application this launch is")
+        })?;
+        let registration = self.registration.as_ref().ok_or_else(|| {
+            BrokerError::denied("this endpoint has not launched anything to authenticate against")
+        })?;
+        let presented = BridgeHello {
+            credential,
+            process: presented_process(&hello)?,
+            environment_session_id: hello.session.clone(),
+        };
+        registration.authenticate_bridge(&presented, &peer, installed, &declared)?;
+        self.broker.admit_bridge_exchange(
+            self.launch.application_instance_id,
+            presented.credential.expose(),
+        )?;
+        let process = peer.process().unwrap_or(&presented.process).clone();
+        let mut stream =
+            crate::broker::bridge::BridgeStream::new(reader, writer, held, self.launch.framing);
+        stream
+            .write_frame(&crate::broker::bridge::admission_frame(declared.surface))
+            .await?;
+        Ok(crate::broker::bridge::AdmittedBridge {
+            surface: declared.surface,
+            process,
+            stream,
+        })
+    }
+
     /// Everything after the accept, for one connection.
     async fn admit<CR, CW>(
         &self,
@@ -759,24 +858,7 @@ impl NativeGateway {
         CW: tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let Accepted { peer, stream } = accepted;
-        let (upstream_reader, upstream_writer) = match stream {
-            #[cfg(unix)]
-            Stream::Socket(socket) => {
-                let (reader, writer) = tokio::io::split(socket);
-                (
-                    Box::new(reader) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
-                    Box::new(writer) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
-                )
-            }
-            Stream::Loopback(socket) => {
-                let (reader, writer) = tokio::io::split(socket);
-                (
-                    Box::new(reader) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
-                    Box::new(writer) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
-                )
-            }
-        };
-        let mut upstream_reader = upstream_reader;
+        let (mut upstream_reader, upstream_writer) = split_stream(stream);
         let (hello, credential, held) = self.hello(&mut upstream_reader).await?;
         // Anything a browser would have added disqualifies the connection before its credential is
         // even compared: section 12 serves no browser on this listener.
@@ -789,23 +871,7 @@ impl NativeGateway {
         // The identity a bridge presents is read back from the operating system rather than
         // believed. A bridge that named a process it is not is then refused by the comparison
         // below instead of having its own account of itself compared with the launch.
-        let presented_pid = u32::try_from(hello.pid).map_err(|_| {
-            BrokerError::denied("this connection named no process this host could read")
-        })?;
-        let read = kr_ipc::identity::process_start_identity(presented_pid).map_err(|error| {
-            BrokerError::denied(format!(
-                "this connection named process {presented_pid}, which this host cannot read: \
-                 {error}"
-            ))
-        })?;
-        if read.start_value.get() != hello.start {
-            return Err(BrokerError::denied(format!(
-                "this connection says process {presented_pid} started at {} and the operating \
-                 system says {}",
-                hello.start,
-                read.start_value.get()
-            )));
-        }
+        let read = presented_process(&hello)?;
         let presented = BridgeHello {
             credential: kr_crypto::secret::SecretVec::new(credential.clone()),
             process: read,
@@ -1011,6 +1077,51 @@ impl NativeGateway {
         let credential = decode_credential(&frame.kr_hello.credential)?;
         Ok((frame.kr_hello, credential, buffer))
     }
+}
+
+/// The two halves of an accepted connection, whichever kind this platform bound.
+type Halves = (
+    Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+);
+
+/// Separates an accepted connection into the halves its owner reads and writes.
+fn split_stream(stream: Stream) -> Halves {
+    match stream {
+        #[cfg(unix)]
+        Stream::Socket(socket) => {
+            let (reader, writer) = tokio::io::split(socket);
+            (Box::new(reader), Box::new(writer))
+        }
+        Stream::Loopback(socket) => {
+            let (reader, writer) = tokio::io::split(socket);
+            (Box::new(reader), Box::new(writer))
+        }
+    }
+}
+
+/// Reads back from the operating system the process a hello presents.
+///
+/// The identity a bridge presents is read back rather than believed: a start value the operating
+/// system does not report for that identifier is a process the bridge is not.
+fn presented_process(hello: &Hello) -> Result<ProcessStartIdentity> {
+    let presented_pid = u32::try_from(hello.pid).map_err(|_| {
+        BrokerError::denied("this connection named no process this host could read")
+    })?;
+    let read = kr_ipc::identity::process_start_identity(presented_pid).map_err(|error| {
+        BrokerError::denied(format!(
+            "this connection named process {presented_pid}, which this host cannot read: {error}"
+        ))
+    })?;
+    if read.start_value.get() != hello.start {
+        return Err(BrokerError::denied(format!(
+            "this connection says process {presented_pid} started at {} and the operating system \
+             says {}",
+            hello.start,
+            read.start_value.get()
+        )));
+    }
+    Ok(read)
 }
 
 /// Reads the hexadecimal credential a bridge presents.

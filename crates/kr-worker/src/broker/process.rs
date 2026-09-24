@@ -257,6 +257,16 @@ impl ManagedProcess {
         self.credential.authenticates(presented) && self.process.matches(process)
     }
 
+    /// Returns true when the presented credential is this launch's private exchange.
+    ///
+    /// This is the private exchange alone, for a bridge the launched application started: its
+    /// process is not this one, and the caller has already bound it to this one by the kernel's
+    /// parent chain. Section 11 still wants both halves, and the caller checks the other.
+    #[must_use]
+    pub fn authenticates_exchange(&self, presented: &[u8]) -> bool {
+        self.credential.authenticates(presented)
+    }
+
     /// Returns true when this platform publishes the launch credential as a file.
     ///
     /// Unix does: the host can read back the owning user and the mode bits of the directory it

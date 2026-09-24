@@ -27,6 +27,7 @@
 //! | [`gateway`] | The core-declarative forwarding path, the closed rich table and reverse calls |
 //! | [`ledger`] | The durable records, in the worker's own journal file |
 //! | [`attach`] | Endpoint acceptance, launch authentication and the connection it becomes |
+//! | [`bridge`] | The native bridge an application starts: its admission, and what it reports |
 //! | [`duplex`] | One supervised owner per live connection: both directions, both queues |
 //! | [`framing`] | How one connector's frames are wrapped and taken apart again |
 //! | [`methods`] | The agent-state reads, the five agent mutations and the plugin action call |
@@ -47,6 +48,7 @@
 pub mod agents;
 pub mod arbitration;
 pub mod attach;
+pub mod bridge;
 pub mod capability;
 pub mod duplex;
 pub mod endpoint;
@@ -87,6 +89,9 @@ pub use crate::broker::arbitration::{
 pub use crate::broker::attach::{
     Attached, Ended, Launched, NativeGateway, NativeLaunch, TEARDOWN_DEADLINE, TerminalWatch,
     hello_frame,
+};
+pub use crate::broker::bridge::{
+    AdmittedBridge, BridgeDeclaration, BridgeStream, BridgeSurface, InstalledBridge,
 };
 pub use crate::broker::capability::{CapabilityOwner, Probe};
 pub use crate::broker::duplex::{

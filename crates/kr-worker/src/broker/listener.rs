@@ -329,6 +329,81 @@ impl Registration {
         Ok(())
     }
 
+    /// Authenticates a native bridge the launched application started, and validates it against
+    /// the installation, before anything it sends is read.
+    ///
+    /// A bridge is not the process this host launched. The application starts it, once for a
+    /// channel server and once for every hook, so the launch binding it proves is the one the
+    /// broker places any helper by: the kernel's parent chain from the connecting process reaches
+    /// the launched process, and every link is checked by its start identity, so an identifier
+    /// recycled since the application started does not complete the chain. On Windows, where a
+    /// recorded parent proves nothing, the job the launched process was started in must hold the
+    /// connecting process instead. A chain or a job that could not be read admits nothing. The
+    /// private exchange is checked where the launch's record lives, by the caller that holds it,
+    /// exactly as [`Registration::authenticate_peer`] leaves it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::PermissionDenied`] naming the first part that failed: the owner, the
+    /// kernel's naming of the peer, the process the hello presents, the launch binding, or the
+    /// installation.
+    pub fn authenticate_bridge(
+        &self,
+        hello: &BridgeHello,
+        peer: &PeerIdentity,
+        installed: &crate::broker::bridge::InstalledBridge,
+        declared: &crate::broker::bridge::BridgeDeclaration,
+    ) -> Result<()> {
+        if !peer.is_owner() {
+            return Err(BrokerError::denied(
+                "this connection is not the operating-system user who owns the session",
+            ));
+        }
+        if cfg!(unix) && !peer.from_operating_system() {
+            return Err(BrokerError::denied(
+                "this platform names the process on a private socket, and this connection was \
+                 admitted without one",
+            ));
+        }
+        // The process the hello presents is the one the kernel named, or the connection is
+        // somebody speaking for a process it is not.
+        if let Some(named) = peer.process()
+            && !named.matches(&hello.process)
+        {
+            return Err(BrokerError::denied(format!(
+                "this connection says it is process {} and the operating system says it is \
+                 process {}",
+                hello.process.pid, named.pid
+            )));
+        }
+        let connecting = peer.process().unwrap_or(&hello.process);
+        match crate::questions::binding::nearest_of(
+            connecting,
+            std::slice::from_ref(&self.expected_process),
+        ) {
+            crate::questions::binding::Ancestry::Reaches(_) => {}
+            crate::questions::binding::Ancestry::ReachesNone => {
+                return Err(BrokerError::denied(format!(
+                    "process {} was not started by the application this host launched as process \
+                     {}",
+                    connecting.pid, self.expected_process.pid
+                )));
+            }
+            crate::questions::binding::Ancestry::Undetermined(why) => {
+                return Err(BrokerError::denied(format!(
+                    "whether process {} was started by the application this host launched as \
+                     process {} could not be established: {why}",
+                    connecting.pid, self.expected_process.pid
+                )));
+            }
+        }
+        let running = u32::try_from(connecting.pid.get())
+            .ok()
+            .and_then(crate::questions::binding::executable_of)
+            .map(std::path::PathBuf::from);
+        installed.validate(declared, running.as_deref())
+    }
+
     /// Renders the registration as the file a launched process reads.
     ///
     /// One `name=value` line each, so the `kr-hook` forwarder can read it without a parser. There
@@ -649,5 +724,130 @@ mod tests {
             upgraded,
             "and a new launch picks up what is on disk now"
         );
+    }
+
+    /// The installation this process stands in for: its own executable, both surfaces.
+    // Unix only: the one case that uses it is.
+    #[cfg(unix)]
+    fn installed_here() -> crate::broker::bridge::InstalledBridge {
+        crate::broker::bridge::InstalledBridge {
+            plugin_id: kr_protocol::ids::PluginId::new("kalareach/claude-code").expect("valid"),
+            application: "claude-code".to_owned(),
+            surfaces: [
+                crate::broker::bridge::BridgeSurface::Hook,
+                crate::broker::bridge::BridgeSurface::Channel,
+            ]
+            .into_iter()
+            .collect(),
+            forwarder: std::env::current_exe().expect("this test's executable"),
+        }
+    }
+
+    // Unix only: the one case that uses it is.
+    #[cfg(unix)]
+    fn hook_declared() -> crate::broker::bridge::BridgeDeclaration {
+        crate::broker::bridge::BridgeDeclaration {
+            application: "claude-code".to_owned(),
+            surface: crate::broker::bridge::BridgeSurface::Hook,
+        }
+    }
+
+    /// KR-REQ-11.43, KR-REQ-05.09: a bridge is admitted when the kernel names it, it presents the
+    /// process it is, the application this host launched started it, and it is the installation;
+    /// each of those failing refuses it, and a session identifier changes none of them. The
+    /// application here is this test's parent process, which started this one.
+    // Unix only: a private socket is where the kernel names the connecting process.
+    #[cfg(unix)]
+    #[test]
+    fn kr_req_11_43_a_bridge_is_admitted_by_its_launch_binding_and_installation() {
+        let me = kr_ipc::identity::current_process_start_identity().expect("this process");
+        let parent = kr_ipc::identity::process_start_identity(std::os::unix::process::parent_id())
+            .expect("its parent");
+        let launched = Registration::new(
+            launch_address(),
+            LaunchProfileId::new("lp-1").expect("valid"),
+            instance(),
+            parent.clone(),
+        );
+        let presenting = |process: ProcessStartIdentity| BridgeHello {
+            credential: kr_crypto::secret::SecretVec::new(vec![9; CREDENTIAL_BYTES]),
+            process,
+            environment_session_id: Some("KR_SESSION=abc".to_owned()),
+        };
+        launched
+            .authenticate_bridge(
+                &presenting(me.clone()),
+                &PeerIdentity::from_kernel(me.clone(), true),
+                &installed_here(),
+                &hook_declared(),
+            )
+            .expect("a process the launched application started, running the installed forwarder");
+
+        let mut stranger = me.clone();
+        stranger.start_value = kr_protocol::scalars::U64::new(stranger.start_value.get() ^ 0xFFFF);
+        let refusals = [
+            // Another user.
+            launched.authenticate_bridge(
+                &presenting(me.clone()),
+                &PeerIdentity::from_kernel(me.clone(), false),
+                &installed_here(),
+                &hook_declared(),
+            ),
+            // A peer the kernel did not name, where the kernel names peers.
+            launched.authenticate_bridge(
+                &presenting(me.clone()),
+                &PeerIdentity::presented(Some(me.clone()), true),
+                &installed_here(),
+                &hook_declared(),
+            ),
+            // A hello presenting a process the kernel did not name.
+            launched.authenticate_bridge(
+                &presenting(stranger.clone()),
+                &PeerIdentity::from_kernel(me.clone(), true),
+                &installed_here(),
+                &hook_declared(),
+            ),
+            // A process the launched application did not start.
+            Registration::new(
+                launch_address(),
+                LaunchProfileId::new("lp-1").expect("valid"),
+                instance(),
+                stranger,
+            )
+            .authenticate_bridge(
+                &presenting(me.clone()),
+                &PeerIdentity::from_kernel(me.clone(), true),
+                &installed_here(),
+                &hook_declared(),
+            ),
+            // A bridge the installation does not have.
+            launched.authenticate_bridge(
+                &presenting(me.clone()),
+                &PeerIdentity::from_kernel(me.clone(), true),
+                &installed_here(),
+                &crate::broker::bridge::BridgeDeclaration {
+                    application: "codex".to_owned(),
+                    surface: crate::broker::bridge::BridgeSurface::Hook,
+                },
+            ),
+            // A forwarder the installation did not put in place.
+            launched.authenticate_bridge(
+                &presenting(me.clone()),
+                &PeerIdentity::from_kernel(me.clone(), true),
+                &crate::broker::bridge::InstalledBridge {
+                    forwarder: std::path::PathBuf::from("/nonexistent/kalareach/kr-hook"),
+                    ..installed_here()
+                },
+                &hook_declared(),
+            ),
+        ];
+        for refused in refusals {
+            let refused = refused.expect_err("refused");
+            assert_eq!(
+                refused.code(),
+                kr_protocol::error::ErrorCode::PermissionDenied,
+                "{refused}"
+            );
+        }
     }
 }
