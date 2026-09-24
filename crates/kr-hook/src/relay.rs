@@ -31,14 +31,12 @@ const HELD_BEFORE_CLOSING: Duration = Duration::from_millis(300);
 ///
 /// Returns what went wrong, for the one line the caller writes to standard error.
 pub fn run(close_after_hello: bool) -> Result<(), String> {
-    let paths = Paths::from_environment()
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| {
-            format!(
-                "{} names the file this relay reads, and it is not set",
-                crate::registration::REGISTRATION_VARIABLE
-            )
-        })?;
+    let paths = Paths::from_environment().ok_or_else(|| {
+        format!(
+            "{} names the file this relay reads, and it is not set",
+            crate::registration::REGISTRATION_VARIABLE
+        )
+    })?;
     let registration = Registration::read(&paths, REGISTRATION_APPEARS_WITHIN)
         .map_err(|error| error.to_string())?;
     let hello = registration

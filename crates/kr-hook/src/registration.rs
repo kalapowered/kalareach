@@ -1,15 +1,18 @@
 //! Where a launch's registration is, what it says, and the hello this forwarder builds from it.
 //!
 //! The worker publishes two files for every launch it makes. The registration file is the small
-//! file section 11 prefers: where to connect, which launch, which process the worker expects, and
-//! how the connection frames. It carries nothing secret. The credential file holds the launch's
-//! private exchange, and the worker writes it owner-only into an owner-only directory.
+//! file section 11 prefers: where to connect, which launch, which process the worker expects,
+//! where the credential is, and how the connection frames. It carries nothing secret. The
+//! credential file holds the launch's private exchange, and the worker writes it owner-only into
+//! the same owner-only directory.
 //!
-//! The environment names the two files and nothing more. [`REGISTRATION_VARIABLE`] and
-//! [`CREDENTIAL_VARIABLE`] are paths; a session identifier in the environment is carried in the
-//! hello so a person debugging can see what the application thought it was, and it is never
-//! authority. A process whose environment names no registration is outside a KalaReach launch, and
-//! says so rather than guessing at a socket.
+//! The environment names the registration and nothing more: [`REGISTRATION_VARIABLE`] is a path,
+//! and the registration names the credential file beside it. One variable is what survives an
+//! application that scrubs its children's environment of anything named like a credential, as
+//! Claude Code does with `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`. A session identifier in the
+//! environment is carried in the hello so a person debugging can see what the application thought
+//! it was, and it is never authority. A process whose environment names no registration is outside
+//! a KalaReach launch, and says so rather than guessing at a socket.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -20,9 +23,6 @@ use kr_crypto::secret::SecretVec;
 /// The variable that names the registration file.
 pub const REGISTRATION_VARIABLE: &str = "KR_REGISTRATION";
 
-/// The variable that names the owner-only file holding the launch's private exchange.
-pub const CREDENTIAL_VARIABLE: &str = "KR_CREDENTIAL";
-
 /// The variable that names the session a command is running inside.
 ///
 /// It is read into the hello as a diagnostic and never used to decide anything.
@@ -30,7 +30,7 @@ pub const SESSION_VARIABLE: &str = "KR_SESSION";
 
 /// The longest registration file this forwarder reads.
 ///
-/// The worker writes six short lines. Anything longer is not a registration it wrote.
+/// The worker writes seven short lines. Anything longer is not a registration it wrote.
 pub const MAX_REGISTRATION_BYTES: u64 = 4096;
 
 /// The longest credential file this forwarder reads.
@@ -44,15 +44,20 @@ const LOOK_AGAIN: Duration = Duration::from_millis(20);
 
 /// Every field the worker's registration names, each on a line of its own; `framing` is written
 /// last.
-pub const REGISTRATION_FIELDS: [&str; 6] =
-    ["endpoint", "profile", "instance", "pid", "start", "framing"];
+pub const REGISTRATION_FIELDS: [&str; 7] = [
+    "endpoint",
+    "profile",
+    "instance",
+    "pid",
+    "start",
+    "credential",
+    "framing",
+];
 
 /// Why a registration could not be used.
 #[derive(Debug)]
 pub enum RegistrationError {
-    /// The environment names a registration but no credential file.
-    NoCredentialNamed,
-    /// A file named by the environment did not appear in time.
+    /// A file the environment or the registration names did not appear in time.
     Missing {
         /// The file.
         path: PathBuf,
@@ -93,11 +98,6 @@ pub enum RegistrationError {
 impl std::fmt::Display for RegistrationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NoCredentialNamed => write!(
-                formatter,
-                "{REGISTRATION_VARIABLE} names a registration and {CREDENTIAL_VARIABLE} names no \
-                 credential file"
-            ),
             Self::Missing { path, waited } => write!(
                 formatter,
                 "{} did not appear within {} ms",
@@ -128,36 +128,24 @@ impl std::fmt::Display for RegistrationError {
 
 impl std::error::Error for RegistrationError {}
 
-/// The two files one launch published, as the environment names them.
+/// Where one launch's registration is, as the environment names it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Paths {
     /// The registration file.
     pub registration: PathBuf,
-    /// The owner-only credential file.
-    pub credential: PathBuf,
 }
 
 impl Paths {
-    /// Reads the two paths from this process's environment.
+    /// Reads the registration's path from this process's environment.
     ///
     /// Returns `None` when the environment names no registration, which is a process outside any
     /// KalaReach launch. A session identifier alone does not change that: it is not a registration
     /// and it is not a credential.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RegistrationError::NoCredentialNamed`] when a registration is named without a
-    /// credential file.
-    pub fn from_environment() -> Result<Option<Self>, RegistrationError> {
-        let Some(registration) = std::env::var_os(REGISTRATION_VARIABLE) else {
-            return Ok(None);
-        };
-        let credential =
-            std::env::var_os(CREDENTIAL_VARIABLE).ok_or(RegistrationError::NoCredentialNamed)?;
-        Ok(Some(Self {
+    #[must_use]
+    pub fn from_environment() -> Option<Self> {
+        std::env::var_os(REGISTRATION_VARIABLE).map(|registration| Self {
             registration: PathBuf::from(registration),
-            credential: PathBuf::from(credential),
-        }))
+        })
     }
 }
 
@@ -281,13 +269,18 @@ impl std::fmt::Debug for Registration {
 }
 
 impl Registration {
-    /// Reads both files, waiting up to `within` for the worker to finish writing them.
+    /// Reads the registration and the credential it names, waiting up to `within` for the worker
+    /// to finish writing them.
     ///
     /// The worker writes the registration after it knows which process it started, so a process
     /// started with the registration's path in its environment can look before the file exists.
     /// The worker publishes the registration whole, by a rename, and last, after the credential; a
     /// read that finds the registration empty or cut short is still read again rather than acted
     /// on. The wait is bounded, and it ends as soon as the registration is whole.
+    ///
+    /// The credential is read only from the file the registration names, and only when that file
+    /// is in the registration's own directory: the worker writes both there, and a registration
+    /// that points anywhere else is not one it wrote.
     ///
     /// # Errors
     ///
@@ -296,11 +289,9 @@ impl Registration {
     pub fn read(paths: &Paths, within: Duration) -> Result<Self, RegistrationError> {
         let deadline = Instant::now() + within;
         let text = wait_for_whole(&paths.registration, deadline, within)?;
-        let credential = wait_for(&paths.credential, MAX_CREDENTIAL_BYTES, deadline, within)?;
-        let credential = SecretVec::new(credential);
-        check_owner_only(&paths.credential)?;
         let mut endpoint = None;
         let mut framing = FramingName::JsonLines;
+        let mut credential_path = None;
         for line in text.lines() {
             let Some((name, value)) = line.split_once('=') else {
                 continue;
@@ -308,12 +299,20 @@ impl Registration {
             match name.trim() {
                 "endpoint" => endpoint = Some(Endpoint::parse(value.trim())?),
                 "framing" => framing = FramingName::parse(value.trim())?,
+                "credential" => credential_path = Some(PathBuf::from(value.trim())),
                 _ => {}
             }
         }
         let endpoint = endpoint.ok_or_else(|| RegistrationError::Malformed {
             detail: "names no endpoint".to_owned(),
         })?;
+        let credential_path = credential_path.ok_or_else(|| RegistrationError::Malformed {
+            detail: "names no credential file".to_owned(),
+        })?;
+        check_beside(&paths.registration, &credential_path)?;
+        let credential = wait_for(&credential_path, MAX_CREDENTIAL_BYTES, deadline, within)?;
+        let credential = SecretVec::new(credential);
+        check_owner_only(&credential_path)?;
         let credential = trimmed(credential);
         if credential.len() != CREDENTIAL_HEX_LENGTH
             || !credential.expose().iter().all(u8::is_ascii_hexdigit)
@@ -484,6 +483,29 @@ fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
     Ok(content)
 }
 
+/// Refuses a credential file that is not in the registration's own directory.
+///
+/// The worker writes the credential beside the registration, inside the launch's owner-only
+/// directory. A path that is relative, or leaves that directory, is not one it wrote, and the
+/// forwarder presents nothing from it.
+fn check_beside(registration: &Path, credential: &Path) -> Result<(), RegistrationError> {
+    let beside = credential.is_absolute()
+        && credential.file_name().is_some()
+        && credential
+            .parent()
+            .is_some_and(|directory| registration.parent().is_some_and(|own| own == directory));
+    if beside {
+        Ok(())
+    } else {
+        Err(RegistrationError::Malformed {
+            detail: format!(
+                "names the credential file {}, which is not in the registration's own directory",
+                credential.display()
+            ),
+        })
+    }
+}
+
 /// Refuses a credential file somebody other than this user can read.
 ///
 /// The worker writes the file owner-only into an owner-only directory. One that is open to another
@@ -559,7 +581,7 @@ mod tests {
     #[test]
     fn a_registration_is_whole_only_when_every_field_and_the_last_line_break_are_there() {
         let complete = "endpoint=/run/kr/a.sock\nprofile=lp-1\ninstance=i\npid=1\nstart=2\n\
-                        framing=json_lines\n";
+                        credential=/run/kr/credential\nframing=json_lines\n";
         assert!(whole(complete));
         assert!(!whole(""));
         assert!(!whole(complete.trim_end()));
@@ -587,6 +609,26 @@ mod tests {
             FramingName::ContentLength.encode(b"{}"),
             b"Content-Length: 2\r\n\r\n{}"
         );
+    }
+
+    /// The credential is read only from beside the registration, where the worker wrote it.
+    #[test]
+    fn a_credential_is_read_only_from_the_registration_s_own_directory() {
+        let registration = Path::new("/run/kr/agents/a/registration");
+        assert!(check_beside(registration, Path::new("/run/kr/agents/a/credential")).is_ok());
+        for elsewhere in [
+            "/run/kr/agents/b/credential",
+            "/run/kr/agents/credential",
+            "/run/kr/agents/a/sub/credential",
+            "credential",
+            "agents/a/credential",
+            "/",
+        ] {
+            assert!(
+                check_beside(registration, Path::new(elsewhere)).is_err(),
+                "{elsewhere} is refused"
+            );
+        }
     }
 
     #[test]

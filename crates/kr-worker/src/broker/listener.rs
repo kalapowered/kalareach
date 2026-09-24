@@ -186,6 +186,12 @@ pub struct Registration {
     pub application_instance_id: ApplicationInstanceId,
     /// The process this host launched and expects on the other end.
     pub expected_process: ProcessStartIdentity,
+    /// The owner-only file beside the registration that holds the launch's private exchange.
+    ///
+    /// The registration names it, so a launched process needs one variable, the registration's
+    /// path, to find both: an application that scrubs its children's environment of anything
+    /// named like a credential still passes that one on.
+    pub credential: std::path::PathBuf,
 }
 
 /// What a connecting bridge presents.
@@ -228,12 +234,14 @@ impl Registration {
         profile_id: LaunchProfileId,
         application_instance_id: ApplicationInstanceId,
         expected_process: ProcessStartIdentity,
+        credential: std::path::PathBuf,
     ) -> Self {
         Self {
             address,
             profile_id,
             application_instance_id,
             expected_process,
+            credential,
         }
     }
 
@@ -411,16 +419,17 @@ impl Registration {
     /// Renders the registration as the file a launched process reads.
     ///
     /// One `name=value` line each, so the `kr-hook` forwarder can read it without a parser. There
-    /// is nothing secret in it.
+    /// is nothing secret in it: the credential line names the file the secret is in.
     #[must_use]
     pub fn to_file(&self) -> String {
         format!(
-            "endpoint={}\nprofile={}\ninstance={}\npid={}\nstart={}\n",
+            "endpoint={}\nprofile={}\ninstance={}\npid={}\nstart={}\ncredential={}\n",
             self.address.for_diagnostics(),
             self.profile_id,
             self.application_instance_id,
             self.expected_process.pid,
             self.expected_process.start_value,
+            self.credential.display(),
         )
     }
 }
@@ -538,6 +547,7 @@ mod tests {
             LaunchProfileId::new("lp-1").expect("valid"),
             instance(),
             process(41, 900),
+            std::path::PathBuf::from("/run/kr/a/credential"),
         )
     }
 
@@ -628,10 +638,13 @@ mod tests {
         )));
         assert!(file.contains("pid=41"));
         assert!(
+            file.contains("credential=/run/kr/a/credential\n"),
+            "it names the file the private exchange is in, beside it"
+        );
+        assert!(
             !file.contains("09"),
             "the registration a person reads carries nothing that speaks to the listener"
         );
-        assert!(!file.to_ascii_lowercase().contains("credential"));
         assert!(!file.to_ascii_lowercase().contains("secret"));
     }
 
@@ -773,6 +786,7 @@ mod tests {
             LaunchProfileId::new("lp-1").expect("valid"),
             instance(),
             parent.clone(),
+            std::path::PathBuf::from("/run/kr/a/credential"),
         );
         let presenting = |process: ProcessStartIdentity| BridgeHello {
             credential: kr_crypto::secret::SecretVec::new(vec![9; CREDENTIAL_BYTES]),
@@ -819,6 +833,7 @@ mod tests {
                 LaunchProfileId::new("lp-1").expect("valid"),
                 instance(),
                 stranger,
+                std::path::PathBuf::from("/run/kr/a/credential"),
             )
             .authenticate_bridge(
                 &presenting(me.clone()),

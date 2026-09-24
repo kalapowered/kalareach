@@ -52,6 +52,7 @@ fn registration_for(address: ListenerAddress, expected: ProcessStartIdentity) ->
         LaunchProfileId::new("lp-1").expect("valid"),
         instance(),
         expected,
+        std::path::PathBuf::from("/run/kr/a/credential"),
     )
 }
 
@@ -167,12 +168,18 @@ fn kr_req_12_14_the_address_is_private_browsers_are_refused_and_nothing_printed_
     let file = registration.to_file();
     for rendering in [&diagnostic, &file] {
         assert!(!rendering.contains("0909"), "{rendering} carries a secret");
-        assert!(!rendering.to_ascii_lowercase().contains("credential"));
         assert!(
             !rendering.contains('@'),
             "a credential never travels in a URL"
         );
     }
+    assert!(!diagnostic.to_ascii_lowercase().contains("credential"));
+    assert!(
+        file.lines()
+            .filter(|line| line.to_ascii_lowercase().contains("credential"))
+            .all(|line| line == "credential=/run/kr/a/credential"),
+        "the registration names the file the exchange is in, and nothing else about it: {file}"
+    );
     let _ = std::fs::remove_dir_all(&directory);
 }
 
@@ -304,8 +311,13 @@ async fn kr_req_11_43_registration_needs_the_launch_binding_and_the_private_exch
     // launch, and nothing that speaks to the listener.
     let file = registration.to_file();
     assert!(file.contains(&address.for_diagnostics()));
-    assert!(file.lines().count() >= 5);
-    assert!(!file.to_ascii_lowercase().contains("credential"));
+    assert!(file.lines().count() >= 6);
+    assert!(
+        file.lines()
+            .filter(|line| line.contains("credential"))
+            .all(|line| line.starts_with("credential=/")),
+        "only the path of the credential file, never the exchange"
+    );
 
     drop(connecting.await.expect("the connecting task finishes"));
     drop(endpoint);

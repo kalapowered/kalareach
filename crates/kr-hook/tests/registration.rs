@@ -3,13 +3,14 @@
 //! The worker publishes a launch's registration by a rename, so a forwarder finds all of it or
 //! nothing. These cases hold the forwarder to its half: whatever it finds before then, an empty
 //! file or one cut short, it reads again rather than acts on, until its deadline. Each starts the
-//! relay a launched agent runs, with the two paths in its environment, and a real listener stands
-//! at the endpoint the registration names.
+//! relay a launched agent runs, with the registration's path in its environment and nothing else,
+//! and a real listener stands at the endpoint the registration names.
 //!
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-11.43 | every case: the forwarder presents the launch's exchange only where a whole registration says |
 //! | KR-REQ-12.14 | every case: the endpoint is the one the whole registration names |
+//! | KR-REQ-05.09 | the credential is the file the registration names beside it, whatever else the environment says |
 
 #![cfg(unix)]
 
@@ -55,6 +56,16 @@ impl Launch {
         self.directory.join("registration")
     }
 
+    fn credential(&self) -> PathBuf {
+        self.directory.join("credential")
+    }
+
+    /// A whole registration, as the worker writes it, naming `endpoint` and this launch's
+    /// credential file.
+    fn whole(&self, endpoint: &Path) -> String {
+        whole(endpoint, &self.credential())
+    }
+
     fn listen(&self, name: &str) -> (PathBuf, UnixListener) {
         let path = self.directory.join(name);
         let listener = UnixListener::bind(&path).expect("the listener binds");
@@ -79,7 +90,6 @@ impl Launch {
         let mut relay = self.placed.command(&["relay"]);
         relay
             .env("KR_REGISTRATION", self.registration())
-            .env("KR_CREDENTIAL", self.directory.join("credential"))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -87,12 +97,13 @@ impl Launch {
     }
 }
 
-/// A whole registration, as the worker writes it, naming `endpoint`.
-fn whole(endpoint: &Path) -> String {
+/// A whole registration, as the worker writes it, naming `endpoint` and `credential`.
+fn whole(endpoint: &Path, credential: &Path) -> String {
     format!(
         "endpoint={}\nprofile=lp-1\ninstance=02020202-0202-0202-0202-020202020202\npid=1\nstart=1\n\
-         framing=json_lines\n",
-        endpoint.display()
+         credential={}\nframing=json_lines\n",
+        endpoint.display(),
+        credential.display()
     )
 }
 
@@ -145,7 +156,7 @@ fn kr_req_12_14_an_empty_registration_is_read_again_until_it_is_whole() {
     );
     assert!(accepted(&listener, Duration::ZERO).is_none());
 
-    launch.publish(&whole(&endpoint));
+    launch.publish(&launch.whole(&endpoint));
     let reached = accepted(&listener, LIVENESS).expect("the relay reaches the endpoint");
     let said = hello(reached);
     assert_eq!(said["kr_hello"]["credential"], CREDENTIAL);
@@ -167,20 +178,20 @@ fn kr_req_11_43_a_registration_cut_short_is_not_acted_on() {
 
     std::thread::sleep(Duration::from_secs(1));
     assert!(relay.try_wait().expect("readable").is_none());
-    let short_of_the_record = whole(&decoy);
+    let short_of_the_record = launch.whole(&decoy);
     let short_of_the_record = short_of_the_record
         .strip_suffix("framing=json_lines\n")
         .expect("the last line");
     launch.write_in_place(short_of_the_record);
     std::thread::sleep(Duration::from_secs(1));
     assert!(relay.try_wait().expect("readable").is_none());
-    let every_field = whole(&decoy);
+    let every_field = launch.whole(&decoy);
     launch.write_in_place(every_field.strip_suffix('\n').expect("the last line break"));
     std::thread::sleep(Duration::from_secs(1));
     assert!(relay.try_wait().expect("readable").is_none());
     assert!(accepted(&decoy_listener, Duration::ZERO).is_none());
 
-    launch.publish(&whole(&endpoint));
+    launch.publish(&launch.whole(&endpoint));
     let reached = accepted(&listener, LIVENESS).expect("the relay reaches the endpoint");
     assert_eq!(hello(reached)["kr_hello"]["credential"], CREDENTIAL);
     assert!(
@@ -225,4 +236,103 @@ fn kr_req_12_14_a_registration_that_never_becomes_whole_ends_the_forwarder_at_it
         "{said}"
     );
     assert!(accepted(&listener, Duration::ZERO).is_none());
+}
+
+/// KR-REQ-05.09: the forwarder needs one variable. The credential it presents is the one in the
+/// file its registration names, and a credential variable in the environment, which an application
+/// may scrub or another process may set, is not read.
+#[test]
+fn kr_req_05_09_the_credential_is_the_one_the_registration_names() {
+    let launch = Launch::new();
+    let (endpoint, listener) = launch.listen("e.sock");
+    let decoy = launch.directory.join("decoy");
+    kr_ipc::paths::create_new_owner_only_file(
+        &decoy,
+        b"0505050505050505050505050505050505050505050505050505050505050505",
+    )
+    .expect("a decoy credential");
+    launch.publish(&launch.whole(&endpoint));
+    let mut relay = launch.placed.command(&["relay"]);
+    relay
+        .env("KR_REGISTRATION", launch.registration())
+        .env("KR_CREDENTIAL", &decoy)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let relay = relay.spawn().expect("the relay starts");
+    let reached = accepted(&listener, LIVENESS).expect("the relay reaches the endpoint");
+    assert_eq!(
+        hello(reached)["kr_hello"]["credential"],
+        CREDENTIAL,
+        "the exchange is the registration's own"
+    );
+    stop(relay);
+}
+
+/// KR-REQ-05.09: a registration that names a credential file anywhere but its own directory, or
+/// names none, is not one the worker wrote. The forwarder presents nothing from it, reaches
+/// nothing, and says why.
+#[test]
+fn kr_req_05_09_a_credential_outside_the_registration_s_directory_is_refused() {
+    let launch = Launch::new();
+    let (endpoint, listener) = launch.listen("e.sock");
+    let elsewhere = launch.placed.host.root().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("a directory");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o700))
+            .expect("made private");
+    }
+    let foreign = elsewhere.join("credential");
+    kr_ipc::paths::create_new_owner_only_file(&foreign, CREDENTIAL.as_bytes())
+        .expect("a credential elsewhere");
+    let unnamed = launch.whole(&endpoint).replace(
+        &format!("credential={}\n", launch.credential().display()),
+        "",
+    );
+    for (registration, why) in [
+        (
+            whole(&endpoint, &foreign),
+            "a credential outside the registration's directory",
+        ),
+        (
+            whole(&endpoint, Path::new("credential")),
+            "a relative credential path",
+        ),
+    ] {
+        launch.publish(&registration);
+        let mut relay = launch.start();
+        let status = wait(&mut relay);
+        assert!(!status.success(), "{why}: the relay fails");
+        let mut said = String::new();
+        std::io::Read::read_to_string(relay.stderr.as_mut().expect("its diagnostics"), &mut said)
+            .expect("the diagnostics are read");
+        assert!(
+            said.contains("not in the registration's own directory"),
+            "{why}: {said}"
+        );
+        assert!(
+            accepted(&listener, Duration::ZERO).is_none(),
+            "{why}: nothing is reached"
+        );
+        std::fs::remove_file(launch.registration()).expect("the registration is removed");
+    }
+    // A registration that names no credential file at all is not whole, and is waited on until
+    // the deadline like any other that is not.
+    assert!(!kr_hook::registration::whole(&unnamed));
+}
+
+/// Waits for a relay that is expected to end on its own, within its deadline.
+fn wait(relay: &mut std::process::Child) -> std::process::ExitStatus {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = relay.try_wait().expect("readable") {
+            return status;
+        }
+        assert!(
+            started.elapsed() <= RELAY_DEADLINE + LIVENESS,
+            "the relay outlived its deadline"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

@@ -60,19 +60,24 @@ The worker writes two files for every launch it makes, both inside its owner-onl
 directory:
 
 - The registration file: one `name=value` line each for the endpoint, the launch profile, the
-  application instance, the process it launched and its start value, and the framing. Nothing in it
-  is secret.
-- The credential file: the launch's private exchange, 64 hexadecimal characters, written owner-only.
+  application instance, the process it launched and its start value, the credential file, and the
+  framing. Nothing in it is secret.
+- The credential file: the launch's private exchange, 64 hexadecimal characters, written owner-only
+  beside the registration.
 
-The launched application's environment names them. `KR_REGISTRATION` and `KR_CREDENTIAL` are paths
-and nothing more. A hook inherits Claude Code's environment, as the hooks reference documents; the
-channel server relies on Claude Code passing the same two variables to the MCP servers it starts. A
+The launched application's environment names one of them: `KR_REGISTRATION` is the registration's
+path and nothing more, and the registration names the credential file. One variable is what
+survives Claude Code's `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` setting, which removes anything named
+like a credential from the environment of the hooks and servers it starts and keeps
+`KR_REGISTRATION`. A hook inherits Claude Code's environment, as the hooks reference documents; the
+channel server relies on Claude Code passing the same variable to the MCP servers it starts. A
 `KR_SESSION` in the environment goes into the hello as a diagnostic and decides nothing: a process
 whose environment names no registration is outside any launch, whatever else it carries.
 
 The forwarder reads the endpoint as a socket path or a loopback address, and refuses anything
-else. It refuses a credential file that another user could read, because the exchange in it would
-already belong to somebody else too.
+else. It reads the credential only from a file in the registration's own directory, and refuses a
+credential file that another user could read, because the exchange in it would already belong to
+somebody else too.
 
 ## Admission
 

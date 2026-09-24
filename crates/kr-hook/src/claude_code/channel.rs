@@ -122,7 +122,7 @@ pub fn run() -> std::process::ExitCode {
 /// This happens before Claude Code's handshake is answered, so the capabilities Claude Code is
 /// told are the ones that hold.
 async fn connect() -> Result<Option<Exchange>, String> {
-    let Some(paths) = Paths::from_environment().map_err(|error| error.to_string())? else {
+    let Some(paths) = Paths::from_environment() else {
         return Ok(None);
     };
     let registration =

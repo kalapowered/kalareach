@@ -15,6 +15,9 @@ use std::time::{Duration, Instant};
 ///
 /// A test run inside a KalaReach session inherits that session's variables, and a forwarder that
 /// found them would reach for a worker the test never started.
+///
+/// A credential variable is removed too: the forwarder finds its credential through the
+/// registration, and a test that passes proves it did not need one.
 pub const FORWARDER_VARIABLES: &[&str] = &["KR_REGISTRATION", "KR_CREDENTIAL", "KR_SESSION"];
 
 /// How long a test waits for something that should happen promptly, before it calls it a failure.

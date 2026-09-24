@@ -83,7 +83,7 @@ pub const REGISTRATION_WAIT: Duration = Duration::from_millis(250);
 fn observe(started: std::time::Instant) -> Result<(), String> {
     let input = read_input(std::io::stdin().lock())?;
     // Outside a launch there is nobody to tell, and the answer is the same neutral one.
-    let Some(paths) = Paths::from_environment().map_err(|error| error.to_string())? else {
+    let Some(paths) = Paths::from_environment() else {
         return Ok(());
     };
     let Some(observation) = observation(&input) else {

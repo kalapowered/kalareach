@@ -46,6 +46,12 @@ use crate::broker::{Broker, ResourceTransition};
 /// endpoint that waits for it indefinitely is an endpoint one stalled process closes.
 pub const HELLO_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The file a launch's registration is published as, inside its owner-only directory.
+pub const REGISTRATION_FILE: &str = "registration";
+
+/// The owner-only file beside the registration that holds a launch's private exchange.
+pub const CREDENTIAL_FILE: &str = "credential";
+
 /// How long a connection's own writes are given to finish once both ends have stopped reading.
 pub const TEARDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -667,6 +673,7 @@ impl NativeGateway {
                 launch.profile_id.clone(),
                 launch.application_instance_id,
                 expected,
+                runtime_directory.join(CREDENTIAL_FILE),
             )
         });
         Ok(Self {
@@ -726,8 +733,8 @@ impl NativeGateway {
     ///    the owner's alone, whether a credential can be drawn, and whether the intent still holds
     ///    against the foreground it was prepared against, because section 12 refuses a launch an
     ///    application took the foreground in front of.
-    /// 2. The executable is started, with the two file paths in its environment and nothing secret
-    ///    in its argument vector.
+    /// 2. The executable is started, with the registration's path in its environment and nothing
+    ///    secret in its argument vector. The registration names the credential file beside it.
     /// 3. The kernel is asked what it started, and that identity is what the registration names.
     ///    Nothing the process says about itself is used.
     /// 4. The private exchange is written to an owner-only file and handed to the broker as the
@@ -756,8 +763,8 @@ impl NativeGateway {
         now: kr_protocol::scalars::TimestampMs,
     ) -> Result<Launched> {
         let application_instance_id = self.launch.application_instance_id;
-        let registration_path = self.runtime_directory.join("registration");
-        let credential_path = self.runtime_directory.join("credential");
+        let registration_path = self.runtime_directory.join(REGISTRATION_FILE);
+        let credential_path = self.runtime_directory.join(CREDENTIAL_FILE);
         // One launch for one instance. A second one would replace the registration a running
         // process was told about, and a second one that failed would give back the instance the
         // first is still running as. Only a launch that never took the instance may take it now.
@@ -789,8 +796,8 @@ impl NativeGateway {
         command
             .args(&reservation.profile().arguments)
             .current_dir(&self.runtime_directory)
+            // One variable: the registration names the credential file beside it.
             .env("KR_REGISTRATION", &registration_path)
-            .env("KR_CREDENTIAL", &credential_path)
             // The worker owns the standard streams of the backend it starts. The person's own
             // terminal is the session's PTY and is a different path; what this pair carries is
             // whatever the launched process says to the host that started it.
@@ -864,7 +871,14 @@ impl NativeGateway {
             now,
         );
         process.write_registration(credential_path)?;
-        let recorded = self.record(reservation, started, process, mode, registration_path);
+        let recorded = self.record(
+            reservation,
+            started,
+            process,
+            mode,
+            credential_path,
+            registration_path,
+        );
         if recorded.is_err() {
             // Best effort: a file that cannot be removed now is refused as a stale name by the
             // next launch's create, which is the safe way round.
@@ -883,6 +897,7 @@ impl NativeGateway {
         started: &ProcessStartIdentity,
         process: ManagedProcess,
         mode: kr_protocol::broker::IntegrationMode,
+        credential_path: &std::path::Path,
         registration_path: &std::path::Path,
     ) -> Result<(Registration, crate::broker::RegisteredLaunch<'b>)> {
         let application_instance_id = self.launch.application_instance_id;
@@ -895,6 +910,7 @@ impl NativeGateway {
             profile_id,
             application_instance_id,
             started.clone(),
+            credential_path.to_path_buf(),
         );
         // The framing travels with it, because the forwarder writes one frame before this host
         // has told it anything else and it has to write that frame the way this connector reads.

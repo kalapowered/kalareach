@@ -127,7 +127,6 @@ async fn kr_req_11_43_the_wrong_exchange_or_a_process_the_application_did_not_st
     let mut outsider = placed.command(&["claude-code", "hook"]);
     outsider
         .env("KR_REGISTRATION", &registration)
-        .env("KR_CREDENTIAL", launch.credential_file())
         .env("KR_SESSION", "the-session-this-process-names");
     let running = std::thread::spawn(move || run_with_input(outsider, SESSION_START));
     let refused = launch
@@ -319,14 +318,13 @@ fn kr_req_12_14_over_loopback_the_forwarder_presents_the_launch_credential() {
             format!(
                 "endpoint=127.0.0.1:{port}\nprofile=lp-1\n\
                  instance=02020202-0202-0202-0202-020202020202\npid=1\nstart=1\n\
-                 framing=json_lines\n"
+                 credential={}\nframing=json_lines\n",
+                credential_file.display()
             ),
         )
         .expect("the registration is written");
         let mut command = placed.command(&["claude-code", "hook"]);
-        command
-            .env("KR_REGISTRATION", &registration)
-            .env("KR_CREDENTIAL", &credential_file);
+        command.env("KR_REGISTRATION", &registration);
         let running = std::thread::spawn(move || run_with_input(command, SESSION_START));
 
         let (mut stream, _) = listener
