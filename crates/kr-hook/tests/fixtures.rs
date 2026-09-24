@@ -74,7 +74,9 @@ fn the_bridge_files_are_the_bytes_the_package_publishes() {
 
 /// KR-REQ-12.18: the hooks file registers the forwarder's hook invocation for exactly the five
 /// events whose exit codes refuse nothing, for every tool and notification (no matcher), each with
-/// a timeout the forwarder's own deadline fits inside.
+/// a timeout the forwarder's own deadline fits inside. Each is in exec form and runs in the
+/// foreground: Claude Code starts the forwarder itself, with no shell between them, which is what
+/// lets the worker order the hooks by when Claude Code started each one.
 #[test]
 fn the_hooks_file_registers_the_five_observing_events_within_the_deadline() {
     let hooks = json("hooks.json");
@@ -101,6 +103,18 @@ fn the_hooks_file_registers_the_five_observing_events_within_the_deadline() {
         let handlers = groups[0]["hooks"].as_array().expect("handlers");
         assert_eq!(handlers.len(), 1, "{event}");
         let handler = &handlers[0];
+        let mut fields: Vec<&str> = handler
+            .as_object()
+            .expect("a handler")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            ["args", "command", "timeout", "type"],
+            "{event}: exec form, no shell, not in the background"
+        );
         assert_eq!(handler["type"], "command", "{event}");
         assert_eq!(
             parsed(&handler["command"], &handler["args"]),

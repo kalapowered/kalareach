@@ -868,6 +868,21 @@ const fn is_first_process(_pid: u32) -> bool {
     false
 }
 
+/// Returns the process that started `child`, read from the kernel and checked by start identity,
+/// or `None` when the kernel cannot name one that is certainly this child's parent.
+///
+/// It is one link of the walk, read the same way: the parent is read between two readings of the
+/// child that both name it, and no start times are ordered. None where the child has no parent,
+/// where its parent has ended or is the system's first process, where a reading failed or changed,
+/// and on a platform that keeps a parent's name after the parent exits, as Windows does, where a
+/// named parent proves nothing.
+pub(crate) fn parent_of(child: &ProcessStartIdentity) -> Option<ProcessStartIdentity> {
+    match read_link(&Kernel, child, false) {
+        Ok(Link::Parent(parent)) => Some(parent),
+        Ok(Link::Top | Link::Ended) | Err(_) => None,
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod platform {
     /// Returns the executable one process is running.
@@ -1926,6 +1941,23 @@ mod tests {
     }
 
     // The kernel's own readings.
+
+    /// The process that started this one is the kernel's parent, read back by its start identity;
+    /// an identity the kernel never reported has none.
+    #[cfg(unix)]
+    #[test]
+    fn a_process_was_started_by_its_parent() {
+        let mine =
+            kr_ipc::identity::process_start_identity(std::process::id()).expect("an identity");
+        let parent = parent_of(&mine).expect("a parent");
+        assert_eq!(
+            u32::try_from(parent.pid.get()).ok(),
+            Some(std::os::unix::process::parent_id())
+        );
+        let mut stranger = mine;
+        stranger.start_value = kr_protocol::scalars::U64::new(stranger.start_value.get() ^ 0xFFFF);
+        assert_eq!(parent_of(&stranger), None);
+    }
 
     #[test]
     fn this_process_descends_from_itself() {

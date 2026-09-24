@@ -342,6 +342,9 @@ impl Registration {
     /// private exchange is checked where the launch's record lives, by the caller that holds it,
     /// exactly as [`Registration::authenticate_peer`] leaves it.
     ///
+    /// Returns the process that started the bridge, as the first link of that chain names it, where
+    /// the kernel can: hooks are ordered by when their starter started them.
+    ///
     /// # Errors
     ///
     /// Returns [`BrokerError::PermissionDenied`] naming the first part that failed: the owner, the
@@ -353,7 +356,7 @@ impl Registration {
         peer: &PeerIdentity,
         installed: &crate::broker::bridge::InstalledBridge,
         declared: &crate::broker::bridge::BridgeDeclaration,
-    ) -> Result<()> {
+    ) -> Result<Option<ProcessStartIdentity>> {
         if !peer.is_owner() {
             return Err(BrokerError::denied(
                 "this connection is not the operating-system user who owns the session",
@@ -401,7 +404,8 @@ impl Registration {
             .ok()
             .and_then(crate::questions::binding::executable_of)
             .map(std::path::PathBuf::from);
-        installed.validate(declared, running.as_deref())
+        installed.validate(declared, running.as_deref())?;
+        Ok(crate::questions::binding::parent_of(connecting))
     }
 
     /// Renders the registration as the file a launched process reads.
@@ -755,7 +759,8 @@ mod tests {
     /// KR-REQ-11.43, KR-REQ-05.09: a bridge is admitted when the kernel names it, it presents the
     /// process it is, the application this host launched started it, and it is the installation;
     /// each of those failing refuses it, and a session identifier changes none of them. The
-    /// application here is this test's parent process, which started this one.
+    /// application here is this test's parent process, which started this one, and admission names
+    /// it as the bridge's starter.
     // Unix only: a private socket is where the kernel names the connecting process.
     #[cfg(unix)]
     #[test]
@@ -774,7 +779,7 @@ mod tests {
             process,
             environment_session_id: Some("KR_SESSION=abc".to_owned()),
         };
-        launched
+        let starter = launched
             .authenticate_bridge(
                 &presenting(me.clone()),
                 &PeerIdentity::from_kernel(me.clone(), true),
@@ -782,6 +787,7 @@ mod tests {
                 &hook_declared(),
             )
             .expect("a process the launched application started, running the installed forwarder");
+        assert_eq!(starter, Some(parent));
 
         let mut stranger = me.clone();
         stranger.start_value = kr_protocol::scalars::U64::new(stranger.start_value.get() ^ 0xFFFF);

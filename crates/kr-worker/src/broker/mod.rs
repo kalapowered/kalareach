@@ -91,8 +91,8 @@ pub use crate::broker::attach::{
     hello_frame,
 };
 pub use crate::broker::bridge::{
-    AdmittedBridge, BridgeDeclaration, BridgeStream, BridgeSurface, HookReport, InstalledBridge,
-    Observation, ObservedEvent, ThreadChange,
+    AdmittedBridge, BridgeDeclaration, BridgeStream, BridgeSurface, HookProcess, HookReport,
+    InstalledBridge, Observation, ObservedEvent, ThreadChange,
 };
 pub use crate::broker::capability::{CapabilityOwner, Probe};
 pub use crate::broker::duplex::{
@@ -246,9 +246,21 @@ impl Instance {
             turn_id: Nullable::from(self.turn_id.clone()),
             profile_id: Nullable::from(self.profile_id.clone()),
             mode: self.mode,
-            rich_mutations_suspended: self.rich_suspension.is_some(),
-            suspension_reason: Nullable::from(self.rich_suspension.clone()),
+            rich_mutations_suspended: self.suspension_reason().is_some(),
+            suspension_reason: Nullable::from(self.suspension_reason().map(str::to_owned)),
         }
+    }
+
+    /// Why rich mutations are suspended, while they are: the reason one was placed with, or else
+    /// this instance's native bridge not being able to vouch for its thread.
+    ///
+    /// The bridge's reason is its own. Lifting a suspension placed here does not lift it, and the
+    /// bridge settling does not lift one placed here.
+    #[must_use]
+    pub fn suspension_reason(&self) -> Option<&str> {
+        self.rich_suspension
+            .as_deref()
+            .or_else(|| self.bridge.suspension())
     }
 
     /// Holds one frame, forgetting the oldest unconsumed ones if it must.
@@ -741,6 +753,9 @@ impl Broker {
     }
 
     /// Lifts the suspension, because the binding has been verified.
+    ///
+    /// A native bridge's own suspension, while it cannot vouch for the application's thread, is not
+    /// this one: it is lifted only by the bridge's next report the host can order.
     ///
     /// # Errors
     ///
@@ -3064,7 +3079,7 @@ impl BrokerState {
                      reported as applied"
                 ),
             })?;
-        if let Some(reason) = instance.rich_suspension.as_ref() {
+        if let Some(reason) = instance.suspension_reason() {
             return Err(BrokerError::PreconditionFailed {
                 detail: format!("rich mutations are suspended: {reason}"),
             });
@@ -3479,7 +3494,7 @@ impl BrokerState {
             .instances
             .get(&invocation.application_instance_id)
             .ok_or_else(|| unknown_instance(invocation.application_instance_id))?;
-        if let Some(reason) = instance.rich_suspension.as_ref() {
+        if let Some(reason) = instance.suspension_reason() {
             return Err(BrokerError::PreconditionFailed {
                 detail: format!("rich mutations are suspended: {reason}"),
             });
@@ -3682,7 +3697,7 @@ impl BrokerState {
             .instances
             .get(&pending.resource.application_instance_id)
             .ok_or_else(|| unknown_instance(pending.resource.application_instance_id))?;
-        if let Some(reason) = instance.rich_suspension.as_ref() {
+        if let Some(reason) = instance.suspension_reason() {
             return Err(BrokerError::PreconditionFailed {
                 detail: format!("rich mutations are suspended: {reason}"),
             });

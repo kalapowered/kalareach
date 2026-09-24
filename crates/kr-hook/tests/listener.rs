@@ -70,6 +70,11 @@ async fn kr_req_12_14_a_hook_the_launched_application_starts_is_admitted() {
         u64::from(launch.application.id()),
         "the admitted process is the hook the application started, not the application"
     );
+    assert_eq!(
+        admitted.starter.as_ref().map(|starter| starter.pid.get()),
+        Some(u64::from(launch.application.id())),
+        "and the application started it itself"
+    );
     drop(admitted);
     let outcome = launched::outcome(&request);
     assert_eq!(outcome.code, 0, "{}", outcome.stderr);

@@ -3739,16 +3739,20 @@ An admitted hook sends one observation and waits for this host to apply it and c
 connection. When that exchange completes, the host has the report before the hook answers the
 application. It does not when the hook reaches its deadline first, or when the application moves on
 without waiting, as Claude Code may while background `SessionStart` hooks still run; the report is
-then applied late, or, if the hook has already gone, not at all. A thread
-starting selects that thread and advances the binding revision, even when it is the thread already
-selected, since a resume is a new selection; a thread continuing after a compaction changes nothing;
-a thread ending leaves none selected. Reports are ordered by what the kernel recorded when the
-application started each hook, the start value and, within one tick of the kernel's clock, the
-process identifier where the platform allocates identifiers in sequence, never by when they
-arrived. A report whose hook started before the one in force changes nothing. Two reports that
-cannot be ordered and disagree leave no thread vouched for: the binding advances so nothing bound to
-the old thread survives, and rich mutations are suspended until a report whose hook started later
-settles it. Every observation goes into the instance's observed history.
+then applied late, or, if the hook has already gone, not at all. Only a hook the
+launched application process started itself, as the kernel's parent link says, reports the
+application's selection; a hook another process started reports that process's threads and moves
+nothing. A thread starting selects that thread and advances the binding revision, even when it is
+the thread already selected, since a resume is a new selection; a thread continuing after a
+compaction changes nothing; a thread ending leaves none selected. Reports are ordered by what the
+kernel recorded when the application started each hook, the start value and, within one tick of the
+kernel's clock, the process identifier where the platform allocates identifiers in sequence, never
+by when they arrived. A report whose hook started before the one in force changes nothing. When two
+reports cannot be ordered, and one would change the binding in either order (a start always would),
+no thread is vouched for: the thread the binding had is left, so nothing bound to it survives, and
+rich mutations are suspended until a report whose hook started later settles it. That suspension is
+the bridge's own: lifting a suspension placed for another reason does not lift it, and it lifts no
+other. Every observation goes into the instance's observed history.
 
 A contact question records, when it is asked, the thread the bridge vouches is selected and its
 revision. When the application's own hook reports that the call that asked it ran in that same

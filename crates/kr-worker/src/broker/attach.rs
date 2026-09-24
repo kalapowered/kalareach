@@ -828,7 +828,7 @@ impl NativeGateway {
             process: presented_process(&hello)?,
             environment_session_id: hello.session.clone(),
         };
-        registration.authenticate_bridge(&presented, &peer, installed, &declared)?;
+        let starter = registration.authenticate_bridge(&presented, &peer, installed, &declared)?;
         self.broker.admit_bridge_exchange(
             self.launch.application_instance_id,
             presented.credential.expose(),
@@ -842,6 +842,7 @@ impl NativeGateway {
         Ok(crate::broker::bridge::AdmittedBridge {
             surface: declared.surface,
             process,
+            starter,
             stream,
         })
     }
@@ -884,7 +885,10 @@ impl NativeGateway {
         let observation = crate::broker::bridge::Observation::from_frame(&body)?;
         let (thread, cursor) = self.broker.observe_bridge(
             self.launch.application_instance_id,
-            &admitted.process,
+            &crate::broker::bridge::HookProcess {
+                process: admitted.process.clone(),
+                starter: admitted.starter.clone(),
+            },
             &observation,
             kr_ipc::now_ms(),
         )?;
