@@ -2467,8 +2467,21 @@ async fn an_attempt_signed_ahead_of_the_rest_keeps_its_identity_from_being_prese
     );
 }
 
+/// Makes a directory readable and not writable, or writable again.
+#[cfg(unix)]
+fn writable(directory: &std::path::Path, writable: bool) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(
+        directory,
+        std::fs::Permissions::from_mode(if writable { 0o700 } else { 0o500 }),
+    )
+    .expect("the directory's mode");
+}
+
+#[cfg(unix)]
 #[tokio::test]
-async fn a_note_the_draft_store_cannot_write_leaves_the_draft_publication_counted() {
+async fn a_note_the_draft_store_cannot_write_leaves_the_draft_publication_counted_across_a_restart()
+{
     let directory = tempfile::tempdir().expect("a directory");
     let service = Arc::new(Service::default());
     let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
@@ -2485,26 +2498,27 @@ async fn a_note_the_draft_store_cannot_write_leaves_the_draft_publication_counte
     .await
     .expect_err("the answer never came back");
 
-    // Something the draft store cannot write a note over is where the note belongs. The note is
-    // written before the record that ends the request, so the settlement stops with the request
-    // still waiting rather than ended without the note that goes with it.
-    let note_path = directory
-        .path()
-        .join("drafts")
-        .join(format!("{}.sync", draft.draft_id));
-    std::fs::create_dir(&note_path).expect("a name the note cannot be written under");
-    sync.reconcile_unsettled(&drafts, TimestampMs::new(NOW + 1))
-        .await
-        .expect_err("the note could not be written");
+    // The draft store can be read and not written, so the settlement reads the note and then fails
+    // to write it. The note is written before the record that ends the request, so the request is
+    // left waiting rather than ended without its note.
+    let drafts_directory = directory.path().join("drafts");
+    writable(&drafts_directory, false);
+    let failed = sync
+        .reconcile_unsettled(&drafts, TimestampMs::new(NOW + 1))
+        .await;
+    writable(&drafts_directory, true);
+    failed.expect_err("the note could not be written");
     assert!(the_only_record(&client).dispatched());
     assert_eq!(client.outstanding().expect("a count"), 1);
     assert!(
         client.store().publications().expect("records").is_empty(),
         "nothing was ended without its note"
     );
+    assert_eq!(drafts.checkpoint(draft.draft_id).expect("a note"), None);
 
-    // Once the note can be written, the next pass settles the request once.
-    std::fs::remove_dir(&note_path).expect("cleared");
+    // A process that starts again finds the request still waiting, and settles it once.
+    drop((drafts, sync, client));
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
     let reconciled = sync
         .reconcile_unsettled(&drafts, TimestampMs::new(NOW + 2))
         .await
@@ -2518,6 +2532,64 @@ async fn a_note_the_draft_store_cannot_write_leaves_the_draft_publication_counte
             position: at(1),
             published_revision: Nullable::some(draft.revision),
         })
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_draft_publication_stopped_between_its_note_and_its_end_is_settled_once_after_a_restart()
+{
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let draft = drafts
+        .create(draft_target(), "a prompt".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+    service.lose_the_next_answer().await;
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(NOW),
+    )
+    .await
+    .expect_err("the answer never came back");
+
+    // The sync store can be read and not written, so the note is written in the draft store and
+    // then the record that ends the request cannot be. That leaves the note ahead of a request that
+    // is still counted, which is the one arrangement a stop between the two writes can leave.
+    let sync_directory = directory.path().join("sync");
+    writable(&sync_directory, false);
+    let failed = sync
+        .reconcile_unsettled(&drafts, TimestampMs::new(NOW + 1))
+        .await;
+    writable(&sync_directory, true);
+    failed.expect_err("the end of the request could not be recorded");
+    assert!(the_only_record(&client).dispatched());
+    assert_eq!(client.outstanding().expect("a count"), 1);
+    let note = DraftCheckpoint {
+        position: at(1),
+        published_revision: Nullable::some(draft.revision),
+    };
+    assert_eq!(
+        drafts.checkpoint(draft.draft_id).expect("a note"),
+        Some(note)
+    );
+
+    // After a restart the next pass settles it once, and the note it meets is the same write.
+    drop((drafts, sync, client));
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let reconciled = sync
+        .reconcile_unsettled(&drafts, TimestampMs::new(NOW + 2))
+        .await
+        .expect("reconciled");
+    assert_eq!(reconciled.settled, 1);
+    assert_eq!(reconciled.diverged, 0);
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    assert_eq!(accounts(&client), 1);
+    assert_eq!(
+        drafts.checkpoint(draft.draft_id).expect("a note"),
+        Some(note)
     );
 }
 
