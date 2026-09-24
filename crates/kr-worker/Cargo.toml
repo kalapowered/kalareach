@@ -17,6 +17,9 @@ clap.workspace = true
 kr-cbor.workspace = true
 kr-crypto.workspace = true
 kr-ipc.workspace = true
+# A connector is read from its installed package with the SDK's own package check, and its table is
+# the SDK's: the core declarative table cannot express a protocol of notification pairs.
+kr-plugin-sdk.workspace = true
 kr-protocol.workspace = true
 kr-shell-integration.workspace = true
 kr-term.workspace = true

@@ -51,6 +51,7 @@ pub mod arbitration;
 pub mod attach;
 pub mod bridge;
 pub mod capability;
+pub mod connectors;
 pub mod duplex;
 pub mod endpoint;
 pub mod error;

@@ -4731,6 +4731,7 @@ dependencies = [
  "kr-controller",
  "kr-crypto",
  "kr-ipc",
+ "kr-plugin-sdk",
  "kr-protocol",
  "kr-shell-integration",
  "kr-term",
