@@ -18,6 +18,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-20.13 | `kr_req_20_13_a_lost_comparison_keeps_both_copies_until_the_person_chooses`, `kr_req_20_13_a_stale_expected_revision_is_refused_and_kept_as_a_copy`, `kr_req_20_13_a_draft_is_published_as_a_draft_and_never_as_an_execution_request`, `kr_req_20_13_a_sealed_object_the_service_refuses_is_refused_here_first`, `kr_req_20_13_an_answer_lost_in_flight_is_settled_from_the_receipt_and_applied_once`, `kr_req_20_13_a_fenced_identity_never_ran_and_nothing_runs_under_it_afterwards` |
+//! | KR-REQ-20.13, KR-REQ-24.28 and KR-REQ-18.05, client side across a restore | The same legs read the recovery identity on every answer they take, an exchange, a refusal, a comparison, a status query with and without a receipt, and a fence, and hold a deployment that has never been put back to naming none |
 //! | KR-REQ-18.05 | `kr_req_18_05_a_setting_is_stored_sealed_in_a_declared_bucket` |
 //! | KR-REQ-24.28 | `kr_req_24_28_a_client_fenced_by_privacy_mode_publishes_nothing_and_keeps_its_pinned_labels` |
 //!
@@ -493,6 +494,11 @@ async fn kr_req_20_13_a_lost_comparison_keeps_both_copies_until_the_person_choos
             panic!("the first write of an object the service has never held is accepted")
         };
         assert_eq!(first.write_sequence, 1, "the service's order starts at one");
+        assert_eq!(
+            first.recovery(),
+            None,
+            "a deployment never put back names no history"
+        );
 
         // The second loses the comparison: it expected nothing and the object is there. It is told
         // where the object stands and keeps the other device's content beside its own.
@@ -506,6 +512,7 @@ async fn kr_req_20_13_a_lost_comparison_keeps_both_copies_until_the_person_choos
         };
         assert_eq!(other_revision, theirs.revision);
         assert_eq!(position, first, "it is told the position that beat it");
+        assert_eq!(position.recovery(), None, "a refusal names no history either");
         assert_eq!(
             two.store().object(object_id).expect("read").expect("held"),
             mine,
@@ -522,6 +529,7 @@ async fn kr_req_20_13_a_lost_comparison_keeps_both_copies_until_the_person_choos
             .expect("compared");
         assert_eq!(compared.objects.len(), 1);
         assert_eq!(compared.objects[0].position, first);
+        assert_eq!(compared.recovery, None, "nor does a comparison");
         assert_eq!(run.opened(&compared.objects[0].ciphertext), theirs);
         assert_eq!(compared.copies.len(), 1);
         assert_eq!(compared.copies[0].current, Some(first));
@@ -900,6 +908,13 @@ async fn kr_req_20_13_an_answer_lost_in_flight_is_settled_from_the_receipt_and_a
             serde_json::from_slice(&lost.body).expect("the service's envelope");
         assert_eq!(lost["ok"], true, "the service admitted the write");
         assert_eq!(lost["data"]["state"], "written", "the service applied it");
+        // The answer names its history, as a member present and null for a deployment never put
+        // back, which is what the positions below are read in.
+        assert_eq!(
+            lost["data"].get("recovery_id"),
+            Some(&serde_json::Value::Null),
+            "the history is named, and it is none"
+        );
         let applied_at = SyncPosition::at(
             lost["data"]["current_write_sequence"]
                 .as_str()
@@ -992,6 +1007,15 @@ async fn kr_req_20_13_a_fenced_identity_never_ran_and_nothing_runs_under_it_afte
         let collection = sync_collection(SyncObjectKind::Settings, object_id);
         let identity = fresh_uuid();
         let signed_at = now_ms();
+
+        // Asked about first, an identity nothing was ever sent under has no receipt, in no history.
+        assert_eq!(
+            run.service
+                .request_status(&collection, identity)
+                .await
+                .expect("asked"),
+            SyncRequestStatus::Unknown { recovery: None }
+        );
 
         // An identity nothing was ever sent under, fenced naming the instant an attempt would have
         // been signed at. The collection is the run's own and has swept nothing, so the service
