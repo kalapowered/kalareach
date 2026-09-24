@@ -707,16 +707,34 @@ mod tests {
         assert!(job.process_ids().expect("the process list").is_empty());
     }
 
-    /// A process that waits for a minute and starts one of its own: `cmd.exe` running `ping`, both
-    /// on every Windows machine.
+    /// A process that starts one of its own and waits, far longer than any test takes: `cmd.exe`
+    /// running `ping`, both on every Windows machine. The test ends both.
     fn an_agent_with_a_child() -> std::process::Command {
         let mut command = std::process::Command::new("cmd.exe");
         command
-            .args(["/d", "/c", "ping -n 60 127.0.0.1 > NUL"])
+            .args(["/d", "/c", "ping -n 600 127.0.0.1 > NUL"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         command
+    }
+
+    /// A process a test started, ended when the test ends, however it ends: with everything in its
+    /// job while the test still holds that job, and on its own otherwise.
+    struct Started<'a> {
+        job: Option<&'a AgentJob>,
+        agent: std::process::Child,
+    }
+
+    impl Drop for Started<'_> {
+        fn drop(&mut self) {
+            if let Some(job) = self.job {
+                let _ = job.terminate(1);
+            } else {
+                let _ = self.agent.kill();
+            }
+            let _ = self.agent.wait();
+        }
     }
 
     /// Waits until `job` holds at least `count` processes, and returns them.
@@ -751,44 +769,50 @@ mod tests {
     #[test]
     fn an_agent_and_every_process_it_starts_are_held_by_its_job() {
         let job = AgentJob::create().expect("a job");
-        let mut agent = job
-            .start(&mut an_agent_with_a_child())
-            .expect("the agent starts");
+        let started = Started {
+            agent: job
+                .start(&mut an_agent_with_a_child())
+                .expect("the agent starts"),
+            job: Some(&job),
+        };
         assert!(
-            job.holds(&agent).expect("the job says"),
+            job.holds(&started.agent).expect("the job says"),
             "the agent is in it"
         );
         // The agent's own child joins it without being put there, and this process never does.
         let held = held_by_at_least(&job, 2);
-        assert!(held.contains(&agent.id()), "the job holds {held:?}");
+        assert!(held.contains(&started.agent.id()), "the job holds {held:?}");
         assert!(
             !held.contains(&std::process::id()),
             "the worker is never in an agent's job: {held:?}"
         );
-        job.terminate(1).expect("the job ends what it holds");
-        agent.wait().expect("the agent ends");
     }
 
     #[test]
     fn closing_an_agent_job_leaves_the_agent_running() {
         let job = AgentJob::create().expect("a job");
-        let mut agent = job
-            .start(
-                std::process::Command::new("ping.exe")
-                    .args(["-n", "60", "127.0.0.1"])
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null()),
-            )
-            .expect("the agent starts");
+        let mut started = Started {
+            agent: job
+                .start(
+                    std::process::Command::new("ping.exe")
+                        .args(["-n", "600", "127.0.0.1"])
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null()),
+                )
+                .expect("the agent starts"),
+            job: None,
+        };
         drop(job);
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert!(
-            agent.try_wait().expect("the agent's status").is_none(),
+            started
+                .agent
+                .try_wait()
+                .expect("the agent's status")
+                .is_none(),
             "closing the job ended the agent"
         );
-        let _ = agent.kill();
-        let _ = agent.wait();
     }
 
     #[test]

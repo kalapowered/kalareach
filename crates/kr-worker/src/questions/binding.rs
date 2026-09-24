@@ -593,31 +593,43 @@ pub(crate) fn nearest_of(
                 .map(|job| job.process_ids().map_err(|error| error.to_string()))
         })
         .collect();
-    held_by(from, candidates, &jobs)
+    held_by(&Kernel, from, candidates, &jobs)
 }
 
 /// Returns which of `candidates` holds `from`, given what each one's job lists.
 ///
 /// `jobs` answers for each candidate in the same order: the processes its job holds, why they
-/// could not be listed, or None where the candidate was started in no job this worker keeps. The
-/// candidate itself holds `from` when it is `from`; otherwise only a job's list establishes either
-/// way whether `from` is one of its processes. A list that could not be read, or a candidate with no
-/// job, establishes nothing about any other process, so `from` is then placed under none of them
-/// only where no candidate is left in doubt.
+/// could not be listed, or None where the candidate was started in no job this worker keeps. A
+/// candidate that is `from` holds it, with nothing read. Otherwise only a job's list establishes
+/// either way whether `from` is one of its processes. A list that could not be read, or a
+/// candidate with no job, establishes nothing about any other process, so `from` is placed under
+/// none of them only where no candidate is left in doubt.
+///
+/// A list names identifiers, and an identifier is not an identity: it describes `from` only if
+/// `from` still holds its identifier once the lists have been read. So `from` is read again last,
+/// and a process that no longer holds it, or cannot be identified, is placed nowhere.
 #[cfg(any(windows, test))]
 fn held_by(
+    table: &impl ProcessTable,
     from: &ProcessStartIdentity,
     candidates: &[ProcessStartIdentity],
     jobs: &[Option<std::result::Result<Vec<u32>, String>>],
 ) -> Ancestry {
+    if let Some(index) = candidates
+        .iter()
+        .position(|candidate| candidate.matches(from))
+    {
+        return Ancestry::Reaches(index);
+    }
     let pid = pid_of(from);
+    let mut listed = None;
     let mut undetermined = None;
     for (index, candidate) in candidates.iter().enumerate() {
-        if from.matches(candidate) {
-            return Ancestry::Reaches(index);
-        }
         match jobs.get(index) {
-            Some(Some(Ok(held))) if held.contains(&pid) => return Ancestry::Reaches(index),
+            Some(Some(Ok(held))) if held.contains(&pid) => {
+                listed = Some(index);
+                break;
+            }
             Some(Some(Ok(_))) => {}
             Some(Some(Err(why))) => {
                 undetermined.get_or_insert_with(|| {
@@ -638,7 +650,21 @@ fn held_by(
             }
         }
     }
-    undetermined.map_or(Ancestry::ReachesNone, Ancestry::Undetermined)
+    let placed = match (listed, undetermined) {
+        (Some(index), _) => Ancestry::Reaches(index),
+        (None, Some(why)) => return Ancestry::Undetermined(why),
+        (None, None) => Ancestry::ReachesNone,
+    };
+    match table.identity(pid) {
+        Reading::Found(again) if again.matches(from) => placed,
+        Reading::Found(_) | Reading::Absent => Ancestry::Undetermined(format!(
+            "process {pid} is no longer the process that was asked about, so what the jobs list \
+             is not about it"
+        )),
+        Reading::Failed(why) => Ancestry::Undetermined(format!(
+            "process {pid} could not be identified again: {why}"
+        )),
+    }
 }
 
 /// Walks the parent chain from `from` until it meets one of `candidates`.
@@ -2062,58 +2088,85 @@ mod tests {
 
     #[test]
     fn a_process_is_placed_under_the_agent_whose_job_lists_it() {
+        // Process 300, still the process asked about when it is read again.
+        let table = Scripted::default().found(&identity(300, 30));
         let agents = [identity(250, 25), identity(260, 26)];
         let listed = [Some(Ok(vec![250, 251])), Some(Ok(vec![260, 300]))];
         assert_eq!(
-            held_by(&identity(300, 30), &agents, &listed),
+            held_by(&table, &identity(300, 30), &agents, &listed),
             Ancestry::Reaches(1)
-        );
-        // An agent is its own, whatever its job lists and whether or not it has one.
-        assert_eq!(
-            held_by(&identity(250, 25), &agents, &[None, None]),
-            Ancestry::Reaches(0)
         );
         // Every job read, and none lists it: it is under none of them.
         let neither = [Some(Ok(vec![250])), Some(Ok(vec![260]))];
         assert_eq!(
-            held_by(&identity(300, 30), &agents, &neither),
+            held_by(&table, &identity(300, 30), &agents, &neither),
             Ancestry::ReachesNone
         );
-        assert_eq!(held_by(&identity(300, 30), &[], &[]), Ancestry::ReachesNone);
+        assert_eq!(
+            held_by(&table, &identity(300, 30), &[], &[]),
+            Ancestry::ReachesNone
+        );
+        // An agent is its own, whatever its job lists and whether or not it has one, and nothing is
+        // read to say so: this table answers no reading.
+        assert_eq!(
+            held_by(
+                &Scripted::default(),
+                &identity(250, 25),
+                &agents,
+                &[None, None]
+            ),
+            Ancestry::Reaches(0)
+        );
         // A record of an agent that ended beside the live one that holds its identifier now, in
         // either order: the live one's job places its process, and the live one is itself.
         let (ended, live) = (identity(250, 20), identity(250, 25));
         let jobs = [Some(Ok(Vec::new())), Some(Ok(vec![250, 300]))];
         assert_eq!(
-            held_by(&identity(300, 30), &[ended.clone(), live.clone()], &jobs),
+            held_by(
+                &table,
+                &identity(300, 30),
+                &[ended.clone(), live.clone()],
+                &jobs
+            ),
             Ancestry::Reaches(1)
         );
         let swapped = [Some(Ok(vec![250, 300])), Some(Ok(Vec::new()))];
         assert_eq!(
-            held_by(&identity(300, 30), &[live.clone(), ended.clone()], &swapped),
+            held_by(
+                &table,
+                &identity(300, 30),
+                &[live.clone(), ended.clone()],
+                &swapped
+            ),
             Ancestry::Reaches(0)
         );
         assert_eq!(
-            held_by(&live, &[ended, live.clone()], &[None, None]),
+            held_by(
+                &Scripted::default(),
+                &live,
+                &[ended, live.clone()],
+                &[None, None]
+            ),
             Ancestry::Reaches(1)
         );
     }
 
     #[test]
     fn a_job_that_cannot_say_what_it_holds_puts_no_process_outside() {
+        let table = Scripted::default().found(&identity(300, 30));
         let agents = [identity(250, 25), identity(260, 26)];
         let unread = [
             Some(Err("Access is denied.".to_owned())),
             Some(Ok(vec![260])),
         ];
         assert!(matches!(
-            held_by(&identity(300, 30), &agents, &unread),
+            held_by(&table, &identity(300, 30), &agents, &unread),
             Ancestry::Undetermined(why) if why.contains("Access is denied")
         ));
         // An agent started in no job this worker keeps establishes nothing about another process.
         let unkept = [None, Some(Ok(vec![260]))];
         assert!(matches!(
-            held_by(&identity(300, 30), &agents, &unkept),
+            held_by(&table, &identity(300, 30), &agents, &unkept),
             Ancestry::Undetermined(why) if why.contains("no job")
         ));
         // A job that lists the caller places it, whatever another could not say.
@@ -2122,9 +2175,38 @@ mod tests {
             Some(Ok(vec![300])),
         ];
         assert_eq!(
-            held_by(&identity(300, 30), &agents, &placed),
+            held_by(&table, &identity(300, 30), &agents, &placed),
             Ancestry::Reaches(1)
         );
+    }
+
+    #[test]
+    fn a_job_list_says_nothing_about_a_process_that_no_longer_holds_its_identifier() {
+        let agents = [identity(250, 25)];
+        let listed = [Some(Ok(vec![250, 300]))];
+        // Another process holds identifier 300 now: the list names that one, not the one asked
+        // about, and it is placed under no agent and under none.
+        let replaced = Scripted::default().found(&identity(300, 31));
+        assert!(matches!(
+            held_by(&replaced, &identity(300, 30), &agents, &listed),
+            Ancestry::Undetermined(why) if why.contains("no longer")
+        ));
+        assert!(matches!(
+            held_by(&replaced, &identity(300, 30), &agents, &[Some(Ok(vec![250]))]),
+            Ancestry::Undetermined(why) if why.contains("no longer")
+        ));
+        // Nothing holds it, or it cannot be read again.
+        let gone = Scripted::default().identity(300, &[Reading::Absent]);
+        assert!(matches!(
+            held_by(&gone, &identity(300, 30), &agents, &listed),
+            Ancestry::Undetermined(_)
+        ));
+        let unread =
+            Scripted::default().identity(300, &[Reading::Failed("Access is denied.".to_owned())]);
+        assert!(matches!(
+            held_by(&unread, &identity(300, 30), &agents, &listed),
+            Ancestry::Undetermined(why) if why.contains("Access is denied")
+        ));
     }
 
     #[test]

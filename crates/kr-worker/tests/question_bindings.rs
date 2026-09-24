@@ -568,7 +568,7 @@ fn an_ended_agents_record_hides_no_live_agent_that_holds_its_identifier() {
 
 /// An agent and the helper it started, as the broker's launch starts one on Windows: in a job of
 /// its own, joined before it ran, kept for the broker. The agent is `cmd.exe` and the helper the
-/// `ping` it runs, which waits for a minute.
+/// `ping` it runs, which waits far longer than the test takes; both end with the test.
 #[cfg(windows)]
 struct Started {
     agent: std::process::Child,
@@ -584,7 +584,7 @@ impl Started {
         let agent = job
             .start(
                 std::process::Command::new("cmd.exe")
-                    .args(["/d", "/c", "ping -n 60 127.0.0.1 > NUL"])
+                    .args(["/d", "/c", "ping -n 600 127.0.0.1 > NUL"])
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null()),
@@ -647,9 +647,10 @@ fn an_empty_session(root: u32) -> (Arc<kr_worker::windows::job::SessionJob>, Ses
 
 /// On Windows, a helper that an agent the broker launched started is bound through the job the
 /// agent was started in: it is outside the session's own job and its parent proves nothing, and
-/// the agent's job holds it. A process the agent did not start is outside, and so is the helper
-/// without the broker's word. An ended agent's record naming the live agent's identifier hides
-/// nothing, whichever the broker reads first.
+/// the agent's job holds it. The helper's identifier with another start value is placed nowhere. A
+/// process the agent did not start is outside, and so is the helper without the broker's word. An
+/// ended agent's record naming the live agent's identifier hides nothing, whichever the broker
+/// reads first.
 #[cfg(windows)]
 #[test]
 fn a_helper_an_agent_started_is_bound_through_the_job_the_agent_was_started_in() {
@@ -681,6 +682,14 @@ fn a_helper_an_agent_started_is_bound_through_the_job_the_agent_was_started_in()
         kr_worker::questions::AgentBindings::binding_of(&broker, &admitted.process),
         kr_worker::questions::AgentPlacement::Bound(binding)
             if binding.application_instance_id == instance
+    ));
+    // The helper's identifier with a start value it never had names a process that is not the
+    // helper, whatever the agent's job lists under that identifier: nothing is placed for it.
+    let mut stranger = started.helper.clone();
+    stranger.start_value = kr_protocol::scalars::U64::new(stranger.start_value.get() ^ 0xFFFF);
+    assert!(matches!(
+        kr_worker::questions::AgentBindings::binding_of(&broker, &stranger),
+        kr_worker::questions::AgentPlacement::Undetermined(_)
     ));
     let me = this_process();
     let outside = verify(std::process::id(), &me, Some(&broker))
