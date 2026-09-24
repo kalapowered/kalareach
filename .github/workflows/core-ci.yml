@@ -127,6 +127,65 @@ jobs:
           git --version
           cargo test --locked -p kr-project --test boundary -- --nocapture
 
+      # Seven checks put a bind mount inside the tree they look at, from inside a mount namespace
+      # this account creates: three in change-set capture, two in the transfer authority and two
+      # in project locations. Ubuntu 24.04 denies an unprivileged account that namespace unless
+      # AppArmor's restriction on it is lifted, and each check fails rather than passes where it
+      # cannot make one, so the workspace test above leaves them out. This step lifts the
+      # restriction for itself on this runner and puts it back when the checks are done, shows the
+      # namespace refused before and given after, and runs the seven by name. A name that matched
+      # no test would run nothing and still exit 0, so the step counts the seven it saw pass.
+      - name: Mount checks inside a mount namespace of this account's own
+        # Whatever the steps before it did, like the boundary step above.
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          restriction=kernel.apparmor_restrict_unprivileged_userns
+          before="$(sysctl -n "$restriction")" || exit 1
+          echo "$restriction is $before"
+          if unshare -r -m true; then
+            echo "before the change: unshare -r -m was given"
+          else
+            echo "before the change: unshare -r -m was refused"
+          fi
+          sudo sysctl -w "$restriction=0" || exit 1
+          checks=(
+            a_file_mounted_inside_this_repository_s_own_data_is_not_captured_around
+            a_tree_reached_on_another_mount_is_not_taken_for_this_one
+            two_views_of_one_directory_are_both_looked_through
+            a_mount_placed_while_reads_resolve_never_reaches_the_other_tree
+            a_removal_stops_before_a_directory_mounted_into_the_tree
+            bind_mount_and_cross_device_grafts_are_refused
+            recursive_removal_refuses_a_grafted_mount
+          )
+          log="$RUNNER_TEMP/mount-checks.log"
+          : >"$log"
+          failed=0
+          if unshare -r -m true; then
+            echo "after the change: unshare -r -m was given"
+            cargo test --locked -p kr-changeset --test capture -- --ignored --exact --color never \
+              "${checks[@]:0:3}" 2>&1 | tee -a "$log" || failed=1
+            cargo test --locked -p kr-transfer --test authority -- --ignored --exact --color never \
+              "${checks[@]:3:2}" 2>&1 | tee -a "$log" || failed=1
+            cargo test --locked -p kr-project --test locations -- --ignored --exact --color never \
+              "${checks[@]:5:2}" 2>&1 | tee -a "$log" || failed=1
+          else
+            echo "after the change: unshare -r -m was still refused" >&2
+            failed=1
+          fi
+          # Put back what this runner had, so no later step runs under the change.
+          sudo sysctl -w "$restriction=$before" || failed=1
+          passed=0
+          for check in "${checks[@]}"; do
+            if grep -q -F -x "test $check ... ok" "$log"; then
+              passed=$((passed + 1))
+            else
+              echo "$check did not pass" >&2
+            fi
+          done
+          echo "$passed of the ${#checks[@]} mount checks passed"
+          [ "$failed" -eq 0 ] && [ "$passed" -eq "${#checks[@]}" ]
+
       - name: Generated protocol schema is current
         run: cargo run --locked -p kr-protocol --bin kr-protocol-gen -- --check
 

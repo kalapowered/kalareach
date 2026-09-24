@@ -2528,12 +2528,13 @@ fn a_version_number_is_never_reused() {
 /// so, and no directory of the tree is on another mount. What finds it is the administrative scan
 /// opening each file it holds.
 ///
-/// It needs a mount namespace this account may create, so it is ignored by default and runs with
-/// `--ignored` on a Linux host that allows one. Where the host allows none it fails and says so,
-/// because a check that returned early would be counted as one that passed.
+/// It needs a mount namespace this account may create, which Ubuntu denies an unprivileged account
+/// by default, so an ordinary run leaves it out. The `rust` job of core-ci lifts that restriction
+/// on its own runner and runs it with `--ignored`. Where the host allows no namespace it fails and
+/// says so, because a check that returned early would be counted as one that passed.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; run it with `cargo test -- --ignored` on a Linux host that allows one"]
+#[ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; the rust job of .github/workflows/core-ci.yml lifts that restriction on its runner and runs it with --ignored"]
 fn a_file_mounted_inside_this_repository_s_own_data_is_not_captured_around() {
     const NOT_EXERCISED: i32 = 42;
 
@@ -2630,12 +2631,13 @@ fn a_file_mounted_inside_administrative_data() {
 /// rather than the data. Taking the tree's own handle there would account for the wrong directory
 /// and leave the data as ordinary content, so this host refuses instead of choosing between them.
 ///
-/// It needs a mount namespace this account may create, so it is ignored by default and runs with
-/// `--ignored` on a Linux host that allows one. Where the host allows none it fails and says so,
-/// because a check that returned early would be counted as one that passed.
+/// It needs a mount namespace this account may create, which Ubuntu denies an unprivileged account
+/// by default, so an ordinary run leaves it out. The `rust` job of core-ci lifts that restriction
+/// on its own runner and runs it with `--ignored`. Where the host allows no namespace it fails and
+/// says so, because a check that returned early would be counted as one that passed.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; run it with `cargo test -- --ignored` on a Linux host that allows one"]
+#[ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; the rust job of .github/workflows/core-ci.yml lifts that restriction on its runner and runs it with --ignored"]
 fn a_tree_reached_on_another_mount_is_not_taken_for_this_one() {
     const NOT_EXERCISED: i32 = 42;
 
@@ -2859,12 +2861,13 @@ fn a_directory_whose_name_only_looks_administrative_is_still_looked_through() {
 /// through that named only the object would pass the second view over. One of the two views can
 /// hold a repository whose own data is an ordinary directory of this tree.
 ///
-/// It needs a mount namespace this account may create, so it is ignored by default and runs with
-/// `--ignored` on a Linux host that allows one. Where the host allows none it fails and says so,
-/// because a check that returned early would be counted as one that passed.
+/// It needs a mount namespace this account may create, which Ubuntu denies an unprivileged account
+/// by default, so an ordinary run leaves it out. The `rust` job of core-ci lifts that restriction
+/// on its own runner and runs it with `--ignored`. Where the host allows no namespace it fails and
+/// says so, because a check that returned early would be counted as one that passed.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; run it with `cargo test -- --ignored` on a Linux host that allows one"]
+#[ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; the rust job of .github/workflows/core-ci.yml lifts that restriction on its runner and runs it with --ignored"]
 fn two_views_of_one_directory_are_both_looked_through() {
     const NOT_EXERCISED: i32 = 42;
 

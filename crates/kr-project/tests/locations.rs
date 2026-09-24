@@ -3358,8 +3358,11 @@ fn no_graft_here() {
 }
 
 /// Runs `body` where this host can graft a mount beneath a location: on macOS directly, and on
-/// Linux inside a mount namespace of this account's own. Where the host allows neither it fails
-/// and says so, because a check that returned early would be counted as one that passed.
+/// Linux inside a mount namespace of this account's own. Ubuntu denies an unprivileged account
+/// that namespace by default, so on Linux an ordinary run leaves these checks out, and the `rust`
+/// job of core-ci lifts that restriction on its own runner and runs them with `--ignored`. Where
+/// the host allows neither it fails and says so, because a check that returned early would be
+/// counted as one that passed.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn with_grafts(test: &str, body: fn()) {
     #[cfg(target_os = "macos")]
@@ -3416,7 +3419,7 @@ fn with_grafts(test: &str, body: fn()) {
 #[test]
 #[cfg_attr(
     target_os = "linux",
-    ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; run it with `cargo test -- --ignored` on a Linux host that allows one"
+    ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; the rust job of .github/workflows/core-ci.yml lifts that restriction on its runner and runs it with --ignored"
 )]
 fn bind_mount_and_cross_device_grafts_are_refused() {
     with_grafts("bind_mount_and_cross_device_grafts_are_refused", || {
@@ -3493,7 +3496,7 @@ fn bind_mount_and_cross_device_grafts_are_refused() {
 #[test]
 #[cfg_attr(
     target_os = "linux",
-    ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; run it with `cargo test -- --ignored` on a Linux host that allows one"
+    ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; the rust job of .github/workflows/core-ci.yml lifts that restriction on its runner and runs it with --ignored"
 )]
 fn recursive_removal_refuses_a_grafted_mount() {
     with_grafts("recursive_removal_refuses_a_grafted_mount", || {
