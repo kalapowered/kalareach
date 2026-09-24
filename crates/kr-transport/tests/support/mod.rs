@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 pub mod conditions;
+pub mod pkarr;
 
 use std::sync::Arc;
 
@@ -78,7 +79,22 @@ pub fn windows(clock: &ManualClock) -> Arc<ActionWindowIssuer> {
 
 /// Builds one side: fresh device keys, an endpoint and the record the other side will hold.
 pub async fn side(config: &EndpointConfig, device_byte: u8, listening: bool) -> Side {
-    let keys = DeviceKeys::generate().expect("device keys");
+    side_with(
+        config,
+        DeviceKeys::generate().expect("device keys"),
+        device_byte,
+        listening,
+    )
+    .await
+}
+
+/// Builds one side from keys it already has, as a device does when it starts again.
+pub async fn side_with(
+    config: &EndpointConfig,
+    keys: DeviceKeys,
+    device_byte: u8,
+    listening: bool,
+) -> Side {
     let endpoint = if listening {
         kr_transport::endpoint::bind_listener(config, &keys.transport)
             .await

@@ -4646,6 +4646,7 @@ name = "kr-transport"
 version = "0.1.0"
 dependencies = [
  "boot-time",
+ "futures",
  "iroh",
  "iroh-mainline-address-lookup",
  "iroh-mdns-address-lookup",

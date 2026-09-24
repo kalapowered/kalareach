@@ -26,6 +26,9 @@ tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+# A lookup answers as a stream, one item for each selected service, and the discovery tests read all
+# of them.
+futures.workspace = true
 iroh = { workspace = true, features = ["test-utils"] }
 iroh-relay = { workspace = true, features = ["server", "test-utils"] }
 serde_json.workspace = true
