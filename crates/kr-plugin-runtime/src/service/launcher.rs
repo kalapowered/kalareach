@@ -371,12 +371,20 @@ async fn retire_ended_hosts(environment: &EnvironmentPaths, supervisor: &Arc<dyn
 /// long the host serves. Then, and at once where no process was recorded, the supervisor is asked
 /// to retire the job, once and then each second until the job has gone or [`RETIREMENT_WINDOW`]
 /// has passed; what was left unsettled at the end is reported, and the next launch asks again.
+///
+/// A launch whose supervisor defined no job, as one that starts a detached process or a
+/// transient unit its manager collects by itself, has nothing to take away and nothing is watched.
 fn retire_when_ended(
     supervisor: Arc<dyn HostSupervisor>,
     jobs: PathBuf,
     label: String,
     launched: Option<ProcessStartIdentity>,
 ) {
+    if std::fs::symlink_metadata(jobs.join(format!("{label}.plist")))
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return;
+    }
     tokio::spawn(async move {
         if let Some(identity) = launched {
             while !matches!(
@@ -1379,6 +1387,8 @@ mod tests {
     /// that keeps ended jobs would, by taking its definition away, and records what it was asked.
     struct Told {
         outcome: Box<dyn Fn(&HostLaunchPlan) -> HostStartOutcome + Send + Sync>,
+        /// Whether a start defines a job, as a service manager that keeps jobs does.
+        defines: bool,
         /// The process a started job runs, where the start reported one.
         process: std::sync::Mutex<Option<ProcessStartIdentity>>,
         asked: std::sync::Mutex<Vec<Asked>>,
@@ -1390,6 +1400,19 @@ mod tests {
         ) -> Arc<Self> {
             Arc::new(Self {
                 outcome: Box::new(outcome),
+                defines: true,
+                process: std::sync::Mutex::new(None),
+                asked: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        /// A supervisor that starts things without defining a job for them.
+        fn defining_nothing(
+            outcome: impl Fn(&HostLaunchPlan) -> HostStartOutcome + Send + Sync + 'static,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                outcome: Box::new(outcome),
+                defines: false,
                 process: std::sync::Mutex::new(None),
                 asked: std::sync::Mutex::new(Vec::new()),
             })
@@ -1427,12 +1450,14 @@ mod tests {
                 .expect("the record")
                 .push(Asked::Start(plan.label.clone()));
             // Defined before it starts, as a service manager's job is.
-            std::fs::create_dir_all(&plan.jobs_directory).expect("the jobs directory");
-            std::fs::write(
-                plan.jobs_directory.join(format!("{}.plist", plan.label)),
-                b"",
-            )
-            .expect("the job's definition");
+            if self.defines {
+                std::fs::create_dir_all(&plan.jobs_directory).expect("the jobs directory");
+                std::fs::write(
+                    plan.jobs_directory.join(format!("{}.plist", plan.label)),
+                    b"",
+                )
+                .expect("the job's definition");
+            }
             let outcome = (self.outcome)(plan);
             if let HostStartOutcome::Started(identity) = &outcome {
                 *self.process.lock().expect("the process") = Some(identity.clone());
@@ -1592,6 +1617,35 @@ mod tests {
         };
         told.until_retired(&label).await;
         assert!(defined_host_jobs(&environment).is_empty());
+    }
+
+    /// A launch whose supervisor defined no job has nothing to take away, and asks for nothing.
+    #[tokio::test]
+    async fn a_launch_that_defined_no_job_asks_for_no_retirement() {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let (mut child, identity) = a_process_that_ends_soon();
+        let told = Told::defining_nothing(move |_plan| HostStartOutcome::Started(identity.clone()));
+        let supervisor: Arc<dyn HostSupervisor> = told.clone();
+        let _ = start(
+            &environment,
+            "/nonexistent/kr-plugin-host",
+            std::path::Path::new("/var/packages"),
+            &supervisor,
+            core::time::Duration::from_millis(50),
+        )
+        .await
+        .expect_err("nothing reported itself");
+        // Well past the moment its process ended and a watch would have asked.
+        let _ = child.wait();
+        tokio::time::sleep(HOST_WATCH_INTERVAL * 3).await;
+        assert!(
+            told.asked()
+                .iter()
+                .all(|asked| matches!(asked, Asked::Start(_))),
+            "{:?}",
+            told.asked()
+        );
     }
 
     /// A launch first retires every job an earlier launch in the environment defined whose host
