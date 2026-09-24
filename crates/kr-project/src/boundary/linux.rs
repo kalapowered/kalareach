@@ -532,12 +532,23 @@ fn current_path(handle: BorrowedFd<'_>, path: &Path) -> Result<PathBuf> {
 fn support_object(path: &Path) -> Result<PathFd> {
     PathFd::new(path).map_err(|error| ProjectError::GitFailed {
         detail: format!(
-            "the support object {} is missing or cannot be opened ({error}), so an invocation for \
-             a caller bounded by a grant is not run",
-            crate::git::redact(&path.display().to_string())
+            "the support object {} is missing or cannot be opened ({}), so an invocation for a \
+             caller bounded by a grant is not run",
+            crate::git::redact(&path.display().to_string()),
+            unopened(&error)
         )
         .into(),
     })
+}
+
+/// Returns why an object could not be opened, in the system's own words.
+///
+/// The library's own text repeats the path in quotation marks, and a message holding a character
+/// this host does not repeat is replaced whole, name and all. The path is named by the message this
+/// host composes instead.
+fn unopened(error: &landlock::PathFdError) -> String {
+    std::error::Error::source(error)
+        .map_or_else(|| "it could not be opened".to_owned(), ToString::to_string)
 }
 
 /// The kind of program header that names the loader a program is started through.
@@ -742,8 +753,9 @@ fn unnamed(path: &Path, error: &std::io::Error) -> ProjectError {
 fn opened(path: &Path) -> Result<PathFd> {
     PathFd::new(path).map_err(|error| ProjectError::GitFailed {
         detail: format!(
-            "{} could not be opened to build this invocation's boundary: {error}",
-            crate::git::redact(&path.display().to_string())
+            "{} could not be opened to build this invocation's boundary: {}",
+            crate::git::redact(&path.display().to_string()),
+            unopened(&error)
         )
         .into(),
     })
