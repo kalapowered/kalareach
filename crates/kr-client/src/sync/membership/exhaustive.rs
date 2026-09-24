@@ -2309,8 +2309,8 @@ fn every_state_of(names: &[&'static str]) {
 /// writes, every
 /// invariant by its exact predicate, and every state settling once events stop.
 ///
-/// Its eight configurations visit some twenty million states, which takes about three minutes in
-/// a release build and far longer in a debug one, so it runs on request:
+/// Its nine configurations visit some seventy million states, which takes about half an hour in a
+/// release build and far longer in a debug one, so it runs on request:
 /// `cargo test --release -p kr-client --lib membership::exhaustive -- --ignored`. A run may name
 /// a subset in `KR_MEMBERSHIP_CONFIGURATIONS`, comma-separated.
 #[test]
