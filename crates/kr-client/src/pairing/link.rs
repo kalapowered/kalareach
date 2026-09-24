@@ -9,7 +9,9 @@
 //! One key cannot hold two endpoints on one relay at once: a relay keeps one active client per key
 //! and parks the other, so the parked endpoint's relayed path goes quiet. The pool therefore never
 //! keeps two endpoints of different configurations that select a common relay; binding one closes
-//! the other, and whatever used it connects again later.
+//! the other, and whatever used it connects again later. An endpoint being closed still holds its
+//! relay until its connections have drained, so the pool records it until its close has finished,
+//! and binds nothing on that relay before then.
 //!
 //! [`HostLink`] is the whole of what the pairing flows ask of the network, so a test can put a
 //! dialler that reaches another host, or a layer that alters an answer, in its place. [`IrohLink`]
@@ -32,7 +34,7 @@ use kr_protocol::scalars::EndpointKey;
 use kr_transport::config::EndpointConfig;
 use kr_transport::handshake::{CandidateConnection, LocalIdentity};
 use kr_transport::scheduler::SendLimits;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 use super::BoxFuture;
 use super::paired::PairedHost;
@@ -208,7 +210,53 @@ impl Services {
 pub struct EndpointPool {
     transport: TransportIdentityKeyPair,
     bind: Option<SocketAddr>,
-    open: Mutex<Vec<(Services, Endpoint)>>,
+    endpoints: Mutex<Endpoints>,
+}
+
+/// The pool's record: the endpoints open, and the ones still closing.
+///
+/// Every change to it is made before anything waits, so a caller that stops waiting leaves it
+/// whole. A closing endpoint is closed by a task of its own, which finishes whether or not anyone
+/// waits for it, and it stays recorded until that task says it has.
+#[derive(Default)]
+struct Endpoints {
+    open: Vec<(Services, Endpoint)>,
+    closing: Vec<(Services, watch::Receiver<bool>)>,
+}
+
+impl Endpoints {
+    /// Moves every open endpoint `selected` picks to the closing record, and starts its close.
+    fn start_closing(&mut self, selected: impl Fn(&Services) -> bool) {
+        let (closing, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.open)
+            .into_iter()
+            .partition(|(held, _)| selected(held));
+        self.open = kept;
+        for (held, endpoint) in closing {
+            let (closed, watching) = watch::channel(false);
+            tokio::spawn(async move {
+                endpoint.close().await;
+                let _ = closed.send(true);
+            });
+            self.closing.push((held, watching));
+        }
+    }
+
+    /// Waits until every closing endpoint `selected` picks has finished closing, and forgets the
+    /// closes that have.
+    async fn closed(&mut self, selected: impl Fn(&Services) -> bool) {
+        let waits: Vec<_> = self
+            .closing
+            .iter()
+            .filter(|(held, _)| selected(held))
+            .map(|(_, watching)| watching.clone())
+            .collect();
+        for mut watching in waits {
+            // A close task that ended without saying so has ended all the same.
+            let _ = watching.wait_for(|closed| *closed).await;
+        }
+        self.closing
+            .retain(|(_, watching)| !*watching.borrow() && watching.has_changed().is_ok());
+    }
 }
 
 impl std::fmt::Debug for EndpointPool {
@@ -228,7 +276,7 @@ impl EndpointPool {
         Self {
             transport,
             bind: None,
-            open: Mutex::new(Vec::new()),
+            endpoints: Mutex::new(Endpoints::default()),
         }
     }
 
@@ -242,7 +290,8 @@ impl EndpointPool {
 
     /// The endpoint for `network`'s services, bound now if none is open.
     ///
-    /// Binding one closes any open endpoint whose services differ but share a relay.
+    /// Binding one first closes any open endpoint whose services differ but share a relay, and
+    /// waits for every endpoint on those relays to finish closing, however it came to be closing.
     ///
     /// # Errors
     ///
@@ -251,32 +300,20 @@ impl EndpointPool {
     pub async fn endpoint(&self, network: &NetworkConfig) -> Result<Endpoint, LinkError> {
         let config = self.config(network)?;
         let services = Services::of(&config);
-        let mut open = self.open.lock().await;
-        if let Some((_, endpoint)) = open.iter().find(|(held, _)| *held == services) {
+        let mut endpoints = self.endpoints.lock().await;
+        if let Some((_, endpoint)) = endpoints.open.iter().find(|(held, _)| *held == services) {
             return Ok(endpoint.clone());
         }
-        // The pool's record changes before anything waits, so a caller that stops waiting leaves
-        // it whole: the endpoints kept are still recorded, and the ones being closed are closed by
-        // tasks of their own, which finish whether or not anyone still waits for them.
-        let (closing, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut *open)
-            .into_iter()
-            .partition(|(held, _)| held.share_a_relay(&services));
-        *open = kept;
-        let closes: Vec<_> = closing
-            .into_iter()
-            .map(|(_, endpoint)| tokio::spawn(async move { endpoint.close().await }))
-            .collect();
-        for close in closes {
-            let _ = close.await;
-        }
+        endpoints.start_closing(|held| held.share_a_relay(&services));
+        endpoints.closed(|held| held.share_a_relay(&services)).await;
         let endpoint = kr_transport::endpoint::bind_dialer(&config, &self.transport).await?;
-        open.push((services, endpoint.clone()));
+        endpoints.open.push((services, endpoint.clone()));
         Ok(endpoint)
     }
 
     /// How many endpoints are open.
     pub async fn open_endpoints(&self) -> usize {
-        self.open.lock().await.len()
+        self.endpoints.lock().await.open.len()
     }
 
     /// True when the pool holds an endpoint for `network`'s services.
@@ -285,23 +322,19 @@ impl EndpointPool {
             return false;
         };
         let services = Services::of(&config);
-        self.open
+        self.endpoints
             .lock()
             .await
+            .open
             .iter()
             .any(|(held, _)| *held == services)
     }
 
-    /// Closes every endpoint.
+    /// Closes every endpoint, and waits until each has finished closing.
     pub async fn close(&self) {
-        let closing = std::mem::take(&mut *self.open.lock().await);
-        let closes: Vec<_> = closing
-            .into_iter()
-            .map(|(_, endpoint)| tokio::spawn(async move { endpoint.close().await }))
-            .collect();
-        for close in closes {
-            let _ = close.await;
-        }
+        let mut endpoints = self.endpoints.lock().await;
+        endpoints.start_closing(|_| true);
+        endpoints.closed(|_| true).await;
     }
 
     /// The endpoint configuration a host's network configuration becomes for this device.
@@ -473,12 +506,47 @@ mod tests {
         assert_eq!(pool.open_endpoints().await, 0);
     }
 
+    /// Polls `future` once and drops it, as a caller that stops waiting at its first wait does.
+    /// Returns true when it had finished by then.
+    async fn stop_at_first_wait(future: impl std::future::Future) -> bool {
+        let mut future = std::pin::pin!(future);
+        std::future::poll_fn(|context| {
+            std::task::Poll::Ready(future.as_mut().poll(context).is_ready())
+        })
+        .await
+    }
+
+    /// Starts a connection from `endpoint` that never completes, because its peer is a socket that
+    /// reads nothing. Closing the endpoint then waits while the connection drains, which is how
+    /// long an endpoint that is closing keeps its relay.
+    async fn stalled_connection(
+        endpoint: &Endpoint,
+    ) -> (std::net::UdpSocket, tokio::task::JoinHandle<()>) {
+        let sink = std::net::UdpSocket::bind("127.0.0.1:0").expect("a loopback socket");
+        let hint = sink.local_addr().expect("an address").to_string();
+        let address = EndpointConfig::from_network_config(&network(&[], None, &[hint.as_str()]))
+            .expect("a configuration")
+            .peer_addr(
+                TransportIdentityKeyPair::generate()
+                    .expect("a key")
+                    .public(),
+            )
+            .expect("an address");
+        let dialling = endpoint.clone();
+        let connecting = tokio::spawn(async move {
+            let _ = dialling.connect(address, ALPN).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        (sink, connecting)
+    }
+
     /// A caller that stops waiting while an endpoint on a shared relay is being closed leaves the
     /// pool whole: every endpoint that did not share the relay is still recorded, a connection
     /// live on one of them stays up, and the endpoint that did share the relay is closed all the
-    /// same.
+    /// same. A request made at once afterwards for another configuration on that relay binds its
+    /// endpoint only once the old one has finished closing.
     #[tokio::test]
-    async fn stopping_part_way_loses_no_endpoint_and_keeps_none_it_closed() {
+    async fn stopping_part_way_loses_no_endpoint_and_binds_nothing_on_a_relay_still_held() {
         let peer_key = TransportIdentityKeyPair::generate().expect("a key");
         let mut peer_config =
             EndpointConfig::from_network_config(&network(&[], None, &[])).expect("a config");
@@ -509,24 +577,25 @@ mod tests {
             Some("http://127.0.0.1:13/pkarr"),
             &[],
         );
+        let again = network(
+            &["https://relay.example.test"],
+            Some("http://127.0.0.1:14/pkarr"),
+            &[],
+        );
         let kept = pool.endpoint(&unrelated).await.expect("an endpoint");
         let closing = pool.endpoint(&relayed).await.expect("an endpoint");
-        // The caller stops waiting at the first point the replacement waits, which is while the
-        // endpoint on the shared relay is being closed.
-        let finished_at_once = {
-            let mut replacement = Box::pin(pool.endpoint(&replacing));
-            std::future::poll_fn(|context| {
-                std::task::Poll::Ready(replacement.as_mut().poll(context).is_ready())
-            })
-            .await
-        };
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while !closing.is_closed() {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the endpoint on the shared relay is closed whether or not anyone waited");
+        let (_sink, _connecting) = stalled_connection(&closing).await;
+
+        assert!(
+            !stop_at_first_wait(pool.endpoint(&replacing)).await,
+            "the replacement waits for the endpoint on the shared relay to close"
+        );
+        assert!(!closing.is_closed(), "which is still closing");
+        pool.endpoint(&again).await.expect("an endpoint");
+        assert!(
+            closing.is_closed(),
+            "an endpoint on the relay is bound only once the one before it has finished closing"
+        );
         assert!(
             pool.holds(&unrelated).await,
             "the unrelated endpoint is still recorded"
@@ -538,9 +607,34 @@ mod tests {
         );
         assert!(held.close_reason().is_none());
         assert!(!pool.holds(&relayed).await);
-        assert_eq!(pool.holds(&replacing).await, finished_at_once);
+        assert!(!pool.holds(&replacing).await);
+        assert!(pool.holds(&again).await);
         pool.close().await;
         peer.close().await;
+    }
+
+    /// A close of the whole pool that its caller stops waiting for still keeps relays apart: an
+    /// endpoint asked for at once afterwards on a relay the pool held is bound only once the old
+    /// endpoint has finished closing.
+    #[tokio::test]
+    async fn a_pool_close_stopped_part_way_binds_nothing_on_a_relay_still_held() {
+        let pool = EndpointPool::new(TransportIdentityKeyPair::generate().expect("a key"))
+            .bound_to("127.0.0.1:0".parse().expect("loopback"));
+        let relayed = network(&["https://relay.example.test"], None, &[]);
+        let again = network(
+            &["https://relay.example.test"],
+            Some("http://127.0.0.1:15/pkarr"),
+            &[],
+        );
+        let first = pool.endpoint(&relayed).await.expect("an endpoint");
+        let (_sink, _connecting) = stalled_connection(&first).await;
+        assert!(!stop_at_first_wait(pool.close()).await);
+        pool.endpoint(&again).await.expect("an endpoint");
+        assert!(
+            first.is_closed(),
+            "the relay is used again only once the old endpoint has finished closing"
+        );
+        pool.close().await;
     }
 
     /// A host's own refusal is a refusal; the transport's own conclusions, such as a response
