@@ -6196,8 +6196,8 @@ impl Outlet {
 /// Writes a span of the output stream, in frames the control stream can carry.
 ///
 /// Each frame carries the cursor its own bytes start at, because they are consecutive positions in
-/// one stream. A span that a newer subscription replaces part way stops at the next frame, as it
-/// does at a withdrawal.
+/// one stream. A span that a newer subscription replaces part way finishes the frame it has begun
+/// and stops before the next; a withdrawal can stop the frame it has begun as well.
 async fn send_stream(
     outlet: &mut Outlet,
     stream_id: &StreamId,
@@ -6232,8 +6232,8 @@ async fn send_stream(
 ///
 /// Every frame carries the same cursor: they are parts of one screen at one moment, not
 /// consecutive positions in a stream, and a client draws them in the order they arrive. A screen
-/// that a newer subscription replaces part way stops at the next frame: the new subscription is
-/// drawn a screen of its own.
+/// that a newer subscription replaces part way finishes the frame it has begun and stops before the
+/// next: the new subscription is drawn a screen of its own.
 async fn send_screen(
     outlet: &mut Outlet,
     stream_id: &StreamId,
