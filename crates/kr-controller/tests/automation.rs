@@ -550,6 +550,20 @@ async fn an_automation_run_captures_a_change_set_in(
         "the version records the run that captured it"
     );
     assert_eq!(change_sets.version.provenance.method, "changeset.capture");
+    // The workflow asked for a reservation and was refused one, so the version says it was read
+    // file by file from a live tree and claims no quiesced or point-in-time tree.
+    assert_eq!(
+        change_sets.version.consistency,
+        kr_protocol::changeset::SourceConsistency::PerFileCapture
+    );
+    assert!(
+        change_sets
+            .version
+            .consistency_detail
+            .contains("could not be reserved"),
+        "{}",
+        change_sets.version.consistency_detail
+    );
 
     // A second workflow materialises the exact version the first one captured. Its node's
     // parameters are `changeset.materialize`'s own, so what installs is what runs.
@@ -2480,6 +2494,80 @@ async fn a_workflow_grant_is_narrowed_by_the_configured_rights_ceiling() {
     let refused = failure(start(&mut control, &host, &document, "evt-narrowed").await);
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
     assert!(refused.message.contains("changeset.create"), "{refused:?}");
+
+    host.clients.abort();
+}
+
+/// A capture node that requires a quiesced capture fails, and says why this host cannot hold its
+/// workspace still: here, the user's own checkout, which the user's own tools write. Nothing is
+/// captured.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_capture_that_requires_a_quiesced_tree_fails_and_names_why() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let workspace = adopted_workspace(&mut control, host.environment_id, host.work()).await;
+    host.issue(grant_id(24), &[ActionRight::ChangesetCreate]);
+    let mut node = capture_node(workspace);
+    let mut params: ChangesetCaptureParams =
+        serde_json::from_str(&node.action_params).expect("the node's parameters");
+    params.required_consistency =
+        Nullable::some(kr_protocol::changeset::SourceConsistency::QuiescedCapture);
+    node.action_params = serde_json::to_string(&params).expect("the node's parameters");
+    let document = definition(
+        workflow_id(24),
+        grant_id(24),
+        "a capture that needs a quiesced tree",
+        node,
+    );
+    install(&mut control, &host, &document).await;
+    enable(&mut control, &host, &document).await;
+
+    let run: WorkflowRunResult = typed(
+        &start(&mut control, &host, &document, "evt-quiesced")
+            .await
+            .expect("workflow.run answers"),
+    );
+    assert_eq!(run.status, WorkflowRunStatus::Failed, "{run:?}");
+    let read: WorkflowReadResult = typed(
+        &control
+            .request(
+                Method::WorkflowRead,
+                &WorkflowReadParams {
+                    workflow_id: Nullable::some(document.workflow_id),
+                    revision: Nullable::some(document.revision),
+                    run_id: Nullable::some(run.run_id),
+                    causal_root_id: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("workflow.read succeeds"),
+    );
+    assert_eq!(read.node_receipts.len(), 1);
+    assert_eq!(read.node_receipts[0].status, NodeStatus::Failed);
+    assert!(
+        read.node_receipts[0].output.0.is_none(),
+        "nothing was captured"
+    );
+    // The journal keeps why.
+    let journal = rusqlite::Connection::open(
+        host._temp
+            .environment()
+            .state_dir()
+            .join(kr_automation::store::WORKFLOW_DB_NAME),
+    )
+    .expect("opens the workflow journal");
+    let why: String = journal
+        .query_row(
+            "SELECT error_json FROM node_receipts WHERE run_id = ?1",
+            [run.run_id.to_string()],
+            |row| row.get(0),
+        )
+        .expect("the failed node's reason");
+    assert!(
+        why.contains("requires a quiesced capture") && why.contains("shared existing checkout"),
+        "{why}"
+    );
 
     host.clients.abort();
 }

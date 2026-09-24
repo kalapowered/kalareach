@@ -1,6 +1,5 @@
-//! Tests for the source workflow's pieces: the completion to tests to reviewer flow, exclusive
-//! quiescence reservations on a workspace, and evidence recorded against one immutable change-set
-//! version that later edits cannot change.
+//! Tests for the source workflow's pieces: the completion to tests to reviewer flow, and evidence
+//! recorded against one immutable change-set version that later edits cannot change.
 
 use std::sync::Arc;
 
@@ -8,7 +7,7 @@ use kr_attention::event::{EventCursor, EventKind};
 use kr_attention::store::{Claimant, Liveness};
 use kr_attention::time::BootMark;
 use kr_attention::{Attention, HostReading, Outcome};
-use kr_automation::{QuiescenceManager, ReviewerTurn, SourceWorkflowCoordinator};
+use kr_automation::{ReviewerTurn, SourceWorkflowCoordinator};
 use kr_changeset::ChangeSetService;
 use kr_changeset::capture::CaptureRequest;
 use kr_changeset::service::CaptureOrder;
@@ -23,10 +22,6 @@ use kr_protocol::project::{
     ProjectAdoptParams, WorkspaceCreateParams, WorkspaceKind,
 };
 use kr_protocol::scalars::{Nullable, Uuid};
-
-fn test_workspace_id(v: u8) -> WorkspaceId {
-    WorkspaceId::new(Uuid::from_bytes([v; 16]))
-}
 
 fn test_session_id(v: u8) -> SessionId {
     SessionId::new(Uuid::from_bytes([v; 16]))
@@ -51,53 +46,6 @@ fn dummy_provenance() -> Provenance {
         derivation: String::new(),
         note: "source workflow test".to_owned(),
     }
-}
-
-#[test]
-fn quiescence_reservation_enforces_exclusive_hold() {
-    let mgr = QuiescenceManager::new();
-    let ws = test_workspace_id(1);
-
-    // Initial reservation succeeds
-    let res1 = mgr.reserve(ws, 5000, 1000).unwrap();
-    assert_eq!(res1.workspace_id, ws);
-    assert!(res1.active);
-    assert_eq!(res1.expires_at_ms, 6000);
-
-    // Workspace is quiesced
-    assert!(mgr.is_quiesced(ws, 2000));
-
-    // Overlapping reservation attempt while res1 is active fails
-    let err = mgr.reserve(ws, 5000, 2000).unwrap_err();
-    assert!(err.to_string().contains("already reserved for quiescence"));
-
-    // Release res1
-    assert!(mgr.release(ws, res1.reservation_id));
-    assert!(!mgr.is_quiesced(ws, 2000));
-
-    // Now reservation succeeds again
-    let res2 = mgr.reserve(ws, 5000, 3000).unwrap();
-    assert!(res2.active);
-}
-
-#[test]
-fn quiescence_reservation_expires_automatically() {
-    let mgr = QuiescenceManager::new();
-    let ws = test_workspace_id(2);
-
-    let res = mgr.reserve(ws, 1000, 1000).unwrap();
-    assert_eq!(res.expires_at_ms, 2000);
-
-    // Active before 2000 ms
-    assert!(mgr.is_quiesced(ws, 1500));
-
-    // Expired at 2000 ms
-    assert!(!mgr.is_quiesced(ws, 2000));
-    assert!(!mgr.is_quiesced(ws, 2500));
-
-    // After expiry, a new reservation succeeds without manual release
-    let res2 = mgr.reserve(ws, 2000, 2100).unwrap();
-    assert!(res2.active);
 }
 
 fn git_raw<I, S>(directory: &std::path::Path, arguments: I)
@@ -263,7 +211,7 @@ fn source_workflow_binds_evidence_to_exact_immutable_version() {
     } = adopted_with_one_version();
     let grant = FileGrant::default();
 
-    let coordinator = SourceWorkflowCoordinator::new(Arc::new(QuiescenceManager::new()));
+    let coordinator = SourceWorkflowCoordinator::new();
     let test_session = test_session_id(1);
 
     // 1. Bind test evidence to version 1
@@ -381,7 +329,7 @@ fn reading(now_ms: u64) -> HostReading {
 fn each_review_is_its_own_item_and_a_repeat_is_not_another() {
     let adopted = adopted_with_one_version();
     let (changesets, version) = (&adopted.changesets, adopted.version);
-    let coordinator = SourceWorkflowCoordinator::new(Arc::new(QuiescenceManager::new()));
+    let coordinator = SourceWorkflowCoordinator::new();
     let unknown = |_: &ProcessStartIdentity| Liveness::Unknown;
     let mut attention = Attention::in_memory(
         reading(1_000),
@@ -462,7 +410,7 @@ fn each_review_is_its_own_item_and_a_repeat_is_not_another() {
 fn a_later_result_of_the_same_reviewer_turn_is_new_review_work() {
     let adopted = adopted_with_one_version();
     let (changesets, version) = (&adopted.changesets, adopted.version);
-    let coordinator = SourceWorkflowCoordinator::new(Arc::new(QuiescenceManager::new()));
+    let coordinator = SourceWorkflowCoordinator::new();
     let unknown = |_: &ProcessStartIdentity| Liveness::Unknown;
     let mut attention = Attention::in_memory(
         reading(1_000),

@@ -1,6 +1,6 @@
 //! The environment automation service.
 //!
-//! Owns workflow definitions, runs, causal budgets, and quiescence reservations.
+//! Owns workflow definitions, runs and causal budgets.
 //! Dispatches the five methods of the `Automation` method group:
 //! - `workflow.install`
 //! - `workflow.enable`
@@ -43,12 +43,10 @@ use kr_protocol::automation::{
     WorkflowRunResult,
 };
 use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::{
-    CausalRootId, EnvironmentId, GrantId, PluginId, WorkflowId, WorkflowRunId, WorkspaceId,
-};
+use kr_protocol::ids::{CausalRootId, EnvironmentId, GrantId, PluginId, WorkflowId, WorkflowRunId};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
+use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 
 use crate::Host;
 use crate::authority::{self, AuthoritySource};
@@ -56,7 +54,7 @@ use crate::causal::CausalContext;
 use crate::definition::validate_definition;
 use crate::engine::WorkflowEngine;
 use crate::error::{AutomationError, Result};
-use crate::source_workflow::{QuiescenceManager, QuiescenceReservation, SourceWorkflowCoordinator};
+use crate::source_workflow::SourceWorkflowCoordinator;
 use crate::store::{
     ATTENTION_CONSUMER, ATTENTION_EVENTS, Acted, ActionKey, ActionRecord, AttentionSubject,
     EVENT_NODE_SETTLED, InstalledDefinition, Journal, JournalEvent, JournalEventKind,
@@ -268,7 +266,6 @@ impl AutomationService {
         let authority = Arc::clone(&host.authority);
         let ceilings = Arc::clone(&host.ceilings);
         let engine = Arc::new(WorkflowEngine::new(Arc::clone(&store), host));
-        let quiescence = Arc::new(QuiescenceManager::new());
 
         Self {
             store,
@@ -277,7 +274,7 @@ impl AutomationService {
             authority,
             environment_id,
             engine,
-            source_workflow: Arc::new(SourceWorkflowCoordinator::new(quiescence)),
+            source_workflow: Arc::new(SourceWorkflowCoordinator::new()),
             events: Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -1259,29 +1256,6 @@ impl AutomationService {
         }
 
         Ok(raised)
-    }
-
-    /// Reserves a workspace for quiesced capture.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AutomationError::PermissionDenied`] while another reservation holds it.
-    pub fn reserve_quiescence(
-        &self,
-        workspace_id: WorkspaceId,
-        timeout_ms: u64,
-        now_ms: u64,
-    ) -> Result<QuiescenceReservation> {
-        self.source_workflow
-            .quiescence()
-            .reserve(workspace_id, timeout_ms, now_ms)
-    }
-
-    /// Releases a quiescence reservation.
-    pub fn release_quiescence(&self, workspace_id: WorkspaceId, reservation_id: Uuid) -> bool {
-        self.source_workflow
-            .quiescence()
-            .release(workspace_id, reservation_id)
     }
 }
 

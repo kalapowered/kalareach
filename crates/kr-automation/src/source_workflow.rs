@@ -12,104 +12,24 @@
 //!   worktree without the selected workspace policy.
 //!
 //! Two things this module does not do yet, and says so rather than implying them:
-//! - A quiescence reservation excludes a second reservation on the same workspace. No workspace
-//!   writer consults it, so it does not yet stop a write during a capture.
+//! - Nothing here holds a workspace still. A capture a workflow runs asks the host for a
+//!   reservation, and the host refuses every one until its writers ask for reservations before
+//!   they write, so a capture records the per-file consistency it performs and is never a
+//!   quiesced one.
 //! - A test or review result registered here is bound to the immutable version it names, and is
 //!   still the caller's account of what happened: this host did not observe the execution that
 //!   produced it. So are the reviewer turn a review names and that turn's position in its
 //!   session's events. A version a workflow node captured is different, because the host records
 //!   the run that captured it.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-
 use kr_attention::event::{EventCursor, EventKind, SourceEvent};
 use kr_changeset::ChangeSetService;
 use kr_protocol::attention::AttentionSource;
 use kr_protocol::changeset::{EvidenceKind, VersionRef};
-use kr_protocol::ids::{AgentTurnId, SessionId, WorkspaceId};
-use kr_protocol::scalars::{TimestampMs, Uuid};
+use kr_protocol::ids::{AgentTurnId, SessionId};
+use kr_protocol::scalars::TimestampMs;
 
 use crate::error::{AutomationError, Result};
-
-/// An enforceable quiescence reservation on a workspace.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct QuiescenceReservation {
-    /// Unique reservation token.
-    pub reservation_id: Uuid,
-    /// Reserved workspace.
-    pub workspace_id: WorkspaceId,
-    /// When granted.
-    pub granted_at_ms: u64,
-    /// Expiry deadline in milliseconds.
-    pub expires_at_ms: u64,
-    /// Active state.
-    pub active: bool,
-}
-
-/// Manages exclusive quiescence reservations on workspaces.
-#[derive(Debug, Default)]
-pub struct QuiescenceManager {
-    reservations: Mutex<HashMap<WorkspaceId, QuiescenceReservation>>,
-}
-
-impl QuiescenceManager {
-    /// Creates a new quiescence manager.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Obtains an enforceable quiescence reservation on a workspace.
-    pub fn reserve(
-        &self,
-        workspace_id: WorkspaceId,
-        timeout_ms: u64,
-        now_ms: u64,
-    ) -> Result<QuiescenceReservation> {
-        let mut lock = self.reservations.lock().unwrap();
-        if let Some(existing) = lock.get_mut(&workspace_id)
-            && existing.active
-            && now_ms < existing.expires_at_ms
-        {
-            return Err(AutomationError::PermissionDenied(format!(
-                "workspace {workspace_id} is already reserved for quiescence until {}",
-                existing.expires_at_ms
-            )));
-        }
-
-        let reservation = QuiescenceReservation {
-            reservation_id: crate::new_uuid(),
-            workspace_id,
-            granted_at_ms: now_ms,
-            expires_at_ms: now_ms.saturating_add(timeout_ms),
-            active: true,
-        };
-
-        lock.insert(workspace_id, reservation.clone());
-        Ok(reservation)
-    }
-
-    /// Releases a quiescence reservation.
-    pub fn release(&self, workspace_id: WorkspaceId, reservation_id: Uuid) -> bool {
-        let mut lock = self.reservations.lock().unwrap();
-        if let Some(existing) = lock.get_mut(&workspace_id)
-            && existing.reservation_id == reservation_id
-        {
-            existing.active = false;
-            return true;
-        }
-        false
-    }
-
-    /// Checks whether a workspace is currently quiesced.
-    #[must_use]
-    pub fn is_quiesced(&self, workspace_id: WorkspaceId, now_ms: u64) -> bool {
-        let lock = self.reservations.lock().unwrap();
-        lock.get(&workspace_id)
-            .is_some_and(|r| r.active && now_ms < r.expires_at_ms)
-    }
-}
 
 /// The reviewer's turn a review result came from, as that session's own events record it.
 ///
@@ -132,21 +52,14 @@ pub struct ReviewerTurn {
 }
 
 /// The completion -> tests -> reviewer coordinator.
-pub struct SourceWorkflowCoordinator {
-    quiescence: Arc<QuiescenceManager>,
-}
+#[derive(Debug, Default)]
+pub struct SourceWorkflowCoordinator;
 
 impl SourceWorkflowCoordinator {
     /// Creates a new source workflow coordinator.
     #[must_use]
-    pub fn new(quiescence: Arc<QuiescenceManager>) -> Self {
-        Self { quiescence }
-    }
-
-    /// Returns the quiescence manager.
-    #[must_use]
-    pub fn quiescence(&self) -> &Arc<QuiescenceManager> {
-        &self.quiescence
+    pub const fn new() -> Self {
+        Self
     }
 
     /// Records a test result against one immutable change-set version.
@@ -239,46 +152,5 @@ impl SourceWorkflowCoordinator {
         );
 
         Ok(event)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use kr_protocol::scalars::Uuid;
-
-    fn test_workspace_id(v: u8) -> WorkspaceId {
-        WorkspaceId::new(Uuid::from_bytes([v; 16]))
-    }
-
-    #[test]
-    fn quiescence_reservation_enforces_exclusive_hold() {
-        let mgr = QuiescenceManager::new();
-        let ws = test_workspace_id(1);
-
-        let res = mgr.reserve(ws, 10_000, 1_000).unwrap();
-        assert!(res.active);
-        assert!(mgr.is_quiesced(ws, 2_000));
-
-        // Concurrent reservation is refused
-        let err = mgr.reserve(ws, 5_000, 2_000).unwrap_err();
-        assert!(matches!(err, AutomationError::PermissionDenied(_)));
-
-        // Release works
-        assert!(mgr.release(ws, res.reservation_id));
-        assert!(!mgr.is_quiesced(ws, 2_000));
-
-        // Can reserve again after release
-        assert!(mgr.reserve(ws, 5_000, 3_000).is_ok());
-    }
-
-    #[test]
-    fn quiescence_reservation_expires_automatically() {
-        let mgr = QuiescenceManager::new();
-        let ws = test_workspace_id(2);
-
-        let _res = mgr.reserve(ws, 5_000, 1_000).unwrap(); // expires at 6_000
-        assert!(mgr.is_quiesced(ws, 3_000));
-        assert!(!mgr.is_quiesced(ws, 7_000)); // expired
     }
 }

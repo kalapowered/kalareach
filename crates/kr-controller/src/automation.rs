@@ -536,6 +536,73 @@ fn version_in_scope(
     Ok(())
 }
 
+/// Why this host cannot hold a workspace still while a workflow's capture reads it.
+///
+/// A reservation promises that every writer is kept off the workspace for as long as it holds.
+/// The first two reasons are the workspace's own and stay true whatever this host does; the third
+/// is this host's, and holds until its writers ask for a reservation before they write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unheld {
+    /// A shared existing checkout, which the user's own tools write and nothing here holds off.
+    SharedCheckout,
+    /// Live sessions hold the workspace, and a session's shell writes where it runs.
+    HeldBySessions(usize),
+    /// This host's own writers, an applied version, a materialisation and the workspace
+    /// operations, do not ask for a reservation before they write.
+    WritersDoNotAsk,
+}
+
+impl Unheld {
+    /// Why a workspace of `kind` that `bound_sessions` live sessions hold cannot be held still.
+    fn of(kind: kr_protocol::project::WorkspaceKind, bound_sessions: usize) -> Self {
+        if kind == kr_protocol::project::WorkspaceKind::SharedExisting {
+            Self::SharedCheckout
+        } else if bound_sessions > 0 {
+            Self::HeldBySessions(bound_sessions)
+        } else {
+            Self::WritersDoNotAsk
+        }
+    }
+}
+
+impl std::fmt::Display for Unheld {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SharedCheckout => formatter.write_str(
+                "it is a shared existing checkout, which the user's own tools write and nothing \
+                 on this host can hold off",
+            ),
+            Self::HeldBySessions(count) => write!(
+                formatter,
+                "{count} live sessions hold it, and a session's shell writes where it runs"
+            ),
+            Self::WritersDoNotAsk => formatter.write_str(
+                "this host's own writers, applying a version, materialising one and the workspace \
+                 operations, do not yet ask for a reservation before they write",
+            ),
+        }
+    }
+}
+
+/// The quiescence authority a workflow's capture asks for a reservation.
+///
+/// Every reservation is refused, because none of [`Unheld`]'s reasons is ever absent: a
+/// reservation that did not keep every writer off would let a capture claim a quiesced tree it
+/// did not read. A capture therefore records the per-file consistency it performs and never
+/// claims a quiesced or point-in-time tree, and a node that requires one fails, naming the reason
+/// that applies to its workspace.
+#[derive(Debug)]
+struct WorkflowQuiescence;
+
+impl kr_changeset::QuiescenceAuthority for WorkflowQuiescence {
+    fn reserve(
+        &self,
+        _subject: kr_changeset::QuiescenceSubject,
+    ) -> kr_changeset::Result<Option<Box<dyn kr_changeset::QuiescenceLease + '_>>> {
+        Ok(None)
+    }
+}
+
 /// Captures one version of a workspace, recorded as this run's work, under the node's held grant.
 fn capture(
     changesets: &ChangeSetService,
@@ -543,6 +610,29 @@ fn capture(
     run_id: kr_protocol::ids::WorkflowRunId,
     held: &HeldGrant,
 ) -> kr_automation::Result<ActionOutcome> {
+    // A node that requires a quiesced capture requires what this host cannot perform, and it is
+    // told which of the reasons applies to its workspace rather than only that it was refused.
+    if asked.required_consistency.0
+        == Some(kr_protocol::changeset::SourceConsistency::QuiescedCapture)
+    {
+        let workspace =
+            match changesets
+                .project()
+                .workspace_read(&kr_protocol::project::WorkspaceReadParams {
+                    workspace_id: asked.workspace_id,
+                }) {
+                Ok(read) => read.workspace,
+                Err(error) => return held.refusal_of(error.into()),
+            };
+        return Ok(ActionOutcome::Failed {
+            error: format!(
+                "this capture requires a quiesced capture, and this host cannot hold workspace {} \
+                 still: {}",
+                asked.workspace_id,
+                Unheld::of(workspace.kind, workspace.bound_sessions.len())
+            ),
+        });
+    }
     let order = CaptureOrder {
         workspace_id: asked.workspace_id,
         change_set_id: asked.change_set_id.0,
@@ -552,9 +642,13 @@ fn capture(
             grant: &asked.grant,
             quiescence_declared: asked.quiescence_declared,
             required_consistency: asked.required_consistency.0,
-            // No workflow offers a quiescence reservation, so a capture here is never a quiesced
-            // one; a declaration is recorded beside the class the service decides.
-            quiescence: None,
+            // The reservation is asked for, and refused: see [`WorkflowQuiescence`]. The capture
+            // records the per-file consistency it performs, and a declaration is recorded beside
+            // it.
+            quiescence: Some(kr_changeset::Quiescence {
+                authority: &WorkflowQuiescence,
+                workspace_id: asked.workspace_id,
+            }),
         },
         pin: asked.pin,
         // The run is the provenance, whatever the document said. A definition cannot claim its
@@ -1152,6 +1246,42 @@ fn encode<T: serde::Serialize>(value: &T) -> Answer<ParamsValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A workflow's capture is never held still, and the reason given is the workspace's own when
+    /// it has one.
+    #[test]
+    fn a_workflow_capture_is_refused_its_reservation_with_the_reason_that_applies() {
+        use kr_changeset::QuiescenceAuthority;
+        use kr_protocol::project::WorkspaceKind;
+        assert_eq!(
+            Unheld::of(WorkspaceKind::SharedExisting, 2),
+            Unheld::SharedCheckout
+        );
+        assert_eq!(
+            Unheld::of(WorkspaceKind::Isolated, 1),
+            Unheld::HeldBySessions(1)
+        );
+        assert_eq!(
+            Unheld::of(WorkspaceKind::Isolated, 0),
+            Unheld::WritersDoNotAsk
+        );
+        let subject = kr_changeset::QuiescenceSubject {
+            workspace_id: kr_protocol::ids::WorkspaceId::new(
+                kr_protocol::scalars::Uuid::from_bytes([3; 16]),
+            ),
+            work_tree: kr_transfer::ObjectIdentity {
+                device: 1,
+                file_id: 2,
+            },
+        };
+        assert!(
+            WorkflowQuiescence
+                .reserve(subject)
+                .expect("an answer")
+                .is_none(),
+            "no reservation is granted"
+        );
+    }
 
     /// A starting anchor for the clock tests, at `ms` and the manual clock's `at`.
     fn anchored(ms: u64, at: kr_transport::clock::ContinuousInstant) -> Anchor {

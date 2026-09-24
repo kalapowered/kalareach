@@ -73,9 +73,7 @@ pub use crate::service::{
     AdmittedTriggers, Answer, AutomationService, DERIVED_TRIGGER_PREFIX, StartedRun,
     TRIGGER_CONSUMER, TriggerDecision,
 };
-pub use crate::source_workflow::{
-    QuiescenceManager, QuiescenceReservation, ReviewerTurn, SourceWorkflowCoordinator,
-};
+pub use crate::source_workflow::{ReviewerTurn, SourceWorkflowCoordinator};
 pub use crate::store::{
     Acted, ActionKey, ActionRecord, AttentionOutboxRecord, AttentionSubject, Breach, Continuation,
     InstalledDefinition, Journal, JournalEvent, JournalEventKind, NodeSettlement, Outlived,
