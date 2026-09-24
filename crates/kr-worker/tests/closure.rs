@@ -427,8 +427,8 @@ async fn close(host: &Host) -> ClosureRecord {
 }
 
 /// KR-REQ-07.52: a worker whose session has closed waits for an attachment that stopped reading to
-/// be sent the closure, for its bound and no longer, and one that reads again is sent all the
-/// output it was owed and then the closure.
+/// be sent the closure for as long as its bound, and one that reads again is sent all the output
+/// it was owed and then the closure.
 ///
 /// The transport each client holds is one this test sets, and each client stops part way through a
 /// frame far larger than it, so the notice queued behind that frame cannot be written until the
@@ -492,9 +492,9 @@ async fn a_client_that_stopped_reading_holds_the_worker_only_until_the_bound() {
         waited >= CLOSURE_NOTICE_TIMEOUT,
         "the wait held for its bound of {CLOSURE_NOTICE_TIMEOUT:?}, and it ended after {waited:?}"
     );
-    // A wait that keeps its bound normally ends within the allowance of the timer, and one with a
-    // bound longer than the allowance normally ends outside it; `TIMER_SLACK` says what can
-    // interfere.
+    // A wait that keeps its bound normally ends within the allowance of the timer, and one that
+    // overruns its bound by more than the allowance normally ends outside it; `TIMER_SLACK` says
+    // what can interfere.
     assert!(
         waited.abs_diff(timed) < TIMER_SLACK,
         "the wait ended within {TIMER_SLACK:?} of a timer set to its bound of \
@@ -526,7 +526,7 @@ async fn a_client_that_stopped_reading_holds_the_worker_only_until_the_bound() {
 }
 
 /// KR-REQ-07.52, KR-REQ-09.23: a client that fell a whole queue behind is told to resynchronise,
-/// and is still sent the closure, straight after the marker and as the last thing on its stream.
+/// and is still sent the closure, as the next notification after the marker.
 ///
 /// Falling behind loses output, not the news of how the session ended. The client stops reading
 /// part way through a frame on a transport this test sets, and the session is given batches until

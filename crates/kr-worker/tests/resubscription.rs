@@ -55,7 +55,8 @@ const SEND_BUFFER: usize = 4 * 1024;
 /// One batch of output, delivered as one frame fifty times larger than [`SEND_BUFFER`].
 const BATCH_BYTES: usize = 200 * 1024;
 
-/// The line the session writes after the replacement.
+/// The line the session is given behind the batch, before the replacement: the new subscription
+/// carries it, and the delivery being replaced must not.
 const AFTER: &[u8] = b"kr-after-the-replacement";
 
 /// The identifier of the subscription request that replaces the first.

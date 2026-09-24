@@ -948,7 +948,8 @@ impl WorkerService {
             if let Some((attachment_id, mut stream)) = state.subscribed.take() {
                 // A connection has one delivery writing at a time. The one this subscription
                 // replaces stops between two frames: a frame it has begun is finished, because one
-                // cut part way would end the connection, and it begins no other. The new one
+                // cut part way would end the connection, and it begins no other, except the
+                // keepalive that completes a closure notice it has already written. The new one
                 // begins its first frame only once the old one has stopped, so the peer is sent
                 // the old stream's last frame whole and then the new stream.
                 #[cfg(feature = "testing")]
@@ -5779,7 +5780,8 @@ impl Delivery {
     ///
     /// The word goes out under the connection's writer, which is where the task decides whether to
     /// begin its next frame: it either sees the replacement and begins nothing more, or had already
-    /// begun and finishes that frame.
+    /// begun and finishes that frame. A closure notice it has written is still followed by the
+    /// keepalive that completes it.
     fn replace(self, writer: &Mutex<kr_ipc::framed::FrameWriter>) -> Predecessor {
         {
             let _boundary = writer
@@ -6156,9 +6158,10 @@ struct Writing {
 
 /// Where one delivery writes its frames, and what stops it.
 ///
-/// Every frame of a delivery goes through here, so each one passes both checks: the withdrawal,
-/// which stops a delivery wherever it stands, and the replacement, which stops it between two
-/// frames.
+/// Every frame of a delivery goes through here. [`Outlet::write`] passes both checks: the
+/// withdrawal, which stops a delivery wherever it stands, and the replacement, which stops it
+/// between two frames. [`Outlet::write_even_if_replaced`] passes the withdrawal only, and carries
+/// nothing but the keepalive that completes a closure notice.
 #[derive(Debug)]
 struct Outlet {
     writable: Writing,
