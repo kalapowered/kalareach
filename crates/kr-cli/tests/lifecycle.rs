@@ -846,9 +846,10 @@ impl Host {
     ///
     /// The ordinary end has closed every session and seen every process go, so this finds nothing.
     /// A failure leaves sessions open: each is closed through the host first, which stops what it
-    /// owns with the grace period and the force a person's close would use, and anything this
-    /// test knows of that is still running after that is ended outright, by the identity the
-    /// kernel gave it, so a reused identifier is never signalled.
+    /// owns with the grace period and the force a person's close would use. A worker still
+    /// running after that is ended outright, as this process's own child, whose number nothing
+    /// else can hold until it is collected; its shell loses its terminal with it. Nothing else is
+    /// signalled: whatever is still running is returned, and the host tree is kept for it.
     fn end_what_is_left(&self) -> Vec<String> {
         if let Ok(listed) = self.kr_within(&["list", "--json"], CLEANUP_COMMAND_DEADLINE)
             && let Ok(listed) = serde_json::from_slice::<Value>(&listed.stdout)
@@ -910,13 +911,15 @@ impl Host {
                         .collect();
                 }
                 for (identity, what) in &following {
+                    if !own_child(identity) {
+                        continue;
+                    }
                     eprintln!(
-                        "ending {what}, process {}, which this test started and did not see end",
+                        "ending {what}, process {}, this test's own child, which it did not see end",
                         identity.pid.get()
                     );
                     if let Ok(pid) = i32::try_from(identity.pid.get())
                         && let Some(pid) = rustix::process::Pid::from_raw(pid)
-                        && matches!(process_state(identity), ProcessState::Running)
                     {
                         let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
                     }
@@ -1790,9 +1793,37 @@ fn worker_killed(worker: &ProcessStartIdentity) {
     );
 }
 
-/// Kills a process this test knows by the identity the kernel gave it.
-fn kill(identity: &ProcessStartIdentity, what: &str) {
-    assert!(running(identity), "{what} is running before it is killed");
+/// Whether a process is this test process's own child, which it has not collected, and is still
+/// the process the kernel described when it was recorded.
+///
+/// The parent is asked first. A child keeps its number until its parent collects it, and this
+/// test collects its workers only after it is done with them, so a number established as a
+/// child's cannot come to name anything else; the identity then says it is the recorded one. A
+/// process table that cannot be read establishes nothing.
+fn own_child(identity: &ProcessStartIdentity) -> bool {
+    let mut command = std::process::Command::new("ps");
+    command.args(["-o", "ppid=", "-p", &identity.pid.get().to_string()]);
+    output_within(command, CLEANUP_COMMAND_DEADLINE)
+        .ok()
+        .and_then(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<u32>()
+                .ok()
+        })
+        == Some(std::process::id())
+        && running(identity)
+}
+
+/// Kills a worker this test's daemon started, which is this test process's own child.
+///
+/// The daemon runs in this process and starts each worker as a detached process, so every worker
+/// is this process's child until this test collects it. Nothing else is signalled by its number.
+fn kill_own_child(identity: &ProcessStartIdentity, what: &str) {
+    assert!(
+        own_child(identity),
+        "{what} is this test process's own running child before it is killed"
+    );
     rustix::process::kill_process(
         rustix::process::Pid::from_raw(i32::try_from(identity.pid.get()).expect("an identifier"))
             .expect("an identifier"),
@@ -2283,6 +2314,8 @@ fn end_of_input_and_a_crash_each_close_their_session_and_neither_is_restarted() 
     first.wait_until_put_back("the terminal came back when the session closed");
 
     // A crash: the shell is killed outright, and the session closes with the signal that did it.
+    // The signal is the shell's own, sent to itself from the line typed into it, so nothing here
+    // signals a process by a number this test does not hold.
     let (second, crash) = host.create_in_window("IFS= read -r _");
     assert_eq!(
         crash.listed["display_number"], 2,
@@ -2296,12 +2329,7 @@ fn end_of_input_and_a_crash_each_close_their_session_and_neither_is_restarted() 
     } = crash;
     let crashing = second.mark();
     assert!(running(&root), "the shell is running before it is killed");
-    rustix::process::kill_process(
-        rustix::process::Pid::from_raw(i32::try_from(root.pid.get()).expect("an identifier"))
-            .expect("an identifier"),
-        rustix::process::Signal::KILL,
-    )
-    .expect("kills the shell");
+    second.type_text(b"kill -KILL $$\r");
     let closed = host.wait_until_closed(&crashed.to_string());
     assert_eq!(closed["closure"]["reason"], "root_signal");
     let signal = closed["closure"]["signal"]
@@ -2378,11 +2406,13 @@ fn each_way_a_shell_ends_reaches_one_attachment_or_two_with_the_status_it_implie
     ended(&input.root, "the shell that read the end of its input");
     assert_eq!(worker_exit_status(&input.worker), 0);
 
-    // A crash, seen by two: the shell is killed outright while both terminals are attached.
+    // A crash, seen by two: the shell is killed outright while both terminals are attached. The
+    // signal is the shell's own, sent to itself from the line typed into it, so nothing here
+    // signals a process by a number this test does not hold.
     let (making, crash) = host.create_in_window("IFS= read -r _");
     let onlooker = watcher(&host, &crash.display);
     let (made, looked) = (making.mark(), onlooker.mark());
-    kill(&crash.root, "the shell");
+    making.type_text(b"kill -KILL $$\r");
     let closed = host.wait_until_closed(&crash.session_id.to_string());
     assert_eq!(closed["closure"]["reason"], "root_signal");
     let signal = closed["closure"]["signal"]
@@ -2420,7 +2450,7 @@ fn a_connection_lost_without_a_closure_still_ends_each_attachment_as_a_lost_conn
     let (making, created) = host.create_in_window("IFS= read -r _");
     let onlooker = watcher(&host, &created.display);
     let (made, looked) = (making.mark(), onlooker.mark());
-    kill(&created.worker, "the worker");
+    kill_own_child(&created.worker, "the worker");
     for (window, mark, marker, what) in [
         (
             &making,
@@ -2504,7 +2534,7 @@ fn refused_then_killed(host: &Host) -> (SessionId, Result<(), String>) {
         running(&kr_new),
         "the attachment the line was typed into is still waiting for the closure"
     );
-    kill(
+    kill_own_child(
         &created.worker,
         "the worker, before it says how its session closed",
     );
@@ -2517,14 +2547,9 @@ fn refused_then_killed(host: &Host) -> (SessionId, Result<(), String>) {
     );
     window.wait_until_put_back("the terminal came back when its connection was lost");
     worker_killed(&created.worker);
-    // The shell ignored the hangup its terminal's end brought, so it is this test's to end, unless
-    // the host has already ended it for the worker that could not.
-    if running(&created.root)
-        && let Ok(pid) = i32::try_from(created.root.pid.get())
-        && let Some(pid) = rustix::process::Pid::from_raw(pid)
-    {
-        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-    }
+    // The shell ignores the hangup its terminal's end brought, but not the end of input that
+    // comes with it: an interactive shell whose terminal has gone reads the end of its input and
+    // exits. Nothing here signals it.
     ended(&created.root, "the shell that ignored the request to stop");
     let closed = host.wait_until_closed(&created.session_id.to_string());
     assert_eq!(closed["state"], "closed");

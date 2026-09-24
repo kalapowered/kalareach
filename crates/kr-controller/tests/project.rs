@@ -11,6 +11,7 @@
 //! to the internal disk and ended with a signal where it stands.
 
 mod net_support;
+mod teardown;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -946,7 +947,9 @@ async fn a_verified_download_publishes_into_a_workspace_this_daemon_created() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_killed_mid_clone_is_replaced_and_the_destination_is_untouched() {
-    let host = kr_ipc::testing::TempHost::create();
+    // A tree that is kept, rather than removed from under it, where a daemon this test started
+    // cannot be established as ended.
+    let host = teardown::Tree::create();
     let environment = host.environment();
     let environment_id = host.environment_id();
     let program = host.root().join("kr-controller");
@@ -1023,7 +1026,9 @@ async fn a_daemon_killed_mid_clone_is_replaced_and_the_destination_is_untouched(
     wait_for_operation(&journal).await;
 
     // The daemon dies where it stands.
-    first.stop();
+    first
+        .stop()
+        .unwrap_or_else(|error| panic!("the first daemon ends where it stands: {error}"));
 
     let mut second = start_daemon(&program, &host);
     wait_for_daemon(&endpoint, &log).await;
@@ -1107,7 +1112,9 @@ async fn a_daemon_killed_mid_clone_is_replaced_and_the_destination_is_untouched(
     assert!(listed.projects.is_empty(), "and recorded nothing");
 
     drop(control);
-    second.stop();
+    second
+        .stop()
+        .unwrap_or_else(|error| panic!("the replacement daemon ends: {error}"));
     let _ = held.join();
     keys_are_this_test_s(&environment, environment_id, &log);
 }
@@ -1133,30 +1140,62 @@ async fn wait_for_operation(journal: &Path) {
     }
 }
 
-/// A daemon this test started, ended when it goes out of scope however that happens.
+/// How long a killed daemon is given to be collected.
 #[cfg(unix)]
-struct Daemon(Option<std::process::Child>);
+const COLLECT_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A daemon this test started, ended when it goes out of scope however that happens.
+///
+/// Its process handle is kept until the daemon is established as ended. A kill that failed, or a
+/// daemon that was not collected in time, leaves the handle here and keeps the host tree, so the
+/// directories a daemon that may still be running reads are never removed from under it.
+#[cfg(unix)]
+struct Daemon {
+    child: Option<std::process::Child>,
+    tree: teardown::Holder,
+}
 
 #[cfg(unix)]
 impl Daemon {
-    /// Ends it now, without giving it a chance to tidy up.
-    fn stop(&mut self) {
-        let Some(mut child) = self.0.take() else {
-            return;
+    /// Ends it now, without giving it a chance to tidy up, and says whether it was seen to end.
+    fn stop(&mut self) -> Result<(), String> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(());
         };
-        if let Ok(pid) = i32::try_from(child.id())
-            && let Some(pid) = rustix::process::Pid::from_raw(pid)
-        {
-            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        // This test's own child, which it has not collected, so the handle's number is still its.
+        child
+            .kill()
+            .map_err(|error| format!("the daemon could not be killed: {error}"))?;
+        let deadline = std::time::Instant::now() + COLLECT_BOUND;
+        let ended = loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break Ok(()),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    break Err(format!(
+                        "the daemon had not ended {COLLECT_BOUND:?} after it was killed"
+                    ));
+                }
+                Err(error) => break Err(format!("the daemon could not be waited for: {error}")),
+            }
+        };
+        if ended.is_ok() {
+            self.child = None;
         }
-        let _ = child.wait();
+        ended
     }
 }
 
 #[cfg(unix)]
 impl Drop for Daemon {
     fn drop(&mut self) {
-        self.stop();
+        if let Err(error) = self.stop() {
+            self.tree.hold(format!(
+                "the daemon this test started could not be established as ended: {error}"
+            ));
+        }
     }
 }
 
@@ -1255,7 +1294,7 @@ fn names_in(directory: &Path) -> Vec<String> {
 
 /// Starts the copied daemon on this test's own directories, with no worker program.
 #[cfg(unix)]
-fn start_daemon(program: &Path, host: &kr_ipc::testing::TempHost) -> Daemon {
+fn start_daemon(program: &Path, host: &teardown::Tree) -> Daemon {
     let logs = host.root().join("daemon.log");
     // A bounded retry, for one race and nothing else. The tests in this binary run in threads of
     // one process, and a child one of them forks inherits a copy of every descriptor open at that
@@ -1300,7 +1339,12 @@ fn start_daemon(program: &Path, host: &kr_ipc::testing::TempHost) -> Daemon {
             .stderr(log)
             .spawn();
         match started {
-            Ok(child) => return Daemon(Some(child)),
+            Ok(child) => {
+                return Daemon {
+                    child: Some(child),
+                    tree: host.holder(),
+                };
+            }
             Err(error)
                 if error.kind() == std::io::ErrorKind::ExecutableFileBusy
                     && attempted < ATTEMPTS =>

@@ -3178,6 +3178,9 @@ mod tests {
         let params = params(AgentTarget::Codex, InstallScope::User);
         installer.install(&params).expect("installs");
         let document = tree.home().join(".codex/config.toml");
+        // Declared after the tree, so it is dropped first however the test ends: a document this
+        // account may not delete would keep the tree it is in from ever being removed.
+        let restriction = Restriction(document.clone());
         exacl::setfacl(
             &[&document],
             &[exacl::AclEntry::deny_group(
@@ -3212,6 +3215,28 @@ mod tests {
                 .is_file(),
             "and nothing was taken before the refusal"
         );
+
+        // With the restriction lifted, the tree goes as every other test's does.
+        let root = tree.root.clone();
+        drop(restriction);
+        drop(tree);
+        assert!(
+            !root.exists(),
+            "the tree the restricted document was in is removed: {}",
+            root.display()
+        );
+    }
+
+    /// The access-control list a test put on a document, taken off again when this is dropped.
+    #[cfg(target_os = "macos")]
+    struct Restriction(PathBuf);
+
+    #[cfg(target_os = "macos")]
+    impl Drop for Restriction {
+        fn drop(&mut self) {
+            // An empty list leaves the document with its mode bits alone.
+            let _ = exacl::setfacl(&[&self.0], &[], None);
+        }
     }
 
     #[test]

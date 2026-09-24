@@ -796,6 +796,7 @@ async fn an_action_whose_admitted_deadline_passed_is_refused_before_it_writes() 
 }
 
 mod fence_support;
+mod teardown;
 
 /// KR-REQ-09.09, 09.12 and 26.16: a withdrawal whose fence could not be raised stops a transfer
 /// mutation. The daemon admits `draft.create` on its own socket; the transfer service asks the
@@ -1145,7 +1146,9 @@ async fn each_endpoint_carries_only_the_methods_its_frame_bound_is_for() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_killed_mid_upload_is_replaced_and_the_upload_resumes() {
-    let host = kr_ipc::testing::TempHost::create();
+    // A tree that is kept, rather than removed from under it, where a daemon this test started
+    // cannot be established as ended.
+    let host = teardown::Tree::create();
     let environment = host.environment();
     let environment_id = host.environment_id();
     let program = host.root().join("kr-controller");
@@ -1207,7 +1210,9 @@ async fn a_daemon_killed_mid_upload_is_replaced_and_the_upload_resumes() {
     }
 
     // The daemon dies where it stands.
-    first.stop();
+    first
+        .stop()
+        .unwrap_or_else(|error| panic!("the first daemon ends where it stands: {error}"));
 
     let mut second = start_daemon(&program, &host);
     wait_for_daemon(&endpoint).await;
@@ -1355,7 +1360,9 @@ async fn a_daemon_killed_mid_upload_is_replaced_and_the_upload_resumes() {
 
     drop(control);
     drop(chunks);
-    second.stop();
+    second
+        .stop()
+        .unwrap_or_else(|error| panic!("the replacement daemon ends: {error}"));
     keys_are_this_test_s(
         &environment,
         environment_id,
@@ -1363,30 +1370,62 @@ async fn a_daemon_killed_mid_upload_is_replaced_and_the_upload_resumes() {
     );
 }
 
-/// A daemon this test started, ended when it goes out of scope however that happens.
+/// How long a killed daemon is given to be collected.
 #[cfg(unix)]
-struct Daemon(Option<std::process::Child>);
+const COLLECT_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A daemon this test started, ended when it goes out of scope however that happens.
+///
+/// Its process handle is kept until the daemon is established as ended. A kill that failed, or a
+/// daemon that was not collected in time, leaves the handle here and keeps the host tree, so the
+/// directories a daemon that may still be running reads are never removed from under it.
+#[cfg(unix)]
+struct Daemon {
+    child: Option<std::process::Child>,
+    tree: teardown::Holder,
+}
 
 #[cfg(unix)]
 impl Daemon {
-    /// Ends it now, without giving it a chance to tidy up.
-    fn stop(&mut self) {
-        let Some(mut child) = self.0.take() else {
-            return;
+    /// Ends it now, without giving it a chance to tidy up, and says whether it was seen to end.
+    fn stop(&mut self) -> Result<(), String> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(());
         };
-        if let Ok(pid) = i32::try_from(child.id())
-            && let Some(pid) = rustix::process::Pid::from_raw(pid)
-        {
-            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        // This test's own child, which it has not collected, so the handle's number is still its.
+        child
+            .kill()
+            .map_err(|error| format!("the daemon could not be killed: {error}"))?;
+        let deadline = std::time::Instant::now() + COLLECT_BOUND;
+        let ended = loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break Ok(()),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    break Err(format!(
+                        "the daemon had not ended {COLLECT_BOUND:?} after it was killed"
+                    ));
+                }
+                Err(error) => break Err(format!("the daemon could not be waited for: {error}")),
+            }
+        };
+        if ended.is_ok() {
+            self.child = None;
         }
-        let _ = child.wait();
+        ended
     }
 }
 
 #[cfg(unix)]
 impl Drop for Daemon {
     fn drop(&mut self) {
-        self.stop();
+        if let Err(error) = self.stop() {
+            self.tree.hold(format!(
+                "the daemon this test started could not be established as ended: {error}"
+            ));
+        }
     }
 }
 
@@ -1444,7 +1483,7 @@ fn keys_are_this_test_s(
 
 /// Starts the copied daemon on this test's own directories, with no worker program.
 #[cfg(unix)]
-fn start_daemon(program: &std::path::Path, host: &kr_ipc::testing::TempHost) -> Daemon {
+fn start_daemon(program: &std::path::Path, host: &teardown::Tree) -> Daemon {
     start_daemon_with(program, host, false)
 }
 
@@ -1456,11 +1495,7 @@ fn start_daemon(program: &std::path::Path, host: &kr_ipc::testing::TempHost) -> 
 /// identity a worker signs and this daemon later compares. All of that has to name the same
 /// directories as the ones this test derives from its own absolute root.
 #[cfg(unix)]
-fn start_daemon_with(
-    program: &std::path::Path,
-    host: &kr_ipc::testing::TempHost,
-    relative: bool,
-) -> Daemon {
+fn start_daemon_with(program: &std::path::Path, host: &teardown::Tree, relative: bool) -> Daemon {
     let logs = host.root().join("daemon.log");
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -1492,7 +1527,10 @@ fn start_daemon_with(
         .stdout(log.try_clone().expect("duplicates the log"))
         .stderr(log)
         .spawn()
-        .map(|child| Daemon(Some(child)))
+        .map(|child| Daemon {
+            child: Some(child),
+            tree: host.holder(),
+        })
         .expect("starts the daemon");
     runs_where_this_test_put_it(&daemon, host);
     daemon
@@ -1505,7 +1543,7 @@ fn start_daemon_with(
 /// that was given the right one until the kernel is asked.
 #[cfg(unix)]
 fn runs_where_this_test_put_it(daemon: &Daemon, host: &kr_ipc::testing::TempHost) {
-    let Some(child) = daemon.0.as_ref() else {
+    let Some(child) = daemon.child.as_ref() else {
         return;
     };
     let expected = std::fs::canonicalize(host.root()).expect("this test's own directory exists");
@@ -1619,7 +1657,9 @@ async fn wait_for_daemon(endpoint: &kr_ipc::paths::Endpoint) {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_given_relative_directories_binds_the_endpoints_this_test_derives() {
-    let host = kr_ipc::testing::TempHost::create();
+    // A tree that is kept, rather than removed from under it, where a daemon this test started
+    // cannot be established as ended.
+    let host = teardown::Tree::create();
     let environment = host.environment();
     let environment_id = host.environment_id();
     let program = host.root().join("kr-controller");
@@ -1678,7 +1718,9 @@ async fn a_daemon_given_relative_directories_binds_the_endpoints_this_test_deriv
     same(&listed.state_directory, environment.state_dir());
 
     drop(control);
-    daemon.stop();
+    daemon
+        .stop()
+        .unwrap_or_else(|error| panic!("the daemon ends: {error}"));
     keys_are_this_test_s(
         &environment,
         environment_id,
