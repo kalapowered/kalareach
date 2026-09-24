@@ -12,6 +12,8 @@ publish.workspace = true
 # The account sign-in: the S256 challenge is base64url of a SHA-256 digest, an ID token's payload
 # is base64url JSON, and a returned state is compared in constant time.
 base64.workspace = true
+# The rendezvous room socket carries its frames in one task, which polls both directions at once.
+futures-util.workspace = true
 iroh.workspace = true
 kr-cbor.workspace = true
 kr-crypto.workspace = true
@@ -28,12 +30,19 @@ reqwest.workspace = true
 # Named so this client can install the TLS provider it is built on when the process has none. A
 # process that already chose one keeps it, so what this buys is a default and not a guarantee.
 rustls.workspace = true
+# The rendezvous room socket's TLS is verified against the platform's trust store, as the managed
+# services' requests are.
+rustls-platform-verifier.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+# The rendezvous room socket opens its own TCP connection, so its TLS and its upgrade are the room's
+# alone.
+tokio = { workspace = true, features = ["net"] }
+tokio-rustls.workspace = true
+tokio-websockets.workspace = true
 tracing.workspace = true
 # A request address is compared with the configured gateway origin as a parsed scheme, host and
 # port, because two spellings of one address are one origin and text comparison would say they are
@@ -73,6 +82,8 @@ tempfile.workspace = true
 # The account lock is held across processes, so its test starts this test binary as two children.
 tokio = { workspace = true, features = ["io-util", "net", "process", "test-util"] }
 tokio-rustls.workspace = true
+# The room's end of a rendezvous socket in the room socket's tests.
+tokio-websockets = { workspace = true, features = ["server"] }
 
 [lints]
 workspace = true
