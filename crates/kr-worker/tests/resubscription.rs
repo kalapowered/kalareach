@@ -47,8 +47,9 @@ use common::{LIVENESS_DEADLINE, carries};
 
 /// The send buffer each connection to the worker is given.
 ///
-/// The operating system keeps a buffer of this order (Linux doubles what it is asked for), so a
-/// frame of [`BATCH_BYTES`] the client is not reading stops part way on every platform.
+/// Linux and macOS keep a buffer of this order (Linux doubles what it is asked for), so a frame of
+/// [`BATCH_BYTES`] the client is not reading stops part way on both. The test watches it stop part
+/// way before relying on it.
 const SEND_BUFFER: usize = 4 * 1024;
 
 /// One batch of output, delivered as one frame fifty times larger than [`SEND_BUFFER`].

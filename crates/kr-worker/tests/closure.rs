@@ -380,9 +380,9 @@ async fn a_client_that_has_gone_holds_nothing_up() {
 /// The send buffer each connection is given where a test sets what a client that stops reading
 /// holds.
 ///
-/// The operating system keeps a buffer of this order (Linux doubles what it is asked for), so a
-/// frame of [`BATCH_BYTES`] that a client is not reading stops part way on every platform, and
-/// whatever is queued behind that frame stays queued.
+/// Linux and macOS keep a buffer of this order (Linux doubles what it is asked for), so a frame of
+/// [`BATCH_BYTES`] that a client is not reading stops part way on both, and whatever is queued
+/// behind that frame stays queued. Each test watches the frame stop part way before relying on it.
 #[cfg(unix)]
 const SEND_BUFFER: usize = 4 * 1024;
 
@@ -390,12 +390,13 @@ const SEND_BUFFER: usize = 4 * 1024;
 #[cfg(unix)]
 const BATCH_BYTES: usize = 200 * 1024;
 
-/// The scheduling allowance between the worker's wait and a timer set to the same bound just after
-/// the wait took its own deadline.
+/// How far apart the worker's wait and a timer set to the same bound may end, the timer being set
+/// just after the wait took its own deadline.
 ///
-/// Their deadlines are microseconds apart and one task waits for both, so this covers the timer's
-/// own tick and a moment of scheduling with room to spare. It is an allowance measured against
-/// this suite's machines, not something the runtime promises.
+/// The two deadlines are normally a moment apart and one task waits for both, so a wait that keeps
+/// its bound normally ends well inside this. It is an allowance, not a guarantee: a thread held up
+/// between the two deadlines being set, or between the two ends being read, can make a correct wait
+/// miss it, and a test resumed only after both deadlines can hide a wait that ran over.
 #[cfg(unix)]
 const TIMER_SLACK: Duration = Duration::from_millis(250);
 
@@ -431,11 +432,11 @@ async fn close(host: &Host) -> ClosureRecord {
 ///
 /// The transport each client holds is one this test sets, and each client stops part way through a
 /// frame far larger than it, so the notice queued behind that frame cannot be written until the
-/// client reads, on any platform. The wait is the one a worker makes before it exits, started
-/// here, so its start is known: it may not end before its bound, measured from before it began,
-/// and it is measured against a timer set to the same bound as soon as the wait has taken its own
-/// deadline, within a scheduling allowance. A machine busy enough to delay this test past both
-/// deadlines can hide a wait that ran a little long; it cannot fail a wait that kept its bound.
+/// client reads, on Linux and macOS alike. The wait is the one a worker makes before it exits,
+/// started here, so its start is known. That it does not end before its bound is checked from a
+/// moment taken before it began, which a correct wait always passes. Its end is also compared with
+/// a timer set to the same bound as soon as the wait has taken its own deadline, within
+/// [`TIMER_SLACK`], which is a measurement with the limits that allowance names.
 ///
 /// Unix only, because the transport this sets is a Unix socket's buffer.
 #[cfg(unix)]
@@ -460,7 +461,8 @@ async fn a_client_that_stopped_reading_holds_the_worker_only_until_the_bound() {
     tokio::pin!(wait);
     let started = tokio::time::Instant::now();
     // The wait takes its deadline when it is first polled, and the timer is set just after that, so
-    // whatever holds up the wait's first steps holds up the timer's start as well.
+    // a delay inside the wait's first steps, such as waiting for the session's lock, delays the
+    // timer's start as well.
     let first =
         std::future::poll_fn(|context| std::task::Poll::Ready(wait.as_mut().poll(context))).await;
     assert!(
@@ -490,8 +492,9 @@ async fn a_client_that_stopped_reading_holds_the_worker_only_until_the_bound() {
         waited >= CLOSURE_NOTICE_TIMEOUT,
         "the wait held for its bound of {CLOSURE_NOTICE_TIMEOUT:?}, and it ended after {waited:?}"
     );
-    // The two deadlines are microseconds apart and one task waits for both, so a wait that keeps
-    // its bound ends within a scheduling moment of the timer, and one with a longer bound later.
+    // A wait that keeps its bound normally ends within the allowance of the timer, and one with a
+    // bound longer than the allowance normally ends outside it; `TIMER_SLACK` says what can
+    // interfere.
     assert!(
         waited.abs_diff(timed) < TIMER_SLACK,
         "the wait ended within {TIMER_SLACK:?} of a timer set to its bound of \

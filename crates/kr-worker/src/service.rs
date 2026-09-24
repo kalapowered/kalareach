@@ -6741,9 +6741,10 @@ mod tests {
     /// A frame none of whose bytes went is taken back as soon as it is abandoned, rather than
     /// holding the connection's turn until the peer reads again.
     ///
-    /// Small frames go to a socket whole or not at all, so the socket fills at a frame boundary and
-    /// the frame that finds it full has none of its bytes with the peer. A Windows named pipe does
-    /// not fill that way, so the arrangement never happens there.
+    /// On Linux and macOS a small frame goes to a local socket whole or not at all, so the socket
+    /// fills at a frame boundary and the frame that finds it full has none of its bytes with the
+    /// peer; the test watches for that state before relying on it. A Windows named pipe does not
+    /// fill that way, so the arrangement does not arise there.
     #[cfg_attr(
         windows,
         ignore = "a Windows named pipe does not fill the way this test's own setup needs"
