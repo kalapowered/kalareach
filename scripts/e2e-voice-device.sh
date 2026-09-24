@@ -12,11 +12,12 @@
 #
 # What a person can see is read from the screen: every claim that something is on screen, in the
 # browser engines, the desktop window and the phones alike, is held to what the system's text
-# recognition reads in an image of it, taken as the page draws itself, every word whole and in
-# order. A page's structure only says where to look. What must be absent is counted in the structure
-# with hidden elements included, and in a picture wherever its letters appear in a row, so a near
-# copy fails the claim. Without text recognition (macOS's Vision framework, compiled here with
-# swiftc) nothing a person sees can be checked, and the run says so.
+# recognition reads in an image of it, taken as the page draws itself and at rest, every word whole
+# and in order. A page's structure only says where to look. What must be absent is counted in the
+# structure with hidden elements included, and in a picture or a page's accessible text wherever its
+# letters appear in a row, so a near copy fails the claim. The picture checks are first held to
+# pictures made to fail them. Without text recognition that passes them (macOS's Vision framework,
+# compiled here with swiftc) nothing a person sees can be checked, and the run says so.
 #
 # The page is the harness: the real screen against the scripted host. Its starting state comes from
 # the address (voice_terms, voice_capture, voice_broker), later changes from the host's controls,
@@ -189,9 +190,17 @@ fi
 # shows the words the claim is about.
 
 ocr=""
+ocr_state=unknown
+# Builds the text reader, then holds the picture checks to pictures made to fail them. True only
+# when both hold: a reader that is missing, or checks that pass what they must refuse, are used for
+# no claim at all.
 ocr_ready() {
-    [ -n "$ocr" ] && return 0
-    command -v swiftc >/dev/null 2>&1 || return 1
+    case "$ocr_state" in
+        ready) return 0 ;;
+        failed) return 1 ;;
+    esac
+    ocr_state=failed
+    command -v swiftc >/dev/null 2>&1 || { say "there is no Swift compiler here to build the text reader"; return 1; }
     local source="$artefacts/read-text.swift"
     cat >"${source:?}" <<'SWIFT'
 import AppKit
@@ -247,33 +256,84 @@ for row in rows {
     print(row.sorted { $0.box.minX < $1.box.minX }.map(\.text).joined(separator: " "))
 }
 SWIFT
-    swiftc -O -o "$artefacts/read-text" "$source" >"$artefacts/read-text-build.log" 2>&1 || return 1
+    swiftc -O -o "$artefacts/read-text" "$source" >"$artefacts/read-text-build.log" 2>&1 || {
+        say "the text reader did not build; see $artefacts/read-text-build.log"
+        return 1
+    }
     ocr="$artefacts/read-text"
+    check_the_readers || {
+        say "the picture checks passed a picture made to fail them, or failed one made to pass; see $artefacts/reader-check.log"
+        return 1
+    }
+    say "the picture checks refused each picture made to fail them and passed the one made to pass"
+    ocr_state=ready
 }
 
-# The words of a text, in lower case, one space between them and one at each end: each amount
-# (digits with the separators inside them and a currency sign in front, so "$0.01" and "8,000" are
-# one word each) and each other run of letters and digits. Spacing, line breaks and the rest of
+# The picture checks held to pictures made to fail them, before any claim is made with them: a
+# longer word, a digit joined to a letter and a moved decimal point must not pass for the phrase,
+# nothing asked must never pass, and a near copy of what must be absent must count as present. Each
+# also passes the picture made to pass it. The pictures are drawn in headless Chromium and kept in
+# the screenshot directory under names that mark them as checks, never as evidence.
+check_the_readers() {
+    local shows="$shots/kr-voice-check-shows.png" lacks="$shots/kr-voice-check-lacks.png"
+    ( cd "$companion" && node --input-type=module -e "
+      import { chromium } from '@playwright/test';
+      const browser = await chromium.launch({ headless: true });
+      const page = await browser.newPage({ viewport: { width: 800, height: 320 } });
+      const draw = async (path, html) => {
+        await page.setContent('<body style=\"font: 20px system-ui, sans-serif; margin: 24px\">' + html + '</body>');
+        await page.screenshot({ path, caret: 'initial' });
+      };
+      await draw('$shows', '<p>Unmute microphone</p><p>Session 1b</p><p>\$00.1 a second</p>');
+      await draw('$lacks', '<p>Start Voice Sessions</p>');
+      await browser.close();
+    " ) >"$artefacts/reader-check.log" 2>&1 || return 1
+    reader_verdict passed "every phrase drawn in it" image_shows "$shows" "Unmute microphone" "Session 1b" '$00.1 a second' &&
+        reader_verdict refused '"Mute microphone" in a picture of "Unmute microphone"' image_shows "$shows" "Mute microphone" &&
+        reader_verdict refused '"Session 1" in a picture of "Session 1b"' image_shows "$shows" "Session 1" &&
+        reader_verdict refused '"$0.01 a second" in a picture of "$00.1 a second"' image_shows "$shows" '$0.01 a second' &&
+        reader_verdict refused "nothing asked" image_shows "$shows" &&
+        reader_verdict passed '"End session" absent from a picture without it' image_lacks "$lacks" "End session" &&
+        reader_verdict refused '"Start voice session" absent from a picture of "Start Voice Sessions"' image_lacks "$lacks" "Start voice session"
+}
+
+# Runs one picture check, writes what it did beside what it had to do, and answers whether they
+# agree.
+reader_verdict() {
+    local want=$1 what=$2 got
+    shift 2
+    if "$@"; then got=passed; else got=refused; fi
+    printf '%s: %s; it must be %s\n' "$what" "$got" "$want" >>"$artefacts/reader-check.log"
+    [ "$got" = "$want" ]
+}
+
+# The words of a text, in lower case, one space between them and one at each end. A word is a run
+# of letters and digits, which keeps a "." or "," standing between two digits and a currency sign in
+# front: "$0.01", "8,000" and "1b" are one word each. Spacing, line breaks and the rest of
 # punctuation only separate words, so a phrase the screen wrapped reads the same, while every word
-# is compared whole: "Unmute" is not "Mute", and "$0.01" is not "$00.1". The same rule as the
-# surface assertions use.
+# is compared whole: "Unmute" is not "Mute", "Session 1b" is not "Session 1", and "$0.01" is not
+# "$00.1". The same rule as the surface assertions use.
 words_of() {
     python3 -c '
 import re, sys, unicodedata
 text = unicodedata.normalize("NFKC", sys.argv[1]).lower()
-print(" " + " ".join(re.findall(r"[$€£]?\d+(?:[.,]\d+)*|[^\W_]+", text)) + " ")
+print(" " + " ".join(re.findall(r"[$€£]?(?:[^\W_]|(?<=\d)[.,](?=\d))+", text)) + " ")
 ' "$1"
 }
 
 # True when each of the phrases after the image path is read in it, every word whole and in order.
+# Nothing asked, a phrase with no words, or a reader or conversion that failed is never a pass.
 # Every variable here is local: a caller's own word lists must come back exactly as they went in.
 image_shows() {
-    local image=$1 text phrase
+    local image=$1 text words phrase wanted
     shift
+    [ "$#" -gt 0 ] || return 1
     text="$("$ocr" "$image" 2>/dev/null)" || return 1
-    text="$(words_of "$text")"
+    words="$(words_of "$text")" || return 1
     for phrase in "$@"; do
-        [[ "$text" == *"$(words_of "$phrase")"* ]] || return 1
+        wanted="$(words_of "$phrase")" || return 1
+        [ -n "${wanted// /}" ] || return 1
+        [[ "$words" == *"$wanted"* ]] || return 1
     done
 }
 
@@ -286,12 +346,12 @@ letters_of() {
 # presence: a phrase counts as there wherever its letters appear in a row, even inside a longer
 # word, so a near copy of what must be absent fails the claim instead of passing it.
 image_lacks() {
-    local image=$1 text phrase
+    local image=$1 text letters phrase
     shift
     text="$("$ocr" "$image" 2>/dev/null)" || return 1
-    text="$(letters_of "$text")"
+    letters="$(letters_of "$text")" || return 1
     for phrase in "$@"; do
-        [[ "$text" == *"$(letters_of "$phrase")"* ]] && return 1
+        [[ "$letters" == *"$(letters_of "$phrase")"* ]] && return 1
     done
     return 0
 }
@@ -349,7 +409,7 @@ voice_address() {
 run_assertions() {
     say "asserting the surface in WebKit and Chromium"
     ocr_ready || {
-        fail "no text recognition on this machine, so nothing a person sees can be asserted"
+        fail "no text recognition that passed its own checks, so nothing a person sees can be asserted"
         return 0
     }
     if node --experimental-strip-types "$companion/test/voice/assert-voice-surface.ts" \
@@ -424,7 +484,7 @@ ios_leg() {
         local wanted=() unwanted=() word
         while IFS= read -r word; do wanted+=("$word"); done < <(words_wanted "$@")
         while IFS= read -r word; do unwanted+=("$word"); done < <(words_unwanted "$@")
-        ocr_ready || { say "no text recognition on this machine, so no iOS screenshot can be checked"; return 1; }
+        ocr_ready || { say "no text recognition that passed its own checks, so no iOS screenshot can be checked"; return 1; }
         # A simulator reports itself booted before it can open an address, so a refusal just after
         # boot is waited out, bounded.
         open_ios() {
@@ -640,10 +700,21 @@ run_android() {
         done
         return 1
     }
+    # True when the page's accessible text, as UI Automator reports it, holds none of the phrases.
+    # Absence errs toward failing: letters and digits only, in any case, so a near copy counts, and
+    # a dump that could not be read is never taken for an empty page. An element the page hides is
+    # not in the dump; the surface assertions count those.
     screen_lacks() {
         "$adb_path" -s "$android_serial" shell uiautomator dump "$dump" >/dev/null 2>&1 || return 2
         "$adb_path" -s "$android_serial" shell cat "$dump" 2>/dev/null |
-            python3 -c 'import sys; page = sys.stdin.read(); sys.exit(0 if not any(w in page for w in sys.argv[1:]) else 1)' "$@"
+            python3 -c '
+import re, sys
+letters = lambda text: re.sub(r"[^0-9a-z]", "", text.lower())
+page = letters(sys.stdin.read())
+if not page:
+    sys.exit(2)
+sys.exit(1 if any(letters(phrase) in page for phrase in sys.argv[1:]) else 0)
+' "$@"
     }
     wait_for_android_without() {
         for _ in $(seq 1 30); do
@@ -653,18 +724,19 @@ run_android() {
         return 1
     }
     # Keeps a screenshot of the screen as it is, once the image itself shows every one of the words
-    # and none of the words after `--without` is anywhere on the page, and only then claims exactly
-    # those words. The image is read with the same text recognition as the iOS screenshots, because
-    # UI Automator's positions for a page scrolled inside a frame do not follow the scroll, so they
-    # cannot say what a screenshot shows. It does say what a page holds, so it answers for what is
-    # absent. `how` says what brought the screen there.
+    # and none of the words after `--without` is in the image or anywhere in the page's accessible
+    # text, near copies counted, and only then claims exactly those words. The image is read with
+    # the same text recognition as the iOS screenshots, because UI Automator's positions for a page
+    # scrolled inside a frame do not follow the scroll, so they cannot say what a screenshot shows.
+    # It does say what a page holds, so it answers for what is absent beside the image. `how` says
+    # what brought the screen there.
     capture_android() {
         local row=$1 name=$2 how=$3
         shift 3
         local wanted=() unwanted=() word
         while IFS= read -r word; do wanted+=("$word"); done < <(words_wanted "$@")
         while IFS= read -r word; do unwanted+=("$word"); done < <(words_unwanted "$@")
-        ocr_ready || { say "no text recognition on this machine, so no Android screenshot can be checked"; return 1; }
+        ocr_ready || { say "no text recognition that passed its own checks, so no Android screenshot can be checked"; return 1; }
         local seen=0
         for _ in $(seq 1 20); do
             sleep 3
@@ -681,7 +753,7 @@ run_android() {
             say "the Android screen never $(words_clause "${wanted[@]}") (what it showed: $shots/kr-voice-android-not-evidence-$name)"
             return 1
         fi
-        if [ "${#unwanted[@]}" -gt 0 ] && ! screen_lacks "${unwanted[@]}"; then
+        if [ "${#unwanted[@]}" -gt 0 ] && ! { image_lacks "$shots/$name" "${unwanted[@]}" && screen_lacks "${unwanted[@]}"; }; then
             mv "$shots/$name" "$shots/kr-voice-android-not-evidence-$name" 2>/dev/null || true
             say "the Android page carried one of: ${unwanted[*]}"
             return 1
@@ -829,7 +901,7 @@ for node in re.finditer(r"<node [^>]*>", sys.stdin.read()):
 run_desktop() {
     say "capturing the desktop voice screens"
     ocr_ready || {
-        fail "no text recognition on this machine, so no desktop screenshot can be checked"
+        fail "no text recognition that passed its own checks, so no desktop screenshot can be checked"
         return 0
     }
     # Each screenshot is taken once the page carries every one of its words and none of the words
@@ -845,18 +917,22 @@ run_desktop() {
         await page.goto('http://localhost:$port/harness.html?surface=desktop&tab=voice' + query);
         await page.waitForSelector('.kr-voice');
       };
-      // The page is photographed as it draws itself, with nothing paused or changed: an animation
-      // that ends is waited for, a little, and one that never ends is shown as it is.
-      const settled = () => page.waitForFunction(() => document.getAnimations().every((animation) =>
-        animation.playState !== 'running' || animation.effect?.getComputedTiming().endTime === Infinity),
-        undefined, { timeout: 2000 }).catch(() => undefined);
+      // The page is photographed as it draws itself, with nothing paused and the caret left as it
+      // is, and only at rest: no animation that ends may be running just before the picture or just
+      // after it. One that never ends is part of how the page looks, and is shown as it is.
+      const atRest = () => document.getAnimations().every((animation) =>
+        animation.playState !== 'running' || animation.effect?.getComputedTiming().endTime === Infinity);
       const shoot = async (row, name, how, words, without = []) => {
         for (const word of words) await page.getByText(word, { exact: false }).first().waitFor({ timeout: 5000 });
         for (const word of without) {
           if ((await page.getByText(word, { exact: false }).count()) !== 0) throw new Error(name + ' carried ' + word);
         }
-        await settled();
-        await page.screenshot({ path: '$shots/' + name, fullPage: true, caret: 'initial' });
+        for (let attempt = 1; ; attempt += 1) {
+          await page.waitForFunction(atRest, undefined, { timeout: 5000 });
+          await page.screenshot({ path: '$shots/' + name, fullPage: true, caret: 'initial' });
+          if (await page.evaluate(atRest)) break;
+          if (attempt === 5) throw new Error(name + ' was never taken at rest');
+        }
         console.log(['shot', row, name, how, words.join('|'), without.join('|')].join('\t'));
       };
       const start = async () => {

@@ -16,12 +16,13 @@
  * says something is on screen captures the place it is drawn and holds its claim to what the
  * system's text recognition reads there; the structure only says where to look and what state the
  * page is in. So no style, clip, cover, colour or animation can make a word count that is not drawn:
- * a word that is not drawn is not read. The picture is taken as the page draws it, with nothing
- * paused or changed, and its words are compared with the claim's whole and in order, so a longer
- * word or a moved decimal point is a different claim. What must be absent is counted in the
- * structure with hidden elements included, so a hidden copy fails the claim instead of passing it.
- * Before any claim, each check is given pages made to fail it and one made to pass it, and must
- * refuse the first and accept the second.
+ * a word that is not drawn is not read. The picture is taken as the page draws itself, with nothing
+ * paused, and only at rest: no animation that ends may be running just before it or just after it.
+ * Its words are compared with the claim's whole and in order, so a longer word, a digit joined to a
+ * letter or a moved decimal point is a different claim, and a claim of nothing is never met. What
+ * must be absent is counted in the structure with hidden elements included, so a hidden copy fails
+ * the claim instead of passing it. Before any claim, each check is given pages made to fail it and
+ * one made to pass it, and must refuse the first and accept the second.
  *
  * Usage: `assert-voice-surface.ts <harness address> <text reader> <image directory>`. The text
  * reader prints the text it recognises in the image it is given; the one image being read is kept
@@ -111,15 +112,15 @@ const PATIENCE_MS = 5_000
 class ReaderFailure extends Error {}
 
 /**
- * The words of a text, in order and in lower case: each amount (digits with the separators inside
- * them and a currency sign in front, so "$0.01" and "8,000" are one word each) and each other run of
- * letters and digits. Spacing, line breaks and the rest of punctuation only separate words, so a
- * sentence the layout wrapped or an apostrophe drawn curly reads the same. Every word is compared
- * whole and in its place: "Unmute" is not "Mute", a sentence without its "not" is another sentence,
- * and "$0.01" is neither "$00.1" nor "0.01".
+ * The words of a text, in order and in lower case. A word is a run of letters and digits, which
+ * keeps a "." or "," standing between two digits and a currency sign in front: "$0.01", "8,000" and
+ * "1b" are one word each. Spacing, line breaks and the rest of punctuation only separate words, so
+ * a sentence the layout wrapped or an apostrophe drawn curly reads the same. Every word is compared
+ * whole and in its place: "Unmute" is not "Mute", "Session 1b" is not "Session 1", a sentence
+ * without its "not" is another sentence, and "$0.01" is neither "$00.1" nor "0.01".
  */
 function wordsOf(text: string): string[] {
-  return text.normalize('NFKC').toLowerCase().match(/[$€£]?\p{N}+(?:[.,]\p{N}+)*|[\p{L}\p{N}]+/gu) ?? []
+  return text.normalize('NFKC').toLowerCase().match(/[$€£]?(?:[\p{L}\p{N}]|(?<=\p{N})[.,](?=\p{N}))+/gu) ?? []
 }
 
 /** Whether all of `run`, a sequence of words, occurs together and in order in `read`. */
@@ -132,24 +133,13 @@ function includesRun(read: readonly string[], run: readonly string[]): boolean {
 }
 
 /**
- * Waits a little for every animation that ends to have ended, so a picture is not taken halfway
- * through a transition. Nothing on the page is changed to get there: an animation that never ends
- * is left running, and the picture shows it as a person sees it.
+ * Whether the page is at rest: no animation that ends is still running, its delay included. An
+ * animation that never ends is part of how the page looks, and is left running. Runs in the page.
  */
-async function settled(page: Page): Promise<void> {
-  await page
-    .waitForFunction(
-      () =>
-        document
-          .getAnimations()
-          .every(
-            (animation) =>
-              animation.playState !== 'running' || animation.effect?.getComputedTiming().endTime === Infinity
-          ),
-      undefined,
-      { timeout: 2_000 }
-    )
-    .catch(() => undefined)
+function atRest(): boolean {
+  return document
+    .getAnimations()
+    .every((animation) => animation.playState !== 'running' || animation.effect?.getComputedTiming().endTime === Infinity)
 }
 
 /** The text the system's text recognition reads in one image. */
@@ -164,15 +154,20 @@ function readImage(image: string): string {
 }
 
 /**
- * What a person can read in the one element `locator` names: the place is captured as the screen
- * draws it, with nothing paused or hidden (animations and the text caret included), and read by
- * text recognition. Null while it is not one element on screen.
+ * What a person can read in the one element `locator` names, once the page is at rest: the element
+ * is brought into view, every animation that ends has ended, and the place is captured as the screen
+ * draws it, with nothing paused and the caret left as it is, then read by text recognition. A
+ * picture is not used when an animation that ends is running after it was taken. Null while there
+ * is no such picture: the claim then waits, and fails when it never comes.
  */
 async function readOnScreen(locator: Locator): Promise<string | null> {
+  const page = locator.page()
   const image = `${imagesArgument}/kr-voice-reading.png`
-  await settled(locator.page())
   try {
+    await locator.scrollIntoViewIfNeeded({ timeout: 1_000 })
+    await page.waitForFunction(atRest, undefined, { timeout: 2_000 })
     await locator.screenshot({ path: image, caret: 'initial', timeout: 1_000 })
+    if (!(await page.evaluate(atRest))) return null
   } catch {
     return null
   }
@@ -199,9 +194,10 @@ async function readUntil(
   throw new Error(`${what} never read ${wanted} on screen; it read ${last}`)
 }
 
-/** The place reads each of the phrases, every word whole and in order. */
+/** The place reads each of the phrases, every word whole and in order. Nothing asked is never read. */
 function readsAll(locator: Locator, what: string, phrases: readonly string[]): Promise<void> {
   const wanted = phrases.map(wordsOf)
+  if (wanted.length === 0) return Promise.reject(new Error(`nothing was asked of ${what}`))
   return readUntil(locator, what, quoted(phrases), (read) => wanted.every((run) => includesRun(read, run)))
 }
 
@@ -705,7 +701,9 @@ const HIDDEN_END: readonly string[] = [
   '<p style="position:relative;display:inline-block">The visible start and the hidden end' +
     '<span style="position:absolute;top:0;right:0;bottom:0;width:50%;background:#fff"></span></p>',
   '<style>@keyframes kr-hidden { from, to { opacity: 0 } } .kr-hidden { animation: kr-hidden 1s infinite }</style>' +
-    '<p>The visible start <span class="kr-hidden">and the hidden end</span></p>'
+    '<p>The visible start <span class="kr-hidden">and the hidden end</span></p>',
+  '<style>@keyframes kr-late { to { opacity: 0 } } .kr-late { animation: kr-late 4s steps(1, end) forwards }</style>' +
+    '<p>The visible start <span class="kr-late">and the hidden end</span></p>'
 ]
 
 const CONTROLS = '<div role="group" aria-label="Call controls"><button>Stop the voice</button></div>'
@@ -714,10 +712,12 @@ const CANCEL_PANEL = '<section><h2>Cancel what the agent is doing</h2><button>Ca
 /**
  * Every check a claim is made with, held first to pages made to fail it and to a page made to pass
  * it, before any claim: a sentence whose end is not drawn in each way a page can manage that, an
- * animation that never ends among them; a section, a name, a capture line, a heading, a button and
- * a running call drawn transparent; a rate drawn with its decimal point moved, and a button named
- * "Mute" that draws "Unmute"; a cancellation drawn transparent, drawn over the call controls, or
- * copied among them hidden; and a start control or a call heading that is present but hidden.
+ * animation that never ends and one that hides the end only when it finishes among them; a
+ * section, a name, a capture line, a heading, a button and a running call drawn transparent; a rate
+ * drawn with its decimal point moved, a session drawn "Session 1b", a button named "Mute" that
+ * draws "Unmute", and a section asked for nothing; a cancellation drawn transparent, drawn over the
+ * call controls, or copied among them hidden; and a start control or a call heading that is
+ * present but hidden.
  */
 async function checkTheChecks(): Promise<void> {
   const browser = await chromium.launch({ headless: true })
@@ -736,6 +736,17 @@ async function checkTheChecks(): Promise<void> {
       costs
     )
     await refuses(page, '<section aria-label="What it costs"><h2>What it costs</h2><p>$00.1 a second</p></section>', costs)
+    await refuses(
+      page,
+      '<section aria-label="What it costs"><h2>What it costs</h2><p>$0.01 a second</p></section>',
+      sectionShows(page, 'What it costs', [])
+    )
+
+    const reach = sectionShows(page, 'Sessions this call can reach', ['Session 1'])
+    const sessionsPanel = (name: string) =>
+      `<section aria-label="Sessions this call can reach"><h2>Sessions this call can reach</h2><p>${name}</p></section>`
+    await accepts(page, sessionsPanel('Session 1'), reach)
+    await refuses(page, sessionsPanel('Session 1b'), reach)
 
     const model = modelReads(page, 'gpt-live-1')
     await accepts(page, '<dl class="kr-voice__provider"><dt>Voice model</dt><dd>gpt-live-1</dd></dl>', model)
