@@ -881,6 +881,11 @@ textarea::placeholder {
   gap: var(--gap-3);
 }
 
+/* The panel's cards hold text and controls directly, so they carry their own inset. */
+.account-panel > .card {
+  padding: var(--gap-4);
+}
+
 .account-state {
   display: flex;
   flex-direction: column;
