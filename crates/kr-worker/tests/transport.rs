@@ -2352,6 +2352,76 @@ async fn kr_req_12_02_a_launch_that_fails_after_its_process_started_leaves_nothi
     let _ = std::fs::remove_dir_all(&directory);
 }
 
+/// KR-REQ-12.02: a second launch for an instance that is live is refused before anything starts,
+/// and the first process and its record are left as they were.
+///
+/// A second launch that went ahead would replace the registration the running process was told
+/// about, and one that failed would give back the instance the first is still running as, leaving a
+/// live process nothing supervises.
+// Unix only: Windows refuses every launch before anything starts, which the next test covers.
+#[cfg(unix)]
+#[tokio::test]
+async fn kr_req_12_02_a_second_launch_for_a_live_instance_starts_nothing_and_keeps_the_first() {
+    let directory = private_directory();
+    let broker = broker_for_launch();
+    let mut gateway = kr_worker::broker::NativeGateway::bind(
+        Arc::clone(&broker),
+        &directory,
+        launch_for(None, None),
+    )
+    .expect("the endpoint binds");
+    let intent = broker
+        .prepare_launch(
+            sleeping_profile(),
+            kr_worker::broker::ForegroundMark::idle(4),
+            None,
+        )
+        .expect("the launch is prepared");
+    let mut first = gateway
+        .launch(
+            &intent,
+            &kr_worker::broker::ForegroundMark::idle(4),
+            IntegrationMode::Gateway,
+            TimestampMs::new(1),
+        )
+        .expect("the first launch runs");
+
+    let refused = gateway
+        .launch(
+            &intent,
+            &kr_worker::broker::ForegroundMark::idle(4),
+            IntegrationMode::Gateway,
+            TimestampMs::new(2),
+        )
+        .expect_err("a second launch for the live instance is refused");
+    assert_eq!(
+        refused.code(),
+        kr_protocol::error::ErrorCode::InvalidArgument
+    );
+    assert_eq!(
+        gateway.last_started(),
+        Some(&first.process),
+        "nothing else was started"
+    );
+    assert_eq!(
+        kr_ipc::identity::process_state(&first.process),
+        kr_ipc::identity::ProcessState::Running,
+        "the first process runs on"
+    );
+    assert!(
+        broker.binding_state(instance()).is_ok(),
+        "its instance is still recorded"
+    );
+    assert!(broker.profile_of(instance()).is_some());
+    assert!(
+        directory.join("credential").exists(),
+        "and the credential it was given is still there"
+    );
+    let _ = first.child.kill();
+    let _ = first.child.wait();
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
 /// KR-REQ-12.02: on a platform that cannot publish the launch credential as a file, a launch
 /// starts nothing.
 ///

@@ -593,16 +593,27 @@ fn start_agent(
     let could_not_start =
         |error: std::io::Error| BrokerError::ledger(format!("could not start {program}: {error}"));
     #[cfg(windows)]
-    let (child, job) = {
+    let (mut child, job) = {
         let job = crate::windows::job::AgentJob::create().map_err(could_not_start)?;
         let child = job.start(command).map_err(could_not_start)?;
         (child, job)
     };
     #[cfg(not(windows))]
-    let child = command.spawn().map_err(could_not_start)?;
-    let started = kr_ipc::identity::started_process_identity(child.id()).map_err(|error| {
-        BrokerError::ledger(format!("the started process cannot be read: {error}"))
-    })?;
+    let mut child = command.spawn().map_err(could_not_start)?;
+    let started = match kr_ipc::identity::started_process_identity(child.id()) {
+        Ok(started) => started,
+        Err(error) => {
+            // A process this host cannot name is one it could never supervise or stop by its
+            // identity later, so it is stopped now, while the handle still names it.
+            #[cfg(windows)]
+            let _ = job.terminate(1);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(BrokerError::ledger(format!(
+                "the started process cannot be read, so it was stopped: {error}"
+            )));
+        }
+    };
     #[cfg(windows)]
     crate::windows::job::keep_agent(started.clone(), Arc::new(job));
     Ok((child, started))
@@ -727,11 +738,13 @@ impl NativeGateway {
     /// A launch that fails after step 2 leaves nothing running and nothing reserved: the process
     /// it started is ended and waited for, the files it wrote are removed, and the broker gives
     /// back the instance and the conversation the launch took, so a retry is not refused for a
-    /// launch that never happened.
+    /// launch that never happened. What it gives back is its own: a gateway launches one instance,
+    /// and a launch for an instance that is already live is refused before anything is executed.
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::UnsupportedCapability`] on a platform that cannot publish the launch
+    /// Returns [`BrokerError::InvalidArgument`] when the instance is already live,
+    /// [`BrokerError::UnsupportedCapability`] on a platform that cannot publish the launch
     /// credential as a file, [`BrokerError::Launch`] when the intent is stale, and
     /// [`BrokerError::LedgerUnavailable`] when the directory is not private, or the process cannot
     /// be started or its files written.
@@ -745,6 +758,16 @@ impl NativeGateway {
         let application_instance_id = self.launch.application_instance_id;
         let registration_path = self.runtime_directory.join("registration");
         let credential_path = self.runtime_directory.join("credential");
+        // One launch for one instance. A second one would replace the registration a running
+        // process was told about, and a second one that failed would give back the instance the
+        // first is still running as. Only a launch that never took the instance may take it now.
+        if self.registration.is_some() || self.broker.binding_state(application_instance_id).is_ok()
+        {
+            return Err(BrokerError::invalid(format!(
+                "{application_instance_id} is already live on this gateway, and a second launch \
+                 would replace the process running as it"
+            )));
+        }
         // Refused before anything is started. A launch that cannot be finished must cost nothing,
         // and on a platform without verifiable owner-only files the credential could never be
         // published, so no process is started only to be stopped again.

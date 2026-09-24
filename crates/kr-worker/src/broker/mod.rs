@@ -1075,7 +1075,9 @@ impl Broker {
     /// An executed launch has reserved its conversation and named its instance, and it may have
     /// registered that instance, before the process it started can be used. A launch that fails
     /// after that point gives all of it back, so a retry is not refused for a launch that never
-    /// happened and nothing is left describing a process that was stopped.
+    /// happened and nothing is left describing a process that was stopped. It is for an instance
+    /// the failed launch took: [`crate::broker::NativeGateway::launch`] refuses one that is already
+    /// live before it executes anything, so there is nothing of another launch's here to give back.
     pub fn abandon_launch(&self, application_instance_id: ApplicationInstanceId) {
         let mut state = self.state();
         state.instances.remove(&application_instance_id);
