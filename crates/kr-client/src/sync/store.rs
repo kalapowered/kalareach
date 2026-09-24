@@ -3600,9 +3600,19 @@ mod windows_tests {
 
         // The operating system flushes only through a handle that may write, and says so when it
         // is asked through one that may not. A directory opened with nothing more than the right to
-        // read its attributes opens, so what refuses here is the flush: a helper that opened the
-        // directory and never asked for the flush would return success instead.
+        // read its attributes opens, as the first reading shows, so what refuses in the second is
+        // the flush: a helper that opened the directory and never asked for the flush would return
+        // success instead.
         let root = tempfile::tempdir().expect("a directory");
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+
+            std::fs::OpenOptions::new()
+                .access_mode(FILE_READ_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(root.path())
+                .expect("the directory opens with the right to read its attributes");
+        }
         assert_eq!(
             flush_directory(root.path(), FILE_READ_ATTRIBUTES)
                 .expect_err("a flush through a handle that may not write")
