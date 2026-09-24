@@ -81,12 +81,14 @@ The re-confirmation after the run is **detection** and is described as such: it 
 changed, it does not keep one from changing, it is on those roots and not on every descendant of
 them, and two readings cannot tell a change made and undone from no change at all.
 
-**Reads are not confined on macOS or Linux.** Git reads the system's shared libraries, its locale
-data and its certificate store, and a read confinement that missed one of those would fail an
-operation for a reason that has nothing to do with safety. What a repository can reach by reading is
-what the account the service runs as can reach, as it was before. Windows is the exception: its
-mechanism confines reading with everything else, and what an invocation reads outside the
-directories the operation owns is granted by name.
+**Reads are not confined for the owner's own operations.** Git reads the system's shared
+libraries, its locale data and its certificate store, and a read confinement that missed one of
+those would fail an operation for a reason that has nothing to do with safety. The owner already
+holds the account's authority over the owner's own files, so what such an operation can reach by
+reading is what the account the service runs as can reach, as it was before. An operation performed
+for a caller bounded by a grant is confined on Linux and refused elsewhere, and the section on that
+caller below says what it is promised. Windows confines reading with everything else, and what an
+invocation reads outside the directories the operation owns is granted by name.
 
 ## Which mechanism holds which guarantee
 
@@ -99,6 +101,8 @@ two and why. The table below describes what is written for that platform, not wh
 | Execution | A sandbox profile permitting `process-exec` on this invocation's own execution list and nothing else, applied by the system's own launcher before it runs Git | Landlock, with the execute right on this invocation's own execution list, on Git's helper directory and on the system's program loader, and nowhere else | An application container granted read and write on the repository, and **refused** the execute right there, so a permission inherited from the same directory cannot add it back, though one written on a file itself can |
 | Network | The same profile: no rule at all for a local operation, and one outbound rule per port for a remote one | Landlock's TCP connect rules per port for a remote operation, and a system-call filter that makes a socket only of what the boundary can account for: a connected pair of local ones for any operation, the internet families for a remote one and on those only a TCP stream socket, and nothing else at all, listening included | The container's capabilities: none at all for a local operation, and the client capability for a remote one, which does not bound ports — one of the two reasons the service refuses here |
 | Writes | The same profile, which permits `file-write` under the operation's own directories and nowhere else | Landlock's write rights, attached to the opened objects rather than to their names, and never carrying the execute right | The container's grants on those directories |
+| Reads | Not confined, so an operation for a caller bounded by a grant is refused | The whole filesystem for the owner. For a caller bounded by a grant, Landlock with no rule on the whole filesystem: read rights only on the objects the invocation is granted and on the support set named for this host's Git, and a refusal when a filesystem is mounted beneath a granted directory | The container's grants on those directories, and read grants by name on what it is lent |
+| Inherited descriptors | Every descriptor the service opens is closed when a child executes | The same, and after the rules are applied the child marks every descriptor from the fourth on to close when it executes Git; a kernel that cannot mark them fails the spawn | An explicit list of the three standard handles, and no other |
 | Descendants | The child leads its own process group, and ending it ends the group | The same | A job object the process is created inside, which it cannot leave and which ends everything in it |
 
 ## What a platform refuses rather than pretends
@@ -118,6 +122,16 @@ of these falls back to reading the configuration and hoping.
   invocation rather than installing a filter that would not mean what it says.
 * **A host with no launcher to apply a sandbox profile with**, or **no shell for an invocation that
   has to reach a repository**, refuses that invocation rather than running it unenclosed.
+* **A caller bounded by a grant, on macOS or Windows.** Neither confines what Git reads: no macOS
+  profile tried confined reads and still let the system's loader start Git, and Windows runs no Git
+  at all. Such a caller's invocation is refused with that reason rather than run with the owner's
+  reach.
+* **A caller bounded by a grant, on a Linux host that cannot name the support set**: a program in
+  Git's helper directory whose loader, or a library its loader resolves, cannot be named. So is an
+  invocation that finds a support object gone when it starts. Each refusal names the object.
+* **A caller bounded by a grant, over a directory with another filesystem mounted beneath it**, or
+  with an operation that would reach a remote. A location says nothing about which providers this
+  host may reach for such a caller, and its reads name no certificate store and no resolver file.
 * **Windows, every invocation.** Two of the three guarantees are not things an application container
   can hold: a permission written on a file itself beats the refusal this service writes on the
   directory above it, and a container's capability permits reaching the network or nothing without
@@ -128,9 +142,57 @@ of these falls back to reading the configuration and hoping.
   execute on it either.
 * **A platform with none of these mechanisms** runs no Git at all.
 
+## What a caller bounded by a grant is promised
+
+An operation performed for a caller bounded by a grant, such as a paired device, reaches every name
+through a location the owner authorised. Which callers reach these operations at all is decided at
+the daemon's door, and `docs/host/README.md` says which. This is what the project service holds for
+such a caller once one does.
+
+On Linux each Git invocation of such an operation runs inside one Landlock ruleset that confines
+what the program reads. It may read the directories the operation owns and the ones it is lent, such
+as a clone's source, along with Git's own program and helper directory, the profile's own empty
+directories and the four device nodes. It may also read a support set named for this host's Git:
+the loader each of Git's programs names for itself, and the directories holding the libraries that
+loader resolves for them. Nothing else the account can read is readable, and nothing in `/proc`,
+`/dev/shm` or `/etc` is. The invocation writes only the operation's own directories and the device
+nodes. It executes only the installed Git, never anything in the location, which it may read and
+write but not execute. It reaches no network, and a remote clone is refused for such a caller.
+Before Git executes, every descriptor the child holds from the fourth on is marked to close, so a
+descriptor the service left open is no way round the rules. The configuration audit runs inside the
+same boundary, so a configuration that includes a file outside the location fails when it is read
+rather than being noticed afterwards.
+
+So the boundary bounds what the caller's own request can reach, repository content included. A
+symbolic link to a file outside, an object store borrowing another repository's objects, a
+configuration including a file outside and a descriptor left open are all refused.
+
+**It does not make the location's tree private.** Git reads the tree as the host presents it.
+Immediately before each invocation this host reads the mount table and refuses the operation when a
+filesystem is mounted beneath any directory the invocation would be granted, so a mount, or a second
+view of another directory bound there, that is already present stops the operation. The check sees
+that moment and nothing after it. A filesystem mounted beneath the location while Git runs, a
+directory holding a mount that another program moves beneath it, and an automatic mount that Git's
+own lookup of a path sets off are all read as part of the tree. So is a hard link already inside the
+tree to a file elsewhere on the same filesystem. Another program running as this host's user account
+can put any of these there. The confinement holds against what the caller can reach through
+repository content; it does not defend the location against this host's own user account or the
+host's own mount arrangement.
+
+A host that cannot hold this refuses such a caller and says why: on macOS and Windows, on a Linux
+kernel older than 6.2, where the support set cannot be named, where a support object is gone, and
+where a filesystem is mounted beneath a granted directory.
+
 ## What is left
 
 Stated rather than implied.
+
+**On macOS nothing marks the descriptors the service did not open itself.** Every descriptor this
+service opens is closed when a child executes, on every platform. On Linux the child also marks
+every other descriptor from the fourth on before it executes Git; on macOS the child executes the
+sandbox launcher directly, so a descriptor some library in the service's process opened without
+that mark would reach Git. Git there reads with the owner's reach anyway, and it could write through
+such a descriptor.
 
 **A substitution inside a granted subtree is outside the guarantee.** The tree Git works in is the
 object this service opened, so nothing can redirect that. What a substitution can still reach is a

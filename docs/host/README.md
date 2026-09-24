@@ -2721,11 +2721,16 @@ changing. Inside a granted subtree the kernels draw no further line, so a direct
 unrecorded name in a tree the operation owns is written to as the tree is; the only writer who could
 put it there is a writer under this same account, who could write those files directly.
 
-What it does not confine, on the two platforms whose mechanism separates the two, is reading. Git
-reads the system's shared libraries, its locale data and its certificate store, and a read
-confinement that missed one of those would fail an operation for a reason that has nothing to do
-with safety. What a repository can reach by reading is what the account this host runs as can reach,
-exactly as before.
+What it does not confine for the owner's own operations, on the two platforms whose mechanism
+separates the two, is reading. Git reads the system's shared libraries, its locale data and its
+certificate store, and a read confinement that missed one of those would fail an operation for a
+reason that has nothing to do with safety. What such an operation can reach by reading is what the
+account this host runs as can reach, exactly as before. An operation performed for a caller bounded
+by a grant is confined on Linux: each of its Git invocations reads only the directories it is
+granted and a support set named for this host's Git, and it is refused when a filesystem is mounted
+beneath a granted directory. On macOS, where no profile tried confined reads and still let the
+system's loader start Git, such an invocation is refused. `crates/kr-project/README.md` says what
+that caller is promised and what it is not.
 
 Where a guarantee cannot be enforced from outside Git at all, the operation that needs it is refused
 rather than run under checks that notice afterwards. Two cases are the exception, and
