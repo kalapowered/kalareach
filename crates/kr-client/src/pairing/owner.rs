@@ -33,6 +33,7 @@ use kr_protocol::confirmation::{
 };
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::ErrorCode;
+use kr_protocol::grant::GrantExpiry;
 use kr_protocol::hostinfo::HostInfoResult;
 use kr_protocol::ids::EnvironmentId;
 use kr_protocol::invitation::{
@@ -219,6 +220,8 @@ pub enum CannotCheck {
     Rights,
     /// What it shows could not be encoded to check.
     Unreadable,
+    /// What it would authorise cannot be said in one line of the platform's prompt.
+    CannotShow,
 }
 
 /// Checks that what a challenge shows is what it would authorise, on the host it is for.
@@ -326,68 +329,182 @@ pub fn check(pending: &PendingConfirmation, host: &PairedHost) -> Result<Subject
     }
 }
 
-/// The one line a platform's dialog shows for a subject, completing "KalaReach is trying to ...".
+/// The kinds of action a grant can let a device take, strongest first, as a prompt names them.
 ///
-/// It is at most [`MAX_REASON_CHARS`] characters and one line: a device name is display text a
-/// candidate chose, so it is shortened and stripped of control characters before it is shown.
-#[must_use]
-pub fn reason(subject: &Subject, host_name: &str) -> String {
-    let host = shown(host_name, 40);
-    let text = match subject {
-        Subject::IssueInvitation {
-            mode,
-            origin,
-            proposed_grant,
-            ..
-        } => {
-            let offered = match (mode, origin) {
-                (InviteModeKind::Code, Some(origin)) => {
-                    format!("a code at {}", shown(origin_host(origin), 60))
-                }
-                (InviteModeKind::Code, None) => "a code".to_owned(),
-                (InviteModeKind::Direct, _) => "a QR code on this network".to_owned(),
-            };
-            format!(
-                "issue an invitation from {host}: {offered}, for a device that would {}",
-                role(proposed_grant)
-            )
-        }
-        Subject::ConfirmDevice {
-            candidate,
-            proposed_grant,
-        } => format!(
-            "confirm adding {} ({}) to {host} {}. It shows {}.",
-            shown(candidate.device_name.as_str(), 40),
-            platform(candidate.platform),
-            match role(proposed_grant) {
-                "become an owner" => "as an owner",
-                _ => "to view sessions",
-            },
-            group_verification_value(&candidate.verification_value)
-        ),
-        Subject::EstablishClock => format!("trust the clock of {host} again"),
-        Subject::Described(described) => format!(
-            "{} on {host}. The host did not say which location or package",
-            match described.action {
-                SensitiveAction::EnlargeGrant => "widen what devices may do",
-                SensitiveAction::TrustRepositoryRoot => "trust a plugin repository",
-                SensitiveAction::GrantExecutableCapability => "let a plugin use new capabilities",
-                SensitiveAction::IssueInvitation => "issue an invitation",
-                SensitiveAction::ConfirmDevice => "add a device",
-                SensitiveAction::ChangeHostAuthority => "change who manages the host",
-            }
-        ),
-    };
-    shown(&text, MAX_REASON_CHARS)
+/// Every right belongs to exactly one kind, and a prompt names every kind a grant holds, so an
+/// authority larger than viewing is never shown as viewing. Host management is the owner's and is
+/// named on its own.
+const KINDS: [(&str, &[ActionRight]); 9] = [
+    ("type in terminals", &[ActionRight::TerminalInput]),
+    (
+        "direct agents",
+        &[
+            ActionRight::AgentPrompt,
+            ActionRight::AgentCancel,
+            ActionRight::AgentApprovalRespond,
+            ActionRight::QuestionRespond,
+        ],
+    ),
+    (
+        "change files",
+        &[
+            ActionRight::FilesRead,
+            ActionRight::FilesUpload,
+            ActionRight::FilesApplyDiff,
+            ActionRight::ChangesetCreate,
+        ],
+    ),
+    ("run automations", &[ActionRight::AutomationManage]),
+    (
+        "manage projects",
+        &[ActionRight::ProjectCreate, ActionRight::WorkspaceManage],
+    ),
+    (
+        "manage sessions",
+        &[
+            ActionRight::SessionCreate,
+            ActionRight::SessionRename,
+            ActionRight::SessionClose,
+            ActionRight::SessionShare,
+        ],
+    ),
+    ("use voice", &[ActionRight::VoiceUse]),
+    (
+        "resize terminals",
+        &[
+            ActionRight::TerminalGeometry,
+            ActionRight::TerminalGeometryTransfer,
+            ActionRight::TerminalPalette,
+        ],
+    ),
+    ("view sessions", &[ActionRight::SessionView]),
+];
+
+/// What `rights` let a device do, in words, or `None` when a right has no words here.
+fn authority(rights: &kr_protocol::scalars::CanonicalSet<ActionRight>) -> Option<String> {
+    if rights.contains(&ActionRight::HostManage) {
+        return Some("manage the host as an owner".to_owned());
+    }
+    let named = rights
+        .iter()
+        .all(|right| KINDS.iter().any(|(_, kind)| kind.contains(right)));
+    if !named {
+        return None;
+    }
+    let kinds: Vec<&str> = KINDS
+        .iter()
+        .filter(|(_, kind)| kind.iter().any(|right| rights.contains(right)))
+        .map(|(phrase, _)| *phrase)
+        .collect();
+    Some(match kinds.as_slice() {
+        [] => "do nothing".to_owned(),
+        [one] => (*one).to_owned(),
+        [first @ .., last] => format!("{} and {last}", first.join(", ")),
+    })
 }
 
-/// What a device would become with a proposal.
-fn role(proposed_grant: &ProposedGrant) -> &'static str {
-    if proposed_grant.actions.contains(&ActionRight::HostManage) {
-        "become an owner"
-    } else {
-        "view sessions"
+/// How long a grant lasts, from `now_ms`, in words.
+fn duration(expiry: &GrantExpiry, now_ms: u64) -> String {
+    let GrantExpiry::At { expires_at_ms } = expiry else {
+        return "until it is revoked".to_owned();
+    };
+    let minutes = expires_at_ms.get().saturating_sub(now_ms).div_ceil(60_000);
+    match minutes {
+        0 => "for no time at all".to_owned(),
+        1 => "for 1 minute".to_owned(),
+        2..=119 => format!("for {minutes} minutes"),
+        120..=2879 => format!("for {} hours", minutes / 60),
+        _ => format!("for {} days", minutes / (60 * 24)),
     }
+}
+
+/// The first eight hexadecimal characters of a digest, grouped as a value is.
+fn digest_prefix(digest: &kr_protocol::scalars::Digest256) -> String {
+    let hex: String = digest.as_bytes()[..4]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    group_verification_value(&hex)
+}
+
+/// The one line a platform's dialog shows for a subject, completing "KalaReach is trying to ...".
+///
+/// It names everything the confirmation would authorise: every kind of action the rights allow,
+/// for how long, and to which device. Names a candidate or a host chose are display text: they are
+/// shortened, and stripped of control characters, line separators and the characters that reorder
+/// text, before they are shown. When what the challenge authorises cannot be said in one line of
+/// at most [`MAX_REASON_CHARS`] characters, even with the names shortened, there is no line: a
+/// prompt that left authority out would be asking the person to approve what it did not show.
+///
+/// # Errors
+///
+/// Returns [`CannotCheck::CannotShow`] when no line can say it all.
+pub fn reason(subject: &Subject, host_name: &str, now_ms: u64) -> Result<String, CannotCheck> {
+    for names in [40, 24, 16] {
+        let host = shown(host_name, names);
+        let text = match subject {
+            Subject::IssueInvitation {
+                mode,
+                origin,
+                proposed_grant,
+                ..
+            } => {
+                let offered = match (mode, origin) {
+                    (InviteModeKind::Code, Some(origin)) => {
+                        format!("a code at {}", shown(origin_host(origin), names + 20))
+                    }
+                    (InviteModeKind::Code, None) => "a code".to_owned(),
+                    (InviteModeKind::Direct, _) => "a QR code on this network".to_owned(),
+                };
+                format!(
+                    "issue an invitation from {host}: {offered}, for a device that may {} {}",
+                    authority(&proposed_grant.actions).ok_or(CannotCheck::CannotShow)?,
+                    duration(&proposed_grant.expiry, now_ms)
+                )
+            }
+            Subject::ConfirmDevice {
+                candidate,
+                proposed_grant,
+            } => format!(
+                "confirm adding {} ({}) to {host}, which may {} {}. It shows {}.",
+                shown(candidate.device_name.as_str(), names),
+                platform(candidate.platform),
+                authority(&proposed_grant.actions).ok_or(CannotCheck::CannotShow)?,
+                duration(&proposed_grant.expiry, now_ms),
+                group_verification_value(&candidate.verification_value)
+            ),
+            Subject::EstablishClock => format!("trust the clock of {host} again"),
+            Subject::Described(described) => {
+                let action = match described.action {
+                    SensitiveAction::EnlargeGrant => "widen what devices may do",
+                    SensitiveAction::TrustRepositoryRoot => "trust a plugin repository",
+                    SensitiveAction::GrantExecutableCapability => {
+                        "let a plugin use new capabilities"
+                    }
+                    SensitiveAction::IssueInvitation => "issue an invitation",
+                    SensitiveAction::ConfirmDevice => "add a device",
+                    SensitiveAction::ChangeHostAuthority => "change who manages the host",
+                };
+                let rights = if described.destination_rights.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        ", so that a device may {}",
+                        authority(&described.destination_rights).ok_or(CannotCheck::CannotShow)?
+                    )
+                };
+                format!(
+                    "{action} on {host}{rights}. The host did not say which location or package; \
+                     its digest starts {}",
+                    digest_prefix(&described.action_digest)
+                )
+            }
+        };
+        if text.chars().count() <= MAX_REASON_CHARS {
+            return Ok(text);
+        }
+    }
+    Err(CannotCheck::CannotShow)
 }
 
 /// A platform's name as people know it.
@@ -401,12 +518,32 @@ const fn platform(platform: DevicePlatform) -> &'static str {
     }
 }
 
-/// Text as a dialog may show it: control characters removed, at most `limit` characters.
+/// True for a character that reorders or hides text, which a dialog's line leaves out.
+const fn invisible(character: char) -> bool {
+    matches!(
+        character,
+        '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+    )
+}
+
+/// True for a character that breaks a line, which a dialog's line shows as a space.
+const fn breaking(character: char) -> bool {
+    character.is_control() || matches!(character, '\u{2028}' | '\u{2029}')
+}
+
+/// Display text as a dialog may show it: on one line, with the characters that reorder or hide
+/// text left out, runs of space as one, and at most `limit` characters.
 fn shown(text: &str, limit: usize) -> String {
-    let clean: String = text
+    let spaced: String = text
         .chars()
-        .filter(|character| !character.is_control())
+        .filter(|character| !invisible(*character))
+        .map(|character| if breaking(character) { ' ' } else { character })
         .collect();
+    let clean = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
     if clean.chars().count() <= limit {
         return clean;
     }
@@ -518,8 +655,11 @@ impl OwnerConfirmations {
             return ReviewOutcome::NoCeremony;
         }
         let host_name = self.host.name.as_deref().unwrap_or("your host");
+        let Ok(reason) = reason(subject, host_name, now) else {
+            return ReviewOutcome::CannotCheck;
+        };
         let within = Duration::from_millis(expires_at_ms - now);
-        match ceremony.verify(&reason(subject, host_name), within).await {
+        match ceremony.verify(&reason, within).await {
             CeremonyOutcome::Unavailable => return ReviewOutcome::NoCeremony,
             CeremonyOutcome::NotConfirmed => return ReviewOutcome::NotConfirmed,
             CeremonyOutcome::Confirmed => {}
@@ -559,13 +699,252 @@ impl OwnerConfirmations {
 mod tests {
     use super::*;
 
-    /// A dialog's line is one short line whatever a candidate calls itself.
+    use kr_crypto::keys::DeviceKeys;
+    use kr_protocol::grant::{EnvironmentSelector, HistoryScope, SessionSelector};
+    use kr_protocol::ids::{ConfirmationId, DeviceId, DeviceKeyRevision, GrantId, InvitationId};
+    use kr_protocol::invitation::PairCandidateView;
+    use kr_protocol::pairing::{DeviceName, NetworkConfig};
+    use kr_protocol::scalars::{CanonicalSet, Digest256, Nonce256, TimestampMs, Uuid};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const NOW: u64 = 1_764_000_000_000;
+
+    fn grant(rights: &[ActionRight], expiry: GrantExpiry) -> ProposedGrant {
+        ProposedGrant {
+            parent_grant_id: Nullable::null(),
+            environment_selector: EnvironmentSelector::Any,
+            session_selector: SessionSelector::Any,
+            actions: rights.iter().copied().collect::<CanonicalSet<_>>(),
+            history: HistoryScope {
+                lower_bound_ms: Nullable::null(),
+                include_live_screen: true,
+                named_questions: CanonicalSet::new(),
+                named_approvals: CanonicalSet::new(),
+            },
+            expiry,
+            organisation: Nullable::null(),
+        }
+    }
+
+    fn an_hour() -> GrantExpiry {
+        GrantExpiry::At {
+            expires_at_ms: TimestampMs::new(NOW + 60 * 60_000),
+        }
+    }
+
+    fn candidate(name: &str) -> PairCandidateView {
+        PairCandidateView {
+            device_name: DeviceName::new(name).expect("a name"),
+            platform: DevicePlatform::Android,
+            keys: DeviceKeys::generate().expect("keys").public_keys(),
+            verification_value: "f3c146fd".to_owned(),
+        }
+    }
+
+    /// KR-REQ-10.06: every kind of action a grant allows is named, for how long, and a grant that
+    /// lets a device type in terminals is never shown as one that lets it view sessions.
     #[test]
-    fn a_reason_is_one_short_line() {
-        let long = "a".repeat(300);
-        let shortened = shown(&format!("{long}\nsecond line"), MAX_REASON_CHARS);
-        assert_eq!(shortened.chars().count(), MAX_REASON_CHARS);
-        assert!(!shortened.contains('\n'));
-        assert_eq!(shown("studio", 40), "studio");
+    fn a_reason_names_all_the_authority_it_would_confirm() {
+        let broad = Subject::ConfirmDevice {
+            candidate: candidate("Pixel 8"),
+            proposed_grant: grant(
+                &[ActionRight::SessionView, ActionRight::TerminalInput],
+                an_hour(),
+            ),
+        };
+        let line = reason(&broad, "studio", NOW).expect("a line");
+        assert_eq!(
+            line,
+            "confirm adding Pixel 8 (Android) to studio, which may type in terminals and view \
+             sessions for 60 minutes. It shows f3c1 46fd."
+        );
+
+        let owner = Subject::IssueInvitation {
+            mode: InviteModeKind::Code,
+            origin: Some(RendezvousOrigin::new("https://reach.kala.to").expect("an origin")),
+            grant_kind: InviteGrantKind::PersonalOwner,
+            proposed_grant: grant(&[ActionRight::HostManage], GrantExpiry::Never),
+        };
+        assert_eq!(
+            reason(&owner, "studio", NOW).expect("a line"),
+            "issue an invitation from studio: a code at reach.kala.to, for a device that may \
+             manage the host as an owner until it is revoked"
+        );
+
+        let described = Subject::Described(DescribedAction {
+            action: SensitiveAction::EnlargeGrant,
+            action_digest: Digest256::from_bytes([0xf3; 32]),
+            destination_keys: Nullable::null(),
+            destination_rights: [ActionRight::FilesApplyDiff].into_iter().collect(),
+        });
+        assert_eq!(
+            reason(&described, "studio", NOW).expect("a line"),
+            "widen what devices may do on studio, so that a device may change files. The host did \
+             not say which location or package; its digest starts f3f3 f3f3"
+        );
+    }
+
+    /// Every right has words, so no right can be left out of a prompt for want of them.
+    #[test]
+    fn every_right_has_words() {
+        for right in ActionRight::ALL {
+            let rights = [*right].into_iter().collect::<CanonicalSet<_>>();
+            assert!(authority(&rights).is_some(), "{right}");
+        }
+    }
+
+    /// KR-REQ-10.06: a dialog's line is one line whatever a candidate or a host calls itself: no
+    /// control character, line or paragraph separator or reordering character survives, and the
+    /// names are shortened before any authority is left out. A device name already refuses control
+    /// characters; a host's name is whatever its owner typed.
+    #[test]
+    fn a_reason_is_one_line_whatever_the_names() {
+        let subject = Subject::ConfirmDevice {
+            candidate: candidate("Pixel\u{2028}8\u{2029}Pro\u{202E}\u{2066}droid\u{FEFF}"),
+            proposed_grant: grant(&[ActionRight::SessionView], an_hour()),
+        };
+        let line = reason(&subject, "stu\u{2028}di\no\r", NOW).expect("a line");
+        for hidden_character in [
+            '\n', '\r', '\u{2028}', '\u{2029}', '\u{202E}', '\u{2066}', '\u{FEFF}',
+        ] {
+            assert!(!line.contains(hidden_character), "{line:?}");
+        }
+        assert!(
+            line.starts_with("confirm adding Pixel 8 Prodroid (Android) to stu di o,"),
+            "{line}"
+        );
+
+        let long = Subject::ConfirmDevice {
+            candidate: candidate(&"a".repeat(120)),
+            proposed_grant: grant(
+                &[ActionRight::SessionView, ActionRight::TerminalInput],
+                an_hour(),
+            ),
+        };
+        let line = reason(&long, &"h".repeat(120), NOW).expect("a line");
+        assert!(line.chars().count() <= MAX_REASON_CHARS, "{line}");
+        assert!(
+            line.contains("type in terminals and view sessions"),
+            "{line}"
+        );
+    }
+
+    /// An owner channel over a listing a test writes, which counts what is sent.
+    struct Listing {
+        pending: Mutex<Vec<PendingConfirmation>>,
+        completions: AtomicUsize,
+    }
+
+    impl OwnerChannel for Listing {
+        fn pending(&self) -> BoxFuture<'_, Result<OwnerConfirmationPendingResult, ClientError>> {
+            let pending = self.pending.lock().expect("the listing").clone();
+            Box::pin(async move { Ok(OwnerConfirmationPendingResult { pending }) })
+        }
+
+        fn complete<'a>(
+            &'a self,
+            _params: &'a OwnerConfirmationCompleteParams,
+        ) -> BoxFuture<'a, Result<(), ClientError>> {
+            self.completions.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct Asked(Mutex<Vec<String>>);
+
+    impl Ceremony for Asked {
+        fn kind(&self) -> CeremonyKind {
+            CeremonyKind::TouchId
+        }
+
+        fn verify<'a>(
+            &'a self,
+            reason: &'a str,
+            _within: Duration,
+        ) -> BoxFuture<'a, CeremonyOutcome> {
+            self.0.lock().expect("the record").push(reason.to_owned());
+            Box::pin(async { CeremonyOutcome::Confirmed })
+        }
+    }
+
+    struct Fixed(u64);
+
+    impl PairingClock for Fixed {
+        fn monotonic_ms(&self) -> u64 {
+            0
+        }
+
+        fn boot_identity(&self) -> kr_pairing::platform::BootIdentity {
+            kr_pairing::platform::BootIdentity([0; 32])
+        }
+
+        fn wall_clock_ms(&self) -> u64 {
+            self.0
+        }
+    }
+
+    /// KR-REQ-10.06: a challenge whose authority no line of the prompt can show is never offered
+    /// to the ceremony, and nothing is signed or sent.
+    #[tokio::test]
+    async fn authority_no_line_can_show_is_not_offered_to_the_ceremony() {
+        let host_keys = DeviceKeys::generate().expect("keys").public_keys();
+        let host = PairedHost {
+            host_device_id: DeviceId::new(Uuid::from_bytes([1; 16])),
+            host_key_revision: DeviceKeyRevision::new(1),
+            host_endpoint_id: host_keys.transport,
+            host_keys,
+            network_config: NetworkConfig::empty(),
+            device_id: DeviceId::new(Uuid::from_bytes([2; 16])),
+            grant_id: GrantId::new(Uuid::from_bytes([3; 16])),
+            proposed_grant: grant(&[ActionRight::HostManage], GrantExpiry::Never),
+            name: Some("studio".to_owned()),
+            paired_at_ms: NOW,
+        };
+        let everything_but_the_host: Vec<ActionRight> = ActionRight::ALL
+            .iter()
+            .copied()
+            .filter(|right| *right != ActionRight::HostManage)
+            .collect();
+        let shown_candidate = candidate("Pixel 8");
+        let proposed = grant(&everything_but_the_host, an_hour());
+        let request = OwnerConfirmationRequest {
+            confirmation_id: ConfirmationId::new(Uuid::from_bytes([4; 16])),
+            action: SensitiveAction::ConfirmDevice,
+            action_digest: Digest256::from_bytes([5; 32]),
+            destination_keys: Nullable::some(shown_candidate.keys),
+            destination_rights: proposed.actions.clone(),
+            host_device_id: host.host_device_id,
+            host_endpoint_id: host.host_endpoint_id,
+            nonce: Nonce256::from_bytes([6; 32]),
+            expires_at_ms: TimestampMs::new(NOW + 60_000),
+        };
+        let listing = Arc::new(Listing {
+            pending: Mutex::new(vec![PendingConfirmation {
+                request,
+                display: ConfirmationDisplay::ConfirmDevice {
+                    invitation_id: InvitationId::new(Uuid::from_bytes([7; 16])),
+                    candidate: shown_candidate,
+                    proposed_grant: proposed,
+                },
+                answered: false,
+            }]),
+            completions: AtomicUsize::new(0),
+        });
+        let confirmations = OwnerConfirmations::new(
+            host,
+            DeviceKeys::generate().expect("keys").authorisation,
+            listing.clone(),
+            Arc::new(Fixed(NOW)),
+        );
+        let listed = confirmations.pending().await.expect("the listing");
+        assert!(listed[0].subject.is_ok(), "the challenge itself checks");
+        let asked = Asked(Mutex::new(Vec::new()));
+        assert_eq!(
+            confirmations.review(&listed[0], &asked).await,
+            ReviewOutcome::CannotCheck
+        );
+        assert!(asked.0.lock().expect("the record").is_empty());
+        assert_eq!(listing.completions.load(Ordering::SeqCst), 0);
     }
 }
