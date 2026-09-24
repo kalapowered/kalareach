@@ -28,6 +28,7 @@
 //! later attempt to take over or to report as still running.
 
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
@@ -329,6 +330,68 @@ pub struct NodeSettlement<'a> {
     pub produced: Option<&'a str>,
     /// When the outcome arrived.
     pub at_ms: u64,
+}
+
+/// A limit one run exceeded, and what the host did about the action it was waiting for.
+#[derive(Debug, Clone, Copy)]
+pub struct Breach<'a> {
+    /// The run.
+    pub run_id: WorkflowRunId,
+    /// The limit it exceeded, which is why it stops.
+    pub reason: &'a str,
+    /// The node whose action outlived the limit, when the host was waiting for one.
+    pub outlived: Option<Outlived<'a>>,
+    /// When the host found the limit exceeded.
+    pub at_ms: u64,
+}
+
+/// A node whose action outlived a limit, as it settles.
+#[derive(Debug, Clone, Copy)]
+pub struct Outlived<'a> {
+    /// The node.
+    pub node_id: &'a str,
+    /// Cancelled when its action was asked to stop, unknown when an action of its kind cannot be.
+    pub status: NodeStatus,
+    /// What the host did, in words.
+    pub detail: &'a str,
+}
+
+/// The nodes still waiting that depend, directly or through other nodes that have not run, on an
+/// outcome that is not known. They wait for review rather than being stopped: whether they should
+/// have run is exactly what is not known.
+fn awaiting_review(
+    definition: &WorkflowDefinition,
+    statuses: &HashMap<String, NodeStatus>,
+) -> Vec<String> {
+    let mut reached: HashSet<&str> = HashSet::new();
+    let mut frontier: Vec<&str> = statuses
+        .iter()
+        .filter(|(_, status)| **status == NodeStatus::Unknown)
+        .map(|(node_id, _)| node_id.as_str())
+        .collect();
+    while let Some(from) = frontier.pop() {
+        for edge in definition
+            .edges
+            .iter()
+            .filter(|edge| edge.from_node == from)
+        {
+            let to = edge.to_node.as_str();
+            let unsettled = matches!(
+                statuses.get(to),
+                Some(NodeStatus::Pending | NodeStatus::Paused)
+            );
+            if unsettled && reached.insert(to) {
+                frontier.push(to);
+            }
+        }
+    }
+    let mut waiting: Vec<String> = reached
+        .into_iter()
+        .filter(|node_id| statuses.get(*node_id) == Some(&NodeStatus::Pending))
+        .map(str::to_owned)
+        .collect();
+    waiting.sort();
+    waiting
 }
 
 /// What an attention record is about.
@@ -1555,6 +1618,28 @@ impl<'c> Journal<'c> {
         Ok(true)
     }
 
+    /// Reads where every node of one run stands.
+    fn node_statuses(&self, run_id: WorkflowRunId) -> Result<HashMap<String, NodeStatus>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT node_id, status FROM node_receipts WHERE run_id = ?1")?;
+        let rows = stmt.query_map(params![run_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut statuses = HashMap::new();
+        for row in rows {
+            let (node_id, status) = row?;
+            let status = NodeStatus::from_wire(&status).ok_or_else(|| {
+                AutomationError::InvalidArgument(format!(
+                    "node {node_id} of run {run_id} holds a status this build does not know: \
+                     {status}"
+                ))
+            })?;
+            statuses.insert(node_id, status);
+        }
+        Ok(statuses)
+    }
+
     /// Stops a run: every node still waiting or running is cancelled, and so is the run.
     ///
     /// A node that already settled keeps what it settled with, and a run that already finished is
@@ -2480,24 +2565,64 @@ impl WorkflowStore {
         Ok(deadline.map(|deadline| u64::try_from(deadline).unwrap_or_default()))
     }
 
-    /// Stops a run that exceeded one of its workflow's limits, in one transaction: every node
-    /// still waiting or running is cancelled, the run is cancelled, and the revision is paused
-    /// with the attention item the pause owes. A run already settled keeps what it settled with.
+    /// Stops a run that exceeded one of its workflow's limits, in one transaction.
+    ///
+    /// The node whose action outlived the limit, when there is one, settles as the breach says:
+    /// cancelled when its action was asked to stop, unknown when it could not be. Every node still
+    /// waiting that depends, directly or through other waiting nodes, on an outcome that is not
+    /// known pauses for review; every other node still waiting is cancelled; the run is cancelled;
+    /// and the revision pauses with the attention item the pause owes. A crash therefore finds
+    /// either none of this or all of it, and never a settled node whose run dispatches on. A node
+    /// or a run that already settled keeps what it settled with.
     ///
     /// # Errors
     ///
-    /// Returns a storage error when the rows cannot be written.
-    pub fn stop_run_on_breach(
-        &self,
-        run_id: WorkflowRunId,
-        workflow_id: WorkflowId,
-        revision: u64,
-        reason: &str,
-        now_ms: u64,
-    ) -> Result<()> {
+    /// Returns a storage error when the rows cannot be read or written.
+    pub fn stop_run_on_breach(&self, breach: &Breach<'_>) -> Result<()> {
         self.write(|journal| {
-            journal.cancel_run(run_id, reason, now_ms)?;
-            journal.pause_workflow_on_breach(workflow_id, revision, reason, now_ms)
+            let Some(run) = journal.run_record(breach.run_id)? else {
+                return Ok(());
+            };
+            if let Some(outlived) = &breach.outlived {
+                journal.settle_node(&NodeSettlement {
+                    run_id: breach.run_id,
+                    node_id: outlived.node_id,
+                    status: outlived.status,
+                    output: None,
+                    error: Some(outlived.detail),
+                    produced: None,
+                    at_ms: breach.at_ms,
+                })?;
+            }
+            if let Some(installed) = journal.definition(run.workflow_id, run.revision)? {
+                let statuses = journal.node_statuses(breach.run_id)?;
+                let review = format!(
+                    "{}: the run stopped, and this node waits for review because a node it \
+                     depends on has an outcome that is not known",
+                    breach.reason
+                );
+                for node_id in awaiting_review(&installed.definition, &statuses) {
+                    journal.conn.execute(
+                        "UPDATE node_receipts SET status = ?1, error_json = ?2, ended_at_ms = ?3
+                         WHERE run_id = ?4 AND node_id = ?5 AND status = ?6",
+                        params![
+                            NodeStatus::Paused.as_str(),
+                            review,
+                            stored(breach.at_ms),
+                            breach.run_id.to_string(),
+                            node_id,
+                            NodeStatus::Pending.as_str(),
+                        ],
+                    )?;
+                }
+            }
+            journal.cancel_run(breach.run_id, breach.reason, breach.at_ms)?;
+            journal.pause_workflow_on_breach(
+                run.workflow_id,
+                run.revision,
+                breach.reason,
+                breach.at_ms,
+            )
         })
     }
 

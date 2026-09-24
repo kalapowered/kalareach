@@ -77,9 +77,9 @@ pub use crate::source_workflow::{
     QuiescenceManager, QuiescenceReservation, ReviewerTurn, SourceWorkflowCoordinator,
 };
 pub use crate::store::{
-    Acted, ActionKey, ActionRecord, AttentionOutboxRecord, AttentionSubject, InstalledDefinition,
-    Journal, JournalEvent, JournalEventKind, NodeSettlement, StoredRunRecord, Submitted,
-    WorkflowStore,
+    Acted, ActionKey, ActionRecord, AttentionOutboxRecord, AttentionSubject, Breach,
+    InstalledDefinition, Journal, JournalEvent, JournalEventKind, NodeSettlement, Outlived,
+    StoredRunRecord, Submitted, WorkflowStore,
 };
 
 pub(crate) fn new_uuid() -> kr_protocol::scalars::Uuid {

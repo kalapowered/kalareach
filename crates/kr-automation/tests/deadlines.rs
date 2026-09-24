@@ -346,6 +346,16 @@ fn two_steps(id: WorkflowId, grant: GrantId, run_ms: u64, action_ms: u64) -> Wor
     definition
 }
 
+/// Two nodes, the second after the first succeeds, and a third that depends on neither, with the
+/// deadlines given. The engine reaches the third only after the first has settled.
+fn three_steps(id: WorkflowId, grant: GrantId, run_ms: u64, action_ms: u64) -> WorkflowDefinition {
+    let mut definition = two_steps(id, grant, run_ms, action_ms);
+    definition
+        .nodes
+        .push(common::node("later", WorkflowActionKind::AttentionNotice));
+    definition
+}
+
 /// The receipts of a run, by node.
 fn statuses(service: &AutomationService, run: kr_protocol::ids::WorkflowRunId) -> Vec<NodeStatus> {
     let mut receipts = service
@@ -364,7 +374,8 @@ fn statuses(service: &AutomationService, run: kr_protocol::ids::WorkflowRunId) -
 }
 
 /// An action that outlives its wait is stopped waiting for. This runner cannot stop it, so what it
-/// did is unknown and its dependant pauses for review. The limit it exceeded pauses the workflow
+/// did is unknown and its dependant pauses for review; the node that depends on nothing is not
+/// dispatched either, because the limit stops the run. The limit it exceeded pauses the workflow
 /// and raises one attention item.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_action_that_outlives_its_wait_is_left_unknown_when_it_cannot_be_stopped() {
@@ -378,7 +389,7 @@ async fn an_action_that_outlives_its_wait_is_left_unknown_when_it_cannot_be_stop
         ))
         .expect("a service"),
     );
-    let definition = two_steps(workflow_id(3), grant_id(3), 1_800_000, 60_000);
+    let definition = three_steps(workflow_id(3), grant_id(3), 1_800_000, 60_000);
     installed(&service, &definition);
 
     let running = {
@@ -391,18 +402,23 @@ async fn an_action_that_outlives_its_wait_is_left_unknown_when_it_cannot_be_stop
     let answered = tokio::time::timeout(std::time::Duration::from_secs(10), running)
         .await
         .expect("the run stops waiting once the action's wait has passed")
-        .expect("the task ends");
-    let run_id = service
-        .store()
-        .list_runs(Some(definition.workflow_id))
-        .expect("reads")[0]
-        .run_id;
-    let _ = answered;
+        .expect("the task ends")
+        .expect("the run answers");
     assert_eq!(
-        statuses(&service, run_id),
-        vec![NodeStatus::Unknown, NodeStatus::Paused],
-        "the stuck action is unknown and its dependant pauses"
+        answered.status,
+        WorkflowRunStatus::Cancelled,
+        "{answered:?}"
     );
+    assert_eq!(
+        statuses(&service, answered.run_id),
+        vec![
+            NodeStatus::Unknown,
+            NodeStatus::Cancelled,
+            NodeStatus::Paused
+        ],
+        "the stuck action is unknown, the node beside it stops, and its dependant pauses"
+    );
+    assert_eq!(stuck.entered.load(Ordering::SeqCst), 1, "nothing else ran");
     assert!(
         service
             .store()
@@ -413,7 +429,8 @@ async fn an_action_that_outlives_its_wait_is_left_unknown_when_it_cannot_be_stop
     assert_eq!(service.store().pending_attention().expect("reads").len(), 1);
 }
 
-/// A run past its deadline stops: the active action is stopped waiting for, the node after it is
+/// A run past its deadline stops: the active action is stopped waiting for, the node after it
+/// waits for review because what the action did is not known, the node that depends on nothing is
 /// never dispatched, and the workflow is paused with one attention item.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_run_past_its_deadline_stops_its_undispatched_nodes() {
@@ -427,7 +444,7 @@ async fn a_run_past_its_deadline_stops_its_undispatched_nodes() {
         ))
         .expect("a service"),
     );
-    let definition = two_steps(workflow_id(4), grant_id(4), 60_000, 600_000);
+    let definition = three_steps(workflow_id(4), grant_id(4), 60_000, 600_000);
     installed(&service, &definition);
 
     let running = {
@@ -453,9 +470,14 @@ async fn a_run_past_its_deadline_stops_its_undispatched_nodes() {
     );
     assert_eq!(
         statuses(&service, runs[0].run_id),
-        vec![NodeStatus::Unknown, NodeStatus::Cancelled],
-        "the active action is unknown and the node after it never ran"
+        vec![
+            NodeStatus::Unknown,
+            NodeStatus::Cancelled,
+            NodeStatus::Paused
+        ],
+        "the active action is unknown, the node beside it stops, and its dependant pauses"
     );
+    assert_eq!(stuck.entered.load(Ordering::SeqCst), 1, "nothing else ran");
     assert!(
         service
             .store()
@@ -536,8 +558,8 @@ impl ActionRunner for Stoppable {
 }
 
 /// An action that outlives its wait and can be stopped is asked to stop. It settles cancelled,
-/// which says the host stopped asking and claims nothing about what it did; the node after it
-/// never runs, and the run ends cancelled.
+/// which says the host stopped asking and claims nothing about what it did; neither the node after
+/// it nor the one beside it runs, and the run ends cancelled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_action_that_outlives_its_wait_is_asked_to_stop() {
     let stoppable = Arc::new(Stoppable::default());
@@ -550,7 +572,7 @@ async fn an_action_that_outlives_its_wait_is_asked_to_stop() {
         ))
         .expect("a service"),
     );
-    let definition = two_steps(workflow_id(6), grant_id(6), 1_800_000, 60_000);
+    let definition = three_steps(workflow_id(6), grant_id(6), 1_800_000, 60_000);
     installed(&service, &definition);
 
     let running = {
@@ -581,8 +603,17 @@ async fn an_action_that_outlives_its_wait_is_asked_to_stop() {
     );
     assert_eq!(
         statuses(&service, answered.run_id),
-        vec![NodeStatus::Cancelled, NodeStatus::Cancelled],
-        "the stopped action and the node that can no longer run"
+        vec![
+            NodeStatus::Cancelled,
+            NodeStatus::Cancelled,
+            NodeStatus::Cancelled
+        ],
+        "the stopped action and the nodes the stopped run no longer runs"
+    );
+    assert_eq!(
+        stoppable.entered.load(Ordering::SeqCst),
+        1,
+        "nothing else ran"
     );
     assert!(
         service
@@ -744,4 +775,145 @@ async fn a_restart_resumes_running_runs_and_leaves_pending_ones_waiting() {
     let started = service.start_queued(2_100).started;
     assert_eq!(started.len(), 1);
     assert_eq!(started[0].run_id(), queued_run);
+}
+
+/// A runner whose action reports at once, having found the host's clock already past its wait:
+/// what a host that was suspended, or not scheduled, while the action ran reads when it resumes.
+struct Late {
+    clock: Arc<ManualClock>,
+    reported_at: u64,
+}
+
+impl ActionRunner for Late {
+    fn cancel(&self, _dispatch: &Dispatch<'_>) -> kr_automation::Cancellation {
+        kr_automation::Cancellation::Unsupported
+    }
+
+    fn execute(
+        &self,
+        dispatch: &Dispatch<'_>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = kr_automation::Result<ActionOutcome>> + Send>,
+    > {
+        let clock = Arc::clone(&self.clock);
+        let reported_at = self.reported_at;
+        let kind = dispatch.node.action_kind;
+        Box::pin(async move {
+            clock.set(reported_at);
+            Ok(ActionOutcome::Success {
+                output: kr_automation::stand_in_output(kind),
+            })
+        })
+    }
+}
+
+/// A report the host reads only once its clock has passed the action's wait is not taken: the
+/// wait was exceeded however the host got past it, so the node settles as one that outlived its
+/// wait, its dependant waits for review, and the workflow pauses with one attention item.
+#[tokio::test]
+async fn a_report_read_after_the_wait_has_passed_is_not_taken() {
+    let clock = Arc::new(ManualClock::new(1_000));
+    let service = AutomationService::in_memory(common::host(
+        Arc::new(Late {
+            clock: Arc::clone(&clock),
+            reported_at: 1_000 + 60_001,
+        }),
+        common::every_right(&[grant_id(21)]),
+        Arc::clone(&clock) as Arc<dyn kr_automation::HostClock>,
+    ))
+    .expect("a service");
+    let definition = two_steps(workflow_id(21), grant_id(21), 1_800_000, 60_000);
+    installed(&service, &definition);
+
+    let answered = service
+        .submit_run(&run_params(&definition, "evt-late-report"), 1_000)
+        .await
+        .expect("the run answers");
+    assert_eq!(
+        answered.status,
+        WorkflowRunStatus::Cancelled,
+        "{answered:?}"
+    );
+    assert_eq!(
+        statuses(&service, answered.run_id),
+        vec![NodeStatus::Unknown, NodeStatus::Paused],
+        "the late report is not the node's outcome, and its dependant does not run on it"
+    );
+    assert!(
+        service
+            .store()
+            .is_paused(definition.workflow_id, 1)
+            .expect("reads")
+    );
+    assert_eq!(service.store().pending_attention().expect("reads").len(), 1);
+}
+
+/// A run a restart finds interrupted after its deadline has passed is stopped for its deadline:
+/// its interrupted node is unknown, and the workflow pauses with one attention item, rather than
+/// the run ending paused as though no limit had been exceeded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_a_restart_finds_past_its_deadline_is_stopped_for_it() {
+    let journal = tempfile::tempdir().expect("a journal directory");
+    let mut definition = one_node(workflow_id(22), grant_id(22));
+    definition.deadlines.run_deadline_ms = U64::new(60_000);
+    let run_id = {
+        let stuck = Arc::new(Stuck::default());
+        let service = Arc::new(
+            AutomationService::open(
+                journal.path(),
+                common::host(
+                    Arc::clone(&stuck) as Arc<dyn ActionRunner>,
+                    common::every_right(&[grant_id(22)]),
+                    Arc::new(ManualClock::new(1_000)),
+                ),
+            )
+            .expect("the journal opens"),
+        );
+        installed(&service, &definition);
+        let running = {
+            let service = Arc::clone(&service);
+            let params = run_params(&definition, "evt-interrupted");
+            tokio::spawn(async move { service.submit_run(&params, 1_000).await })
+        };
+        stuck_entered(&stuck, 1).await;
+        // The host stops with the action dispatched.
+        running.abort();
+        let _ = running.await;
+        service
+            .store()
+            .list_runs(Some(definition.workflow_id))
+            .expect("reads")[0]
+            .run_id
+    };
+
+    let service = AutomationService::open(
+        journal.path(),
+        common::host(
+            Arc::new(kr_automation::MockActionRunner::new()),
+            common::every_right(&[grant_id(22)]),
+            Arc::new(ManualClock::new(1_000 + 60_001)),
+        ),
+    )
+    .expect("the journal opens again");
+    let resumed = service.recover(1_000 + 60_001).expect("recovers");
+    assert_eq!(resumed.len(), 1);
+    let answered = service
+        .execute(resumed.into_iter().next().expect("the run"))
+        .await
+        .expect("the run answers");
+    assert_eq!(answered.run_id, run_id);
+    assert_eq!(
+        answered.status,
+        WorkflowRunStatus::Cancelled,
+        "{answered:?}"
+    );
+    assert_eq!(statuses(&service, run_id), vec![NodeStatus::Unknown]);
+    assert!(
+        service
+            .store()
+            .is_paused(definition.workflow_id, 1)
+            .expect("reads"),
+        "the deadline is a limit exceeded"
+    );
+    assert_eq!(service.store().pending_attention().expect("reads").len(), 1);
 }

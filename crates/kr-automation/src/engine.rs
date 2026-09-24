@@ -352,8 +352,8 @@ impl WorkflowEngine {
                     if checked_ms >= deadline_ms {
                         return self.stop_on_breach(
                             run_id,
-                            definition,
                             &crate::error::AutomationError::RunTimeout { run_id }.to_string(),
+                            None,
                             checked_ms,
                         );
                     }
@@ -499,32 +499,20 @@ impl WorkflowEngine {
                                 ),
                             ),
                         };
-                        self.store.settle_node(&NodeSettlement {
+                        // Either limit stops the run: the node settles as above, what depends on
+                        // an outcome that is not known waits for review, everything else still
+                        // waiting stops, and the revision pauses with its attention item, in one
+                        // transaction.
+                        return self.stop_on_breach(
                             run_id,
-                            node_id: &node.node_id,
-                            status,
-                            output: None,
-                            error: Some(&detail),
-                            produced: None,
-                            at_ms: outlived_ms,
-                        })?;
-                        if past_deadline {
-                            return self.stop_on_breach(run_id, definition, &limit, outlived_ms);
-                        }
-                        // The action's wait is one of the workflow's own limits too.
-                        self.store.pause_workflow_on_breach(
-                            definition.workflow_id,
-                            definition.revision.get(),
                             &limit,
+                            Some(crate::store::Outlived {
+                                node_id: &node.node_id,
+                                status,
+                                detail: &detail,
+                            }),
                             outlived_ms,
-                        )?;
-                        let recorded = self.recorded_status(run_id, &node.node_id)?;
-                        node_statuses.insert(node.node_id.clone(), recorded);
-                        if recorded == NodeStatus::Unknown {
-                            run_status = WorkflowRunStatus::Paused;
-                        }
-                        progress = true;
-                        continue;
+                        );
                     };
 
                     // A runner that asked the grant once more and was refused never began the
@@ -635,6 +623,24 @@ impl WorkflowEngine {
             run_status = WorkflowRunStatus::Failed;
         }
 
+        // A run that ends with work it has not finished, an outcome that is not known or a node
+        // waiting for review, has not finished within its deadline when the deadline has passed:
+        // the limit is decided here as well as before each dispatch, so a run that a restart found
+        // interrupted after its deadline is stopped for it rather than left paused as though
+        // nothing had been exceeded. A run whose every node settled finished its work, whenever
+        // this last write happens.
+        if run_status == WorkflowRunStatus::Paused {
+            let checked_ms = self.clock.now_ms();
+            if checked_ms >= deadline_ms {
+                return self.stop_on_breach(
+                    run_id,
+                    &crate::error::AutomationError::RunTimeout { run_id }.to_string(),
+                    None,
+                    checked_ms,
+                );
+            }
+        }
+
         if run_status == WorkflowRunStatus::Cancelled {
             // A cancelled node's dependants can never run, so the nodes still waiting are
             // cancelled with the run rather than left looking as though they might.
@@ -651,7 +657,7 @@ impl WorkflowEngine {
     }
 
     /// Waits for `action` until the host's clock reaches `until`, and answers `None` when it
-    /// outlived that moment.
+    /// outlived that moment, including when its report is read only after that moment.
     ///
     /// The clock is read at least every [`DEADLINE_POLL_MS`], so a deadline that passes while the
     /// host sleeps or while nothing else happens is found soon after it passes rather than when
@@ -670,29 +676,32 @@ impl WorkflowEngine {
             let left = std::time::Duration::from_millis((until - now).min(DEADLINE_POLL_MS));
             tokio::select! {
                 biased;
-                outcome = &mut action => return Some(outcome),
+                // A report is taken only while the wait lasts. One the host reads once its clock
+                // has passed the wait, however it got there, is not taken: a host that was
+                // suspended or starved past the limit exceeded it.
+                outcome = &mut action => return (self.clock.now_ms() < until).then_some(outcome),
                 () = tokio::time::sleep(left) => {}
             }
         }
     }
 
-    /// Stops a run that exceeded one of its workflow's limits: every node still waiting is
-    /// cancelled, the run is cancelled, and the revision pauses with the attention item it owes,
-    /// all in one transaction.
+    /// Stops a run that exceeded one of its workflow's limits, in one transaction: the node whose
+    /// action outlived it settles as `outlived` says, what depends on an outcome that is not known
+    /// waits for review, every other node still waiting is cancelled, the run is cancelled, and
+    /// the revision pauses with the attention item it owes.
     fn stop_on_breach(
         &self,
         run_id: WorkflowRunId,
-        definition: &WorkflowDefinition,
         reason: &str,
-        now_ms: u64,
+        outlived: Option<crate::store::Outlived<'_>>,
+        at_ms: u64,
     ) -> Result<WorkflowRunStatus> {
-        self.store.stop_run_on_breach(
+        self.store.stop_run_on_breach(&crate::store::Breach {
             run_id,
-            definition.workflow_id,
-            definition.revision.get(),
             reason,
-            now_ms,
-        )?;
+            outlived,
+            at_ms,
+        })?;
         Ok(WorkflowRunStatus::Cancelled)
     }
 
