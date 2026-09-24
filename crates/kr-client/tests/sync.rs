@@ -223,6 +223,9 @@ enum Interruption {
     /// The receipt under it accounts for that other request, and the object is left alone: what
     /// section 9 refuses is the second request wearing the first one's name.
     IdentityTaken,
+    /// The request is still on its way when the call gives up on its answer, and reaches the
+    /// service only when the test delivers it.
+    OnItsWay,
 }
 
 /// A compare-and-exchange store over opaque bytes, and the request receipts beside it.
@@ -284,6 +287,8 @@ struct Service {
     /// The instant before which a request signed is refused where it would act, which the
     /// deployed service derives from the receipts it swept, or nothing where it has none.
     cutoff_ms: Mutex<Option<u64>>,
+    /// The requests still on their way, in the order they were sent.
+    on_its_way: Mutex<Vec<Exchange>>,
 }
 
 /// What an export of the service holds, which a restore puts back.
@@ -416,6 +421,32 @@ impl Service {
     /// Stops the next exchange before the service sees it, so it leaves no receipt.
     async fn drop_the_next_request(&self) {
         *self.interruption.lock().await = Some(Interruption::BeforeItArrives);
+    }
+
+    /// Holds the next exchange on its way: the call gives up on its answer, and the request
+    /// reaches the service only when [`Self::deliver_what_is_on_its_way`] delivers it.
+    async fn hold_the_next_request_on_its_way(&self) {
+        *self.interruption.lock().await = Some(Interruption::OnItsWay);
+    }
+
+    /// Delivers every request still on its way, as each would arrive now, and returns what the
+    /// service answered each with.
+    async fn deliver_what_is_on_its_way(&self) -> Vec<kr_client::Result<SyncExchanged>> {
+        let arriving = std::mem::take(&mut *self.on_its_way.lock().await);
+        let mut answered = Vec::new();
+        for request in arriving {
+            answered.push(
+                self.exchange(
+                    &request.collection,
+                    request.request_id,
+                    request.signed_at_ms,
+                    request.expected,
+                    &request.ciphertext,
+                )
+                .await,
+            );
+        }
+        answered
     }
 
     /// Answers the next exchange as an identity a different request already wore.
@@ -683,6 +714,16 @@ impl SyncBackupService for Service {
             let interruption = self.interruption.lock().await.take();
             if interruption == Some(Interruption::BeforeItArrives) {
                 return Err(lost("the request never reached the service"));
+            }
+            if interruption == Some(Interruption::OnItsWay) {
+                self.on_its_way.lock().await.push(Exchange {
+                    collection: collection.to_owned(),
+                    request_id,
+                    signed_at_ms,
+                    expected,
+                    ciphertext: ciphertext.to_vec(),
+                });
+                return Err(lost("the answer did not come back in time"));
             }
             if interruption == Some(Interruption::IdentityTaken) {
                 // The receipt under this identity answers a request that carried other content,
@@ -2430,6 +2471,156 @@ async fn a_draft_attempt_refused_as_signed_before_the_cutoff_is_never_made_again
     assert_eq!(sent.len(), 3);
     assert_ne!(sent[2].request_id, first.work_id, "never presented again");
     assert_eq!(accounts(&client), 2, "both accounts kept");
+}
+
+/// A refusal before the cutoff ends only the attempts it covers. While an attempt signed later
+/// than the refused one is still on its way, the publication stays counted and is never attempted
+/// again: privacy mode's cleanup waits for the fence that covers every attempt, the attempt on its
+/// way then runs nothing, and the account of what left is kept.
+#[tokio::test]
+async fn a_refusal_before_the_cutoff_holds_the_barrier_while_an_attempt_signed_later_is_on_its_way()
+{
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let draft = drafts
+        .create(draft_target(), "a prompt".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+    let collection = draft_collection(draft.draft_id);
+
+    // The first attempt is signed ten seconds ahead and is still on its way when this device's
+    // clock is corrected and the second is signed, before the service's cutoff.
+    service.hold_the_next_request_on_its_way().await;
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(NOW + 10_000),
+    )
+    .await
+    .expect_err("no answer yet");
+    let first = the_only_record(&client);
+    service.cuts_off_signatures_before(NOW + 5_000).await;
+    let refused = sync
+        .publish(
+            &drafts,
+            draft.draft_id,
+            draft.revision,
+            TimestampMs::new(NOW),
+        )
+        .await
+        .expect_err("signed before the cutoff");
+    assert!(
+        matches!(refused, SyncError::SignedBeforeCutoff { .. }),
+        "{refused:?}"
+    );
+    assert_eq!(service.exchanges().await[1].request_id, first.work_id);
+
+    // Counted still, and closed to further attempts.
+    assert_eq!(
+        client.outstanding().expect("a count"),
+        1,
+        "the barrier holds"
+    );
+    let held = the_only_record(&client);
+    assert!(held.cut_off && held.dispatched(), "{held:?}");
+
+    // A later call is new work under an identity of its own, signed after the cutoff.
+    assert_eq!(
+        sync.publish(
+            &drafts,
+            draft.draft_id,
+            draft.revision,
+            TimestampMs::new(NOW + 6_000),
+        )
+        .await
+        .expect("new work"),
+        DraftPublished::Accepted { position: at(1) }
+    );
+    let sent = service.exchanges().await;
+    assert_eq!(sent.len(), 3);
+    assert_ne!(sent[2].request_id, first.work_id, "never presented again");
+
+    // Privacy mode's cleanup ends it only through the fence, which covers both attempts.
+    client.fence(3).expect("fenced");
+    let cancelled = client
+        .cancel_undispatched(3, TimestampMs::new(NOW + 7_000))
+        .await
+        .expect("cancelled");
+    assert_eq!(cancelled.reconciled.fenced, 1);
+    assert_eq!(cancelled.reconciled.accounts_kept, 1);
+    assert_eq!(cancelled.in_flight, 0);
+    let fences = service.fence_requests().await;
+    assert_eq!(fences.len(), 1);
+    assert_eq!(
+        (fences[0].first_signed_at_ms, fences[0].last_signed_at_ms),
+        (NOW, NOW + 10_000)
+    );
+
+    // The attempt on its way arrives and runs nothing: the collection holds the new work alone.
+    let arrived = service.deliver_what_is_on_its_way().await;
+    assert_eq!(arrived.len(), 1);
+    assert!(arrived[0].is_err(), "a fenced identity runs nothing");
+    assert_eq!(
+        service
+            .stored(&collection)
+            .await
+            .map(|(position, _)| position),
+        Some(at(1))
+    );
+    assert_eq!(the_only_record(&client).state, RequestState::Unaccounted);
+    assert_eq!(accounts(&client), 2, "what left, both times");
+}
+
+/// Outside privacy mode, a reconciliation fences a publication closed by a refusal before the
+/// cutoff at once, whatever its generation, rather than waiting for an answer no attempt will
+/// bring; the account stays even where the fence says nothing ran.
+#[tokio::test]
+async fn a_publication_closed_by_the_cutoff_is_fenced_by_the_next_reconciliation() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let draft = drafts
+        .create(draft_target(), "a prompt".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+
+    service.hold_the_next_request_on_its_way().await;
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(NOW + 10_000),
+    )
+    .await
+    .expect_err("no answer yet");
+    service.cuts_off_signatures_before(NOW + 5_000).await;
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(NOW),
+    )
+    .await
+    .expect_err("signed before the cutoff");
+    assert_eq!(client.outstanding().expect("a count"), 1);
+
+    let reconciled = sync
+        .reconcile_unsettled(&drafts, TimestampMs::new(NOW + 1))
+        .await
+        .expect("reconciled");
+    assert_eq!(reconciled.fenced, 1);
+    assert_eq!(reconciled.accounts_kept, 1, "kept though nothing ran");
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    assert_eq!(service.fence_requests().await.len(), 1);
+    assert_eq!(the_only_record(&client).state, RequestState::Unaccounted);
+    assert!(
+        service
+            .deliver_what_is_on_its_way()
+            .await
+            .iter()
+            .all(Result::is_err),
+        "the attempt on its way runs nothing"
+    );
 }
 
 #[tokio::test]

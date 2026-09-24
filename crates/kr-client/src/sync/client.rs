@@ -510,11 +510,11 @@ impl SyncClient {
                     .await
             }
             // Refused as signed before the service's cutoff: this attempt ran nothing and no
-            // attempt signed then ever runs. The request ends here, never attempted again, and its
-            // record stays as the account of what left.
+            // attempt signed then ever runs. A setting's request is attempted once, so it ends
+            // here, never attempted again, and its record stays as the account of what left.
             Ok(SyncExchanged::SignedBeforeCutoff) => {
                 self.store
-                    .close_signed_before_cutoff(&dispatch, staged.work_id)?;
+                    .close_signed_before_cutoff(&dispatch, staged.work_id, signed_at)?;
                 Err(SyncError::SignedBeforeCutoff { object_id })
             }
             // The identity this request presented already answered a different one. The receipt
@@ -1435,13 +1435,15 @@ pub(crate) enum Answer {
 /// also where a fence the service refuses as out of its reach ends up: the work stays counted, and
 /// the same instants are presented again next time.
 ///
-/// A request attempted in a history the collection has since been put back from is the one case
+/// A request attempted in a history the collection has since been put back from is one of two cases
 /// where no receipt ends the request at once, whatever the generation. It is never attempted again,
 /// and the history that replaced the one it was attempted in holds no receipt of it, so waiting could
 /// end only by an attempt still on its way landing in the collection as it now stands. The fence
 /// stops that attempt, and its answer says what is left to account for: a restored collection
 /// cannot say for a while that nothing ran, so the account stays. A status answer from a history
-/// this device does not follow settles nothing.
+/// this device does not follow settles nothing. The other case is a request an attempt of which the
+/// service refused as signed before its cutoff while one signed later could still be on its way
+/// ([`RequestRecord::cut_off`]): it is never attempted again either, so the fence is what ends it.
 pub(crate) async fn ask_about(
     service: &dyn SyncBackupService,
     store: &SyncStore,
@@ -1466,7 +1468,7 @@ pub(crate) async fn ask_about(
             let end_now = match store.crossed(dispatch, staged, recovery)? {
                 Crossing::Unfollowed => return Ok(Answer::Open),
                 Crossing::Crossed => true,
-                Crossing::InHistory => store.beyond_its_generation(staged)?,
+                Crossing::InHistory => staged.cut_off || store.beyond_its_generation(staged)?,
             };
             if !end_now {
                 return Ok(Answer::Open);

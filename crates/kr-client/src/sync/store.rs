@@ -316,8 +316,27 @@ pub struct RequestRecord {
     /// after it was signed, so the service keeps a fence of this identity until this instant and
     /// its window have gone by, and nothing this device signed can outlive the fence that ended it.
     pub last_signed_at_ms: Nullable<TimestampMs>,
+    /// True once the service refused an attempt under this identity as signed before its cutoff
+    /// while an attempt signed later could still be on its way.
+    ///
+    /// Nothing is attempted under the identity again, and the request stays counted until a fence
+    /// ends it, covering every attempt. That fence keeps the account whatever it says of the past:
+    /// the refusal is the service saying that an attempt was signed where a receipt of it may
+    /// already be gone. Written only when true, so every other record keeps the shape it had
+    /// before the member existed.
+    #[serde(default, skip_serializing_if = "attempts_open")]
+    pub cut_off: bool,
     /// Where the request has got to.
     pub state: RequestState,
+}
+
+/// Whether nothing has closed a request's attempts, which is when a record leaves the member out.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde hands a skip test the member by reference"
+)]
+const fn attempts_open(cut_off: &bool) -> bool {
+    !*cut_off
 }
 
 /// The revision one request carries, in the terms of what it publishes.
@@ -1046,9 +1065,10 @@ pub enum SyncError {
     },
     /// The service refused the publication's attempt as signed before the collection's cutoff.
     ///
-    /// The attempt ran nothing, and the request is over: it is never attempted again, and its
-    /// record stays as the account of what left this device, since an earlier attempt may have run.
-    /// Publishing again is new work under an identity of its own.
+    /// The attempt ran nothing, and nothing is attempted under the request's identity again. Its
+    /// record stays as the account of what left this device, since an earlier attempt may have
+    /// run, and it stays counted until a fence ends it while an attempt signed later may still be
+    /// on its way. Publishing again is new work under an identity of its own.
     #[error(
         "the publication of {object_id} was refused as signed before the service's cutoff; publishing it again is new work"
     )]
@@ -1660,6 +1680,7 @@ impl SyncStore {
                 attempted_in: history.current,
                 first_signed_at_ms: Nullable::null(),
                 last_signed_at_ms: Nullable::null(),
+                cut_off: false,
                 state: RequestState::Admitted {
                     ciphertext: Bytes::new(ciphertext),
                 },
@@ -1941,6 +1962,7 @@ impl SyncStore {
                                 && record.revision == revision
                                 && record.produced_under == privacy.generation
                                 && record.attempted_in == history.current
+                                && !record.cut_off
                                 && record.may_attempt_again(signed_at) =>
                         {
                             Some((ciphertext.clone(), record))
@@ -1977,6 +1999,7 @@ impl SyncStore {
                 attempted_in: history.current,
                 first_signed_at_ms: Nullable::null(),
                 last_signed_at_ms: Nullable::null(),
+                cut_off: false,
                 state: RequestState::Dispatched {
                     ciphertext: ciphertext.clone(),
                 },
@@ -2052,28 +2075,35 @@ impl SyncStore {
         outcome
     }
 
-    /// Ends one dispatched request whose attempt the service refused as signed before its cutoff,
-    /// keeping its account.
+    /// Closes the attempts of one dispatched request whose attempt signed at `signed_at` the
+    /// service refused as signed before its cutoff, and ends the request where that is safe.
     ///
-    /// The refused attempt ran nothing and recorded nothing, and no attempt signed then ever runs.
-    /// Presenting the identity again, signed now, could run the work a second time, because the
-    /// receipt of an earlier attempt may be the one the service swept; so nothing is attempted
-    /// under it again, and nothing asks about it. What the refusal cannot say is whether an earlier
-    /// attempt ran before that receipt went, so the record stays, with no content in it, as the
-    /// account of what left this device, as it does after a fence that cannot say.
+    /// The refused attempt ran nothing and recorded nothing, and presenting the identity again,
+    /// signed now, could run the work a second time, because the receipt of an earlier attempt
+    /// may be the one the service swept. So nothing is attempted under it again. The cutoff only
+    /// rises, so no attempt signed no later than the refused one ever runs: when that covers every
+    /// attempt the record names, the request ends here, and nothing asks about it again. An
+    /// attempt signed later, which only a clock corrected backwards between two attempts
+    /// produces, could still be on its way and run, so then the request stays counted, marked
+    /// [`RequestRecord::cut_off`], until a fence ends it, which a reconciliation asks for at once.
     ///
-    /// One case stays open: an earlier attempt signed later than this one, which only a clock
-    /// corrected backwards between the two produces, could still be on its way and run. The
-    /// account already says what that would put on the service.
+    /// Either way the account stays: what the refusal cannot say is whether an earlier attempt ran
+    /// before its receipt went, so the record is kept, with no content in it once it ends, as the
+    /// account of what left this device.
     ///
-    /// Returns true when a record was ended, false when the work was never sent or something had
-    /// already settled it.
+    /// Returns true when the request ended here, false when it waits for a fence, when the work
+    /// was never sent, or when something had already settled it.
     ///
     /// # Errors
     ///
     /// Returns [`SyncError::OtherRequest`] when the dispatch is held for a different request, and
     /// [`SyncError::Storage`] when a record cannot be read or written.
-    pub fn close_signed_before_cutoff(&self, dispatch: &Dispatch, work_id: Uuid) -> Result<bool> {
+    pub fn close_signed_before_cutoff(
+        &self,
+        dispatch: &Dispatch,
+        work_id: Uuid,
+        signed_at: TimestampMs,
+    ) -> Result<bool> {
         dispatch.owns(&self.directory, work_id)?;
         let path = self.named(work_id, REQUEST_EXTENSION);
         let guard = self.lock()?;
@@ -2083,6 +2113,17 @@ impl SyncStore {
                 return Ok(false);
             };
             if !held.dispatched() {
+                return Ok(false);
+            }
+            let covers_every_attempt = held
+                .last_signed_at_ms
+                .as_ref()
+                .is_none_or(|last| *last <= signed_at);
+            if !covers_every_attempt {
+                self.write_request(&RequestRecord {
+                    cut_off: true,
+                    ..held
+                })?;
                 return Ok(false);
             }
             self.write_request(&held.in_state(RequestState::Unaccounted))?;
@@ -2138,7 +2179,9 @@ impl SyncStore {
             {
                 return Ok(End::Unfollowed);
             }
-            if never_ran {
+            // A request an attempt of which was refused as signed before the cutoff keeps its
+            // account whatever the fence says of the past.
+            if never_ran && !held.cut_off {
                 self.remove_file(&path)?;
                 self.retire(work_id)?;
                 return Ok(End::NeverRan);
