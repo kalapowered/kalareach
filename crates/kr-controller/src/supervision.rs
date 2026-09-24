@@ -234,25 +234,56 @@ pub fn defines_worker_job(jobs_directory: &Path, reservation_id: ReservationId) 
 
 /// Removes what the service manager keeps of a worker's job, once that job's process has ended.
 ///
+/// [`retire_service_job`] for the job of the worker started for `reservation_id`.
+#[must_use]
+pub fn retire_worker_job(jobs_directory: &Path, reservation_id: ReservationId) -> JobRetirement {
+    retire_service_job(jobs_directory, &worker_label(reservation_id))
+}
+
+/// Removes what the service manager keeps of one service's job, once that job's process has ended.
+///
 /// launchd keeps a job loaded after its process exits until something removes it, so without
-/// this every session would leave one behind for as long as the machine runs. A job whose process
-/// is still running is left exactly as it is: removing it would end that process, and a worker is
-/// ended by its own closure, never by taking its job away. Only a job this environment defined is
-/// looked at, and only the job itself and its definition are removed; the diagnostics the job wrote
-/// stay where a person can read them.
+/// this every session, and every plugin host, would leave one behind for as long as the machine
+/// runs. A job whose process is still running is left exactly as it is: removing it would end that
+/// process, and a service is ended by its own closure, never by taking its job away. Only a job this
+/// environment defined is looked at, under a label this host gives one, and only the job itself and
+/// its definition are removed; the diagnostics the job wrote stay where a person can read them.
+///
+/// The labels this host gives a job are a worker's, `kr-worker-<reservation>`, and a plugin
+/// host's, `kr-plugin-host-<reservation>`, each spelt exactly as this host spells it. Any other
+/// label is refused rather than looked at, so a file somebody else put in the jobs directory never
+/// has a job of that name taken away.
 ///
 /// Only launchd keeps a job of this kind, so on every other platform there is nothing to remove.
 #[must_use]
-pub fn retire_worker_job(jobs_directory: &Path, reservation_id: ReservationId) -> JobRetirement {
+pub fn retire_service_job(jobs_directory: &Path, label: &str) -> JobRetirement {
+    if !is_service_label(label) {
+        return JobRetirement::Unsettled(format!(
+            "{label} is not a label this host gives a job, so it is left alone"
+        ));
+    }
     #[cfg(target_os = "macos")]
     {
-        LaunchdSupervisor::retire(jobs_directory, &worker_label(reservation_id))
+        LaunchdSupervisor::retire(jobs_directory, label)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (jobs_directory, reservation_id);
+        let _ = jobs_directory;
         JobRetirement::Gone
     }
+}
+
+/// The start of each label this host gives a job, before the reservation it was started for.
+const SERVICE_LABEL_PREFIXES: [&str; 2] = ["kr-worker-", "kr-plugin-host-"];
+
+/// Whether `label` is one this host gives a job, spelt exactly as this host spells it.
+fn is_service_label(label: &str) -> bool {
+    SERVICE_LABEL_PREFIXES.iter().any(|prefix| {
+        label
+            .strip_prefix(prefix)
+            .and_then(|reservation| reservation.parse::<ReservationId>().ok())
+            .is_some_and(|reservation_id| format!("{prefix}{reservation_id}") == label)
+    })
 }
 
 /// What asking the platform to start a worker produced.
@@ -1735,6 +1766,43 @@ mod tests {
         }
     }
 
+    /// Only a label this host gives a job is looked at: a worker's or a plugin host's, spelt as
+    /// this host spells it. Anything else is refused before launchd is asked about it.
+    #[test]
+    fn a_label_this_host_does_not_give_a_job_is_left_alone() {
+        let host = kr_ipc::testing::TempHost::create();
+        let jobs = host.environment().jobs_dir();
+        // Letters in it, so that its spelling in capitals is another spelling.
+        let reservation_id = ReservationId::new(Uuid::from_bytes([0xcd; 16]));
+        for label in [
+            "com.example.agent".to_owned(),
+            "kr-plugin-host-not-a-reservation".to_owned(),
+            format!(
+                "kr-plugin-host-{}",
+                reservation_id.to_string().to_uppercase()
+            ),
+            format!("kr-helper-{reservation_id}"),
+        ] {
+            // A definition under that name, which is what a label this host gives would have.
+            std::fs::write(jobs.join(format!("{label}.plist")), b"").expect("writes a file");
+            let JobRetirement::Unsettled(detail) = retire_service_job(&jobs, &label) else {
+                panic!("{label} is not a label this host gives a job, and it was looked at");
+            };
+            assert!(detail.contains("left alone"), "{detail}");
+            assert!(
+                jobs.join(format!("{label}.plist")).exists(),
+                "and its file is where it was"
+            );
+        }
+        // Both labels this host does give, with nothing defined under them, are gone.
+        for label in [
+            worker_label(reservation_id),
+            format!("kr-plugin-host-{reservation_id}"),
+        ] {
+            assert_eq!(retire_service_job(&jobs, &label), JobRetirement::Gone);
+        }
+    }
+
     /// A service-manager command that does not answer is ended and collected within its bound,
     /// and one that could not be started at all is told apart from one that ran and failed.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1811,6 +1879,43 @@ mod tests {
             removal_failure(target, &Err(unanswered.to_owned())).as_deref(),
             Some(unanswered),
             "a launchctl that could not be collected is part of what is reported"
+        );
+    }
+
+    /// A plugin host's job whose process has ended is removed from launchd, and its definition
+    /// with it, the same way a worker's is.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_plugin_host_job_whose_process_has_ended_goes_with_its_definition() {
+        launchd_domains_are_here();
+        let host = kr_ipc::testing::TempHost::create();
+        let jobs = host.environment().jobs_dir();
+        let label = format!("kr-plugin-host-{}", kr_ipc::new_uuid());
+        let _own = OwnJob(label.clone());
+        // The system's own program that ends at once, as a service in this user's graphical
+        // domain, which is where a plugin host is started.
+        let outcome = LaunchdSupervisor::new().start_service(&ServiceLaunch {
+            label: label.clone(),
+            program: PathBuf::from("/usr/bin/true"),
+            arguments: Vec::new(),
+            jobs_directory: jobs.clone(),
+            working_directory: host.root().to_path_buf(),
+        });
+        assert!(
+            !matches!(outcome, LaunchOutcome::NotStarted { .. }),
+            "the job was started: {outcome:?}"
+        );
+        let target = format!("gui/{}/{label}", kr_ipc::paths::current_uid());
+        until_ended(&target);
+
+        assert_eq!(retire_service_job(&jobs, &label), JobRetirement::Gone);
+        assert!(
+            matches!(job_state(&target), JobState::NotLoaded),
+            "launchd no longer has the job"
+        );
+        assert!(
+            !jobs.join(format!("{label}.plist")).exists(),
+            "its definition went with it"
         );
     }
 

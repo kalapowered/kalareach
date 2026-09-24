@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kr_controller::supervision::{
-    DetachedSupervisor, LaunchOutcome, ServiceLaunch, WorkerSupervisor,
+    DetachedSupervisor, JobRetirement, LaunchOutcome, ServiceLaunch, WorkerSupervisor,
 };
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
@@ -26,7 +26,9 @@ use kr_plugin_runtime::runtime::host::{
     BindingActivity, BindingFacts, ScopedSourceEvent, SourceProvenance,
 };
 use kr_plugin_runtime::service::client::{PluginClient, new_binding_id};
-use kr_plugin_runtime::service::launcher::{self, HostLaunchPlan, HostStartOutcome, host_endpoint};
+use kr_plugin_runtime::service::launcher::{
+    self, HostJobRetirement, HostLaunchPlan, HostStartOutcome, HostSupervisor, host_endpoint,
+};
 use kr_plugin_runtime::service::protocol::{ComponentSource, HostDescriptor, Notice};
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::identity::PluginIdentity;
@@ -130,48 +132,18 @@ impl Host {
 
     /// Starts a plugin host through the platform's own service manager.
     async fn start_plugin_host(&self) -> Started {
-        // The detached supervisor, deliberately, and not the platform's choice. All three
-        // supervisors go through the same trait and the same launcher, and this is the one a
-        // headless macOS or non-systemd Unix host uses. The alternative here would bootstrap jobs
-        // into the operator's own login domain and leave them loaded after the temporary tree they
-        // point at is gone, which is not something a test should do to the machine it ran on.
-        let supervisor: Box<dyn WorkerSupervisor> = Box::new(DetachedSupervisor::new());
         let recorded: Arc<std::sync::Mutex<Option<ServiceLaunch>>> =
             Arc::new(std::sync::Mutex::new(None));
         let seen: Arc<std::sync::Mutex<Option<u32>>> = Arc::new(std::sync::Mutex::new(None));
-        let starter = {
-            let recorded = Arc::clone(&recorded);
-            let seen = Arc::clone(&seen);
-            move |plan: &HostLaunchPlan| {
-                let launch = ServiceLaunch {
-                    label: plan.label.clone(),
-                    program: plan.program.clone(),
-                    arguments: plan.arguments.clone(),
-                    jobs_directory: plan.jobs_directory.clone(),
-                    working_directory: plan.working_directory.clone(),
-                };
-                if let Ok(mut slot) = recorded.lock() {
-                    *slot = Some(launch.clone());
-                }
-                match supervisor.start_service(&launch) {
-                    LaunchOutcome::Started(identity) => {
-                        if let Ok(mut slot) = seen.lock() {
-                            *slot = u32::try_from(identity.pid.get()).ok();
-                        }
-                        HostStartOutcome::Started(identity)
-                    }
-                    LaunchOutcome::NotStarted { detail } => HostStartOutcome::NotStarted { detail },
-                    LaunchOutcome::Uncertain { detail, pid } => {
-                        HostStartOutcome::Uncertain { detail, pid }
-                    }
-                }
-            }
-        };
+        let supervisor: Arc<dyn HostSupervisor> = Arc::new(Recorded {
+            recorded: Arc::clone(&recorded),
+            seen: Arc::clone(&seen),
+        });
         let outcome = launcher::start(
             &self.environment(),
             &self.plugin_host,
             &self.packages,
-            &starter,
+            &supervisor,
             RENDEZVOUS_DEADLINE,
         )
         .await;
@@ -244,6 +216,53 @@ impl Host {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             }
+        }
+    }
+}
+
+/// The supervisor these tests start a plugin host through, recording what it was asked to start
+/// and the process it reported.
+///
+/// The detached supervisor, deliberately, and not the platform's choice. All three supervisors go
+/// through the same trait and the same launcher, and this is the one a headless macOS or
+/// non-systemd Unix host uses. The alternative here would bootstrap jobs into the operator's own
+/// login domain, which is not something a test should do to the machine it ran on. A job is
+/// retired the way the daemon retires one, which for the detached supervisor finds nothing to take
+/// away.
+struct Recorded {
+    recorded: Arc<std::sync::Mutex<Option<ServiceLaunch>>>,
+    seen: Arc<std::sync::Mutex<Option<u32>>>,
+}
+
+impl HostSupervisor for Recorded {
+    fn start(&self, plan: &HostLaunchPlan) -> HostStartOutcome {
+        let launch = ServiceLaunch {
+            label: plan.label.clone(),
+            program: plan.program.clone(),
+            arguments: plan.arguments.clone(),
+            jobs_directory: plan.jobs_directory.clone(),
+            working_directory: plan.working_directory.clone(),
+        };
+        if let Ok(mut slot) = self.recorded.lock() {
+            *slot = Some(launch.clone());
+        }
+        match DetachedSupervisor::new().start_service(&launch) {
+            LaunchOutcome::Started(identity) => {
+                if let Ok(mut slot) = self.seen.lock() {
+                    *slot = u32::try_from(identity.pid.get()).ok();
+                }
+                HostStartOutcome::Started(identity)
+            }
+            LaunchOutcome::NotStarted { detail } => HostStartOutcome::NotStarted { detail },
+            LaunchOutcome::Uncertain { detail, pid } => HostStartOutcome::Uncertain { detail, pid },
+        }
+    }
+
+    fn retire(&self, jobs_directory: &std::path::Path, label: &str) -> HostJobRetirement {
+        match kr_controller::supervision::retire_service_job(jobs_directory, label) {
+            JobRetirement::Gone => HostJobRetirement::Gone,
+            JobRetirement::StillRunning => HostJobRetirement::StillRunning,
+            JobRetirement::Unsettled(detail) => HostJobRetirement::Unsettled(detail),
         }
     }
 }

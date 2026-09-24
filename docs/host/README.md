@@ -541,6 +541,12 @@ leaves nothing loaded either. A job whose process is still running is never remo
 removing it would end that worker. The job's definition under `jobs/` goes with it, and its
 `.diagnostics` file stays.
 
+The plugin host is started the same way, as a job of its own, and its job goes the same way. The
+launch that started a host watches its process and removes the job once the kernel says it has
+gone, or at once where the start failed. A host that ended while no daemon was watching it leaves
+its job to the next plugin-host launch in the environment, which removes every such job whose
+process has ended before it starts its own.
+
 systemd drops a transient unit once its process has ended, and `--collect` makes that so for a
 unit whose process failed as well, which would otherwise stay listed as failed until somebody
 reset it. Every command put to launchd or to the user manager, whether it asks, loads, starts or

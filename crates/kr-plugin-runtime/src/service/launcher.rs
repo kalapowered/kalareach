@@ -18,6 +18,14 @@
 //! and for a related reason: a plugin host that died with the daemon would take every rich binding
 //! with it on every daemon restart.
 //!
+//! A service manager can keep a job after its process has ended, as launchd does until something
+//! removes it, so each launch takes its own job away again once its host has ended: the launcher
+//! watches the process it started and asks the supervisor to retire the job when the kernel says
+//! it has gone, or, where the start failed, as soon as the job has no process left. A launcher
+//! that was not running when a host ended leaves that job to the next launch in the environment,
+//! which retires every job an earlier launch defined whose host has ended before it starts its own.
+//! A job whose host is still running is never taken away, because that would end the host.
+//!
 //! # The identity proof
 //!
 //! Four things establish which process is answering the plugin endpoint, and none of them
@@ -241,11 +249,179 @@ pub enum HostStartOutcome {
     },
 }
 
-/// What starts a job on this platform.
+/// What removing an ended host's job found.
 ///
-/// A function rather than a trait implemented here, so the control daemon supplies its own
-/// supervisor and this crate does not have to depend on the daemon to be tested.
-pub type HostStarter<'a> = &'a dyn Fn(&HostLaunchPlan) -> HostStartOutcome;
+/// The same three answers a worker's job has.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostJobRetirement {
+    /// Nothing of the job is left: the service manager no longer has it and its definition has
+    /// gone with it. A job that was never defined or never loaded ends here too.
+    Gone,
+    /// The job's process is still running, so the job was left exactly as it was.
+    StillRunning,
+    /// What the service manager holds could not be established, or the removal did not take.
+    Unsettled(String),
+}
+
+/// What starts a plugin host as its own job on this platform, and takes that job away again once
+/// the host has ended.
+///
+/// A trait the control daemon implements over its own supervisor, rather than one implemented
+/// here, so this crate does not have to depend on the daemon to be tested.
+pub trait HostSupervisor: Send + Sync {
+    /// Starts one host as its own job, and says what happened.
+    fn start(&self, plan: &HostLaunchPlan) -> HostStartOutcome;
+
+    /// Removes what the service manager keeps of the job labelled `label`, defined in
+    /// `jobs_directory`, once that job's process has ended.
+    ///
+    /// A job whose process is still running is left exactly as it is, and says so. It runs the
+    /// platform's own commands, so it is called where blocking is allowed.
+    fn retire(&self, jobs_directory: &Path, label: &str) -> HostJobRetirement;
+}
+
+/// How long a launch keeps asking for the job of a host that has ended to be taken away.
+///
+/// A service manager can describe a job as running for a moment after the kernel has said its
+/// process has gone, and a start that failed part way may still have a process to end. Once this
+/// has passed, the next launch in the environment asks again.
+pub const RETIREMENT_WINDOW: core::time::Duration = core::time::Duration::from_secs(60);
+
+/// How often a launch looks at the process of the host it started.
+const HOST_WATCH_INTERVAL: core::time::Duration = core::time::Duration::from_secs(1);
+
+/// The label every plugin host's job has, before the reservation it was started for.
+const LABEL_PREFIX: &str = "kr-plugin-host-";
+
+/// Launches of one environment, one at a time from the retirement of earlier jobs to the start of
+/// the new one.
+///
+/// A launch defines its job before the service manager starts it, and in between the job has no
+/// process. Another launch retiring the jobs it found with no process could take that one away
+/// before it started, so the look and the start are one turn per environment.
+static LAUNCHES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<EnvironmentId, Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Returns one environment's launch turn.
+fn launch_turn(environment_id: EnvironmentId) -> Arc<tokio::sync::Mutex<()>> {
+    LAUNCHES.lock().map_or_else(
+        |_poisoned| Arc::new(tokio::sync::Mutex::new(())),
+        |mut environments| {
+            Arc::clone(
+                environments
+                    .entry(environment_id)
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        },
+    )
+}
+
+/// Returns the label of every plugin host's job this environment has a definition for.
+///
+/// A file whose name is not a job definition spelt exactly as a launch writes one is not listed:
+/// nothing here takes away what a launch did not define.
+#[must_use]
+pub fn defined_host_jobs(environment: &EnvironmentPaths) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(environment.jobs_dir()) else {
+        return Vec::new();
+    };
+    let mut defined: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let label = name.to_str()?.strip_suffix(".plist")?;
+            let reservation_id: ReservationId = label.strip_prefix(LABEL_PREFIX)?.parse().ok()?;
+            (label_of(reservation_id) == label).then(|| label.to_owned())
+        })
+        .collect();
+    defined.sort();
+    defined
+}
+
+/// Returns the job label of the host started for `reservation_id`.
+fn label_of(reservation_id: ReservationId) -> String {
+    format!("{LABEL_PREFIX}{reservation_id}")
+}
+
+/// Retires every plugin host's job this environment defined whose host has ended.
+///
+/// Called with the environment's launch turn held, so no job it looks at is one a launch has
+/// defined and not yet started. A job whose host is running is left as it is.
+async fn retire_ended_hosts(environment: &EnvironmentPaths, supervisor: &Arc<dyn HostSupervisor>) {
+    let jobs = environment.jobs_dir();
+    let supervisor = Arc::clone(supervisor);
+    let defined = defined_host_jobs(environment);
+    if defined.is_empty() {
+        return;
+    }
+    let _ = tokio::task::spawn_blocking(move || {
+        for label in defined {
+            if let HostJobRetirement::Unsettled(detail) = supervisor.retire(&jobs, &label) {
+                eprintln!("kr-plugin-runtime: the job {label} could not be removed: {detail}");
+            }
+        }
+    })
+    .await;
+}
+
+/// Takes the job of one launch away once its host has ended.
+///
+/// Where the launch recorded a process, the kernel is asked about it until it has gone, however
+/// long the host serves. Then, and at once where no process was recorded, the supervisor is asked
+/// to retire the job, once and then each second until the job has gone or [`RETIREMENT_WINDOW`]
+/// has passed; what was left unsettled at the end is reported, and the next launch asks again.
+fn retire_when_ended(
+    supervisor: Arc<dyn HostSupervisor>,
+    jobs: PathBuf,
+    label: String,
+    launched: Option<ProcessStartIdentity>,
+) {
+    tokio::spawn(async move {
+        if let Some(identity) = launched {
+            while !matches!(
+                kr_ipc::identity::process_state(&identity),
+                kr_ipc::identity::ProcessState::Ended
+            ) {
+                tokio::time::sleep(HOST_WATCH_INTERVAL).await;
+            }
+        }
+        let deadline = tokio::time::Instant::now() + RETIREMENT_WINDOW;
+        let left = loop {
+            let asked = {
+                let supervisor = Arc::clone(&supervisor);
+                let (jobs, label) = (jobs.clone(), label.clone());
+                tokio::task::spawn_blocking(move || supervisor.retire(&jobs, &label)).await
+            };
+            let answer = match asked {
+                Ok(HostJobRetirement::Gone) => return,
+                Ok(answer) => answer,
+                Err(error) => HostJobRetirement::Unsettled(error.to_string()),
+            };
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break answer;
+            }
+            tokio::time::sleep(
+                core::time::Duration::from_secs(1).min(deadline.saturating_duration_since(now)),
+            )
+            .await;
+            if tokio::time::Instant::now() >= deadline {
+                break answer;
+            }
+        };
+        match left {
+            HostJobRetirement::Gone => {}
+            HostJobRetirement::StillRunning => eprintln!(
+                "kr-plugin-runtime: the job {label} still had a process {RETIREMENT_WINDOW:?} \
+                 after its launch, so it is left for the next launch to look at"
+            ),
+            HostJobRetirement::Unsettled(detail) => {
+                eprintln!("kr-plugin-runtime: the job {label} could not be removed: {detail}");
+            }
+        }
+    });
+}
 
 /// The plugin host's own per-process signing identity.
 ///
@@ -710,7 +886,7 @@ impl HostReservation {
     /// Returns the job label for this reservation.
     #[must_use]
     pub fn label(&self) -> String {
-        format!("kr-plugin-host-{}", self.reservation_id)
+        label_of(self.reservation_id)
     }
 
     /// Returns the directory this launch's host process runs in.
@@ -959,8 +1135,10 @@ impl HostReservation {
 
 /// Starts a plugin host and takes its identity proof.
 ///
-/// The whole sequence in one call: reserve, bind the rendezvous, start the job, record what the
-/// service manager reported, wait for the claim, check it, publish the descriptor.
+/// The whole sequence in one call: retire the jobs of hosts that have ended, reserve, bind the
+/// rendezvous, start the job, record what the service manager reported, wait for the claim, check
+/// it, publish the descriptor. However that ends, the job this launch defined is taken away again
+/// once its host has ended, without the caller waiting for it.
 ///
 /// # Errors
 ///
@@ -969,9 +1147,12 @@ pub async fn start(
     environment: &EnvironmentPaths,
     program: impl Into<PathBuf>,
     packages: &Path,
-    starter: HostStarter<'_>,
+    supervisor: &Arc<dyn HostSupervisor>,
     within: core::time::Duration,
 ) -> LaunchResult<(HostDescriptor, HostFence)> {
+    let turn = launch_turn(environment.environment_id());
+    let held = turn.lock().await;
+    retire_ended_hosts(environment, supervisor).await;
     // The rendezvous listener exists before anything is started, so a host that connects the
     // instant it starts finds somebody listening.
     let reservation = HostReservation::open(environment)?;
@@ -980,14 +1161,25 @@ pub async fn start(
     // yet. It is inside this environment's state directory, which this host owns and which holds
     // nothing a person keeps.
     kr_ipc::paths::create_private_tree(environment.state_root(), &plan.working_directory)?;
-    let launched = match starter(&plan) {
-        HostStartOutcome::Started(identity) => identity,
-        HostStartOutcome::NotStarted { detail } => return Err(LaunchError::NotStarted { detail }),
-        HostStartOutcome::Uncertain { detail, pid } => {
-            return Err(LaunchError::Uncertain { detail, pid });
-        }
+    let outcome = supervisor.start(&plan);
+    drop(held);
+    let launched = match &outcome {
+        HostStartOutcome::Started(identity) => Some(identity.clone()),
+        HostStartOutcome::NotStarted { .. } | HostStartOutcome::Uncertain { .. } => None,
     };
-    reservation.accept(environment, &launched, within).await
+    retire_when_ended(
+        Arc::clone(supervisor),
+        plan.jobs_directory.clone(),
+        plan.label.clone(),
+        launched,
+    );
+    match outcome {
+        HostStartOutcome::Started(identity) => {
+            reservation.accept(environment, &identity, within).await
+        }
+        HostStartOutcome::NotStarted { detail } => Err(LaunchError::NotStarted { detail }),
+        HostStartOutcome::Uncertain { detail, pid } => Err(LaunchError::Uncertain { detail, pid }),
+    }
 }
 
 #[cfg(test)]
@@ -1173,17 +1365,133 @@ mod tests {
         assert!(reservation.label().starts_with("kr-plugin-host-"));
     }
 
+    /// What a supervisor was asked, in order.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Asked {
+        /// To start the job with this label.
+        Start(String),
+        /// To retire the job with this label, and whether the process it was told about had ended
+        /// by then.
+        Retire(String, bool),
+    }
+
+    /// A supervisor that answers a start as it is told, retires a job the way a service manager
+    /// that keeps ended jobs would, by taking its definition away, and records what it was asked.
+    struct Told {
+        outcome: Box<dyn Fn(&HostLaunchPlan) -> HostStartOutcome + Send + Sync>,
+        /// The process a started job runs, where the start reported one.
+        process: std::sync::Mutex<Option<ProcessStartIdentity>>,
+        asked: std::sync::Mutex<Vec<Asked>>,
+    }
+
+    impl Told {
+        fn new(
+            outcome: impl Fn(&HostLaunchPlan) -> HostStartOutcome + Send + Sync + 'static,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                outcome: Box::new(outcome),
+                process: std::sync::Mutex::new(None),
+                asked: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn asked(&self) -> Vec<Asked> {
+            self.asked.lock().expect("the record").clone()
+        }
+
+        /// Waits until this supervisor has been asked to retire `label`.
+        async fn until_retired(&self, label: &str) -> bool {
+            let deadline = std::time::Instant::now() + core::time::Duration::from_secs(30);
+            loop {
+                if let Some(Asked::Retire(_, ended)) = self
+                    .asked()
+                    .into_iter()
+                    .find(|asked| matches!(asked, Asked::Retire(retired, _) if retired == label))
+                {
+                    return ended;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{label} was never retired: {:?}",
+                    self.asked()
+                );
+                tokio::time::sleep(core::time::Duration::from_millis(20)).await;
+            }
+        }
+    }
+
+    impl HostSupervisor for Told {
+        fn start(&self, plan: &HostLaunchPlan) -> HostStartOutcome {
+            self.asked
+                .lock()
+                .expect("the record")
+                .push(Asked::Start(plan.label.clone()));
+            // Defined before it starts, as a service manager's job is.
+            std::fs::create_dir_all(&plan.jobs_directory).expect("the jobs directory");
+            std::fs::write(
+                plan.jobs_directory.join(format!("{}.plist", plan.label)),
+                b"",
+            )
+            .expect("the job's definition");
+            let outcome = (self.outcome)(plan);
+            if let HostStartOutcome::Started(identity) = &outcome {
+                *self.process.lock().expect("the process") = Some(identity.clone());
+            }
+            outcome
+        }
+
+        fn retire(&self, jobs_directory: &Path, label: &str) -> HostJobRetirement {
+            let ended = self
+                .process
+                .lock()
+                .expect("the process")
+                .as_ref()
+                .is_none_or(|identity| {
+                    kr_ipc::identity::process_state(identity)
+                        == kr_ipc::identity::ProcessState::Ended
+                });
+            self.asked
+                .lock()
+                .expect("the record")
+                .push(Asked::Retire(label.to_owned(), ended));
+            let _ = std::fs::remove_file(jobs_directory.join(format!("{label}.plist")));
+            HostJobRetirement::Gone
+        }
+    }
+
+    /// Starts a process of this test's own that ends by itself a second later, and returns it
+    /// with the identity the kernel gives it.
+    fn a_process_that_ends_soon() -> (std::process::Child, ProcessStartIdentity) {
+        let child = std::process::Command::new("sleep")
+            .arg("1")
+            .spawn()
+            .expect("the process starts");
+        let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
+        loop {
+            match kr_ipc::identity::process_start_identity(child.id()) {
+                Ok(identity) => return (child, identity),
+                Err(error) => assert!(
+                    std::time::Instant::now() < deadline,
+                    "the kernel never described the process: {error}"
+                ),
+            }
+            std::thread::sleep(core::time::Duration::from_millis(20));
+        }
+    }
+
     #[tokio::test]
     async fn a_launcher_that_starts_nothing_says_so() {
         let host = kr_ipc::testing::TempHost::create();
         let environment = host.environment();
+        let told = Told::new(|_plan| HostStartOutcome::NotStarted {
+            detail: "no such file".to_owned(),
+        });
+        let supervisor: Arc<dyn HostSupervisor> = told.clone();
         let outcome = start(
             &environment,
             "/nonexistent/kr-plugin-host",
             std::path::Path::new("/var/packages"),
-            &|_plan| HostStartOutcome::NotStarted {
-                detail: "no such file".to_owned(),
-            },
+            &supervisor,
             core::time::Duration::from_millis(50),
         )
         .await
@@ -1198,17 +1506,157 @@ mod tests {
         let host = kr_ipc::testing::TempHost::create();
         let environment = host.environment();
         let identity = HostIdentity::generate(host.environment_id()).expect("an identity");
+        let reported = identity.process_start_identity().clone();
+        let told = Told::new(move |_plan| HostStartOutcome::Started(reported.clone()));
+        let supervisor: Arc<dyn HostSupervisor> = told.clone();
         let outcome = start(
             &environment,
             "/nonexistent/kr-plugin-host",
             std::path::Path::new("/var/packages"),
-            &|_plan| HostStartOutcome::Started(identity.process_start_identity().clone()),
+            &supervisor,
             core::time::Duration::from_millis(50),
         )
         .await
         .expect_err("nothing reported itself");
         assert!(matches!(outcome, LaunchError::NoRendezvous { .. }));
         assert!(read_descriptor(&environment).expect("a read").is_none());
+    }
+
+    /// The job of a host this launch started is taken away once the host has ended, and not
+    /// before: taking it away sooner would end the host.
+    #[tokio::test]
+    async fn the_job_of_a_host_is_taken_away_once_the_host_has_ended() {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let (mut child, identity) = a_process_that_ends_soon();
+        let told = Told::new(move |_plan| HostStartOutcome::Started(identity.clone()));
+        let supervisor: Arc<dyn HostSupervisor> = told.clone();
+        // The process never reports in, so the launch fails; its job is still one this launch
+        // defined, and it is taken away all the same.
+        let outcome = start(
+            &environment,
+            "/nonexistent/kr-plugin-host",
+            std::path::Path::new("/var/packages"),
+            &supervisor,
+            core::time::Duration::from_millis(50),
+        )
+        .await
+        .expect_err("nothing reported itself");
+        assert!(matches!(outcome, LaunchError::NoRendezvous { .. }));
+        let Some(Asked::Start(label)) = told.asked().first().cloned() else {
+            panic!("the job was started: {:?}", told.asked());
+        };
+        assert!(
+            told.until_retired(&label).await,
+            "the job was retired only once its host had ended: {:?}",
+            told.asked()
+        );
+        assert!(
+            told.asked()
+                .iter()
+                .all(|asked| !matches!(asked, Asked::Retire(_, false))),
+            "and never while the host was running: {:?}",
+            told.asked()
+        );
+        assert!(
+            defined_host_jobs(&environment).is_empty(),
+            "nothing of the job is left: {:?}",
+            defined_host_jobs(&environment)
+        );
+        let _ = child.wait();
+    }
+
+    /// A start that failed leaves no process to wait for, so its job is taken away at once, which
+    /// takes away a definition the service manager was given before it refused.
+    #[tokio::test]
+    async fn the_job_of_a_start_that_failed_is_taken_away_at_once() {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let told = Told::new(|_plan| HostStartOutcome::Uncertain {
+            detail: "the service manager did not say".to_owned(),
+            pid: None,
+        });
+        let supervisor: Arc<dyn HostSupervisor> = told.clone();
+        let outcome = start(
+            &environment,
+            "/nonexistent/kr-plugin-host",
+            std::path::Path::new("/var/packages"),
+            &supervisor,
+            core::time::Duration::from_millis(50),
+        )
+        .await
+        .expect_err("nothing is known to have started");
+        assert!(matches!(outcome, LaunchError::Uncertain { .. }));
+        let Some(Asked::Start(label)) = told.asked().first().cloned() else {
+            panic!("the job was started: {:?}", told.asked());
+        };
+        told.until_retired(&label).await;
+        assert!(defined_host_jobs(&environment).is_empty());
+    }
+
+    /// A launch first retires every job an earlier launch in the environment defined whose host
+    /// has ended, and looks at nothing else in the jobs directory.
+    #[tokio::test]
+    async fn a_launch_first_retires_the_jobs_earlier_launches_left() {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let jobs = environment.jobs_dir();
+        std::fs::create_dir_all(&jobs).expect("the jobs directory");
+        let earlier = ReservationId::new(kr_protocol::scalars::Uuid::from_bytes([0xef; 16]));
+        // Letters in it, so that its spelling in capitals is another spelling. Not `earlier`: a
+        // volume that ignores case would hold the capitalised file under that name too.
+        let other = ReservationId::new(kr_protocol::scalars::Uuid::from_bytes([0xab; 16]));
+        let left = format!("kr-plugin-host-{earlier}");
+        for name in [
+            format!("{left}.plist"),
+            // What a job wrote, rather than a job.
+            format!("{left}.diagnostics"),
+            // Another kind of service's job, and names no launch writes.
+            format!("kr-worker-{earlier}.plist"),
+            "kr-plugin-host-not-a-reservation.plist".to_owned(),
+            format!("kr-plugin-host-{}.plist", other.to_string().to_uppercase()),
+        ] {
+            std::fs::write(jobs.join(name), b"").expect("writes a file");
+        }
+        assert_eq!(defined_host_jobs(&environment), vec![left.clone()]);
+
+        let told = Told::new(|_plan| HostStartOutcome::NotStarted {
+            detail: "not this time".to_owned(),
+        });
+        let supervisor: Arc<dyn HostSupervisor> = told.clone();
+        let _ = start(
+            &environment,
+            "/nonexistent/kr-plugin-host",
+            std::path::Path::new("/var/packages"),
+            &supervisor,
+            core::time::Duration::from_millis(50),
+        )
+        .await;
+        let asked = told.asked();
+        assert_eq!(
+            asked.first(),
+            Some(&Asked::Retire(left.clone(), true)),
+            "the job an earlier launch left was retired before anything was started: {asked:?}"
+        );
+        let started: Vec<&String> = asked
+            .iter()
+            .filter_map(|asked| match asked {
+                Asked::Start(label) => Some(label),
+                Asked::Retire(..) => None,
+            })
+            .collect();
+        assert!(
+            asked.iter().all(|asked| match asked {
+                Asked::Retire(label, _) => *label == left || started.contains(&label),
+                Asked::Start(_) => true,
+            }),
+            "nothing but the jobs the launches defined was looked at: {asked:?}"
+        );
+        assert!(
+            jobs.join(format!("kr-worker-{earlier}.plist")).exists()
+                && jobs.join(format!("{left}.diagnostics")).exists(),
+            "and what is not a plugin host's job definition is where it was"
+        );
     }
 
     #[tokio::test]
