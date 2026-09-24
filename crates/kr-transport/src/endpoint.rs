@@ -103,7 +103,12 @@ async fn bind(
     builder = apply_discovery(builder, config)?;
 
     if let Some(addr) = config.bind_addr {
+        // The bind address is the endpoint's one IP socket. iroh starts from an unspecified socket
+        // for each address family, and naming an address replaces only the default of its own
+        // family, so the defaults go first: an endpoint bound to the IPv4 loopback would otherwise
+        // also listen on every IPv6 interface.
         builder = builder
+            .clear_ip_transports()
             .bind_addr(addr)
             .map_err(|error| TransportError::Configuration {
                 what: addr.to_string(),
@@ -268,6 +273,68 @@ mod tests {
                 .into_iter()
                 .collect::<std::collections::BTreeSet<_>>()
         );
+    }
+
+    /// Whether this machine can bind a socket on `addr` at all.
+    ///
+    /// An IPv6 loopback bind needs IPv6, which a host can have switched off. Such a host has no
+    /// IPv6 socket to leave open either, so the family it lacks is the one leg with nothing to show.
+    fn bindable(addr: std::net::SocketAddr) -> bool {
+        std::net::UdpSocket::bind(addr).is_ok()
+    }
+
+    /// An endpoint given a loopback bind address listens on the loopback and nowhere else, in
+    /// either address family. Every socket it binds is a loopback socket: the unspecified
+    /// socket iroh binds by default for the *other* family is not left listening on every
+    /// interface beside the one that was asked for.
+    #[tokio::test]
+    async fn a_loopback_bind_address_binds_only_loopback_sockets() {
+        let identity = TransportIdentityKeyPair::generate().expect("a transport identity");
+        for loopback in ["127.0.0.1:0", "[::1]:0"] {
+            let addr: std::net::SocketAddr = loopback.parse().expect("a loopback address");
+            if !bindable(addr) {
+                eprintln!("{loopback} cannot be bound on this machine, so that leg is not run");
+                continue;
+            }
+            let config = EndpointConfig {
+                bind_addr: Some(addr),
+                ..EndpointConfig::default()
+            };
+            for accept in [true, false] {
+                let endpoint = bind(&config, &identity, accept).await.expect("an endpoint");
+                let sockets = endpoint.bound_sockets();
+                assert!(
+                    !sockets.is_empty(),
+                    "an endpoint bound to {loopback} has a socket"
+                );
+                assert!(
+                    sockets.iter().all(|socket| socket.ip().is_loopback()),
+                    "every socket an endpoint bound to {loopback} holds is a loopback socket: \
+                     {sockets:?}"
+                );
+                endpoint.close().await;
+            }
+        }
+    }
+
+    /// A relay-only endpoint holds no IP socket at all, even when a bind address is named, because
+    /// the bind address is applied before the IP transports are removed.
+    #[tokio::test]
+    async fn a_relay_only_endpoint_binds_no_ip_socket_even_with_a_bind_address() {
+        let identity = TransportIdentityKeyPair::generate().expect("a transport identity");
+        let config = EndpointConfig {
+            relay_urls: vec![
+                "https://relay.example.invalid"
+                    .parse()
+                    .expect("a relay URL"),
+            ],
+            bind_addr: Some("127.0.0.1:0".parse().expect("a loopback address")),
+            relay_only: true,
+            ..EndpointConfig::default()
+        };
+        let endpoint = bind_dialer(&config, &identity).await.expect("an endpoint");
+        assert_eq!(endpoint.bound_sockets(), Vec::<std::net::SocketAddr>::new());
+        endpoint.close().await;
     }
 
     /// KR-REQ-10.02: discovery is configured only when selected, apart from the relay choice.
