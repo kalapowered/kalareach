@@ -53,6 +53,23 @@ pub fn device(
     room: Arc<dyn CandidateRoom>,
     capture: &Arc<Capture>,
 ) -> Arc<Device> {
+    device_in_boot(
+        data,
+        secrets,
+        room,
+        capture,
+        DeviceClock::current().expect("a clock"),
+    )
+}
+
+/// A device on this test's parts, running in the boot `clock` belongs to.
+pub fn device_in_boot(
+    data: &std::path::Path,
+    secrets: Arc<dyn SecretStore>,
+    room: Arc<dyn CandidateRoom>,
+    capture: &Arc<Capture>,
+    clock: DeviceClock,
+) -> Arc<Device> {
     let held: Arc<OnceLock<Arc<Device>>> = Arc::new(OnceLock::new());
     let (seen, kept) = (Arc::clone(capture), Arc::clone(&held));
     let device = Device::with(
@@ -61,7 +78,7 @@ pub fn device(
             secrets,
             room,
             bind: Some(loopback()),
-            clock: Arc::new(DeviceClock::current().expect("a clock")),
+            clock: Arc::new(clock),
         },
         move || {
             if let Some(device) = kept.get() {
