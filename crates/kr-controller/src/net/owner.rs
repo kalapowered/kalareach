@@ -402,6 +402,10 @@ impl OwnerAuthority {
     /// that equals `expectation`, signed by a live owner device of this host after its own
     /// ceremony. Nothing is spent.
     ///
+    /// A challenge an owner device already answered through `owner.confirmation.complete` is
+    /// answered: the proof on record is the only one that spends it, so what the acceptance record
+    /// says was verified is what is consumed.
+    ///
     /// The signers are the ones every other confirmation on this host is verified against: the
     /// authorisation keys of the live paired devices whose grant holds `host.manage` and is in
     /// force. A key the caller presents is never one, and neither is the terminal bootstrap.
@@ -433,6 +437,7 @@ impl OwnerAuthority {
                 "that challenge is not outstanding on this host",
             ));
         }
+        answered_otherwise(&state, proof)?;
         verify_confirmation(
             &self.clock,
             &proof.request,
@@ -472,6 +477,7 @@ impl OwnerAuthority {
         }
         let signer = self.owner_device_key(proof.signer_key_id)?;
         let mut state = self.state();
+        answered_otherwise(&state, proof)?;
         kr_pairing::confirm::accept_confirmation(
             &mut state.ledger,
             &self.clock,
@@ -918,6 +924,24 @@ impl Challenges {
             self.entries
                 .remove(request.confirmation_id.get().as_bytes());
         }
+    }
+}
+
+/// Refuses a presented proof for a challenge an owner device already answered with another.
+///
+/// The answer on record is the verified one, and the acceptance record keeps it, so spending a
+/// different proof would consume one confirmation while the record names another. A refusal here
+/// spends nothing: the answer on record still confirms the challenge.
+fn answered_otherwise(state: &Challenges, proof: &OwnerConfirmationProof) -> Result<()> {
+    let answered = state
+        .entries
+        .get(proof.request.confirmation_id.get().as_bytes())
+        .and_then(|entry| entry.answer.as_ref());
+    match answered {
+        Some(answer) if &answer.proof != proof => Err(confirmation_required(
+            "that challenge has already been answered with another proof",
+        )),
+        _ => Ok(()),
     }
 }
 

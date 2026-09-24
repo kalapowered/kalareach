@@ -1478,7 +1478,17 @@ async fn owned_on(
         .expect("the owner record reads")
         == kr_pairing::confirm::HostEnrolment::InitialBootstrap;
     let owner_device = if unowned {
-        Some(pair_first_owner(&host, owner).await)
+        // The first owner is paired the way a person pairs it: from this host's own account,
+        // through the terminal bootstrap, with a key made for the ceremony.
+        let ceremony = kr_crypto::keys::DeviceKeys::generate().expect("a ceremony key");
+        Some(
+            pair_owner(
+                &host,
+                owner,
+                &calls::Signer::Bootstrap(&ceremony.authorisation),
+            )
+            .await,
+        )
     } else {
         None
     };
@@ -1521,35 +1531,34 @@ async fn networked_on(
     (host, network)
 }
 
-/// Pairs `owner` as the host's first owner device, the way a person does: the host's own account
-/// issues a personal owner invitation through the terminal bootstrap, the device redeems it over
-/// its own connection, and the owner confirms the device it was shown.
-async fn pair_first_owner(
+/// Pairs `keys` as an owner device, the way a person does: the host's own account issues a
+/// personal owner invitation under `signer`'s confirmation, the device redeems it over its own
+/// connection, and the owner confirms the device it was shown.
+async fn pair_owner(
     host: &Host,
-    owner: &kr_crypto::keys::DeviceKeys,
+    keys: &kr_crypto::keys::DeviceKeys,
+    signer: &calls::Signer<'_>,
 ) -> kr_protocol::ids::DeviceId {
-    let device = net_support::Device::with_keys(owner.clone()).await;
-    let ceremony = kr_crypto::keys::DeviceKeys::generate().expect("a ceremony key");
-    let signer = calls::Signer::Bootstrap(&ceremony.authorisation);
+    let device = net_support::Device::with_keys(keys.clone()).await;
     let mut control = client(host).await;
     let invited = calls::invite_direct(
         host.environment_id,
         &mut control,
         kr_protocol::invitation::InviteGrantKind::PersonalOwner,
         &kr_pairing::grants::personal_owner_grant(),
-        &signer,
+        signer,
     )
     .await
-    .expect("the first owner's invitation");
+    .expect("an owner invitation");
     let (connection, _candidate, _value) = calls::redeem(&device.candidate(), &invited).await;
     let confirmed = calls::confirm_candidate(
         host.environment_id,
         &mut control,
         invited.invitation_id,
-        &signer,
+        signer,
     )
     .await
-    .expect("the first owner device is paired");
+    .expect("the owner device is paired");
     connection.close(0u32.into(), b"paired");
     confirmed.device_id
 }
@@ -2023,6 +2032,69 @@ async fn a_location_is_confirmed_by_an_owner_device_and_by_nothing_else() {
         locations(&mut control, environment_id).await,
         vec![location]
     );
+    drop(control);
+    let _ = owned.stop().await;
+}
+
+/// KR-REQ-10.05: a location challenge an owner device already answered through
+/// `owner.confirmation.complete` is spent with that answer and no other. A second owner device's
+/// valid proof of the same challenge is another answer: it is refused and spends nothing, and the
+/// answer on record then authorises the location and is what the acceptance record shows spent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answered_location_challenge_is_spent_with_its_answer_only() {
+    use kr_protocol::project::LocationPurpose;
+
+    let owner = owner_keys();
+    let owned = owned(&owner).await;
+    let host = &owned.host;
+    let environment_id = host.environment_id;
+    let second = owner_keys();
+    pair_owner(host, &second, &calls::Signer::OwnerDevice(&owner)).await;
+    let mut control = client(host).await;
+    let params = location_params(environment_id, host.work(), LocationPurpose::Source);
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let request = challenged(&mut control, environment_id, action, &params).await;
+    let answered = calls::complete(environment_id, &mut control, signed(&owner, &request), None)
+        .await
+        .expect("the first owner device's answer is recorded");
+
+    let refusal = failure(
+        submit(
+            &mut control,
+            environment_id,
+            Method::ProjectLocationAuthorise,
+            action,
+            &proven(&params, signed(&second, &request)),
+        )
+        .await,
+    );
+    assert_eq!(refusal.code, ErrorCode::OwnerConfirmationRequired);
+    assert!(
+        locations(&mut control, environment_id).await.is_empty(),
+        "the other answer authorised nothing"
+    );
+
+    authorised_location(
+        &submit(
+            &mut control,
+            environment_id,
+            Method::ProjectLocationAuthorise,
+            action,
+            &proven(&params, signed(&owner, &request)),
+        )
+        .await
+        .expect("the answer on record authorises it"),
+    );
+    let acceptance = owned
+        .network
+        .pairing()
+        .rows()
+        .acceptance(request.confirmation_id)
+        .expect("readable")
+        .expect("the acceptance record");
+    assert_eq!(acceptance.proof, signed(&owner, &request));
+    assert_eq!(acceptance.answered_at_ms, answered.answered_at_ms);
+    assert!(acceptance.consumed_at_ms.is_some(), "spent, on record");
     drop(control);
     let _ = owned.stop().await;
 }
