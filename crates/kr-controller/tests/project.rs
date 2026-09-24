@@ -10,6 +10,8 @@
 //! built with installed Git, and — for the kill test — a separate `kr-controller` process copied
 //! to the internal disk and ended with a signal where it stands.
 
+mod net_support;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -35,6 +37,7 @@ use kr_protocol::project::{
     WorkspaceRemoveParams, WorkspaceRemoveResult, WorkspaceState,
 };
 use kr_protocol::scalars::{Nullable, U64};
+use net_support::pairing as calls;
 
 /// A supervisor that starts nothing. These tests create no sessions.
 #[derive(Debug)]
@@ -1427,13 +1430,16 @@ async fn an_admission_withdrawn_during_a_creation_is_refused_inside_the_services
 
 // ----- the owner's authorised locations ----------------------------------------------------------
 
-/// A daemon on the loopback network with an enrolled owner, whose project service is lent that
-/// owner for its location decisions.
+/// A daemon on the loopback network with an owner device, whose confirmations the project service
+/// takes for its location decisions.
 struct Owned {
     host: Host,
     network: kr_controller::service::net::Network,
-    /// The owner the daemon enrolled, whose ledger its own sweep keeps.
+    /// This host's owner as the project service reaches it: the daemon's own pairing service, whose
+    /// ledger the daemon's sweep keeps.
     owner: Arc<kr_controller::project::HostOwner>,
+    /// The owner device, when this daemon paired it rather than finding it on record.
+    owner_device: Option<kr_protocol::ids::DeviceId>,
 }
 
 impl Owned {
@@ -1443,7 +1449,7 @@ impl Owned {
     }
 }
 
-/// The owner every location test confirms as.
+/// The owner device every location test confirms as.
 fn owner_keys() -> kr_crypto::keys::DeviceKeys {
     kr_crypto::keys::DeviceKeys::generate().expect("owner keys")
 }
@@ -1457,15 +1463,45 @@ async fn owned(owner: &kr_crypto::keys::DeviceKeys) -> Owned {
     .await
 }
 
+/// Starts a daemon on the network, and pairs `owner` as its first owner device unless the host
+/// already has an owner, as a replacement daemon on the same tree does.
 async fn owned_on(
     temp: kr_ipc::testing::TempHost,
     work: Arc<tempfile::TempDir>,
     owner: &kr_crypto::keys::DeviceKeys,
 ) -> Owned {
+    let (host, network) = networked_on(temp, work).await;
+    let unowned = network
+        .pairing()
+        .owner()
+        .enrolment()
+        .expect("the owner record reads")
+        == kr_pairing::confirm::HostEnrolment::InitialBootstrap;
+    let owner_device = if unowned {
+        Some(pair_first_owner(&host, owner).await)
+    } else {
+        None
+    };
+    let lent = Arc::new(kr_controller::project::HostOwner::new(Arc::clone(
+        network.pairing(),
+    )));
+    Owned {
+        host,
+        network,
+        owner: lent,
+        owner_device,
+    }
+}
+
+/// Starts a daemon and puts it on the loopback network, which lends its project service this
+/// host's owner devices.
+async fn networked_on(
+    temp: kr_ipc::testing::TempHost,
+    work: Arc<tempfile::TempDir>,
+) -> (Host, kr_controller::service::net::Network) {
     use kr_controller::service::net::{self, NetworkSetup, config::NetworkSettings};
 
     let host = host_on(temp, work).await;
-    let signer = *owner.authorisation.public();
     let network = net::register(
         &host.controller,
         NetworkSetup {
@@ -1482,32 +1518,62 @@ async fn owned_on(
     )
     .await
     .expect("the daemon joins the loopback network");
-    let enrolled = host
-        .controller
-        .enrol_project_owner(
-            &network,
-            signer,
-            kr_pairing::confirm::HostEnrolment::Enrolled,
-        )
-        .expect("the owner is lent to the project service");
-    Owned {
-        host,
-        network,
-        owner: enrolled,
-    }
+    (host, network)
 }
 
-/// The owner's proof for one challenge, from the owner's own presence signer.
+/// Pairs `owner` as the host's first owner device, the way a person does: the host's own account
+/// issues a personal owner invitation through the terminal bootstrap, the device redeems it over
+/// its own connection, and the owner confirms the device it was shown.
+async fn pair_first_owner(
+    host: &Host,
+    owner: &kr_crypto::keys::DeviceKeys,
+) -> kr_protocol::ids::DeviceId {
+    let device = net_support::Device::with_keys(owner.clone()).await;
+    let ceremony = kr_crypto::keys::DeviceKeys::generate().expect("a ceremony key");
+    let signer = calls::Signer::Bootstrap(&ceremony.authorisation);
+    let mut control = client(host).await;
+    let invited = calls::invite_direct(
+        host.environment_id,
+        &mut control,
+        kr_protocol::invitation::InviteGrantKind::PersonalOwner,
+        &kr_pairing::grants::personal_owner_grant(),
+        &signer,
+    )
+    .await
+    .expect("the first owner's invitation");
+    let (connection, _candidate, _value) = calls::redeem(&device.candidate(), &invited).await;
+    let confirmed = calls::confirm_candidate(
+        host.environment_id,
+        &mut control,
+        invited.invitation_id,
+        &signer,
+    )
+    .await
+    .expect("the first owner device is paired");
+    connection.close(0u32.into(), b"paired");
+    confirmed.device_id
+}
+
+/// The owner device's proof for one challenge, after its own ceremony.
 fn signed(
     owner: &kr_crypto::keys::DeviceKeys,
     request: &kr_protocol::pairing::OwnerConfirmationRequest,
 ) -> kr_protocol::pairing::OwnerConfirmationProof {
-    kr_pairing::confirm::sign_confirmation(
-        &owner.authorisation,
+    signed_on(
+        owner,
         request,
-        kr_protocol::pairing::ConfirmationChannel::EnrolledPresenceSigner,
+        kr_protocol::pairing::ConfirmationChannel::OwnerDevicePresence,
     )
-    .expect("the owner signs")
+}
+
+/// A proof for one challenge signed with `keys`, as it arrives on `channel`.
+fn signed_on(
+    keys: &kr_crypto::keys::DeviceKeys,
+    request: &kr_protocol::pairing::OwnerConfirmationRequest,
+    channel: kr_protocol::pairing::ConfirmationChannel,
+) -> kr_protocol::pairing::OwnerConfirmationProof {
+    kr_pairing::confirm::sign_confirmation(&keys.authorisation, request, channel)
+        .expect("the proof is signed")
 }
 
 fn location_params(
@@ -1663,7 +1729,7 @@ async fn authorise_requires_exact_fresh_owner_confirmation() {
         "nothing is authorised before the owner confirms"
     );
 
-    // A signature that is not the enrolled owner's.
+    // A signature that is not an owner device's.
     let refusal = failure(
         submit(
             &mut control,
@@ -1756,7 +1822,8 @@ async fn authorise_requires_exact_fresh_owner_confirmation() {
     let _ = owned.stop().await;
 }
 
-/// A daemon with no enrolled owner confirms nothing, so it authorises nothing.
+/// A daemon that is not on the network has no owner device to confirm anything, so it authorises
+/// nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_with_no_enrolled_owner_authorises_no_location() {
     let host = host().await;
@@ -1778,6 +1845,186 @@ async fn a_host_with_no_enrolled_owner_authorises_no_location() {
     assert_eq!(refusal.code, ErrorCode::HostNotConfigured);
     drop(control);
     let _ = host.stop().await;
+}
+
+/// A daemon on the network whose first owner has not been paired has no owner device to confirm a
+/// location decision, so it issues no challenge and authorises nothing. The terminal bootstrap
+/// establishes the first owner and confirms nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_with_no_owner_device_authorises_no_location() {
+    let (host, network) = networked_on(
+        kr_ipc::testing::TempHost::create(),
+        Arc::new(tempfile::TempDir::new().expect("a working directory on the internal disk")),
+    )
+    .await;
+    let mut control = client(&host).await;
+    let refusal = failure(
+        submit(
+            &mut control,
+            host.environment_id,
+            Method::ProjectLocationAuthorise,
+            ActionId::new(kr_ipc::new_uuid()),
+            &location_params(
+                host.environment_id,
+                host.work(),
+                kr_protocol::project::LocationPurpose::Source,
+            ),
+        )
+        .await,
+    );
+    assert_eq!(refusal.code, ErrorCode::HostNotConfigured);
+    assert!(
+        locations(&mut control, host.environment_id)
+            .await
+            .is_empty()
+    );
+    drop(control);
+    network.shutdown().await;
+    let _ = host.stop().await;
+}
+
+/// KR-REQ-10.05: a location decision is confirmed by this host's owner devices, the owner every
+/// other sensitive action here is confirmed by, and by nothing else.
+///
+/// Its challenge is listed to the owner with what it approves. A key that is not an owner device's,
+/// the owner device's own key on a channel that is not its ceremony, and the owner device once it
+/// is revoked confirm nothing; the owner device's proof authorises the location, and the
+/// acceptance record holds that proof being spent. Without an owner device no challenge is issued.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_location_is_confirmed_by_an_owner_device_and_by_nothing_else() {
+    use kr_protocol::confirmation::{ConfirmationDisplay, DescribedAction};
+    use kr_protocol::pairing::{ConfirmationChannel, SensitiveAction};
+    use kr_protocol::project::{LocationPurpose, LocationState};
+
+    let owner = owner_keys();
+    let owned = owned(&owner).await;
+    let host = &owned.host;
+    let environment_id = host.environment_id;
+    let mut control = client(host).await;
+    let root = host.work().join("projects");
+    std::fs::create_dir(&root).expect("a directory to authorise");
+    let params = location_params(environment_id, &root, LocationPurpose::Destination);
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let request = challenged(&mut control, environment_id, action, &params).await;
+
+    // Listed to the owner, and so to its owner devices, with what it approves.
+    let pending = calls::pending(&mut control)
+        .await
+        .expect("the owner reads what is outstanding");
+    let listed = pending
+        .pending
+        .iter()
+        .find(|pending| pending.request == request)
+        .expect("the challenge is listed");
+    assert_eq!(
+        listed.display,
+        ConfirmationDisplay::Described(DescribedAction {
+            action: SensitiveAction::EnlargeGrant,
+            action_digest: request.action_digest,
+            destination_keys: Nullable::null(),
+            destination_rights: request.destination_rights.clone(),
+        })
+    );
+
+    // Not an owner device's key, and not the owner device's ceremony.
+    for proof in [
+        signed(&owner_keys(), &request),
+        signed_on(
+            &owner,
+            &request,
+            ConfirmationChannel::EnrolledPresenceSigner,
+        ),
+        signed_on(
+            &owner,
+            &request,
+            ConfirmationChannel::LocalBootstrapTerminal,
+        ),
+    ] {
+        let refusal = failure(
+            submit(
+                &mut control,
+                environment_id,
+                Method::ProjectLocationAuthorise,
+                action,
+                &proven(&params, proof),
+            )
+            .await,
+        );
+        assert_eq!(refusal.code, ErrorCode::OwnerConfirmationRequired);
+    }
+    // The owner device's own proof.
+    let location = authorised_location(
+        &submit(
+            &mut control,
+            environment_id,
+            Method::ProjectLocationAuthorise,
+            action,
+            &proven(&params, signed(&owner, &request)),
+        )
+        .await
+        .expect("the owner device confirms it"),
+    );
+    assert_eq!(location.state, LocationState::Active);
+    let acceptance = owned
+        .network
+        .pairing()
+        .rows()
+        .acceptance(request.confirmation_id)
+        .expect("readable")
+        .expect("the acceptance record");
+    assert_eq!(acceptance.channel, "owner_device_presence");
+    assert!(acceptance.consumed_at_ms.is_some(), "spent, on record");
+
+    // A challenge the owner device was given, and then the device revoked.
+    let elsewhere = host.work().join("elsewhere");
+    std::fs::create_dir(&elsewhere).expect("another directory");
+    let other_params = location_params(environment_id, &elsewhere, LocationPurpose::Source);
+    let second = ActionId::new(kr_ipc::new_uuid());
+    let request = challenged(&mut control, environment_id, second, &other_params).await;
+    submit(
+        &mut control,
+        environment_id,
+        Method::DeviceRevoke,
+        ActionId::new(kr_ipc::new_uuid()),
+        &kr_protocol::sharing::DeviceRevokeParams {
+            device_id: owned
+                .owner_device
+                .expect("the owner device this daemon paired"),
+        },
+    )
+    .await
+    .expect("revoked");
+    // A revocation withdraws every registration, the owner's own socket included.
+    drop(control);
+    let mut control = client(host).await;
+    let refusal = failure(
+        submit(
+            &mut control,
+            environment_id,
+            Method::ProjectLocationAuthorise,
+            second,
+            &proven(&other_params, signed(&owner, &request)),
+        )
+        .await,
+    );
+    assert_eq!(refusal.code, ErrorCode::OwnerConfirmationRequired);
+    let refusal = failure(
+        submit(
+            &mut control,
+            environment_id,
+            Method::ProjectLocationAuthorise,
+            ActionId::new(kr_ipc::new_uuid()),
+            &other_params,
+        )
+        .await,
+    );
+    assert_eq!(refusal.code, ErrorCode::HostNotConfigured);
+    assert_eq!(
+        locations(&mut control, environment_id).await,
+        vec![location]
+    );
+    drop(control);
+    let _ = owned.stop().await;
 }
 
 /// Section 9's receipt: a confirmed authorisation's exact retry is answered from its record, over
@@ -1858,9 +2105,9 @@ async fn an_exact_confirmation_retry_returns_its_receipt() {
 ///
 /// The daemon answers one connection's requests in order and admits a first submission only under
 /// the window of the connection it arrived on, so two exact copies of one submission meet nowhere
-/// but in the service. They are driven there directly, under the owner this daemon enrolled and
-/// its real ceremony: a challenge this host issued, the owner's signature over it, and a ledger
-/// that spends it once.
+/// but in the service. They are driven there directly, under this daemon's own owner and its real
+/// ceremony: a challenge this host issued, the owner device's signature over it, and a ledger that
+/// spends it once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_confirmation_submissions_overlap_before_the_claim() {
     use kr_project::policy::OwnerAuthority as _;
@@ -1871,8 +2118,8 @@ async fn two_confirmation_submissions_overlap_before_the_claim() {
     let owner = owner_keys();
     let owned = owned(&owner).await;
     let host = &owned.host;
-    // The daemon's own enrolled owner, whose ledger its sweep keeps: the service has one owner, and
-    // a second one's challenges would be ones the daemon's ledger does not know.
+    // The daemon's own owner, over its own pairing service, whose ledger its sweep keeps: the
+    // service has one owner, and another's challenges would be ones that ledger does not know.
     let authority = Arc::clone(&owned.owner);
     let service = Arc::clone(host.controller.project().service());
     let actor = kr_protocol::ids::ActorId::new("local:owner").expect("a principal");

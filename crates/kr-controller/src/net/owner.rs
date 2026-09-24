@@ -321,7 +321,22 @@ impl OwnerAuthority {
                 initial_bootstrap,
             });
         }
-        state.ledger.issue(&request, &self.clock);
+        self.issue(&mut state, &request, resolved.display, resolved.first_owner);
+        Ok(OwnerConfirmationRequestResult {
+            request,
+            initial_bootstrap,
+        })
+    }
+
+    /// Puts a challenge in the ledger and beside it what an owner is shown.
+    fn issue(
+        &self,
+        state: &mut Challenges,
+        request: &OwnerConfirmationRequest,
+        display: ConfirmationDisplay,
+        first_owner: bool,
+    ) {
+        state.ledger.issue(request, &self.clock);
         state.issued += 1;
         let order = state.issued;
         state.entries.insert(
@@ -329,15 +344,158 @@ impl OwnerAuthority {
             Entry {
                 order,
                 request: request.clone(),
-                display: resolved.display,
-                first_owner: resolved.first_owner,
+                display,
+                first_owner,
                 answer: None,
             },
         );
-        Ok(OwnerConfirmationRequestResult {
-            request,
-            initial_bootstrap,
-        })
+    }
+
+    /// Issues the challenge for an effect whose caller presents the owner's proof itself: the
+    /// project service's decisions about repository locations.
+    ///
+    /// The challenge is this host's like every other: in the same ledger, with the same lifetime,
+    /// and listed by `owner.confirmation.pending` with what it approves, so an owner device reads
+    /// exactly what it is asked to sign. The service keeps its own action identity, so no pairing
+    /// action is recorded for it. A host with no owner device refuses it, because nothing on the
+    /// host could answer it: the terminal bootstrap establishes the first owner and confirms
+    /// nothing else.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HOST_NOT_CONFIGURED` for a host with no owner device, and an error when the random
+    /// generator or the records are unavailable.
+    pub fn challenge(&self, resolved: Resolved) -> Result<OwnerConfirmationRequest> {
+        if self.owner_devices()?.is_empty() {
+            return Err(ControllerError::NotConfigured(
+                "this host has no owner device to confirm this; pair one first".to_owned(),
+            ));
+        }
+        let request = request_confirmation(
+            &self.clock,
+            resolved.action,
+            resolved.digest,
+            resolved.destination,
+            resolved.rights.iter().copied().collect(),
+            self.host_device_id,
+            self.host_endpoint_id,
+        )
+        .map_err(refusal)?;
+        let mut state = self.state();
+        self.sweep(&mut state);
+        self.issue(&mut state, &request, resolved.display, false);
+        Ok(request)
+    }
+
+    /// Returns whether the ledger still holds exactly this challenge, inside its deadline.
+    ///
+    /// The deadline is the ledger's own, on the machine's continuous clock and bound to this boot,
+    /// so a wall clock moved back does not keep a challenge alive.
+    #[must_use]
+    pub fn outstanding(&self, request: &OwnerConfirmationRequest) -> bool {
+        let mut state = self.state();
+        self.sweep(&mut state);
+        state.ledger.outstanding(request.confirmation_id) == Some(request)
+    }
+
+    /// Verifies a proof a caller presents for an effect: an answer to an outstanding challenge
+    /// that equals `expectation`, signed by a live owner device of this host after its own
+    /// ceremony. Nothing is spent.
+    ///
+    /// The signers are the ones every other confirmation on this host is verified against: the
+    /// authorisation keys of the live paired devices whose grant holds `host.manage` and is in
+    /// force. A key the caller presents is never one, and neither is the terminal bootstrap.
+    ///
+    /// # Errors
+    ///
+    /// Returns `OWNER_CONFIRMATION_REQUIRED` for a challenge that is not this one or not
+    /// outstanding, another channel than an owner device's, or a signer that is not an owner
+    /// device, and `PAIRING_AUTH_FAILED` when the signature fails.
+    pub fn verify_presented(
+        &self,
+        expectation: &ConfirmationExpectation<'_>,
+        proof: &OwnerConfirmationProof,
+    ) -> Result<()> {
+        expectation.require(&proof.request).map_err(refusal)?;
+        if !matches!(
+            proof.channel,
+            ConfirmationChannel::OwnerDevicePresence | ConfirmationChannel::PairedOwnerDevice
+        ) {
+            return Err(confirmation_required(
+                "this is confirmed by an owner device's own ceremony and nothing else",
+            ));
+        }
+        let signer = self.owner_device_key(proof.signer_key_id)?;
+        let mut state = self.state();
+        self.sweep(&mut state);
+        if state.ledger.outstanding(proof.request.confirmation_id) != Some(&proof.request) {
+            return Err(confirmation_required(
+                "that challenge is not outstanding on this host",
+            ));
+        }
+        verify_confirmation(
+            &self.clock,
+            &proof.request,
+            proof,
+            &signer,
+            HostEnrolment::Enrolled,
+        )
+        .map_err(refusal)
+    }
+
+    /// Spends a presented proof for `effect`, once, immediately before the effect.
+    ///
+    /// Authority can change between the verification and the spend, so the signer is looked up
+    /// among the owner devices again, the proof verified again and the challenge consumed; the
+    /// consumption is then written to the acceptance record, whose transaction reads the signer's
+    /// authority once more. A crash between the two wastes the confirmation and never leaves an
+    /// effect without its record.
+    ///
+    /// # Errors
+    ///
+    /// Returns `OWNER_CONFIRMATION_REQUIRED` when the proof no longer answers an outstanding
+    /// challenge equal to `expectation` or its signer is no longer an owner device, and a registry
+    /// error when the consumption cannot be recorded.
+    pub fn spend_presented(
+        &self,
+        expectation: &ConfirmationExpectation<'_>,
+        proof: &OwnerConfirmationProof,
+        effect: &str,
+    ) -> Result<()> {
+        if !matches!(
+            proof.channel,
+            ConfirmationChannel::OwnerDevicePresence | ConfirmationChannel::PairedOwnerDevice
+        ) {
+            return Err(confirmation_required(
+                "this is confirmed by an owner device's own ceremony and nothing else",
+            ));
+        }
+        let signer = self.owner_device_key(proof.signer_key_id)?;
+        let mut state = self.state();
+        kr_pairing::confirm::accept_confirmation(
+            &mut state.ledger,
+            &self.clock,
+            &proof.request,
+            proof,
+            &signer,
+            HostEnrolment::Enrolled,
+            expectation,
+        )
+        .map_err(refusal)?;
+        state
+            .entries
+            .remove(proof.request.confirmation_id.get().as_bytes());
+        drop(state);
+        self.rows.record_consumed(proof, effect, kr_ipc::now_ms())
+    }
+
+    /// Returns the authorisation key of the live owner device whose key `signer` identifies.
+    fn owner_device_key(&self, signer: KeyId) -> Result<AuthorisationKey> {
+        self.owner_devices()?
+            .into_iter()
+            .find(|device| key_id(&device.authorisation) == signer)
+            .map(|device| device.authorisation)
+            .ok_or_else(|| confirmation_required("the signer is not an owner device of this host"))
     }
 
     /// Returns the answer an action that already asked for a challenge is owed, when it did.

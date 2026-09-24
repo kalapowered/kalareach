@@ -1411,7 +1411,10 @@ revoking authority must never turn into a weaker way to confirm.
 
 **Owner confirmations.** Six actions need a fresh confirmation bound to the exact action. A caller
 asks with `owner.confirmation.request`, naming a subject; the host fills in the action, the digest,
-the destination keys and the rights itself. `owner.confirmation.pending` lists what an owner can
+the destination keys and the rights itself. The project service's location decisions are confirmed
+by the same owner devices: their challenges are issued in the same ledger and listed the same way,
+and the proof the caller presents with the decision is checked against the owner device that
+signed it, then spent into the same acceptance record. `owner.confirmation.pending` lists what an owner can
 still answer, with the full grant and, for a device, its keys and verification value, to the local
 owner and to paired devices holding `host.manage`. `owner.confirmation.complete` verifies a proof
 against an enrolled signer (a live paired device holding `host.manage`, on an owner-device channel)
@@ -1477,8 +1480,9 @@ rendezvous service and answers a code invitation with `RENDEZVOUS_CONFIG_ERROR`.
 
 **Records.** The pairing records are tables in the registry database, written through the device
 directory's connection: `pairing_invitations` (never the code or the direct secret),
-`pairing_commitments`, `pairing_events`, `host_owner` and `owner_confirmations`, the acceptance
-record of each confirmation answered and the effect that consumed it. A completed pairing writes the
+`pairing_commitments`, `pairing_events`, `host_owner`, `owner_confirmations`, the acceptance
+record of each confirmation answered and the effect that consumed it, and `pairing_actions`, the
+action identifiers the pairing mutations were answered under. A completed pairing writes the
 device row, its commitment, its security event and its confirmation's consumption in one
 transaction. A daemon that starts cancels every invitation it left unfinished before it serves
 anything; the consumed state and the failed-confirmation count stay.

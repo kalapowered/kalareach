@@ -26,26 +26,29 @@
 //! And it lends the service this host's owner. Authorising a location and binding a repository to
 //! one enlarge what this host will do, so the owner confirms each through the ceremony this host
 //! already runs for its other sensitive actions: a challenge bound to the exact digest, the rights,
-//! this host and a short expiry, answered under the enrolled owner signer and spent once. A host
-//! with no enrolled owner confirms nothing and authorises nothing.
+//! this host and a short expiry, signed by one of this host's owner devices and spent once. A host
+//! that is not on the network, or has no owner device yet, confirms nothing and authorises nothing.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
-use kr_pairing::confirm::{ConfirmationExpectation, ConfirmationLedger, HostEnrolment};
-use kr_pairing::platform::PairingClock;
+use kr_pairing::confirm::ConfirmationExpectation;
 use kr_project::ProjectService;
 use kr_project::policy::{Enlargement, OwnerAuthority};
 use kr_project::store::{Action, RetainedOutcome};
+use kr_protocol::confirmation::{ConfirmationDisplay, DescribedAction};
 use kr_protocol::envelope::{
     ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::{ActorId, DeviceId, GrantId, RequestId};
+use kr_protocol::ids::{ActorId, GrantId, RequestId};
 use kr_protocol::method::{Method, MethodGroup};
 use kr_protocol::pairing::{OwnerConfirmationProof, OwnerConfirmationRequest, SensitiveAction};
-use kr_protocol::scalars::{AuthorisationKey, EndpointKey};
+use kr_protocol::rights::ActionRight;
+use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable};
 
 use crate::error::{ControllerError, Result};
+use crate::service::net::owner::Resolved;
+use crate::service::net::pairing::PairingHost;
 
 /// What a project call answers with: the method's result, or the refusal the service decided.
 pub type Answer<T> = std::result::Result<T, ProtocolError>;
@@ -66,66 +69,44 @@ const CHALLENGE_SWEEP: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// This host's owner, as the project service's location decisions reach it.
 ///
-/// The challenge is issued, verified and spent here, against this host's own ledger, identity and
-/// enrolled signer. A challenge the caller made up, one issued for another digest, another set of
-/// rights or another host, one that has run out and one already spent are all refused before the
-/// service acts.
+/// It is the owner every other sensitive action on this host is confirmed by: the owner devices the
+/// pairing service enrolled, the live paired devices whose grant holds `host.manage` and is in
+/// force. The challenge is issued in that service's ledger and listed to those devices with what it
+/// approves. A proof is verified against the owner device whose key it names, while that device is
+/// still one, and the spend is checked against current authority again and written to the same
+/// acceptance record before the service acts. A challenge the caller made up, one issued for
+/// another digest, another set of rights or another host, one that has run out, one already spent
+/// and one signed by anything but an owner device are all refused.
 pub struct HostOwner {
-    host_device_id: DeviceId,
-    host_endpoint_id: EndpointKey,
-    signer: AuthorisationKey,
-    enrolment: HostEnrolment,
-    clock: Arc<dyn PairingClock + Send + Sync>,
-    ledger: Mutex<ConfirmationLedger>,
+    pairing: Arc<PairingHost>,
 }
 
 impl std::fmt::Debug for HostOwner {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("HostOwner")
-            .field("host_device_id", &self.host_device_id)
-            .field("enrolment", &self.enrolment)
+            .field("host_device_id", &self.pairing.identity().device_id)
             .finish_non_exhaustive()
     }
 }
 
 impl HostOwner {
-    /// Builds the owner a network registration enrolled.
+    /// Lends the project service the owner confirmations of this host's pairing service.
     #[must_use]
-    pub fn new(
-        host_device_id: DeviceId,
-        host_endpoint_id: EndpointKey,
-        signer: AuthorisationKey,
-        enrolment: HostEnrolment,
-        clock: Arc<dyn PairingClock + Send + Sync>,
-    ) -> Self {
-        Self {
-            host_device_id,
-            host_endpoint_id,
-            signer,
-            enrolment,
-            clock,
-            ledger: Mutex::new(ConfirmationLedger::new()),
-        }
+    pub const fn new(pairing: Arc<PairingHost>) -> Self {
+        Self { pairing }
     }
 
-    fn ledger(&self) -> std::sync::MutexGuard<'_, ConfirmationLedger> {
-        self.ledger
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// What a challenge for this enlargement has to say, member for member.
-    fn expectation<'a>(&self, enlargement: &'a Enlargement) -> ConfirmationExpectation<'a> {
-        ConfirmationExpectation {
-            action: SensitiveAction::EnlargeGrant,
-            action_digest: enlargement.action_digest,
-            host_device_id: self.host_device_id,
-            host_endpoint_id: self.host_endpoint_id,
-            // An owner location sends authority to no device, so its challenge names none.
-            destination_keys: None,
-            destination_rights: &enlargement.rights,
-        }
+    /// What a challenge for an owner location's enlargement has to say, member for member.
+    fn expectation<'a>(
+        &self,
+        action_digest: Digest256,
+        rights: &'a CanonicalSet<ActionRight>,
+    ) -> ConfirmationExpectation<'a> {
+        // An owner location sends authority to no device, so its challenge names none.
+        self.pairing
+            .owner()
+            .expectation(SensitiveAction::EnlargeGrant, action_digest, None, rights)
     }
 }
 
@@ -134,28 +115,27 @@ impl OwnerAuthority for HostOwner {
         &self,
         enlargement: &Enlargement,
     ) -> std::result::Result<OwnerConfirmationRequest, ProtocolError> {
-        let request = kr_pairing::confirm::request_confirmation(
-            self.clock.as_ref(),
-            SensitiveAction::EnlargeGrant,
-            enlargement.action_digest,
-            None,
-            enlargement.rights.iter().copied().collect(),
-            self.host_device_id,
-            self.host_endpoint_id,
-        )
-        .map_err(|error| refused(&error))?;
-        let mut ledger = self.ledger();
-        ledger.expire(self.clock.as_ref());
-        ledger.issue(&request, self.clock.as_ref());
-        Ok(request)
+        self.pairing
+            .owner()
+            .challenge(Resolved {
+                action: SensitiveAction::EnlargeGrant,
+                digest: enlargement.action_digest,
+                destination: None,
+                rights: enlargement.rights.clone(),
+                // What an owner device shows the owner before it signs.
+                display: ConfirmationDisplay::Described(DescribedAction {
+                    action: SensitiveAction::EnlargeGrant,
+                    action_digest: enlargement.action_digest,
+                    destination_keys: Nullable::null(),
+                    destination_rights: enlargement.rights.clone(),
+                }),
+                first_owner: false,
+            })
+            .map_err(|error| error.to_protocol_error())
     }
 
     fn outstanding(&self, request: &OwnerConfirmationRequest) -> bool {
-        let mut ledger = self.ledger();
-        // The ledger's own deadline, on the machine's continuous clock and bound to this boot, is
-        // the one that decides: a wall clock moved back does not keep a challenge alive.
-        ledger.expire(self.clock.as_ref());
-        ledger.outstanding(request.confirmation_id) == Some(request)
+        self.pairing.owner().outstanding(request)
     }
 
     fn verify(
@@ -163,31 +143,30 @@ impl OwnerAuthority for HostOwner {
         enlargement: &Enlargement,
         proof: &OwnerConfirmationProof,
     ) -> std::result::Result<(), ProtocolError> {
-        self.expectation(enlargement)
-            .require(&proof.request)
-            .map_err(|error| refused(&error))?;
-        // The ledger's own copy has to be the challenge presented, so a challenge the caller
-        // composed is refused before its signature is believed.
-        if !self.outstanding(&proof.request) {
-            return Err(refused(
-                &kr_pairing::PairingError::OwnerConfirmationRequired,
-            ));
-        }
-        kr_pairing::confirm::verify_confirmation(
-            self.clock.as_ref(),
-            &proof.request,
-            proof,
-            // This host's own enrolled signer, never one the proof supplies.
-            &self.signer,
-            self.enrolment,
-        )
-        .map_err(|error| refused(&error))
+        self.pairing
+            .owner()
+            .verify_presented(
+                &self.expectation(enlargement.action_digest, &enlargement.rights),
+                proof,
+            )
+            .map_err(|error| error.to_protocol_error())
     }
 
     fn consume(&self, proof: &OwnerConfirmationProof) -> std::result::Result<(), ProtocolError> {
-        self.ledger()
-            .consume(&proof.request, self.clock.as_ref())
-            .map_err(|error| refused(&error))
+        // The proof was verified against the enlargement it answers. The spend holds it to an
+        // owner location's shape and to the ledger's own copy of the challenge, and checks the
+        // signer's authority again.
+        self.pairing
+            .owner()
+            .spend_presented(
+                &self.expectation(
+                    proof.request.action_digest,
+                    &proof.request.destination_rights,
+                ),
+                proof,
+                "project.location",
+            )
+            .map_err(|error| error.to_protocol_error())
     }
 }
 
@@ -246,8 +225,8 @@ impl ProjectModule {
     /// # Errors
     ///
     /// Returns [`ControllerError::NotConfigured`] when there is no runtime to sweep on, or when an
-    /// owner is already enrolled: a host has one owner signer, and a second enrolment would be a
-    /// second authority over the same decisions.
+    /// owner is already enrolled: a host has one owner, and a second enrolment would be a second
+    /// authority over the same decisions.
     pub fn enrol_owner(&self, owner: Arc<HostOwner>) -> Result<()> {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             ControllerError::NotConfigured(
@@ -593,14 +572,6 @@ impl ProjectModule {
         })
         .await
     }
-}
-
-/// The owner-confirmation refusal a caller is told, under the ceremony's own code.
-fn refused(error: &kr_pairing::PairingError) -> ProtocolError {
-    ProtocolError::new(
-        error.code(),
-        format!("the owner's confirmation does not authorise this: {error}"),
-    )
 }
 
 /// Performs one of the owner's two confirmed location decisions.

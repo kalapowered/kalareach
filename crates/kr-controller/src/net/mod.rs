@@ -914,6 +914,14 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
             "this daemon is already on the network".to_owned(),
         ));
     }
+    // The project service's location decisions are confirmed by this host's owner devices, the
+    // owner every other sensitive action here is confirmed by. There is one owner, lent once, with
+    // the network that holds its devices.
+    controller
+        .project
+        .enrol_owner(Arc::new(crate::project::HostOwner::new(Arc::clone(
+            &host.pairing,
+        ))))?;
     let mut config = ListenerConfig::new(
         setup.settings.endpoint,
         HostEpochs {

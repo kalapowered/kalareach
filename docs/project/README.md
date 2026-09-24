@@ -86,11 +86,17 @@ repository operation on this host, so there is nothing such a location could adm
 opens the path, holds that handle beside a challenge whose digest covers the request and the
 identity it read through the handle, and answers with the challenge, as
 `{"confirmation_required": {"request": …}}`. Nothing durable is written, and a repeat of the same
-request under the same action identifier is given the same challenge. The owner is shown the
-rights a location carries, `project.create` and `workspace.manage`, and signs. The same action
-submitted again with that proof authorises the directory the held handle is: the proof is checked,
-the action is claimed in the journal before the challenge is spent, and the location, the outbox
-row that announces it and the answer commit in one transaction. A copy of that submission arriving
+request under the same action identifier is given the same challenge. The owner confirms it on an
+owner device, one of this host's live paired devices whose grant holds `host.manage`: the challenge
+is listed by `owner.confirmation.pending` with the rights a location carries, `project.create` and
+`workspace.manage`, and the device signs it after its own ceremony. A host with no owner device
+issues no challenge and answers `HOST_NOT_CONFIGURED`; nothing else confirms a location, neither
+the terminal bootstrap nor a key the caller presents. The same action submitted again with that
+proof authorises the directory the held handle is: the proof is checked against the owner device
+that signed it, the action is claimed in the journal before the challenge is spent, the owner
+device's authority is checked again as it is spent and the spending is written to the host's
+acceptance record, and the location, the outbox row that announces it and the answer commit in one
+transaction. A copy of that submission arriving
 meanwhile waits for it and is given its answer, and a repeat after it is answered from the record.
 A challenge lives as long as the daemon's own ledger keeps it, at most 32 are outstanding at once,
 and a restart drops the challenges with the handles they held.
@@ -828,7 +834,8 @@ names for the owner.
 | `OUTCOME_UNKNOWN` | An interrupted publication this host cannot resolve, a reconciliation a daemon ended in the middle of, or an action a copy of itself is still performing |
 | `UPSTREAM_UNAVAILABLE` | A Git invocation failed, ran past its deadline, or produced more output than the host accepts |
 | `QUOTA_EXCEEDED` | An inclusion that would copy more than the host moves without being asked |
-| `HOST_NOT_CONFIGURED` | Installed Git is missing or older than the profile needs |
+| `OWNER_CONFIRMATION_REQUIRED` | A location decision whose proof is not an owner device's answer to the challenge it was given, or whose owner device is no longer one |
+| `HOST_NOT_CONFIGURED` | Installed Git is missing or older than the profile needs; a location decision on a host with no owner device to confirm it |
 | `STORAGE_UNAVAILABLE` | The journal or the service's own directories |
 
 ## Change sets

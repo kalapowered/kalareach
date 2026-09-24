@@ -822,11 +822,8 @@ impl Controller {
         let _ = controller.power_state().await;
         // The network comes up last. A paired device must not reach a daemon that has not yet
         // recovered its reservations and rebuilt its worker directory, because it would be told
-        // that sessions this host is running do not exist.
-        //
-        // No owner is lent to the project service here: this host's owners are its paired owner
-        // devices, and the project service confirms under one enrolled signer. Its location
-        // decisions are refused until one is enrolled, rather than taken under whoever calls.
+        // that sessions this host is running do not exist. Registering it also lends the project
+        // service this host's owner, its owner devices, for its location decisions.
         if let Some(setup) =
             net::NetworkSetup::from_environment(&controller.paths, controller.secret_store())?
         {
@@ -839,34 +836,6 @@ impl Controller {
         // nothing at all.
         controller.automation.start();
         Ok(controller)
-    }
-
-    /// Lends the project service this host's owner, so the owner's own decisions about repository
-    /// locations can be confirmed, and returns the owner it enrolled.
-    ///
-    /// The owner is the one a network registration enrolled: the same signer, the same host
-    /// identity and endpoint, and the same pairing clock, with a challenge ledger of its own. A
-    /// daemon started with a network of a caller's own making enrols it with this.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when an owner is already enrolled, or when there is no runtime for the
-    /// sweep that lets go of the challenges nobody answers.
-    pub fn enrol_project_owner(
-        &self,
-        network: &net::Network,
-        signer: kr_protocol::scalars::AuthorisationKey,
-        enrolment: kr_pairing::confirm::HostEnrolment,
-    ) -> Result<Arc<crate::project::HostOwner>> {
-        let owner = Arc::new(crate::project::HostOwner::new(
-            self.host_device_id(),
-            network.endpoint_id(),
-            signer,
-            enrolment,
-            Arc::new(net::pairing::HostPairingClock::new(&self.boot_identity)),
-        ));
-        self.project.enrol_owner(Arc::clone(&owner))?;
-        Ok(owner)
     }
 
     /// Resolves every create that a previous daemon did not finish.
