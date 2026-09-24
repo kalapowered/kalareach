@@ -603,8 +603,9 @@ A collection two or more devices share is named by a `sync::membership::Collecti
 installation that started it, its home, and the collection. The `_shared` calls address one:
 `exchange_shared`, `status_shared`, `fence_shared`, `compare_shared` and `resolve_shared`. Every one
 names the home, every write names the key epoch its object is sealed under, and the per-object
-name this crate gives an object names it inside the collection. They answer with
-`services::Keyed`, which adds the two answers a shared collection gives beside the usual ones:
+name this crate gives an object names it inside the collection. A write, its status query and its
+fence answer with `services::Keyed`, which adds the two answers a shared collection gives beside
+the usual ones:
 
 - `Retired`, for a write sealed under an epoch the collection has retired. Nothing was stored or
   held, the refusal names the collection's epoch and revision, and it is the request's receipt, so
@@ -614,24 +615,44 @@ name this crate gives an object names it inside the collection. They answer with
   installation; the service answers both the same way. A member removed after it sent a request
   is still answered about that request.
 
-Every other answer names where the collection's key records stood, `services::KeyHead`, so a
-device holding an older record knows to fetch the ones after it. The epoch is part of what a write
-asks, so a retry names the epoch the first attempt named and is answered from the receipt, whatever
-the collection's epoch has become; a write under a new identity and the retired epoch meets the
-refusal. For a collection only its home writes, neither answer can be the service's, and both
-stay errors.
+A comparison and a resolution answer nothing for such a collection, and otherwise the comparison
+and the resolution the unshared calls give.
+
+An answer names where the collection's key records stood, `services::KeyHead`, when the service
+named it: a write and a comparison in a collection a key record has claimed, and a status query or
+fence about a receipt that recorded it. A status query about an identity nothing was recorded for,
+a fence that has just been made and a resolution name none. A device holding an older record than a named head knows to fetch the ones
+after it. The epoch is part of what a write asks, so a retry names the epoch the first attempt named
+and is answered from the receipt, whatever the collection's epoch has become; a write under a new
+identity and the retired epoch meets the refusal. For a collection only its home writes, neither
+answer can be the service's, and both stay errors.
+
+The service answers a comparison sixty-four objects at a time and names every object the
+collection holds. `compare_shared` takes what the reader holds, each object at the revision it
+holds it at, which the service leaves out, and follows the pages until nothing the collection names
+is missing, naming at each page what the ones before brought. It stops at a page that brings
+nothing while something is missing, and after `MAX_COMPARISON_PAGES` pages of a collection that
+keeps moving.
 
 `ManagedSyncService` is also the membership's `KeyRecordService`. A read of key records names the
 home and follows every page to the newest, handing the records over as the service answered them,
 because whether they form a chain is for the reader to establish; it stops following a page that
 does not move on, and at `MAX_KEY_RECORDS_READ` records. The offer of a record carries its request
-identity, its home and the record exactly as it was signed, and a record the service would refuse
-for its collection, its home or its structure never leaves the device; its status and fence read
-the receipt of the offer, and one that names a write is an answer about another request.
-`memberships` lists the shared collections whose newest record names this installation, page by
-page, from an index that can be behind and admits nobody. `inventory` reads every object and every
-copy a shared collection holds, each with the epoch it is sealed under, page by page to the end,
-which is what a member reads before it forgets an old epoch's key.
+identity, its home and the record exactly as it was signed. A record the service would refuse for
+its collection, its home, its structure or a revision or epoch past what the service compares
+exactly never leaves the device. Its status and fence read the receipt of the offer, and one that
+names a write is an answer about another request. `memberships` lists the shared collections whose
+newest record names this installation, page by page, from an index that can be behind and admits
+nobody.
+
+`inventory` reads what a shared collection holds, each with the epoch it is sealed under: every
+object, and its copies of refused writes, page by page. A collection keeps copies until a person
+chooses about them, including copies of objects it no longer holds, so their number has no bound
+this client can state, and each page carries the copies' content. A read therefore stops at the
+number of pages its caller gives it and names the cursor it stopped at; the caller continues from
+there, handing back what it has, until the read reaches the end. That is what a member reads before
+it forgets an old epoch's key, and only a read that reached the end can show that nothing is sealed
+under one.
 
 A field left `None` is a service this client does not use, and nothing degrades. Direct connections,
 local sessions, drafts, plugins, local descriptions and user-operated alternatives need none of
