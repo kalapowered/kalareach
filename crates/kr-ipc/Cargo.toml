@@ -38,9 +38,11 @@ testing = []
 kr-ipc = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
-# The workspace forbids unsafe code, which a crate that reads the machine's own interrupt-time
-# counter cannot honour. This crate denies it instead and allows it in exactly one module,
-# `clock::windows`, which owns that single call. Nothing else in this crate may relax the rule.
+# The workspace forbids unsafe code, which a crate that asks the Windows kernel directly cannot
+# honour. This crate denies it instead and allows it in exactly three Windows modules, each of which
+# says why: `clock::windows` (the interrupt-time counter), `paths::windows` (owner-only access-control
+# lists) and `identity::process_times` (a process's creation time and whether it has exited).
+# Nothing else in this crate may relax the rule.
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "deny"

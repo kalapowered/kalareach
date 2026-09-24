@@ -17,10 +17,10 @@
 //! identifier. Every call there refuses and says so, because a host that is handed a stub is a
 //! host that believes something nobody established.
 //!
-//! The Windows values come from `sysinfo`, which reports the boot time as the wall clock minus the
-//! uptime and the creation time in whole seconds. Both are coarser than the kernel's own values;
-//! the Windows qualification pass narrows them, and a Windows worker's per-session Job Object
-//! carries the ownership a recycled identifier could otherwise confuse.
+//! The Windows boot time comes from `sysinfo`, which reports it as the wall clock minus the uptime.
+//! A process's creation time comes from the kernel, through `GetProcessTimes`, which records it in
+//! hundreds of nanoseconds; the start value keeps its whole seconds. A Windows worker's per-session
+//! Job Object carries the ownership a recycled identifier could otherwise confuse.
 
 use kr_protocol::identity::{BootIdentity, ProcessStartIdentity, ProcessStartSource};
 // Only a platform that produces a boot identity names where it came from. The Apple mobile
@@ -70,8 +70,8 @@ pub fn boot_epoch(identity: &BootIdentity) -> Result<BootEpoch> {
 ///
 /// Three answers, and only one of them is "gone". Each platform decides which of the three it has
 /// where it reads the process, from the reading itself: a missing `/proc` entry on Linux, the
-/// kernel's "no such process" on macOS, and on Windows a process table that was read and does not
-/// list the identifier. A query that failed is never turned into absence afterwards. It
+/// kernel's "no such process" on macOS, and on Windows the kernel's refusal to open an identifier
+/// no process holds. A query that failed is never turned into absence afterwards. It
 /// establishes nothing, and a host that read it as a process that had ended would release a session
 /// identity, take over a journal or pass over a live worker while the process was still running.
 #[derive(Debug)]
@@ -818,7 +818,10 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
-    use super::{BootIdentity, BootIdentitySource, ProcessStartSource, Result, unavailable};
+    use super::{
+        BootIdentity, BootIdentitySource, ProcessQuery, ProcessStartSource, ProcessState, Result,
+        WindowsReading, process_times, unavailable,
+    };
 
     pub(super) fn processes_in_group(_group: u32) -> Result<Vec<u32>> {
         // Windows has no process group to enumerate. A worker's descendants are held by its job
@@ -848,99 +851,250 @@ mod platform {
     }
 
     /// Where this platform's start value comes from.
-    pub(super) const START_IDENTITY_SOURCE: ProcessStartSource =
-        ProcessStartSource::WindowsProcessStartSeconds;
+    pub(super) const START_IDENTITY_SOURCE: ProcessStartSource = super::WINDOWS_START_SOURCE;
 
     /// Returns whether a process whose identity still matches is running.
     ///
-    /// The reading that matched came from the process table, which does not keep a process that
-    /// has exited, so there is nothing further to ask.
-    pub(super) const fn liveness(_pid: u32, _start_value: u64) -> super::ProcessState {
-        super::ProcessState::Running
+    /// The kernel keeps describing a process that has exited for as long as anything holds it
+    /// open, and its identifier stays with it until then, so a reading that matched does not say
+    /// the process is still running. It is opened again, and the one handle answers both halves:
+    /// that it is still the process that was recorded, which a process that ended and was replaced
+    /// between the two openings is not, and whether it has exited.
+    pub(super) fn liveness(pid: u32, start_value: u64) -> ProcessState {
+        let (reading, process) = look(pid);
+        match super::windows_answer(pid, reading, process_times::now()) {
+            ProcessQuery::Present(current) if current.start_value.get() == start_value => {
+                match process.map(|process| process.has_exited()) {
+                    Some(Ok(false)) => ProcessState::Running,
+                    Some(Ok(true)) => ProcessState::Ended,
+                    Some(Err(error)) => ProcessState::Unknown {
+                        detail: format!("pid {pid}: whether it has exited: {error}"),
+                    },
+                    // A reading that described the process came through a handle to it.
+                    None => ProcessState::Unknown {
+                        detail: format!("pid {pid}: described without a handle"),
+                    },
+                }
+            }
+            ProcessQuery::Present(_) | ProcessQuery::Gone => ProcessState::Ended,
+            ProcessQuery::CannotEstablish(error) => ProcessState::Unknown {
+                detail: error.to_string(),
+            },
+        }
     }
 
-    pub(super) fn query_process(pid: u32) -> super::ProcessQuery {
-        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
+    pub(super) fn query_process(pid: u32) -> ProcessQuery {
+        let (reading, _) = look(pid);
+        super::windows_answer(pid, reading, process_times::now())
+    }
 
-        // The table is read with this process in it as well as the one asked about. `sysinfo`
-        // answers a table it could not read with nothing at all, which looks exactly like a table
-        // without the process asked about; a table that was read always lists the process reading
-        // it, so this is what tells the two apart.
-        //
-        // Each identifier is named once, and nothing is removed from what the reading found: the
-        // table starts empty, so there is nothing to remove, and `sysinfo` removing an identifier it
-        // was given twice would drop this process from a reading that listed it.
-        let own = sysinfo::Pid::from_u32(std::process::id());
-        let target = sysinfo::Pid::from_u32(pid);
-        let both = [target, own];
-        let asked: &[sysinfo::Pid] = if target == own { &both[1..] } else { &both };
-        let mut system = sysinfo::System::new();
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::Some(asked),
-            false,
-            ProcessRefreshKind::nothing(),
-        );
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |since| since.as_secs());
-        super::windows_answer(
-            pid,
-            system.process(own).is_some(),
-            system.process(target).map(sysinfo::Process::start_time),
-            now,
-        )
+    /// Opens one process and reads its creation time, keeping the handle for a second question.
+    fn look(pid: u32) -> (WindowsReading, Option<process_times::Process>) {
+        match process_times::open(pid) {
+            process_times::Opened::Absent => (WindowsReading::Absent, None),
+            process_times::Opened::Failed(error) => (WindowsReading::Failed(error), None),
+            process_times::Opened::Process(process) => match process.created() {
+                Ok(created) => (WindowsReading::Created(created), Some(process)),
+                Err(error) => (
+                    WindowsReading::Failed(format!("its times could not be read: {error}")),
+                    None,
+                ),
+            },
+        }
     }
 }
 
-/// How far past the wall clock a Windows start value may lie and still be a reading, in seconds.
+/// The one place in this module that leaves safe Rust: opening a Windows process and reading its
+/// times.
 ///
-/// A process starts before anyone asks about it, so a start value after the current time is a
+/// The crate denies unsafe code and relaxes the rule here, beside `clock::windows` and
+/// `paths::windows`, because the kernel's record of when a process was created, and whether it has
+/// exited, are `kernel32` calls with no safe interface. The handle is owned as soon as it exists,
+/// so every path closes it.
+#[cfg(windows)]
+mod process_times {
+    #![expect(
+        unsafe_code,
+        reason = "a process's creation time and whether it has exited are kernel32 calls, which have \
+                  no safe interface"
+    )]
+
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+
+    use windows_sys::Win32::Foundation::{
+        ERROR_INVALID_PARAMETER, FILETIME, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        WaitForSingleObject,
+    };
+
+    /// One process, opened for the two questions asked of it.
+    pub(super) struct Process(OwnedHandle);
+
+    /// What opening a process by its identifier produced.
+    pub(super) enum Opened {
+        /// The process, open.
+        Process(Process),
+        /// No process holds the identifier.
+        Absent,
+        /// The kernel would not open it, for the reason given.
+        Failed(String),
+    }
+
+    /// Opens the process holding `pid`, with the right to ask its times and the right to wait on
+    /// it.
+    ///
+    /// Only one refusal says that nothing holds the identifier: the kernel's invalid-parameter
+    /// answer, which is what it gives for an identifier no process has. A refusal of access is a
+    /// process that is there, and so is every other failure as far as this can tell.
+    pub(super) fn open(pid: u32) -> Opened {
+        // SAFETY: the call takes three plain values and returns either a new handle the caller
+        // owns or null; it has no other effect.
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(code) if u32::try_from(code) == Ok(ERROR_INVALID_PARAMETER) => Opened::Absent,
+                _ => Opened::Failed(format!("the process could not be opened: {error}")),
+            };
+        }
+        // SAFETY: the handle was returned open by the call above, and nothing else owns it.
+        Opened::Process(Process(unsafe { OwnedHandle::from_raw_handle(handle) }))
+    }
+
+    impl Process {
+        /// Returns when the kernel recorded the process's creation, as a `FILETIME`: hundreds of
+        /// nanoseconds since the start of 1601, UTC.
+        pub(super) fn created(&self) -> std::io::Result<u64> {
+            let mut creation = FILETIME::default();
+            let mut exit = FILETIME::default();
+            let mut kernel = FILETIME::default();
+            let mut user = FILETIME::default();
+            // SAFETY: the handle is open for as long as `self` is, with the right this call needs,
+            // and each pointer is to a live local of the structure the call writes.
+            let read = unsafe {
+                GetProcessTimes(
+                    self.0.as_raw_handle(),
+                    &raw mut creation,
+                    &raw mut exit,
+                    &raw mut kernel,
+                    &raw mut user,
+                )
+            };
+            if read == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
+        }
+
+        /// Returns whether the process has exited, without waiting for it to.
+        pub(super) fn has_exited(&self) -> std::io::Result<bool> {
+            // SAFETY: the handle is open for as long as `self` is, with the right to wait on it,
+            // and a zero timeout returns at once.
+            match unsafe { WaitForSingleObject(self.0.as_raw_handle(), 0) } {
+                WAIT_OBJECT_0 => Ok(true),
+                WAIT_TIMEOUT => Ok(false),
+                _ => Err(std::io::Error::last_os_error()),
+            }
+        }
+    }
+
+    /// Returns the wall clock as a `FILETIME`, the unit a creation time is read in.
+    pub(super) fn now() -> u64 {
+        let since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| {
+                u64::try_from(since.as_nanos() / 100).unwrap_or(u64::MAX)
+            });
+        since.saturating_add(super::UNIX_EPOCH_AS_FILETIME)
+    }
+}
+
+/// Where the start value of a Windows reading comes from.
+const WINDOWS_START_SOURCE: ProcessStartSource = ProcessStartSource::WindowsProcessStartSeconds;
+
+/// The Unix epoch as a `FILETIME`: hundreds of nanoseconds from the start of 1601 to the start of
+/// 1970, UTC.
+const UNIX_EPOCH_AS_FILETIME: u64 = 116_444_736_000_000_000;
+
+/// Hundreds of nanoseconds in one second, the unit a `FILETIME` counts.
+const FILETIME_UNITS_PER_SECOND: u64 = 10_000_000;
+
+/// How far past the wall clock a Windows creation time may lie and still be a reading, in the unit
+/// a `FILETIME` counts.
+///
+/// A process starts before anyone asks about it, so a creation time after the current time is a
 /// clock stepped back since the process started, or a value nobody read. A day covers any ordinary
 /// correction of the clock; a value further ahead establishes nothing.
-#[cfg(any(windows, test))]
-const WINDOWS_START_AHEAD_SECONDS: u64 = 24 * 60 * 60;
+const WINDOWS_START_AHEAD: u64 = 24 * 60 * 60 * FILETIME_UNITS_PER_SECOND;
 
-/// Decides what one reading of the Windows process table says about `pid`.
+/// What the Windows kernel said about one process identifier, as it said it.
 ///
-/// `listed_self` is whether the reading listed the process that took it. Every reading that
-/// happened lists at least that one, so a reading that did not list it did not happen: the query
-/// failed, and a process missing from it says nothing.
+/// The reader on that platform produces one of these for every question it asks, and
+/// [`windows_answer`] decides what it means. It is public so that a decision built on a reading can
+/// be checked with a reading injected, on any platform: no real kernel gives a failed reading, a
+/// creation time of zero, or two processes created within one second under one identifier, on
+/// request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WindowsReading {
+    /// The kernel opened the process and gave its creation time, as a `FILETIME`: hundreds of
+    /// nanoseconds since the start of 1601, UTC.
+    Created(u64),
+    /// The kernel has no process under the identifier.
+    Absent,
+    /// The kernel did not answer, for the reason given, so the reading did not happen.
+    Failed(String),
+}
+
+/// Decides what one reading of a Windows process says about `pid`.
 ///
-/// `start` is the start value of `pid` when the reading listed it, in seconds since the epoch, and
-/// `now` is the wall clock in the same unit. Two start values are not readings, so neither
-/// identifies the process. `sysinfo` gives zero when it could not open the process to ask when it
-/// started. And when the operating system opened it but would not give its times, `sysinfo`
-/// subtracts the epoch offset from zero: a build with overflow checks stops there, and any other
-/// wraps round to a value near the top of the range, far past the wall clock.
-///
-/// It is its own function so the decision can be checked with a failed reading injected, on any
-/// platform, which no real process table produces on request.
-#[cfg(any(windows, test))]
-fn windows_answer(pid: u32, listed_self: bool, start: Option<u64>, now: u64) -> ProcessQuery {
-    if !listed_self {
+/// A reading that did not happen establishes nothing, and a process it did not find is not taken
+/// to have gone. Nor is a creation time that is not one: zero, which the kernel never records for
+/// a process it created; one before 1970, which no process this host asks about has; and one past
+/// `now`, the wall clock in the same unit, by more than a day, which is a clock stepped back
+/// further than any ordinary correction or a value nobody read. Every other creation time is the
+/// process's start value.
+#[must_use]
+pub fn windows_answer(pid: u32, reading: WindowsReading, now: u64) -> ProcessQuery {
+    let created = match reading {
+        WindowsReading::Absent => return ProcessQuery::Gone,
+        WindowsReading::Failed(why) => {
+            return ProcessQuery::CannotEstablish(unavailable(
+                "process start identity",
+                format!("pid {pid}: {why}"),
+            ));
+        }
+        WindowsReading::Created(created) => created,
+    };
+    if created == 0 {
         return ProcessQuery::CannotEstablish(unavailable(
             "process start identity",
-            format!("pid {pid}: the process table could not be read"),
+            format!("pid {pid}: the operating system would not say when it started"),
         ));
     }
-    match start {
-        None => ProcessQuery::Gone,
-        Some(0) => ProcessQuery::CannotEstablish(unavailable(
-            "process start identity",
-            format!("pid {pid}: the operating system would not say when it started"),
-        )),
-        Some(start) if start > now.saturating_add(WINDOWS_START_AHEAD_SECONDS) => {
-            ProcessQuery::CannotEstablish(unavailable(
+    let since_epoch = match created.checked_sub(UNIX_EPOCH_AS_FILETIME) {
+        Some(since) if created <= now.saturating_add(WINDOWS_START_AHEAD) => since,
+        _ => {
+            return ProcessQuery::CannotEstablish(unavailable(
                 "process start identity",
-                format!("pid {pid}: a start time of {start} is not a time it could have started"),
-            ))
+                format!(
+                    "pid {pid}: a creation time of {created} is not a time it could have started"
+                ),
+            ));
         }
-        Some(start) => ProcessQuery::Present(ProcessStartIdentity::new(
-            u64::from(pid),
-            ProcessStartSource::WindowsProcessStartSeconds,
-            start,
-        )),
-    }
+    };
+    ProcessQuery::Present(ProcessStartIdentity::new(
+        u64::from(pid),
+        WINDOWS_START_SOURCE,
+        since_epoch / FILETIME_UNITS_PER_SECOND,
+    ))
 }
 
 #[cfg(test)]
@@ -1137,86 +1291,108 @@ mod tests {
         );
     }
 
+    /// A `FILETIME` a number of whole seconds after the Unix epoch.
+    fn filetime_at(seconds: u64) -> u64 {
+        UNIX_EPOCH_AS_FILETIME + seconds * FILETIME_UNITS_PER_SECOND
+    }
+
     #[test]
-    fn a_windows_table_that_could_not_be_read_is_not_an_absent_process() {
+    fn a_windows_reading_that_did_not_happen_is_not_an_absent_process() {
         let pid = 4242;
-        let now = 1_800_000_000;
-        let started = 1_700_000_000;
-        // `sysinfo` answers a table it could not read with nothing at all. The process asking is
-        // missing from it too, and that is what marks the reading as one that did not happen.
-        let unread = windows_answer(pid, false, None, now);
+        let now = filetime_at(1_800_000_000);
+        let started = filetime_at(1_700_000_000);
+        // The kernel would not open the process, or would not give its times: the reading did not
+        // happen, and a process it did not find is not a process that has gone.
+        let unread = windows_answer(
+            pid,
+            WindowsReading::Failed("Access is denied.".to_owned()),
+            now,
+        );
         assert!(
-            matches!(unread, ProcessQuery::CannotEstablish(_)),
+            matches!(unread, ProcessQuery::CannotEstablish(ref error) if error.to_string().contains("Access is denied")),
             "a failed reading is not an absent process: {unread:?}"
         );
-        assert!(matches!(
-            windows_answer(pid, false, Some(started), now),
-            ProcessQuery::CannotEstablish(_)
-        ));
         // Carried through to what a session guard asks, the failed reading refuses rather than
         // passing over the worker it was asked about.
-        let recorded = ProcessStartIdentity::new(
-            u64::from(pid),
-            ProcessStartSource::WindowsProcessStartSeconds,
-            started,
-        );
+        let recorded = match windows_answer(pid, WindowsReading::Created(started), now) {
+            ProcessQuery::Present(identity) => identity,
+            other => panic!("a creation time is a start value: {other:?}"),
+        };
+        assert_eq!(recorded.pid.get(), u64::from(pid));
+        assert_eq!(recorded.source, WINDOWS_START_SOURCE);
+        let failed = || WindowsReading::Failed("the kernel did not answer".to_owned());
         assert!(matches!(
-            state_from(&recorded, pid, windows_answer(pid, false, None, now)),
+            state_from(&recorded, pid, windows_answer(pid, failed(), now)),
             ProcessState::Unknown { .. }
         ));
-        assert!(started_from(pid, windows_answer(pid, false, None, now)).is_err());
+        assert!(started_from(pid, windows_answer(pid, failed(), now)).is_err());
 
-        // A table that was read and does not list the process: it has gone.
+        // The kernel has no process under the identifier: it has gone.
         assert!(matches!(
-            windows_answer(pid, true, None, now),
+            windows_answer(pid, WindowsReading::Absent, now),
             ProcessQuery::Gone
         ));
         assert_eq!(
-            state_from(&recorded, pid, windows_answer(pid, true, None, now)),
+            state_from(
+                &recorded,
+                pid,
+                windows_answer(pid, WindowsReading::Absent, now)
+            ),
             ProcessState::Ended
         );
-        // Listed, but with a start value nobody read: zero, when the process could not be opened,
-        // and the epoch offset subtracted from zero, when its times could not be read. Neither
-        // identifies the process, and nothing is concluded from comparing it.
-        for unreadable in [0, 0_u64.wrapping_sub(11_644_473_600)] {
+        // Opened, with a creation time that is not one: zero, which the kernel never records for a
+        // process it created, and one before 1970. Neither identifies the process, and nothing is
+        // concluded from comparing it.
+        for unreadable in [0, UNIX_EPOCH_AS_FILETIME - 1] {
+            let answer = || windows_answer(pid, WindowsReading::Created(unreadable), now);
             assert!(
-                matches!(
-                    windows_answer(pid, true, Some(unreadable), now),
-                    ProcessQuery::CannotEstablish(_)
-                ),
-                "{unreadable} is not a start time"
+                matches!(answer(), ProcessQuery::CannotEstablish(_)),
+                "{unreadable} is not a creation time"
             );
             assert!(matches!(
-                state_from(
-                    &recorded,
-                    pid,
-                    windows_answer(pid, true, Some(unreadable), now)
-                ),
+                state_from(&recorded, pid, answer()),
                 ProcessState::Unknown { .. }
             ));
-            assert!(started_from(pid, windows_answer(pid, true, Some(unreadable), now)).is_err());
+            assert!(started_from(pid, answer()).is_err());
         }
-        // Listed with its start value: the process, and the one recorded when the values agree.
+        // The first instant of 1970 is a time a process could have started.
         assert!(matches!(
-            windows_answer(pid, true, Some(started), now),
+            windows_answer(pid, WindowsReading::Created(UNIX_EPOCH_AS_FILETIME), now),
+            ProcessQuery::Present(_)
+        ));
+        // Opened with its creation time: the process, and the one recorded when the values agree.
+        assert!(matches!(
+            windows_answer(pid, WindowsReading::Created(started), now),
             ProcessQuery::Present(identity) if identity == recorded
         ));
         assert_eq!(
             state_from(
                 &recorded,
                 pid,
-                windows_answer(pid, true, Some(started + 1), now)
+                windows_answer(
+                    pid,
+                    WindowsReading::Created(started + FILETIME_UNITS_PER_SECOND),
+                    now
+                )
             ),
             ProcessState::Ended,
-            "another start value is another process"
+            "a process created a second later is another process"
         );
         // A clock stepped back since the process started still identifies it, within a day.
         assert!(matches!(
-            windows_answer(pid, true, Some(now + 60), now),
+            windows_answer(
+                pid,
+                WindowsReading::Created(now + 60 * FILETIME_UNITS_PER_SECOND),
+                now
+            ),
             ProcessQuery::Present(_)
         ));
         assert!(matches!(
-            windows_answer(pid, true, Some(now + WINDOWS_START_AHEAD_SECONDS + 1), now),
+            windows_answer(
+                pid,
+                WindowsReading::Created(now + WINDOWS_START_AHEAD + 1),
+                now
+            ),
             ProcessQuery::CannotEstablish(_)
         ));
     }
