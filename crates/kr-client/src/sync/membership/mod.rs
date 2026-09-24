@@ -60,7 +60,7 @@
 //! | Row | When | What it does |
 //! | --- | --- | --- |
 //! | 1 | A dispatched candidate | Takes its answer, or settles it by status and then fence; when the fence cannot say it never ran, reads the record after its base, makes it the head and drops the candidate. A candidate that did not apply leaves with its key withdrawn |
-//! | 2 | A record after the installed one leaves this device out, or the service answers the collection as absent or with a chain this device cannot follow | Out at once: every pending change ends as refused and an undispatched candidate goes. A dispatched one stays, and is settled first, by status and fence, with nothing sent and no head moved; then the collection's keys are forgotten, one epoch a write |
+//! | 2 | A record after the installed one leaves this device out, or the service answers the collection as absent, with a chain this device cannot follow, or put back without this device's head | Out at once: every pending change ends as refused and an undispatched candidate goes. A dispatched one stays, and is settled first, by status and fence, with nothing sent and no head moved; then the collection's keys are forgotten, one epoch a write |
 //! | 3 | A join awaits the owner | Nothing until the owner confirms the join on this device, once row 2's settling and forgetting are done |
 //! | 4 | A record after the installed one is accepted | Stores its key when its epoch is new, then records it as installed |
 //! | 5 | No candidate, the head installed, and a pending change it carries out | Ends the change as done when the head was fetched after it was recorded; otherwise waits for a fetch |
@@ -70,6 +70,32 @@
 //!
 //! Publication into the collection is open only while no removal is pending, no candidate stands,
 //! no join awaits the owner and the head is installed ([`SyncMembership::publishes`]).
+//!
+//! # A collection put back
+//!
+//! A service restored from an archive puts every collection back as the archive held it, under a
+//! recovery identity of its own, and every key-record answer names the history it is in.
+//! Revisions compare only within one history, so the file records the one its records were read
+//! in: the history a claim applied in, for a collection this device starts; the history of the
+//! chain a join verified; and none for a collection never put back, and for a file written before
+//! histories were recorded, which is how this device read the collection then.
+//!
+//! An answer from another history changes nothing until this device reads the collection again
+//! there, in the same step and under the same hold of the file: the record at its head and the
+//! records after it, both in that history. Found there with its own bytes, the head proves that
+//! the records up to it are the ones this device holds, since each names the digest of the one
+//! before it, so the file moves to that history and takes the records after the head as a refresh
+//! takes them. Missing, or another record in its place, the head is one the archive did not keep,
+//! and a record the restore lost may have removed a device: this device is out at once, as row 2
+//! leaves, with a dispatched candidate kept for settlement, until the owner confirms a join. Two
+//! reads answered from two histories record nothing, and the operation is asked again. Row 1
+//! settles only from answers in the history the file records: an answer to the one send that
+//! arrives from another is dropped, and the status is asked instead.
+//!
+//! A membership listing is the service's index, and each entry names a history too. An entry in
+//! another history than the one this device holds, whatever revision it names, or at a later
+//! revision in the same one, is news: a reason to refresh, and nothing more
+//! ([`crate::services::MembershipListing::names_news`]).
 //!
 //! # Stated limits
 //!
@@ -112,7 +138,7 @@ use plans::Plans;
 use reconciler::Reconciler;
 
 use crate::error::ClientError;
-use crate::services::ServiceFuture;
+use crate::services::{ServiceFuture, SyncRecoveryId};
 use crate::sync::keys::StoredCollectionKeys;
 
 /// A collection two or more devices share: the service's collection in its home's namespace.
@@ -252,7 +278,13 @@ pub trait DeviceDirectory: Send + Sync + std::fmt::Debug {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KeyRecords<R = CollectionKeyRecord> {
     /// The records after the revision asked about, in order.
-    Records(Vec<R>),
+    Records {
+        /// The records.
+        records: Vec<R>,
+        /// The history they are records of: the recovery the collection named, or none for a
+        /// collection never put back.
+        recovery: Option<SyncRecoveryId>,
+    },
     /// The collection does not exist, or this device is not a member: the service answers both
     /// the same way.
     Absent,
@@ -262,9 +294,17 @@ pub enum KeyRecords<R = CollectionKeyRecord> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecordAt<R = CollectionKeyRecord> {
     /// The record.
-    Record(R),
+    Record {
+        /// The record.
+        record: R,
+        /// The history it is a record of.
+        recovery: Option<SyncRecoveryId>,
+    },
     /// The collection holds no record at that revision yet.
-    Missing,
+    Missing {
+        /// The history that holds none.
+        recovery: Option<SyncRecoveryId>,
+    },
     /// The collection does not exist, or this device is not a member.
     Absent,
 }
@@ -276,12 +316,27 @@ pub enum RekeyAnswer {
     Applied {
         /// The record's revision.
         revision: u64,
+        /// The history that revision is in, as the collection stands when it answers.
+        recovery: Option<SyncRecoveryId>,
     },
     /// The record was refused; the service names its own revision.
     Refused {
         /// The collection's revision.
         revision: u64,
+        /// The history that revision is in.
+        recovery: Option<SyncRecoveryId>,
     },
+}
+
+impl RekeyAnswer {
+    /// Returns the history this answer came from: the recovery it named, or none for a
+    /// collection never put back.
+    #[must_use]
+    pub const fn recovery(&self) -> Option<SyncRecoveryId> {
+        match self {
+            Self::Applied { recovery, .. } | Self::Refused { recovery, .. } => *recovery,
+        }
+    }
 }
 
 /// What the service recorded about one `rekey`.
@@ -291,19 +346,42 @@ pub enum RekeyStatus {
     Applied {
         /// The record's revision.
         revision: u64,
+        /// The history that revision is in, as the collection stands now: a restored collection's
+        /// history begins with what the archive held, its receipts included.
+        recovery: Option<SyncRecoveryId>,
     },
     /// Refused.
     Refused {
         /// The collection's revision when it was refused.
         revision: u64,
+        /// The history that revision is in.
+        recovery: Option<SyncRecoveryId>,
     },
     /// The service holds no receipt for it.
-    Unknown,
+    Unknown {
+        /// The history that holds none.
+        recovery: Option<SyncRecoveryId>,
+    },
     /// It was fenced before it ran.
     Fenced {
         /// Whether the service also established that it never ran.
         never_ran: bool,
+        /// The history the fence is recorded in.
+        recovery: Option<SyncRecoveryId>,
     },
+}
+
+impl RekeyStatus {
+    /// Returns the history this answer came from.
+    #[must_use]
+    pub const fn recovery(&self) -> Option<SyncRecoveryId> {
+        match self {
+            Self::Applied { recovery, .. }
+            | Self::Refused { recovery, .. }
+            | Self::Unknown { recovery }
+            | Self::Fenced { recovery, .. } => *recovery,
+        }
+    }
 }
 
 /// What the service answered when asked to fence one `rekey`.
@@ -313,18 +391,37 @@ pub enum RekeyFence {
     Applied {
         /// The record's revision.
         revision: u64,
+        /// The history that revision is in.
+        recovery: Option<SyncRecoveryId>,
     },
     /// It had already been refused.
     Refused {
         /// The collection's revision when it was refused.
         revision: u64,
+        /// The history that revision is in.
+        recovery: Option<SyncRecoveryId>,
     },
     /// It is fenced: nothing will run under its identity.
     Fenced {
         /// Whether the service also established that it never ran. False when a receipt it
-        /// would have had has passed the service's retention.
+        /// would have had has passed the service's retention, and for thirty days after a
+        /// restore for anything signed before it.
         never_ran: bool,
+        /// The history the fence is recorded in.
+        recovery: Option<SyncRecoveryId>,
     },
+}
+
+impl RekeyFence {
+    /// Returns the history this answer came from.
+    #[must_use]
+    pub const fn recovery(&self) -> Option<SyncRecoveryId> {
+        match self {
+            Self::Applied { recovery, .. }
+            | Self::Refused { recovery, .. }
+            | Self::Fenced { recovery, .. } => *recovery,
+        }
+    }
 }
 
 /// Where a collection's key records are kept, beside the collection, for the collection's life.
@@ -412,6 +509,10 @@ pub enum Step {
     },
     /// Row 1 settled the dispatched candidate.
     Settled(Settlement),
+    /// Row 1 met an answer from a collection put back under another recovery that holds this
+    /// device's head: the records it holds are read in that history now, and the next step
+    /// settles the candidate there.
+    Followed,
     /// Row 2: this device is out of the collection; a join awaits the owner.
     Left,
     /// This device forgot one epoch's key of a collection it left.
@@ -459,6 +560,9 @@ pub enum Refreshed {
     /// The service answered with a chain this device cannot follow: it is out until the owner
     /// confirms a join.
     BrokenChain,
+    /// The collection was put back under another recovery without the record this device holds
+    /// as its head: it is out until the owner confirms a join.
+    PutBack,
     /// This device is out of the collection; a join awaits the owner.
     Out,
     /// This device holds no collection.
@@ -544,6 +648,10 @@ pub enum MembershipError {
     /// Another handle on this membership is in the middle of an operation; try again.
     #[error("another operation on this device's membership is under way")]
     Busy,
+    /// The collection was put back again while this device read it, so two of its answers came
+    /// from two histories. Nothing was recorded; try again.
+    #[error("the collection was put back again while this device read it")]
+    PutBackWhileRead,
     /// The keys of a collection this device left are still being forgotten, a step each; a new
     /// membership is recorded only after them.
     #[error("the keys of the collection this device left are not all forgotten yet")]
@@ -598,6 +706,9 @@ pub struct MembershipStatus {
     pub installed: Option<(u64, u64)>,
     /// The head's revision.
     pub head: u64,
+    /// The history the records this device holds were read in: the recovery the collection
+    /// named, or none for a collection never put back.
+    pub recovery: Option<SyncRecoveryId>,
     /// The installed record's members.
     pub members: Vec<MemberStatus>,
     /// The pending removals.
@@ -704,7 +815,9 @@ impl SyncMembership {
     ///
     /// # Errors
     ///
-    /// A storage, key or service failure. Nothing was written when a step fails.
+    /// A storage, key or service failure, or [`MembershipError::PutBackWhileRead`] when the
+    /// collection was put back again between two of the step's reads. Nothing was written when a
+    /// step fails.
     pub async fn step(&mut self, now: TimestampMs) -> Result<Step, MembershipError> {
         self.reconciler.step(now).await
     }
@@ -752,7 +865,8 @@ impl SyncMembership {
     ///
     /// # Errors
     ///
-    /// A storage or service failure.
+    /// A storage or service failure, or [`MembershipError::PutBackWhileRead`] when the collection
+    /// was put back again between two of the refresh's reads; nothing was written then.
     pub async fn refresh(&mut self) -> Result<Refreshed, MembershipError> {
         self.reconciler.refresh().await
     }
@@ -971,6 +1085,7 @@ impl SyncMembership {
             installed: installed
                 .map(|record| (DeviceKinds::epoch(record), DeviceKinds::revision(record))),
             head: facts.head,
+            recovery: facts.recovery.0,
             members,
             removals: facts.removals.iter().copied().collect(),
             addition: facts.addition,

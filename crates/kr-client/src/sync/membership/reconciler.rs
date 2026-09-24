@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use kr_protocol::scalars::{TimestampMs, Uuid};
+use kr_protocol::scalars::{Nullable, TimestampMs, Uuid};
 
 use super::environment::{Environment, MarkOf, MemberOf, RecordOf};
 use super::facts::{Candidate, Change, Ended, Facts, Kinds, Outcome, Rule, View, weakened};
@@ -17,6 +17,7 @@ use super::{
     CollectionRef, KeyRecords, MembershipError, PlanRefusal, RecordAt, Refreshed, RekeyAnswer,
     RekeyFence, RekeyStatus, Settlement, Step,
 };
+use crate::services::SyncRecoveryId;
 
 /// The facts, and the mark of the key the store holds for each epoch it holds one for.
 pub(crate) type Held<E> = (Facts<<E as Environment>::Kinds>, BTreeMap<u64, MarkOf<E>>);
@@ -385,43 +386,59 @@ impl<E: Environment> Reconciler<E> {
         }
     }
 
-    /// How a dispatched candidate settles: by its answer when one arrived, otherwise by what the
-    /// service recorded, and failing that by the fence, which always ends the request.
+    /// How a dispatched candidate settles, and the history of the answer that says so: by its
+    /// answer when one arrived, otherwise by what the service recorded, and failing that by the
+    /// fence, which always ends the request.
+    ///
+    /// An answer to the send that arrived from another history than the one the records were
+    /// read in is dropped as late: the status says what became of the request in the collection
+    /// as it stands.
     async fn settlement_of(
         &mut self,
         facts: &Facts<E::Kinds>,
         candidate: &Candidate<RecordOf<E>, MarkOf<E>>,
         signed_at: TimestampMs,
-    ) -> Result<Settle, MembershipError> {
+    ) -> Result<(Settle, Option<SyncRecoveryId>), MembershipError> {
         let request = candidate.request;
         if let Some((id, answer)) = self.inbox.take()
             && id == request
+            && facts.follows(answer.recovery())
         {
-            return Ok(match answer {
-                RekeyAnswer::Applied { revision } => Settle::Applied(revision),
-                RekeyAnswer::Refused { revision } => Settle::Refused(revision),
-            });
+            let settle = match answer {
+                RekeyAnswer::Applied { revision, .. } => Settle::Applied(revision),
+                RekeyAnswer::Refused { revision, .. } => Settle::Refused(revision),
+            };
+            return Ok((settle, answer.recovery()));
         }
-        Ok(
-            match self.env.rekey_status(&facts.collection, request).await? {
-                RekeyStatus::Applied { revision } => Settle::Applied(revision),
-                RekeyStatus::Refused { revision } => Settle::Refused(revision),
-                RekeyStatus::Fenced { never_ran: true } => Settle::Fenced,
-                RekeyStatus::Fenced { never_ran: false } => Settle::Unknown,
-                RekeyStatus::Unknown => {
-                    match self
-                        .env
-                        .rekey_fence(&facts.collection, request, signed_at, signed_at)
-                        .await?
-                    {
-                        RekeyFence::Applied { revision } => Settle::Applied(revision),
-                        RekeyFence::Refused { revision } => Settle::Refused(revision),
-                        RekeyFence::Fenced { never_ran: true } => Settle::Fenced,
-                        RekeyFence::Fenced { never_ran: false } => Settle::Unknown,
-                    }
-                }
-            },
-        )
+        let status = self.env.rekey_status(&facts.collection, request).await?;
+        let settle = match status {
+            RekeyStatus::Applied { revision, .. } => Settle::Applied(revision),
+            RekeyStatus::Refused { revision, .. } => Settle::Refused(revision),
+            RekeyStatus::Fenced {
+                never_ran: true, ..
+            } => Settle::Fenced,
+            RekeyStatus::Fenced {
+                never_ran: false, ..
+            } => Settle::Unknown,
+            RekeyStatus::Unknown { .. } => {
+                let fence = self
+                    .env
+                    .rekey_fence(&facts.collection, request, signed_at, signed_at)
+                    .await?;
+                let settle = match fence {
+                    RekeyFence::Applied { revision, .. } => Settle::Applied(revision),
+                    RekeyFence::Refused { revision, .. } => Settle::Refused(revision),
+                    RekeyFence::Fenced {
+                        never_ran: true, ..
+                    } => Settle::Fenced,
+                    RekeyFence::Fenced {
+                        never_ran: false, ..
+                    } => Settle::Unknown,
+                };
+                return Ok((settle, fence.recovery()));
+            }
+        };
+        Ok((settle, status.recovery()))
     }
 
     /// Records the key of a candidate that settled without applying as withdrawn: its wraps left
@@ -446,7 +463,12 @@ impl<E: Environment> Reconciler<E> {
         if !answered && weakened(Rule::ResendAfterRestart) {
             return self.send(&facts, signed_at).await;
         }
-        let settle = self.settlement_of(&facts, &candidate, signed_at).await?;
+        let (settle, mut history) = self.settlement_of(&facts, &candidate, signed_at).await?;
+        // Nothing settles from another history than the one the records were read in until this
+        // device reads the collection again there.
+        if !facts.follows(history) {
+            return self.follow(facts, history).await;
+        }
         let me = self.env.me();
         let before = facts.outcomes.len();
         let mut next = facts.clone();
@@ -473,10 +495,18 @@ impl<E: Environment> Reconciler<E> {
                 // the fence now stops it from ever replacing.
                 let base = <E::Kinds as Kinds>::revision(&candidate.record) - 1;
                 let read = match self.env.record_at(&facts.collection, base + 1).await? {
-                    RecordAt::Record(record) => Some(record),
+                    RecordAt::Record { recovery, .. } | RecordAt::Missing { recovery }
+                        if !facts.follows(recovery) =>
+                    {
+                        return self.follow(facts, recovery).await;
+                    }
+                    RecordAt::Record { record, recovery } => {
+                        history = recovery;
+                        Some(record)
+                    }
                     // A first record that never applied leaves no collection behind it.
-                    RecordAt::Missing | RecordAt::Absent if base == 0 => None,
-                    RecordAt::Missing => None,
+                    RecordAt::Missing { .. } | RecordAt::Absent if base == 0 => None,
+                    RecordAt::Missing { .. } => None,
                     RecordAt::Absent => {
                         Self::withdraw(&mut next, &candidate);
                         next.leave();
@@ -510,8 +540,92 @@ impl<E: Environment> Reconciler<E> {
                 Settlement::ReadAfterBase { revision }
             }
         };
+        // Either the history the records were read in already, or, for a first record, the one
+        // its claim settled in.
+        next.recovery = Nullable(history);
         self.commit(before, next)?;
         Ok(Step::Settled(settlement))
+    }
+
+    /// Row 1 met an answer from another history than the one the records were read in: the
+    /// collection was put back. Nothing settles from it until this device reads the collection
+    /// again there, in this step: the records after the head and the record at the head, both in
+    /// that history. With its own head found there, the records move to that history, the ones
+    /// after the head are taken as a refresh takes them, and the next step settles the candidate
+    /// there. Otherwise this device is out at once, as row 2 leaves, with the dispatched
+    /// candidate kept for settlement.
+    async fn follow(
+        &mut self,
+        facts: Facts<E::Kinds>,
+        answered: Option<SyncRecoveryId>,
+    ) -> Result<Step, MembershipError> {
+        let before = facts.outcomes.len();
+        let mut next = facts.clone();
+        let followed = match self
+            .env
+            .records_after(&facts.collection, facts.head)
+            .await?
+        {
+            KeyRecords::Records { records, recovery } if recovery == answered => {
+                if self.holds_head(&facts, answered).await? {
+                    next.recovery = Nullable(answered);
+                    self.link(&mut next, records)
+                } else {
+                    false
+                }
+            }
+            KeyRecords::Records { .. } => return Err(MembershipError::PutBackWhileRead),
+            KeyRecords::Absent => false,
+        };
+        if !followed {
+            let mut left = facts;
+            left.leave();
+            self.inbox = None;
+            self.commit(before, left)?;
+            return Ok(Step::Left);
+        }
+        next.record_answers(&self.env.me(), false);
+        self.commit(before, next)?;
+        Ok(Step::Followed)
+    }
+
+    /// Whether the collection holds this device's head in the history an answer named: the same
+    /// record at the same revision, which makes the records up to it the ones this device holds,
+    /// since each names the digest of the one before it. It says nothing of the records after it.
+    ///
+    /// An answer from a third history is no answer: the collection was put back again while this
+    /// device read it, so nothing is recorded and the operation is asked again.
+    async fn holds_head(
+        &self,
+        facts: &Facts<E::Kinds>,
+        answered: Option<SyncRecoveryId>,
+    ) -> Result<bool, MembershipError> {
+        match self.env.record_at(&facts.collection, facts.head).await? {
+            RecordAt::Record { record, recovery } if recovery == answered => {
+                Ok(facts.head_record() == Some(&record))
+            }
+            RecordAt::Missing { recovery } if recovery == answered => Ok(false),
+            RecordAt::Absent => Ok(false),
+            RecordAt::Record { .. } | RecordAt::Missing { .. } => {
+                Err(MembershipError::PutBackWhileRead)
+            }
+        }
+    }
+
+    /// Takes records into the window after the head, each checked to follow the one before it
+    /// (check 2). False at the first that does not: a chain this device cannot follow, and the
+    /// caller leaves from the facts it read rather than from these.
+    fn link(&self, facts: &mut Facts<E::Kinds>, records: Vec<RecordOf<E>>) -> bool {
+        for record in records {
+            let follows = facts.head.checked_add(1) == Some(<E::Kinds as Kinds>::revision(&record))
+                && self.links(facts, &record);
+            if !follows {
+                return false;
+            }
+            let mark = self.env.mark_of(&record);
+            facts.push(record, mark);
+        }
+        true
     }
 
     /// What a device that is out still does, a step at a time: settle a dispatched candidate,
@@ -527,7 +641,8 @@ impl<E: Environment> Reconciler<E> {
             && let Some(signed_at) = candidate.dispatched
             && !facts.unsettleable()
         {
-            let settle = self.settlement_of(&facts, &candidate, signed_at).await?;
+            // Whatever history answers: nothing learnt here moves a head.
+            let (settle, _) = self.settlement_of(&facts, &candidate, signed_at).await?;
             let mut next = facts.clone();
             next.candidate = None;
             // A fence that cannot say whether the request ran still stops it for good. Nothing
@@ -605,22 +720,19 @@ impl<E: Environment> Reconciler<E> {
             // at the service yet, which is no answer about this device's membership.
             KeyRecords::Absent if facts.head == 0 => None,
             KeyRecords::Absent => Some(Refreshed::Left),
-            KeyRecords::Records(records) => {
-                let mut broken = None;
-                for record in records {
-                    let follows = next.head.checked_add(1)
-                        == Some(<E::Kinds as Kinds>::revision(&record))
-                        && self.links(&next, &record);
-                    if !follows {
-                        // An answer, not a failed fetch: a chain this device cannot follow from
-                        // the revision it holds. It accepts nothing and waits for a rejoin.
-                        broken = Some(Refreshed::BrokenChain);
-                        break;
-                    }
-                    let mark = self.env.mark_of(&record);
-                    next.push(record, mark);
+            // Records from another history than the one the records held were read in follow
+            // only from this device's own head, found there. A collection put back without it
+            // may have lost a record that removed a device, so this device accepts nothing and
+            // waits for a rejoin.
+            KeyRecords::Records { records, recovery } => {
+                if facts.follows(recovery) || self.holds_head(&facts, recovery).await? {
+                    next.recovery = Nullable(recovery);
+                    // An answer, not a failed fetch: a chain this device cannot follow from the
+                    // revision it holds. It accepts nothing and waits for a rejoin.
+                    (!self.link(&mut next, records)).then_some(Refreshed::BrokenChain)
+                } else {
+                    Some(Refreshed::PutBack)
                 }
-                broken
             }
         };
         if let Some(ended) = ended {
@@ -748,7 +860,11 @@ impl<E: Environment> Reconciler<E> {
             .answers()
             .await?
             .ok_or(MembershipError::NoHostAnswered)?;
-        let KeyRecords::Records(chain) = self.env.records_after(&collection, 0).await? else {
+        let KeyRecords::Records {
+            records: chain,
+            recovery,
+        } = self.env.records_after(&collection, 0).await?
+        else {
             return Err(MembershipError::NotListed);
         };
         let Some(first) = chain.first() else {
@@ -806,6 +922,8 @@ impl<E: Environment> Reconciler<E> {
             out: false,
             outcomes,
             unfetched: BTreeSet::new(),
+            // The history of the chain verified here, which every later answer is read against.
+            recovery: Nullable(recovery),
         };
         if let Some(mark) = self.env.mark_of(newest) {
             facts.opened.insert(super::facts::Opened {

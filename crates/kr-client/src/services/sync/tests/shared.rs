@@ -208,7 +208,13 @@ async fn a_read_of_key_records_names_the_home_and_follows_every_page_to_the_newe
         .records_after(&collection, 0)
         .await
         .expect("the records");
-    assert_eq!(read, KeyRecords::Records(chain.to_vec()));
+    assert_eq!(
+        read,
+        KeyRecords::Records {
+            records: chain.to_vec(),
+            recovery: None
+        }
+    );
     assert_eq!(recorder.requests(), 2, "one request a page, to the newest");
     let sent = recorder.last_body();
     assert_eq!(
@@ -258,11 +264,14 @@ async fn a_collection_that_does_not_list_this_device_answers_key_reads_as_absent
             .records_after(&collection, 0)
             .await
             .expect("an answer"),
-        KeyRecords::Records(Vec::new())
+        KeyRecords::Records {
+            records: Vec::new(),
+            recovery: None
+        }
     );
     assert_eq!(
         client.record_at(&collection, 1).await.expect("an answer"),
-        RecordAt::Missing
+        RecordAt::Missing { recovery: None }
     );
 
     // The record at one revision is the first of the records after the one before it.
@@ -278,7 +287,10 @@ async fn a_collection_that_does_not_list_this_device_answers_key_reads_as_absent
     )]);
     assert_eq!(
         client.record_at(&collection, 4).await.expect("an answer"),
-        RecordAt::Record(at_four)
+        RecordAt::Record {
+            record: at_four,
+            recovery: None
+        }
     );
     assert_eq!(recorder.last_body()["keys"]["after_revision"], "3");
 
@@ -315,7 +327,10 @@ async fn a_read_of_key_records_ends_when_a_page_does_not_move_on_or_the_bound_is
             .records_after(&collection, 5)
             .await
             .expect("an answer"),
-        KeyRecords::Records(vec![at_revision(&one, 3)])
+        KeyRecords::Records {
+            records: vec![at_revision(&one, 3)],
+            recovery: None
+        }
     );
     assert_eq!(recorder.requests(), 1);
     recorder.answering(vec![keys_page(&[], true, head)]);
@@ -324,7 +339,10 @@ async fn a_read_of_key_records_ends_when_a_page_does_not_move_on_or_the_bound_is
             .records_after(&collection, 5)
             .await
             .expect("an answer"),
-        KeyRecords::Records(Vec::new())
+        KeyRecords::Records {
+            records: Vec::new(),
+            recovery: None
+        }
     );
     assert_eq!(recorder.requests(), 2);
 
@@ -367,7 +385,10 @@ async fn the_offer_of_a_key_record_carries_its_identity_home_and_record_and_its_
             .rekey(&collection, request, signed_at, &offered)
             .await
             .expect("an answer"),
-        RekeyAnswer::Applied { revision: 2 }
+        RekeyAnswer::Applied {
+            revision: 2,
+            recovery: None
+        }
     );
     let sent = recorder.last();
     assert_eq!(
@@ -398,7 +419,10 @@ async fn the_offer_of_a_key_record_carries_its_identity_home_and_record_and_its_
             .rekey(&collection, request, signed_at, &offered)
             .await
             .expect("an answer"),
-        RekeyAnswer::Refused { revision: 5 }
+        RekeyAnswer::Refused {
+            revision: 5,
+            recovery: None
+        }
     );
 
     // A record applied at another revision than its own is not an answer this client reads.
@@ -516,6 +540,169 @@ async fn every_shared_answer_names_the_history_of_its_revisions() {
     let listed = client.memberships().await.expect("the listing");
     assert_eq!(listed[0].head.recovery, Some(restored));
     assert_eq!(listed[1].head.recovery, None);
+}
+
+#[tokio::test]
+async fn every_key_record_answer_names_the_history_it_is_in() {
+    // A read of key records, the record at one revision, the offer of a record, and the status
+    // and fence of an offer each name the history of the collection that answered, so the
+    // reconciler can hold each of them to the history its records were read in.
+    let (client, recorder) = sync_client();
+    let collection = shared_collection(installation(0x41), 0x42);
+    let restored = super::put_back_by(0xb0);
+    let first = record(&collection, 1, 0);
+    let head = KeyHead {
+        epoch: 0,
+        revision: 1,
+        recovery: Some(restored),
+    };
+    recorder.answering(vec![
+        keys_page(std::slice::from_ref(&first), false, head),
+        keys_page(std::slice::from_ref(&first), false, head),
+        keys_page(&[], false, head),
+    ]);
+    assert_eq!(
+        client
+            .records_after(&collection, 0)
+            .await
+            .expect("the records"),
+        KeyRecords::Records {
+            records: vec![first.clone()],
+            recovery: Some(restored)
+        }
+    );
+    assert_eq!(
+        client.record_at(&collection, 1).await.expect("the record"),
+        RecordAt::Record {
+            record: first,
+            recovery: Some(restored)
+        }
+    );
+    assert_eq!(
+        client.record_at(&collection, 2).await.expect("no record"),
+        RecordAt::Missing {
+            recovery: Some(restored)
+        }
+    );
+
+    let offered = record(&collection, 2, 1);
+    let request = identity(0x51);
+    let offer = |state: &str, revision: &str, epoch: &str| {
+        super::under(
+            serde_json::json!({
+                "state": state,
+                "key_revision": revision,
+                "key_epoch": epoch,
+                "recovery_id": null,
+            }),
+            restored,
+        )
+    };
+    recorder.answering(vec![offer("applied", "2", "1"), offer("refused", "5", "3")]);
+    assert_eq!(
+        client
+            .rekey(&collection, request, now_ms(), &offered)
+            .await
+            .expect("an answer"),
+        RekeyAnswer::Applied {
+            revision: 2,
+            recovery: Some(restored)
+        }
+    );
+    assert_eq!(
+        client
+            .rekey(&collection, request, now_ms(), &offered)
+            .await
+            .expect("an answer"),
+        RekeyAnswer::Refused {
+            revision: 5,
+            recovery: Some(restored)
+        }
+    );
+
+    // A receipt the archive brought back is answered in the history that brought it back, and a
+    // fence of an offer signed before the restore cannot say it never ran.
+    let recorded = Some(KeyHead {
+        epoch: 1,
+        revision: 2,
+        recovery: Some(restored),
+    });
+    let receipts = || {
+        vec![
+            super::under(
+                receipt_status(request, "applied", "rekeyed", recorded, false),
+                restored,
+            ),
+            super::under(
+                receipt_status(request, "refused", "rekey_refused", recorded, false),
+                restored,
+            ),
+            super::under(
+                receipt_status(request, "fenced", "fenced", None, false),
+                restored,
+            ),
+        ]
+    };
+    let mut statuses = receipts();
+    statuses.push(super::under(status(request, "unknown", false), restored));
+    recorder.answering(statuses);
+    let mut answered = Vec::new();
+    for _ in 0..4 {
+        answered.push(
+            client
+                .rekey_status(&collection, request)
+                .await
+                .expect("an answer"),
+        );
+    }
+    assert_eq!(
+        answered,
+        [
+            RekeyStatus::Applied {
+                revision: 2,
+                recovery: Some(restored)
+            },
+            RekeyStatus::Refused {
+                revision: 2,
+                recovery: Some(restored)
+            },
+            RekeyStatus::Fenced {
+                never_ran: false,
+                recovery: Some(restored)
+            },
+            RekeyStatus::Unknown {
+                recovery: Some(restored)
+            },
+        ]
+    );
+    recorder.answering(receipts());
+    let (first_signed, last_signed) = (now_ms() - 2_000, now_ms() - 1_000);
+    let mut fenced = Vec::new();
+    for _ in 0..3 {
+        fenced.push(
+            client
+                .rekey_fence(&collection, request, first_signed, last_signed)
+                .await
+                .expect("an answer"),
+        );
+    }
+    assert_eq!(
+        fenced,
+        [
+            RekeyFence::Applied {
+                revision: 2,
+                recovery: Some(restored)
+            },
+            RekeyFence::Refused {
+                revision: 2,
+                recovery: Some(restored)
+            },
+            RekeyFence::Fenced {
+                never_ran: false,
+                recovery: Some(restored)
+            },
+        ]
+    );
 }
 
 #[tokio::test]
@@ -743,7 +930,8 @@ async fn a_key_record_travels_in_the_json_form_the_vectors_publish() {
                 .await
                 .expect("an answer"),
             RekeyAnswer::Applied {
-                revision: head.revision
+                revision: head.revision,
+                recovery: None
             }
         );
         assert_eq!(
@@ -758,7 +946,10 @@ async fn a_key_record_travels_in_the_json_form_the_vectors_publish() {
                 .records_after(&collection, head.revision - 1)
                 .await
                 .expect("an answer"),
-            KeyRecords::Records(vec![offered])
+            KeyRecords::Records {
+                records: vec![offered],
+                recovery: None
+            }
         );
     }
 }
@@ -808,7 +999,10 @@ async fn the_status_and_fence_of_a_key_record_offer_read_what_its_receipt_record
             .rekey_status(&collection, request)
             .await
             .expect("an answer"),
-        RekeyStatus::Applied { revision: 2 }
+        RekeyStatus::Applied {
+            revision: 2,
+            recovery: None
+        }
     );
     let sent = recorder.last_body();
     assert_eq!(sent["status"]["home"], collection.home.to_string());
@@ -818,21 +1012,27 @@ async fn the_status_and_fence_of_a_key_record_offer_read_what_its_receipt_record
             .rekey_status(&collection, request)
             .await
             .expect("an answer"),
-        RekeyStatus::Refused { revision: 2 }
+        RekeyStatus::Refused {
+            revision: 2,
+            recovery: None
+        }
     );
     assert_eq!(
         client
             .rekey_status(&collection, request)
             .await
             .expect("an answer"),
-        RekeyStatus::Fenced { never_ran: true }
+        RekeyStatus::Fenced {
+            never_ran: true,
+            recovery: None
+        }
     );
     assert_eq!(
         client
             .rekey_status(&collection, request)
             .await
             .expect("an answer"),
-        RekeyStatus::Unknown
+        RekeyStatus::Unknown { recovery: None }
     );
 
     recorder.answering(vec![
@@ -847,7 +1047,10 @@ async fn the_status_and_fence_of_a_key_record_offer_read_what_its_receipt_record
             .rekey_fence(&collection, request, first, last)
             .await
             .expect("an answer"),
-        RekeyFence::Applied { revision: 2 }
+        RekeyFence::Applied {
+            revision: 2,
+            recovery: None
+        }
     );
     let sent = recorder.last_body();
     assert_eq!(sent["fence"]["home"], collection.home.to_string());
@@ -858,14 +1061,20 @@ async fn the_status_and_fence_of_a_key_record_offer_read_what_its_receipt_record
             .rekey_fence(&collection, request, first, last)
             .await
             .expect("an answer"),
-        RekeyFence::Refused { revision: 2 }
+        RekeyFence::Refused {
+            revision: 2,
+            recovery: None
+        }
     );
     assert_eq!(
         client
             .rekey_fence(&collection, request, first, last)
             .await
             .expect("an answer"),
-        RekeyFence::Fenced { never_ran: false }
+        RekeyFence::Fenced {
+            never_ran: false,
+            recovery: None
+        }
     );
 
     // What an offer's identity cannot be answered: a fence that does not know, a write's outcome,

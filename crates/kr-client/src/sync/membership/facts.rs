@@ -14,11 +14,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::hash::Hash;
 
-use kr_protocol::scalars::{TimestampMs, Uuid};
+use kr_protocol::scalars::{Nullable, TimestampMs, Uuid};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::CollectionRef;
+use crate::services::{SyncRecoveryId, names_no_recovery};
 
 /// The shapes a reconciler works over, and the questions about a record that need no key.
 ///
@@ -176,7 +177,8 @@ pub(crate) struct Candidate<R, A> {
 ///
 /// The ten facts of the reconciler, plus what they are read with: the records between the
 /// installed one and the head (the chain check 2 accepted), the issuer that opened each epoch,
-/// and the mark of every key this device opened since its current join (check 5).
+/// the mark of every key this device opened since its current join (check 5), and the history
+/// those records were read in.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(bound = "", deny_unknown_fields)]
 pub(crate) struct Facts<K: Kinds> {
@@ -218,6 +220,12 @@ pub(crate) struct Facts<K: Kinds> {
     pub outcomes: Vec<Outcome<K::Member>>,
     /// The pending changes recorded since the head was last fetched.
     pub unfetched: BTreeSet<Change<K::Member>>,
+    /// The history the records were read in: the recovery the collection named, or none for a
+    /// collection never put back. A file written before histories were recorded names none,
+    /// which is how this device read the collection then, and it is written without the member
+    /// while it names none, so such a file keeps its shape.
+    #[serde(default = "Nullable::null", skip_serializing_if = "names_no_recovery")]
+    pub recovery: Nullable<SyncRecoveryId>,
 }
 
 /// Why a file's facts are not ones any sequence of writes produces.
@@ -255,7 +263,16 @@ impl<K: Kinds> Facts<K> {
             out: false,
             outcomes: Vec::new(),
             unfetched: BTreeSet::new(),
+            // A collection this device starts has no history until its claim applies in one.
+            recovery: Nullable::null(),
         }
+    }
+
+    /// Whether an answer from this history may change the facts: one from the history the
+    /// records were read in, or any while this device holds no record, when there is nothing to
+    /// hold it to.
+    pub(crate) fn follows(&self, answered: Option<SyncRecoveryId>) -> bool {
+        self.head == 0 || self.recovery.0 == answered
     }
 
     /// The revision the record window starts at.

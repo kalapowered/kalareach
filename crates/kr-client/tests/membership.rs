@@ -4,6 +4,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-18.05, settings-sync part (the library path) | `a_production_device_receives_its_key_through_its_own_wrap_and_keeps_it_in_its_store`, `nothing_is_sealed_to_a_device_its_host_has_not_committed` |
+//! | KR-REQ-18.05, settings-sync part across a restore | `a_collection_put_back_without_the_head_this_device_holds_leaves_it_out_until_a_join`, with its control `an_older_revision_in_the_same_history_leaves_the_head_standing`, and the other tests under "A collection put back" |
 //! | KR-REQ-20.11, sync-collection half | `removing_a_device_gives_the_rest_a_key_it_cannot_open`, `every_new_epoch_has_a_freshly_drawn_key`, `publication_stays_fenced_from_a_recorded_removal_until_its_record_is_installed` |
 //! | KR-REQ-20.17, settings part (export and import) | `a_collection_key_is_neither_backed_up_nor_restored`, `a_restore_returns_settings_without_a_key_a_membership_or_a_sync_checkpoint`, `a_restored_device_joins_only_after_a_fresh_authorisation` |
 //!
@@ -18,12 +19,14 @@ use kr_client::recovery::{
     ExportedSettings, FreshRestore, RecoveryError, SETTINGS_FILENAME, export_settings,
     import_settings,
 };
-use kr_client::services::{ServiceFuture, SyncPosition, SyncRevision};
+use kr_client::services::{
+    KeyHead, MembershipListing, ServiceFuture, SyncPosition, SyncRecoveryId, SyncRevision,
+};
 use kr_client::sync::membership::{
     CollectionRef, Device, DeviceDirectory, Ended, HostAnswers, HostDevice, HostReport,
-    KeyRecordService, KeyRecords, MembershipError, Outcome, PLAN_LIFETIME_MS, Plan, PlanRefusal,
-    PlannedOperation, RecordAt, Refreshed, RekeyAnswer, RekeyFence, RekeyStatus, Settlement, Step,
-    SyncMembership,
+    KeyRecordService, KeyRecords, MembershipError, MembershipStatus, Outcome, PLAN_LIFETIME_MS,
+    Plan, PlanRefusal, PlannedOperation, RecordAt, Refreshed, RekeyAnswer, RekeyFence, RekeyStatus,
+    Settlement, Step, SyncMembership,
 };
 use kr_client::sync::{
     PrivacyRecord, SettingValue, StoredCollectionKeys, SyncBody, SyncCheckpoint, SyncError,
@@ -100,6 +103,19 @@ struct ServiceState {
     sends: BTreeMap<[u8; 16], u32>,
     /// Answers a hostile service gives the next reads of records.
     forged: VecDeque<KeyRecords>,
+    /// The history every answer is in: none until a restore puts the service back.
+    recovery: Option<SyncRecoveryId>,
+    /// Requests signed before the latest restore, which a fence cannot say never ran.
+    before_recovery: BTreeSet<[u8; 16]>,
+    /// A restore that happens just before the next read of the record at one revision.
+    restore_before_record_at: Option<(Archive, SyncRecoveryId)>,
+}
+
+/// What an archive of the service holds: every collection's records and every receipt.
+#[derive(Clone, Debug)]
+struct Archive {
+    chains: BTreeMap<CollectionRef, Vec<CollectionKeyRecord>>,
+    receipts: BTreeMap<[u8; 16], Receipt>,
 }
 
 impl ServiceState {
@@ -140,6 +156,17 @@ impl ServiceState {
         };
         self.receipts.insert(key, receipt);
         receipt
+    }
+
+    /// Puts the service back as an archive held it, under a recovery of its own. For thirty days
+    /// a fence answers anything signed before it as possibly run.
+    fn put_back(&mut self, archive: &Archive, recovery: SyncRecoveryId) {
+        self.chains.clone_from(&archive.chains);
+        self.receipts.clone_from(&archive.receipts);
+        self.held.clear();
+        let signed: Vec<[u8; 16]> = self.sends.keys().copied().collect();
+        self.before_recovery.extend(signed);
+        self.recovery = Some(recovery);
     }
 
     /// Whether a caller is a member of the collection's newest record: the service answers a
@@ -217,6 +244,43 @@ impl World {
     fn forge_next(&self, answer: KeyRecords) {
         self.state().forged.push_back(answer);
     }
+
+    /// What an archive taken now would hold.
+    fn archive(&self) -> Archive {
+        let state = self.state();
+        Archive {
+            chains: state.chains.clone(),
+            receipts: state.receipts.clone(),
+        }
+    }
+
+    /// A restore puts the service back as `archive` held it, under the recovery `seed` names.
+    fn put_back(&self, archive: &Archive, seed: u8) -> SyncRecoveryId {
+        let recovery = recovery(seed);
+        self.state().put_back(archive, recovery);
+        recovery
+    }
+
+    /// A restore that happens between the next read of the records after a revision and the read
+    /// of the record at one.
+    fn put_back_before_record_at(&self, archive: &Archive, seed: u8) -> SyncRecoveryId {
+        let recovery = recovery(seed);
+        self.state().restore_before_record_at = Some((archive.clone(), recovery));
+        recovery
+    }
+
+    /// The service answers from an archive's records without a restore: an older revision in
+    /// the same history, which no honest service gives.
+    fn go_back(&self, archive: &Archive) {
+        let mut state = self.state();
+        state.chains.clone_from(&archive.chains);
+        state.receipts.clone_from(&archive.receipts);
+    }
+}
+
+/// The recovery a restore records, named by one byte.
+fn recovery(seed: u8) -> SyncRecoveryId {
+    SyncRecoveryId::new(Uuid::from_bytes([seed; 16]))
 }
 
 /// One device's view of the service: its requests are signed by its authorisation key.
@@ -243,13 +307,14 @@ impl KeyRecordService for ServiceView {
         let answer = if let Some(forged) = state.forged.pop_front() {
             forged
         } else if state.admits(collection, &self.caller) {
-            KeyRecords::Records(
-                state.chains[collection]
+            KeyRecords::Records {
+                records: state.chains[collection]
                     .iter()
                     .filter(|record| record.payload.revision.get() > after)
                     .cloned()
                     .collect(),
-            )
+                recovery: state.recovery,
+            }
         } else {
             KeyRecords::Absent
         };
@@ -261,13 +326,20 @@ impl KeyRecordService for ServiceView {
         collection: &'a CollectionRef,
         revision: u64,
     ) -> ServiceFuture<'a, RecordAt> {
-        let state = self.world.state();
+        let mut state = self.world.state();
+        if let Some((archive, recovery)) = state.restore_before_record_at.take() {
+            state.put_back(&archive, recovery);
+        }
+        let recovery = state.recovery;
         let answer = if state.admits(collection, &self.caller) {
             state.chains[collection]
                 .iter()
                 .find(|record| record.payload.revision.get() == revision)
                 .cloned()
-                .map_or(RecordAt::Missing, RecordAt::Record)
+                .map_or(RecordAt::Missing { recovery }, |record| RecordAt::Record {
+                    record,
+                    recovery,
+                })
         } else {
             RecordAt::Absent
         };
@@ -284,6 +356,7 @@ impl KeyRecordService for ServiceView {
         let mut state = self.world.state();
         *state.sends.entry(*request_id.as_bytes()).or_default() += 1;
         let fate = state.fates.pop_front().unwrap_or(Fate::Answer);
+        let recovery = state.recovery;
         let flight = Flight {
             collection: *collection,
             request: request_id,
@@ -300,8 +373,12 @@ impl KeyRecordService for ServiceView {
                 let receipt = state.take(&flight);
                 match (fate, receipt) {
                     (Fate::LoseAnswer, _) => Err(lost()),
-                    (_, Receipt::Applied(revision)) => Ok(RekeyAnswer::Applied { revision }),
-                    (_, Receipt::Refused(revision)) => Ok(RekeyAnswer::Refused { revision }),
+                    (_, Receipt::Applied(revision)) => {
+                        Ok(RekeyAnswer::Applied { revision, recovery })
+                    }
+                    (_, Receipt::Refused(revision)) => {
+                        Ok(RekeyAnswer::Refused { revision, recovery })
+                    }
                     (_, Receipt::Fenced { .. }) => Err(ClientError::Host(ProtocolError::new(
                         ErrorCode::IdConflict,
                         "the request is fenced",
@@ -318,17 +395,21 @@ impl KeyRecordService for ServiceView {
         request_id: Uuid,
     ) -> ServiceFuture<'a, RekeyStatus> {
         let state = self.world.state();
+        let recovery = state.recovery;
         let status = match state.receipts.get(request_id.as_bytes()) {
             Some(Receipt::Applied(revision)) => RekeyStatus::Applied {
                 revision: *revision,
+                recovery,
             },
             Some(Receipt::Refused(revision)) => RekeyStatus::Refused {
                 revision: *revision,
+                recovery,
             },
             Some(Receipt::Fenced { never_ran }) => RekeyStatus::Fenced {
                 never_ran: *never_ran,
+                recovery,
             },
-            None => RekeyStatus::Unknown,
+            None => RekeyStatus::Unknown { recovery },
         };
         Box::pin(std::future::ready(Ok(status)))
     }
@@ -342,22 +423,30 @@ impl KeyRecordService for ServiceView {
     ) -> ServiceFuture<'a, RekeyFence> {
         let mut state = self.world.state();
         let key = *request_id.as_bytes();
+        let recovery = state.recovery;
         let fence = match state.receipts.get(&key) {
             Some(Receipt::Applied(revision)) => RekeyFence::Applied {
                 revision: *revision,
+                recovery,
             },
             Some(Receipt::Refused(revision)) => RekeyFence::Refused {
                 revision: *revision,
+                recovery,
             },
             Some(Receipt::Fenced { never_ran }) => RekeyFence::Fenced {
                 never_ran: *never_ran,
+                recovery,
             },
             None => {
-                let never_ran = !state.past_horizon.contains(&key);
+                let never_ran =
+                    !state.past_horizon.contains(&key) && !state.before_recovery.contains(&key);
                 state.receipts.insert(key, Receipt::Fenced { never_ran });
                 // A request still in flight never runs once it is fenced.
                 state.held.retain(|flight| flight.request != request_id);
-                RekeyFence::Fenced { never_ran }
+                RekeyFence::Fenced {
+                    never_ran,
+                    recovery,
+                }
             }
         };
         Box::pin(std::future::ready(Ok(fence)))
@@ -538,6 +627,14 @@ impl Node {
             .members()
             .expect("a readable membership")
             .is_some_and(|status| status.out)
+    }
+
+    /// What the status screen shows.
+    fn status(&self) -> MembershipStatus {
+        self.membership
+            .members()
+            .expect("a readable membership")
+            .expect("a membership")
     }
 
     /// The standing candidate's request identity.
@@ -884,7 +981,10 @@ async fn a_record_older_than_the_one_held_is_refused() {
     let chain = world.chain(&collection);
     let installed = owner.installed();
 
-    world.forge_next(KeyRecords::Records(vec![chain[0].clone()]));
+    world.forge_next(KeyRecords::Records {
+        records: vec![chain[0].clone()],
+        recovery: None,
+    });
     assert_eq!(owner.refresh().await, Refreshed::BrokenChain);
     assert_eq!(owner.installed(), installed, "nothing older is installed");
     assert!(!owner.publishes());
@@ -912,7 +1012,10 @@ async fn a_newer_record_without_a_chain_from_the_held_one_needs_a_confirmed_rejo
         epoch,
         &fresh(),
     );
-    world.forge_next(KeyRecords::Records(vec![forged]));
+    world.forge_next(KeyRecords::Records {
+        records: vec![forged],
+        recovery: None,
+    });
     assert_eq!(owner.refresh().await, Refreshed::BrokenChain);
     assert!(owner.held(&collection, epoch).is_none());
     assert!(!owner.publishes());
@@ -2418,6 +2521,336 @@ async fn a_reused_key_before_the_current_join_is_the_stated_limit_and_a_current_
 }
 
 /* -------------------------------------------------------------------------- */
+/* A collection put back                                                       */
+/* -------------------------------------------------------------------------- */
+
+/// KR-REQ-18.05, across a restore: a collection put back under another recovery without the
+/// record this device holds as its head ends the membership until the owner confirms a join. A
+/// record the restore lost may have removed a device, so nothing is taken from a history this
+/// device can no longer see, and a listing entry in the new history is news whatever revision it
+/// names.
+#[tokio::test]
+async fn a_collection_put_back_without_the_head_this_device_holds_leaves_it_out_until_a_join() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut device = Node::new(&world);
+    let mut removed = Node::new(&world);
+    let collection = collection_of(&world, &mut owner, &mut [&mut device, &mut removed]).await;
+    let archive = world.archive();
+    owner.membership.remove(&removed.auth()).expect("a removal");
+    owner.reconcile().await;
+    device.reconcile().await;
+    let held = device.status();
+    assert_eq!((held.head, held.recovery), (4, None));
+    assert!(device.publishes());
+
+    // The archive was taken before the removal: the collection comes back at revision 3, which
+    // lists the removed device, in a history of its own.
+    let restored = world.put_back(&archive, 0xb1);
+    let entry = MembershipListing {
+        collection,
+        head: KeyHead {
+            epoch: 2,
+            revision: 3,
+            recovery: Some(restored),
+        },
+    };
+    assert!(
+        entry.names_news(&held),
+        "another history is news at any revision"
+    );
+
+    assert_eq!(device.refresh().await, Refreshed::PutBack);
+    assert!(device.out());
+    assert!(!device.publishes());
+    // What a device that is out owes: its keys go, one epoch a step.
+    let steps = run(&mut device).await;
+    assert!(
+        steps.iter().all(|(step, publishes)| !publishes
+            && matches!(step, Step::ForgotKeys { .. } | Step::Nothing))
+    );
+    for epoch in 0..=3 {
+        assert!(
+            device.held(&collection, epoch).is_none(),
+            "every key forgotten"
+        );
+    }
+
+    // The owner confirms a join, which reads the collection again, in its new history.
+    let plan = device
+        .membership
+        .plan_join(collection, now())
+        .expect("a plan");
+    device.membership.join(&plan, now()).await.expect("a join");
+    device.reconcile().await;
+    let joined = device.status();
+    assert_eq!((joined.head, joined.recovery), (3, Some(restored)));
+    assert!(device.publishes());
+}
+
+/// The negative control: in one history an older revision is no news, and the head this device
+/// holds stands. A service that answers from behind the head without a restore changes nothing
+/// the device holds.
+#[tokio::test]
+async fn an_older_revision_in_the_same_history_leaves_the_head_standing() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut device = Node::new(&world);
+    let mut removed = Node::new(&world);
+    let collection = collection_of(&world, &mut owner, &mut [&mut device, &mut removed]).await;
+    let archive = world.archive();
+    owner.membership.remove(&removed.auth()).expect("a removal");
+    owner.reconcile().await;
+    device.reconcile().await;
+    let held = device.status();
+
+    // Revision 3 again, in the history the device read revision 4 in.
+    world.go_back(&archive);
+    let entry = MembershipListing {
+        collection,
+        head: KeyHead {
+            epoch: 2,
+            revision: 3,
+            recovery: None,
+        },
+    };
+    assert!(!entry.names_news(&held), "an older revision in one history");
+    let later = MembershipListing {
+        head: KeyHead {
+            epoch: 4,
+            revision: 5,
+            recovery: None,
+        },
+        ..entry
+    };
+    assert!(later.names_news(&held), "a later revision in one history");
+    let elsewhere = MembershipListing {
+        collection: CollectionRef {
+            collection_id: collection_id(0x60),
+            ..collection
+        },
+        head: KeyHead {
+            recovery: Some(recovery(0xb1)),
+            ..entry.head
+        },
+    };
+    assert!(
+        !elsewhere.names_news(&held),
+        "an entry of another collection says nothing of this one"
+    );
+
+    assert_eq!(device.refresh().await, Refreshed::Recorded);
+    let after = device.status();
+    assert_eq!((after.head, after.recovery, after.out), (4, None, false));
+    assert!(device.publishes());
+}
+
+/// A collection put back under another recovery that holds this device's head, the same record at
+/// the same revision, is followed from there: the records up to the head are the ones the device
+/// holds, since each names the digest of the one before it, and the records after it are taken
+/// as a refresh takes them.
+#[tokio::test]
+async fn a_collection_put_back_with_the_head_this_device_holds_is_followed_from_there() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut device = Node::new(&world);
+    let collection = collection_of(&world, &mut owner, &mut [&mut device]).await;
+    let restored = world.put_back(&world.archive(), 0xb2);
+
+    // The owner shares the collection again in the restored history.
+    let mut third = Node::new(&world);
+    world.hosts.commit(third.device(), true);
+    share(&mut owner, &mut third).await;
+    assert_eq!(owner.status().recovery, Some(restored));
+    assert_eq!(third.status().recovery, Some(restored));
+
+    assert_eq!(device.refresh().await, Refreshed::Recorded);
+    let followed = device.status();
+    assert_eq!((followed.head, followed.recovery), (3, Some(restored)));
+    device.reconcile().await;
+    assert_eq!(device.installed(), Some((2, 3)));
+    assert!(device.publishes());
+    assert!(lists(&world.newest(&collection), &third));
+}
+
+/// Row 1 across a restore that kept this device's head: nothing settles from the new history
+/// until the device has read the collection again there and found its own head; then the
+/// candidate settles there. The restore lost the candidate, so its fence cannot say it never ran:
+/// its key is withdrawn, it is never sent again, and the change it carried is built again in the
+/// new history.
+#[tokio::test]
+async fn a_candidate_that_crossed_a_restore_which_kept_the_head_settles_in_the_new_history() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut device = Node::new(&world);
+    let mut other = Node::new(&world);
+    let collection = collection_of(&world, &mut owner, &mut [&mut device, &mut other]).await;
+    let archive = world.archive();
+    owner.membership.remove(&other.auth()).expect("a removal");
+    world.fate(Fate::LoseAnswer);
+    assert_eq!(owner.step().await, Step::Built { built: true });
+    let request = owner.candidate_request().expect("a candidate");
+    assert_eq!(owner.step().await, Step::Dispatched);
+    assert_eq!(owner.step().await, Step::Sent { answered: false });
+
+    let restored = world.put_back(&archive, 0xb3);
+    assert_eq!(owner.step().await, Step::Followed);
+    let followed = owner.status();
+    assert_eq!(
+        (followed.head, followed.recovery, followed.out),
+        (3, Some(restored), false)
+    );
+    assert_eq!(owner.candidate_request(), Some(request), "not settled yet");
+    assert_eq!(
+        owner.step().await,
+        Step::Settled(Settlement::ReadAfterBase { revision: None })
+    );
+    assert_eq!(world.sends(request), 1, "never sent again");
+
+    owner.reconcile().await;
+    let newest = world.newest(&collection);
+    assert_eq!(newest.payload.revision.get(), 4);
+    assert!(
+        !lists(&newest, &other),
+        "the removal applies in the new history"
+    );
+    assert_eq!(owner.status().recovery, Some(restored));
+    assert!(owner.publishes());
+}
+
+/// Row 1 across a restore that lost this device's head: the candidate's request was fenced where
+/// the collection stands, and its fence cannot say it never ran, but no record is read after its
+/// base in the new history. The device is out at once, before anything settles, and the candidate
+/// it dispatched stays until status and fence settle it, sent once.
+#[tokio::test]
+async fn a_candidate_that_crossed_a_restore_which_lost_the_head_leaves_the_device_out_first() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut device = Node::new(&world);
+    let mut other = Node::new(&world);
+    let _collection = collection_of(&world, &mut owner, &mut [&mut device]).await;
+    let archive = world.archive();
+    world.hosts.commit(other.device(), true);
+    share(&mut owner, &mut other).await;
+    owner.membership.remove(&other.auth()).expect("a removal");
+    world.fate(Fate::LoseAnswer);
+    assert_eq!(owner.step().await, Step::Built { built: true });
+    let request = owner.candidate_request().expect("a candidate");
+    assert_eq!(owner.step().await, Step::Dispatched);
+    assert_eq!(owner.step().await, Step::Sent { answered: false });
+
+    // The collection comes back at revision 2, before the record that added the device the
+    // candidate removes.
+    world.put_back(&archive, 0xb4);
+    assert_eq!(owner.step().await, Step::Left);
+    assert!(owner.out());
+    assert!(!owner.publishes());
+    assert_eq!(
+        owner.candidate_request(),
+        Some(request),
+        "kept for settlement"
+    );
+    assert_eq!(owner.step().await, Step::Settled(Settlement::Fenced));
+    assert_eq!(owner.candidate_request(), None);
+    assert_eq!(world.sends(request), 1, "never sent again");
+}
+
+/// Row 1 across a restore that kept the candidate and lost the record after it: the receipt the
+/// archive brought back says the candidate applied, below a head this device holds and the
+/// restored collection does not. Such a receipt says nothing of the records after it, a removal
+/// among them, so the device is out.
+#[tokio::test]
+async fn an_applied_receipt_below_a_head_the_restore_lost_leaves_the_device_out() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut device = Node::new(&world);
+    let mut other = Node::new(&world);
+    let collection = collection_of(&world, &mut owner, &mut [&mut device, &mut other]).await;
+    owner.membership.remove(&other.auth()).expect("a removal");
+    world.fate(Fate::LoseAnswer);
+    assert_eq!(owner.step().await, Step::Built { built: true });
+    assert_eq!(owner.step().await, Step::Dispatched);
+    assert_eq!(owner.step().await, Step::Sent { answered: false });
+    // The archive holds the candidate at revision 4 and its receipt.
+    let archive = world.archive();
+
+    // Another member issues the record after it, which the owner reads before it settles.
+    device.reconcile().await;
+    let newest = world.newest(&collection);
+    let after = issue(
+        &device,
+        &newest,
+        &[owner.device(), device.device()],
+        epoch_of(&newest),
+        &key_in(&newest, &device),
+    );
+    world.append(&collection, after);
+    assert_eq!(owner.refresh().await, Refreshed::Recorded);
+    assert_eq!(owner.status().head, 5);
+
+    world.put_back(&archive, 0xb5);
+    assert_eq!(owner.step().await, Step::Left);
+    assert!(owner.out());
+    assert!(!owner.publishes());
+}
+
+/// Two reads answered from two histories record nothing: the collection was put back again while
+/// the device read it. Asked again, the refresh reads one history whole.
+#[tokio::test]
+async fn a_collection_put_back_again_between_two_reads_records_nothing_and_is_read_again() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut device = Node::new(&world);
+    let _collection = collection_of(&world, &mut owner, &mut [&mut device]).await;
+    let archive = world.archive();
+    let first = world.put_back(&archive, 0xb6);
+    let second = world.put_back_before_record_at(&archive, 0xb7);
+    assert_ne!(first, second);
+
+    let refused = device
+        .membership
+        .refresh()
+        .await
+        .expect_err("two histories");
+    assert!(matches!(refused, MembershipError::PutBackWhileRead));
+    let held = device.status();
+    assert_eq!(
+        (held.head, held.recovery, held.out),
+        (2, None, false),
+        "nothing recorded"
+    );
+
+    assert_eq!(device.refresh().await, Refreshed::Recorded);
+    assert_eq!(device.status().recovery, Some(second));
+    assert!(device.publishes());
+}
+
+/// A collection this device starts takes the history its claim applied in, and a device that
+/// joins the history of the chain it verified. A membership in a history never put back names
+/// none, and its file is written as it always was, without the member.
+#[tokio::test]
+async fn a_start_takes_the_history_its_claim_applied_in_and_a_join_that_of_the_chain_it_read() {
+    let never = World::default();
+    let mut first = Node::new(&never);
+    collection_of(&never, &mut first, &mut []).await;
+    assert_eq!(first.status().recovery, None);
+    let file = |node: &Node| {
+        std::fs::read(node.root.path().join("membership").join("membership.facts"))
+            .expect("the membership file")
+    };
+    assert!(!contains(&file(&first), b"recovery"), "the shape it had");
+
+    let world = World::default();
+    let restored = world.put_back(&world.archive(), 0xb8);
+    let mut owner = Node::new(&world);
+    let mut device = Node::new(&world);
+    collection_of(&world, &mut owner, &mut [&mut device]).await;
+    assert_eq!(owner.status().recovery, Some(restored));
+    assert_eq!(device.status().recovery, Some(restored));
+    assert!(contains(&file(&device), b"recovery"));
+}
+
+/* -------------------------------------------------------------------------- */
 /* The file, the lock and the order of things                                  */
 /* -------------------------------------------------------------------------- */
 
@@ -2454,7 +2887,10 @@ async fn a_dispatched_candidate_is_settled_after_an_answer_that_ends_the_members
     // the dispatched candidate kept to be settled.
     let installed = owner.installed();
     let replayed = world.chain(&collection)[0].clone();
-    world.forge_next(KeyRecords::Records(vec![replayed]));
+    world.forge_next(KeyRecords::Records {
+        records: vec![replayed],
+        recovery: None,
+    });
     assert_eq!(owner.refresh().await, Refreshed::BrokenChain);
     assert!(owner.out() && !owner.publishes());
     assert_eq!(owner.candidate_request(), Some(request));
@@ -3326,7 +3762,10 @@ async fn a_restored_device_joins_only_after_a_fresh_authorisation() {
     ));
     // ... and a valid chain handed to it anyway, which lists the device it replaces and not it, is
     // refused by the device itself.
-    world.forge_next(KeyRecords::Records(world.chain(&collection)));
+    world.forge_next(KeyRecords::Records {
+        records: world.chain(&collection),
+        recovery: None,
+    });
     let handed = restored
         .membership
         .plan_join(collection, now())

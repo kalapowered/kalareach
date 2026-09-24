@@ -106,7 +106,8 @@ use super::{
 };
 use crate::error::{ClientError, Result};
 use crate::sync::membership::{
-    CollectionRef, KeyRecordService, KeyRecords, RecordAt, RekeyAnswer, RekeyFence, RekeyStatus,
+    CollectionRef, KeyRecordService, KeyRecords, MembershipStatus, RecordAt, RekeyAnswer,
+    RekeyFence, RekeyStatus,
 };
 
 /// Where every settings-sync member is served.
@@ -624,7 +625,6 @@ struct RekeyResult {
     #[expect(dead_code, reason = "held to its schema and never read")]
     key_epoch: Nullable<U64>,
     /// The history that revision is in, as the collection stands when it answers.
-    #[expect(dead_code, reason = "held to its schema and never read")]
     recovery_id: Nullable<SyncRecoveryId>,
 }
 
@@ -832,8 +832,23 @@ impl Inventory {
 pub struct MembershipListing {
     /// The collection.
     pub collection: CollectionRef,
-    /// The epoch and revision of the record the index last heard of.
+    /// The epoch and revision of the record the index last heard of, and the history they are in.
     pub head: KeyHead,
+}
+
+impl MembershipListing {
+    /// Whether this entry says something the membership this device holds does not know: for the
+    /// same collection, another history than the one its records were read in, whatever revision
+    /// the entry names, since the revision held belongs to a history the collection no longer
+    /// has; or, in the same history, a later revision than its head.
+    ///
+    /// It is a reason to refresh and nothing more. The index admits nobody, so nothing in an entry
+    /// changes what this device holds: only the records the collection itself answers do.
+    #[must_use]
+    pub fn names_news(&self, held: &MembershipStatus) -> bool {
+        self.collection == held.collection
+            && (self.head.recovery != held.recovery || self.head.revision > held.head)
+    }
 }
 
 /// A shared comparison read over several pages, folded into one answer.
@@ -1681,7 +1696,8 @@ impl ManagedSyncService {
             let Some(page) = self.keys_page(collection, cursor).await? else {
                 return Ok(KeyRecords::Absent);
             };
-            one_history(&mut history, page.recovery_id.0)?;
+            let recovery = page.recovery_id.0;
+            one_history(&mut history, recovery)?;
             let last = page
                 .records
                 .last()
@@ -1694,7 +1710,7 @@ impl ManagedSyncService {
                 Some(last) if page.more && last > cursor => cursor = last,
                 // The newest was reached, or a page that does not move the cursor on: what was
                 // answered is handed over, and the reader decides what it follows.
-                _ => return Ok(KeyRecords::Records(records)),
+                _ => return Ok(KeyRecords::Records { records, recovery }),
             }
         }
     }
@@ -1706,11 +1722,16 @@ impl ManagedSyncService {
             .ok_or_else(|| malformed("key record revisions count from one"))?;
         Ok(match self.keys_page(collection, after).await? {
             None => RecordAt::Absent,
-            Some(page) => page
-                .records
-                .into_iter()
-                .next()
-                .map_or(RecordAt::Missing, RecordAt::Record),
+            Some(page) => {
+                let recovery = page.recovery_id.0;
+                page.records
+                    .into_iter()
+                    .next()
+                    .map_or(RecordAt::Missing { recovery }, |record| RecordAt::Record {
+                        record,
+                        recovery,
+                    })
+            }
         })
     }
 
@@ -1750,16 +1771,17 @@ impl ManagedSyncService {
             "what the offer of a key record answered",
         )?;
         let revision = answer.key_revision.get();
+        let recovery = answer.recovery_id.0;
         Ok(match answer.state {
             RekeyState::Applied if revision == record.payload.revision.get() => {
-                RekeyAnswer::Applied { revision }
+                RekeyAnswer::Applied { revision, recovery }
             }
             RekeyState::Applied => {
                 return Err(contrary(
                     "an applied key record at another revision than its own",
                 ));
             }
-            RekeyState::Refused => RekeyAnswer::Refused { revision },
+            RekeyState::Refused => RekeyAnswer::Refused { revision, recovery },
         })
     }
 
@@ -1776,11 +1798,15 @@ impl ManagedSyncService {
         });
         let data = self.ask(&request, None).await?.data()?;
         let answer = status_answer(data, request_id, "what a status query answered")?;
+        let recovery = answer.recovery_id.0;
         Ok(match offer_outcome(&answer)? {
-            OfferOutcome::Unknown => RekeyStatus::Unknown,
-            OfferOutcome::Applied(revision) => RekeyStatus::Applied { revision },
-            OfferOutcome::Refused(revision) => RekeyStatus::Refused { revision },
-            OfferOutcome::Fenced { never_ran } => RekeyStatus::Fenced { never_ran },
+            OfferOutcome::Unknown => RekeyStatus::Unknown { recovery },
+            OfferOutcome::Applied(revision) => RekeyStatus::Applied { revision, recovery },
+            OfferOutcome::Refused(revision) => RekeyStatus::Refused { revision, recovery },
+            OfferOutcome::Fenced { never_ran } => RekeyStatus::Fenced {
+                never_ran,
+                recovery,
+            },
         })
     }
 
@@ -1800,11 +1826,15 @@ impl ManagedSyncService {
         )?;
         let data = self.ask(&request, None).await?.data()?;
         let answer = status_answer(data, request_id, "what a fence answered")?;
+        let recovery = answer.recovery_id.0;
         Ok(match offer_outcome(&answer)? {
             OfferOutcome::Unknown => return Err(fence_answered_unknown()),
-            OfferOutcome::Applied(revision) => RekeyFence::Applied { revision },
-            OfferOutcome::Refused(revision) => RekeyFence::Refused { revision },
-            OfferOutcome::Fenced { never_ran } => RekeyFence::Fenced { never_ran },
+            OfferOutcome::Applied(revision) => RekeyFence::Applied { revision, recovery },
+            OfferOutcome::Refused(revision) => RekeyFence::Refused { revision, recovery },
+            OfferOutcome::Fenced { never_ran } => RekeyFence::Fenced {
+                never_ran,
+                recovery,
+            },
         })
     }
 }

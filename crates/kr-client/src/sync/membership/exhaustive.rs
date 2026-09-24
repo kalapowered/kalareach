@@ -13,7 +13,10 @@
 //!
 //! Records here are a few small numbers rather than signed records, so every reachable state
 //! within the budgets can be visited; the checks that need keys (the chain, the signature, the
-//! opening of a wrap) are the device environment's and have their own tests. Every state and every
+//! opening of a wrap) are the device environment's and have their own tests. The model's service
+//! is never put back, so every answer is in one history: what a device does with a collection put
+//! back under another recovery is held by the scripted tests in `tests/membership.rs`, over the
+//! same reconciler. Every state and every
 //! step is checked against the invariants by their exact predicates:
 //!
 //! * I1: publication only when no removal is pending, no candidate stands and the head is
@@ -222,11 +225,18 @@ enum Answer {
     Refused(u64),
 }
 
+// The model's service is never put back: every answer is in the one history it names as none.
 impl From<Answer> for RekeyAnswer {
     fn from(answer: Answer) -> Self {
         match answer {
-            Answer::Applied(revision) => Self::Applied { revision },
-            Answer::Refused(revision) => Self::Refused { revision },
+            Answer::Applied(revision) => Self::Applied {
+                revision,
+                recovery: None,
+            },
+            Answer::Refused(revision) => Self::Refused {
+                revision,
+                recovery: None,
+            },
         }
     }
 }
@@ -234,8 +244,8 @@ impl From<Answer> for RekeyAnswer {
 impl From<RekeyAnswer> for Answer {
     fn from(answer: RekeyAnswer) -> Self {
         match answer {
-            RekeyAnswer::Applied { revision } => Self::Applied(revision),
-            RekeyAnswer::Refused { revision } => Self::Refused(revision),
+            RekeyAnswer::Applied { revision, .. } => Self::Applied(revision),
+            RekeyAnswer::Refused { revision, .. } => Self::Refused(revision),
         }
     }
 }
@@ -503,7 +513,10 @@ impl Environment for ModelEnv {
             let mut read = locked(&self.read);
             *read = (*read).max(newest.revision);
         }
-        ready(KeyRecords::Records(records))
+        ready(KeyRecords::Records {
+            records,
+            recovery: None,
+        })
     }
 
     fn record_at<'a>(
@@ -524,7 +537,14 @@ impl Environment for ModelEnv {
             let mut read = locked(&self.read);
             *read = (*read).max(revision);
         }
-        ready(found.map_or(RecordAt::Missing, RecordAt::Record))
+        ready(
+            found.map_or(RecordAt::Missing { recovery: None }, |record| {
+                RecordAt::Record {
+                    record,
+                    recovery: None,
+                }
+            }),
+        )
     }
 
     fn rekey<'a>(
@@ -549,13 +569,23 @@ impl Environment for ModelEnv {
         let request = request_of(request);
         let service = locked(&self.service);
         let status = match receipt(&service, request) {
-            Some(Receipt::Applied(revision)) => RekeyStatus::Applied { revision },
+            Some(Receipt::Applied(revision)) => RekeyStatus::Applied {
+                revision,
+                recovery: None,
+            },
             Some(Receipt::Refused) => RekeyStatus::Refused {
                 revision: service.chain.len() as u64,
+                recovery: None,
             },
-            Some(Receipt::Fenced) => RekeyStatus::Fenced { never_ran: true },
-            Some(Receipt::FencedUnknown) => RekeyStatus::Fenced { never_ran: false },
-            None => RekeyStatus::Unknown,
+            Some(Receipt::Fenced) => RekeyStatus::Fenced {
+                never_ran: true,
+                recovery: None,
+            },
+            Some(Receipt::FencedUnknown) => RekeyStatus::Fenced {
+                never_ran: false,
+                recovery: None,
+            },
+            None => RekeyStatus::Unknown { recovery: None },
         };
         ready(status)
     }
@@ -570,19 +600,35 @@ impl Environment for ModelEnv {
         let request = request_of(request);
         let mut service = locked(&self.service);
         let fence = match receipt(&service, request) {
-            Some(Receipt::Applied(revision)) => RekeyFence::Applied { revision },
+            Some(Receipt::Applied(revision)) => RekeyFence::Applied {
+                revision,
+                recovery: None,
+            },
             Some(Receipt::Refused) => RekeyFence::Refused {
                 revision: service.chain.len() as u64,
+                recovery: None,
             },
-            Some(Receipt::Fenced) => RekeyFence::Fenced { never_ran: true },
-            Some(Receipt::FencedUnknown) => RekeyFence::Fenced { never_ran: false },
+            Some(Receipt::Fenced) => RekeyFence::Fenced {
+                never_ran: true,
+                recovery: None,
+            },
+            Some(Receipt::FencedUnknown) => RekeyFence::Fenced {
+                never_ran: false,
+                recovery: None,
+            },
             None if !service.expired => {
                 service.receipts.insert((request, Receipt::Fenced));
-                RekeyFence::Fenced { never_ran: true }
+                RekeyFence::Fenced {
+                    never_ran: true,
+                    recovery: None,
+                }
             }
             None => {
                 service.receipts.insert((request, Receipt::FencedUnknown));
-                RekeyFence::Fenced { never_ran: false }
+                RekeyFence::Fenced {
+                    never_ran: false,
+                    recovery: None,
+                }
             }
         };
         ready(fence)
