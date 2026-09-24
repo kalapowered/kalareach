@@ -2060,9 +2060,11 @@ impl Controller {
     /// does not bring it back, and a lapse found there is written down as a device's is.
     ///
     /// `now_ms` is the wall clock as the caller read it at `read_at` on the continuous clock. A
-    /// workflow runs unattended, so nothing is decided while a clock floor an earlier refusal stood
-    /// on is still owed its record: that write is made first, and while it cannot be, the answer is
-    /// that authority is unavailable. Every wait is therefore over before the decision, and the
+    /// workflow runs unattended, so nothing that reads the clock is decided while the clock floor
+    /// is still owed its record: that write is made first, and while it cannot be, the answer is
+    /// that authority is unavailable. A personal grant that never expires, under no time bound of
+    /// this host's policy, reads no clock and is decided as before
+    /// ([`crate::grants::HostPolicy::stands_on_the_clock`]). Every wait is therefore over before the decision, and the
     /// decision is taken at the caller's reading advanced by the time those waits took, so a
     /// deadline that passed while this waited for the policy or for storage is decided as passed.
     /// Nothing waits between a permission and the caller's use of it. A refusal the clock decided
@@ -2083,7 +2085,7 @@ impl Controller {
         let grant_id = record.grant.grant_id;
         let unwritten = || {
             kr_automation::AutomationError::AuthorityUnavailable(
-                "the clock floor a refusal stood on could not be written down".to_owned(),
+                crate::grants::FLOOR_UNRECORDED.to_owned(),
             )
         };
         let ceiling = self
@@ -2113,7 +2115,7 @@ impl Controller {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.write_owed_floor(&policy);
-        if self.utc_floor.is_owed() {
+        if self.utc_floor.is_owed() && policy.stands_on_the_clock(&record.grant, ingress) {
             return Err(unwritten());
         }
         let waited = self.clock.now().saturating_duration_since(read_at);
@@ -11868,5 +11870,167 @@ impl crate::attention::Reach for AttentionReach {
         )
         .ok()
         .map(|history| history.oldest_retained_cursor())
+    }
+}
+
+#[cfg(test)]
+mod a_floor_owed_its_record {
+    //! What a workflow's grant is decided on while this host's clock floor is owed its record.
+
+    use std::sync::Arc;
+
+    use kr_protocol::actor::ActorIngress;
+    use kr_protocol::grant::{
+        EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector,
+    };
+    use kr_protocol::ids::{BuildId, DeviceId, GrantId};
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs};
+
+    use crate::grants::GrantRecord;
+    use crate::service::{Controller, ControllerSetup};
+    use crate::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
+
+    /// A supervisor that starts nothing. Deciding a grant needs no worker.
+    #[derive(Debug)]
+    struct NoWorkers;
+
+    impl WorkerSupervisor for NoWorkers {
+        fn start(&self, _launch: &WorkerLaunch) -> LaunchOutcome {
+            LaunchOutcome::NotStarted {
+                detail: "this test starts no workers".to_owned(),
+            }
+        }
+
+        fn describe(&self) -> &'static str {
+            "a supervisor that starts nothing"
+        }
+    }
+
+    async fn daemon(temp: &kr_ipc::testing::TempHost) -> Arc<Controller> {
+        let environment = temp.environment();
+        let environment_id = temp.environment_id();
+        let secrets = environment.secrets_dir();
+        Controller::start(ControllerSetup {
+            paths: environment,
+            environment_id,
+            identity: Box::new(move || {
+                let store = kr_crypto::store::open_store_in(&secrets)
+                    .expect("a secret store for the test environment");
+                Ok(kr_ipc::verify::ControllerIdentity::open(
+                    store.store.as_ref(),
+                    environment_id,
+                    false,
+                )
+                .expect("an identity"))
+            }),
+            secret_store: kr_crypto::store::StoreSelection::File,
+            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            supervisor: Box::new(NoWorkers),
+            worker_program: temp.root().join("kr-worker"),
+            build_id: BuildId::new("kr-test/0").expect("a build identifier"),
+            release: "0".to_owned(),
+            shell_packages: None,
+            terminal: Box::new(crate::supervision::NoTerminal),
+        })
+        .await
+        .expect("the daemon starts")
+    }
+
+    /// A personal grant a workflow runs under, held by a device that reaches this host remotely.
+    fn held(controller: &Controller, expiry: GrantExpiry) -> GrantRecord {
+        let device_id = DeviceId::new(kr_ipc::new_uuid());
+        GrantRecord {
+            grant: Grant {
+                grant_id: GrantId::new(kr_ipc::new_uuid()),
+                parent_grant_id: Nullable::null(),
+                issuer_device_id: controller.sharing().host_device_id(),
+                recipient_device_id: device_id,
+                authority_revision: controller.policy().authority_revision(),
+                environment_selector: EnvironmentSelector::Any,
+                session_selector: SessionSelector::Any,
+                actions: [ActionRight::SessionView].into_iter().collect(),
+                history: HistoryScope {
+                    lower_bound_ms: Nullable::null(),
+                    include_live_screen: false,
+                    named_questions: CanonicalSet::new(),
+                    named_approvals: CanonicalSet::new(),
+                },
+                expiry,
+                organisation: Nullable::null(),
+            },
+            session_id: None,
+            issued_at_ms: 1,
+            activated_at_ms: Some(1),
+            revoked_at_ms: None,
+            revoked_by_parent: None,
+        }
+    }
+
+    /// While the floor is owed its record, a workflow's grant that reads the clock is not decided,
+    /// and a personal grant that never expires, under no time bound of this host's policy, is
+    /// decided as before. Once the floor is written down, the expiring grant is decided again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_that_never_expires_is_decided_while_the_floor_is_owed() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = daemon(&temp).await;
+        let registry = rusqlite::Connection::open(temp.environment().registry_database())
+            .expect("opens the registry");
+        registry
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .expect("waits for the daemon's writes");
+        registry
+            .execute_batch(
+                "CREATE TRIGGER refuse_policy BEFORE INSERT ON host_authority
+                 WHEN NEW.key = 'policy'
+                 BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+            )
+            .expect("the fault is in place");
+        // A lapse this host found and could not write down.
+        controller.keep_lapse(kr_ipc::now_ms().get());
+
+        let now_ms = kr_ipc::now_ms().get();
+        let lasting = held(&controller, GrantExpiry::Never);
+        controller
+            .decide_for_workflow(
+                &lasting,
+                ActorIngress::PairedDevice,
+                now_ms,
+                controller.continuous_now(),
+            )
+            .expect("a personal grant that never expires reads no clock");
+        let expiring = held(
+            &controller,
+            GrantExpiry::At {
+                expires_at_ms: TimestampMs::new(now_ms + 60 * 60 * 1000),
+            },
+        );
+        let refused = controller
+            .decide_for_workflow(
+                &expiring,
+                ActorIngress::PairedDevice,
+                now_ms,
+                controller.continuous_now(),
+            )
+            .expect_err("a grant that expires is not decided while the floor is owed");
+        assert!(
+            matches!(
+                refused,
+                kr_automation::AutomationError::AuthorityUnavailable(_)
+            ),
+            "{refused:?}"
+        );
+
+        registry
+            .execute_batch("DROP TRIGGER refuse_policy;")
+            .expect("the fault is cleared");
+        controller
+            .decide_for_workflow(
+                &expiring,
+                ActorIngress::PairedDevice,
+                kr_ipc::now_ms().get(),
+                controller.continuous_now(),
+            )
+            .expect("once the floor is written down, the grant is decided on its merits");
     }
 }

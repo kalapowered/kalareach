@@ -313,9 +313,18 @@ impl GrantDirectory {
         })
     }
 
-    /// Whether `expiry` has passed at the effect, for a caller that decided it at `admitted_ms`, or
-    /// the refusal when that cannot be answered now.
-    fn passed_at_effect(&self, expiry: GrantExpiry, admitted_ms: u64) -> Result<bool> {
+    /// Whether `expiry` has passed, for a caller that read the clock at `admitted_ms`, or the
+    /// refusal when that cannot be answered now.
+    ///
+    /// Decided the way an effect in this store decides it ([`Self::bind_host_clock`]): at the later
+    /// of the caller's reading and this host's clock now, under its floor, once the daemon has
+    /// bound it. A lapse the floor on disk does not cover yet, and any bound that can pass while
+    /// the floor is owed its record, is refused as unrecorded rather than answered.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `STORAGE_UNAVAILABLE` refusal when the bound cannot be answered now.
+    pub fn bound_passed(&self, expiry: GrantExpiry, admitted_ms: u64) -> Result<bool> {
         let bound = self.bound_at_effect(expiry, admitted_ms);
         if bound.answerable() {
             Ok(bound.passed)
@@ -433,7 +442,7 @@ impl GrantDirectory {
         // parent read can each outlast it.
         self.in_transaction(|connection| {
             check_parent(connection, record, |expiry, at| {
-                self.passed_at_effect(expiry, at)
+                self.bound_passed(expiry, at)
             })?;
             still_admitted()?;
             write_grant(connection, record, &encoded)
@@ -751,7 +760,7 @@ impl GrantDirectory {
         let recipient = record.grant.recipient_device_id;
         self.in_transaction(|connection| {
             check_parent(connection, record, |expiry, at| {
-                self.passed_at_effect(expiry, at)
+                self.bound_passed(expiry, at)
             })?;
             still_admitted()?;
             write_grant(connection, record, &encoded_grant)?;
@@ -975,9 +984,7 @@ impl GrantDirectory {
                 });
             }
             // Its expiry at the moment of the transfer, not at the moment it was asked for.
-            if source.revoked_at_ms.is_some()
-                || self.passed_at_effect(source.grant.expiry, now_ms)?
-            {
+            if source.revoked_at_ms.is_some() || self.bound_passed(source.grant.expiry, now_ms)? {
                 return Err(ControllerError::PermissionDenied {
                     detail: "that grant is no longer valid, so there is no control to transfer"
                         .to_owned(),
@@ -1318,7 +1325,7 @@ type Row = Result<GrantRecord>;
 fn check_parent(
     connection: &Connection,
     record: &GrantRecord,
-    passed_at_effect: impl FnOnce(GrantExpiry, u64) -> Result<bool>,
+    bound_passed: impl FnOnce(GrantExpiry, u64) -> Result<bool>,
 ) -> Result<()> {
     let Some(parent_grant_id) = record.grant.parent_grant_id.as_ref().copied() else {
         return Ok(());
@@ -1340,7 +1347,7 @@ fn check_parent(
             detail: "the grant this one delegates from has been revoked".to_owned(),
         });
     }
-    if passed_at_effect(parent.grant.expiry, record.issued_at_ms)? {
+    if bound_passed(parent.grant.expiry, record.issued_at_ms)? {
         return Err(ControllerError::PermissionDenied {
             detail: "the grant this one delegates from has expired".to_owned(),
         });

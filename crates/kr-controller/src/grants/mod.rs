@@ -326,9 +326,10 @@ pub fn decide(
     }
     // Nothing that reads the clock is decided while the floor it would stand on is owed its
     // record: a daemon that stopped before that record landed would start again on an older floor
-    // and could decide the other way. A lapse found here is owed its record by the caller, which
-    // writes the floor it stood on.
-    if bound.owed && policy.stands_on_the_clock(grant, request.ingress) {
+    // and could decide the other way. What reads the clock is the grant's expiry and this host's
+    // own time bounds on its use, so the debt is asked about whatever the grant's own expiry is. A
+    // lapse found here is owed its record by the caller, which writes the floor it stood on.
+    if policy.utc_floor().is_owed() && policy.stands_on_the_clock(grant, request.ingress) {
         return Err(Refusal::FloorUnrecorded);
     }
     if bound.passed {
@@ -465,7 +466,7 @@ pub fn standing_at_dispatch(
         });
     }
     // As [`decide`]: nothing that reads the clock is decided while its floor is owed its record.
-    if bound.owed && policy.stands_on_the_clock(grant, ingress) {
+    if policy.utc_floor().is_owed() && policy.stands_on_the_clock(grant, ingress) {
         return Err(Refusal::FloorUnrecorded);
     }
     if bound.passed {

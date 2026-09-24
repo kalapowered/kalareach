@@ -1651,8 +1651,9 @@ What the grant decides, for every request:
   written to the device's record, so the device cannot connect again. A refusal the wall clock
   decided also writes that floor down. A write that fails is retried by every later decision and
   by the network's record task, and until one lands the floor is owed its record: no decision that
-  reads the clock is taken, so a request under a grant that expires, under an organisation's lease
-  or under this host's offline bound is refused as unrecorded, while a grant that never expires is
+  reads the clock is taken, so a request under a grant that expires, under an organisation's lease,
+  under this host's offline bound or on a host enrolled as exclusively organisation-managed is
+  refused as unrecorded, while a personal grant that never expires and answers to none of those is
   used as before. A daemon that starts and cannot write its floor starts in the same state, and
   leaves it once a write lands. A daemon that stops before the floor is written starts on the older
   floor; what keeps the device out then is the expiry on its record, which is retried the same way

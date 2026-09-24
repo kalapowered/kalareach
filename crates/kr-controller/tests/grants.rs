@@ -9,6 +9,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-09.08 | `a_device_revocation_is_performed_once_however_long_its_first_attempt_waits`, `a_retry_while_a_device_revocation_runs_is_told_it_has_not_finished`, `a_share_whose_record_was_never_written_is_answered_from_what_it_wrote_after_a_restart`, `a_revocation_whose_record_was_never_written_is_not_performed_again_after_a_restart`, `an_authority_change_whose_attempt_ended_unrecorded_is_not_performed_again`, `a_refused_authority_change_is_refused_the_same_way_when_it_is_sent_again`, `an_unfinished_key_registration_is_not_answered_with_another_actions_registration`, `a_claim_excludes_every_other_attempt_and_is_never_taken_over`, `an_earlier_receipts_table_migrates_once_and_its_open_claims_are_unfinished` |
+//! | KR-REQ-09.18 | `a_decision_that_reads_the_clock_waits_for_the_floor_whatever_the_grants_expiry`, `a_delegation_is_not_refused_as_expired_on_a_reading_this_host_could_not_write` |
 //! | KR-REQ-10.40 | `a_grant_carries_every_field_section_ten_names`, `the_host_intersects_the_grant_with_policy_on_every_request`, `a_delegation_narrows_and_never_extends`, `revoking_a_parent_revokes_every_descendant` |
 //! | KR-REQ-10.41 | `a_method_is_decided_from_the_registry_table_and_never_from_a_capability` |
 //! | KR-REQ-10.43 | `an_owner_grant_stays_valid_until_it_is_revoked`, `an_invitation_is_view_only_for_an_hour_and_bounded_at_thirty_days` |
@@ -1571,6 +1572,78 @@ fn a_clock_that_goes_backwards_does_not_revive_an_expiry_the_host_already_decide
     );
 }
 
+/// KR-REQ-09.18: a decision that reads this host's clock is not taken while the clock floor is owed
+/// its record, whatever the grant's own expiry, and one that reads no clock is taken as before.
+///
+/// A grant that never expires reads the clock when this host bounds its use in time: remotely
+/// under a bounded offline validity, or on a host enrolled as exclusively organisation-managed,
+/// where a personal grant answers to a lease. Used from this machine, or with neither bound, it
+/// reads no clock.
+#[test]
+fn a_decision_that_reads_the_clock_waits_for_the_floor_whatever_the_grants_expiry() {
+    let lasting = grant(1, None, &[ActionRight::SessionView], GrantExpiry::Never);
+    let stored = record(lasting.clone());
+    let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
+    // A decision stood on the floor at 5,000 and its record has not been written.
+    policy.utc_floor().owe(5_000);
+    let local = || AccessRequest {
+        ingress: ActorIngress::LocalIpc,
+        ..request(Method::SessionRead, 1_000)
+    };
+
+    decide(
+        &lasting,
+        &stored,
+        &mut policy,
+        request(Method::SessionRead, 1_000),
+    )
+    .expect("a personal grant that never expires reads no clock");
+
+    policy.set_offline_validity(Some(OfflineValidityPolicy {
+        maximum_offline_ms: kr_protocol::scalars::DurationMs::new(60 * 60 * 1000),
+        last_synchronised_at_ms: Nullable::some(TimestampMs::new(1_000)),
+    }));
+    assert_eq!(
+        decide(
+            &lasting,
+            &stored,
+            &mut policy,
+            request(Method::SessionRead, 1_000)
+        ),
+        Err(Refusal::FloorUnrecorded),
+        "remote use under an offline bound reads the clock"
+    );
+    decide(&lasting, &stored, &mut policy, local())
+        .expect("the offline bound is about remote access");
+
+    policy.set_offline_validity(None);
+    policy.set_exclusively_managed(true);
+    assert_eq!(
+        decide(
+            &lasting,
+            &stored,
+            &mut policy,
+            request(Method::SessionRead, 1_000)
+        ),
+        Err(Refusal::FloorUnrecorded),
+        "on an exclusively managed host a personal grant answers to a lease"
+    );
+
+    // Once the floor is written down, the decision is taken on its merits again.
+    policy.utc_floor().wrote(5_000);
+    assert_eq!(
+        decide(
+            &lasting,
+            &stored,
+            &mut policy,
+            request(Method::SessionRead, 1_000)
+        ),
+        Err(Refusal::MembershipUnusable {
+            refusal: MembershipRefusal::NoLease
+        })
+    );
+}
+
 /// The stored policy is what a host reads back, and a restored old policy cannot revive authority.
 ///
 /// The store is the durable path a restart takes; this exercises that path rather than restarting
@@ -2822,6 +2895,90 @@ async fn an_unfinished_key_registration_is_not_answered_with_another_actions_reg
         kr_protocol::error::ErrorCode::OutcomeUnknown,
         "{refusal}"
     );
+}
+
+/// KR-REQ-09.18: a delegation from a parent the clock says has expired is not refused as expired
+/// while this host cannot write down the reading that says so.
+///
+/// The store refuses every write of the host's policy, and with it the clock floor. The parent ran
+/// out an hour ago by the wall clock, and the floor on disk says nothing about that hour. A
+/// delegation from it is refused as unrecorded: were it refused as expired, a daemon that stopped
+/// before the floor was written and started with its clock wound back would decide the other way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delegation_is_not_refused_as_expired_on_a_reading_this_host_could_not_write() {
+    let host = Serving::start().await;
+    let host_device = DeviceId::new(host.temp.environment_id().get());
+    let now_ms = kr_ipc::now_ms().get();
+    let parent = Grant {
+        recipient_device_id: host_device,
+        issuer_device_id: host_device,
+        environment_selector: EnvironmentSelector::These {
+            environment_ids: [host.temp.environment_id()].into_iter().collect(),
+        },
+        session_selector: SessionSelector::These {
+            session_ids: [session_id(0xa1)].into_iter().collect(),
+        },
+        history: HistoryScope {
+            lower_bound_ms: Nullable::some(TimestampMs::new(now_ms - 2 * 60 * 60 * 1000)),
+            ..no_history()
+        },
+        authority_revision: host.controller.policy().authority_revision(),
+        expiry: GrantExpiry::At {
+            expires_at_ms: TimestampMs::new(now_ms - 60 * 60 * 1000),
+        },
+        ..grant(
+            0x31,
+            None,
+            &[ActionRight::SessionView, ActionRight::SessionShare],
+            GrantExpiry::Never,
+        )
+    };
+    host.controller
+        .sharing()
+        .grants()
+        .issue(
+            &GrantRecord {
+                issued_at_ms: now_ms - 2 * 60 * 60 * 1000,
+                activated_at_ms: Some(now_ms - 2 * 60 * 60 * 1000),
+                session_id: Some(session_id(0xa1)),
+                ..record(parent.clone())
+            },
+            || Ok(()),
+        )
+        .expect("the parent");
+
+    let registry = rusqlite::Connection::open(host.temp.environment().registry_database())
+        .expect("opens the registry");
+    registry
+        .busy_timeout(Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    registry
+        .execute_batch(
+            "CREATE TRIGGER refuse_policy BEFORE INSERT ON host_authority
+             WHEN NEW.key = 'policy'
+             BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("the fault is in place");
+
+    let mut client = host.client().await;
+    let refusal = client
+        .mutate(
+            Method::GrantCreate,
+            kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x65; 16])),
+            shared_session(host.temp.environment_id(), session_id(0xa1)),
+            &share_params(session_id(0xa1), device_id(0xf3), Some(parent.grant_id)),
+        )
+        .await
+        .expect("the daemon answers")
+        .expect_err("a delegation from an expired parent is refused");
+    assert_eq!(
+        refusal.code,
+        kr_protocol::error::ErrorCode::StorageUnavailable,
+        "{refusal:?}"
+    );
+    registry
+        .execute_batch("DROP TRIGGER refuse_policy;")
+        .expect("the fault is cleared");
 }
 
 /// KR-REQ-09.08: an authority change refused before its effect is refused the same way when the
