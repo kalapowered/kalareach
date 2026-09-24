@@ -178,8 +178,9 @@ mod mac {
     }
 }
 
+/// Windows Hello, for a window of this process.
 #[cfg(target_os = "windows")]
-mod hello {
+pub mod hello {
     use std::future::IntoFuture as _;
     use std::time::Duration;
 
