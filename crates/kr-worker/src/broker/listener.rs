@@ -20,8 +20,8 @@
 //!
 //! And one property that belongs to a binding rather than to the listener: an installed upgrade
 //! affects new launches. [`BoundBinary`] is pinned when a process starts, and
-//! [`BoundBinary::survives_upgrade`] is what says a running binding keeps the identity it was
-//! bound to.
+//! [`BoundBinary::identity_for`] is what says a running binding keeps the identity it was bound
+//! to.
 
 use kr_protocol::broker::BinaryIdentity;
 use kr_protocol::identity::ProcessStartIdentity;
