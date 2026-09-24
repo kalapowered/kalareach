@@ -6018,19 +6018,39 @@ async fn write_frame_unless(
             Err(_) => return false,
         }
         // The peer has no room. Waiting for it happens here, where the boundary is not held and a
-        // withdrawal can both take that boundary and end this wait.
+        // withdrawal can both take that boundary and end this wait. While none of the frame has
+        // gone, abandoning it ends the wait too, and the next look under the writer takes it back:
+        // a frame that is not going to be sent does not hold the connection's turn until the peer
+        // reads again.
+        let abandon = async {
+            match abandoned.as_deref_mut() {
+                Some(abandoned) if !begun => {
+                    let _ = abandoned.await;
+                }
+                _ => std::future::pending::<()>().await,
+            }
+        };
         if protected {
             tokio::select! {
                 biased;
                 () = withdrawn.wait() => return false,
+                () = abandon => {}
                 ready = writable.readiness.ready() => {
                     if ready.is_err() {
                         return false;
                     }
                 }
             }
-        } else if writable.readiness.ready().await.is_err() {
-            return false;
+        } else {
+            tokio::select! {
+                biased;
+                () = abandon => {}
+                ready = writable.readiness.ready() => {
+                    if ready.is_err() {
+                        return false;
+                    }
+                }
+            }
         }
     }
 }
@@ -6502,7 +6522,8 @@ mod tests {
 
     use super::{
         ContinuousClock, ContinuousInstant, MAX_OUTPUT_EVENT_BYTES, Outlet, StreamId, Withdrawal,
-        Writing, notification, send_stream, vouched_deadline, write_frame, write_within,
+        Writing, notification, send_stream, vouched_deadline, write_frame, write_frame_unless,
+        write_within,
     };
 
     /// Two clocks with one pause between the first reading and the second.
@@ -6714,6 +6735,81 @@ mod tests {
                 .expect("the write answers the withdrawal")
                 .expect("the write task"),
             "and the frame it was waiting to finish is not delivered"
+        );
+    }
+
+    /// A frame none of whose bytes went is taken back as soon as it is abandoned, rather than
+    /// holding the connection's turn until the peer reads again.
+    ///
+    /// Small frames go to a socket whole or not at all, so the socket fills at a frame boundary and
+    /// the frame that finds it full has none of its bytes with the peer. A Windows named pipe does
+    /// not fill that way, so the arrangement never happens there.
+    #[cfg_attr(
+        windows,
+        ignore = "a Windows named pipe does not fill the way this test's own setup needs"
+    )]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_abandoned_frame_none_of_which_went_gives_the_turn_back_at_once() {
+        let (_temp, writable, writer, _reader) = connected().await;
+        let withdrawn = Arc::new(Withdrawal::default());
+        let (replacement, mut replaced) = tokio::sync::oneshot::channel::<()>();
+        let filling = tokio::spawn({
+            let writable = writable.clone();
+            let writer = Arc::clone(&writer);
+            async move {
+                let frame = output_frame(16);
+                while write_frame_unless(
+                    &writable,
+                    &writer,
+                    &frame,
+                    &withdrawn,
+                    true,
+                    Some(&mut replaced),
+                )
+                .await
+                {}
+            }
+        });
+
+        // The socket fills, and the frame that found it full waits whole for the peer.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let sender = writer
+                    .lock()
+                    .expect("the connection writer is not poisoned");
+                if sender.is_mid_frame() && !sender.has_sent_any() {
+                    break;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the peer's socket filled and a frame is waiting for room with none of it sent"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The replacement, exactly as a connection signals it: with the writer held.
+        {
+            let _boundary = writer
+                .lock()
+                .expect("the connection writer is not poisoned");
+            drop(replacement);
+        }
+        tokio::time::timeout(Duration::from_secs(5), filling)
+            .await
+            .expect("the abandoned frame stops waiting for a peer that is not reading")
+            .expect("the writing task");
+        assert!(
+            !writer
+                .lock()
+                .expect("the connection writer is not poisoned")
+                .is_mid_frame(),
+            "and it was taken back, so the stream is clean for the next frame"
+        );
+        assert!(
+            writable.turn.try_lock().is_ok(),
+            "and the connection's turn is free for whoever writes next"
         );
     }
 
