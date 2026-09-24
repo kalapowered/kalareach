@@ -515,8 +515,13 @@ pub struct TransitionReplay {
     pub cursor: ReplayCursor,
     /// True when the cursor named another generation and this page starts the stream again.
     pub reset: bool,
-    /// True when something after the cursor was announced and never recorded, so it is lost.
-    pub gap: bool,
+    /// The highest position after the cursor that was announced and never recorded, when there
+    /// is one: everything up to it that no page returns is lost.
+    ///
+    /// A position rather than a flag, so a consumer that has already reported a loss can tell it
+    /// from a new one. No page ever returns what was lost, so every later page from below it
+    /// still names it.
+    pub lost_through: Option<u64>,
     /// True when the backlog continues after this page.
     pub more: bool,
 }
@@ -3078,8 +3083,8 @@ impl Broker {
             .events_after(from, MAX_REPLAY_EVENTS, MAX_REPLAY_BYTES)?;
         // An announcement the journal could not take spends a number that no read returns. The
         // highest of those is enough to answer the only question a consumer asks: was anything
-        // after my cursor lost for good?
-        let gap = state.unrecorded_after > from;
+        // after my cursor lost for good, and is it what I have already reported?
+        let lost_through = (state.unrecorded_after > from).then_some(state.unrecorded_after);
         let sequence = page.events.last().map_or(from, |event| event.sequence);
         Ok(TransitionReplay {
             events: page.events,
@@ -3088,7 +3093,7 @@ impl Broker {
                 sequence,
             },
             reset,
-            gap,
+            lost_through,
             more: page.more,
         })
     }

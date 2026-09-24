@@ -357,6 +357,9 @@ pub async fn deliver_to_views(
     runtime: Arc<crate::runtime::SessionRuntime>,
 ) {
     let mut cursor = broker.stream_start();
+    // The highest lost position the views have been told about. A loss is news once: a view that
+    // has started again since installed a state that already accounts for it.
+    let mut reported = 0_u64;
     loop {
         match observations.next().await {
             Some(transition) => {
@@ -373,7 +376,7 @@ pub async fn deliver_to_views(
                 // also what says whether this connection goes on: the registry decides that with
                 // the withdrawal, under one lock.
                 let continuing = observations.resubscribe();
-                recover_views(&broker, &runtime, session_id, &mut cursor).await;
+                recover_views(&broker, &runtime, session_id, &mut cursor, &mut reported).await;
                 if !continuing {
                     break;
                 }
@@ -385,12 +388,14 @@ pub async fn deliver_to_views(
 /// Replays what the views have not been told about, in bounded pages.
 ///
 /// The broker's lock is taken for one page at a time, so a connection that is far behind recovers
-/// without holding every other caller behind its read.
+/// without holding every other caller behind its read. A loss the views were already told about,
+/// by this recovery's earlier page or by an earlier recovery, is not told again.
 async fn recover_views(
     broker: &Arc<Broker>,
     runtime: &Arc<crate::runtime::SessionRuntime>,
     session_id: kr_protocol::ids::SessionId,
     cursor: &mut crate::broker::ReplayCursor,
+    reported: &mut u64,
 ) {
     // One recovery is one piece of news, however many pages it reads. The lock is given back
     // between pages, so a view can install its fresh state part way through; telling the views
@@ -411,11 +416,19 @@ async fn recover_views(
                 return;
             }
         };
-        if (replay.reset || replay.gap) && !told {
+        // Positions mean nothing across two generations, so a reset forgets what was reported.
+        if replay.reset {
+            *reported = 0;
+        }
+        let lost = replay.lost_through.is_some_and(|lost| lost > *reported);
+        if (replay.reset || lost) && !told {
             told = true;
             runtime
                 .session()
                 .resync_all_views(kr_protocol::recovery::ResyncReason::AgentStreamGap);
+        }
+        if let Some(lost) = replay.lost_through {
+            *reported = (*reported).max(lost);
         }
         for transition in replay.events {
             if transition.sequence <= cursor.sequence && !replay.reset {

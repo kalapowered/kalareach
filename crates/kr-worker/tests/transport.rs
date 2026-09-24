@@ -3830,7 +3830,7 @@ async fn kr_req_12_11_a_position_from_an_earlier_run_replays_the_stream_again() 
         })
         .expect("the outbox reads");
     assert!(
-        announced.gap,
+        announced.lost_through.is_some(),
         "and the run that announced them says so to anyone reading from before them"
     );
     drop(first_run);
@@ -5734,12 +5734,13 @@ async fn kr_req_12_11_an_overflowed_observer_replays_what_its_queue_lost() {
     served.drained.abort();
 }
 
-/// KR-REQ-12.11 and section 12: what was announced and never recorded is reported as a gap.
+/// KR-REQ-12.11 and section 12: what was announced and never recorded is reported as a gap, once.
 ///
 /// A stretch the journal could not take is published and not written, so no replay can return it.
 /// An observer that overflows inside such a stretch therefore cannot be made whole by the outbox,
 /// and the one thing it must not do is hand the views a shorter history that looks complete. It
-/// tells them to start again instead.
+/// tells them to start again instead, and only once: every later page and every later recovery
+/// finds the same loss, and a view that has started again already accounts for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_12_11_a_recovery_that_cannot_cover_the_interval_tells_the_views_to_start_again() {
     let broker = broker();
@@ -5812,10 +5813,17 @@ async fn kr_req_12_11_a_recovery_that_cannot_cover_the_interval_tells_the_views_
             Ok(None) | Err(_) => break,
         }
     }
-    // And nothing more is said about it while the recovery finishes its remaining pages, or when
-    // delivery ends and runs its last recovery, which finds the same loss. Delivery is ended and
-    // joined before the count, so every page any recovery read has been delivered by then; the
-    // view has not started again, so the loss is not news to it a second time.
+    // The view does what the marker asks and starts again on a fresh subscription.
+    let mut fresh = runtime
+        .session()
+        .subscribe(kr_protocol::ids::AttachmentId::new(Uuid::from_bytes(
+            [5; 16],
+        )))
+        .expect("the view subscribes again");
+
+    // And nothing more is said about the loss while the recovery finishes its remaining pages, or
+    // when delivery ends and runs its last recovery, which finds the same loss. Delivery is ended
+    // and joined before the count, so every page any recovery read has been delivered by then.
     broker.observatory().withdraw(GatewayConnectionId::new(1));
     tokio::time::timeout(LIVENESS_DEADLINE, carrying)
         .await
@@ -5830,6 +5838,17 @@ async fn kr_req_12_11_a_recovery_that_cannot_cover_the_interval_tells_the_views_
             _ => {}
         }
     }
+    let mut told_again = 0_usize;
+    while let Some(delivery) = fresh.try_recv() {
+        if matches!(delivery, kr_worker::output::OutputDelivery::Resync(_)) {
+            told_again += 1;
+        }
+        fresh.written(delivery.len());
+    }
+    assert_eq!(
+        told_again, 0,
+        "a view that started again after the loss is not sent back for it a second time"
+    );
 
     let marker = markers
         .first()
@@ -6498,7 +6517,7 @@ async fn kr_req_12_11_a_recovery_larger_than_one_control_frame_is_given_back_in_
             !replay.reset,
             "the copy belongs to the run that is still live"
         );
-        assert!(!replay.gap, "and nothing after it was lost");
+        assert_eq!(replay.lost_through, None, "and nothing after it was lost");
         for event in &replay.events {
             installed.insert(event.resource_id, event.state);
             replayed += 1;
