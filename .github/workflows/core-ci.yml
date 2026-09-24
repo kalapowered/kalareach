@@ -302,10 +302,16 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       # What has been qualified on this platform, and only that: the terminal engine, the
-      # repository boundary, the attach client, the worker's own library, and the suite that
-      # drives a real pseudo-console, a real PowerShell and a real job object. "The attach client"
-      # means the part of it that runs here - `crates/kr-cli/tests/attach.rs` is a Unix file, so
-      # what passes is that crate's library and its path tests rather than a real attachment.
+      # repository boundary, the attach client, the contact tools against a session's job, the
+      # worker's own library, the suite that drives a real pseudo-console, a real PowerShell and a
+      # real job object and hosts a worker on its own pipe, where a launched agent's helper is
+      # placed, what a question's caller token reaches, a controller's and the local command
+      # line's authority at a worker's pipe, and the local endpoint, descriptors and process
+      # identity the host rests on. "The attach client" means the part of it that runs here -
+      # `crates/kr-cli/tests/attach.rs` is a Unix file, so what passes is that crate's library and
+      # its path tests rather than a real attachment. The contact tools run in
+      # `crates/kr-cli/tests/contact_windows.rs`, beside the Unix suite, with the tool server
+      # started by a root shell inside the session's job.
       #
       # The worker's other integration suites are **not** run here. They drive a session the way a
       # Unix pseudo-terminal behaves - a process group, a shell that answers a signal, a stream
@@ -340,9 +346,58 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-client --test sync
 
+      # The session job object and, beside it, a worker hosted on its own named pipe: each worker's
+      # journal and pipe are its own, the pipe's list is its owner's, and a local caller on it is
+      # served as that owner and held to the worker's own session.
       - name: Drive a pseudo-console, PowerShell and the session job object
         if: ${{ !cancelled() }}
         run: cargo test --locked -p kr-worker --test windows
+
+      # Where the worker places a helper that an agent it launched started: by the job the agent
+      # was started in, since a Windows process keeps naming a parent that has exited, and that job
+      # is let go of with the last instance that names the agent.
+      - name: Place a launched agent's helper by the job it was started in
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-worker --test question_bindings
+
+      # The local endpoint on this platform and what it rests on. A worker's endpoint is a named
+      # pipe that carries its own access-control list: a caller without the owner's identity is
+      # refused when it opens it, and so is the owner arriving over the network, which is why this
+      # case opens a pipe through the runner's own file-sharing server. The pipe names the process
+      # at its other end; a descriptor is published under its owner's list and replaced whole; a
+      # process's start identity is the creation time Windows records.
+      - name: Test the local endpoint, the descriptors and the process identity
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-ipc --test windows
+
+      # The crate's own tests, among them the environment identity's list and the profile it is
+      # kept in. Two of the frame writer's tests are left out: on this platform a named pipe with
+      # no reader takes less of one write than a socket does, and reports room while it is full,
+      # and what that means for the writer's backpressure has not been established.
+      - name: Test the local IPC library
+        if: ${{ !cancelled() }}
+        run: >-
+          cargo test --locked -p kr-ipc --lib --
+          --skip framed::tests::a_checked_write_asks_before_every_transport_write
+          --skip framed::tests::a_peer_that_stops_reading_blocks_the_attempt_rather_than_holding_the_writer
+
+      # What the originating agent may do with a question on this platform's identities: a caller
+      # token works only for the helper it was issued to.
+      - name: Test what a question's caller token reaches
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-worker --test questions_answer
+
+      # A controller's authority at a worker's own pipe, and the local command line on it, which
+      # the pipe admits as its owner and the worker still holds to its own session.
+      - name: Test controller and local authority at a worker's pipe
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-worker --test authority
+
+      # The settings-sync store flushes the directory it changes a name in, through a handle of
+      # the directory's own, and passes over a directory on its path this account may not add to.
+      - name: Test the settings-sync store's directory flush
+        if: ${{ !cancelled() }}
+        run: cargo test --locked -p kr-client --lib sync::store
 
       # The root editor's own transport on this platform. The bridge endpoint is a named pipe
       # rather than a socket, so the client keeps one asynchronous read in flight and collects it
