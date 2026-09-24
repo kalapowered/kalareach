@@ -2047,22 +2047,33 @@ impl Controller {
     /// bound was anchored on as well as in UTC, so a wall clock wound back after the bound ran out
     /// does not bring it back, and a lapse found there is written down as a device's is.
     ///
-    /// A workflow runs unattended, so a decision is used only once the clock floor it stands on is
-    /// written down. Every decision owes that record to the one this daemon keeps, and a write that
-    /// fails leaves it owed for whichever step writes the floor next.
+    /// `now_ms` is the wall clock as the caller read it at `read_at` on the continuous clock. A
+    /// workflow runs unattended, so nothing is decided while a clock floor an earlier refusal stood
+    /// on is still owed its record: that write is made first, and while it cannot be, the answer is
+    /// that authority is unavailable. Every wait is therefore over before the decision, and the
+    /// decision is taken at the caller's reading advanced by the time those waits took, so a
+    /// deadline that passed while this waited for the policy or for storage is decided as passed.
+    /// Nothing waits between a permission and the caller's use of it. A refusal the clock decided
+    /// owes its own floor, and is answered only once that is written.
     ///
     /// # Errors
     ///
     /// Returns [`kr_automation::AutomationError::PermissionDenied`] naming the rule that refused,
-    /// and [`kr_automation::AutomationError::AuthorityUnavailable`] while the floor the decision
-    /// stands on cannot be written down.
+    /// and [`kr_automation::AutomationError::AuthorityUnavailable`] while a floor a refusal stood on
+    /// cannot be written down.
     pub(crate) fn decide_for_workflow(
         &self,
         record: &crate::grants::GrantRecord,
         ingress: kr_protocol::actor::ActorIngress,
         now_ms: u64,
+        read_at: kr_transport::clock::ContinuousInstant,
     ) -> kr_automation::Result<CanonicalSet<kr_protocol::rights::ActionRight>> {
         let grant_id = record.grant.grant_id;
+        let unwritten = || {
+            kr_automation::AutomationError::AuthorityUnavailable(
+                "the clock floor a refusal stood on could not be written down".to_owned(),
+            )
+        };
         let ceiling = self
             .rights_ceiling
             .lock()
@@ -2089,6 +2100,14 @@ impl Controller {
             .policy
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.write_owed_floor(&policy);
+        if self.floor_written.load(std::sync::atomic::Ordering::SeqCst)
+            < self.floor_owed.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(unwritten());
+        }
+        let waited = self.clock.now().saturating_duration_since(read_at);
+        let now_ms = now_ms.saturating_add(u64::try_from(waited.as_millis()).unwrap_or(u64::MAX));
         // The bound a remote holder under a personal grant is held to, which is the policy's own
         // rule for when it applies.
         let offline = (ingress != kr_protocol::actor::ActorIngress::LocalIpc
@@ -2124,14 +2143,20 @@ impl Controller {
             }
             (decided, _) => decided,
         };
-        let floor = policy.utc_floor_ms();
-        self.owe_floor(&policy);
-        if self.floor_written.load(std::sync::atomic::Ordering::SeqCst) < floor {
-            return Err(kr_automation::AutomationError::AuthorityUnavailable(
-                "the clock floor this decision stands on could not be written down".to_owned(),
-            ));
-        }
         decided.map_err(|refusal| {
+            if matches!(
+                refusal,
+                crate::grants::Refusal::Expired { .. }
+                    | crate::grants::Refusal::OfflineValidityLapsed { .. }
+            ) {
+                // A refusal the clock decided is one a clock wound back before the next start
+                // would otherwise revive, so it is answered only once its floor is on disk.
+                let floor = policy.utc_floor_ms();
+                self.owe_floor(&policy);
+                if self.floor_written.load(std::sync::atomic::Ordering::SeqCst) < floor {
+                    return unwritten();
+                }
+            }
             kr_automation::AutomationError::PermissionDenied(format!(
                 "grant {grant_id}: {}",
                 refusal.detail()

@@ -2154,15 +2154,26 @@ async fn a_grant_withdrawn_while_the_change_set_write_waits_writes_nothing() {
     host.clients.abort();
 }
 
-/// Writes a grant carrying `rights` to a device other than this host, as a paired device's own
-/// grant is, into this daemon's grant store.
-fn issue_to_another_device(host: &Host, grant_id: GrantId, rights: &[ActionRight]) -> Grant {
+/// A device other than this host, which a grant issued to it reaches the host over the network.
+fn another_device() -> kr_protocol::ids::DeviceId {
+    kr_protocol::ids::DeviceId::new(Uuid::from_bytes([0x7d; 16]))
+}
+
+/// Writes a grant carrying `rights` to `recipient`, running out at `expiry`, into this daemon's
+/// grant store.
+fn issue_grant(
+    host: &Host,
+    grant_id: GrantId,
+    recipient: kr_protocol::ids::DeviceId,
+    rights: &[ActionRight],
+    expiry: GrantExpiry,
+) -> Grant {
     let issuer = kr_protocol::ids::DeviceId::new(host.environment_id.get());
     let grant = Grant {
         grant_id,
         parent_grant_id: Nullable::null(),
         issuer_device_id: issuer,
-        recipient_device_id: kr_protocol::ids::DeviceId::new(Uuid::from_bytes([0x7d; 16])),
+        recipient_device_id: recipient,
         authority_revision: host.controller.policy().authority_revision(),
         environment_selector: EnvironmentSelector::Any,
         session_selector: SessionSelector::Any,
@@ -2173,7 +2184,7 @@ fn issue_to_another_device(host: &Host, grant_id: GrantId, rights: &[ActionRight
             named_questions: CanonicalSet::new(),
             named_approvals: CanonicalSet::new(),
         },
-        expiry: GrantExpiry::Never,
+        expiry,
         organisation: Nullable::null(),
     };
     host.controller
@@ -2214,7 +2225,13 @@ async fn a_workflow_grant_is_held_to_the_offline_bound_on_the_continuous_clock()
             }));
         })
         .expect("the owner chooses an offline bound of a fifth of a second");
-    let grant = issue_to_another_device(&host, grant_id(21), &[ActionRight::ChangesetCreate]);
+    let grant = issue_grant(
+        &host,
+        grant_id(21),
+        another_device(),
+        &[ActionRight::ChangesetCreate],
+        GrantExpiry::Never,
+    );
     let grants = HostGrants::for_daemon(&host.controller);
     grants
         .grant(grant.grant_id, synchronised)
@@ -2228,6 +2245,177 @@ async fn a_workflow_grant_is_held_to_the_offline_bound_on_the_continuous_clock()
         .expect_err("the bound ran out on the continuous clock");
     assert!(
         matches!(&refused, AutomationError::PermissionDenied(detail) if detail.contains("offline")),
+        "{refused}"
+    );
+
+    host.clients.abort();
+}
+
+/// A deadline that passes while a workflow's decision waits for storage is decided after the wait.
+/// A refusal left its clock floor owed, and storage is held while the next decision writes it. The
+/// offline bound runs out during that wait, so the decision that follows it is a refusal rather
+/// than the permission the clock gave before the wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deadline_that_passes_while_the_floor_is_written_is_decided_after_the_write() {
+    use kr_automation::{AuthoritySource, AutomationError};
+    use kr_controller::automation::HostGrants;
+
+    let host = host().await;
+    let environment = host._temp.environment();
+    let synchronised = kr_ipc::now_ms().get();
+    host.controller
+        .update_policy(|policy| {
+            policy.set_offline_validity(Some(kr_protocol::sharing::OfflineValidityPolicy {
+                maximum_offline_ms: kr_protocol::scalars::DurationMs::new(400),
+                last_synchronised_at_ms: Nullable::some(kr_protocol::scalars::TimestampMs::new(
+                    synchronised,
+                )),
+            }));
+        })
+        .expect("the owner chooses an offline bound of 400 milliseconds");
+    let lasting = issue_grant(
+        &host,
+        grant_id(23),
+        another_device(),
+        &[ActionRight::ChangesetCreate],
+        GrantExpiry::Never,
+    );
+    let expired = issue_grant(
+        &host,
+        grant_id(24),
+        another_device(),
+        &[ActionRight::ChangesetCreate],
+        GrantExpiry::At {
+            expires_at_ms: kr_protocol::scalars::TimestampMs::new(synchronised - 1),
+        },
+    );
+    let grants = Arc::new(HostGrants::for_daemon(&host.controller));
+    grants
+        .grant(lasting.grant_id, kr_ipc::now_ms().get())
+        .expect("inside the bound");
+
+    // A grant that has already run out is refused while the host's policy cannot be written, so
+    // the floor that refusal stood on is owed.
+    let registry =
+        rusqlite::Connection::open(environment.registry_database()).expect("opens the registry");
+    registry
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    registry
+        .execute_batch(
+            "CREATE TRIGGER refuse_policy BEFORE INSERT ON host_authority
+             WHEN NEW.key = 'policy'
+             BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("the fault is in place");
+    let owed = grants
+        .grant(expired.grant_id, kr_ipc::now_ms().get() + 50)
+        .expect_err("an expired grant is refused");
+    assert!(
+        matches!(owed, AutomationError::AuthorityUnavailable(_)),
+        "{owed}"
+    );
+
+    // Storage can take the write again, but another writer holds it while the next decision is
+    // taken, for longer than the bound has left.
+    registry
+        .execute_batch("DROP TRIGGER refuse_policy; BEGIN IMMEDIATE;")
+        .expect("storage is held");
+    let deciding = {
+        let grants = Arc::clone(&grants);
+        let reading = kr_ipc::now_ms().get();
+        std::thread::spawn(move || grants.grant(lasting.grant_id, reading))
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    registry
+        .execute_batch("ROLLBACK;")
+        .expect("storage is free");
+    let refused = deciding
+        .join()
+        .expect("the decision returns")
+        .expect_err("the bound ran out while the decision waited for storage");
+    assert!(
+        matches!(&refused, AutomationError::PermissionDenied(detail) if detail.contains("offline")),
+        "{refused}"
+    );
+
+    host.clients.abort();
+}
+
+/// A grant that expires while a workflow's decision waits for storage is refused after the wait.
+/// The owner's own grant is held to no offline bound, so its expiry in UTC is the only deadline:
+/// the decision is taken at the caller's reading advanced by the time the write took, not at the
+/// reading the caller took before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_that_expires_while_the_floor_is_written_is_refused_after_the_write() {
+    use kr_automation::{AuthoritySource, AutomationError};
+    use kr_controller::automation::HostGrants;
+
+    let host = host().await;
+    let environment = host._temp.environment();
+    let here = kr_protocol::ids::DeviceId::new(host.environment_id.get());
+    let now = kr_ipc::now_ms().get();
+    let expiring = issue_grant(
+        &host,
+        grant_id(25),
+        here,
+        &[ActionRight::ChangesetCreate],
+        GrantExpiry::At {
+            expires_at_ms: kr_protocol::scalars::TimestampMs::new(now + 300),
+        },
+    );
+    let expired = issue_grant(
+        &host,
+        grant_id(26),
+        here,
+        &[ActionRight::ChangesetCreate],
+        GrantExpiry::At {
+            expires_at_ms: kr_protocol::scalars::TimestampMs::new(now - 1),
+        },
+    );
+    let grants = Arc::new(HostGrants::for_daemon(&host.controller));
+
+    // A grant that has already run out is refused while the host's policy cannot be written, so
+    // the floor that refusal stood on is owed.
+    let registry =
+        rusqlite::Connection::open(environment.registry_database()).expect("opens the registry");
+    registry
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    registry
+        .execute_batch(
+            "CREATE TRIGGER refuse_policy BEFORE INSERT ON host_authority
+             WHEN NEW.key = 'policy'
+             BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("the fault is in place");
+    let owed = grants
+        .grant(expired.grant_id, kr_ipc::now_ms().get() + 50)
+        .expect_err("an expired grant is refused");
+    assert!(
+        matches!(owed, AutomationError::AuthorityUnavailable(_)),
+        "{owed}"
+    );
+
+    // The next decision waits for storage past the moment the first grant expires.
+    registry
+        .execute_batch("DROP TRIGGER refuse_policy; BEGIN IMMEDIATE;")
+        .expect("storage is held");
+    let deciding = {
+        let grants = Arc::clone(&grants);
+        let reading = kr_ipc::now_ms().get();
+        std::thread::spawn(move || grants.grant(expiring.grant_id, reading))
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    registry
+        .execute_batch("ROLLBACK;")
+        .expect("storage is free");
+    let refused = deciding
+        .join()
+        .expect("the decision returns")
+        .expect_err("the grant expired while the decision waited for storage");
+    assert!(
+        matches!(&refused, AutomationError::PermissionDenied(detail) if detail.contains("expired")),
         "{refused}"
     );
 

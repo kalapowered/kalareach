@@ -154,6 +154,9 @@ impl HostGrants {
 impl AuthoritySource for HostGrants {
     fn grant(&self, grant_id: GrantId, now_ms: u64) -> kr_automation::Result<Grant> {
         let daemon = self.daemon.get()?;
+        // The moment the caller's reading stands for. Everything from here on can wait, and the
+        // daemon decides at the reading advanced by however long that was.
+        let read_at = daemon.continuous_now();
         let record = Self::record(&daemon, grant_id)?;
         // A grant this host holds for itself is the owner's own authority at this machine; any
         // other recipient is a device that reached the host over the network, and the bounded
@@ -163,7 +166,7 @@ impl AuthoritySource for HostGrants {
         } else {
             ActorIngress::PairedDevice
         };
-        let rights = daemon.decide_for_workflow(&record, ingress, now_ms)?;
+        let rights = daemon.decide_for_workflow(&record, ingress, now_ms, read_at)?;
         // The grant as this host leaves it: a configured ceiling or an organisation lease that
         // narrows it narrows what the workflow may do, and the node is checked against the result.
         Ok(Grant {

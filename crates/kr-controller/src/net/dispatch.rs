@@ -3393,12 +3393,13 @@ mod write_boundary {
         }
     }
 
-    /// Records a paired device whose grant does not expire, and returns the grant's identifier.
-    fn a_paired_device(controller: &Controller) -> kr_protocol::ids::GrantId {
-        let (grant, _) = super::super::tests::granted(
-            kr_protocol::grant::GrantExpiry::Never,
-            controller.policy().authority_revision(),
-        );
+    /// Records a paired device whose grant runs out at `expiry`, and returns the grant's identifier.
+    fn a_paired_device(
+        controller: &Controller,
+        expiry: kr_protocol::grant::GrantExpiry,
+    ) -> kr_protocol::ids::GrantId {
+        let (grant, _) =
+            super::super::tests::granted(expiry, controller.policy().authority_revision());
         let record = crate::service::net::devices::DeviceRecord {
             device_id: grant.recipient_device_id,
             endpoint_id: kr_protocol::scalars::EndpointKey::from_bytes([7; 32]),
@@ -3422,10 +3423,10 @@ mod write_boundary {
     }
 
     /// A floor raised while the policy's lock is held stops a batch as surely as one a device's
-    /// decision raised. A workflow's grant is decided at a reading past the moment the batch's
-    /// decision runs out, and the lock is then held while that decision's write waits for storage.
-    /// The batch is not written, whether it waited for the writer or had started and waited for
-    /// the peer.
+    /// decision raised. A workflow's grant that runs out at the moment the batch's decision does is
+    /// refused at a reading past it, and the lock is then held while that refusal's write waits for
+    /// storage. The batch is not written, whether it waited for the writer or had started and
+    /// waited for the peer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_batch_is_not_written_once_a_floor_raised_under_the_lock_passes_its_decision() {
         use kr_automation::authority::AuthoritySource as _;
@@ -3439,9 +3440,14 @@ mod write_boundary {
             if peer_stops_reading {
                 stream.writer.add_permits(1);
             }
-            let grant_id = a_paired_device(&controller);
-            let grants = crate::automation::HostGrants::for_daemon(&controller);
             let lapses_at_ms = kr_ipc::now_ms().get() + 60 * 60 * 1000;
+            let grant_id = a_paired_device(
+                &controller,
+                kr_protocol::grant::GrantExpiry::At {
+                    expires_at_ms: kr_protocol::scalars::TimestampMs::new(lapses_at_ms),
+                },
+            );
+            let grants = crate::automation::HostGrants::for_daemon(&controller);
 
             // Another writer holds storage, so the write that decision owes waits with the lock
             // held.
