@@ -92,12 +92,13 @@ export type AccountView =
   | { readonly state: 'browser_open' }
   /** The answer came back and is being exchanged. */
   | { readonly state: 'finishing' }
-  /** An account is signed in. */
+  /** An account is signed in, with how the last sign-out ended when it left it signed in. */
   | {
       readonly state: 'signed_in'
       readonly email: string | null
       readonly name: string | null
       readonly usage_readable: boolean
+      readonly outcome: AccountOutcome | null
     }
   /** The sign-in ended by itself. */
   | { readonly state: 'ended' }

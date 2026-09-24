@@ -43,55 +43,83 @@ export interface AccountHandle {
   readonly readUsage: () => void
 }
 
-/** Reads where the device stands and follows every change the backend publishes. */
+/** Who a view says is signed in, or null when nobody is. */
+function signedInAs(view: AccountView): string | null {
+  return view.state === 'signed_in' ? (view.email ?? '') : null
+}
+
+/**
+ * Reads where the device stands and follows every change the backend publishes.
+ *
+ * Usage belongs to one sign-in. Each change of who is signed in, including signing out, starts a
+ * new epoch; a usage read answers for the epoch it was asked in, so figures read for one sign-in
+ * are never shown for another, however late they arrive.
+ */
 export function useAccount(port: HostPort): AccountHandle {
   const [view, setView] = useState<AccountView | null>(null)
-  const [usage, setUsage] = useState<UsageView | null>(null)
+  const [epoch, setEpoch] = useState(0)
+  const [usage, setUsage] = useState<{ readonly epoch: number; readonly usage: UsageView } | null>(
+    null
+  )
+  const current = useRef({ epoch: 0, who: null as string | null })
+
+  const show = useCallback((next: AccountView) => {
+    setView(next)
+    const who = signedInAs(next)
+    if (who === null || who !== current.current.who) {
+      current.current = { epoch: current.current.epoch + 1, who }
+      setEpoch(current.current.epoch)
+    }
+  }, [])
 
   useEffect(() => {
     let live = true
     port
       .accountStatus()
       .then((next) => {
-        if (live) setView(next)
+        if (live) show(next)
       })
       .catch(() => {
-        if (live) setView({ state: 'signed_out', outcome: null })
+        if (live) show({ state: 'signed_out', outcome: null })
       })
     const stop = port.onAccount((next) => {
-      if (live) setView(next)
+      if (live) show(next)
     })
     return () => {
       live = false
       stop()
     }
-  }, [port])
+  }, [port, show])
 
   const readUsage = useCallback(() => {
+    const asked = current.current.epoch
+    const keep = (read: UsageView) => {
+      if (asked === current.current.epoch) setUsage({ epoch: asked, usage: read })
+    }
     port
       .accountUsage()
-      .then(setUsage)
+      .then(keep)
       .catch(() => {
-        setUsage({ state: 'could_not_read' })
+        keep({ state: 'could_not_read' })
       })
   }, [port])
 
   const readable = view?.state === 'signed_in' && view.usage_readable
   useEffect(() => {
     if (readable) readUsage()
-  }, [readable, readUsage])
+  }, [readable, epoch, readUsage])
 
   const signIn = useCallback(() => {
     // The panel says the browser is open before the browser appears, so a return by any path lands
     // on a screen that says what happens next.
-    setView({ state: 'browser_open' })
+    show({ state: 'browser_open' })
     port
       .accountSignIn()
-      .then(setView)
+      .then(show)
       .catch(() => {
-        setView({ state: 'signed_out', outcome: 'browser_failed' })
+        show({ state: 'signed_out', outcome: 'browser_failed' })
       })
-  }, [port])
+  }, [port, show])
 
   const cancel = useCallback(() => {
     void port.accountSignInCancel().catch(() => undefined)
@@ -100,14 +128,15 @@ export function useAccount(port: HostPort): AccountHandle {
   const signOut = useCallback(() => {
     port
       .accountSignOut()
-      .then(setView)
+      .then(show)
       .catch(() => {
-        setView({ state: 'signed_out', outcome: 'sign_out_failed' })
+        show({ state: 'signed_out', outcome: 'sign_out_failed' })
       })
-  }, [port])
+  }, [port, show])
 
-  // Usage is shown only while the sign-in may read it.
-  return { view, usage: readable ? usage : null, signIn, cancel, signOut, readUsage }
+  // Usage is shown only while the sign-in may read it, and only what was read for this sign-in.
+  const shown = readable && usage?.epoch === epoch ? usage.usage : null
+  return { view, usage: shown, signIn, cancel, signOut, readUsage }
 }
 
 /** The account panel. */
@@ -144,7 +173,7 @@ export function AccountPanel({
     return <div className="account-panel" data-testid="account-panel" aria-busy="true" />
   }
 
-  const outcome = view.state === 'signed_out' ? view.outcome : null
+  const outcome = view.state === 'signed_out' || view.state === 'signed_in' ? view.outcome : null
   const offersSignIn = view.state === 'signed_out' || view.state === 'ended'
 
   return (

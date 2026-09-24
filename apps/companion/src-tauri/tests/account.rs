@@ -210,10 +210,25 @@ fn account(
     exchanges: &Arc<Exchanges>,
     views: &Arc<Mutex<Vec<AccountView>>>,
 ) -> Arc<Account> {
+    account_in(
+        Arc::new(MemoryStore::new()),
+        client,
+        carrier,
+        exchanges,
+        views,
+    )
+}
+
+fn account_in(
+    store: Arc<dyn SecretStore>,
+    client: Client,
+    carrier: Arc<dyn Carrier>,
+    exchanges: &Arc<Exchanges>,
+    views: &Arc<Mutex<Vec<AccountView>>>,
+) -> Arc<Account> {
     let service: Arc<dyn AccountService> = Arc::new(Stub {
         exchanges: Arc::clone(exchanges),
     });
-    let store: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
     let signed_in = Arc::new(SignedInAccount::new(Arc::clone(&service), store, client));
     let published = Arc::clone(views);
     Arc::new(Account::new(
@@ -368,4 +383,57 @@ fn a_cancelled_sign_in_changes_nothing() {
     assert_eq!(answer["state"], "signed_out");
     assert_eq!(answer["outcome"], "cancelled");
     assert!(exchanges.0.lock().expect("the record").is_empty());
+}
+
+/// A store that keeps and reads items but cannot remove one.
+struct RefusingDeletes(MemoryStore);
+
+impl SecretStore for RefusingDeletes {
+    fn set(&self, name: &kr_crypto::store::SecretName, secret: &[u8]) -> kr_crypto::Result<()> {
+        self.0.set(name, secret)
+    }
+
+    fn get(
+        &self,
+        name: &kr_crypto::store::SecretName,
+    ) -> kr_crypto::Result<Option<kr_crypto::secret::SecretVec>> {
+        self.0.get(name)
+    }
+
+    fn delete(&self, _name: &kr_crypto::store::SecretName) -> kr_crypto::Result<()> {
+        Err(kr_crypto::CryptoError::SecretStore {
+            message: "the store refused the removal".to_owned(),
+        })
+    }
+
+    fn describe(&self) -> String {
+        "a store that cannot remove".to_owned()
+    }
+}
+
+/// A sign-out the store refuses leaves the device signed in, and the page is told both: that it is
+/// still signed in, and that the sign-out failed.
+#[test]
+fn a_sign_out_the_store_refuses_says_so_beside_the_signed_in_account() {
+    let exchanges = Arc::new(Exchanges::default());
+    let views = Arc::new(Mutex::new(Vec::new()));
+    let carrier: Arc<dyn Carrier> = Arc::new(PhoneSession {
+        redirect: Redirect::AppLink,
+        opened: Arc::new(Mutex::new(Vec::new())),
+    });
+    let account = account_in(
+        Arc::new(RefusingDeletes(MemoryStore::new())),
+        Client::Mobile,
+        carrier,
+        &exchanges,
+        &views,
+    );
+    let signed_in = invoke(Arc::clone(&account), "account_sign_in");
+    assert_eq!(signed_in["state"], "signed_in", "{signed_in}");
+
+    let answer = invoke(Arc::clone(&account), "account_sign_out");
+    assert_eq!(answer["state"], "signed_in", "{answer}");
+    assert_eq!(answer["outcome"], "sign_out_failed", "{answer}");
+    let status = invoke(account, "account_status");
+    assert_eq!(status["outcome"], "sign_out_failed", "{status}");
 }

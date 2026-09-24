@@ -55,11 +55,77 @@ describe('the desktop Account sheet', () => {
         state: 'signed_in',
         email: 'sam@example.com',
         name: null,
-        usage_readable: false
+        usage_readable: false,
+        outcome: null
       })
     })
     expect(await screen.findByText('Signed in as sam@example.com.')).toBeInTheDocument()
     expect(item).toHaveTextContent('sam@example.com')
+  })
+
+  it('never shows one sign-in\'s usage for another, however late it answers', async () => {
+    const person = userEvent.setup()
+    const controls = start()
+    controls.account.holdUsage()
+    const signedIn = (email: string): AccountView => ({
+      state: 'signed_in',
+      email,
+      name: null,
+      usage_readable: true,
+      outcome: null
+    })
+    const line = (used: number) => ({
+      state: 'read' as const,
+      period_label: 'Usage in September 2026',
+      lines: [{ label: 'Relay this month', used, included: 10, unit: 'GB' }]
+    })
+    await person.click(screen.getByRole('button', { name: /^Account/ }))
+    const sheet = await screen.findByRole('dialog', { name: 'Account' })
+
+    act(() => {
+      controls.account.set(signedIn('first@example.com'))
+    })
+    expect(await within(sheet).findByText('Usage has not been read yet.')).toBeInTheDocument()
+    act(() => {
+      controls.account.set({ state: 'signed_out', outcome: 'signed_out' })
+    })
+    act(() => {
+      controls.account.set(signedIn('second@example.com'))
+    })
+    await within(sheet).findByText('Signed in as second@example.com.')
+
+    // The second sign-in's usage arrives, then the first's, late.
+    await act(async () => {
+      controls.account.answerUsage(1, line(2))
+      controls.account.answerUsage(0, line(9))
+      await Promise.resolve()
+    })
+    expect(await within(sheet).findByText('2 of 10 GB')).toBeInTheDocument()
+    expect(within(sheet).queryByText('9 of 10 GB')).toBeNull()
+  })
+
+  it('says a failed sign-out beside the account that stays signed in', async () => {
+    const person = userEvent.setup()
+    const controls = start()
+    await person.click(screen.getByRole('button', { name: /^Account/ }))
+    const sheet = await screen.findByRole('dialog', { name: 'Account' })
+    await within(sheet).findByRole('button', { name: 'Sign in' })
+    act(() => {
+      controls.account.set({
+        state: 'signed_in',
+        email: 'sam@example.com',
+        name: null,
+        usage_readable: false,
+        outcome: null
+      })
+    })
+    controls.account.failSignOut()
+    await person.click(await within(sheet).findByRole('button', { name: 'Sign out' }))
+    expect(
+      await within(sheet).findByText('KalaReach could not remove the sign-in from this device.')
+    ).toBeInTheDocument()
+    expect(within(sheet).getByText('Signed in as sam@example.com.')).toBeInTheDocument()
+    expect(within(sheet).getByRole('button', { name: 'Sign out' })).toBeInTheDocument()
   })
 
   it('names nothing to buy in any state', async () => {
@@ -71,7 +137,13 @@ describe('the desktop Account sheet', () => {
       { state: 'signed_out', outcome: 'signed_out_pending' },
       { state: 'browser_open' },
       { state: 'finishing' },
-      { state: 'signed_in', email: 'sam@example.com', name: 'Sam', usage_readable: false },
+      {
+        state: 'signed_in',
+        email: 'sam@example.com',
+        name: 'Sam',
+        usage_readable: false,
+        outcome: 'sign_out_failed'
+      },
       { state: 'ended' },
       { state: 'unavailable', reason: 'no_returning_browser' }
     ]

@@ -173,6 +173,12 @@ export interface FakeAccount {
   finishSignIn(view: AccountView): void
   /** Sets what a usage read answers. */
   setUsage(usage: UsageView): void
+  /** Holds every usage read from now on until the test answers it. */
+  holdUsage(): void
+  /** Answers the held usage read at `index`, counting from the first one held. */
+  answerUsage(index: number, usage: UsageView): void
+  /** Makes the next sign-outs fail the way the backend reports it: still signed in. */
+  failSignOut(): void
 }
 
 /** What the fake host can be told to do before a test drives the interface. */
@@ -296,6 +302,9 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
 
   let accountView: AccountView = { state: 'signed_out', outcome: null }
   let accountUsage: UsageView = { state: 'signed_out' }
+  let usageHeld = false
+  const heldUsage: ((usage: UsageView) => void)[] = []
+  let signOutFails = false
   let signIns = 0
   let pendingSignIn: ((view: AccountView) => void) | null = null
   const accountListeners = new Set<(view: AccountView) => void>()
@@ -902,11 +911,20 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       return Promise.resolve()
     },
     accountSignOut: () => {
+      if (signOutFails && accountView.state === 'signed_in') {
+        setAccount({ ...accountView, outcome: 'sign_out_failed' })
+        return Promise.resolve(accountView)
+      }
       accountUsage = { state: 'signed_out' }
       setAccount({ state: 'signed_out', outcome: 'signed_out' })
       return Promise.resolve(accountView)
     },
-    accountUsage: () => Promise.resolve(accountUsage),
+    accountUsage: () =>
+      usageHeld
+        ? new Promise<UsageView>((resolve) => {
+            heldUsage.push(resolve)
+          })
+        : Promise.resolve(accountUsage),
     onAccount(listener) {
       accountListeners.add(listener)
       return () => accountListeners.delete(listener)
@@ -931,6 +949,15 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
       finishSignIn: settleSignIn,
       setUsage(usage) {
         accountUsage = usage
+      },
+      holdUsage() {
+        usageHeld = true
+      },
+      answerUsage(index, usage) {
+        heldUsage[index]?.(usage)
+      },
+      failSignOut() {
+        signOutFails = true
       }
     },
     emit,

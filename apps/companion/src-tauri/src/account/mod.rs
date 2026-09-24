@@ -103,6 +103,8 @@ pub enum AccountView {
         name: Option<String>,
         /// Whether this sign-in may read usage.
         usage_readable: bool,
+        /// How the last sign-out ended, when it left the account signed in.
+        outcome: Option<Outcome>,
     },
     /// The sign-in on this device ended by itself.
     Ended,
@@ -237,6 +239,10 @@ impl Account {
                 email,
                 name,
                 usage_readable: scopes.iter().any(|scope| scope == USAGE_SCOPE),
+                // Only a sign-out that failed leaves an outcome beside a signed-in account.
+                outcome: self
+                    .outcome()
+                    .filter(|outcome| *outcome == Outcome::SignOutFailed),
             },
             Ok(AccountStatus::Ended) => AccountView::Ended,
             Ok(AccountStatus::SignedOut) | Err(_) => match self.carrier.plan().await {

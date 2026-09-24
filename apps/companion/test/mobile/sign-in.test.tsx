@@ -58,7 +58,8 @@ describe('signing in hands the ceremony to the system browser (KR-REQ-17.19)', (
         state: 'signed_in',
         email: 'sam@example.com',
         name: null,
-        usage_readable: true
+        usage_readable: true,
+        outcome: null
       })
     })
     expect(await within(account).findByText('Signed in as sam@example.com.')).toBeInTheDocument()

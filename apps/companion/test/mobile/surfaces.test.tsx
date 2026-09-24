@@ -314,7 +314,8 @@ describe('the commercial surface (KR-REQ-17.32)', () => {
       state: 'signed_in',
       email: 'sam@example.com',
       name: null,
-      usage_readable: true
+      usage_readable: true,
+      outcome: null
     })
     await person.click(await screen.findByRole('button', { name: /^Account/ }))
     const account = await screen.findByTestId('mobile-account')
