@@ -413,9 +413,11 @@ mod linux {
             granted.stderr
         );
 
-        // The process's own environment, under the kernel's process tree. The control is the
-        // owner's ruleset: a read grant on that tree is one the mount check refuses on a host with
-        // a filesystem mounted beneath it, which is most hosts.
+        // The process's own environment, under the kernel's process tree. Git reads it as
+        // configuration and prints its first entry, the search path this host gives every Git
+        // child, with the key in lower case. The control is the owner's ruleset: a read grant on
+        // that tree is one the mount check refuses on a host with a filesystem mounted beneath it,
+        // which is most hosts.
         let environ = Path::new("/proc/self/environ");
         let confined = read_as_configuration(
             &fixture,
@@ -424,18 +426,24 @@ mod linux {
             Vec::new(),
             bounded_reads(&fixture),
         );
-        assert_refused(&confined, "PATH=", "the process tree");
+        assert_refused(&confined, "path=", "the process tree");
         let owner =
             read_as_configuration(&fixture, &location, environ, Vec::new(), Reads::Everywhere);
         assert!(
-            owner.stderr.contains("bad config line"),
-            "the owner's reads reach it, and Git read what it holds as configuration: {}",
+            owner.stdout.starts_with("path="),
+            "the owner's reads reach it, and Git read the environment as configuration: {} {}",
+            owner.stdout,
             owner.stderr
         );
 
-        // The system's configuration directory.
+        // The system's own name, which Git reads as a key with no value and prints as it is.
         let hostname = Path::new("/etc/hostname");
-        if hostname.is_file() {
+        let named = std::fs::read_to_string(hostname)
+            .map(|name| name.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        if named.is_empty() {
+            println!("not exercised for /etc: this host keeps no name in /etc/hostname");
+        } else {
             let confined = read_as_configuration(
                 &fixture,
                 &location,
@@ -443,7 +451,7 @@ mod linux {
                 Vec::new(),
                 bounded_reads(&fixture),
             );
-            assert_refused(&confined, "\u{0}", "the system's configuration directory");
+            assert_refused(&confined, &named, "the system's configuration directory");
             let granted = read_as_configuration(
                 &fixture,
                 &location,
@@ -452,12 +460,11 @@ mod linux {
                 bounded_reads(&fixture),
             );
             assert!(
-                !granted.stderr.contains("Permission denied"),
-                "with that directory granted the file is read: {}",
+                granted.stdout.to_ascii_lowercase().contains(&named),
+                "with that directory granted the file is read: {} {}",
+                granted.stdout,
                 granted.stderr
             );
-        } else {
-            println!("not exercised for /etc: this host has no /etc/hostname");
         }
     }
 
