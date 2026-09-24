@@ -996,11 +996,8 @@ jobs:
       #   KR_SHELL_PACKAGES names one, and this job builds none. The shell-packages job builds the
       #   packages and drives them through the contract and qualification suites; these two cases
       #   run where KR_SHELL_PACKAGES names a built package.
-      # - Two cases whose verdicts are timings this runner does not meet, alone or beside their
-      #   suites: two prompts that must overlap inside 1.4 seconds, and every export stopped no
-      #   sooner than a millisecond before its deadline. The rust job runs both.
-      # - The cases that need another filesystem, and a timed case that needs the processors to
-      #   itself, which the two steps after this one run.
+      # - The cases that need another filesystem, and the cases whose verdicts are timings, which
+      #   the two steps after this one run.
       - name: Test
         if: ${{ !cancelled() }}
         timeout-minutes: 70
@@ -1085,28 +1082,33 @@ jobs:
             fi
           done
 
-      # A case whose verdict is a timing: a queue that must overflow before a slow component drains
-      # it. On this runner's three processors the rest of its suite, running beside it, takes the
-      # processor time the case depends on, so the test step leaves it out by name and it runs here
-      # on its own, as the rust job runs its timed suites serially. A case that did not pass here
-      # by name fails the step.
+      # The cases whose verdicts are timings: two prompts that must overlap rather than queue behind
+      # one another, a queue that must overflow before a slow component drains it, and every export
+      # stopped at its own deadline. They run here one at a time, as the rust job runs its timed
+      # suites serially, so that no other case of their suites shares this runner's three
+      # processors with them. A case that did not pass here by name fails the step.
       - name: The timed cases, one at a time
         if: ${{ !cancelled() }}
         timeout-minutes: 10
         run: |
           set -euo pipefail
           cases=(
+            kr_req_12_04_an_admitted_operation_leaves_the_session_boundary_before_it_transmits
             kr_req_11_38_a_worker_is_told_when_the_queue_overflowed
+            kr_req_11_38_every_export_is_stopped_by_its_own_deadline
           )
           log="$RUNNER_TEMP/timed-cases.log"
-          cargo test --locked --workspace --exclude kr-sync-integration --test service -- \
-            --exact --test-threads=1 "${cases[@]}" 2>&1 | tee "$log"
+          status=0
+          cargo test --locked --workspace --exclude kr-sync-integration --no-fail-fast \
+            --test agent_service --test service --test execution -- \
+            --exact --test-threads=1 "${cases[@]}" 2>&1 | tee "$log" || status=$?
           for case in "${cases[@]}"; do
             if ! grep -q "^test $case \.\.\. ok\$" "$log"; then
               echo "$case did not pass here" >&2
-              exit 1
+              status=1
             fi
           done
+          exit "$status"
 
       # Real processes, real sockets and real terminals, the suites the script names and nothing
       # else, each of which must demonstrate something, and no process of the run left behind.
