@@ -78,6 +78,12 @@ const SCHEMA_VERSION: i64 = 7;
 /// The one earlier schema this build brings forward rather than refusing.
 const PREVIOUS_SCHEMA_VERSION: i64 = 6;
 
+/// The binding a notification is given when its destination is removed while an attempt is on the
+/// wire. A destination's digest is 64 hexadecimal characters, so no destination configured under
+/// the identifier afterwards, an identical one included, can match it, and a claim settles the
+/// notification rather than sending it again.
+pub const REMOVED_BINDING: &str = "removed";
+
 /// Every table a working journal has.
 ///
 /// A store that has lost one of them is refused rather than recreated: an empty outbox and an
@@ -1235,15 +1241,22 @@ impl DeliveryJournal {
     /// Nothing more is sent to it: every notification queued for it is taken back in the same
     /// transaction, so none waits for a claim to notice. One nothing dispatched is revoked and its
     /// bytes go; one an earlier attempt already dispatched is an outcome this host can no longer
-    /// settle, and is recorded as one. The record goes too, unless a notification or an encrypted
-    /// object already names it: then it stays as the name of what was sent, out of service, with
-    /// no rule and no credential, and a destination configured under the identifier later is a new
-    /// one. An attempt on the wire is left to the pass that claimed it.
+    /// settle, and is recorded as one. Each is classified by the kind of destination it was
+    /// admitted for, never by what is configured under the identifier now.
+    ///
+    /// An attempt on the wire is left to the pass that claimed it, which records whatever its
+    /// answer says. What its answer cannot do is lead to another attempt: the notification's
+    /// binding is replaced by [`REMOVED_BINDING`], which no destination's digest can equal, so a
+    /// claim settles it however the identifier is configured afterwards, an identical destination
+    /// included.
+    ///
+    /// The record goes too, unless a notification or an encrypted object already names it: then it
+    /// stays as the name of what was sent, out of service, with no rule and no credential.
     ///
     /// # Errors
     ///
     /// Returns [`DeliveryError::JournalUnavailable`] when the write fails, and
-    /// [`DeliveryError::JournalUnreadable`] when the stored kind is not one this build writes.
+    /// [`DeliveryError::JournalUnreadable`] when a stored kind is not one this build writes.
     pub fn remove_destination(
         &mut self,
         destination_id: &DestinationId,
@@ -1252,26 +1265,24 @@ impl DeliveryJournal {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let kind: Option<String> = transaction
+        let configured: Option<i64> = transaction
             .query_row(
-                "SELECT kind FROM delivery_destinations WHERE destination_id = ?1",
+                "SELECT 1 FROM delivery_destinations WHERE destination_id = ?1",
                 params![destination_id.as_str()],
                 |row| row.get(0),
             )
             .optional()?;
-        let Some(kind) = kind else {
+        if configured.is_none() {
             return Ok(DestinationRemoval::default());
-        };
-        let kind = DestinationKind::from_stored(&kind).ok_or(DeliveryError::JournalUnreadable(
-            "a stored destination kind is not one this build writes",
-        ))?;
-        let queued: Vec<(String, i64, i64)> = {
+        }
+        let queued: Vec<(String, i64, i64, String)> = {
             let mut statement = transaction.prepare(
-                "SELECT notification_id, attempts, dispatched FROM delivery_notifications
+                "SELECT notification_id, attempts, dispatched, destination_kind
+                   FROM delivery_notifications
                   WHERE destination_id = ?1 AND state IN ('admitted', 'retrying')",
             )?;
             let rows = statement.query_map(params![destination_id.as_str()], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })?;
             rows.collect::<rusqlite::Result<_>>()?
         };
@@ -1279,7 +1290,7 @@ impl DeliveryJournal {
             found: true,
             ..DestinationRemoval::default()
         };
-        for (identifier, attempts, dispatched) in queued {
+        for (identifier, attempts, dispatched, admitted_kind) in queued {
             if dispatched == 0 {
                 settle_in(
                     &transaction,
@@ -1291,18 +1302,29 @@ impl DeliveryJournal {
                 )?;
                 removal.revoked += 1;
             } else {
+                let admitted_kind = DestinationKind::from_stored(&admitted_kind).ok_or(
+                    DeliveryError::JournalUnreadable(
+                        "a stored destination kind is not one this build writes",
+                    ),
+                )?;
                 settle_in(
                     &transaction,
                     &identifier,
                     as_u64(attempts),
                     now_ms,
-                    unresolved_for(kind),
+                    unresolved_for(admitted_kind),
                     "the destination was removed after an earlier attempt reached it, so whether \
                      it arrived is not something this host can say",
                 )?;
                 removal.unresolved += 1;
             }
         }
+        removal.fenced = u64::try_from(transaction.execute(
+            "UPDATE delivery_notifications SET destination_digest = ?2
+              WHERE destination_id = ?1 AND state = 'in_flight'",
+            params![destination_id.as_str(), REMOVED_BINDING],
+        )?)
+        .unwrap_or(u64::MAX);
         let named: i64 = transaction.query_row(
             "SELECT EXISTS (SELECT 1 FROM delivery_notifications WHERE destination_id = ?1)
                  OR EXISTS (SELECT 1 FROM delivery_objects WHERE destination_id = ?1)",
@@ -3068,6 +3090,8 @@ pub struct DestinationRemoval {
     /// How many queued notifications an earlier attempt had dispatched, now outcomes nobody can
     /// settle.
     pub unresolved: u64,
+    /// How many attempts were on the wire, each left to report its answer and fenced from another.
+    pub fenced: u64,
     /// Whether the record stays, out of service, as the name of what was already sent to it.
     pub kept_as_history: bool,
 }
@@ -5970,6 +5994,7 @@ mod tests {
                 found: true,
                 revoked: 1,
                 unresolved: 1,
+                fenced: 1,
                 kept_as_history: true,
             }
         );
@@ -6007,6 +6032,37 @@ mod tests {
             .expect("a count");
         assert_eq!(queued, 0, "nothing of it waits to be sent");
 
+        // The attempt that was on the wire answers late and asks to be tried again, and the
+        // owner configures the identical destination before the next pass. Its answer is
+        // recorded, and it is still never sent again.
+        journal
+            .record_attempt(&Transition {
+                notification_id: NotificationId::new(uuid(3)),
+                attempt: 1,
+                state: DeliveryState::Retrying,
+                started_at_ms: TimestampMs::new(2_000),
+                settled_at_ms: Some(TimestampMs::new(4_000)),
+                next_attempt_at_ms: Some(TimestampMs::new(5_000)),
+                next: crate::push::NextAction::Send,
+                detail: Some("the destination answered 503".to_owned()),
+                suppression: None,
+                left_this_host: true,
+                reported_by_destination: false,
+            })
+            .expect("the late answer is recorded");
+        journal
+            .configure_destination(&destination("hook"))
+            .expect("the identical destination again");
+        assert!(
+            matches!(
+                journal
+                    .claim(NotificationId::new(uuid(3)), 6_000)
+                    .expect("a claim"),
+                Claim::Settled(DeliveryState::DuplicateUncertain)
+            ),
+            "a removed destination's attempt is never followed by another"
+        );
+
         let unused = journal
             .remove_destination(&unnamed.id, 3_000)
             .expect("a removal");
@@ -6018,6 +6074,92 @@ mod tests {
                 .expect("a removal"),
             DestinationRemoval::default(),
             "removing it again finds nothing"
+        );
+    }
+
+    /// What a removal settles is classified by the kind each notification was admitted for, not
+    /// by what the identifier is configured as when it is removed: a webhook's message a retry was
+    /// waiting on stays marked uncertain even when the identifier now names a paired device, and a
+    /// paired device's notification stays an outcome its gateway can still be asked about even when
+    /// the identifier now names a webhook.
+    #[test]
+    fn a_removal_classifies_each_notification_by_the_kind_it_was_admitted_for() {
+        fn dispatched_and_waiting(journal: &mut DeliveryJournal, byte: u8) {
+            claim(journal, byte, 2_000);
+            journal
+                .record_attempt(&Transition {
+                    notification_id: NotificationId::new(uuid(byte)),
+                    attempt: 1,
+                    state: DeliveryState::Retrying,
+                    started_at_ms: TimestampMs::new(2_000),
+                    settled_at_ms: Some(TimestampMs::new(2_000)),
+                    next_attempt_at_ms: Some(TimestampMs::new(60_000)),
+                    next: crate::push::NextAction::Send,
+                    detail: Some("an answer that asks for another attempt".to_owned()),
+                    suppression: None,
+                    left_this_host: true,
+                    reported_by_destination: false,
+                })
+                .expect("a transition");
+        }
+
+        // A webhook's message, and then a paired device under the same identifier.
+        let mut first = journal();
+        first
+            .take_events(&consumer(), &[taken(1, 1)], 1)
+            .expect("a page");
+        first
+            .admit(&delivery(1, event(1), "hook"))
+            .expect("admitted");
+        dispatched_and_waiting(&mut first, 1);
+        let device = DestinationRecord {
+            id: DestinationId::new("hook").expect("an identifier"),
+            ..phone()
+        };
+        first
+            .configure_destination(&device)
+            .expect("the identifier now names a device");
+        first
+            .remove_destination(&device.id, 3_000)
+            .expect("a removal");
+        assert_eq!(
+            first
+                .delivery(NotificationId::new(uuid(1)))
+                .expect("a read")
+                .expect("a record")
+                .state,
+            DeliveryState::DuplicateUncertain,
+            "a webhook's message has no gateway to ask"
+        );
+
+        // A paired device's notification, and then a webhook under the same identifier.
+        let mut second = journal();
+        let phone = phone();
+        second.configure_destination(&phone).expect("a device");
+        second
+            .take_events(&consumer(), &[taken(2, 2)], 2)
+            .expect("a page");
+        second
+            .admit(&delivery_for(2, event(2), &phone))
+            .expect("admitted");
+        dispatched_and_waiting(&mut second, 2);
+        second
+            .configure_destination(&DestinationRecord {
+                id: phone.id.clone(),
+                ..destination("hook")
+            })
+            .expect("the identifier now names a webhook");
+        second
+            .remove_destination(&phone.id, 3_000)
+            .expect("a removal");
+        assert_eq!(
+            second
+                .delivery(NotificationId::new(uuid(2)))
+                .expect("a read")
+                .expect("a record")
+                .state,
+            DeliveryState::OutcomeUnknown,
+            "a device's notification can still be asked about at its gateway"
         );
     }
 
