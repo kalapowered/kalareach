@@ -71,6 +71,14 @@ pub mod net;
 /// How long a closing worker is watched before the controller stops waiting for it to end.
 pub const CLOSURE_WATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long a daemon's start spends looking at the worker jobs its environment still has defined.
+///
+/// Each job takes launchd a few milliseconds to answer for, so this is room for hundreds of them. A
+/// launchd that has stopped answering costs a start this long, and the bounded questions about the
+/// job in hand when it runs out, rather than the start; the jobs not reached are looked at again by
+/// the next one.
+pub const JOB_SWEEP_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The file this environment's capability revision is recorded in.
 ///
 /// It is durable because a revision must never repeat: a caller compares the revision a record
@@ -7190,9 +7198,20 @@ impl Controller {
     async fn retire_ended_jobs(&self) {
         let jobs = self.paths.jobs_dir();
         let _ = tokio::task::spawn_blocking(move || {
-            for reservation_id in crate::supervision::defined_worker_jobs(&jobs) {
+            let deadline = std::time::Instant::now() + JOB_SWEEP_BOUND;
+            let defined = crate::supervision::defined_worker_jobs(&jobs);
+            for (looked, reservation_id) in defined.iter().enumerate() {
+                if std::time::Instant::now() >= deadline {
+                    eprintln!(
+                        "kr-controller: {} of {} worker jobs were not looked at within \
+                         {JOB_SWEEP_BOUND:?}; the next start looks at them again",
+                        defined.len() - looked,
+                        defined.len()
+                    );
+                    return;
+                }
                 if let JobRetirement::Unsettled(detail) =
-                    crate::supervision::retire_worker_job(&jobs, reservation_id)
+                    crate::supervision::retire_worker_job(&jobs, *reservation_id)
                 {
                     eprintln!(
                         "kr-controller: the job of the worker started for reservation \
@@ -8052,7 +8071,8 @@ impl Controller {
                     Ok(JobRetirement::Gone) | Err(_) => return,
                     Ok(left) => left,
                 };
-                if tokio::time::Instant::now() >= deadline {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
                     if let JobRetirement::Unsettled(detail) = left {
                         eprintln!(
                             "kr-controller: the job of the worker started for reservation \
@@ -8061,7 +8081,11 @@ impl Controller {
                     }
                     return;
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                // Never past the bound, so the last look is at it rather than after it.
+                tokio::time::sleep(
+                    std::time::Duration::from_secs(1).min(deadline.saturating_duration_since(now)),
+                )
+                .await;
             }
         });
     }

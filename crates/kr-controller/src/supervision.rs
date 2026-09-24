@@ -581,7 +581,7 @@ impl LaunchdSupervisor {
             }
             // Whether the removal took is read back from launchd rather than from this command's
             // own answer: a job something else removed a moment earlier is gone all the same.
-            let _ = run("/bin/launchctl", &["bootout", &target]);
+            let _ = launchctl_within(&["bootout", &target]);
             match job_state(&target) {
                 JobState::NotLoaded => {}
                 JobState::Unknown(detail) => return JobRetirement::Unsettled(detail),
@@ -614,20 +614,60 @@ enum JobState {
     Unknown(String),
 }
 
+/// How long one question or removal put to launchd is given before it counts as unanswered.
+#[cfg(target_os = "macos")]
+const LAUNCHCTL_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Runs `launchctl` for no longer than [`LAUNCHCTL_BOUND`], and returns its answer or why there was
+/// none.
+///
+/// A job's description is a few kilobytes, well inside what a pipe holds, so what launchctl prints
+/// is read once it has ended. One still running at the bound is this process's own child, which it
+/// has not collected, and is ended and collected before this returns.
+#[cfg(target_os = "macos")]
+fn launchctl_within(arguments: &[&str]) -> std::result::Result<std::process::Output, String> {
+    let mut child = std::process::Command::new("/bin/launchctl")
+        .args(arguments)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("/bin/launchctl: {error}"))?;
+    let deadline = std::time::Instant::now() + LAUNCHCTL_BOUND;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|error| format!("/bin/launchctl: {error}"));
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "launchctl {} did not answer within {LAUNCHCTL_BOUND:?}",
+                    arguments.join(" ")
+                ));
+            }
+            Err(error) => return Err(format!("/bin/launchctl: {error}")),
+        }
+    }
+}
+
 /// Asks launchd about one job, `<domain>/<label>`.
 #[cfg(target_os = "macos")]
 fn job_state(target: &str) -> JobState {
-    match std::process::Command::new("/bin/launchctl")
-        .args(["print", target])
-        .output()
-    {
+    match launchctl_within(&["print", target]) {
         Ok(output) => job_state_answered(
             target,
             output.status.code(),
             &String::from_utf8_lossy(&output.stdout),
             &String::from_utf8_lossy(&output.stderr),
         ),
-        Err(error) => JobState::Unknown(format!("/bin/launchctl: {error}")),
+        Err(detail) => JobState::Unknown(detail),
     }
 }
 
