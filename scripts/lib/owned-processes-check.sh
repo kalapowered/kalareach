@@ -79,6 +79,15 @@ else
   fail "a record of a process that has gone was taken for a live one: $said"
 fi
 
+# And a process that has gone before it is recorded is not recorded, without ending a script that
+# runs under `set -e` and `pipefail`, as this one does.
+remember_process "$first" "$sleep_program"
+if [ "${#owned_processes[@]}" -eq 0 ]; then
+  echo "  ok: a process that has gone is not recorded, and the script carries on"
+else
+  fail "a process that has gone was recorded: ${owned_processes[*]}"
+fi
+
 if [ "$failed" -ne 0 ]; then
   exit 1
 fi

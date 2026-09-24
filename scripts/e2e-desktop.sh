@@ -127,8 +127,9 @@ jobs_left() {
 # the instance it describes is this run's to end all the same.
 record_marked_textedits() {
   local pid line command
-  for pid in $(pgrep -u "$uid" -f "TextEdit.app/Contents/MacOS/TextEdit" 2>/dev/null); do
-    line="$(LC_ALL=C ps -o lstart=,command= -p "$pid" 2>/dev/null)"
+  for pid in $(pgrep -u "$uid" -f "TextEdit.app/Contents/MacOS/TextEdit" 2>/dev/null || true); do
+    # One that ended since it was listed has nothing left to end.
+    line="$(LC_ALL=C ps -o lstart=,command= -p "$pid" 2>/dev/null)" || continue
     command="$(printf '%s' "$line" | cut -c25- | sed 's/^ *//')"
     case $command in
       *" -KalaReachRun $run_root") ;;

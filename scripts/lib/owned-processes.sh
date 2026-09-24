@@ -19,14 +19,19 @@
 owned_processes=()
 
 # When a process started, as the operating system reports it, or nothing where there is no such
-# process.
+# process. A process that has gone is an answer, not a failure, so this succeeds either way and a
+# script under `set -e` and `pipefail` carries on.
 process_started() {
-  LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | sed -e 's/^ *//' -e 's/ *$//'
+  local started
+  started="$(LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null)" || return 0
+  printf '%s\n' "$started" | sed -e 's/^ *//' -e 's/ *$//'
 }
 
 # The command a process runs, program first, or nothing where there is no such process.
 process_command() {
-  ps -o command= -p "$1" 2>/dev/null | sed -e 's/^ *//'
+  local command
+  command="$(ps -o command= -p "$1" 2>/dev/null)" || return 0
+  printf '%s\n' "$command" | sed -e 's/^ *//'
 }
 
 # remember_process <number> <program>
