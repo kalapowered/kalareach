@@ -35,14 +35,16 @@ use kr_plugin_sdk::predicate::{BindingState, Predicate, PredicateError, Presenta
 use kr_plugin_sdk::presentation::{
     Control, DocumentNode, NodeRevision, UnsupportedNode, read_node,
 };
+use kr_protocol::ids::ApprovalRequestId;
 
 /// What a client knows about the facts a visibility predicate can name.
 ///
 /// Absent is not false. A client that has not been told whether the person holds the input lease
 /// does not know, and a predicate that turns on it is hidden rather than guessed at.
 ///
-/// Rights and present nodes are supplied as whole sets, because a client that has them has all of
-/// them: the question is whether it was told at all, which is what the option answers.
+/// Rights, present nodes and pending approvals are supplied as whole sets, because a client that
+/// has them has all of them: the question is whether it was told at all, which is what the option
+/// answers.
 #[derive(Clone, Debug, Default)]
 pub struct ControlState {
     capabilities: Vec<(PluginCapability, CapabilityState)>,
@@ -50,6 +52,7 @@ pub struct ControlState {
     binding_state: Option<BindingState>,
     present_nodes: Option<Vec<NodeId>>,
     flags: Vec<(PresentationFlag, bool)>,
+    pending_approvals: Option<Vec<ApprovalRequestId>>,
 }
 
 impl ControlState {
@@ -96,6 +99,16 @@ impl ControlState {
         self
     }
 
+    /// Records every approval request pending for the binding, by its upstream identifier.
+    #[must_use]
+    pub fn with_pending_approvals(
+        mut self,
+        requests: impl IntoIterator<Item = ApprovalRequestId>,
+    ) -> Self {
+        self.pending_approvals = Some(requests.into_iter().collect());
+        self
+    }
+
     fn capability(&self, capability: PluginCapability, state: CapabilityState) -> Truth {
         self.capabilities
             .iter()
@@ -127,6 +140,14 @@ impl ControlState {
             .iter()
             .find(|(held, _)| *held == flag)
             .map_or(Truth::Unknown, |(_, holds)| Truth::from(*holds))
+    }
+
+    fn pending_approval(&self, request_id: &ApprovalRequestId) -> Truth {
+        self.pending_approvals
+            .as_ref()
+            .map_or(Truth::Unknown, |pending| {
+                Truth::from(pending.contains(request_id))
+            })
     }
 }
 
@@ -273,6 +294,7 @@ fn truth(predicate: &Predicate, state: &ControlState) -> Truth {
         Predicate::Binding { state: wanted } => state.binding(*wanted),
         Predicate::NodePresent { node_id } => state.node_present(node_id),
         Predicate::Flag { flag } => state.flag(*flag),
+        Predicate::PendingApprovalFor { request_id } => state.pending_approval(request_id),
     }
 }
 
@@ -308,6 +330,10 @@ fn unknown_fact(predicate: &Predicate, state: &ControlState) -> Option<String> {
             .then(|| format!("whether node {node_id} is present")),
         Predicate::Flag { flag } => (state.flags.iter().all(|(held, _)| held != flag))
             .then(|| format!("whether {flag:?} holds")),
+        Predicate::PendingApprovalFor { request_id } => state
+            .pending_approvals
+            .is_none()
+            .then(|| format!("whether approval request {request_id} is pending")),
     }
 }
 
@@ -639,6 +665,64 @@ mod tests {
                 },
                 &ControlState::new().with_flag(PresentationFlag::HoldsInputLease, false)
             ),
+            Visibility::Hidden(Hidden::PredicateFalse)
+        );
+    }
+
+    /// KR-REQ-11.46: a control drawn for one approval request is shown while the client knows
+    /// that request is pending, hidden once only another one is, and hidden as unknown, with the
+    /// fact named, when the client was never told which requests are pending.
+    #[test]
+    fn a_control_for_one_approval_request_follows_that_request() {
+        let request =
+            |text: &str| ApprovalRequestId::new(text).expect("a valid request identifier");
+        let for_one = Predicate::PendingApprovalFor {
+            request_id: request("abcde"),
+        };
+
+        let untold = evaluate(&for_one, &ControlState::new());
+        let Some(Hidden::UnknownFact { fact }) = untold.hidden() else {
+            panic!("an untold pending set is not a guess: {untold:?}");
+        };
+        assert!(fact.contains("abcde"), "{fact}");
+        // Negated, it stays unknown rather than showing the control.
+        assert!(matches!(
+            evaluate(
+                &Predicate::Not {
+                    term: Box::new(for_one.clone())
+                },
+                &ControlState::new()
+            )
+            .hidden(),
+            Some(Hidden::UnknownFact { .. })
+        ));
+
+        let waiting = ControlState::new()
+            .with_flag(PresentationFlag::PendingApproval, true)
+            .with_pending_approvals([request("abcde"), request("fghij")]);
+        assert_eq!(evaluate(&for_one, &waiting), Visibility::Shown);
+
+        // Another request is still waiting, so the untargeted flag holds; this one is not.
+        let answered = ControlState::new()
+            .with_flag(PresentationFlag::PendingApproval, true)
+            .with_pending_approvals([request("fghij")]);
+        assert_eq!(
+            evaluate(&for_one, &answered),
+            Visibility::Hidden(Hidden::PredicateFalse)
+        );
+        assert_eq!(
+            evaluate(
+                &Predicate::Flag {
+                    flag: PresentationFlag::PendingApproval
+                },
+                &answered
+            ),
+            Visibility::Shown
+        );
+
+        // Told that nothing is pending is knowing, not an unknown.
+        assert_eq!(
+            evaluate(&for_one, &ControlState::new().with_pending_approvals([])),
             Visibility::Hidden(Hidden::PredicateFalse)
         );
     }

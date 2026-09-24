@@ -7,9 +7,12 @@
 //!
 //! The grammar has no variables, no arithmetic, no string matching and no user-supplied text. It
 //! is a boolean combination of facts drawn from closed vocabularies, bounded to
-//! [`MAX_PREDICATE_DEPTH`] levels and [`MAX_PREDICATE_TERMS`] terms per combinator. Evaluation
-//! terminates on every input, which is what makes rechecking on invocation affordable.
+//! [`MAX_PREDICATE_DEPTH`] levels and [`MAX_PREDICATE_TERMS`] terms per combinator. The only
+//! values a term carries are identifiers, compared for exact equality: a node in the document, or
+//! one upstream approval request. Evaluation terminates on every input, which is what makes
+//! rechecking on invocation affordable.
 
+use kr_protocol::ids::ApprovalRequestId;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +50,10 @@ pub enum BindingState {
 #[serde(rename_all = "snake_case")]
 pub enum PresentationFlag {
     /// A pending approval resource exists in the ledger.
+    ///
+    /// Any one: this fact does not say which. A control that answers one request tests
+    /// [`Predicate::PendingApprovalFor`] instead, so it is hidden once that request is resolved
+    /// whatever else is still waiting.
     PendingApproval,
     /// The upstream draft has text in it.
     DraftNotEmpty,
@@ -111,6 +118,20 @@ pub enum Predicate {
     Flag {
         /// The fact.
         flag: PresentationFlag,
+    },
+    /// True when the named upstream approval request is pending.
+    ///
+    /// The identifier is the upstream's own, exactly as the pending approval resource records it,
+    /// so a document drawn for one request can say that its controls are for that request and no
+    /// other. An identifier that names no pending approval is false rather than an error: the
+    /// request has been answered, cancelled or has expired, or it never existed, and in each case
+    /// there is nothing for the control to answer.
+    ///
+    /// The identifier is required. The question "is any approval pending" is
+    /// [`PresentationFlag::PendingApproval`], so this term has no untargeted form.
+    PendingApprovalFor {
+        /// The upstream approval request.
+        request_id: ApprovalRequestId,
     },
 }
 
@@ -202,6 +223,9 @@ impl Predicate {
             Self::Binding { state } => context.binding_state == *state,
             Self::NodePresent { node_id } => context.present_nodes.contains(node_id),
             Self::Flag { flag } => context.flags.contains(flag),
+            Self::PendingApprovalFor { request_id } => {
+                context.pending_approvals.contains(request_id)
+            }
         }
     }
 }
@@ -219,6 +243,11 @@ pub struct PredicateContext<'a> {
     pub present_nodes: &'a [NodeId],
     /// The presentation facts that currently hold.
     pub flags: &'a [PresentationFlag],
+    /// The upstream identifiers of the approval requests pending for this binding.
+    ///
+    /// The host reads these from the same ledger that sets [`PresentationFlag::PendingApproval`],
+    /// so the flag holds exactly when this list is not empty.
+    pub pending_approvals: &'a [ApprovalRequestId],
 }
 
 #[cfg(test)]
@@ -236,6 +265,23 @@ mod tests {
             binding_state,
             present_nodes: &[],
             flags,
+            pending_approvals: &[],
+        }
+    }
+
+    fn request(text: &str) -> ApprovalRequestId {
+        ApprovalRequestId::new(text).expect("a valid request identifier")
+    }
+
+    fn waiting_on(pending: &[ApprovalRequestId]) -> PredicateContext<'_> {
+        let flags: &[PresentationFlag] = if pending.is_empty() {
+            &[]
+        } else {
+            &[PresentationFlag::PendingApproval]
+        };
+        PredicateContext {
+            pending_approvals: pending,
+            ..context(&[], BindingState::AwaitingPerson, flags)
         }
     }
 
@@ -330,5 +376,159 @@ mod tests {
             }
             .evaluate(&context)
         );
+    }
+
+    /// KR-REQ-12.18 and KR-REQ-11.46: a control drawn for one approval request is shown while
+    /// that request is pending and hidden when only another one is, where the untargeted flag
+    /// cannot tell the two apart.
+    #[test]
+    fn kr_req_12_18_a_targeted_term_names_one_pending_request() {
+        let targeted = Predicate::PendingApprovalFor {
+            request_id: request("abcde"),
+        };
+        let untargeted = Predicate::Flag {
+            flag: PresentationFlag::PendingApproval,
+        };
+        assert_eq!(targeted.validate(), Ok(()));
+        assert_eq!(targeted.depth(), 1);
+
+        let both = [request("abcde"), request("fghij")];
+        assert!(targeted.evaluate(&waiting_on(&both)));
+        assert!(untargeted.evaluate(&waiting_on(&both)));
+
+        // Another request is waiting and this one is not: the flag still holds, the targeted
+        // term does not, so a control for the answered request disappears.
+        let other = [request("fghij")];
+        assert!(!targeted.evaluate(&waiting_on(&other)));
+        assert!(untargeted.evaluate(&waiting_on(&other)));
+
+        // Nothing is waiting.
+        assert!(!targeted.evaluate(&waiting_on(&[])));
+        assert!(!untargeted.evaluate(&waiting_on(&[])));
+
+        // The identifier is compared exactly: case and surrounding text are part of it.
+        assert!(!targeted.evaluate(&waiting_on(&[request("ABCDE")])));
+        assert!(!targeted.evaluate(&waiting_on(&[request("abcdef")])));
+    }
+
+    /// KR-REQ-11.46: an identifier that names no pending approval is false, not a failure, and
+    /// the term combines like any other leaf, inside the same depth and width bounds.
+    #[test]
+    fn kr_req_11_46_a_targeted_term_is_total_and_bounded() {
+        let unknown = Predicate::PendingApprovalFor {
+            request_id: request("no-such-request"),
+        };
+        let nothing_waiting = waiting_on(&[]);
+        assert!(!unknown.evaluate(&nothing_waiting));
+        assert!(
+            Predicate::Not {
+                term: Box::new(unknown.clone())
+            }
+            .evaluate(&nothing_waiting)
+        );
+
+        // A control for one request, shown to an actor who may answer it, while the binding is
+        // not in volatile operation: four levels, the grammar's limit.
+        let deepest = Predicate::All {
+            terms: vec![
+                Predicate::Grant {
+                    right: ActionRight::AgentApprovalRespond,
+                },
+                Predicate::Not {
+                    term: Box::new(Predicate::Any {
+                        terms: vec![
+                            Predicate::Binding {
+                                state: BindingState::NativeOnlyVolatile,
+                            },
+                            Predicate::Not {
+                                term: Box::new(Predicate::PendingApprovalFor {
+                                    request_id: request("abcde"),
+                                }),
+                            },
+                        ],
+                    }),
+                },
+            ],
+        };
+        assert_eq!(deepest.depth(), MAX_PREDICATE_DEPTH + 1);
+        assert!(matches!(
+            deepest.validate(),
+            Err(PredicateError::TooDeep { .. })
+        ));
+        let within = Predicate::All {
+            terms: vec![
+                Predicate::Grant {
+                    right: ActionRight::AgentApprovalRespond,
+                },
+                Predicate::Not {
+                    term: Box::new(Predicate::Binding {
+                        state: BindingState::NativeOnlyVolatile,
+                    }),
+                },
+                Predicate::PendingApprovalFor {
+                    request_id: request("abcde"),
+                },
+            ],
+        };
+        assert_eq!(within.validate(), Ok(()));
+        let pending = [request("abcde")];
+        let answering = PredicateContext {
+            pending_approvals: &pending,
+            ..context(
+                &[ActionRight::AgentApprovalRespond],
+                BindingState::AwaitingPerson,
+                &[PresentationFlag::PendingApproval],
+            )
+        };
+        assert!(within.evaluate(&answering));
+        let answered = PredicateContext {
+            pending_approvals: &[],
+            ..answering
+        };
+        assert!(!within.evaluate(&answered));
+
+        let wide = Predicate::Any {
+            terms: vec![unknown; MAX_PREDICATE_TERMS + 1],
+        };
+        assert_eq!(
+            wide.validate(),
+            Err(PredicateError::TooManyTerms {
+                count: MAX_PREDICATE_TERMS + 1
+            })
+        );
+    }
+
+    /// KR-REQ-11.46: the targeted term is a fixed shape with a required, bounded identifier. It
+    /// has no untargeted form, no pattern and no extra members.
+    #[test]
+    fn a_targeted_term_is_a_closed_shape() {
+        let term: Predicate = serde_json::from_value(
+            serde_json::json!({"op": "pending_approval_for", "request_id": "abcde"}),
+        )
+        .expect("the targeted term reads");
+        assert_eq!(
+            term,
+            Predicate::PendingApprovalFor {
+                request_id: request("abcde")
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&term).expect("the term writes"),
+            serde_json::json!({"op": "pending_approval_for", "request_id": "abcde"})
+        );
+        for refused in [
+            serde_json::json!({"op": "pending_approval_for"}),
+            serde_json::json!({"op": "pending_approval_for", "request_id": null}),
+            serde_json::json!({"op": "pending_approval_for", "request_id": ""}),
+            serde_json::json!({"op": "pending_approval_for", "request_id": "a\u{0}b"}),
+            serde_json::json!({"op": "pending_approval_for", "request_id": "x".repeat(257)}),
+            serde_json::json!({"op": "pending_approval_for", "request_id": "abcde", "pattern": "*"}),
+            serde_json::json!({"op": "pending_approval_for", "request_id": ["abcde", "fghij"]}),
+        ] {
+            assert!(
+                serde_json::from_value::<Predicate>(refused.clone()).is_err(),
+                "{refused} was accepted"
+            );
+        }
     }
 }
