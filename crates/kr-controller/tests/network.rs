@@ -2250,12 +2250,16 @@ async fn a_device_pairs_and_attaches_through_a_relay_and_losing_it_leaves_the_se
 /// What is left of a metered relay's allowance when the next command starts.
 const ALLOWANCE_LEFT: u64 = 32 * 1024;
 
-/// A command that waits until `barrier` exists and then prints several times what is left of the
-/// allowance.
-fn spending_command(barrier: &Path) -> String {
+/// The file the spending command waits for, named relative to the directory the session's shell
+/// starts in: the host tree's root, which `create` gives every session as its working directory.
+const SPENDING_BARRIER: &str = "spend-the-allowance";
+
+/// A command that waits until the barrier file exists and then prints several times what is left
+/// of the allowance.
+fn spending_command() -> String {
     format!(
-        "while [ ! -e '{}' ]; do sleep 0.05; done; yes kalareach-spends-the-allowance | head -n 20000\n",
-        barrier.display()
+        "while [ ! -e {SPENDING_BARRIER} ]; do sleep 0.05; done; \
+         yes kalareach-spends-the-allowance | head -n 20000\n"
     )
 }
 
@@ -2363,14 +2367,14 @@ async fn a_relay_quota_disconnect_leaves_the_terminal_worker_running() {
     // the device holds the command's acknowledgement, because output that spent it sooner could
     // end the path before the acknowledgement came back. Then what is left of the allowance is less
     // than the command prints, and the barrier is released, so the session's own output spends it.
-    let barrier = host.tree().root().join("spend-the-allowance");
+    let barrier = host.tree().root().join(SPENDING_BARRIER);
     session
         .write_input(&InputWriteParams {
             session_id,
             attachment_id: attached.typing,
             epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
             sequence: kr_protocol::ids::InputSequence::new(1),
-            bytes: kr_protocol::scalars::Bytes::new(spending_command(&barrier).into_bytes()),
+            bytes: kr_protocol::scalars::Bytes::new(spending_command().into_bytes()),
         })
         .await
         .expect("the command is accepted");
