@@ -28,36 +28,15 @@ android {
     }
 }
 
-/*
- * The platform TLS verifier's Kotlin half ships inside its Rust crate as a local Maven repository,
- * so the crate's place on disk is asked of Cargo rather than assumed.
- */
-val rustlsPlatformVerifierRepository: File by lazy {
-    val metadata = providers.exec {
-        workingDir = file("../../../../..")
-        commandLine(
-            "cargo", "metadata", "--format-version", "1", "--filter-platform", "aarch64-linux-android"
-        )
-    }.standardOutput.asText.get()
-    @Suppress("UNCHECKED_CAST")
-    val packages = (groovy.json.JsonSlurper().parseText(metadata) as Map<String, Any>)["packages"]
-        as List<Map<String, Any>>
-    val manifest = packages.first { it["name"] == "rustls-platform-verifier-android" }["manifest_path"]
-        as String
-    File(File(manifest).parentFile, "maven")
-}
-
-repositories {
-    maven {
-        url = uri(rustlsPlatformVerifierRepository)
-        metadataSources { mavenPom(); artifact() }
-    }
-}
-
 dependencies {
     implementation(project(":tauri-android"))
     // The decisions and the sealed-file rules, as plain Kotlin with their own tests.
     implementation(project(":krnative"))
+    // The activity results the Auth Tab and the Custom Tab return through, at the application's
+    // own version.
+    implementation("androidx.activity:activity:1.10.1")
     implementation("androidx.browser:browser:1.9.0")
+    // The platform TLS verifier's Kotlin half, from the local Maven repository inside its Rust
+    // crate, which the application's root build declares for every project.
     implementation("rustls:rustls-platform-verifier:0.1.1")
 }

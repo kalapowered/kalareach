@@ -7,6 +7,7 @@ import android.content.pm.verify.domain.DomainVerificationUserState
 import android.net.Uri
 import android.os.Build
 import android.util.Base64
+import android.util.Log
 import android.webkit.WebView
 import androidx.activity.result.ActivityResult
 import androidx.browser.auth.AuthTabIntent
@@ -68,7 +69,15 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
     private val queued = ArrayDeque<JSObject>()
 
     override fun load(webView: WebView) {
-        TlsVerifier.start(activity.applicationContext)
+        // Without its start the verifier refuses every certificate, so an HTTPS request fails and
+        // says so; everything that needs no request keeps working, rather than the application
+        // failing to start. The log says which happened.
+        try {
+            TlsVerifier.start(activity.applicationContext)
+            Log.i(LOG_TAG, "the platform TLS verifier has the application context")
+        } catch (failure: RuntimeException) {
+            Log.e(LOG_TAG, "the platform TLS verifier could not start", failure)
+        }
     }
 
     @Command
@@ -241,6 +250,7 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     private companion object {
+        const val LOG_TAG = "KalaReach"
         const val CALLBACK_HOST = "reach.kala.to"
         const val CALLBACK_PATH = "/app/oauth/callback"
     }

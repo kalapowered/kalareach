@@ -7,6 +7,10 @@
 //! with a browser that records what it is asked to open and answers as the service would, and a
 //! stub account service. Each client is run: the desktop's loopback redirect, and the phone's app
 //! link and private-use redirects.
+//!
+//! They run where the mock runtime does, on a desktop. A phone's own carrier needs its native half,
+//! which the device legs exercise; there these tests build nothing.
+#![cfg(desktop)]
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;

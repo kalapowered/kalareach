@@ -63,7 +63,9 @@ impl<R: Runtime> Platform<R> {
             .map_err(|error| PlatformError::new(format!("the platform's {method} failed: {error}")))
     }
 
-    /// Calls one of the native methods from a thread that may wait for it.
+    /// Calls one of the native methods from a thread that may wait for it. Only the iOS store
+    /// opens this way; Android's store calls its native half through the handle it keeps.
+    #[cfg(target_os = "ios")]
     fn call_blocking<T: serde::de::DeserializeOwned>(
         &self,
         method: &str,
