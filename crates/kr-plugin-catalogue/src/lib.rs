@@ -1874,10 +1874,16 @@ impl Catalogue {
     /// atomically before anything is recorded as installed, so a failed installation leaves
     /// whatever was installed before exactly as it was.
     ///
+    /// An installation that may do more than the installation it replaces, or, with nothing to
+    /// replace, more than its repository's ceiling permits by itself, and every release that
+    /// installs a native bridge, needs the owner's confirmation, which the change's authority
+    /// carries: it is asked before anything is fetched and again inside the commit.
+    ///
     /// # Errors
     ///
     /// Returns the refusal verification, the budgets, the admission, the package rules or the
-    /// ceiling decided.
+    /// ceiling decided, and [`CatalogueError::OwnerConfirmationRequired`] when the installation
+    /// needs the owner's confirmation and the authority does not carry it.
     // The package identity, the environment, the grant and the change each have to be named
     // separately here, because an installation is authorised against all four.
     #[allow(clippy::too_many_arguments)]
@@ -1925,11 +1931,13 @@ impl Catalogue {
             });
         }
         let previous = self.installation(environment_id, plugin_id)?;
+        let confirmed = authority.owner_confirmed();
         check_installation(
             &entry,
             &enrolled.enrolment.ceiling,
             &grant,
             previous.as_ref(),
+            confirmed,
         )?;
 
         let package = self
@@ -1971,6 +1979,7 @@ impl Catalogue {
                 &current.enrolment.ceiling,
                 &grant,
                 previous.as_ref(),
+                confirmed,
             )?;
             // The ceiling travels with the installation. What this package may do was decided
             // against the repository's ceiling as it stood now, and that answer must not move
@@ -2398,29 +2407,21 @@ fn reclaim(
 }
 
 /// Checks that an installation may proceed: the ceiling and the grant, the pin on what it
-/// replaces, and that it widens nothing the previous release was not permitted.
+/// replaces, and whether the owner's confirmation it needs is there.
+///
+/// An installation needs the owner's confirmation where it may do anything the installation it
+/// replaces did not, or, with nothing to replace, anything its repository's ceiling does not permit
+/// by itself; and every release that asks for a native bridge needs one, because a native bridge
+/// runs under the application's own permissions and outside the component sandbox. `plugin.grant`
+/// takes the same confirmation for every widening, so removing a package and installing it again
+/// is not a way around it.
 fn check_installation(
     entry: &IndexEntry,
     repository_ceiling: &CapabilityCeiling,
     grant: &InstallationGrant,
     previous: Option<&Installation>,
+    confirmed: bool,
 ) -> CatalogueResult<()> {
-    // A native bridge runs under the application's own permissions, outside the component
-    // sandbox, and needs the owner's confirmation of this exact package. Installing carries no
-    // such confirmation, so this host does not install one; granting it on an installed package
-    // is `plugin.grant`'s, under the owner's confirmation.
-    if entry
-        .capabilities
-        .iter()
-        .any(|request| request.capability == PluginCapability::NativeBridgeInstall)
-    {
-        return Err(CatalogueError::GrantRequired {
-            capability: PluginCapability::NativeBridgeInstall,
-            requirement: "the owner's confirmation of this exact package, which an installation \
-                          does not carry; this host does not install a native bridge"
-                .to_owned(),
-        });
-    }
     // A grant names only what the package asks for. A grant for anything else would be authority
     // an installation holds with nothing in the package to use it, waiting for a later release to
     // ask for it without anybody deciding again.
@@ -2440,32 +2441,59 @@ fn check_installation(
         }
     }
     ceiling::check_installable(&entry.capabilities, repository_ceiling, grant)?;
-    if let Some(previous) = previous {
-        // A pin holds an installation at the hash it names. Installing something else over it is
-        // the pin's decision to make, not the install's.
-        if previous.pinned && previous.package_digest != entry.manifest_digest {
-            return Err(CatalogueError::InvalidArgument {
-                detail: format!(
-                    "{} is pinned to {}; unpin it before installing {}",
-                    entry.plugin_id, previous.package_digest, entry.version
-                ),
-            });
-        }
-        // What an upgrade may do is compared as effective sets rather than as grant lists, and
-        // the previous set under the ceiling the previous release was installed under: a release
-        // that newly requests something the ceiling already permits, a wider enrolment, and a move
-        // between repositories must not make an increase look like something already held.
-        let held = ceiling::effective(&previous.requested, &previous.ceiling, &previous.grant);
-        let proposed = ceiling::effective(&entry.capabilities, repository_ceiling, grant);
-        if let Some(added) = proposed.difference(&held).next().copied() {
-            return Err(CatalogueError::GrantRequired {
-                capability: added,
-                requirement: format!(
-                    "an explicit installation grant: the installed release was not permitted \
-                     {added}, and an installation does not widen what a package may do"
-                ),
-            });
-        }
+    // A pin holds an installation at the hash it names. Installing something else over it is the
+    // pin's decision to make, not the install's.
+    if let Some(previous) = previous
+        && previous.pinned
+        && previous.package_digest != entry.manifest_digest
+    {
+        return Err(CatalogueError::InvalidArgument {
+            detail: format!(
+                "{} is pinned to {}; unpin it before installing {}",
+                entry.plugin_id, previous.package_digest, entry.version
+            ),
+        });
+    }
+    if confirmed {
+        return Ok(());
+    }
+    // What the installation may do is compared as effective sets rather than as grant lists, and
+    // the previous set under the ceiling the previous release was installed under: a release that
+    // newly requests something the ceiling already permits, a wider enrolment, and a move between
+    // repositories must not make an increase look like something already held.
+    let proposed = ceiling::effective(&entry.capabilities, repository_ceiling, grant);
+    let (held, against) = match previous {
+        Some(previous) => (
+            ceiling::effective(&previous.requested, &previous.ceiling, &previous.grant),
+            "the installed release",
+        ),
+        None => (
+            ceiling::effective(
+                &entry.capabilities,
+                repository_ceiling,
+                &InstallationGrant::none(),
+            ),
+            "its repository's ceiling",
+        ),
+    };
+    if let Some(added) = proposed.difference(&held).next().copied() {
+        return Err(CatalogueError::OwnerConfirmationRequired {
+            detail: format!(
+                "installing {} {} lets it do {added}, which {against} did not permit; that is the \
+                 owner's decision, confirmed for this exact package and grant",
+                entry.plugin_id, entry.version
+            ),
+        });
+    }
+    if proposed.contains(&PluginCapability::NativeBridgeInstall) {
+        return Err(CatalogueError::OwnerConfirmationRequired {
+            detail: format!(
+                "{} {} installs a native bridge, which runs under the application's own \
+                 permissions and outside the component sandbox; every release of one is the \
+                 owner's decision, confirmed for this exact package and grant",
+                entry.plugin_id, entry.version
+            ),
+        });
     }
     Ok(())
 }

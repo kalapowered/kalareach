@@ -20730,6 +20730,17 @@
           },
           "type": "array"
         },
+        "owner_confirmation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OwnerConfirmationProof"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The owner's confirmation of this exact installation, where it needs one.\n\nAn installation that may do anything the installation it replaces could not, or, with\nnothing to replace, anything the repository's ceiling does not permit by itself, needs it,\nand so does every release that installs a native bridge. It is bound to the repository and\nits ceiling as `catalogue.list` reports them, the release, the package hash and the grant\nabove, so it cannot be carried to another repository, release or grant. One that is given is\nspent whether or not the installation needed it."
+        },
         "package_digest": {
           "description": "The exact package hash the caller expects.\n\nInstallation verifies the signature before it installs, and the hash makes the caller's\nexpectation explicit: a repository that published something else between the caller reading\nthe index and this request arriving is a refusal rather than a surprise.",
           "type": "string"
@@ -20749,7 +20760,8 @@
         "plugin_id",
         "version",
         "package_digest",
-        "grant"
+        "grant",
+        "owner_confirmation"
       ],
       "type": "object"
     },

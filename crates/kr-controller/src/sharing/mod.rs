@@ -40,7 +40,9 @@ use kr_protocol::sharing::{
 use crate::error::{ControllerError, Result};
 use crate::grants::{GrantDirectory, GrantRecord, GrantRevocation};
 
-pub use confirmation::{CatalogueTrustPlan, ConfirmedAction, OwnerConfirmations, PluginGrantPlan};
+pub use confirmation::{
+    CatalogueTrustPlan, ConfirmedAction, OwnerConfirmations, PluginGrantPlan, PluginInstallPlan,
+};
 pub use invitation::InvitationRecord;
 pub use roles::{Intermediary, effective_rights};
 pub use transfer::{ConfirmedTransfer, ControlTransfer, TransferHost, TransferPlan};

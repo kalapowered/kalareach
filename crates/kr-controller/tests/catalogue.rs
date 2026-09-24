@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use kr_controller::catalogue::{Admission, CatalogueModule};
 use kr_controller::sharing::{
-    CatalogueTrustPlan, ConfirmedAction, OwnerConfirmations, PluginGrantPlan,
+    CatalogueTrustPlan, ConfirmedAction, OwnerConfirmations, PluginGrantPlan, PluginInstallPlan,
 };
 use kr_plugin_catalogue::{
     Authority, CapabilityCeiling, CatalogueError, CatalogueResult, Effect, Enrolment, Owner,
@@ -280,6 +280,16 @@ fn budgets() -> wire::CatalogueBudgets {
 }
 
 fn add_params(host: &Host) -> wire::CatalogueAddParams {
+    add_params_for(host, "development", Vec::new())
+}
+
+/// The parameters that enrol the development generation as `catalogue_id`, permitting `ceiling`
+/// beyond the default, with the owner's confirmation of that enrolment.
+fn add_params_for(
+    host: &Host,
+    catalogue_id: &str,
+    ceiling: Vec<String>,
+) -> wire::CatalogueAddParams {
     use base64::Engine as _;
     let root = std::fs::read(host.working.join("root.json")).expect("a trust root");
     let metadata_url = directory_url(&host.working.join("metadata"));
@@ -288,22 +298,22 @@ fn add_params(host: &Host) -> wire::CatalogueAddParams {
     // The client builds the plan the host will build, which is what makes the digests agree.
     let digest = CatalogueTrustPlan {
         environment_id: host.environment_id,
-        catalogue_id: "development".to_owned(),
+        catalogue_id: catalogue_id.to_owned(),
         root_digest: kr_plugin_sdk::digest::PayloadDigest::of(&root).to_string(),
         root_key_ids: root_key_ids(&root, &metadata_url, &targets_url),
-        ceiling: kr_protocol::scalars::CanonicalSet::new(),
+        ceiling: ceiling.iter().cloned().collect(),
     }
     .action_digest()
     .expect("a digest");
     wire::CatalogueAddParams {
         environment_id: host.environment_id,
-        catalogue_id: "development".to_owned(),
+        catalogue_id: catalogue_id.to_owned(),
         kind: wire::CatalogueKind::Local,
         metadata_url,
         targets_url,
         root: base64::engine::general_purpose::STANDARD.encode(&root),
         budgets: budgets(),
-        ceiling: Vec::new(),
+        ceiling,
         owner_confirmation: host
             .ceremony
             .approve(SensitiveAction::TrustRepositoryRoot, digest),
@@ -660,6 +670,7 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
                         version: "0.1.0".to_owned(),
                         package_digest: "0".repeat(64),
                         grant: Vec::new(),
+                        owner_confirmation: Nullable::null(),
                     },
                 ),
                 Method::PluginInstall,
@@ -682,6 +693,7 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
                         version: "0.1.0".to_owned(),
                         package_digest: digest.clone(),
                         grant: vec!["native_bridge.install".to_owned()],
+                        owner_confirmation: Nullable::null(),
                     },
                 ),
                 Method::PluginInstall,
@@ -710,6 +722,7 @@ async fn kr_req_23_29_the_plugin_group_installs_enables_pins_reads_and_removes()
                     version: "0.1.0".to_owned(),
                     package_digest: digest.clone(),
                     grant: Vec::new(),
+                    owner_confirmation: Nullable::null(),
                 },
             ),
             Method::PluginInstall,
@@ -926,6 +939,7 @@ async fn kr_req_23_29_removing_a_catalogue_does_not_uninstall_what_came_from_it(
                     version: "0.1.0".to_owned(),
                     package_digest: digest,
                     grant: Vec::new(),
+                    owner_confirmation: Nullable::null(),
                 },
             ),
             Method::PluginInstall,
@@ -1589,7 +1603,262 @@ fn install_params(host: &Host, digest: &str) -> wire::PluginInstallParams {
         version: "0.1.0".to_owned(),
         package_digest: digest.to_owned(),
         grant: Vec::new(),
+        owner_confirmation: Nullable::null(),
     }
+}
+
+/// The installation of the example package at `digest` from `catalogue_id` that a client asks the
+/// owner to confirm, with the repository's ceiling as `catalogue.list` reports it.
+fn install_plan(
+    host: &Host,
+    catalogue_id: &str,
+    ceiling: &[String],
+    digest: &str,
+    grant: &[&str],
+) -> PluginInstallPlan {
+    PluginInstallPlan {
+        environment_id: host.environment_id,
+        catalogue_id: catalogue_id.to_owned(),
+        ceiling: ceiling.iter().cloned().collect(),
+        plugin_id: plugin(),
+        version: "0.1.0".to_owned(),
+        package_digest: digest.to_owned(),
+        grant: grant.iter().map(|name| (*name).to_owned()).collect(),
+    }
+}
+
+/// The parameters that install the example package at `digest` from `catalogue_id`, granting
+/// nothing, with the owner's confirmation of the installation `plan` describes, which is what the
+/// owner was shown and need not be this request.
+fn confirmed_install(
+    host: &Host,
+    catalogue_id: &str,
+    digest: &str,
+    plan: &PluginInstallPlan,
+) -> wire::PluginInstallParams {
+    wire::PluginInstallParams {
+        catalogue_id: catalogue_id.to_owned(),
+        owner_confirmation: Nullable::some(host.ceremony.approve(
+            SensitiveAction::GrantExecutableCapability,
+            plan.action_digest().expect("a digest"),
+        )),
+        ..install_params(host, digest)
+    }
+}
+
+/// The ceiling `catalogue.list` reports for `catalogue_id`.
+async fn listed_ceiling(host: &Host, catalogue_id: &str) -> Vec<String> {
+    let listed: wire::CatalogueListResult = ok(host
+        .module
+        .read_frame(
+            ActorIngress::LocalIpc,
+            &request(
+                Method::CatalogueList,
+                &wire::CatalogueListParams {
+                    environment_id: host.environment_id,
+                },
+            ),
+        )
+        .await);
+    listed
+        .catalogues
+        .into_iter()
+        .find(|catalogue| catalogue.catalogue_id == catalogue_id)
+        .expect("listed")
+        .ceiling
+}
+
+/// Rewrites the installed record so the release it names asked only to match metadata, as an
+/// installed release that asked for less would have. No package the development generation
+/// publishes asks for more than the three passive capabilities, so this is how an installation of
+/// one of them comes to widen what it may do.
+async fn narrow_installed_request(host: &Host) {
+    let connection =
+        rusqlite::Connection::open(database_of(host).await).expect("the catalogue's database");
+    let requested: String = connection
+        .query_row("SELECT requested FROM installations", [], |row| row.get(0))
+        .expect("one installation");
+    let mut requests: Vec<serde_json::Value> =
+        serde_json::from_str(&requested).expect("a list of requests");
+    requests.retain(|request| request["capability"] == "metadata.match");
+    assert_eq!(requests.len(), 1, "{requested}");
+    connection
+        .execute(
+            "UPDATE installations SET requested = ?1",
+            [serde_json::Value::Array(requests).to_string()],
+        )
+        .expect("rewritten");
+}
+
+/// How many capabilities the installed record says its release asked for.
+async fn installed_requests(host: &Host) -> usize {
+    host.module
+        .catalogue()
+        .lock()
+        .await
+        .installation(host.environment_id, &plugin())
+        .expect("readable")
+        .expect("installed")
+        .requested
+        .len()
+}
+
+/// An installation that may do more than the installation it replaces carries the owner's
+/// confirmation of that exact installation, accepted through the ceremony `plugin.grant` uses and
+/// consumed once: without one it is refused, one for another package hash or another grant is
+/// refused, its own installs, and spending it a second time is refused. None of the refusals
+/// changes the installation.
+#[tokio::test]
+async fn kr_req_10_05_and_11_11_an_installation_that_widens_is_the_owners_confirmed_decision() {
+    let host = host();
+    let digest = installed(&host).await;
+    narrow_installed_request(&host).await;
+    let ceiling = listed_ceiling(&host, "development").await;
+    let install = |params: wire::PluginInstallParams| {
+        let host = &host;
+        async move {
+            host.module
+                .write_frame_admitted(
+                    &mutation(Method::PluginInstall, host.environment_id, &params),
+                    Method::PluginInstall,
+                    Some(host.confirmations()),
+                )
+                .await
+        }
+    };
+
+    let refused = refusal(install(install_params(&host, &digest)).await);
+    assert_eq!(
+        refused.code,
+        ErrorCode::OwnerConfirmationRequired,
+        "{refused:?}"
+    );
+    for (what, plan) in [
+        (
+            "another package hash",
+            install_plan(&host, "development", &ceiling, &"0".repeat(64), &[]),
+        ),
+        (
+            "another grant",
+            install_plan(
+                &host,
+                "development",
+                &ceiling,
+                &digest,
+                &["broker.semantic_events"],
+            ),
+        ),
+    ] {
+        let refused =
+            refusal(install(confirmed_install(&host, "development", &digest, &plan)).await);
+        assert_eq!(
+            refused.code,
+            ErrorCode::PermissionDenied,
+            "{what}: {refused:?}"
+        );
+    }
+    assert_eq!(installed_requests(&host).await, 1, "nothing was installed");
+
+    let confirmed = confirmed_install(
+        &host,
+        "development",
+        &digest,
+        &install_plan(&host, "development", &ceiling, &digest, &[]),
+    );
+    let installed: wire::PluginInstallResult = ok(install(confirmed.clone()).await);
+    assert_eq!(installed.plugin.package_digest, digest);
+    assert_eq!(installed_requests(&host).await, 3, "the release as it asks");
+
+    narrow_installed_request(&host).await;
+    let refused = refusal(install(confirmed).await);
+    assert_eq!(
+        refused.code,
+        ErrorCode::PermissionDenied,
+        "a confirmation spent once: {refused:?}"
+    );
+    assert_eq!(installed_requests(&host).await, 1, "nothing was installed");
+}
+
+/// A confirmation shown for an installation from one repository does not install the same package
+/// from another whose ceiling permits more: the repository and its ceiling are part of what the
+/// owner confirmed. Shown for the wider repository, it installs from that one.
+#[tokio::test]
+async fn kr_req_10_05_and_11_11_a_confirmation_for_a_narrow_repository_is_not_one_for_a_wider() {
+    let host = host();
+    let digest = synchronised(&host).await;
+    let _: wire::CatalogueAddResult = ok(host
+        .module
+        .write_frame_admitted(
+            &mutation(
+                Method::CatalogueAdd,
+                host.environment_id,
+                &add_params_for(&host, "wide", vec!["terminal.transcript_tail".to_owned()]),
+            ),
+            Method::CatalogueAdd,
+            Some(host.confirmations()),
+        )
+        .await);
+    let _: wire::CatalogueSyncResult = ok(host
+        .module
+        .write_frame_admitted(
+            &mutation(
+                Method::CatalogueSync,
+                host.environment_id,
+                &wire::CatalogueSyncParams {
+                    environment_id: host.environment_id,
+                    catalogue_id: "wide".to_owned(),
+                },
+            ),
+            Method::CatalogueSync,
+            Some(host.confirmations()),
+        )
+        .await);
+    let (narrow, wide) = (
+        listed_ceiling(&host, "development").await,
+        listed_ceiling(&host, "wide").await,
+    );
+    assert_ne!(narrow, wide);
+
+    let shown = install_plan(&host, "development", &narrow, &digest, &[]);
+    let refused = refusal(
+        host.module
+            .write_frame_admitted(
+                &mutation(
+                    Method::PluginInstall,
+                    host.environment_id,
+                    &confirmed_install(&host, "wide", &digest, &shown),
+                ),
+                Method::PluginInstall,
+                Some(host.confirmations()),
+            )
+            .await,
+    );
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(
+        host.module
+            .catalogue()
+            .lock()
+            .await
+            .installation(host.environment_id, &plugin())
+            .expect("readable")
+            .is_none(),
+        "nothing was installed"
+    );
+
+    let shown = install_plan(&host, "wide", &wide, &digest, &[]);
+    let installed: wire::PluginInstallResult = ok(host
+        .module
+        .write_frame_admitted(
+            &mutation(
+                Method::PluginInstall,
+                host.environment_id,
+                &confirmed_install(&host, "wide", &digest, &shown),
+            ),
+            Method::PluginInstall,
+            Some(host.confirmations()),
+        )
+        .await);
+    assert_eq!(installed.plugin.catalogue_id, "wide");
 }
 
 /// Enrols and synchronises the development catalogue as the owner, and returns the example

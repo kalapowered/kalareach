@@ -12,19 +12,21 @@
 //!   where the change becomes durable. [`DaemonAdmission`] answers by holding this daemon's
 //!   connection table for the length of the commit, so a withdrawal lands wholly before the change
 //!   or wholly after it.
-//! * Adopting a trust root and granting a capability are the owner's decisions, and section 10
-//!   says outright that an operating-system identity is not that decision. Both methods carry the
-//!   owner's confirmation of one exact action: the challenge this host issued and is still
-//!   holding, answered under the enrolled signer, bound to the root or the release in front of the
-//!   owner, and consumed here so one ceremony authorises one action. The accepted confirmation is
-//!   checked again inside the same commit.
+//! * Adopting a trust root, granting a capability and an installation that widens what a package
+//!   may do are the owner's decisions, and section 10 says outright that an operating-system
+//!   identity is not that decision. Those methods carry the owner's confirmation of one exact
+//!   action: the challenge this host issued and is still holding, answered under the enrolled
+//!   signer, bound to the root, the grant or the installation in front of the owner, and consumed
+//!   here so one ceremony authorises one action. The accepted confirmation is checked again inside
+//!   the same commit.
 //! * An action is claimed before it is performed, and its effect and the answer it gave commit in
 //!   one transaction, so a resubmission is answered from that record rather than performed again,
 //!   and an action a stopped daemon left mid-way reads as unknown rather than as refused.
 //! * Enlarging trust is never a side effect of another method. A sync verifies inside the ceiling
-//!   the enrolment already has and refuses a generation that would need more; an install refuses a
-//!   grant wider than the installation already held and names `plugin.grant`, which is the method
-//!   whose whole purpose is that decision.
+//!   the enrolment already has and refuses a generation that would need more; an install that may
+//!   do more than the installation it replaces, or, with nothing to replace, more than its
+//!   repository's ceiling permits by itself, and every release that installs a native bridge, is
+//!   refused unless it carries the owner's confirmation of that exact installation.
 
 use std::sync::Arc;
 
@@ -663,6 +665,61 @@ impl CatalogueModule {
                 let version = version(&params.version)?;
                 let digest = digest(&params.package_digest)?;
                 let grant = grant_from(&params.grant)?;
+                // An installation that may do more than the one it replaces, or than its
+                // repository's ceiling permits by itself, and every release that installs a native
+                // bridge, is the owner's decision, and the catalogue decides whether this one is.
+                // The confirmation names the repository and its ceiling with the release, the hash
+                // and the grant, and is spent the way `plugin.grant` spends one: accepted and
+                // consumed here, and asked again inside the commit.
+                let confirmed = match params.owner_confirmation.as_ref() {
+                    None => None,
+                    Some(proof) => {
+                        let enrolment = catalogue
+                            .repository(&id)
+                            .map_err(ProtocolError::from)?
+                            .ok_or_else(|| {
+                                ProtocolError::new(
+                                    ErrorCode::ResourceUnavailable,
+                                    format!("{id} is not enrolled"),
+                                )
+                            })?;
+                        let plan = crate::sharing::PluginInstallPlan {
+                            environment_id: params.environment_id,
+                            catalogue_id: id.to_string(),
+                            ceiling: enrolment
+                                .ceiling
+                                .capabilities()
+                                .into_iter()
+                                .map(|capability| capability.as_str().to_owned())
+                                .collect(),
+                            plugin_id: params.plugin_id.clone(),
+                            version: version.to_string(),
+                            package_digest: digest.to_string(),
+                            grant: params.grant.iter().cloned().collect(),
+                        };
+                        let action_digest = plan
+                            .action_digest()
+                            .map_err(|error| error.to_protocol_error())?;
+                        let (confirmations, confirmed) = confirm(
+                            confirmations,
+                            crate::sharing::PluginInstallPlan::sensitive_action(),
+                            action_digest,
+                            proof,
+                            "installation",
+                        )?;
+                        Some(Confirmed {
+                            admission,
+                            confirmed,
+                            action_digest,
+                            confirmations,
+                            subject: "installation",
+                        })
+                    }
+                };
+                let authority: &dyn Authority = match &confirmed {
+                    Some(confirmed) => confirmed,
+                    None => admission,
+                };
                 let mut render = settle(&mut answer, |transition| match transition {
                     Transition::Installed(view) => Ok(wire::PluginInstallResult {
                         plugin: plugin_summary(view)?,
@@ -678,7 +735,7 @@ impl CatalogueModule {
                         &version,
                         digest,
                         grant,
-                        &mut Change::settling(admission, key, now, &mut render),
+                        &mut Change::settling(authority, key, now, &mut render),
                     )
                     .await
                     .map_err(ProtocolError::from)?;
@@ -1286,7 +1343,8 @@ fn confirm<'a>(
         ProtocolError::new(
             ErrorCode::PermissionDenied,
             format!(
-                "this {subject} needs the owner's confirmation and this host has no enrolled                  owner signer to check one against"
+                "this {subject} needs the owner's confirmation and this host has no enrolled \
+                 owner signer to check one against"
             ),
         )
     })?;

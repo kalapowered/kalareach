@@ -514,6 +514,15 @@ pub struct PluginInstallParams {
     pub package_digest: String,
     /// Capabilities the owner is granting this installation.
     pub grant: Vec<String>,
+    /// The owner's confirmation of this exact installation, where it needs one.
+    ///
+    /// An installation that may do anything the installation it replaces could not, or, with
+    /// nothing to replace, anything the repository's ceiling does not permit by itself, needs it,
+    /// and so does every release that installs a native bridge. It is bound to the repository and
+    /// its ceiling as `catalogue.list` reports them, the release, the package hash and the grant
+    /// above, so it cannot be carried to another repository, release or grant. One that is given is
+    /// spent whether or not the installation needed it.
+    pub owner_confirmation: Nullable<OwnerConfirmationProof>,
 }
 
 /// Result of `plugin.install`.

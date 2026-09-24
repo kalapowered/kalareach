@@ -371,6 +371,7 @@ async fn kr_req_23_28_and_23_29_a_paired_device_reaches_every_catalogue_and_plug
                 version: "0.1.0".to_owned(),
                 package_digest: package_digest.clone(),
                 grant: Vec::new(),
+                owner_confirmation: Nullable::null(),
             },
         )
         .await

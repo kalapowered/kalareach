@@ -291,14 +291,20 @@ prompts. Past the default, each decision is somebody's and they are not intercha
 | Metadata matching, declarative presentation, authorised broker events | Nobody; the enrolment already did |
 | Raw terminal streams, transcript tails, process observation, upstream actions | An explicit package or repository grant |
 | Terminal input, filesystem, network, approval decoding and answering | An explicit installation grant, which a repository ceiling cannot reach |
-| A native bridge, which runs under the application's own permissions | An installation grant the owner confirms |
-| Anything the previous installation did not hold | An installation grant, because an increase is a new decision |
+| A native bridge, which runs under the application's own permissions | An installation grant the owner confirms, on every release |
+| Anything the installation it replaces could not do, or, for a first installation, anything past the ceiling | The owner's confirmation, because an increase is a new decision |
 
-A grant names only capabilities the package asks for. An installation carries no owner
-confirmation, so this host does not install a package that asks for a native bridge, and it does
-not install a release that would be permitted more than the release it replaces: an increase is a
-new decision, and installing is not where that decision is made. `plugin.grant`, which does carry
-the owner's confirmation of one exact package, is where an installed package is granted more.
+A grant names only capabilities the package asks for. An installation that may do anything the
+installation it replaces could not, or, with nothing to replace, anything its repository's ceiling
+does not permit by itself, carries the owner's confirmation of that exact installation, and so does
+every release that installs a native bridge. What the replaced installation could do is read under
+the ceiling it was installed under, so a move to a repository that permits more is an increase
+too. The confirmation names the repository and its ceiling, as `catalogue.list` reports them, the
+release, the package hash and the grant; it is accepted and consumed the way `plugin.grant`'s is,
+and asked again when the installation is recorded. An installation that widens nothing needs none,
+and one that is given is spent all the same. `plugin.grant` takes the same confirmation for every
+widening of an installed package, so removing a package and installing it again is not a way
+around it.
 
 Qualification data ships as signed, immutable catalogue artifacts, separately from host binaries. A
 vendor can say "this release was qualified against ExternalApp 1.4" without waiting for a core release,

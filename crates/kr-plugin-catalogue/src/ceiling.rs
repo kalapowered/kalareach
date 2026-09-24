@@ -13,12 +13,13 @@
 //! | The three default capabilities | Nobody; the enrolment already did |
 //! | Transcript tails, process observation, upstream actions | An explicit package or repository grant |
 //! | Raw terminal streams, terminal input, filesystem, network, decoding and answering approvals | An explicit installation grant |
-//! | A native bridge, which runs under the application's own permissions | An installation grant with the owner's confirmation |
-//! | Anything the previous installation did not have | An installation grant, because an increase is not the old decision |
+//! | A native bridge, which runs under the application's own permissions | An installation grant with the owner's confirmation, on every release |
+//! | Anything the installation it replaces could not do, or, with nothing to replace, anything past the ceiling | The owner's confirmation of that exact package and grant, because an increase is not the old decision |
 //!
-//! The last row is why this module compares two grants rather than answering about one
-//! capability. An upgrade that quietly widens what a package may do is the thing the installation
-//! grant exists to prevent, and a host that only checked the floor would miss it.
+//! The last row is why an installation is compared as a whole effective set, with [`effective`],
+//! rather than asked about one capability. An upgrade that quietly widens what a package may do is
+//! the thing the installation grant exists to prevent, and a host that only checked the floor
+//! would miss it.
 
 use std::collections::BTreeSet;
 
@@ -236,36 +237,6 @@ pub fn check_installable(
     Ok(())
 }
 
-/// Checks an upgrade's grant against the one the installation already had.
-///
-/// An increase over the previous grant is a new decision, whatever the new package asks for and
-/// whatever the ceiling permits. A host that only asked "is this inside the ceiling?" would let an
-/// upgrade widen an installation silently, which is the one thing the installation grant is for.
-///
-/// # Errors
-///
-/// Returns [`CatalogueError::GrantRequired`] when the upgrade would hold more than the previous
-/// installation and the owner has not confirmed it.
-pub fn check_upgrade(
-    previous: &InstallationGrant,
-    proposed: &InstallationGrant,
-    confirmed: bool,
-) -> CatalogueResult<()> {
-    if confirmed {
-        return Ok(());
-    }
-    if let Some(added) = previous.increase_over(proposed).first().copied() {
-        return Err(CatalogueError::GrantRequired {
-            capability: added,
-            requirement: format!(
-                "an explicit installation grant: the installed package was not permitted {added}, \
-                 and an upgrade does not widen what it may do"
-            ),
-        });
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,23 +326,5 @@ mod tests {
             .into_iter()
             .collect::<BTreeSet<_>>()
         );
-    }
-
-    #[test]
-    fn an_upgrade_does_not_widen_what_an_installation_may_do() {
-        let previous = InstallationGrant::with([PluginCapability::TranscriptTail]);
-        let same = InstallationGrant::with([PluginCapability::TranscriptTail]);
-        assert!(check_upgrade(&previous, &same, false).is_ok());
-
-        let narrower = InstallationGrant::none();
-        assert!(check_upgrade(&previous, &narrower, false).is_ok());
-
-        let wider = InstallationGrant::with([
-            PluginCapability::TranscriptTail,
-            PluginCapability::NetworkOutbound,
-        ]);
-        let refusal = check_upgrade(&previous, &wider, false).expect_err("an increase");
-        assert!(refusal.to_string().contains("does not widen"), "{refusal}");
-        assert!(check_upgrade(&previous, &wider, true).is_ok());
     }
 }

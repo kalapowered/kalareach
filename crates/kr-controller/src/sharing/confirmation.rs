@@ -107,6 +107,57 @@ impl PluginGrantPlan {
     }
 }
 
+/// Installing a package where the installation needs the owner's confirmation, as the owner is
+/// asked to confirm it.
+///
+/// What an installation may do depends on the repository it comes from as well as on its grant, so
+/// the repository and its ceiling are in the digest with the release and the grant: a confirmation
+/// shown for an installation from one repository cannot install the same package from another
+/// that permits it more.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginInstallPlan {
+    /// The environment the package is installed in.
+    pub environment_id: EnvironmentId,
+    /// This host's identifier for the repository the package is installed from.
+    pub catalogue_id: String,
+    /// The capabilities that repository's ceiling permits, as `catalogue.list` reports them.
+    pub ceiling: CanonicalSet<String>,
+    /// The package.
+    pub plugin_id: PluginId,
+    /// The release being installed.
+    pub version: String,
+    /// The exact package hash being installed.
+    pub package_digest: String,
+    /// The capabilities the installation is granted, as a whole set.
+    pub grant: CanonicalSet<String>,
+}
+
+impl PluginInstallPlan {
+    /// The sensitive action a confirmation for this plan is bound to.
+    #[must_use]
+    pub const fn sensitive_action() -> SensitiveAction {
+        SensitiveAction::GrantExecutableCapability
+    }
+
+    /// The digest an owner's confirmation for this exact installation covers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an encoding error when the plan cannot be represented in KR-CBOR-1.
+    pub fn action_digest(&self) -> Result<Digest256> {
+        digest_of(&(
+            "kr-plugin-install/1",
+            self.environment_id,
+            &self.catalogue_id,
+            &self.ceiling,
+            &self.plugin_id,
+            &self.version,
+            &self.package_digest,
+            &self.grant,
+        ))
+    }
+}
+
 fn digest_of<T: serde::Serialize>(value: &T) -> Result<Digest256> {
     let value = kr_cbor::to_canonical_value(value)
         .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
@@ -263,7 +314,7 @@ pub trait OwnerConfirmations: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{CatalogueTrustPlan, PluginGrantPlan};
+    use super::{CatalogueTrustPlan, PluginGrantPlan, PluginInstallPlan};
     use kr_protocol::ids::{EnvironmentId, PluginId};
     use kr_protocol::scalars::{CanonicalSet, Uuid};
 
@@ -325,11 +376,67 @@ mod tests {
         assert_ne!(first, second);
     }
 
+    fn install_plan() -> PluginInstallPlan {
+        PluginInstallPlan {
+            environment_id: EnvironmentId::new(Uuid::NIL),
+            catalogue_id: "official".to_owned(),
+            ceiling: ["metadata.match".to_owned()]
+                .into_iter()
+                .collect::<CanonicalSet<_>>(),
+            plugin_id: PluginId::new("kalareach/example").expect("a plugin id"),
+            version: "0.1.0".to_owned(),
+            package_digest: "sha256:bb".to_owned(),
+            grant: CanonicalSet::new(),
+        }
+    }
+
     #[test]
     fn the_two_plans_never_share_a_digest() {
         assert_ne!(
             trust_plan().action_digest().expect("a digest"),
             grant_plan().action_digest().expect("a digest")
         );
+    }
+
+    /// Each part of an installation is part of what the owner confirmed: the repository it comes
+    /// from and that repository's ceiling as much as the release and the grant. And confirming an
+    /// installation is never confirming a grant, whatever the two name.
+    #[test]
+    fn every_part_of_an_installation_is_a_different_action() {
+        let confirmed = install_plan().action_digest().expect("a digest");
+        let changed = [
+            PluginInstallPlan {
+                catalogue_id: "wide".to_owned(),
+                ..install_plan()
+            },
+            PluginInstallPlan {
+                ceiling: ["metadata.match".to_owned(), "terminal.stream".to_owned()]
+                    .into_iter()
+                    .collect::<CanonicalSet<_>>(),
+                ..install_plan()
+            },
+            PluginInstallPlan {
+                version: "0.2.0".to_owned(),
+                ..install_plan()
+            },
+            PluginInstallPlan {
+                package_digest: "sha256:cc".to_owned(),
+                ..install_plan()
+            },
+            PluginInstallPlan {
+                grant: ["terminal.input".to_owned()]
+                    .into_iter()
+                    .collect::<CanonicalSet<_>>(),
+                ..install_plan()
+            },
+        ];
+        for plan in changed {
+            assert_ne!(
+                confirmed,
+                plan.action_digest().expect("a digest"),
+                "{plan:?}"
+            );
+        }
+        assert_ne!(confirmed, grant_plan().action_digest().expect("a digest"));
     }
 }

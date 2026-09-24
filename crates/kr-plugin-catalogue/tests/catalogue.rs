@@ -1467,8 +1467,7 @@ async fn kr_req_11_11_the_default_ceiling_permits_the_three_passive_capabilities
     assert_eq!(refusal.code(), ErrorCode::PluginGrantRequired);
 
     // A native bridge runs outside the component sandbox and needs the owner's confirmation of
-    // this exact package, which an installation does not carry, so even a grant that names it
-    // does not install it.
+    // this exact package, so a grant that names it does not install it on its own.
     let grant = InstallationGrant::with([
         PluginCapability::TranscriptTail,
         PluginCapability::TerminalInput,
@@ -1484,15 +1483,9 @@ async fn kr_req_11_11_the_default_ceiling_permits_the_three_passive_capabilities
             grant.clone(),
         )
         .await
-        .expect_err("a native bridge is not installed");
+        .expect_err("a native bridge is not installed unconfirmed");
     assert!(
-        matches!(
-            refusal,
-            CatalogueError::GrantRequired {
-                capability: PluginCapability::NativeBridgeInstall,
-                ..
-            }
-        ),
+        matches!(refusal, CatalogueError::OwnerConfirmationRequired { .. }),
         "{refusal:?}"
     );
     assert!(
@@ -1578,17 +1571,16 @@ async fn kr_req_11_11_a_capability_answer_uses_the_ceiling_the_package_came_from
         .sync(&repository())
         .await
         .expect("a verified generation");
-    catalogue
-        .install(
-            &repository(),
-            environment(),
-            &plugin(),
-            &version(),
-            generation.manifest_digest(),
-            InstallationGrant::with([PluginCapability::TranscriptTail]),
-        )
-        .await
-        .expect("installable");
+    install_as(
+        &mut catalogue,
+        &repository(),
+        "0.1.0",
+        generation.manifest_digest(),
+        &[PluginCapability::TranscriptTail],
+        true,
+    )
+    .await
+    .expect("installable with the owner's confirmation of the grant");
 
     // The owner withdraws the grant. Under the narrow repository's ceiling that leaves the
     // transcript tail unpermitted, and the wider enrolment beside it does not answer for this
@@ -1609,6 +1601,384 @@ async fn kr_req_11_11_a_capability_answer_uses_the_ceiling_the_package_came_from
     assert!(
         catalogue.repository(&wider).expect("readable").is_some(),
         "the wider repository is enrolled all the same"
+    );
+}
+
+/// Installs `version` of the example package at `digest` from `id`, granting `grant`, under an
+/// authority that carries the owner's confirmation where `confirmed` says so.
+async fn install_as(
+    catalogue: &mut Catalogue,
+    id: &RepositoryId,
+    version: &str,
+    digest: PayloadDigest,
+    grant: &[PluginCapability],
+    confirmed: bool,
+) -> CatalogueResult<Installation> {
+    let owner = if confirmed {
+        Owner::confirming()
+    } else {
+        Owner::acting()
+    };
+    catalogue
+        .install_with(
+            id,
+            environment(),
+            &plugin(),
+            &PackageVersion::parse(version).expect("a valid version"),
+            digest,
+            InstallationGrant::with(grant.iter().copied()),
+            &mut Change::new(&owner),
+        )
+        .await
+        .map(|view| view.installation)
+}
+
+/// The three passive capabilities, and `more`.
+fn passive_and(more: &[PluginCapability]) -> Vec<PluginCapability> {
+    let mut capabilities = vec![
+        PluginCapability::MetadataMatch,
+        PluginCapability::DeclarativePresentation,
+        PluginCapability::BrokerSemanticEvents,
+    ];
+    capabilities.extend_from_slice(more);
+    capabilities
+}
+
+/// A first installation of a release that asks for a native bridge installs with the owner's
+/// confirmation, and not without it: a grant that names the bridge is not enough on its own, and
+/// without a grant the refusal names the bridge. Every release of a bridge is the owner's decision,
+/// so installing the same one again needs the confirmation again.
+#[tokio::test]
+async fn kr_req_11_11_a_first_native_bridge_installs_with_the_owners_confirmation() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(
+        home.path(),
+        GenerationSpec {
+            capabilities: passive_and(&[PluginCapability::NativeBridgeInstall]),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue.sync(&repository()).await.expect("a generation");
+    let digest = generation.manifest_digest();
+    let bridge = [PluginCapability::NativeBridgeInstall];
+
+    let refusal = install_as(
+        &mut catalogue,
+        &repository(),
+        "0.1.0",
+        digest,
+        &bridge,
+        false,
+    )
+    .await
+    .expect_err("a bridge the owner did not confirm");
+    assert!(
+        matches!(refusal, CatalogueError::OwnerConfirmationRequired { .. }),
+        "{refusal:?}"
+    );
+    let refusal = install_as(&mut catalogue, &repository(), "0.1.0", digest, &[], true)
+        .await
+        .expect_err("a bridge nothing grants");
+    assert!(
+        matches!(
+            refusal,
+            CatalogueError::GrantRequired {
+                capability: PluginCapability::NativeBridgeInstall,
+                ..
+            }
+        ),
+        "{refusal:?}"
+    );
+    assert!(
+        catalogue
+            .installation(environment(), &plugin())
+            .expect("readable")
+            .is_none()
+    );
+
+    let installed = install_as(
+        &mut catalogue,
+        &repository(),
+        "0.1.0",
+        digest,
+        &bridge,
+        true,
+    )
+    .await
+    .expect("the owner confirmed this package and grant");
+    assert_eq!(installed.package_digest, digest);
+    assert!(installed.grant.holds(PluginCapability::NativeBridgeInstall));
+
+    let refusal = install_as(
+        &mut catalogue,
+        &repository(),
+        "0.1.0",
+        digest,
+        &bridge,
+        false,
+    )
+    .await
+    .expect_err("every release of a bridge is the owner's decision");
+    assert!(
+        matches!(refusal, CatalogueError::OwnerConfirmationRequired { .. }),
+        "{refusal:?}"
+    );
+}
+
+/// A release that may do more than the installed one installs with the owner's confirmation, and
+/// the installation stays on the release it was on without it: a release that newly asks for
+/// something its repository's ceiling already permits, and one granted something past the
+/// ceiling, are both increases.
+#[tokio::test]
+async fn kr_req_11_11_an_increase_installs_with_the_owners_confirmation() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let first = Generation::build(
+        home.path(),
+        GenerationSpec {
+            capabilities: passive_and(&[]),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let release = |generation: u64, version: &str, capabilities: Vec<PluginCapability>| {
+        let home = home.path().join(version);
+        let keys = first.keys();
+        let version = version.to_owned();
+        async move {
+            Generation::build(
+                &home,
+                GenerationSpec {
+                    generation,
+                    package_version: version,
+                    capabilities,
+                    keys: Some(keys),
+                    ..GenerationSpec::default()
+                },
+            )
+            .await
+        }
+    };
+    // The repository's ceiling permits a transcript tail: the second release asks for it newly,
+    // inside the ceiling, and the third is granted terminal input, which no ceiling reaches.
+    let within = release(2, "0.2.0", passive_and(&[PluginCapability::TranscriptTail])).await;
+    let past = release(
+        3,
+        "0.3.0",
+        passive_and(&[
+            PluginCapability::TranscriptTail,
+            PluginCapability::TerminalInput,
+        ]),
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &first,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::with([PluginCapability::TranscriptTail]),
+    )
+    .await;
+    catalogue.sync(&repository()).await.expect("generation 1");
+    install_as(
+        &mut catalogue,
+        &repository(),
+        "0.1.0",
+        first.manifest_digest(),
+        &[],
+        false,
+    )
+    .await
+    .expect("nothing past the ceiling");
+
+    for (next, version, grant) in [
+        (&within, "0.2.0", &[][..]),
+        (&past, "0.3.0", &[PluginCapability::TerminalInput][..]),
+    ] {
+        first.replace_with(next);
+        catalogue
+            .sync(&repository())
+            .await
+            .unwrap_or_else(|refusal| panic!("{version}: {refusal}"));
+        let before = catalogue
+            .installation(environment(), &plugin())
+            .expect("readable")
+            .expect("installed")
+            .package_digest;
+        let refusal = install_as(
+            &mut catalogue,
+            &repository(),
+            version,
+            next.manifest_digest(),
+            grant,
+            false,
+        )
+        .await
+        .expect_err("an increase the owner did not confirm");
+        assert!(
+            matches!(refusal, CatalogueError::OwnerConfirmationRequired { .. }),
+            "{version}: {refusal:?}"
+        );
+        assert_eq!(
+            catalogue
+                .installation(environment(), &plugin())
+                .expect("readable")
+                .expect("installed")
+                .package_digest,
+            before,
+            "{version}: the installation stays on the release it was on"
+        );
+        let installed = install_as(
+            &mut catalogue,
+            &repository(),
+            version,
+            next.manifest_digest(),
+            grant,
+            true,
+        )
+        .await
+        .unwrap_or_else(|refusal| panic!("{version}: {refusal}"));
+        assert_eq!(installed.package_digest, next.manifest_digest());
+    }
+}
+
+/// Moving an installation to a repository whose ceiling permits more is an increase where the
+/// installation could not do that under the repository it came from: what it could do is read
+/// under the ceiling it was installed under, never the new one. The move installs with the owner's
+/// confirmation and not without it.
+#[tokio::test]
+async fn kr_req_11_11_a_move_to_a_wider_repository_is_an_increase_the_owner_confirms() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(
+        home.path(),
+        GenerationSpec {
+            capabilities: passive_and(&[PluginCapability::TranscriptTail]),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    let wide = RepositoryId::new("wide").expect("a valid repository identifier");
+    catalogue
+        .enrol(
+            Enrolment::new(
+                wide.clone(),
+                RepositoryKind::Community,
+                generation.metadata_url(),
+                generation.targets_url(),
+                generation.root_bytes(),
+                RepositoryBudgets::defaults(),
+                CapabilityCeiling::with([PluginCapability::TranscriptTail]),
+            )
+            .expect("an enrollable repository"),
+            true,
+        )
+        .expect("the owner adopted the root");
+    for id in [repository(), wide.clone()] {
+        catalogue.sync(&id).await.expect("a generation");
+    }
+    let digest = generation.manifest_digest();
+    let tail = [PluginCapability::TranscriptTail];
+
+    // A first installation granted a transcript tail its repository's ceiling does not permit.
+    let refusal = install_as(&mut catalogue, &repository(), "0.1.0", digest, &tail, false)
+        .await
+        .expect_err("past the ceiling, unconfirmed");
+    assert!(
+        matches!(refusal, CatalogueError::OwnerConfirmationRequired { .. }),
+        "{refusal:?}"
+    );
+    install_as(&mut catalogue, &repository(), "0.1.0", digest, &tail, true)
+        .await
+        .expect("confirmed");
+    catalogue
+        .set_grant(environment(), &plugin(), InstallationGrant::none())
+        .expect("the owner withdraws the grant");
+
+    // The same package from the wider repository needs no grant for the tail, and may do what the
+    // installation it replaces may no longer do.
+    let refusal = install_as(&mut catalogue, &wide, "0.1.0", digest, &[], false)
+        .await
+        .expect_err("a move that widens, unconfirmed");
+    assert!(
+        matches!(refusal, CatalogueError::OwnerConfirmationRequired { .. }),
+        "{refusal:?}"
+    );
+    assert_eq!(
+        catalogue
+            .installation(environment(), &plugin())
+            .expect("readable")
+            .expect("installed")
+            .repository,
+        repository()
+    );
+    let moved = install_as(&mut catalogue, &wide, "0.1.0", digest, &[], true)
+        .await
+        .expect("a move the owner confirmed");
+    assert_eq!(moved.repository, wide);
+}
+
+/// Removing a package and installing it again is not a way around the owner's confirmation: a
+/// first installation granted terminal input needs it as much as a grant of it would.
+#[tokio::test]
+async fn kr_req_11_11_installing_again_after_a_removal_needs_the_owners_confirmation_again() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(
+        home.path(),
+        GenerationSpec {
+            capabilities: passive_and(&[PluginCapability::TerminalInput]),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue.sync(&repository()).await.expect("a generation");
+    let digest = generation.manifest_digest();
+    let input = [PluginCapability::TerminalInput];
+    install_as(&mut catalogue, &repository(), "0.1.0", digest, &input, true)
+        .await
+        .expect("confirmed");
+    catalogue
+        .uninstall(environment(), &plugin())
+        .expect("removed");
+
+    let refusal = install_as(
+        &mut catalogue,
+        &repository(),
+        "0.1.0",
+        digest,
+        &input,
+        false,
+    )
+    .await
+    .expect_err("installed again without the owner's confirmation");
+    assert!(
+        matches!(refusal, CatalogueError::OwnerConfirmationRequired { .. }),
+        "{refusal:?}"
+    );
+    assert!(
+        catalogue
+            .installation(environment(), &plugin())
+            .expect("readable")
+            .is_none()
     );
 }
 
