@@ -301,9 +301,10 @@ async fn a_caller_without_the_owners_identity_is_refused_when_it_opens_the_pipe(
 /// KR-REQ-05.02: a network client reaches a worker only through the control daemon. A named pipe
 /// can be opened from another machine by name, through the machine's file-sharing server, unless
 /// the pipe refuses remote callers, and that is also how the pipe's own owner arrives when it
-/// names this machine over the network. So the owner tries that path twice: to a pipe made to
-/// accept remote callers, which shows the path is open on this machine, and to the worker's pipe,
-/// which refuses it.
+/// names this machine over the network. So the owner tries that path twice: to a pipe that carries
+/// the worker pipe's own list and accepts remote callers, which shows that the path is open on
+/// this machine and that the list admits the owner arriving that way, and to the worker's pipe,
+/// which differs from it only in refusing remote callers and refuses it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_owner_arriving_over_the_network_is_refused() {
     use interprocess::os::windows::named_pipe::{PipeListenerOptions, pipe_mode};
@@ -317,16 +318,16 @@ async fn the_owner_arriving_over_the_network_is_refused() {
     let _listener = Listener::bind(&endpoint).expect("binds the endpoint");
 
     let control = format!("kr-network-control-{}", kr_ipc::new_uuid());
-    // Everyone, and remote callers accepted: the only thing that can refuse the owner here is the
-    // path itself.
-    let everyone = SecurityDescriptor::deserialize(
-        &widestring::U16CString::from_str("D:(A;;GA;;;WD)").expect("valid text"),
+    // The list a worker's pipe carries, and remote callers accepted: whatever refuses the owner on
+    // the worker's pipe and not here is the refusal of remote callers, not the list.
+    let owner_only = SecurityDescriptor::deserialize(
+        &widestring::U16CString::from_str("D:P(A;;GA;;;OW)").expect("valid text"),
     )
-    .expect("a list that grants everyone");
+    .expect("the list a worker's pipe carries");
     let _accepting = PipeListenerOptions::new()
         .path(format!(r"\\.\pipe\{control}"))
         .accept_remote(true)
-        .security_descriptor(Some(everyone))
+        .security_descriptor(Some(owner_only))
         .create_duplex::<pipe_mode::Bytes>()
         .expect("a pipe that accepts remote callers");
 
@@ -344,9 +345,10 @@ async fn the_owner_arriving_over_the_network_is_refused() {
     .expect("the open finishes");
     if let Err(error) = path_is_open {
         panic!(
-            "this machine does not reach a pipe over its own file-sharing server, so whether the \
-             worker's pipe refuses a network caller was not established: {error}. The Server \
-             service has to be running; see docs/host/README.md."
+            "the owner does not reach a pipe with the worker's list over this machine's own \
+             file-sharing server, so whether the worker's pipe refuses a network caller was not \
+             established: {error}. The Server service has to be running, and the owner has to \
+             arrive over the network with the identity that owns the pipe."
         );
     }
     let name = endpoint.as_text();
@@ -428,11 +430,19 @@ fn a_process_start_identity_is_the_creation_time_the_system_records() {
     let pid = child.id();
     let identity = kr_ipc::identity::process_start_identity(pid);
     let recorded = output_of(&created_at, &[&pid.to_string()]);
+    // Both readings are taken while the process runs, so the only difference between the two
+    // identities they are asked about is the start value.
     let running = identity.as_ref().map(kr_ipc::identity::process_state).ok();
-    let mut another = identity.as_ref().ok().cloned();
-    if let Some(another) = another.as_mut() {
-        another.start_value = kr_protocol::scalars::U64::new(another.start_value.get() + 1);
-    }
+    let another = identity
+        .as_ref()
+        .ok()
+        .map(|identity| {
+            let mut another = identity.clone();
+            another.start_value = kr_protocol::scalars::U64::new(identity.start_value.get() + 1);
+            another
+        })
+        .map(|another| kr_ipc::identity::process_state(&another));
+    let still_running = child.try_wait().expect("the process's status").is_none();
     let _ = child.kill();
     let _ = child.wait();
 
@@ -450,11 +460,15 @@ fn a_process_start_identity_is_the_creation_time_the_system_records() {
         ),
         "the start identity is the process and the creation time the operating system records"
     );
+    assert!(
+        still_running,
+        "the process was still running when both identities were asked about"
+    );
     assert_eq!(running, Some(kr_ipc::identity::ProcessState::Running));
     assert_eq!(
-        another.map(|another| kr_ipc::identity::process_state(&another)),
+        another,
         Some(kr_ipc::identity::ProcessState::Ended),
-        "another start value under the same identifier is another process"
+        "another start value under the same identifier, while the process runs, is another process"
     );
     let deadline = Instant::now() + PATIENCE;
     while kr_ipc::identity::process_state(&identity) != kr_ipc::identity::ProcessState::Ended {
