@@ -1449,8 +1449,13 @@ fn a_replayed_character_never_reaches_the_decision(
     session.type_bytes(shellpkg::CTRL_T);
 
     // The reader's own answer while the replay is in flight, which is the only thing that
-    // separates a macro being replayed from a binding that did nothing.
-    let replaying = session.reader_replaying(&entered, shellpkg::fence_id(23));
+    // separates a macro being replayed from a binding that did nothing. The replayed character can
+    // be this editor's own end of file at an empty prompt, so the shell may already have ended,
+    // as it is allowed to, by the time the question is written: the write says it may find the
+    // bridge gone, and a reader that is gone was not seen replaying.
+    let replaying = session.expecting_the_bridge_to_go(|session| {
+        session.reader_replaying(&entered, shellpkg::fence_id(23))
+    });
 
     let ended = session.ended_within(Duration::from_secs(5));
     let proved;

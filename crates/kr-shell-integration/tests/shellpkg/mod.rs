@@ -777,20 +777,16 @@ impl Session {
         Delivery::Delivered
     }
 
+    /// The length of the whole frame at the front of what has been received, where one is there.
+    fn whole_frame_len(&self) -> Option<usize> {
+        let header: [u8; 4] = self.pending.get(..4)?.try_into().ok()?;
+        let length = u32::from_be_bytes(header) as usize;
+        (self.pending.len() >= 4 + length).then_some(length)
+    }
+
     /// Decodes one whole frame out of what has already been received, where there is one.
     fn decode_pending(&mut self) -> Option<BridgeFrame> {
-        if self.pending.len() < 4 {
-            return None;
-        }
-        let length = u32::from_be_bytes([
-            self.pending[0],
-            self.pending[1],
-            self.pending[2],
-            self.pending[3],
-        ]) as usize;
-        if self.pending.len() < 4 + length {
-            return None;
-        }
+        let length = self.whole_frame_len()?;
         let body: Vec<u8> = self.pending[4..4 + length].to_vec();
         self.pending.drain(..4 + length);
         // Strict decoding, and the typed value has to re-encode to the same bytes: this is where a
@@ -1128,11 +1124,19 @@ impl Session {
             if let Some((arrived, answer)) = self.answers.remove(&id) {
                 return (arrived <= deadline.0).then_some(answer);
             }
-            if deadline.passed() {
+            // A bridge that has closed its side sends nothing more, so once every whole frame it
+            // did send has been read, no answer is coming, and waiting out the deadline would be
+            // waiting for a stream that has ended.
+            if deadline.passed() || self.read_to_the_end() {
                 return None;
             }
             self.pump_before(deadline.left().min(Duration::from_millis(50)), deadline.0);
         }
+    }
+
+    /// Whether the bridge's side of the endpoint has gone and nothing whole it sent is left unread.
+    fn read_to_the_end(&self) -> bool {
+        (self.shut || self.peer_read_gone) && self.whole_frame_len().is_none()
     }
 
     /// Publishes a fence the bridge will hold until it is invalidated.
