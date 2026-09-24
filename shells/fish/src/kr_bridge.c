@@ -228,6 +228,7 @@ kr_trace(const char *format, ...)
 {
     char line[1024];
     va_list arguments;
+    struct stat file;
     int length;
     int fd;
 
@@ -244,11 +245,13 @@ kr_trace(const char *format, ...)
         length = (int)(sizeof(line) - 2);
     }
     line[length++] = '\n';
-    fd = open(kr.trace, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    /* A path that is not a plain file is written to never: opening a pipe nobody reads, or a
+     * device, would hold the shell up, and diagnostics must never do that. */
+    fd = open(kr.trace, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NONBLOCK, 0600);
     if (fd < 0) {
         return;
     }
-    if (write(fd, line, (size_t)length) < 0) {
+    if (fstat(fd, &file) == 0 && S_ISREG(file.st_mode) && write(fd, line, (size_t)length) < 0) {
         /* Diagnostics that cannot be written are not a reason to do anything differently. */
     }
     close(fd);
@@ -300,6 +303,15 @@ kr_utf8_valid(const unsigned char *text, size_t len)
         at += follow + 1;
     }
     return 1;
+}
+
+/* Whether a descriptor of this process is one end of a pipe. */
+static int
+kr_is_pipe(int fd)
+{
+    struct stat file;
+
+    return fstat(fd, &file) == 0 && S_ISFIFO(file.st_mode);
 }
 
 /* Whether a C string is well-formed UTF-8. */
@@ -2557,6 +2569,15 @@ kr_bridge_resolve(const char *const *argv, size_t argc, const char *executable, 
     memset(out, 0, sizeof(*out));
     if (!kr_bridge_root_process() || argv == NULL || argc == 0 || executable == NULL ||
         cwd == NULL) {
+        return 0;
+    }
+    /*
+     * A command whose input or output is a pipe is part of a pipeline, even where the shell runs
+     * that part itself rather than in a child it forks: the last part of a pipeline can run in
+     * the root shell, with the pipe on its input.
+     */
+    if (kr_is_pipe(0) || kr_is_pipe(1)) {
+        kr_trace("resolve: %s was not asked about: it is part of a pipeline", argv[0]);
         return 0;
     }
     /*

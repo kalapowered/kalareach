@@ -136,6 +136,18 @@ fn a_pipeline_subshell_substitution_background_job_sourced_script_or_script_neve
 
 /// KR-REQ-12.07
 #[test]
+fn assignments_in_front_of_a_command_run_the_file_and_vector_they_select() {
+    shellpkg::assignments_in_front_of_a_command_run_what_they_select(BASH);
+}
+
+/// KR-REQ-07.44
+#[test]
+fn diagnostics_that_cannot_be_written_never_hold_a_command_up() {
+    shellpkg::diagnostics_that_cannot_be_written_never_hold_a_command_up(BASH);
+}
+
+/// KR-REQ-12.07
+#[test]
 fn an_absolute_path_invocation_runs_as_typed() {
     shellpkg::an_absolute_path_invocation_runs_as_typed(BASH);
 }

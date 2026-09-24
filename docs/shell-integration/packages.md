@@ -92,9 +92,10 @@ input it is holding, and a launch that arrives at that moment is refused with `q
 rather than installed over it.
 
 The fourth patch is the command integration's one point in the executor. `execcmd_exec` asks,
-immediately before it forks an external command, when the command has no pipe, is not a
-background job and holds no filename pattern still to expand: zsh expands a pattern only in the
-child, so a command with one is not asked about. The question is a pointer, `kr_resolve_hook`,
+immediately before it forks an external command, when the command has no pipe, is not a background
+job, holds no filename pattern still to expand and has no assignments in front of it: zsh expands a
+pattern and applies those assignments only in the child, where `PATH` or `ARGV0` would change what
+runs, so a command with either is not asked about. The question is a pointer, `kr_resolve_hook`,
 that the editor module sets when it loads and clears in its `finish_`, so the executor never calls
 into a module that is not there; the bridge answers it, and refuses everything but a top-level
 command of the accepted line that the root shell starts itself. When the answer names a launcher,

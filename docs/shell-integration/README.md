@@ -304,12 +304,14 @@ The Zsh and Bash packages ask before each command of an accepted line that the r
 itself: an external command found on the search path, at the top level of the line, in the
 foreground and with no pipe. The question is `command_resolve`, asked from the shell's executor
 after its own search has found the file and before it forks, so it names the vector the shell is
-about to run, the absolute path it found and the directory it runs in. A command in a pipeline, a
-subshell, a command substitution or the background runs in a process the shell forks, and one that
-a function, a sourced or startup file, an `eval`, a trap or a prompt hook runs is not a command of
-the line: none of these asks, and each runs as it was typed. A script is a process of its own, so
-only the interpreter it is started with is asked about. Zsh expands a filename pattern only in the
-child it forks, so a command whose words still hold one is not asked about either.
+about to run, the absolute path it found and the directory it runs in. A command in a subshell, a
+command substitution or the background runs in a process the shell forks; a command whose input or
+output is a pipe is part of a pipeline, even the last part a shell runs itself; and one that a
+function, a sourced or startup file, an `eval`, a trap or a prompt hook runs is not a command of the
+line. None of these asks, and each runs as it was typed. A script is a process of its own, so only
+the interpreter it is started with is asked about. Zsh expands a filename pattern and applies the
+assignments in front of a command only in the child it forks, so a command with either is not asked
+about either: `PATH` or `ARGV0` there would change the file or the vector that runs.
 
 The shell waits at most one second for the answer. A bypass, a refusal, the deadline and a lost
 endpoint all run the command exactly as the shell would have run it without asking: the same file,
@@ -332,7 +334,9 @@ line runs nothing and reports no block, and the input a running command reads th
 belongs to that command.
 
 A session that names an absolute path in `KR_SHELL_BRIDGE_TRACE` gets one line of diagnostics in
-that file for each question, answer and block. Otherwise the integration writes no file of its own.
+that file for each question, answer and block, as long as the path is a plain file: a pipe or a
+device is never opened for writing in a way that could hold the shell up. Otherwise the integration
+writes no file of its own.
 
 ## The reader-thread rules
 

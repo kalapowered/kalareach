@@ -417,12 +417,17 @@ kr_zle_resolve(char **argv, char *path, char ***launch, char ***environment)
     unsigned long revision;
 
     *launch = *environment = NULL;
-    kr_bridge_resolution_free(&kr_resolution_now);
-    /* A command of the line the person typed, started by the root shell itself at the top level. */
+    /*
+     * A command of the line the person typed, started by the root shell itself at the top level. A
+     * process forked from the root shell asks nothing and releases nothing: what the bridge holds
+     * may be the launch that child is about to start, and the child can run a command of its own
+     * first, as it does for STTY.
+     */
     if (!kr_line_running || !kr_bridge_root_process() || !kr_top_level() || argv == NULL ||
         path == NULL || pwd == NULL) {
         return 0;
     }
+    kr_bridge_resolution_free(&kr_resolution_now);
     for (argc = 0; argv[argc] != NULL; argc++) {
     }
     if (argc == 0) {

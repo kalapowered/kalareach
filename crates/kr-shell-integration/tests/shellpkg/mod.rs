@@ -350,6 +350,8 @@ pub enum ResolvePolicy {
     Decide(Vec<kr_protocol::session::CommandIntegration>),
     /// No answer to a resolve, while every other event is still answered.
     Silent,
+    /// A refusal, which is no detach's and must not be taken for one.
+    Refuse,
     /// A backend the worker established: the answer names `launcher`, adds `environment` for the
     /// one invocation and appends `added` to the vector.
     Backend {
@@ -599,9 +601,6 @@ impl Session {
         command.env("XDG_DATA_HOME", home.join(".local").join("share"));
         command.env("TERM", "xterm-256color");
         command.env("LANG", "C");
-        for (name, value) in environment {
-            command.env(name, value);
-        }
         command.env("KR_SESSION", session_id.to_string());
         command.env("KR_SHELL_BRIDGE", &endpoint.path);
         command.env(
@@ -611,6 +610,10 @@ impl Session {
         // A run that asked a package for diagnostics passes that through to the shell it starts.
         if let Some(trace) = std::env::var_os("KR_SHELL_BRIDGE_TRACE") {
             command.env("KR_SHELL_BRIDGE_TRACE", trace);
+        }
+        // What the case itself names goes last, so a case that sets one of these is the one heard.
+        for (name, value) in environment {
+            command.env(name, value);
         }
 
         let child = pty
@@ -1076,6 +1079,12 @@ impl Session {
                 let answer = match &self.commands.policy {
                     ResolvePolicy::Decide(integrations) => worker_decision(integrations, params),
                     ResolvePolicy::Silent => return None,
+                    ResolvePolicy::Refuse => {
+                        return Some(EventOutcome::Refused(ProtocolError::new(
+                            ErrorCode::PermissionDenied,
+                            "this invocation is not resolved",
+                        )));
+                    }
                     ResolvePolicy::Backend {
                         launcher,
                         environment,

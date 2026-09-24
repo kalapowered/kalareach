@@ -13,7 +13,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use kr_protocol::root::{CommandBypassReason, RootCommandResolveParams};
+use kr_protocol::root::{CommandBypassReason, DETACH_HINT, RootCommandResolveParams};
 use kr_protocol::session::{CommandIntegration, EnvironmentVariable};
 use kr_shell_integration::contract::qualification::ShellKind;
 
@@ -140,7 +140,7 @@ impl Probes {
             .expect("a directory on the internal disk");
         // The name the kernel gives it, which is the one a shell reports.
         let root = std::fs::canonicalize(directory.path()).expect("the directory resolves");
-        for sub in ["bin", "launcher", "elsewhere"] {
+        for sub in ["bin", "other", "launcher", "elsewhere"] {
             std::fs::create_dir(root.join(sub)).expect("a directory for the probes");
         }
         write_recorder(
@@ -155,6 +155,18 @@ impl Probes {
             "launcher-",
             "ran",
         );
+        // The same name in another directory, for a command whose own search path finds it.
+        write_recorder(
+            &root.join("other").join("kr-probe"),
+            &root.join("other.record"),
+            "other-",
+            "ran",
+        );
+        // A launcher that is an executable file the system cannot start.
+        let broken = root.join("launcher").join("kr-hook-broken");
+        std::fs::write(&broken, [0u8, 1, 2, 3]).expect("a launcher that cannot start");
+        std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755))
+            .expect("an executable file");
         std::fs::write(root.join("script.sh"), "kr-probe from-a-script\n").expect("a script");
         Self {
             _directory: directory,
@@ -182,6 +194,30 @@ impl Probes {
     #[must_use]
     pub fn launcher(&self) -> PathBuf {
         self.root.join("launcher").join("kr-hook")
+    }
+
+    /// A launcher that is an executable file the system cannot start.
+    #[must_use]
+    pub fn broken_launcher(&self) -> PathBuf {
+        self.root.join("launcher").join("kr-hook-broken")
+    }
+
+    /// Another directory holding a program of the same name.
+    #[must_use]
+    pub fn other_directory(&self) -> PathBuf {
+        self.root.join("other")
+    }
+
+    /// Every start of the program of the same name in the other directory.
+    #[must_use]
+    pub fn other_runs(&self) -> Vec<ProbeRun> {
+        read_runs(&self.root.join("other.record"))
+    }
+
+    /// A path in the probes' directory, for a case that needs a file of its own there.
+    #[must_use]
+    pub fn path(&self, name: &str) -> PathBuf {
+        self.root.join(name)
     }
 
     /// A script that runs the program.
@@ -385,7 +421,23 @@ pub fn forms_the_root_shell_does_not_start_itself_never_ask(kind: ShellKind) {
             "kr_probe_function() { kr-probe in-a-function; }; kr_probe_function".to_owned(),
         ),
         ("an eval", "eval 'kr-probe in-an-eval'".to_owned()),
+        // The last part of a pipeline can run in the root shell itself, with the pipe on its
+        // input: zsh runs a group there.
+        (
+            "a group at the end of a pipeline",
+            "printf x | { kr-probe in-a-group; }".to_owned(),
+        ),
     ];
+    let mut forms = forms.to_vec();
+    if kind == ShellKind::Bash {
+        // Bash runs the last part of a pipeline itself when job control is off and lastpipe is on.
+        forms.push((
+            "the last part of a pipeline the shell runs itself",
+            "set +m; shopt -s lastpipe; printf x | kr-probe in-the-last-part; shopt -u lastpipe; \
+             set -m"
+                .to_owned(),
+        ));
+    }
     for (form, command) in forms {
         let runs = probes.runs().len();
         let asked = session.run_asking(&command, "probe-ran");
@@ -399,6 +451,112 @@ pub fn forms_the_root_shell_does_not_start_itself_never_ask(kind: ShellKind) {
     assert_eq!(asked.len(), 1, "only the interpreter asks: {asked:?}");
     assert_eq!(asked[0].argv[0], "sh");
     assert_eq!(last_run(&probes).arguments, ["from-a-script"]);
+}
+
+/// KR-REQ-12.07: a command runs the file and the vector its shell would run. Assignments in front
+/// of it can change both, so the question names what they select, or is not asked.
+///
+/// Bash searches with a `PATH` placed in front of the command, and asks about the file that search
+/// finds. Zsh applies those assignments only in the child it forks, so it does not ask about such
+/// a command at all; `STTY` in front of one runs a command in that child before it starts.
+pub fn assignments_in_front_of_a_command_run_what_they_select(kind: ShellKind) {
+    let Some(package) = Package::found(kind) else {
+        return;
+    };
+    let probes = Probes::new();
+    let mut session = a_session_with_probes(&package, &probes);
+    // A backend for whatever is asked about, so a question that named the wrong file would start
+    // the launcher in the command's place.
+    session.commands.policy = ResolvePolicy::Backend {
+        launcher: probes.launcher().display().to_string(),
+        environment: Vec::new(),
+        added: Vec::new(),
+    };
+    let other = probes.other_directory();
+
+    let launches = probes.launches().len();
+    let asked = session.run_asking(
+        &format!(
+            "PATH='{}':\"$PATH\" kr-probe from-the-other",
+            other.display()
+        ),
+        match kind {
+            ShellKind::Bash => "launcher-ran",
+            _ => "other-ran",
+        },
+    );
+    match kind {
+        ShellKind::Bash => {
+            assert_eq!(asked.len(), 1, "one command asks once: {asked:?}");
+            assert_eq!(
+                asked[0].executable,
+                other.join("kr-probe").display().to_string(),
+                "the question names the file the command's own search path finds"
+            );
+            let launched = probes.launches().last().cloned().expect("the launcher ran");
+            assert_eq!(
+                launched.arguments[2],
+                other.join("kr-probe").display().to_string()
+            );
+        }
+        _ => {
+            assert!(
+                asked.is_empty(),
+                "a command with assignments asked: {asked:?}"
+            );
+            assert_eq!(probes.launches().len(), launches, "the launcher started");
+            assert_eq!(
+                probes.other_runs().last().map(|run| run.arguments.clone()),
+                Some(vec!["from-the-other".to_owned()]),
+                "the file the command's own search path finds ran as typed"
+            );
+        }
+    }
+
+    if kind == ShellKind::Zsh {
+        for command in [
+            "ARGV0=renamed kr-probe with-argv0",
+            "STTY=sane kr-probe with-stty",
+        ] {
+            let launches = probes.launches().len();
+            let asked = session.run_asking(command, "probe-ran");
+            assert!(asked.is_empty(), "{command:?} asked: {asked:?}");
+            assert_eq!(
+                probes.launches().len(),
+                launches,
+                "{command:?} started the launcher"
+            );
+        }
+        assert_eq!(last_run(&probes).arguments, ["with-stty"]);
+    }
+}
+
+/// KR-REQ-07.44: diagnostics the session names a path for never hold a command up, whatever is at
+/// that path.
+pub fn diagnostics_that_cannot_be_written_never_hold_a_command_up(kind: ShellKind) {
+    let Some(package) = Package::found(kind) else {
+        return;
+    };
+    let probes = Probes::new();
+    // A pipe that nothing reads, where an ordinary open for writing would wait for a reader.
+    let fifo = probes.path("trace.fifo");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo starts");
+    assert!(made.success(), "a pipe for the diagnostics");
+    let mut environment = probes.environment();
+    environment.push((
+        "KR_SHELL_BRIDGE_TRACE".to_owned(),
+        fifo.display().to_string(),
+    ));
+    let mut session = Session::start_with(&package, &environment);
+    session.first_prompt();
+    session.forget_events();
+    assert!(session.answered("kr-ready"));
+    let asked = session.run_asking("kr-probe traced", "probe-ran");
+    assert_eq!(asked.len(), 1, "one command asks once: {asked:?}");
+    assert_eq!(last_run(&probes).arguments, ["traced"]);
 }
 
 /// KR-REQ-12.07: an absolute-path invocation asks, is answered with the documented bypass, and
@@ -440,7 +598,47 @@ pub fn an_unanswered_question_runs_the_command_as_typed_after_the_deadline(kind:
         waited >= ANSWER_WAIT,
         "the command started after {waited:?}, before the answer's deadline"
     );
+    // The deadline, and time for a busy machine to schedule the command after it, but no second
+    // wait of the same length.
+    assert!(
+        waited < ANSWER_WAIT * 2 + Duration::from_secs(4),
+        "the command started after {waited:?}, long after the answer's deadline"
+    );
     assert_eq!(last_run(&probes).arguments, ["unanswered"]);
+
+    // A worker that answers what came after the unanswered question has caught up, so the next
+    // command asks again.
+    session.commands.policy = ResolvePolicy::default();
+    let asked = session.run_asking("kr-probe caught-up", "probe-ran");
+    assert_eq!(
+        asked.len(),
+        1,
+        "a worker that has caught up is asked again: {asked:?}"
+    );
+    assert_eq!(last_run(&probes).arguments, ["caught-up"]);
+
+    // A refusal answers the question it names and nothing else: the command runs as it was typed,
+    // and no detach is taken to have been refused.
+    session.commands.policy = ResolvePolicy::Refuse;
+    let before = session.written();
+    let asked = session.run_asking("kr-probe refused", "probe-ran");
+    assert_eq!(asked.len(), 1, "the command asked: {asked:?}");
+    assert_eq!(last_run(&probes).arguments, ["refused"]);
+    assert!(
+        !session
+            .drew_after(before, DETACH_HINT, Duration::from_millis(500))
+            .was_drawn(),
+        "a refused question was taken for a refused detach:\n{}",
+        session.terminal_output()
+    );
+    assert!(
+        !session.saw_event(Duration::from_millis(200), |event| matches!(
+            event,
+            kr_shell_integration::contract::events::BridgeEvent::PreEofConsumed(_)
+        )),
+        "a refused question consumed a gesture"
+    );
+    session.commands.policy = ResolvePolicy::default();
 
     // A worker that answers nothing at all is not asked again while an answer is owed: the
     // commands after it run as they were typed without a question.
@@ -539,6 +737,16 @@ pub fn a_backend_runs_the_command_through_the_launcher_it_names(kind: ShellKind)
         assert_eq!(ran.arguments, ["refused"], "{launcher}");
         assert_eq!(ran.names(), control.names(), "{launcher}");
     }
+
+    // A launcher that is an executable file the system cannot start leaves the command as it was
+    // typed, with the shell's own environment.
+    session.commands.policy = backend(probes.broken_launcher().display().to_string());
+    let asked = session.run_asking("kr-probe unstartable", "probe-ran");
+    assert_eq!(asked.len(), 1, "one command asks once: {asked:?}");
+    let ran = last_run(&probes);
+    assert_eq!(ran.arguments, ["unstartable"]);
+    assert_eq!(ran.names(), control.names());
+    assert!(!ran.environment.contains_key("KR_REGISTRATION"));
 
     // The backend's variables were that one child's: the shell exports none of them.
     session.commands.policy = ResolvePolicy::default();

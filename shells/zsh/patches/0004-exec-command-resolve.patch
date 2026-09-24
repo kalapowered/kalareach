@@ -5,10 +5,12 @@ the question is asked at the one point where the shell knows exactly what it is 
 executor, after the search has found the file and before the fork. It is asked only for an external
 command started in the foreground with no pipe, and the line editor's bridge, which answers it,
 refuses the rest: anything but a command of the line the person typed that the root shell starts
-itself at the top level. Words that still hold a filename pattern are expanded only in the child,
-so such a command is not asked about. The answer either leaves the command exactly as it was, or
-names a launcher that the forked child starts in its place with the backend's variables added. A
-launcher that cannot be started leaves the command as it was typed.
+itself at the top level. What the child does after the fork has to be known before it, so a
+command is not asked about when the child would still change it: a word that is a filename pattern
+is expanded only in the child, and assignments in front of the command take effect only there. The
+answer either leaves the command exactly as it was, or names a launcher that the forked child starts
+in its place with the backend's variables added. A launcher that cannot be started leaves the
+command as it was typed.
 
 The question is a pointer the editor module sets when it loads and clears when it goes, so the
 executor never calls into a module that is not there. Nothing the person sees changes: no key
@@ -18,10 +20,11 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
 
 --- a/Src/exec.c
 +++ b/Src/exec.c
-@@ -30,6 +30,19 @@
+@@ -29,6 +29,19 @@
+ 
  #include "zsh.mdh"
  #include "exec.pro"
- 
++
 +/*
 + * The command integration's question in front of an external command the root shell is about
 + * to fork.  The line editor's bridge sets it when it loads and clears it when it goes; what it
@@ -34,10 +37,9 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
 +/* In a forked child, what the command runs as: the integration's launcher and the variables it
 + * adds, or null for the command as it was typed.  Only the child sets them. */
 +static char **kr_launch_argv, **kr_launch_env;
-+
+ 
  /* Flags for last argument of addvars */
  
- enum {
 @@ -662,6 +675,81 @@
  	}
      }
@@ -129,7 +131,7 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
      for (s = arg0; *s; s++)
  	if (*s == '/') {
  	    int lerrno = zexecve(arg0, argv, newenvp);
-@@ -3572,11 +3662,31 @@
+@@ -3572,11 +3662,33 @@
  	    (((is_builtin || is_shfunc) && output) ||
  	     (!is_cursh && (last1 != 1 || nsigtrapped || havefiles() ||
  			    fdtable_flocks)))) {
@@ -138,12 +140,14 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
 +	    /*
 +	     * An external command started in the foreground with no pipe asks the integration
 +	     * before the fork: its answer runs the command as it was typed, or through the launcher
-+	     * of a backend the worker established for it before anything started.  A word that is
-+	     * still a filename pattern is expanded only in the child, so such a command is not
-+	     * asked about and runs as it was typed.
++	     * of a backend the worker established for it before anything started.  What the child
++	     * does after the fork has to be known here, so a command is not asked about, and runs
++	     * as it was typed, when the child would still change it: a word that is a filename
++	     * pattern is expanded there, and assignments in front of the command take effect there,
++	     * where one of PATH or ARGV0 would change the file or the vector.
 +	     */
 +	    if (!is_cursh && kr_resolve_hook && type == WC_SIMPLE && !input && !output &&
-+		!(how & Z_ASYNC) && !(cflags & BINF_DASH) && args && nonempty(args) &&
++		!(how & Z_ASYNC) && !(cflags & BINF_DASH) && !varspc && args && nonempty(args) &&
 +		!kr_expands_in_child(args, cflags)) {
 +		char **words = kr_plain_words(args);
 +		char *found = findcmd(words[0], 1, use_defpath);

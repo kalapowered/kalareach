@@ -106,18 +106,19 @@ kr_bash_resolve (words, command, launch, environment)
   int argc, launching;
 
   *launch = *environment = (char **) NULL;
-  kr_bridge_resolution_free (&kr_resolution_now);
 
   /*
    * A command of the line the person typed, started by the root shell itself: never one that a
    * function, a sourced file or a startup file, an eval, a trap or a prompt command runs, and
-   * never one in a subshell.
+   * never one in a subshell. A process forked from the root shell asks nothing and releases
+   * nothing: what the bridge holds may be what that child is about to start.
    */
   if (kr_rl_line_running () == 0 || kr_bridge_root_process () == 0)
     return 0;
   if (interactive_shell == 0 || subshell_environment || sourcelevel || variable_context
       || parse_and_execute_level || running_trap)
     return 0;
+  kr_bridge_resolution_free (&kr_resolution_now);
   if (words == 0 || command == 0 || *command == '\0')
     return 0;
   cwd = kr_rl_cwd (&revision);
