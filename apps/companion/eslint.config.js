@@ -10,6 +10,11 @@ export default tseslint.config(
       'src-tauri',
       'playwright-report',
       'test-results',
+      // What the native builds write beside their sources: the platform plugin's copy of Tauri's
+      // own packages, and Gradle's and Swift's outputs with their reports.
+      'native/**/.tauri',
+      'native/**/build',
+      'native/**/.build',
       // The linter's own configuration is not linted.
       'eslint.config.js'
     ]
