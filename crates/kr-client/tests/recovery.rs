@@ -49,6 +49,7 @@ fn at(write_sequence: u64) -> SyncPosition {
     SyncPosition::at(
         write_sequence,
         SyncRevision::new(Uuid::from_bytes([write_sequence as u8; 16])),
+        None,
     )
 }
 
@@ -245,6 +246,8 @@ impl ScriptedService {
             Some(Receipt::Refused(retained)) => {
                 return Ok(SyncExchanged::Refused {
                     retained: *retained,
+                    current: None,
+                    recovery: None,
                 });
             }
             Some(Receipt::Fenced { .. }) => {
@@ -260,7 +263,11 @@ impl ScriptedService {
         if names(entry.position) != names(attempt.expected) {
             let retained = *self.keeps_refused_copies_as.lock().expect("the script");
             receipts.insert(attempt.request_id, Receipt::Refused(retained));
-            return Ok(SyncExchanged::Refused { retained });
+            return Ok(SyncExchanged::Refused {
+                retained,
+                current: entry.position,
+                recovery: None,
+            });
         }
         let position = self
             .exchange_answers
@@ -353,7 +360,7 @@ impl SyncBackupService for ScriptedService {
     ) -> ServiceFuture<'a, SyncRequestStatus> {
         Box::pin(async move {
             *self.statuses_asked.lock().expect("the count") += 1;
-            Ok(SyncRequestStatus::Unknown)
+            Ok(SyncRequestStatus::Unknown { recovery: None })
         })
     }
 
@@ -385,8 +392,14 @@ impl SyncBackupService for ScriptedService {
                 .or_insert(Receipt::Fenced { never_ran });
             Ok(match recorded {
                 Receipt::Applied(position) => SyncRequestFence::Applied { position },
-                Receipt::Refused(retained) => SyncRequestFence::Refused { retained },
-                Receipt::Fenced { never_ran } => SyncRequestFence::Fenced { never_ran },
+                Receipt::Refused(retained) => SyncRequestFence::Refused {
+                    retained,
+                    recovery: None,
+                },
+                Receipt::Fenced { never_ran } => SyncRequestFence::Fenced {
+                    never_ran,
+                    recovery: None,
+                },
             })
         })
     }
@@ -1609,7 +1622,7 @@ async fn a_position_no_write_of_the_bundle_can_be_at_is_declined_rather_than_rea
     // A removal took a place in the order and produced no object, so it is not where a write of
     // the bundle can be. Reading it as one would leave this store comparing its next write against
     // no object while the bundle was there.
-    service.next_fetch_answers(SyncPosition::removed_at(2));
+    service.next_fetch_answers(SyncPosition::removed_at(2, None));
     assert!(matches!(
         store.fetch(&seed).await,
         Err(RecoveryError::BundleNotAWrite { found }) if found.is_removal()
@@ -1694,7 +1707,7 @@ async fn a_locator_that_went_back_or_forked_is_refused_rather_than_written_over(
 
     // And one sequence names one write for the life of a collection, so the same place under
     // another name is two histories: the locator is not the collection this store has been reading.
-    let other_history = SyncPosition::at(2, SyncRevision::new(Uuid::from_bytes([0xaa; 16])));
+    let other_history = SyncPosition::at(2, SyncRevision::new(Uuid::from_bytes([0xaa; 16])), None);
     service.next_fetch_answers(other_history);
     assert!(matches!(
         store.fetch(&seed).await,
@@ -4629,7 +4642,7 @@ impl SyncBackupService for ForgetfulService {
         _collection: &'a str,
         _request_id: Uuid,
     ) -> ServiceFuture<'a, SyncRequestStatus> {
-        Box::pin(async move { Ok(SyncRequestStatus::Unknown) })
+        Box::pin(async move { Ok(SyncRequestStatus::Unknown { recovery: None }) })
     }
 
     fn fence_request<'a>(
@@ -4639,7 +4652,12 @@ impl SyncBackupService for ForgetfulService {
         _first_signed_at_ms: u64,
         _last_signed_at_ms: u64,
     ) -> ServiceFuture<'a, SyncRequestFence> {
-        Box::pin(async move { Ok(SyncRequestFence::Fenced { never_ran: true }) })
+        Box::pin(async move {
+            Ok(SyncRequestFence::Fenced {
+                never_ran: true,
+                recovery: None,
+            })
+        })
     }
 
     fn fetch<'a>(&'a self, _collection: &'a str) -> ServiceFuture<'a, (SyncPosition, Vec<u8>)> {

@@ -365,14 +365,18 @@ impl BundleStore {
                     .await?;
                 LostWrite::Applied
             }
-            SyncRequestFence::Refused { retained } => LostWrite::Ended { retained },
+            SyncRequestFence::Refused { retained, .. } => LostWrite::Ended { retained },
             // The service established that nothing ever ran, so this store's baseline is still
             // where it was and the write left nothing anywhere.
-            SyncRequestFence::Fenced { never_ran: true } => LostWrite::Ended { retained: None },
+            SyncRequestFence::Fenced {
+                never_ran: true, ..
+            } => LostWrite::Ended { retained: None },
             // Nothing will run from now on, and whether this write ran before is not established.
             // If it did, the bundle at the locator is this device's own and the baseline is behind
             // it, so the read that recognises it is what makes the next write safe.
-            SyncRequestFence::Fenced { never_ran: false } => match self.fetch(seed).await {
+            SyncRequestFence::Fenced {
+                never_ran: false, ..
+            } => match self.fetch(seed).await {
                 Ok(_) => match self.lost_write() {
                     Some(LostWrite::Applied) => return Ok(Some(LostWrite::Applied)),
                     _ => LostWrite::Ended { retained: None },
@@ -635,7 +639,7 @@ impl BundleStore {
                 *bundle = candidate;
                 Ok(position)
             }
-            Ok(SyncExchanged::Refused { retained }) => {
+            Ok(SyncExchanged::Refused { retained, .. }) => {
                 // A refusal is an answer: the service compared, the comparison did not hold, and
                 // the bundle this device sent was not written. Nothing is outstanding.
                 self.answered();
@@ -1016,12 +1020,16 @@ impl BundleStore {
             // The service can no longer say whether the write ran, and nothing will run under it
             // from now on. The bytes it sent are what is left to recognise it by, and they are its
             // own: no other write, even of an equal bundle at the same instant, sent those bytes.
-            SyncRequestFence::Fenced { never_ran: false } => None,
-            SyncRequestFence::Refused { retained } => {
+            SyncRequestFence::Fenced {
+                never_ran: false, ..
+            } => None,
+            SyncRequestFence::Refused { retained, .. } => {
                 self.settle(LostWrite::Ended { retained });
                 return Err(self.left_nothing(seed).await);
             }
-            SyncRequestFence::Fenced { never_ran: true } => {
+            SyncRequestFence::Fenced {
+                never_ran: true, ..
+            } => {
                 self.settle(LostWrite::Ended { retained: None });
                 return Err(self.left_nothing(seed).await);
             }

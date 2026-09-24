@@ -83,6 +83,7 @@ fn keys_page(records: &[CollectionKeyRecord], more: bool, newest: KeyHead) -> se
         "more": more,
         "key_revision": newest.revision.to_string(),
         "key_epoch": newest.epoch.to_string(),
+        "recovery_id": newest.recovery.map(|recovery| recovery.to_string()),
     })
 }
 
@@ -164,6 +165,7 @@ fn compared_shared(
         "more_conflicts": more,
         "key_epoch": head.epoch.to_string(),
         "key_revision": head.revision.to_string(),
+        "recovery_id": head.recovery.map(|recovery| recovery.to_string()),
         "stored": usage(),
     })
 }
@@ -195,6 +197,7 @@ async fn a_read_of_key_records_names_the_home_and_follows_every_page_to_the_newe
     let head = KeyHead {
         epoch: 0,
         revision: 3,
+        recovery: None,
     };
     recorder.answering(vec![
         keys_page(&chain[..2], true, head),
@@ -248,6 +251,7 @@ async fn a_collection_that_does_not_list_this_device_answers_key_reads_as_absent
         "more": false,
         "key_revision": "0",
         "key_epoch": null,
+        "recovery_id": null,
     })]);
     assert_eq!(
         client
@@ -269,6 +273,7 @@ async fn a_collection_that_does_not_list_this_device_answers_key_reads_as_absent
         KeyHead {
             epoch: 1,
             revision: 4,
+            recovery: None,
         },
     )]);
     assert_eq!(
@@ -299,6 +304,7 @@ async fn a_read_of_key_records_ends_when_a_page_does_not_move_on_or_the_bound_is
     let head = KeyHead {
         epoch: 0,
         revision: 9,
+        recovery: None,
     };
 
     // A page that claims more and does not move the cursor on ends the read with what was
@@ -354,6 +360,7 @@ async fn the_offer_of_a_key_record_carries_its_identity_home_and_record_and_its_
         "state": "applied",
         "key_revision": "2",
         "key_epoch": "1",
+        "recovery_id": null,
     })]);
     assert_eq!(
         client
@@ -384,6 +391,7 @@ async fn the_offer_of_a_key_record_carries_its_identity_home_and_record_and_its_
         "state": "refused",
         "key_revision": "5",
         "key_epoch": "3",
+        "recovery_id": null,
     })]);
     assert_eq!(
         client
@@ -398,6 +406,7 @@ async fn the_offer_of_a_key_record_carries_its_identity_home_and_record_and_its_
         "state": "applied",
         "key_revision": "3",
         "key_epoch": "1",
+        "recovery_id": null,
     })]);
     let contrary = client
         .rekey(&collection, request, signed_at, &offered)
@@ -418,6 +427,283 @@ async fn the_offer_of_a_key_record_carries_its_identity_home_and_record_and_its_
             .expect_err("a refusal");
         assert_eq!(code_of(&refused), expected, "{code}");
     }
+}
+
+#[tokio::test]
+async fn every_shared_answer_names_the_history_of_its_revisions() {
+    let (client, recorder) = sync_client();
+    let collection = shared_collection(installation(0x41), 0x42);
+    let restored = super::put_back_by(0xb0);
+    let head = KeyHead {
+        epoch: 4,
+        revision: 6,
+        recovery: Some(restored),
+    };
+
+    // A write, and the head its answer names, are both places in the restored history.
+    let mut written = exchanged(
+        "written",
+        summary(identity(7), revision(9), "4"),
+        Some(revision(9)),
+        "4",
+        serde_json::Value::Null,
+    );
+    written["key_epoch"] = "4".into();
+    written["key_revision"] = "6".into();
+    recorder.answering(vec![super::under(written, restored)]);
+    let sealed = published(&sealed(b"theme=dark"));
+    assert_eq!(
+        client
+            .exchange_shared(
+                &collection,
+                &settings_of(identity(7)),
+                4,
+                identity(8),
+                now_ms(),
+                None,
+                &sealed,
+            )
+            .await
+            .expect("an answer"),
+        Keyed::Answered {
+            answer: SyncExchanged::Applied {
+                position: SyncPosition::at(4, revision(9), Some(restored)),
+            },
+            head: Some(head),
+        }
+    );
+
+    // A retired epoch names the head's history beside it.
+    recorder.answering_with(vec![retired(head)]);
+    assert_eq!(
+        client
+            .exchange_shared(
+                &collection,
+                &settings_of(identity(7)),
+                3,
+                identity(9),
+                now_ms(),
+                None,
+                &sealed,
+            )
+            .await
+            .expect("an answer"),
+        Keyed::Retired { head }
+    );
+
+    // Each entry of a membership listing names the history its revision is in, as the index last
+    // heard it, and entries of one listing may name different ones.
+    recorder.answering(vec![serde_json::json!({
+        "memberships": [
+            {
+                "home": installation(0x41).to_string(),
+                "collection_id": identity(0x42).to_string(),
+                "key_revision": "3",
+                "key_epoch": "1",
+                "recovery_id": restored.to_string(),
+            },
+            {
+                "home": installation(0x41).to_string(),
+                "collection_id": identity(0x43).to_string(),
+                "key_revision": "5",
+                "key_epoch": "2",
+                "recovery_id": null,
+            },
+        ],
+        "more": false,
+        "next_after": null,
+    })]);
+    let listed = client.memberships().await.expect("the listing");
+    assert_eq!(listed[0].head.recovery, Some(restored));
+    assert_eq!(listed[1].head.recovery, None);
+}
+
+#[tokio::test]
+async fn a_read_that_meets_a_restore_between_its_pages_is_not_one_this_client_follows() {
+    // Places compare only under one history, so pages of one read that name two histories would
+    // join a chain, a listing of objects or a run of copies from both. Such a read is declined, and
+    // asking again reads one history whole.
+    let (client, recorder) = sync_client();
+    let collection = shared_collection(installation(0x41), 0x42);
+    let restored = super::put_back_by(0xb0);
+    let first = record(&collection, 1, 0);
+    let before = KeyHead {
+        epoch: 0,
+        revision: 3,
+        recovery: None,
+    };
+    let after = KeyHead {
+        recovery: Some(restored),
+        ..before
+    };
+    recorder.answering(vec![
+        keys_page(std::slice::from_ref(&first), true, before),
+        keys_page(&[at_revision(&first, 2)], false, after),
+    ]);
+    assert_eq!(
+        code_of(
+            &client
+                .records_after(&collection, 0)
+                .await
+                .expect_err("a chain from two histories")
+        ),
+        ErrorCode::OutcomeUnknown
+    );
+
+    // A comparison's pages, which follow until nothing listed is missing.
+    let object = identity(0x61);
+    let page = |head: KeyHead| {
+        let mut page = compared_shared(&[(object, revision(0x62), 1, 0)], &[], false, 0, head);
+        page["changed"] = serde_json::json!([]);
+        page
+    };
+    let mut brought = page(after);
+    brought["changed"] = serde_json::json!([{
+        "kind": "settings",
+        "object_id": object.to_string(),
+        "revision": revision(0x62).to_string(),
+        "write_sequence": "1",
+        "key_epoch": "0",
+        "object": sealed(b"theme=dark"),
+        "updated_at": "2026-09-24T10:00:00.000Z",
+    }]);
+    recorder.answering(vec![page(before), brought]);
+    assert_eq!(
+        code_of(
+            &client
+                .compare_shared(&collection, &[], false, None)
+                .await
+                .expect_err("a comparison from two histories")
+        ),
+        ErrorCode::OutcomeUnknown
+    );
+
+    // An inventory continued from a read in one history takes no page from another.
+    recorder.answering(vec![compared_shared(
+        &[(object, revision(0x62), 1, 0)],
+        &[(1, identity(0x71), object, 0)],
+        true,
+        1,
+        before,
+    )]);
+    let started = client
+        .inventory(&collection, None, budget(1))
+        .await
+        .expect("an answer")
+        .expect("a member");
+    assert!(!started.is_complete());
+    assert_eq!(started.recovery, None);
+    recorder.answering(vec![compared_shared(
+        &[(object, revision(0x62), 1, 0)],
+        &[(2, identity(0x72), object, 0)],
+        false,
+        2,
+        after,
+    )]);
+    assert_eq!(
+        code_of(
+            &client
+                .inventory(&collection, Some(started), budget(1))
+                .await
+                .expect_err("copies from two histories")
+        ),
+        ErrorCode::OutcomeUnknown
+    );
+}
+
+#[tokio::test]
+async fn a_shared_answer_that_leaves_out_its_recovery_is_not_one_this_client_reads() {
+    // A key record's revision is a place in the collection's history as much as an object's write
+    // is, so every answer naming one names the history too: a read of the records, the answer to
+    // an offer, each entry of a membership listing, and a write refused for a retired epoch. One
+    // without it is declined as any answer missing a required member is.
+    let (client, recorder) = sync_client();
+    let collection = shared_collection(installation(0x41), 0x42);
+    let first = record(&collection, 1, 0);
+    let head = KeyHead {
+        epoch: 0,
+        revision: 1,
+        recovery: None,
+    };
+
+    recorder.answering(vec![super::without_recovery(keys_page(
+        std::slice::from_ref(&first),
+        false,
+        head,
+    ))]);
+    assert_eq!(
+        code_of(
+            &client
+                .records_after(&collection, 0)
+                .await
+                .expect_err("a read of the records")
+        ),
+        ErrorCode::OutcomeUnknown
+    );
+    assert_eq!(
+        code_of(
+            &client
+                .record_at(&collection, 1)
+                .await
+                .expect_err("a read of one record")
+        ),
+        ErrorCode::OutcomeUnknown
+    );
+
+    let offered = record(&collection, 2, 1);
+    for answer in [
+        serde_json::json!({ "state": "applied", "key_revision": "2", "key_epoch": "1" }),
+        serde_json::json!({ "state": "refused", "key_revision": "5", "key_epoch": "3" }),
+    ] {
+        recorder.answering(vec![answer]);
+        assert_eq!(
+            code_of(
+                &client
+                    .rekey(&collection, identity(0x51), now_ms(), &offered)
+                    .await
+                    .expect_err("an answer to an offer")
+            ),
+            ErrorCode::OutcomeUnknown
+        );
+    }
+
+    recorder.answering(vec![serde_json::json!({
+        "memberships": [{
+            "home": installation(0x41).to_string(),
+            "collection_id": identity(0x42).to_string(),
+            "key_revision": "3",
+            "key_epoch": "1",
+        }],
+        "more": false,
+        "next_after": null,
+    })]);
+    assert_eq!(
+        code_of(&client.memberships().await.expect_err("an entry")),
+        ErrorCode::OutcomeUnknown
+    );
+
+    recorder.answering_with(vec![refusal_with(
+        409,
+        "KEY_EPOCH_RETIRED",
+        serde_json::json!({ "key_epoch": "5", "key_revision": "7" }),
+    )]);
+    assert_eq!(
+        code_of(
+            &client
+                .exchange_shared(
+                    &collection,
+                    &settings_of(identity(7)),
+                    4,
+                    identity(8),
+                    now_ms(),
+                    None,
+                    &published(&sealed(b"theme=dark")),
+                )
+                .await
+                .expect_err("a retired epoch names the head's history")
+        ),
+        ErrorCode::OutcomeUnknown
+    );
 }
 
 /// A key record travels as the JSON the published vectors give it, which is the form the service
@@ -442,12 +728,14 @@ async fn a_key_record_travels_in_the_json_form_the_vectors_publish() {
         let head = KeyHead {
             epoch: offered.payload.key_epoch.get(),
             revision: offered.payload.revision.get(),
+            recovery: None,
         };
         let (client, recorder) = sync_client();
         recorder.answering(vec![serde_json::json!({
             "state": "applied",
             "key_revision": head.revision.to_string(),
             "key_epoch": head.epoch.to_string(),
+            "recovery_id": null,
         })]);
         assert_eq!(
             client
@@ -506,6 +794,7 @@ async fn the_status_and_fence_of_a_key_record_offer_read_what_its_receipt_record
     let head = Some(KeyHead {
         epoch: 1,
         revision: 2,
+        recovery: None,
     });
 
     recorder.answering(vec![
@@ -629,6 +918,7 @@ async fn a_membership_listing_follows_every_page_to_the_end() {
             "collection_id": identity(collection).to_string(),
             "key_revision": revision.to_string(),
             "key_epoch": epoch.to_string(),
+            "recovery_id": null,
         })
     };
     let cursor = |home: u8, collection: u8| format!("{}/{}", identity(home), identity(collection));
@@ -653,21 +943,24 @@ async fn a_membership_listing_follows_every_page_to_the_end() {
                 collection: shared_collection(installation(0x41), 0x42),
                 head: KeyHead {
                     epoch: 1,
-                    revision: 3
+                    revision: 3,
+                    recovery: None
                 },
             },
             MembershipListing {
                 collection: shared_collection(installation(0x41), 0x43),
                 head: KeyHead {
                     epoch: 0,
-                    revision: 1
+                    revision: 1,
+                    recovery: None
                 },
             },
             MembershipListing {
                 collection: shared_collection(installation(0x45), 0x46),
                 head: KeyHead {
                     epoch: 2,
-                    revision: 7
+                    revision: 7,
+                    recovery: None
                 },
             },
         ]
@@ -704,6 +997,7 @@ async fn an_inventory_reads_every_object_and_every_copy_with_its_epoch_to_the_en
     let head = KeyHead {
         epoch: 2,
         revision: 3,
+        recovery: None,
     };
     let (first, second) = (identity(0x61), identity(0x62));
     recorder.answering(vec![
@@ -744,12 +1038,12 @@ async fn an_inventory_reads_every_object_and_every_copy_with_its_epoch_to_the_en
         vec![
             InventoryObject {
                 object_id: SyncObjectId::new(first),
-                position: SyncPosition::at(5, revision(0x73)),
+                position: SyncPosition::at(5, revision(0x73), None),
                 epoch: Some(2),
             },
             InventoryObject {
                 object_id: SyncObjectId::new(second),
-                position: SyncPosition::at(2, revision(0x72)),
+                position: SyncPosition::at(2, revision(0x72), None),
                 epoch: Some(2),
             },
         ],
@@ -869,11 +1163,12 @@ async fn a_shared_write_names_its_home_and_epoch_and_reads_both_answering_refusa
         write(4).await.expect("an answer"),
         Keyed::Answered {
             answer: SyncExchanged::Applied {
-                position: SyncPosition::at(4, revision(9)),
+                position: SyncPosition::at(4, revision(9), None),
             },
             head: Some(KeyHead {
                 epoch: 4,
-                revision: 6
+                revision: 6,
+                recovery: None
             }),
         }
     );
@@ -897,14 +1192,15 @@ async fn a_shared_write_names_its_home_and_epoch_and_reads_both_answering_refusa
     recorder.answering_with(vec![refusal_with(
         409,
         "KEY_EPOCH_RETIRED",
-        serde_json::json!({ "key_epoch": "5", "key_revision": "7" }),
+        serde_json::json!({ "key_epoch": "5", "key_revision": "7", "recovery_id": null }),
     )]);
     assert_eq!(
         write(4).await.expect("an answer"),
         Keyed::Retired {
             head: KeyHead {
                 epoch: 5,
-                revision: 7
+                revision: 7,
+                recovery: None
             }
         }
     );
@@ -961,6 +1257,7 @@ async fn a_shared_comparison_and_resolution_name_the_home_and_read_each_epoch() 
     let head = KeyHead {
         epoch: 2,
         revision: 3,
+        recovery: None,
     };
     let mut page = compared_shared(
         &[(object, revision(0x71), 4, 2)],
@@ -1040,7 +1337,7 @@ async fn a_collection_only_its_home_writes_reads_neither_shared_refusal_as_an_an
             refusal_with(
                 409,
                 "KEY_EPOCH_RETIRED",
-                serde_json::json!({ "key_epoch": "1", "key_revision": "2" }),
+                serde_json::json!({ "key_epoch": "1", "key_revision": "2", "recovery_id": null }),
             ),
             ErrorCode::ResyncRequired,
             UserAction::Resync,
@@ -1075,6 +1372,7 @@ async fn a_collection_only_its_home_writes_reads_neither_shared_refusal_as_an_an
         Some(KeyHead {
             epoch: 1,
             revision: 2,
+            recovery: None,
         }),
         false,
     )]);
@@ -1100,6 +1398,7 @@ fn object_page(
     let head = KeyHead {
         epoch: 1,
         revision: 2,
+        recovery: None,
     };
     let object = |index: u64| {
         Uuid::from_bytes([
@@ -1295,6 +1594,7 @@ fn fold_page(
         KeyHead {
             epoch: 1,
             revision: 2,
+            recovery: None,
         },
     );
     page["changed"] = changed
@@ -1374,7 +1674,7 @@ async fn a_shared_comparison_folds_removals_and_later_words_across_pages() {
         vec![
             SyncRemoved {
                 object_id: SyncObjectId::new(a),
-                position: Some(SyncPosition::removed_at(5)),
+                position: Some(SyncPosition::removed_at(5, None)),
             },
             SyncRemoved {
                 object_id: SyncObjectId::new(c),
@@ -1406,7 +1706,7 @@ async fn a_shared_comparison_folds_removals_and_later_words_across_pages() {
         compared.removed,
         vec![SyncRemoved {
             object_id: SyncObjectId::new(a),
-            position: Some(SyncPosition::removed_at(7)),
+            position: Some(SyncPosition::removed_at(7, None)),
         }]
     );
 
@@ -1452,6 +1752,7 @@ async fn an_inventory_reads_under_a_budget_and_resumes_past_two_thousand_copies(
     let head = KeyHead {
         epoch: 2,
         revision: 3,
+        recovery: None,
     };
     let live = identity(0x61);
     let pages: u64 = 34;
@@ -1605,6 +1906,7 @@ impl SharedState {
         KeyHead {
             epoch: *epoch,
             revision: u64::try_from(self.records.len()).expect("a revision"),
+            recovery: None,
         }
     }
 
@@ -1639,6 +1941,7 @@ impl SharedState {
             "current_revision": receipt.current_revision,
             "current_write_sequence": receipt.current_write_sequence,
             "conflict_id": null,
+            "recovery_id": null,
             "recorded_at": "2026-09-24T10:00:00.000Z",
         });
         if let Some(head) = receipt.head {
@@ -1851,6 +2154,7 @@ impl Contract {
                 "conflict": null,
                 "key_epoch": head.epoch.to_string(),
                 "key_revision": head.revision.to_string(),
+                "recovery_id": null,
                 "stored": usage(),
             });
             state.receipts.insert(
@@ -1890,6 +2194,7 @@ impl Contract {
             "conflict": null,
             "key_epoch": head.epoch.to_string(),
             "key_revision": head.revision.to_string(),
+            "recovery_id": null,
             "stored": usage(),
         });
         state.receipts.insert(
@@ -1949,6 +2254,7 @@ fn retired(head: KeyHead) -> ServiceHttpAnswer {
         serde_json::json!({
             "key_epoch": head.epoch.to_string(),
             "key_revision": head.revision.to_string(),
+            "recovery_id": head.recovery.map(|recovery| recovery.to_string()),
         }),
     )
 }
@@ -2033,7 +2339,8 @@ async fn a_retry_of_an_applied_write_gets_its_receipt_not_a_retired_refusal() {
         head,
         KeyHead {
             epoch: 0,
-            revision: 1
+            revision: 1,
+            recovery: None
         }
     );
 
@@ -2066,7 +2373,8 @@ async fn a_retry_of_an_applied_write_gets_its_receipt_not_a_retired_refusal() {
         Keyed::Retired {
             head: KeyHead {
                 epoch: 1,
-                revision: 2
+                revision: 2,
+                recovery: None
             }
         }
     );
@@ -2108,6 +2416,7 @@ async fn exchange_status_and_fence_agree_on_a_retired_request() {
     let retired_at = KeyHead {
         epoch: 1,
         revision: 2,
+        recovery: None,
     };
     let ciphertext = published(&sealed(b"theme=dark"));
 
@@ -2179,7 +2488,10 @@ async fn exchange_status_and_fence_agree_on_a_retired_request() {
             .await
             .expect("an answer"),
         Keyed::Answered {
-            answer: SyncRequestFence::Fenced { never_ran: true },
+            answer: SyncRequestFence::Fenced {
+                never_ran: true,
+                recovery: None,
+            },
             head: None,
         }
     );
@@ -2193,12 +2505,15 @@ async fn exchange_status_and_fence_agree_on_a_retired_request() {
             .await
             .expect("an answer"),
         Keyed::Answered {
-            answer: SyncRequestStatus::Unknown,
+            answer: SyncRequestStatus::Unknown { recovery: None },
             head: None,
         }
     );
     let fenced = Keyed::Answered {
-        answer: SyncRequestFence::Fenced { never_ran: false },
+        answer: SyncRequestFence::Fenced {
+            never_ran: false,
+            recovery: None,
+        },
         head: None,
     };
     assert_eq!(
@@ -2214,7 +2529,10 @@ async fn exchange_status_and_fence_agree_on_a_retired_request() {
             .await
             .expect("an answer"),
         Keyed::Answered {
-            answer: SyncRequestStatus::Fenced { never_ran: false },
+            answer: SyncRequestStatus::Fenced {
+                never_ran: false,
+                recovery: None,
+            },
             head: None,
         },
         "the status query repeats what the fence recorded"

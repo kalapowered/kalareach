@@ -1613,7 +1613,7 @@ impl DraftSync {
                     },
                 })
             }
-            Ok(SyncExchanged::Refused { retained }) => {
+            Ok(SyncExchanged::Refused { retained, .. }) => {
                 // The refusal is settled first and on its own, along with the account of whatever
                 // the service kept of this write, so a fetch this device cannot make costs the copy
                 // rather than the knowledge that the write did not land.
@@ -1961,6 +1961,7 @@ mod tests {
         SyncPosition::at(
             write_sequence,
             crate::services::SyncRevision::new(Uuid::from_bytes([write_sequence as u8; 16])),
+            None,
         )
     }
 
@@ -2857,6 +2858,7 @@ mod tests {
         let elsewhere = SyncPosition::at(
             2,
             crate::services::SyncRevision::new(Uuid::from_bytes([0xee; 16])),
+            None,
         );
         assert_eq!(
             store

@@ -101,7 +101,7 @@ use serde::{Deserialize, Serialize};
 use super::relay::{ServiceHttp, ServiceSigner};
 use super::signed::{Answer, Refusal, SignedService, malformed, unreadable_answer};
 use super::{
-    KeyHead, Keyed, ServiceFuture, SyncBackupService, SyncExchanged, SyncPosition,
+    KeyHead, Keyed, ServiceFuture, SyncBackupService, SyncExchanged, SyncPosition, SyncRecoveryId,
     SyncRequestFence, SyncRequestStatus, SyncRevision,
 };
 use crate::error::{ClientError, Result};
@@ -449,6 +449,8 @@ struct ExchangeAnswer {
     /// The revision of the collection's newest key record, beside the epoch.
     #[serde(default)]
     key_revision: Option<U64>,
+    /// The history every place in this answer is in, as the collection stands when it answers.
+    recovery_id: Nullable<SyncRecoveryId>,
     #[expect(dead_code, reason = "held to its schema and never read")]
     stored: SyncUsage,
 }
@@ -519,6 +521,9 @@ struct StatusAnswer {
     /// The key record revision the recorded answer named, beside the epoch.
     #[serde(default)]
     key_revision: Option<U64>,
+    /// The history the collection answers from now, which is the one every place the receipt
+    /// recorded is read in: a restored collection's history begins with what the archive held.
+    recovery_id: Nullable<SyncRecoveryId>,
     #[expect(dead_code, reason = "held to its schema and never read")]
     recorded_at: Nullable<String>,
 }
@@ -585,6 +590,8 @@ struct CompareAnswer {
     key_epoch: Option<U64>,
     #[serde(default)]
     key_revision: Option<U64>,
+    /// The history every place in this answer is in.
+    recovery_id: Nullable<SyncRecoveryId>,
     stored: SyncUsage,
 }
 
@@ -597,6 +604,8 @@ struct KeysAnswer {
     key_revision: U64,
     #[expect(dead_code, reason = "held to its schema and never read")]
     key_epoch: Nullable<U64>,
+    /// The history every revision in this answer is in.
+    recovery_id: Nullable<SyncRecoveryId>,
 }
 
 /// What a `rekey` did.
@@ -614,6 +623,9 @@ struct RekeyResult {
     key_revision: U64,
     #[expect(dead_code, reason = "held to its schema and never read")]
     key_epoch: Nullable<U64>,
+    /// The history that revision is in, as the collection stands when it answers.
+    #[expect(dead_code, reason = "held to its schema and never read")]
+    recovery_id: Nullable<SyncRecoveryId>,
 }
 
 /// One shared collection a membership listing names.
@@ -623,6 +635,8 @@ struct MembershipEntry {
     collection_id: SyncCollectionId,
     key_revision: U64,
     key_epoch: U64,
+    /// The history the collection stated with that revision.
+    recovery_id: Nullable<SyncRecoveryId>,
 }
 
 /// What `sync.compare_exchange` answers for a membership listing.
@@ -725,6 +739,9 @@ pub struct SyncComparison {
     pub next_copies_after: u64,
     /// Where the collection's key records stood, in a collection a key record has claimed.
     pub head: Option<KeyHead>,
+    /// The history every place in this comparison is in: the recovery the service named, or none
+    /// for a service never put back. It is stated even when the comparison names no place at all.
+    pub recovery: Option<SyncRecoveryId>,
     /// How the collection stands.
     pub stored: SyncUsage,
 }
@@ -767,6 +784,10 @@ pub struct InventoryCopy {
 pub struct Inventory {
     /// Where the collection's key records stood when the last page was read.
     pub head: Option<KeyHead>,
+    /// The history every page was read in: the recovery the first page named. A read continued
+    /// from here takes pages from that history only, because a collection put back between two
+    /// pages holds copies the earlier pages never saw and has lost some they did.
+    pub recovery: Option<SyncRecoveryId>,
     /// Every object.
     pub objects: Vec<InventoryObject>,
     /// Every copy the read reached.
@@ -1034,6 +1055,8 @@ impl ManagedSyncService {
         let mut fold = ObjectFold::holding(known);
         // The copies are the first page's: it is the one request that asks for them.
         let mut first: Option<SyncComparison> = None;
+        // The history the first page was read in, which every later page is held to.
+        let mut history: Option<Option<SyncRecoveryId>> = None;
         for page in 0..MAX_COMPARISON_PAGES {
             let request = if page == 0 {
                 self.compare_body(
@@ -1051,6 +1074,7 @@ impl ManagedSyncService {
                 Reply::Absent => return Ok(None),
                 Reply::Retired(_) => return Err(retired_where_no_write_was()),
             };
+            one_history(&mut history, answer.recovery_id.0)?;
             let listed = answer
                 .revisions
                 .iter()
@@ -1069,6 +1093,7 @@ impl ManagedSyncService {
                     more_copies: first.more_copies,
                     next_copies_after: first.next_copies_after,
                     head,
+                    recovery: first.recovery,
                     stored,
                 }));
             }
@@ -1123,7 +1148,7 @@ impl ManagedSyncService {
         match reply(self.ask(&request, Some(signed_at_ms)).await?, true)? {
             Reply::Data(data) => {
                 let answer: ExchangeAnswer = read(data, "what an exchange answered")?;
-                let head = head_of(answer.key_epoch, answer.key_revision)?;
+                let head = head_of(answer.key_epoch, answer.key_revision, answer.recovery_id.0)?;
                 Ok(Keyed::Answered {
                     answer: exchanged(answer, named.object_id)?,
                     head,
@@ -1156,6 +1181,7 @@ impl ManagedSyncService {
         match reply(self.ask(&request, None).await?, false)? {
             Reply::Data(data) => {
                 let answer = status_answer(data, request_id, "what a status query answered")?;
+                let recovery = answer.recovery_id.0;
                 let (outcome, head) = write_outcome(&answer)?;
                 Ok(match outcome {
                     WriteOutcome::Applied(position) => Keyed::Answered {
@@ -1163,15 +1189,18 @@ impl ManagedSyncService {
                         head,
                     },
                     WriteOutcome::Refused(retained) => Keyed::Answered {
-                        answer: SyncRequestStatus::Refused { retained },
+                        answer: SyncRequestStatus::Refused { retained, recovery },
                         head,
                     },
                     WriteOutcome::Fenced { never_ran } => Keyed::Answered {
-                        answer: SyncRequestStatus::Fenced { never_ran },
+                        answer: SyncRequestStatus::Fenced {
+                            never_ran,
+                            recovery,
+                        },
                         head,
                     },
                     WriteOutcome::Unknown => Keyed::Answered {
-                        answer: SyncRequestStatus::Unknown,
+                        answer: SyncRequestStatus::Unknown { recovery },
                         head,
                     },
                     WriteOutcome::Retired(head) => Keyed::Retired { head },
@@ -1206,6 +1235,7 @@ impl ManagedSyncService {
         match reply(self.ask(&request, None).await?, false)? {
             Reply::Data(data) => {
                 let answer = status_answer(data, request_id, "what a fence answered")?;
+                let recovery = answer.recovery_id.0;
                 let (outcome, head) = write_outcome(&answer)?;
                 Ok(match outcome {
                     WriteOutcome::Applied(position) => Keyed::Answered {
@@ -1213,11 +1243,14 @@ impl ManagedSyncService {
                         head,
                     },
                     WriteOutcome::Refused(retained) => Keyed::Answered {
-                        answer: SyncRequestFence::Refused { retained },
+                        answer: SyncRequestFence::Refused { retained, recovery },
                         head,
                     },
                     WriteOutcome::Fenced { never_ran } => Keyed::Answered {
-                        answer: SyncRequestFence::Fenced { never_ran },
+                        answer: SyncRequestFence::Fenced {
+                            never_ran,
+                            recovery,
+                        },
                         head,
                     },
                     WriteOutcome::Unknown => return Err(fence_answered_unknown()),
@@ -1269,6 +1302,8 @@ impl ManagedSyncService {
         resume: Option<Inventory>,
         pages: NonZeroUsize,
     ) -> Result<Option<Inventory>> {
+        // The history the pages already read were in, which every page read from here is held to.
+        let mut history = resume.as_ref().map(|inventory| inventory.recovery);
         let (mut inventory, mut after) = match resume {
             // A read that already reached the end has nothing to continue.
             Some(inventory) if inventory.is_complete() => return Ok(Some(inventory)),
@@ -1296,7 +1331,10 @@ impl ManagedSyncService {
                 Reply::Absent => return Ok(None),
                 Reply::Retired(_) => return Err(retired_where_no_write_was()),
             };
-            let head = head_of(answer.key_epoch, answer.key_revision)?;
+            let recovery = answer.recovery_id.0;
+            one_history(&mut history, recovery)?;
+            let head = head_of(answer.key_epoch, answer.key_revision, recovery)?;
+            inventory.recovery = recovery;
             inventory.objects = answer
                 .revisions
                 .iter()
@@ -1306,6 +1344,7 @@ impl ManagedSyncService {
                         position: SyncPosition::at(
                             position.write_sequence.get(),
                             position.revision,
+                            recovery,
                         ),
                         epoch: epoch_in(head, position.key_epoch)?,
                     })
@@ -1379,6 +1418,7 @@ impl ManagedSyncService {
                     head: KeyHead {
                         epoch: entry.key_epoch.get(),
                         revision: entry.key_revision.get(),
+                        recovery: entry.recovery_id.0,
                     },
                 });
             }
@@ -1499,17 +1539,20 @@ impl ManagedSyncService {
         });
         let data = self.ask(&request, None).await?.data()?;
         let answer = status_answer(data, request_id, "what a status query answered")?;
+        let recovery = answer.recovery_id.0;
         Ok(match answer.state {
             StatusState::Applied => SyncRequestStatus::Applied {
                 position: recorded_position(&answer)?,
             },
             StatusState::Refused => SyncRequestStatus::Refused {
                 retained: answer.conflict_id.0,
+                recovery,
             },
             StatusState::Fenced => SyncRequestStatus::Fenced {
                 never_ran: answer.never_ran,
+                recovery,
             },
-            StatusState::Unknown => SyncRequestStatus::Unknown,
+            StatusState::Unknown => SyncRequestStatus::Unknown { recovery },
             // A write that named no epoch cannot have named a retired one.
             StatusState::Retired => return Err(retired_where_no_epoch_was()),
         })
@@ -1533,15 +1576,18 @@ impl ManagedSyncService {
         )?;
         let data = self.ask(&request, None).await?.data()?;
         let answer = status_answer(data, request_id, "what a fence answered")?;
+        let recovery = answer.recovery_id.0;
         Ok(match answer.state {
             StatusState::Applied => SyncRequestFence::Applied {
                 position: recorded_position(&answer)?,
             },
             StatusState::Refused => SyncRequestFence::Refused {
                 retained: answer.conflict_id.0,
+                recovery,
             },
             StatusState::Fenced => SyncRequestFence::Fenced {
                 never_ran: answer.never_ran,
+                recovery,
             },
             // A fence either finds an outcome or makes one, so the service never answers one with
             // "unknown". Inventing an answer for it here would be this client deciding whether a
@@ -1628,10 +1674,14 @@ impl ManagedSyncService {
     ) -> Result<KeyRecords> {
         let mut records: Vec<CollectionKeyRecord> = Vec::new();
         let mut cursor = after;
+        // The history the first page was read in, which every later page is held to: a chain read
+        // across a restore would join records of two histories.
+        let mut history: Option<Option<SyncRecoveryId>> = None;
         loop {
             let Some(page) = self.keys_page(collection, cursor).await? else {
                 return Ok(KeyRecords::Absent);
             };
+            one_history(&mut history, page.recovery_id.0)?;
             let last = page
                 .records
                 .last()
@@ -1945,11 +1995,13 @@ fn retired_head(refusal: &Refusal) -> Result<KeyHead> {
     struct Named {
         key_epoch: U64,
         key_revision: U64,
+        recovery_id: Nullable<SyncRecoveryId>,
     }
     let named: Named = refusal.members("what a retired epoch named")?;
     Ok(KeyHead {
         epoch: named.key_epoch.get(),
         revision: named.key_revision.get(),
+        recovery: named.recovery_id.0,
     })
 }
 
@@ -1960,6 +2012,7 @@ fn read<T: for<'de> Deserialize<'de>>(data: serde_json::Value, what: &str) -> Re
 
 /// What one exchange did, as the service stated it.
 fn exchanged(answer: ExchangeAnswer, object_id: SyncObjectId) -> Result<SyncExchanged> {
+    let recovery = answer.recovery_id;
     Ok(match answer.state {
         // Where the service put the write, as it stated it. A removal's place, and a place of
         // nought, come back as the service said them rather than as something a caller would
@@ -1968,6 +2021,7 @@ fn exchanged(answer: ExchangeAnswer, object_id: SyncObjectId) -> Result<SyncExch
             position: SyncPosition {
                 write_sequence: answer.current_write_sequence.get(),
                 revision: answer.current_revision,
+                recovery,
             },
         },
         ExchangeState::Conflict => SyncExchanged::Refused {
@@ -1980,6 +2034,21 @@ fn exchanged(answer: ExchangeAnswer, object_id: SyncObjectId) -> Result<SyncExch
                 Some(copy) => Some(copy.conflict_id),
                 None => None,
             },
+            // Where the object stood: the write that won, a removal's place with no revision, or
+            // nought for an object the collection had never held, which is no place at all.
+            current: match (
+                answer.current_revision.0,
+                answer.current_write_sequence.get(),
+            ) {
+                (Some(revision), write_sequence) => {
+                    Some(SyncPosition::at(write_sequence, revision, recovery.0))
+                }
+                (None, 0) => None,
+                (None, write_sequence) => {
+                    Some(SyncPosition::removed_at(write_sequence, recovery.0))
+                }
+            },
+            recovery: recovery.0,
         },
     })
 }
@@ -2000,7 +2069,8 @@ fn dropped(data: serde_json::Value) -> Result<bool> {
 
 /// What one comparison found, as the service stated it.
 fn comparison(answer: CompareAnswer) -> Result<SyncComparison> {
-    let head = head_of(answer.key_epoch, answer.key_revision)?;
+    let recovery = answer.recovery_id.0;
+    let head = head_of(answer.key_epoch, answer.key_revision, recovery)?;
     let objects = answer
         .changed
         .into_iter()
@@ -2008,7 +2078,7 @@ fn comparison(answer: CompareAnswer) -> Result<SyncComparison> {
             Ok(SyncHeldObject {
                 object_id: held.object_id,
                 kind: held.kind,
-                position: SyncPosition::at(held.write_sequence.get(), held.revision),
+                position: SyncPosition::at(held.write_sequence.get(), held.revision, recovery),
                 epoch: epoch_in(head, held.key_epoch)?,
                 ciphertext: encoded(&held.object)?,
             })
@@ -2021,7 +2091,7 @@ fn comparison(answer: CompareAnswer) -> Result<SyncComparison> {
             object_id: removed.object_id,
             // A removal takes a place in the object's order; nought is an object never held.
             position: (removed.write_sequence.get() != 0)
-                .then(|| SyncPosition::removed_at(removed.write_sequence.get())),
+                .then(|| SyncPosition::removed_at(removed.write_sequence.get(), recovery)),
         })
         .collect();
     let copies = answer
@@ -2034,7 +2104,11 @@ fn comparison(answer: CompareAnswer) -> Result<SyncComparison> {
                 object_id: copy.object_id,
                 kind: copy.kind,
                 expected_revision: copy.expected_revision,
-                current: copy_position(&copy.current_revision, copy.current_write_sequence)?,
+                current: copy_position(
+                    &copy.current_revision,
+                    copy.current_write_sequence,
+                    recovery,
+                )?,
                 epoch: epoch_in(head, copy.key_epoch)?,
                 ciphertext: encoded(&copy.object)?,
             })
@@ -2047,17 +2121,23 @@ fn comparison(answer: CompareAnswer) -> Result<SyncComparison> {
         more_copies: answer.more_conflicts,
         next_copies_after: answer.next_conflicts_after_sequence.get(),
         head,
+        recovery,
         stored: answer.stored,
     })
 }
 
 /// Where the collection's key records stood, as an answer named it: both the epoch and the
 /// revision, or neither.
-fn head_of(key_epoch: Option<U64>, key_revision: Option<U64>) -> Result<Option<KeyHead>> {
+fn head_of(
+    key_epoch: Option<U64>,
+    key_revision: Option<U64>,
+    recovery: Option<SyncRecoveryId>,
+) -> Result<Option<KeyHead>> {
     match (key_epoch, key_revision) {
         (Some(epoch), Some(revision)) => Ok(Some(KeyHead {
             epoch: epoch.get(),
             revision: revision.get(),
+            recovery,
         })),
         (None, None) => Ok(None),
         _ => Err(contrary(
@@ -2109,7 +2189,7 @@ enum WriteOutcome {
 /// write's identity answers only a write's outcomes: one that names the offer of a key record is
 /// an answer about another request.
 fn write_outcome(answer: &StatusAnswer) -> Result<(WriteOutcome, Option<KeyHead>)> {
-    let head = head_of(answer.key_epoch, answer.key_revision)?;
+    let head = head_of(answer.key_epoch, answer.key_revision, answer.recovery_id.0)?;
     let outcome = match consistent_outcome(answer)? {
         None => WriteOutcome::Unknown,
         Some(ReceiptOutcome::Written | ReceiptOutcome::Removed) => {
@@ -2220,10 +2300,16 @@ fn encoded(object: &SealedSyncObject) -> Result<Vec<u8>> {
 /// The service writes a place in the order beside a revision, and empty text where the object held
 /// no revision: a removal's place, or nought for an object the collection had never held, which is
 /// no position at all.
-fn copy_position(current_revision: &str, write_sequence: U64) -> Result<Option<SyncPosition>> {
+fn copy_position(
+    current_revision: &str,
+    write_sequence: U64,
+    recovery: Option<SyncRecoveryId>,
+) -> Result<Option<SyncPosition>> {
     let write_sequence = write_sequence.get();
     if current_revision.is_empty() {
-        return Ok((write_sequence != 0).then(|| SyncPosition::removed_at(write_sequence)));
+        return Ok(
+            (write_sequence != 0).then(|| SyncPosition::removed_at(write_sequence, recovery))
+        );
     }
     let revision: Uuid = current_revision
         .parse()
@@ -2231,6 +2317,7 @@ fn copy_position(current_revision: &str, write_sequence: U64) -> Result<Option<S
     Ok(Some(SyncPosition::at(
         write_sequence,
         SyncRevision::new(revision),
+        recovery,
     )))
 }
 
@@ -2252,7 +2339,29 @@ fn recorded_position(answer: &StatusAnswer) -> Result<SyncPosition> {
     Ok(SyncPosition {
         write_sequence: write_sequence.get(),
         revision: answer.current_revision,
+        recovery: answer.recovery_id,
     })
+}
+
+/// Holds every page of one read to the history the first page was read in.
+///
+/// Places in a collection's order compare only under one recovery, so a read that met a restore
+/// between two pages would fold places from two histories into one answer. Such a read is declined
+/// as an answer this client does not follow, and asking again reads one history whole.
+fn one_history(
+    history: &mut Option<Option<SyncRecoveryId>>,
+    page: Option<SyncRecoveryId>,
+) -> Result<()> {
+    match history {
+        None => {
+            *history = Some(page);
+            Ok(())
+        }
+        Some(first) if *first == page => Ok(()),
+        Some(_) => Err(contrary(
+            "pages of one read from two histories of the collection",
+        )),
+    }
 }
 
 /// Refuses a counter the service could not compare exactly, before anything is sent.

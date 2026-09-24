@@ -44,6 +44,7 @@ fn at(write_sequence: u64) -> SyncPosition {
     SyncPosition::at(
         write_sequence,
         SyncRevision::new(Uuid::from_bytes([write_sequence as u8; 16])),
+        None,
     )
 }
 
@@ -133,8 +134,9 @@ fn expected_object(expected: Option<SyncPosition>) -> Option<SyncRevision> {
 enum Recorded {
     /// The write was applied, leaving the object at this position.
     Applied(SyncPosition),
-    /// The comparison was refused, and the service kept the rejected write as this copy of its own.
-    Refused(SyncConflictId),
+    /// The comparison was refused, and the service kept the rejected write as this copy of its own;
+    /// the object stood where the second part says, or nowhere when the collection never held it.
+    Refused(SyncConflictId, Option<SyncPosition>),
     /// The request was fenced before anything ran under it, so nothing ever will.
     ///
     /// It carries what the service established about the past when it fenced: whether a receipt of
@@ -292,7 +294,7 @@ impl Service {
             .lock()
             .await
             .insert(collection.to_owned(), next);
-        SyncPosition::removed_at(next)
+        SyncPosition::removed_at(next, None)
     }
 
     /// Puts one object in a collection at a position of the caller's choosing.
@@ -494,7 +496,7 @@ impl Service {
             .or_else(|| {
                 removals
                     .get(collection)
-                    .map(|sequence| SyncPosition::removed_at(*sequence))
+                    .map(|sequence| SyncPosition::removed_at(*sequence, None))
             });
         // The comparison is against the object the caller named, which is the only part of a
         // position the exchange carries. The order beside it is the service's own answer.
@@ -519,7 +521,7 @@ impl Service {
             // service stored nothing.
             let kept = SyncConflictId::new(fresh_request_id());
             self.copies.lock().await.insert(kept, collection.to_owned());
-            Recorded::Refused(kept)
+            Recorded::Refused(kept, current)
         };
         receipts.insert(
             key.clone(),
@@ -540,8 +542,10 @@ impl Service {
 fn answer(recorded: Recorded) -> SyncExchanged {
     match recorded {
         Recorded::Applied(position) => SyncExchanged::Applied { position },
-        Recorded::Refused(conflict_id) => SyncExchanged::Refused {
+        Recorded::Refused(conflict_id, current) => SyncExchanged::Refused {
             retained: Some(conflict_id),
+            current,
+            recovery: None,
         },
         Recorded::Fenced { .. } => unreachable!("a fenced identity never answers an exchange"),
     }
@@ -620,7 +624,7 @@ impl SyncBackupService for Service {
                 return Err(lost("the service could not be asked"));
             }
             if std::mem::take(&mut *self.status_misses_the_receipt.lock().await) {
-                return Ok(SyncRequestStatus::Unknown);
+                return Ok(SyncRequestStatus::Unknown { recovery: None });
             }
             Ok(
                 match self
@@ -631,11 +635,15 @@ impl SyncBackupService for Service {
                     .map(|receipt| receipt.recorded)
                 {
                     Some(Recorded::Applied(position)) => SyncRequestStatus::Applied { position },
-                    Some(Recorded::Refused(conflict_id)) => SyncRequestStatus::Refused {
+                    Some(Recorded::Refused(conflict_id, _)) => SyncRequestStatus::Refused {
                         retained: Some(conflict_id),
+                        recovery: None,
                     },
-                    Some(Recorded::Fenced { never_ran }) => SyncRequestStatus::Fenced { never_ran },
-                    None => SyncRequestStatus::Unknown,
+                    Some(Recorded::Fenced { never_ran }) => SyncRequestStatus::Fenced {
+                        never_ran,
+                        recovery: None,
+                    },
+                    None => SyncRequestStatus::Unknown { recovery: None },
                 },
             )
         })
@@ -697,10 +705,14 @@ impl SyncBackupService for Service {
             }
             Ok(match recorded {
                 Recorded::Applied(position) => SyncRequestFence::Applied { position },
-                Recorded::Refused(conflict_id) => SyncRequestFence::Refused {
+                Recorded::Refused(conflict_id, _) => SyncRequestFence::Refused {
                     retained: Some(conflict_id),
+                    recovery: None,
                 },
-                Recorded::Fenced { never_ran } => SyncRequestFence::Fenced { never_ran },
+                Recorded::Fenced { never_ran } => SyncRequestFence::Fenced {
+                    never_ran,
+                    recovery: None,
+                },
             })
         })
     }
@@ -2327,7 +2339,7 @@ async fn past_the_span_publishing_again_is_new_work_and_the_first_keeps_its_acco
     service.sweep_the_receipt(first.work_id).await;
     assert_eq!(
         service.remove(&collection).await,
-        SyncPosition::removed_at(2)
+        SyncPosition::removed_at(2, None)
     );
 
     // One instant past the span, the identity is not presented again: under it the same bytes could
@@ -3114,7 +3126,7 @@ async fn an_accepted_draft_answered_at_the_place_it_replaced_is_never_recorded_a
             TimestampMs::new(NOW + 1),
         )
         .expect("an edit");
-    let forked_at = SyncPosition::at(1, SyncRevision::new(Uuid::from_bytes([0xee; 16])));
+    let forked_at = SyncPosition::at(1, SyncRevision::new(Uuid::from_bytes([0xee; 16])), None);
     service.applies_the_next_write_at(forked_at).await;
     let error = sync
         .publish(
@@ -3675,7 +3687,7 @@ fn a_note_is_never_replaced_by_an_answer_that_does_not_follow_it() {
     let directory = tempfile::tempdir().expect("a directory");
     let store = SyncStore::open(directory.path().join("one")).expect("a store");
     let object_id = fresh_object_id().expect("an identity");
-    let forked = SyncPosition::at(5, SyncRevision::new(Uuid::from_bytes([0xf0; 16])));
+    let forked = SyncPosition::at(5, SyncRevision::new(Uuid::from_bytes([0xf0; 16])), None);
 
     let note = |position| SyncCheckpoint {
         position,
@@ -3771,6 +3783,7 @@ async fn a_service_holding_another_write_in_the_same_place_says_the_history_fork
             SyncPosition::at(
                 position.write_sequence,
                 SyncRevision::new(Uuid::from_bytes([0xf0; 16])),
+                None,
             ),
             ciphertext,
         )
@@ -3845,7 +3858,7 @@ async fn a_removal_keeps_its_place_in_the_order_and_the_write_after_it_names_no_
     // order, and this device's note records that place: an object that is not there is not the
     // same thing as an object that has never been there, and the difference is the order.
     let removed = service.remove(&collection).await;
-    assert_eq!(removed, SyncPosition::removed_at(2));
+    assert_eq!(removed, SyncPosition::removed_at(2, None));
     let note = |position| SyncCheckpoint {
         position,
         published_revision: Nullable::null(),
@@ -3874,6 +3887,7 @@ async fn a_removal_keeps_its_place_in_the_order_and_the_write_after_it_names_no_
                 note(SyncPosition::at(
                     2,
                     SyncRevision::new(Uuid::from_bytes([0xf0; 16])),
+                    None,
                 )),
             )
             .expect("a note")
@@ -3912,7 +3926,7 @@ async fn a_removal_keeps_its_place_in_the_order_and_the_write_after_it_names_no_
     let last = sent.last().expect("an exchange");
     assert_eq!(
         last.expected,
-        Some(SyncPosition::removed_at(2)),
+        Some(SyncPosition::removed_at(2, None)),
         "the comparison names the removal, and the wire reads it as no object"
     );
     assert_eq!(
@@ -3960,6 +3974,7 @@ async fn an_accepted_write_that_claims_the_notes_place_under_another_name_is_rep
         .applies_the_next_write_at(SyncPosition::at(
             5,
             SyncRevision::new(Uuid::from_bytes([0xbb; 16])),
+            None,
         ))
         .await;
 
@@ -4020,7 +4035,11 @@ async fn a_position_no_write_of_the_object_can_be_at_is_declined_rather_than_rea
         .seal(&kr_cbor::to_canonical_vec(&theirs).expect("canonical bytes"))
         .expect("sealed");
     service
-        .hold(&collection, SyncPosition::removed_at(5), sealed.clone())
+        .hold(
+            &collection,
+            SyncPosition::removed_at(5, None),
+            sealed.clone(),
+        )
         .await;
     let refused = client
         .fetch(
@@ -4070,7 +4089,7 @@ async fn a_position_no_write_of_the_object_can_be_at_is_declined_rather_than_rea
             .begin_dispatch(staged.work_id, object_id, TimestampMs::new(NOW + 3))
             .expect("dispatched"),
     );
-    for impossible in [SyncPosition::removed_at(6), at(0)] {
+    for impossible in [SyncPosition::removed_at(6, None), at(0)] {
         assert!(
             matches!(
                 client
@@ -7050,7 +7069,7 @@ async fn a_write_under_a_place_another_history_holds_keeps_its_own_account() {
     // A second request of the same object is answered with write one under another name. One write
     // sequence names one write for the life of a collection, so this is a second history rather
     // than a later state of the first, and the object's record can hold only one of them.
-    let forked = SyncPosition::at(1, SyncRevision::new(Uuid::from_bytes([0xbb; 16])));
+    let forked = SyncPosition::at(1, SyncRevision::new(Uuid::from_bytes([0xbb; 16])), None);
     let staged = client
         .store()
         .admit(object_id, |object| {
@@ -7173,7 +7192,7 @@ async fn a_stop_after_the_fork_is_recorded_keeps_the_account_when_the_object_mov
     // name. The device stops with the settlement's **first** replacement on disk and nothing after
     // it: the record says which history took the write, and the object's own record still names
     // the other one. That is the state this store must come back to and finish from.
-    let forked = SyncPosition::at(1, SyncRevision::new(Uuid::from_bytes([0xbb; 16])));
+    let forked = SyncPosition::at(1, SyncRevision::new(Uuid::from_bytes([0xbb; 16])), None);
     let staged = client
         .store()
         .admit(object_id, |object| {
@@ -7271,7 +7290,7 @@ async fn a_publication_record_two_histories_claim_is_reported_even_when_the_note
         .store()
         .forget_checkpoint(object_id)
         .expect("forgotten");
-    let forked = SyncPosition::at(1, SyncRevision::new(Uuid::from_bytes([0xbb; 16])));
+    let forked = SyncPosition::at(1, SyncRevision::new(Uuid::from_bytes([0xbb; 16])), None);
     let staged = client
         .store()
         .admit(object_id, |object| {
@@ -7342,7 +7361,7 @@ async fn a_reconciliation_counts_a_place_two_histories_claim_rather_than_refusin
 
     // A second write goes out and its answer is lost. The service put it at a place its own order
     // had already used, which is a second history rather than a later state of this one.
-    let forked = SyncPosition::at(1, SyncRevision::new(Uuid::from_bytes([0xbb; 16])));
+    let forked = SyncPosition::at(1, SyncRevision::new(Uuid::from_bytes([0xbb; 16])), None);
     service.applies_the_next_write_at(forked).await;
     service.lose_the_next_answer().await;
     let later = object(
@@ -7421,7 +7440,7 @@ async fn a_note_two_histories_claim_is_reported_rather_than_left_to_a_later_comp
         }
     });
     service.wait_for_a_publication().await;
-    let other_history = SyncPosition::at(5, SyncRevision::new(Uuid::from_bytes([0xaa; 16])));
+    let other_history = SyncPosition::at(5, SyncRevision::new(Uuid::from_bytes([0xaa; 16])), None);
     client
         .store()
         .record_checkpoint(

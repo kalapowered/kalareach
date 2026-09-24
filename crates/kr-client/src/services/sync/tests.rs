@@ -229,6 +229,7 @@ fn exchanged(
         "current_revision": current_revision.map(|revision| revision.to_string()),
         "current_write_sequence": current_write_sequence,
         "conflict": conflict,
+        "recovery_id": null,
         "stored": usage(),
     })
 }
@@ -244,6 +245,7 @@ fn status(request: Uuid, state: &str, never_ran: bool) -> serde_json::Value {
         "current_revision": null,
         "current_write_sequence": null,
         "conflict_id": null,
+        "recovery_id": null,
         "recorded_at": null,
     })
 }
@@ -396,7 +398,7 @@ async fn an_exchange_carries_the_callers_identity_instant_and_object() {
             &settings_of(object),
             request,
             signed_at,
-            Some(SyncPosition::at(3, revision(3))),
+            Some(SyncPosition::at(3, revision(3), None)),
             &published(&sealed_object),
         )
         .await
@@ -433,7 +435,7 @@ async fn an_exchange_carries_the_callers_identity_instant_and_object() {
 
     // No position and a removal's position both name no object, and the comparison says so with
     // a revision that is present and null.
-    for expected in [None, Some(SyncPosition::removed_at(5))] {
+    for expected in [None, Some(SyncPosition::removed_at(5, None))] {
         client
             .compare_exchange(
                 &settings_of(object),
@@ -508,7 +510,7 @@ async fn an_exchange_answer_is_passed_through_as_the_service_stated_it() {
                 serde_json::Value::Null,
             ),
             SyncExchanged::Applied {
-                position: SyncPosition::at(4, revision(9)),
+                position: SyncPosition::at(4, revision(9), None),
             },
         ),
         // A removal's place, and a place of nought, are passed through as they were stated. The
@@ -522,7 +524,7 @@ async fn an_exchange_answer_is_passed_through_as_the_service_stated_it() {
                 serde_json::Value::Null,
             ),
             SyncExchanged::Applied {
-                position: SyncPosition::removed_at(5),
+                position: SyncPosition::removed_at(5, None),
             },
         ),
         (
@@ -534,7 +536,7 @@ async fn an_exchange_answer_is_passed_through_as_the_service_stated_it() {
                 serde_json::Value::Null,
             ),
             SyncExchanged::Applied {
-                position: SyncPosition::at(0, revision(9)),
+                position: SyncPosition::at(0, revision(9), None),
             },
         ),
         // A refusal is an answer, and it names the copy the service kept of the refused write.
@@ -548,6 +550,8 @@ async fn an_exchange_answer_is_passed_through_as_the_service_stated_it() {
             ),
             SyncExchanged::Refused {
                 retained: Some(SyncConflictId::new(conflict)),
+                current: Some(SyncPosition::at(4, revision(4), None)),
+                recovery: None,
             },
         ),
         (
@@ -558,7 +562,11 @@ async fn an_exchange_answer_is_passed_through_as_the_service_stated_it() {
                 "4",
                 serde_json::Value::Null,
             ),
-            SyncExchanged::Refused { retained: None },
+            SyncExchanged::Refused {
+                retained: None,
+                current: Some(SyncPosition::at(4, revision(4), None)),
+                recovery: None,
+            },
         ),
     ];
     for (answer, expected) in cases {
@@ -624,29 +632,39 @@ async fn a_status_answer_is_what_the_receipt_recorded() {
         (
             applied,
             SyncRequestStatus::Applied {
-                position: SyncPosition::at(4, revision(9)),
+                position: SyncPosition::at(4, revision(9), None),
             },
         ),
         (
             removed,
             SyncRequestStatus::Applied {
-                position: SyncPosition::removed_at(5),
+                position: SyncPosition::removed_at(5, None),
             },
         ),
         (
             refused,
             SyncRequestStatus::Refused {
                 retained: Some(SyncConflictId::new(conflict)),
+                recovery: None,
             },
         ),
-        (fenced, SyncRequestStatus::Fenced { never_ran: true }),
+        (
+            fenced,
+            SyncRequestStatus::Fenced {
+                never_ran: true,
+                recovery: None,
+            },
+        ),
         (
             fenced_unvouched,
-            SyncRequestStatus::Fenced { never_ran: false },
+            SyncRequestStatus::Fenced {
+                never_ran: false,
+                recovery: None,
+            },
         ),
         (
             status(request, "unknown", false),
-            SyncRequestStatus::Unknown,
+            SyncRequestStatus::Unknown { recovery: None },
         ),
     ] {
         recorder.answering(vec![answer]);
@@ -713,6 +731,370 @@ async fn an_answer_that_does_not_say_whether_the_request_ran_is_an_error() {
     );
 }
 
+/// The recovery a restore of the service recorded, as the service names it.
+fn put_back_by(byte: u8) -> SyncRecoveryId {
+    SyncRecoveryId::new(identity(byte))
+}
+
+/// The same answer, from a service a restore put back under `recovery`.
+fn under(mut answer: serde_json::Value, recovery: SyncRecoveryId) -> serde_json::Value {
+    answer["recovery_id"] = recovery.to_string().into();
+    answer
+}
+
+#[tokio::test]
+async fn every_answer_names_the_history_its_places_are_in() {
+    // A restore gives the collection a history of its own, and every answer names it: beside each
+    // place it states, and on an answer that states none, so a refusal about an object the
+    // collection never held still says which history holds nothing.
+    let (client, recorder) = sync_client();
+    let object = identity(7);
+    let request = identity(8);
+    let conflict = identity(0x44);
+    let bytes = published(&sealed(b"theme=dark"));
+    let now = now_ms();
+    let restored = put_back_by(0xb0);
+    let theirs = sealed(b"theme=light");
+
+    recorder.answering(vec![under(
+        exchanged(
+            "written",
+            summary(object, revision(9), "4"),
+            Some(revision(9)),
+            "4",
+            serde_json::Value::Null,
+        ),
+        restored,
+    )]);
+    assert_eq!(
+        client
+            .compare_exchange(&settings_of(object), request, now, None, &bytes)
+            .await
+            .expect("applied"),
+        SyncExchanged::Applied {
+            position: SyncPosition::at(4, revision(9), Some(restored)),
+        }
+    );
+    for (answer, current) in [
+        (
+            exchanged(
+                "conflict",
+                summary(object, revision(4), "4"),
+                Some(revision(4)),
+                "4",
+                copy_summary(object, conflict, revision(4)),
+            ),
+            Some(SyncPosition::at(4, revision(4), Some(restored))),
+        ),
+        (
+            exchanged(
+                "conflict",
+                serde_json::Value::Null,
+                None,
+                "6",
+                copy_summary(object, conflict, revision(4)),
+            ),
+            Some(SyncPosition::removed_at(6, Some(restored))),
+        ),
+        // Refused because the restored collection has never held the object: no place, and the
+        // history that holds nothing all the same.
+        (
+            exchanged(
+                "conflict",
+                serde_json::Value::Null,
+                None,
+                "0",
+                copy_summary(object, conflict, revision(4)),
+            ),
+            None,
+        ),
+    ] {
+        recorder.answering(vec![under(answer, restored)]);
+        let answered = client
+            .compare_exchange(&settings_of(object), request, now, None, &bytes)
+            .await
+            .expect("refused");
+        assert_eq!(
+            answered,
+            SyncExchanged::Refused {
+                retained: Some(SyncConflictId::new(conflict)),
+                current,
+                recovery: Some(restored),
+            }
+        );
+        assert_eq!(answered.recovery(), Some(restored));
+    }
+
+    let mut applied = status(request, "applied", false);
+    applied["outcome"] = "written".into();
+    applied["current_revision"] = revision(9).to_string().into();
+    applied["current_write_sequence"] = "4".into();
+    let mut refused = status(request, "refused", false);
+    refused["outcome"] = "conflict".into();
+    refused["conflict_id"] = conflict.to_string().into();
+    let mut fenced = status(request, "fenced", false);
+    fenced["outcome"] = "fenced".into();
+    for (answer, expected) in [
+        (
+            applied.clone(),
+            SyncRequestStatus::Applied {
+                position: SyncPosition::at(4, revision(9), Some(restored)),
+            },
+        ),
+        (
+            refused,
+            SyncRequestStatus::Refused {
+                retained: Some(SyncConflictId::new(conflict)),
+                recovery: Some(restored),
+            },
+        ),
+        (
+            fenced.clone(),
+            SyncRequestStatus::Fenced {
+                never_ran: false,
+                recovery: Some(restored),
+            },
+        ),
+        (
+            status(request, "unknown", false),
+            SyncRequestStatus::Unknown {
+                recovery: Some(restored),
+            },
+        ),
+    ] {
+        recorder.answering(vec![under(answer, restored)]);
+        let answered = client
+            .request_status(&settings_of(object), request)
+            .await
+            .expect("answered");
+        assert_eq!(answered, expected);
+        assert_eq!(answered.recovery(), Some(restored));
+    }
+    for (answer, expected) in [
+        (
+            applied,
+            SyncRequestFence::Applied {
+                position: SyncPosition::at(4, revision(9), Some(restored)),
+            },
+        ),
+        (
+            fenced,
+            SyncRequestFence::Fenced {
+                never_ran: false,
+                recovery: Some(restored),
+            },
+        ),
+    ] {
+        recorder.answering(vec![under(answer, restored)]);
+        let answered = client
+            .fence_request(&settings_of(object), request, now, now)
+            .await
+            .expect("answered");
+        assert_eq!(answered, expected);
+        assert_eq!(answered.recovery(), Some(restored));
+    }
+
+    recorder.answering(vec![under(
+        compared(vec![held(object, revision(9), "4", &theirs)], Vec::new()),
+        restored,
+    )]);
+    assert_eq!(
+        client.fetch(&settings_of(object)).await.expect("fetched").0,
+        SyncPosition::at(4, revision(9), Some(restored))
+    );
+    let mut with_everything = compared(
+        vec![held(object, revision(9), "4", &theirs)],
+        vec![serde_json::json!({
+            "sequence": "1",
+            "conflict_id": conflict.to_string(),
+            "kind": "settings",
+            "object_id": object.to_string(),
+            "expected_revision": null,
+            "current_revision": revision(9).to_string(),
+            "current_write_sequence": "4",
+            "object": theirs,
+            "recorded_at": "2026-09-23T10:00:00.000Z",
+        })],
+    );
+    with_everything["removed"] =
+        serde_json::json!([{ "object_id": identity(0x62).to_string(), "write_sequence": "3" }]);
+    recorder.answering(vec![under(with_everything, restored)]);
+    let comparison = client
+        .compare(&settings_of(object), true, None)
+        .await
+        .expect("compared");
+    assert_eq!(comparison.recovery, Some(restored));
+    assert_eq!(
+        comparison.objects[0].position,
+        SyncPosition::at(4, revision(9), Some(restored))
+    );
+    assert_eq!(
+        comparison.removed[0].position,
+        Some(SyncPosition::removed_at(3, Some(restored)))
+    );
+    assert_eq!(
+        comparison.copies[0].current,
+        Some(SyncPosition::at(4, revision(9), Some(restored)))
+    );
+    // A comparison that names no place names the history all the same.
+    recorder.answering(vec![under(compared(Vec::new(), Vec::new()), restored)]);
+    assert_eq!(
+        client
+            .compare(&settings_of(object), false, None)
+            .await
+            .expect("compared")
+            .recovery,
+        Some(restored)
+    );
+    // And a service never put back names none, which is null rather than absent.
+    recorder.answering(vec![compared(Vec::new(), Vec::new())]);
+    assert_eq!(
+        client
+            .compare(&settings_of(object), false, None)
+            .await
+            .expect("compared")
+            .recovery,
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_recovery_that_is_not_an_identity_is_not_one_this_client_reads() {
+    let (client, recorder) = sync_client();
+    let object = identity(7);
+    for named in [
+        serde_json::json!("not an identity"),
+        serde_json::json!(7),
+        serde_json::json!({ "identity": identity(0xb0).to_string() }),
+    ] {
+        let mut answer = compared(Vec::new(), Vec::new());
+        answer["recovery_id"] = named.clone();
+        recorder.answering(vec![answer]);
+        assert_eq!(
+            client
+                .compare(&settings_of(object), false, None)
+                .await
+                .expect_err("not a recovery")
+                .code(),
+            ErrorCode::OutcomeUnknown,
+            "{named}"
+        );
+    }
+}
+
+/// The same answer without its `recovery_id`.
+fn without_recovery(mut answer: serde_json::Value) -> serde_json::Value {
+    answer
+        .as_object_mut()
+        .expect("members")
+        .remove("recovery_id");
+    answer
+}
+
+#[tokio::test]
+async fn an_answer_that_leaves_out_its_recovery_is_not_one_this_client_reads() {
+    // Every answer that names a place in a collection's history names the history too, and a
+    // missing one is not "never put back": a position read under a guessed history is compared
+    // against positions it has nothing to do with. So the answer is declined, as one missing any
+    // other member is, and whatever it was about stays unsettled.
+    let (client, recorder) = sync_client();
+    let object = identity(7);
+    let request = identity(8);
+    let bytes = published(&sealed(b"theme=dark"));
+    let now = now_ms();
+
+    let mut applied = status(request, "applied", false);
+    applied["outcome"] = "written".into();
+    applied["current_revision"] = revision(9).to_string().into();
+    applied["current_write_sequence"] = "4".into();
+    let mut fenced = status(request, "fenced", true);
+    fenced["outcome"] = "fenced".into();
+    let theirs = sealed(b"theme=light");
+
+    for (what, answer) in [
+        (
+            "an applied exchange",
+            exchanged(
+                "written",
+                summary(object, revision(9), "4"),
+                Some(revision(9)),
+                "4",
+                serde_json::Value::Null,
+            ),
+        ),
+        (
+            "a refused exchange",
+            exchanged(
+                "conflict",
+                summary(object, revision(4), "4"),
+                Some(revision(4)),
+                "4",
+                serde_json::Value::Null,
+            ),
+        ),
+    ] {
+        recorder.answering(vec![without_recovery(answer)]);
+        assert_eq!(
+            client
+                .compare_exchange(&settings_of(object), request, now, None, &bytes)
+                .await
+                .expect_err(what)
+                .code(),
+            ErrorCode::OutcomeUnknown,
+            "{what}"
+        );
+    }
+    for (what, answer) in [
+        ("an applied receipt", applied.clone()),
+        ("a fenced identity", fenced.clone()),
+        ("no receipt", status(request, "unknown", false)),
+    ] {
+        recorder.answering(vec![without_recovery(answer)]);
+        assert_eq!(
+            client
+                .request_status(&settings_of(object), request)
+                .await
+                .expect_err(what)
+                .code(),
+            ErrorCode::OutcomeUnknown,
+            "{what}"
+        );
+    }
+    for (what, answer) in [("an applied receipt", applied), ("a fence", fenced)] {
+        recorder.answering(vec![without_recovery(answer)]);
+        assert_eq!(
+            client
+                .fence_request(&settings_of(object), request, now, now)
+                .await
+                .expect_err(what)
+                .code(),
+            ErrorCode::OutcomeUnknown,
+            "{what}"
+        );
+    }
+    recorder.answering(vec![without_recovery(compared(
+        vec![held(object, revision(9), "4", &theirs)],
+        Vec::new(),
+    ))]);
+    assert_eq!(
+        client
+            .fetch(&settings_of(object))
+            .await
+            .expect_err("a comparison")
+            .code(),
+        ErrorCode::OutcomeUnknown
+    );
+    recorder.answering(vec![without_recovery(compared(Vec::new(), Vec::new()))]);
+    assert_eq!(
+        client
+            .compare(&settings_of(object), false, None)
+            .await
+            .expect_err("an empty comparison names its history too")
+            .code(),
+        ErrorCode::OutcomeUnknown
+    );
+}
+
 #[tokio::test]
 async fn a_fence_answered_unknown_is_an_error_rather_than_an_answer_invented_here() {
     // A fence finds an outcome or makes one, so "unknown" is never its answer, and the client has
@@ -748,7 +1130,10 @@ async fn a_fence_names_both_signing_times_and_is_answered_as_the_service_states(
             .fence_request(&settings_of(object), request, first, last)
             .await
             .expect("fenced"),
-        SyncRequestFence::Fenced { never_ran: true }
+        SyncRequestFence::Fenced {
+            never_ran: true,
+            recovery: None,
+        }
     );
     assert_eq!(
         recorder.last_body(),
@@ -776,7 +1161,7 @@ async fn a_fence_names_both_signing_times_and_is_answered_as_the_service_states(
             .await
             .expect("answered"),
         SyncRequestFence::Applied {
-            position: SyncPosition::at(4, revision(9)),
+            position: SyncPosition::at(4, revision(9), None),
         }
     );
 }
@@ -962,7 +1347,7 @@ async fn an_answer_carrying_members_this_client_does_not_read_is_read_all_the_sa
             .await
             .expect("applied"),
         SyncExchanged::Applied {
-            position: SyncPosition::at(4, revision(9)),
+            position: SyncPosition::at(4, revision(9), None),
         }
     );
 
@@ -974,7 +1359,10 @@ async fn an_answer_carrying_members_this_client_does_not_read_is_read_all_the_sa
             .request_status(&settings_of(object), request)
             .await
             .expect("answered"),
-        SyncRequestStatus::Fenced { never_ran: true }
+        SyncRequestStatus::Fenced {
+            never_ran: true,
+            recovery: None,
+        }
     );
     let now = now_ms();
     assert_eq!(
@@ -982,7 +1370,10 @@ async fn an_answer_carrying_members_this_client_does_not_read_is_read_all_the_sa
             .fence_request(&settings_of(object), request, now, now)
             .await
             .expect("answered"),
-        SyncRequestFence::Fenced { never_ran: true }
+        SyncRequestFence::Fenced {
+            never_ran: true,
+            recovery: None,
+        }
     );
 
     let theirs = sealed(b"theme=light");
@@ -991,7 +1382,7 @@ async fn an_answer_carrying_members_this_client_does_not_read_is_read_all_the_sa
     recorder.answering(vec![with_more(compared(vec![held_object], Vec::new()))]);
     assert_eq!(
         client.fetch(&settings_of(object)).await.expect("fetched").0,
-        SyncPosition::at(4, revision(9))
+        SyncPosition::at(4, revision(9), None)
     );
 
     recorder.answering(vec![with_more(
@@ -1081,6 +1472,7 @@ fn compared(
         "conflicts": conflicts,
         "next_conflicts_after_sequence": "0",
         "more_conflicts": false,
+        "recovery_id": null,
         "stored": usage(),
     })
 }
@@ -1112,7 +1504,7 @@ async fn a_fetch_is_the_object_and_the_place_the_service_states() {
     )]);
 
     let (position, ciphertext) = client.fetch(&settings_of(object)).await.expect("fetched");
-    assert_eq!(position, SyncPosition::at(4, revision(9)));
+    assert_eq!(position, SyncPosition::at(4, revision(9), None));
     assert_eq!(
         ciphertext,
         published(&theirs),
@@ -1177,7 +1569,7 @@ async fn a_comparison_reads_every_copy_with_where_the_object_stood() {
     assert_eq!(comparison.objects.len(), 1);
     assert_eq!(
         comparison.objects[0].position,
-        SyncPosition::at(4, revision(9))
+        SyncPosition::at(4, revision(9), None)
     );
     assert_eq!(
         comparison
@@ -1188,12 +1580,12 @@ async fn a_comparison_reads_every_copy_with_where_the_object_stood() {
         vec![
             (
                 SyncConflictId::new(identity(1)),
-                Some(SyncPosition::at(4, revision(9)))
+                Some(SyncPosition::at(4, revision(9), None))
             ),
             // Refused while the object was removed: the removal's place, with no revision.
             (
                 SyncConflictId::new(identity(2)),
-                Some(SyncPosition::removed_at(6))
+                Some(SyncPosition::removed_at(6, None))
             ),
             // Refused while the collection had never held the object: no position at all.
             (SyncConflictId::new(identity(3)), None),
@@ -1259,7 +1651,7 @@ fn a_rendering_of_a_request_an_object_or_a_copy_carries_nothing_sealed() {
     let held = SyncHeldObject {
         object_id: SyncObjectId::new(identity(2)),
         kind: SyncObjectKind::Settings,
-        position: SyncPosition::at(4, revision(9)),
+        position: SyncPosition::at(4, revision(9), None),
         epoch: Some(2),
         ciphertext: ciphertext.clone(),
     };
@@ -1278,7 +1670,7 @@ fn a_rendering_of_a_request_an_object_or_a_copy_carries_nothing_sealed() {
         object_id: SyncObjectId::new(identity(2)),
         kind: SyncObjectKind::Settings,
         expected_revision: Nullable::null(),
-        current: Some(SyncPosition::at(4, revision(9))),
+        current: Some(SyncPosition::at(4, revision(9), None)),
         epoch: Some(2),
         ciphertext,
     };

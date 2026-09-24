@@ -468,7 +468,7 @@ impl SyncClient {
                     },
                 })
             }
-            Ok(SyncExchanged::Refused { retained }) => {
+            Ok(SyncExchanged::Refused { retained, .. }) => {
                 // The service answered the comparison and refused it, so this write did not replace
                 // the object. That is settled first, along with the account of whatever the service
                 // kept of it, so a fetch this device cannot make does not leave a refusal it
@@ -1378,9 +1378,9 @@ pub(crate) async fn ask_about(
     };
     Ok(match status {
         SyncRequestStatus::Applied { position } => Answer::Applied(position),
-        SyncRequestStatus::Refused { retained } => Answer::Refused(retained),
-        SyncRequestStatus::Fenced { never_ran } => Answer::Fenced { never_ran },
-        SyncRequestStatus::Unknown => {
+        SyncRequestStatus::Refused { retained, .. } => Answer::Refused(retained),
+        SyncRequestStatus::Fenced { never_ran, .. } => Answer::Fenced { never_ran },
+        SyncRequestStatus::Unknown { .. } => {
             if !store.beyond_its_generation(staged)? {
                 return Ok(Answer::Open);
             }
@@ -1396,9 +1396,9 @@ pub(crate) async fn ask_about(
                 )
                 .await
             {
-                Ok(SyncRequestFence::Fenced { never_ran }) => Answer::Fenced { never_ran },
+                Ok(SyncRequestFence::Fenced { never_ran, .. }) => Answer::Fenced { never_ran },
                 Ok(SyncRequestFence::Applied { position }) => Answer::Applied(position),
-                Ok(SyncRequestFence::Refused { retained }) => Answer::Refused(retained),
+                Ok(SyncRequestFence::Refused { retained, .. }) => Answer::Refused(retained),
                 Err(_) => Answer::Open,
             }
         }

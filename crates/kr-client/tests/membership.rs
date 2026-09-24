@@ -3005,7 +3005,11 @@ fn settings_on(node: &Node) -> (SyncStore, SyncObject) {
         .record_checkpoint(
             object.object_id,
             SyncCheckpoint {
-                position: SyncPosition::at(3, SyncRevision::new(Uuid::from_bytes([0x8d; 16]))),
+                position: SyncPosition::at(
+                    3,
+                    SyncRevision::new(Uuid::from_bytes([0x8d; 16])),
+                    None,
+                ),
                 published_revision: Nullable::some(object.revision),
             },
         )
@@ -3237,7 +3241,11 @@ async fn a_restore_returns_settings_without_a_key_a_membership_or_a_sync_checkpo
         .record_checkpoint(
             object.object_id,
             SyncCheckpoint {
-                position: SyncPosition::at(9, SyncRevision::new(Uuid::from_bytes([0x9e; 16]))),
+                position: SyncPosition::at(
+                    9,
+                    SyncRevision::new(Uuid::from_bytes([0x9e; 16])),
+                    None,
+                ),
                 published_revision: Nullable::null(),
             },
         )

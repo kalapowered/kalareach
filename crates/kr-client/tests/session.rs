@@ -28,6 +28,7 @@ fn at(write_sequence: u64) -> SyncPosition {
     SyncPosition::at(
         write_sequence,
         SyncRevision::new(Uuid::from_bytes([write_sequence as u8; 16])),
+        None,
     )
 }
 use kr_client::session::Session;
@@ -1201,6 +1202,8 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
                     self.copies.lock().await.insert(kept);
                     SyncExchanged::Refused {
                         retained: Some(kept),
+                        current,
+                        recovery: None,
                     }
                 };
             receipts.insert(
@@ -1237,15 +1240,19 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
                     Some(Some(SyncExchanged::Applied { position })) => {
                         SyncRequestStatus::Applied { position }
                     }
-                    Some(Some(SyncExchanged::Refused { retained })) => {
-                        SyncRequestStatus::Refused { retained }
+                    Some(Some(SyncExchanged::Refused { retained, .. })) => {
+                        SyncRequestStatus::Refused {
+                            retained,
+                            recovery: None,
+                        }
                     }
                     // A receipt that holds no reply is the one a fence wrote, and it carries what
                     // that fence established about the past.
                     Some(None) => SyncRequestStatus::Fenced {
                         never_ran: FENCE_FOUND_NO_RUN,
+                        recovery: None,
                     },
-                    None => SyncRequestStatus::Unknown,
+                    None => SyncRequestStatus::Unknown { recovery: None },
                 },
             )
         })
@@ -1272,9 +1279,13 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
                 .answered;
             Ok(match recorded {
                 Some(SyncExchanged::Applied { position }) => SyncRequestFence::Applied { position },
-                Some(SyncExchanged::Refused { retained }) => SyncRequestFence::Refused { retained },
+                Some(SyncExchanged::Refused { retained, .. }) => SyncRequestFence::Refused {
+                    retained,
+                    recovery: None,
+                },
                 None => SyncRequestFence::Fenced {
                     never_ran: FENCE_FOUND_NO_RUN,
+                    recovery: None,
                 },
             })
         })

@@ -911,6 +911,7 @@ async fn kr_req_20_13_an_answer_lost_in_flight_is_settled_from_the_receipt_and_a
                     .and_then(|revision| revision.parse().ok())
                     .expect("the name it was given"),
             ),
+            None,
         );
         let staged = client
             .store()
@@ -1000,7 +1001,10 @@ async fn kr_req_20_13_a_fenced_identity_never_ran_and_nothing_runs_under_it_afte
                 .fence_request(&collection, identity, signed_at, signed_at)
                 .await
                 .expect("fenced"),
-            SyncRequestFence::Fenced { never_ran: true }
+            SyncRequestFence::Fenced {
+                never_ran: true,
+                recovery: None,
+            }
         );
 
         // An exchange that arrives under it afterwards runs nothing.
@@ -1027,7 +1031,10 @@ async fn kr_req_20_13_a_fenced_identity_never_ran_and_nothing_runs_under_it_afte
                 .request_status(&collection, identity)
                 .await
                 .expect("asked"),
-            SyncRequestStatus::Fenced { never_ran: true }
+            SyncRequestStatus::Fenced {
+                never_ran: true,
+                recovery: None,
+            }
         );
         let compared = run
             .service

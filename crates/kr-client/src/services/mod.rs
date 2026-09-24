@@ -393,6 +393,42 @@ impl std::fmt::Display for SyncRevision {
     }
 }
 
+/// The identity of one restore of a synchronisation service: the history a collection answers from.
+///
+/// A place in a collection's order is a place in one history, and a restore rewinds a history. A
+/// service put back from an export records the recovery with an identity of its own, and every
+/// collection it writes back, and every collection created in it afterwards, names that identity
+/// beside every place it answers with. So positions compare only under one identity: a device that
+/// holds a position under one and meets another has met a collection that was put back, not one that
+/// went backwards or forked, and what it held is not a place in the history it is now reading.
+///
+/// A service that has never been put back names none, which this client carries as no identity.
+/// The identity changes only when a restore writes the collection back, never while it serves, and
+/// two identities say nothing about which restore came first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SyncRecoveryId(pub Uuid);
+
+impl SyncRecoveryId {
+    /// Wraps the identity a service's restore recorded.
+    #[must_use]
+    pub const fn new(value: Uuid) -> Self {
+        Self(value)
+    }
+
+    /// Returns the raw identity.
+    #[must_use]
+    pub const fn get(self) -> Uuid {
+        self.0
+    }
+}
+
+impl std::fmt::Display for SyncRecoveryId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
 /// Where one object stands on a synchronisation service.
 ///
 /// Two facts, because one of them cannot do both jobs. The revision names the write, so a
@@ -408,6 +444,10 @@ impl std::fmt::Display for SyncRevision {
 /// is an object nothing has ever written, which a comparison compares against nothing. A device
 /// that forgot the removal's place in the order would read the next answer it saw as a service
 /// that had gone back.
+///
+/// A place in the order is a place in one history, so a position names the history too: the
+/// [`SyncRecoveryId`] the answer it came from named, or none for a service never put back. Two
+/// positions compare only when they name the same one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SyncPosition {
@@ -419,28 +459,45 @@ pub struct SyncPosition {
     /// would be read as a removal, and a record read as something it is not is worse than a record
     /// this build refuses.
     pub revision: Nullable<SyncRevision>,
+    /// The history this place is in: the recovery the answer named, or null for a service never put
+    /// back.
+    ///
+    /// A position this device stored before it read the member has none, and reads as null. That
+    /// is how this client read every answer then, so it is a statement of what was recorded rather
+    /// than a reconstruction of what the service said: a service put back before then names its
+    /// identity on its next answer, and that answer reads as a collection put back, which compares
+    /// nothing across the two.
+    #[serde(default = "Nullable::null")]
+    pub recovery: Nullable<SyncRecoveryId>,
 }
 
 impl SyncPosition {
-    /// The place one write of the object took, under the name the service gave it.
+    /// The place one write of the object took, under the name the service gave it, in the history
+    /// `recovery` names.
     #[must_use]
-    pub const fn at(write_sequence: u64, revision: SyncRevision) -> Self {
+    pub const fn at(
+        write_sequence: u64,
+        revision: SyncRevision,
+        recovery: Option<SyncRecoveryId>,
+    ) -> Self {
         Self {
             write_sequence,
             revision: Nullable::some(revision),
+            recovery: Nullable(recovery),
         }
     }
 
-    /// The place the removal of the object took.
+    /// The place the removal of the object took, in the history `recovery` names.
     ///
     /// The object is not there, and this says where in the order it stopped being there. The
     /// comparison that replaces it therefore names no object, and the order it is measured against
     /// carries on from here.
     #[must_use]
-    pub const fn removed_at(write_sequence: u64) -> Self {
+    pub const fn removed_at(write_sequence: u64, recovery: Option<SyncRecoveryId>) -> Self {
         Self {
             write_sequence,
             revision: Nullable::null(),
+            recovery: Nullable(recovery),
         }
     }
 
@@ -449,13 +506,23 @@ impl SyncPosition {
     pub const fn is_removal(&self) -> bool {
         !self.revision.is_present()
     }
+
+    /// Returns the recovery whose history this place is in, or none for a service never put back.
+    #[must_use]
+    pub const fn recovery(&self) -> Option<SyncRecoveryId> {
+        self.recovery.0
+    }
 }
 
 impl std::fmt::Display for SyncPosition {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.revision.as_ref() {
-            Some(revision) => write!(formatter, "write {} ({revision})", self.write_sequence),
-            None => write!(formatter, "write {} (removed)", self.write_sequence),
+            Some(revision) => write!(formatter, "write {} ({revision})", self.write_sequence)?,
+            None => write!(formatter, "write {} (removed)", self.write_sequence)?,
+        }
+        match self.recovery() {
+            Some(recovery) => write!(formatter, " after recovery {recovery}"),
+            None => Ok(()),
         }
     }
 }
@@ -481,7 +548,29 @@ pub enum SyncExchanged {
         /// conflict copy of its own names that copy here, and the ciphertext it holds is content
         /// this device sent, which section 24 shows rather than pretends away.
         retained: Option<SyncConflictId>,
+        /// Where the object stood when the refusal was answered: the write that beat this one, or
+        /// the place a removal took, and nothing when the collection had never held the object.
+        ///
+        /// An answer given again from a receipt names where the object stood when the first attempt
+        /// was answered, not where it stands now.
+        current: Option<SyncPosition>,
+        /// The history the refusal was answered in, which [`Self::Refused::current`] names too when
+        /// there is one. It is here for the refusal of an object the collection had never held,
+        /// which names no place and still says which history of the collection holds nothing.
+        recovery: Option<SyncRecoveryId>,
     },
+}
+
+impl SyncExchanged {
+    /// Returns the history this answer came from: the recovery it named, or none for a service
+    /// never put back.
+    #[must_use]
+    pub const fn recovery(&self) -> Option<SyncRecoveryId> {
+        match self {
+            Self::Applied { position } => position.recovery(),
+            Self::Refused { recovery, .. } => *recovery,
+        }
+    }
 }
 
 /// What a synchronisation service recorded about one request.
@@ -504,14 +593,20 @@ pub enum SyncRequestStatus {
     Refused {
         /// The copy the service kept of the refused write, when it kept one.
         retained: Option<SyncConflictId>,
+        /// The history the collection answered from, as it stands now.
+        recovery: Option<SyncRecoveryId>,
     },
     /// The service holds no receipt for this request.
     ///
     /// Two different things look like this from here: a request that has not been executed, which
     /// may still be on its way, and a receipt that has passed section 9's thirty-day retention.
     /// Neither establishes that the write did not land, which is why this is one answer rather than
-    /// two, and why it settles nothing on its own.
-    Unknown,
+    /// two, and why it settles nothing on its own. A third joins them once a collection has been put
+    /// back: a request the replaced history ran and whose receipt no archive brought back.
+    Unknown {
+        /// The history the collection answered from.
+        recovery: Option<SyncRecoveryId>,
+    },
     /// The request was fenced before the service executed it, so it never will be.
     Fenced {
         /// Whether the service also established that the request never ran.
@@ -519,7 +614,23 @@ pub enum SyncRequestStatus {
         /// The fence receipt recorded it when the fence was made, and this repeats it, so asking
         /// again about a fenced request concludes exactly what the fence concluded.
         never_ran: bool,
+        /// The history the collection answered from, as it stands now.
+        recovery: Option<SyncRecoveryId>,
     },
+}
+
+impl SyncRequestStatus {
+    /// Returns the history this answer came from: the recovery it named, or none for a service
+    /// never put back.
+    #[must_use]
+    pub const fn recovery(&self) -> Option<SyncRecoveryId> {
+        match self {
+            Self::Applied { position } => position.recovery(),
+            Self::Refused { recovery, .. }
+            | Self::Unknown { recovery }
+            | Self::Fenced { recovery, .. } => *recovery,
+        }
+    }
 }
 
 /// What a synchronisation service answered when asked to fence one request.
@@ -538,6 +649,8 @@ pub enum SyncRequestFence {
     Refused {
         /// The copy the service kept of the refused write, when it kept one.
         retained: Option<SyncConflictId>,
+        /// The history the collection answered from, as it stands now.
+        recovery: Option<SyncRecoveryId>,
     },
     /// The request is fenced: nothing will execute under this identity.
     ///
@@ -554,9 +667,26 @@ pub enum SyncRequestFence {
         /// here, because every fact in that comparison is the service's.
         ///
         /// False says only that the service could not establish it, never that the request ran. So
-        /// a caller keeps whatever account it owes for content that left the device.
+        /// a caller keeps whatever account it owes for content that left the device. A collection
+        /// put back answers false for a while for every request signed before the restore, because
+        /// the history it replaced may have run them.
         never_ran: bool,
+        /// The history the collection answered from, as it stands now. The fence holds in that
+        /// history, which is the one the service serves.
+        recovery: Option<SyncRecoveryId>,
     },
+}
+
+impl SyncRequestFence {
+    /// Returns the history this answer came from: the recovery it named, or none for a service
+    /// never put back.
+    #[must_use]
+    pub const fn recovery(&self) -> Option<SyncRecoveryId> {
+        match self {
+            Self::Applied { position } => position.recovery(),
+            Self::Refused { recovery, .. } | Self::Fenced { recovery, .. } => *recovery,
+        }
+    }
 }
 
 /// Where a shared collection's key records stood when a service answered: the newest record's key
@@ -570,6 +700,9 @@ pub struct KeyHead {
     pub epoch: u64,
     /// The newest record's revision.
     pub revision: u64,
+    /// The history that revision is a place in: the recovery the answer named, or none for a
+    /// service never put back. Two revisions compare only under one.
+    pub recovery: Option<SyncRecoveryId>,
 }
 
 /// What a service answered about one request in a collection two or more devices share.
@@ -639,6 +772,11 @@ pub enum Keyed<T> {
 /// 6. **A copy goes when the person has chosen.** [`Self::resolve`] drops the copy a refusal
 ///    named, and answers a copy that is already gone the same way rather than failing, so a caller
 ///    unsure whether its resolution arrived asks again.
+/// 7. **Every answer names its history.** A position carries the [`SyncRecoveryId`] its answer
+///    named, and an answer that names no position carries it beside what it says, so a caller can
+///    tell a collection put back from one that went backwards or forked. The identity is the
+///    service's to state: an implementation passes on the one it was given and invents none, and an
+///    answer that states none is not one it can pass on.
 pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
     /// Publishes an encrypted object, comparing against where the caller last saw the object.
     ///
