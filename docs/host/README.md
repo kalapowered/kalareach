@@ -2780,8 +2780,9 @@ fails executes nothing.
 Admission is decided from the workflow journal: four runs of a workflow at once, a hundred more
 waiting as pending, and host-wide and per-grant rates whose admissions the journal keeps, so a
 restart is not a way past them. A run's deadline and each action's wait are measured on the
-daemon's own reading of UTC, and an action that outlives either is asked to stop. A limit
-exceeded pauses the workflow and records one attention item. A new chain inherits the session
+daemon's own reading of UTC, carried forward by the continuous clock, and an action that outlives
+either is asked to stop and stops its run. A limit exceeded pauses the workflow and records one
+attention item. A new chain inherits the session
 number admission enforces as a ceiling on the sessions it creates. Breaching a causal budget pauses
 the chain with error code `CAUSAL_LIMIT`, rejects further descendants, and commits one attention
 record in the same transaction as the pause.

@@ -270,14 +270,21 @@ each of them as it stood and two admissions that arrive together cannot both tak
   and ten-minute action wait, and may neither lengthen them nor set one to nothing. A run's
   deadline starts when the run starts running. The host waits for an action no longer than its
   wait or its run's deadline, whichever passes first, reading its clock at least every quarter
-  second while it waits, and then asks the action to stop. A kind that can be stopped settles
-  cancelled, which says the host stopped asking and not that the world is as it was; a kind that
-  cannot settles unknown, and its dependants pause for review. Neither change-set kind can be
-  stopped once it has begun. A run past its deadline dispatches nothing further: the nodes still
-  waiting and the run itself are cancelled.
+  second while it waits, and then asks the action to stop. A report it reads only once its clock
+  has passed the wait is not taken, however the host got there. A kind that can be stopped
+  settles cancelled, which says the host stopped asking and not that the world is as it was; a
+  kind that cannot settles unknown. Neither change-set kind can be stopped once it has begun.
+* **A limit stops the run.** When a run's deadline or an action's wait passes, the run dispatches
+  nothing further. In one transaction, the action it outlived settles as above, every node still
+  waiting that depends on an outcome that is not known pauses for review, every other node still
+  waiting is cancelled, the run is cancelled, and the revision pauses with its attention item. A
+  run the host finds unfinished, with an outcome not known or a node waiting for review, after its
+  deadline has passed is stopped the same way, which is what a restart finds when a run was
+  interrupted and its deadline went by; a run whose every node settled finished its work.
 * **The host's clock.** Deadlines, waits and a chain's lifetime are measured on the daemon's own
-  reading of UTC, the later of the wall clock and its clock floor, so a wall clock wound back
-  extends none of them.
+  reading of UTC, the later of the wall clock and its clock floor, carried forward by the
+  suspend-aware continuous clock whenever that is further on. A wall clock wound back therefore
+  neither moves the reading backwards nor holds it still, and a suspension counts.
 
 A limit exceeded, whether a full queue, a rate, a run deadline or an action's wait, pauses the
 workflow revision and records one attention item, in one transaction, so the workflow stops
@@ -310,7 +317,11 @@ the daemon's registry, because a causal budget has to survive a reboot as well a
   that has to be up first; a start that fails executes nothing. Only nodes that were never
   dispatched go on, each after its grant is read again. Causal budgets, run records, node
   receipts, pending triggers and the dispatcher's own position are all the journal's and come
-  back as they were left.
+  back as they were left. Every dispatcher pass after that does the same for a run whose
+  execution in this daemon ended without settling it, a journal write that failed part way among
+  them, so no run holds one of its workflow's places while nothing executes it. A run under way is
+  held by its execution from inside the transaction that made it running, so it is never taken
+  up twice.
 * **Cancellation.** Cancelling a run stops undispatched nodes: the journal, not a snapshot taken
   when the run started, decides whether a node still has anything owed to it, so a cancellation
   that arrives while an earlier node is running still stops the next one. Cancellation is
