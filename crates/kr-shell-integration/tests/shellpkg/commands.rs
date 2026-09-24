@@ -13,8 +13,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use kr_protocol::root::{CommandBypassReason, DETACH_HINT, RootCommandResolveParams};
+use kr_protocol::root::{
+    CommandBypassReason, DETACH_HINT, FENCE_EXCHANGE_TIMEOUT, FenceCause, FenceRefusalReason,
+    RootCommandResolveParams, RootEditorFenceParams, RootEditorFenceResult,
+};
 use kr_protocol::session::{CommandIntegration, EnvironmentVariable};
+use kr_shell_integration::contract::events::ConsumeReason;
 use kr_shell_integration::contract::qualification::ShellKind;
 
 use super::*;
@@ -421,11 +425,15 @@ pub fn forms_the_root_shell_does_not_start_itself_never_ask(kind: ShellKind) {
             "kr_probe_function() { kr-probe in-a-function; }; kr_probe_function".to_owned(),
         ),
         ("an eval", "eval 'kr-probe in-an-eval'".to_owned()),
-        // The last part of a pipeline can run in the root shell itself, with the pipe on its
-        // input: zsh runs a group there.
+        // The last part of a pipeline can run in the root shell itself: zsh runs a group there,
+        // and a redirection of the group's own does not make it any less part of the pipeline.
         (
             "a group at the end of a pipeline",
             "printf x | { kr-probe in-a-group; }".to_owned(),
+        ),
+        (
+            "a redirected group at the end of a pipeline",
+            "printf x | { kr-probe in-a-redirected-group; } </dev/null".to_owned(),
         ),
     ];
     let mut forms = forms.to_vec();
@@ -437,6 +445,12 @@ pub fn forms_the_root_shell_does_not_start_itself_never_ask(kind: ShellKind) {
              set -m"
                 .to_owned(),
         ));
+        forms.push((
+            "a redirected group as the last part of a pipeline the shell runs itself",
+            "set +m; shopt -s lastpipe; printf x | { kr-probe in-the-last-group; } </dev/null; \
+             shopt -u lastpipe; set -m"
+                .to_owned(),
+        ));
     }
     for (form, command) in forms {
         let runs = probes.runs().len();
@@ -444,6 +458,16 @@ pub fn forms_the_root_shell_does_not_start_itself_never_ask(kind: ShellKind) {
         assert!(asked.is_empty(), "{form} asked: {asked:?}");
         assert_eq!(probes.runs().len(), runs + 1, "{form} ran the program once");
     }
+
+    // A group reading a string is no pipeline, however the shell carries the string to it: it
+    // asks.
+    let asked = session.run_asking("{ kr-probe from-a-string; } <<<x", "probe-ran");
+    assert_eq!(
+        asked.len(),
+        1,
+        "a group reading a string asks once: {asked:?}"
+    );
+    assert_eq!(last_run(&probes).arguments, ["from-a-string"]);
 
     // The interpreter a script is started with is a command of the line, so it asks; nothing
     // the script runs does.
@@ -922,5 +946,140 @@ pub fn a_line_exports_the_capability_minted_for_it(kind: ShellKind) {
     assert!(
         !ran.environment.contains_key("KR_DETACH_TOKEN"),
         "a line with no capability ran with one: {ran:?}"
+    );
+
+    // A bridge that goes while its line runs leaves nothing the next line could present: the
+    // capability leaves the environment with its line, bridge or no bridge.
+    session.commands.withhold_tokens = false;
+    session.commands.policy = ResolvePolicy::CloseEndpoint;
+    assert!(session.run("kr-probe as-the-bridge-goes", "probe-ran"));
+    assert!(
+        last_run(&probes)
+            .environment
+            .contains_key("KR_DETACH_TOKEN"),
+        "the line was answered with its capability before the bridge went"
+    );
+    assert!(session.run("kr-probe after-the-bridge", "probe-ran"));
+    let ran = last_run(&probes);
+    assert!(
+        !ran.environment.contains_key("KR_DETACH_TOKEN"),
+        "a line after the bridge went ran with the last line's capability: {ran:?}"
+    );
+}
+
+/// KR-REQ-07.34, KR-REQ-07.35: what the worker sends while a shell waits for an answer before a
+/// command starts reaches the next reader in the order it came, once, and with nothing more from
+/// the worker: each request is answered once, a detach's answer is acted on once, and the
+/// publication sent last is the one in force.
+pub fn frames_that_arrive_while_a_command_waits_reach_the_reader_once(kind: ShellKind) {
+    let Some(package) = Package::found(kind) else {
+        return;
+    };
+    let probes = Probes::new();
+    let mut session = a_session_with_probes(&package, &probes);
+
+    // A gesture at a fenced prompt leaves a detach waiting for the worker's answer, which comes
+    // only after the next line has been typed.
+    let (reader, _) = session.fenced_prompt(4);
+    session.type_bytes(CTRL_D);
+    let (detach, _) = session.expect_event("eof_detach", |event| {
+        matches!(event, BridgeEvent::EofDetach(_))
+    });
+
+    let fence = fence_for(&reader, fence_id(9), attachment_id(9), epoch(1));
+    let ask = |session: &mut Session| {
+        let id = RequestId::new(session.next_request);
+        session.next_request += 1;
+        let request = BridgeFrame::Request {
+            id,
+            request: WorkerRequest::Fence(RootEditorFenceParams {
+                session_id: session.session_id,
+                fence_id: fence.fence_id,
+                prompt_generation: reader.prompt_generation,
+                reader_revision: reader.reader_revision,
+                deadline_ms: FENCE_EXCHANGE_TIMEOUT,
+                cause: FenceCause::EditorEntry,
+            }),
+        };
+        (id, request)
+    };
+    // Ahead of the acceptance's answer: a request, the detach's refusal and a fence's withdrawal.
+    // Ahead of the resolve's: another request and that fence published. Taken in order, that
+    // leaves the fence held, about the reader the line was typed at.
+    let (first, request) = ask(&mut session);
+    session.commands.before_acceptance_answer = vec![
+        request,
+        BridgeFrame::EventResult {
+            id: detach,
+            result: detach_refusal(),
+        },
+        BridgeFrame::FencePublished(FencePublication::Invalidated {
+            fence_id: fence.fence_id,
+            reason: WithheldReason::ReaderMoved,
+            state: FenceState::Unfenced,
+        }),
+    ];
+    let (second, request) = ask(&mut session);
+    session.commands.before_resolve_answer = vec![
+        request,
+        BridgeFrame::FencePublished(FencePublication::Published(fence.clone())),
+    ];
+    // Nothing is answered after the resolve, so what the next reader does with those frames
+    // depends on nothing more arriving.
+    session.commands.silent_after_resolve = true;
+
+    let asked = session.run_asking("kr-probe amid-traffic", "probe-ran");
+    assert_eq!(asked.len(), 1, "one command asks once: {asked:?}");
+    assert_eq!(last_run(&probes).arguments, ["amid-traffic"]);
+    for id in [first, second] {
+        match session.answer(id) {
+            BridgeAnswer::Fence(RootEditorFenceResult::Refused(refusal)) => {
+                assert_eq!(refusal.reason, FenceRefusalReason::ReaderMoved);
+            }
+            other => panic!("a request about a reader that had gone was answered with {other:?}"),
+        }
+    }
+
+    // The refused detach is consumed with the hint, once, by the reader that took the refusal.
+    let (_, refused) = session.expect_event("the refused detach consumed", |event| {
+        matches!(event, BridgeEvent::PreEofConsumed(_))
+    });
+    let BridgeEvent::PreEofConsumed(refused) = refused else {
+        unreachable!()
+    };
+    assert!(refused.hint_printed, "a refused detach printed no hint");
+    assert!(
+        !session.saw_event(Duration::from_millis(300), |event| matches!(
+            event,
+            BridgeEvent::PreEofConsumed(_)
+        )),
+        "a refused detach was acted on more than once"
+    );
+
+    // The fence the bridge holds is the one published last, which names the reader the line was
+    // typed at, so a gesture here is consumed as a stale fence's. Had the publication been lost,
+    // or taken before what came ahead of it, there would be no fence at all.
+    session.type_bytes(CTRL_D);
+    let (_, consumed) = session.expect_event("pre_eof_consumed", |event| {
+        matches!(event, BridgeEvent::PreEofConsumed(_))
+    });
+    let BridgeEvent::PreEofConsumed(consumed) = consumed else {
+        unreachable!()
+    };
+    assert_eq!(consumed.reason, ConsumeReason::FenceStale);
+
+    session.commands.stuck = false;
+    assert!(session.answered("kr-after-traffic"));
+    let answered: Vec<RequestId> = session
+        .commands
+        .answer_ids
+        .iter()
+        .copied()
+        .filter(|id| *id == first || *id == second)
+        .collect();
+    assert_eq!(
+        answered,
+        [first, second],
+        "each request the reader held was answered once, in the order it came"
     );
 }

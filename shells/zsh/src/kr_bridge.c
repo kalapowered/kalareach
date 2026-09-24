@@ -304,15 +304,6 @@ kr_utf8_valid(const unsigned char *text, size_t len)
     return 1;
 }
 
-/* Whether a descriptor of this process is one end of a pipe. */
-static int
-kr_is_pipe(int fd)
-{
-    struct stat file;
-
-    return fstat(fd, &file) == 0 && S_ISFIFO(file.st_mode);
-}
-
 /* Whether a C string is well-formed UTF-8. */
 static int
 kr_utf8_text(const char *text)
@@ -2568,15 +2559,6 @@ kr_bridge_resolve(const char *const *argv, size_t argc, const char *executable, 
     memset(out, 0, sizeof(*out));
     if (!kr_bridge_root_process() || argv == NULL || argc == 0 || executable == NULL ||
         cwd == NULL) {
-        return 0;
-    }
-    /*
-     * A command whose input or output is a pipe is part of a pipeline, even where the shell runs
-     * that part itself rather than in a child it forks: the last part of a pipeline can run in
-     * the root shell, with the pipe on its input.
-     */
-    if (kr_is_pipe(0) || kr_is_pipe(1)) {
-        kr_trace("resolve: %s was not asked about: it is part of a pipeline", argv[0]);
         return 0;
     }
     /*

@@ -520,6 +520,14 @@ kr_zle_finish(void)
 void
 kr_zle_enter(void)
 {
+    /* The line before this prompt has run: its block ends with the shell's own status for it, and
+     * its capability leaves the environment with it. That holds whether or not the bridge is still
+     * there, because a capability the worker has ended must not outlive its line. */
+    if (kr_line_running && zlecontext == ZLCON_LINE_START) {
+        kr_line_running = 0;
+        kr_bridge_block_finished(lastval);
+        kr_shell_unexport(KR_DETACH_TOKEN_VARIABLE);
+    }
     if (!kr_bridge_registered()) {
         return;
     }
@@ -529,13 +537,6 @@ kr_zle_enter(void)
     }
     kr_reader_revision++;
     if (zlecontext == ZLCON_LINE_START) {
-        /* The line before this prompt has run: its block ends with the shell's own status for
-         * it, and its capability leaves the environment with it. */
-        if (kr_line_running) {
-            kr_line_running = 0;
-            kr_bridge_block_finished(lastval);
-            kr_shell_unexport(KR_DETACH_TOKEN_VARIABLE);
-        }
         kr_prompt_generation++;
     }
     kr_track_cwd();

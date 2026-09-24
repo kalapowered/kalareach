@@ -92,15 +92,17 @@ input it is holding, and a launch that arrives at that moment is refused with `q
 rather than installed over it.
 
 The fourth patch is the command integration's one point in the executor. `execcmd_exec` asks,
-immediately before it forks an external command, when the command has no pipe, is not a background
-job, holds no filename pattern still to expand and has no assignments in front of it: zsh expands a
-pattern and applies those assignments only in the child, where `PATH` or `ARGV0` would change what
-runs, so a command with either is not asked about. The question is a pointer, `kr_resolve_hook`,
-that the editor module sets when it loads and clears in its `finish_`, so the executor never calls
-into a module that is not there; the bridge answers it, and refuses everything but a top-level
-command of the accepted line that the root shell starts itself. When the answer names a launcher,
-the forked child's `execute` starts it in the command's place with the backend's variables added,
-and a launcher that cannot be started leaves the child running the command as it was typed.
+immediately before it forks an external command, when the command is in no pipeline, is not a
+background job, holds no filename pattern still to expand and has no assignments in front of it. The
+part of a pipeline zsh runs itself, a group at its end for one, runs with `list_pipe` set, which is
+how the question tells it apart. Zsh expands a pattern and applies those assignments only in the
+child, where `PATH` or `ARGV0` would change what runs, so a command with either is not asked about.
+The question is a pointer, `kr_resolve_hook`, that the editor module sets when it loads and clears
+in its `finish_`, so the executor never calls into a module that is not there; the bridge answers
+it, and refuses everything but a top-level command of the accepted line that the root shell starts
+itself. When the answer names a launcher, the forked child's `execute` starts it in the command's
+place with the backend's variables added, and a launcher that cannot be started leaves the child
+running the command as it was typed.
 
 ## What Bash changes
 
@@ -148,14 +150,15 @@ The patch leaves Bash's parser alone on purpose. Bash ships a generated `y.tab.c
 carry. Calling the two functions Bash already exports costs nothing and keeps the build to a C
 compiler.
 
-The fourth patch is the command integration's one point in the executor. `execute_disk_command`
-asks after `search_for_command` has found the file and before `make_child`, when the command has no
-pipe and is not a background job. `kr_bash_resolve`, in the shell's own half of the bridge, refuses
-everything but a command of the accepted line: never one a function, a sourced or startup file, an
-`eval`, a trap, `PROMPT_COMMAND` or a subshell runs. When the answer names a launcher, the forked
-child starts it in the command's place with the backend's variables added to the environment it
-would have had, and a launcher that cannot be started leaves the child running the command as it
-was typed.
+The fourth patch is the command integration's one point in the executor. `execute_disk_command` asks
+after `search_for_command` has found the file and before `make_child`, when the command is in no
+pipeline and is not a background job. `execute_pipeline` marks the last part of a pipeline while it
+runs that part in the shell itself under `lastpipe`, because that part has no pipe arguments of its
+own. `kr_bash_resolve`, in the shell's own half of the bridge, refuses everything but a command of
+the accepted line: never one a function, a sourced or startup file, an `eval`, a trap,
+`PROMPT_COMMAND` or a subshell runs. When the answer names a launcher, the forked child starts it in
+the command's place with the backend's variables added to the environment it would have had, and a
+launcher that cannot be started leaves the child running the command as it was typed.
 
 ## What fish changes
 

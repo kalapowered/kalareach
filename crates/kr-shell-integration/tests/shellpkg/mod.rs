@@ -352,6 +352,8 @@ pub enum ResolvePolicy {
     Silent,
     /// A refusal, which is no detach's and must not be taken for one.
     Refuse,
+    /// No answer, and the endpoint closed, as by a worker that went while the shell asked.
+    CloseEndpoint,
     /// A backend the worker established: the answer names `launcher`, adds `environment` for the
     /// one invocation and appends `added` to the vector.
     Backend {
@@ -381,6 +383,16 @@ pub struct Commands {
     pub withhold_tokens: bool,
     /// Whether the worker side has stopped answering anything at all.
     pub stuck: bool,
+    /// Frames written ahead of the next answer to a resolve, as a worker's other traffic can be.
+    pub before_resolve_answer: Vec<BridgeFrame>,
+    /// Frames written ahead of the next answer to an acceptance.
+    pub before_acceptance_answer: Vec<BridgeFrame>,
+    /// Whether the worker side stops answering anything once it has answered the next resolve.
+    pub silent_after_resolve: bool,
+    /// The request every answer the reader sent was for, in the order the answers arrived.
+    pub answer_ids: Vec<RequestId>,
+    /// Set when this side is to close the endpoint once the event in hand has been read.
+    close_requested: bool,
     /// Every resolve the bridge asked.
     pub resolves: Vec<kr_protocol::root::RootCommandResolveParams>,
     /// Every command block the bridge reported.
@@ -991,6 +1003,11 @@ impl Session {
                     // the rest of this call would be waiting for a stream that has ended.
                     return;
                 }
+                if self.shut {
+                    // This side closed the endpoint, so the read above returned at once: the
+                    // interval is only time passing, and passes without taking a processor.
+                    std::thread::sleep(left.min(Duration::from_millis(20)));
+                }
                 continue;
             };
             match frame {
@@ -1008,13 +1025,27 @@ impl Session {
                     }
                     let outcome = self.routine_answer(&event);
                     if let Some(result) = outcome {
+                        // What a case put ahead of this answer goes first, in the same write, so
+                        // the shell reads it while it waits.
+                        let mut frames = match &event {
+                            BridgeEvent::CommandResolve(_) => {
+                                std::mem::take(&mut self.commands.before_resolve_answer)
+                            }
+                            BridgeEvent::CommandAccepted(_) => {
+                                std::mem::take(&mut self.commands.before_acceptance_answer)
+                            }
+                            _ => Vec::new(),
+                        };
+                        frames.push(BridgeFrame::EventResult { id, result });
                         // A routine acknowledgement is not a check's own write, so a bridge that
                         // has gone is recorded here rather than asserted: the check that needs a
                         // working endpoint asks for one and says so itself.
-                        let _ = self.write_frames_before(
-                            &[BridgeFrame::EventResult { id, result }],
-                            deadline,
-                        );
+                        let _ = self.write_frames_before(&frames, deadline);
+                        if matches!(event, BridgeEvent::CommandResolve(_))
+                            && std::mem::take(&mut self.commands.silent_after_resolve)
+                        {
+                            self.commands.stuck = true;
+                        }
                     }
                     // The one way an event reaches the queue, and the inbox counts a managed
                     // decision as it takes it in: a wait that later drops it from the queue
@@ -1024,8 +1055,13 @@ impl Session {
                         event,
                         reader_lifetime: self.reader_lifetime,
                     });
+                    if std::mem::take(&mut self.commands.close_requested) {
+                        self.close_endpoint();
+                        return;
+                    }
                 }
                 BridgeFrame::Answer { id, answer } => {
+                    self.commands.answer_ids.push(id);
                     self.answers.insert(id, (Instant::now(), answer));
                 }
                 other => panic!("a bridge sent {other:?}"),
@@ -1079,6 +1115,10 @@ impl Session {
                 let answer = match &self.commands.policy {
                     ResolvePolicy::Decide(integrations) => worker_decision(integrations, params),
                     ResolvePolicy::Silent => return None,
+                    ResolvePolicy::CloseEndpoint => {
+                        self.commands.close_requested = true;
+                        return None;
+                    }
                     ResolvePolicy::Refuse => {
                         return Some(EventOutcome::Refused(ProtocolError::new(
                             ErrorCode::PermissionDenied,

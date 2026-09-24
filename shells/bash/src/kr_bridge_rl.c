@@ -409,23 +409,22 @@ kr_rl_pending_paste (int active)
 void
 kr_rl_enter (void)
 {
+  /* The line before this prompt has run: its block ends with the shell's own status for it, and
+     its capability leaves the environment with it. That holds whether or not the bridge is still
+     there, because a capability the worker has ended must not outlive its line. */
+  if (kr_line_running && kr_context () == KR_CONTEXT_PRIMARY)
+    {
+      kr_line_running = 0;
+      kr_bridge_block_finished (kr_shell_last_status ());
+      kr_shell_unexport (KR_DETACH_TOKEN_VARIABLE);
+    }
   if (kr_bridge_registered () == 0)
     return;
   if (kr_inside_reader)
     kr_bridge_editor_leave (KR_LEAVE_READER_TAKEOVER);
   kr_reader_revision++;
   if (kr_context () == KR_CONTEXT_PRIMARY)
-    {
-      /* The line before this prompt has run: its block ends with the shell's own status for it,
-	 and its capability leaves the environment with it. */
-      if (kr_line_running)
-	{
-	  kr_line_running = 0;
-	  kr_bridge_block_finished (kr_shell_last_status ());
-	  kr_shell_unexport (KR_DETACH_TOKEN_VARIABLE);
-	}
-      kr_prompt_generation++;
-    }
+    kr_prompt_generation++;
   kr_track_cwd ();
   kr_buffer_hash = kr_hash_line ();
   kr_buffer_revision++;

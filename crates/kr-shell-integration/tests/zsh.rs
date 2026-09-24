@@ -145,6 +145,12 @@ fn diagnostics_that_cannot_be_written_never_hold_a_command_up() {
     shellpkg::diagnostics_that_cannot_be_written_never_hold_a_command_up(ZSH);
 }
 
+/// KR-REQ-07.34, KR-REQ-07.35
+#[test]
+fn frames_that_arrive_while_a_command_waits_reach_the_reader_once() {
+    shellpkg::frames_that_arrive_while_a_command_waits_reach_the_reader_once(ZSH);
+}
+
 /// KR-REQ-12.07
 #[test]
 fn an_absolute_path_invocation_runs_as_typed() {

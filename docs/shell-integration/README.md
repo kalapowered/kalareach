@@ -294,9 +294,10 @@ prompt, and that line is the one that runs.
 
 The Zsh and Bash packages export it for a primary or continuation line, after waiting at most one
 second for the answer that carries it, and take it out of the environment again when the next
-primary reader starts. The fish and PSReadLine packages do not export it, so a bare `kr detach`
-inside one of those is answered with the instruction to name the attachment, which is the refusal
-this contract asks for rather than an attachment the host cannot stand behind.
+primary reader starts, whether or not the bridge is still connected by then. The fish and PSReadLine
+packages do not export it, so a bare `kr detach` inside one of those is answered with the
+instruction to name the attachment, which is the refusal this contract asks for rather than an
+attachment the host cannot stand behind.
 
 ### The command a line runs
 
@@ -305,13 +306,14 @@ itself: an external command found on the search path, at the top level of the li
 foreground and with no pipe. The question is `command_resolve`, asked from the shell's executor
 after its own search has found the file and before it forks, so it names the vector the shell is
 about to run, the absolute path it found and the directory it runs in. A command in a subshell, a
-command substitution or the background runs in a process the shell forks; a command whose input or
-output is a pipe is part of a pipeline, even the last part a shell runs itself; and one that a
-function, a sourced or startup file, an `eval`, a trap or a prompt hook runs is not a command of the
-line. None of these asks, and each runs as it was typed. A script is a process of its own, so only
-the interpreter it is started with is asked about. Zsh expands a filename pattern and applies the
-assignments in front of a command only in the child it forks, so a command with either is not asked
-about either: `PATH` or `ARGV0` there would change the file or the vector that runs.
+command substitution or the background runs in a process the shell forks; a command in any part of a
+pipeline is part of that pipeline, including the part a shell runs itself (zsh runs a group at the
+end of one, and Bash its last part under `lastpipe`); and one that a function, a sourced or startup
+file, an `eval`, a trap or a prompt hook runs is not a command of the line. None of these asks, and
+each runs as it was typed. A script is a process of its own, so only the interpreter it is started
+with is asked about. Zsh expands a filename pattern and applies the assignments in front of a
+command only in the child it forks, so a command with either is not asked about either: `PATH` or
+`ARGV0` there would change the file or the vector that runs.
 
 The shell waits at most one second for the answer. A bypass, a refusal, the deadline and a lost
 endpoint all run the command exactly as the shell would have run it without asking: the same file,
