@@ -13,6 +13,7 @@ import { Badge, Banner, Button, Card, CommitButton } from '../components/ui'
 import { useApp } from '../app/state'
 import { failureMessage } from '../host/port'
 import { outcomeMessage, receiptTone } from './Conversation'
+import { Confirmations } from '../pairing/Confirmations'
 import type { AttentionEntry, AttentionInbox, AttentionKind } from '../model/pending'
 
 const FILTERS: readonly { readonly value: AttentionKind | 'all'; readonly label: string }[] = [
@@ -108,6 +109,8 @@ export function Attention(): ReactNode {
           <p>Decisions, failures and finished work, across every host you have paired.</p>
         </div>
       </header>
+
+      <Confirmations />
 
       {failure ? (
         <Banner

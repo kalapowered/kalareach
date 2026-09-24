@@ -1,145 +1,268 @@
-//! The owner's user-verification ceremony.
+//! The owner's user-verification ceremony, drawn by the platform.
 //!
 //! Section 10 wants a protected native ceremony on the unlocked owner device for a rights-enlarging
 //! action, and says plainly what will not do: a click that desktop automation can synthesise is not
-//! proof that a person was present. So the ceremony is not a dialog this application draws. On
-//! macOS it is `LAContext`, which the window server presents and this process cannot drive.
+//! proof that a person was present. So the ceremony is never a dialog this application draws. On
+//! macOS it is `LAContext`, whose reason is the one-line description the dialog prints: Touch ID,
+//! or the password on a Mac without it. On Windows it is Windows Hello, through
+//! `UserConsentVerifier` for this application's window, whose message is the same line. Other
+//! platforms have none here, and a device without one signs nothing.
 //!
-//! What this module returns is a *presence* result. The confirmation itself is the host's: it binds
-//! the action digest, the destination keys, the host, the nonce and the expiry, and it records the
-//! user-presence verification and the challenge-consumption transition in its acceptance record.
-//! This is the part that has to happen on the device, and it is deliberately the only part here.
+//! Every ceremony is bounded by the challenge's remaining lifetime: at the bound the platform's
+//! dialog is dismissed (`LAContext::invalidate`, `IAsyncOperation::Cancel`) and the answer is "not
+//! confirmed", and an answer that arrives after that is discarded. What this module returns is only
+//! whether the person confirmed; kr-client decides what that lets it sign.
 
-use serde::Serialize;
+use std::sync::Arc;
+use std::time::Duration;
 
-use crate::error::{CommandError, Result};
+use kr_client::pairing::BoxFuture;
+use kr_client::pairing::owner::{Ceremony, CeremonyKind, CeremonyOutcome};
 
-/// What the platform said about the person in front of the device.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct Presence {
-    /// True only when the platform's own ceremony completed.
-    pub verified: bool,
-    /// Which ceremony ran, so the host's acceptance record can name it.
-    pub mechanism: String,
-    /// What the person was asked to authorise, repeated back.
-    pub reason: String,
+/// The ceremony this computer offers. On Windows it belongs to `window`, so the dialog is that
+/// window's.
+#[must_use]
+pub fn platform_ceremony<R: tauri::Runtime>(
+    window: Option<tauri::WebviewWindow<R>>,
+) -> Arc<dyn Ceremony> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = window;
+        Arc::new(mac::LocalAuthentication)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        match window.and_then(|window| window.hwnd().ok()) {
+            Some(hwnd) => Arc::new(hello::WindowsHello::for_window(hwnd)),
+            None => Arc::new(NoCeremony),
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = window;
+        Arc::new(NoCeremony)
+    }
 }
 
-/// The longest reason this application will put in front of a person.
-const MAX_REASON_LEN: usize = 200;
+/// A device with no ceremony: it confirms nothing and says so.
+#[derive(Debug)]
+pub struct NoCeremony;
 
-/// Runs the platform's user-verification ceremony.
-///
-/// # Errors
-///
-/// Returns `UNAVAILABLE` on a platform or device with no such ceremony, because a client that
-/// answered "verified" without one would be making the claim section 10 forbids. Returns
-/// `PERMISSION_DENIED` when the ceremony ran and the person did not complete it.
-pub fn verify_owner_presence(reason: &str) -> Result<Presence> {
-    let reason = reason.trim();
-    if reason.is_empty() || reason.len() > MAX_REASON_LEN {
-        return Err(CommandError::invalid(
-            "the ceremony states what is being authorised, in one short line",
-        ));
+impl Ceremony for NoCeremony {
+    fn kind(&self) -> CeremonyKind {
+        CeremonyKind::None
     }
-    if reason.chars().any(char::is_control) {
-        return Err(CommandError::invalid(
-            "the ceremony's reason is one line of plain text",
-        ));
+
+    fn verify<'a>(&'a self, _reason: &'a str, _within: Duration) -> BoxFuture<'a, CeremonyOutcome> {
+        Box::pin(async { CeremonyOutcome::Unavailable })
     }
-    platform_verify(reason)
 }
 
 #[cfg(target_os = "macos")]
-#[expect(
-    unsafe_code,
-    reason = "the user-verification ceremony is a call into Apple's LocalAuthentication runtime; \
-              this is the only function in this crate that leaves safe Rust"
-)]
-fn platform_verify(reason: &str) -> Result<Presence> {
-    use objc2_foundation::NSString;
-    use objc2_local_authentication::{LAContext, LAPolicy};
+mod mac {
+    use std::time::Duration;
 
-    let context = unsafe { LAContext::new() };
-    let policy = LAPolicy::DeviceOwnerAuthentication;
-    let localised = NSString::from_str(reason);
+    use kr_client::pairing::BoxFuture;
+    use kr_client::pairing::owner::{Ceremony, CeremonyKind, CeremonyOutcome};
 
-    // `canEvaluatePolicy` is what distinguishes a device that has no ceremony from a person who
-    // declined one. Without it, both would read as a refusal and the interface could not tell the
-    // owner to use a separately paired owner device instead.
-    if unsafe { context.canEvaluatePolicy_error(policy) }.is_err() {
-        return Err(CommandError::unavailable(
-            "this device has no user-verification ceremony; confirm from a separately paired \
-             owner device",
-        ));
+    /// macOS's `LocalAuthentication`.
+    #[derive(Debug)]
+    pub struct LocalAuthentication;
+
+    /// What this module asks `LAContext`.
+    enum Question<'a> {
+        /// Which ceremony the Mac offers.
+        Kind,
+        /// Whether the person confirms `reason`, answered within `within`.
+        Verify { reason: &'a str, within: Duration },
     }
 
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let handler = block2::RcBlock::new(
-        move |success: objc2::runtime::Bool, _error: *mut objc2_foundation::NSError| {
-            let _ = sender.send(success.as_bool());
-        },
-    );
-    unsafe {
-        context.evaluatePolicy_localizedReason_reply(policy, &localised, &handler);
+    enum Answer {
+        Kind(CeremonyKind),
+        Outcome(CeremonyOutcome),
     }
-    let verified = receiver
-        .recv_timeout(std::time::Duration::from_secs(120))
-        .map_err(|_| {
-            CommandError::unavailable("the user-verification ceremony was not completed")
-        })?;
 
-    if !verified {
-        return Err(CommandError::refused(
-            "the user-verification ceremony was not completed",
-        ));
-    }
-    Ok(Presence {
-        verified: true,
-        mechanism: "macos.local_authentication.device_owner".to_owned(),
-        reason: reason.to_owned(),
-    })
-}
+    impl Ceremony for LocalAuthentication {
+        fn kind(&self) -> CeremonyKind {
+            match ask(Question::Kind) {
+                Answer::Kind(kind) => kind,
+                Answer::Outcome(_) => CeremonyKind::None,
+            }
+        }
 
-#[cfg(not(target_os = "macos"))]
-fn platform_verify(_reason: &str) -> Result<Presence> {
-    // Windows Hello and the Linux desktop portals are the equivalents on the other two desktops,
-    // and neither is wired up yet. Answering "verified" here would be the exact claim section 10
-    // refuses, so the application says it cannot verify and the owner confirms from a device that
-    // can.
-    Err(CommandError::unavailable(
-        "this platform has no user-verification ceremony yet; confirm from a separately paired \
-         owner device",
-    ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_ceremony_without_a_stated_reason_is_refused() {
-        for reason in ["", "   ", "line\nbreak"] {
-            let error = verify_owner_presence(reason).expect_err("a reason is required");
-            assert_eq!(error.code, kr_protocol::error::ErrorCode::InvalidArgument);
+        fn verify<'a>(
+            &'a self,
+            reason: &'a str,
+            within: Duration,
+        ) -> BoxFuture<'a, CeremonyOutcome> {
+            let reason = reason.to_owned();
+            Box::pin(async move {
+                // The platform's window may stay up for as long as the person takes, so the
+                // evaluation waits on a blocking thread rather than a command's.
+                tokio::task::spawn_blocking(move || {
+                    match ask(Question::Verify {
+                        reason: &reason,
+                        within,
+                    }) {
+                        Answer::Outcome(outcome) => outcome,
+                        Answer::Kind(_) => CeremonyOutcome::NotConfirmed,
+                    }
+                })
+                .await
+                .unwrap_or(CeremonyOutcome::NotConfirmed)
+            })
         }
     }
 
-    #[test]
-    fn an_over_long_reason_is_refused() {
-        let reason = "a".repeat(MAX_REASON_LEN + 1);
-        let error = verify_owner_presence(&reason).expect_err("a reason is one short line");
-        assert_eq!(error.code, kr_protocol::error::ErrorCode::InvalidArgument);
+    #[expect(
+        unsafe_code,
+        reason = "the user-verification ceremony is a call into Apple's LocalAuthentication \
+                  runtime; on macOS this is the only function in this crate that leaves safe Rust"
+    )]
+    fn ask(question: Question<'_>) -> Answer {
+        use objc2_foundation::NSString;
+        use objc2_local_authentication::{LAContext, LAPolicy};
+
+        let context = unsafe { LAContext::new() };
+        match question {
+            // `canEvaluatePolicy` tells a Mac with no ceremony apart from a person who declined
+            // one, which is what lets the interface send the person to another owner device.
+            Question::Kind => {
+                if unsafe {
+                    context
+                        .canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthenticationWithBiometrics)
+                }
+                .is_ok()
+                {
+                    Answer::Kind(CeremonyKind::TouchId)
+                } else if unsafe {
+                    context.canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthentication)
+                }
+                .is_ok()
+                {
+                    Answer::Kind(CeremonyKind::Password)
+                } else {
+                    Answer::Kind(CeremonyKind::None)
+                }
+            }
+            Question::Verify { reason, within } => {
+                let policy = LAPolicy::DeviceOwnerAuthentication;
+                if unsafe { context.canEvaluatePolicy_error(policy) }.is_err() {
+                    return Answer::Outcome(CeremonyOutcome::Unavailable);
+                }
+                let (sender, receiver) = std::sync::mpsc::channel();
+                let handler = block2::RcBlock::new(
+                    move |success: objc2::runtime::Bool, _error: *mut objc2_foundation::NSError| {
+                        let _ = sender.send(success.as_bool());
+                    },
+                );
+                unsafe {
+                    context.evaluatePolicy_localizedReason_reply(
+                        policy,
+                        &NSString::from_str(reason),
+                        &handler,
+                    );
+                }
+                match receiver.recv_timeout(within) {
+                    Ok(true) => Answer::Outcome(CeremonyOutcome::Confirmed),
+                    Ok(false) => Answer::Outcome(CeremonyOutcome::NotConfirmed),
+                    // The challenge's time ran out: the platform's dialog goes, and a late reply
+                    // lands on a closed channel.
+                    Err(_) => {
+                        unsafe { context.invalidate() };
+                        Answer::Outcome(CeremonyOutcome::NotConfirmed)
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod hello {
+    use std::future::IntoFuture as _;
+    use std::time::Duration;
+
+    use kr_client::pairing::BoxFuture;
+    use kr_client::pairing::owner::{Ceremony, CeremonyKind, CeremonyOutcome};
+    use windows::Security::Credentials::UI::{
+        UserConsentVerificationResult, UserConsentVerifier, UserConsentVerifierAvailability,
+    };
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::WinRT::IUserConsentVerifierInterop;
+    use windows::core::HSTRING;
+    use windows_future::IAsyncOperation;
+
+    /// Windows Hello, for one window.
+    #[derive(Debug)]
+    pub struct WindowsHello {
+        window: isize,
     }
 
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn a_platform_without_a_ceremony_says_so_rather_than_claiming_presence() {
-        let error =
-            verify_owner_presence("Confirm this new device").expect_err("no ceremony, no claim");
-        assert_eq!(
-            error.code,
-            kr_protocol::error::ErrorCode::ResourceUnavailable
-        );
+    impl WindowsHello {
+        /// Windows Hello for the window `hwnd`.
+        pub fn for_window(hwnd: HWND) -> Self {
+            Self {
+                window: hwnd.0 as isize,
+            }
+        }
+    }
+
+    impl Ceremony for WindowsHello {
+        fn kind(&self) -> CeremonyKind {
+            let availability =
+                UserConsentVerifier::CheckAvailabilityAsync().and_then(|operation| operation.get());
+            match availability {
+                Ok(UserConsentVerifierAvailability::Available) => CeremonyKind::WindowsHello,
+                _ => CeremonyKind::None,
+            }
+        }
+
+        fn verify<'a>(
+            &'a self,
+            reason: &'a str,
+            within: Duration,
+        ) -> BoxFuture<'a, CeremonyOutcome> {
+            Box::pin(async move {
+                let Ok(operation) = request(self.window, reason) else {
+                    return CeremonyOutcome::Unavailable;
+                };
+                match tokio::time::timeout(within, operation.clone().into_future()).await {
+                    Ok(Ok(UserConsentVerificationResult::Verified)) => CeremonyOutcome::Confirmed,
+                    Ok(Ok(
+                        UserConsentVerificationResult::DeviceNotPresent
+                        | UserConsentVerificationResult::NotConfiguredForUser
+                        | UserConsentVerificationResult::DisabledByPolicy,
+                    )) => CeremonyOutcome::Unavailable,
+                    // Cancelled, retries used, the device busy, or an answer Windows could not
+                    // give: not confirmed.
+                    Ok(_) => CeremonyOutcome::NotConfirmed,
+                    // The challenge's time ran out: Windows Hello's dialog is cancelled, and a late
+                    // answer is never read.
+                    Err(_) => {
+                        let _ = operation.Cancel();
+                        CeremonyOutcome::NotConfirmed
+                    }
+                }
+            })
+        }
+    }
+
+    #[expect(
+        unsafe_code,
+        reason = "Windows Hello for a window is a COM interop call; on Windows this is the only \
+                  function in this crate that leaves safe Rust"
+    )]
+    fn request(
+        window: isize,
+        reason: &str,
+    ) -> windows::core::Result<IAsyncOperation<UserConsentVerificationResult>> {
+        let interop = windows::core::factory::<UserConsentVerifier, IUserConsentVerifierInterop>()?;
+        unsafe {
+            interop.RequestVerificationForWindowAsync(
+                HWND(window as *mut core::ffi::c_void),
+                &HSTRING::from(reason),
+            )
+        }
     }
 }
