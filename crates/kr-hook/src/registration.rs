@@ -390,6 +390,9 @@ fn wait_for_whole(
 ) -> Result<String, RegistrationError> {
     let mut seen = false;
     loop {
+        // Whether the deadline has passed is decided before the read, so the last read is taken
+        // after it: a registration published whole by then is found.
+        let expired = Instant::now() >= deadline;
         match read_bounded(path, MAX_REGISTRATION_BYTES) {
             Ok(content) => {
                 if let Some(text) = String::from_utf8(content).ok().filter(|text| whole(text)) {
@@ -405,7 +408,7 @@ fn wait_for_whole(
                 });
             }
         }
-        if Instant::now() >= deadline {
+        if expired {
             let path = path.to_path_buf();
             return Err(if seen {
                 RegistrationError::Incomplete {
@@ -444,10 +447,11 @@ fn wait_for(
     within: Duration,
 ) -> Result<Vec<u8>, RegistrationError> {
     loop {
+        let expired = Instant::now() >= deadline;
         match read_bounded(path, limit) {
             Ok(content) => return Ok(content),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if Instant::now() >= deadline {
+                if expired {
                     return Err(RegistrationError::Missing {
                         path: path.to_path_buf(),
                         waited: within,

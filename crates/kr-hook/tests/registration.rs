@@ -154,9 +154,9 @@ fn kr_req_12_14_an_empty_registration_is_read_again_until_it_is_whole() {
 }
 
 /// KR-REQ-11.43, KR-REQ-12.14: a registration cut short is not acted on, even where what it
-/// already says names an endpoint. Cut inside a line, or whole lines short of the record, the
-/// forwarder waits; the endpoint it reaches is the one the whole registration names, and the one
-/// the partial record named hears nothing.
+/// already says names an endpoint. Cut inside a line, whole lines short of the record, or with
+/// every field but not the line break after the last, the forwarder waits; the endpoint it reaches
+/// is the one the whole registration names, and the one the partial record named hears nothing.
 #[test]
 fn kr_req_11_43_a_registration_cut_short_is_not_acted_on() {
     let launch = Launch::new();
@@ -172,6 +172,10 @@ fn kr_req_11_43_a_registration_cut_short_is_not_acted_on() {
         .strip_suffix("framing=json_lines\n")
         .expect("the last line");
     launch.write_in_place(short_of_the_record);
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(relay.try_wait().expect("readable").is_none());
+    let every_field = whole(&decoy);
+    launch.write_in_place(every_field.strip_suffix('\n').expect("the last line break"));
     std::thread::sleep(Duration::from_secs(1));
     assert!(relay.try_wait().expect("readable").is_none());
     assert!(accepted(&decoy_listener, Duration::ZERO).is_none());
