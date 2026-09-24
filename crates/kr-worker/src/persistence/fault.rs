@@ -251,6 +251,13 @@ pub struct JournalHealth {
     /// A recovery gap starts here, so it is kept beside the condition rather than read from the
     /// store: the store is what has just stopped answering.
     durable_mark: AtomicU64,
+    /// How many faults have opened since this seam was built.
+    ///
+    /// The condition says what the journal is now; this says what it has been through. A consumer
+    /// that reads the condition only when it next decides something can find it healthy again
+    /// after a fault it never saw, and that fault is still an interval it cannot vouch for.
+    /// Comparing this count with the one it last applied is how it knows.
+    opened: AtomicU64,
 }
 
 impl Default for JournalHealth {
@@ -267,6 +274,7 @@ impl JournalHealth {
         Self {
             sender,
             durable_mark: AtomicU64::new(0),
+            opened: AtomicU64::new(0),
         }
     }
 
@@ -296,6 +304,16 @@ impl JournalHealth {
     #[must_use]
     pub fn is_healthy(&self) -> bool {
         self.sender.borrow().is_healthy()
+    }
+
+    /// Returns how many faults have opened since this seam was built.
+    ///
+    /// A fault is counted as it opens, before anything can recover from it, so a consumer that
+    /// finds this above the count it last applied has missed a fault, whatever the condition says
+    /// now.
+    #[must_use]
+    pub fn faults_opened(&self) -> u64 {
+        self.opened.load(Ordering::Acquire)
     }
 
     /// Subscribes to every change of condition.
@@ -347,6 +365,9 @@ impl JournalHealth {
         let mut changed = false;
         self.sender.send_if_modified(|condition| {
             if condition.is_healthy() {
+                // Counted under the condition's own lock, so the count has moved before any
+                // recovery can take the condition back to healthy.
+                self.opened.fetch_add(1, Ordering::AcqRel);
                 *condition = JournalCondition::Faulted(fault);
                 changed = true;
                 true
@@ -435,6 +456,25 @@ mod tests {
             receiver.borrow().fault().map(|fault| fault.kind),
             Some(FaultKind::Corrupt)
         );
+    }
+
+    #[test]
+    fn a_fault_is_counted_as_it_opens_and_stays_counted_after_recovery() {
+        let health = JournalHealth::new();
+        assert_eq!(health.faults_opened(), 0);
+        health.note_fault(fault(FaultKind::WriteFailed));
+        // A second report of the same interval is not a second fault.
+        health.note_fault(fault(FaultKind::Full));
+        assert_eq!(health.faults_opened(), 1);
+        health.note_recovered();
+        assert!(health.is_healthy());
+        assert_eq!(
+            health.faults_opened(),
+            1,
+            "a consumer that looks only now still learns a fault opened"
+        );
+        health.note_fault(fault(FaultKind::Corrupt));
+        assert_eq!(health.faults_opened(), 2);
     }
 
     #[test]

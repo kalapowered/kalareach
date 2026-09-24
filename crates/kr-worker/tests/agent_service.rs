@@ -1597,3 +1597,44 @@ async fn kr_req_11_37_one_fence_covers_the_receipt_journal_and_the_ledger_and_ma
         "only the prompts admitted outside the fence reached the upstream"
     );
 }
+
+/// KR-REQ-11.37: a receipt fault the broker never saw is still the broker's gap, and the host's
+/// own maintenance recovers it.
+///
+/// Nothing asks the broker anything between the journal faulting and its store taking writes
+/// again, so by the time maintenance runs the condition is healthy. Maintenance writes the
+/// journal's gap first, and then the broker applies the fault it missed, enters the fence, writes
+/// its own gap and, with nothing owed, returns to normal operation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_37_a_receipt_fault_the_broker_never_saw_is_still_its_gap() {
+    let host = host().await;
+    register(&host, None);
+    let broker = Arc::clone(host.service.broker());
+    let before = broker.recovery_generation();
+    assert!(broker.recorded_gaps().expect("the ledger reads").is_empty());
+
+    {
+        let mut session = host.service.runtime().session();
+        let journal = session.journal_mut().expect("the session journals");
+        common::refuse_acceptance(journal, &mut 0);
+        journal
+            .release_size_cap()
+            .expect("the store may grow again");
+    }
+    host.service.recover_storage_now();
+
+    assert!(
+        broker.recovery_generation() > before,
+        "the broker went behind the fence it missed"
+    );
+    assert_eq!(
+        broker.recorded_gaps().expect("the ledger reads").len(),
+        1,
+        "and wrote its own gap down"
+    );
+    assert_eq!(
+        broker.mode(),
+        kr_protocol::gateway::GatewayMode::Normal,
+        "with nothing owed, rich work is back"
+    );
+}

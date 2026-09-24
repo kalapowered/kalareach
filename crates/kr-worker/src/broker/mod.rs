@@ -542,9 +542,10 @@ enum OnStoreFault {
     /// already happened (an answer that went, a request the upstream withdrew, a claim given
     /// back) follows what happened rather than being refused after the fact.
     CarryOn,
-    /// It is refused.
+    /// It is refused, when the store fails under it and while the fence is up.
     ///
-    /// New rich work and a reconciliation are never taken without their record.
+    /// New rich work and a reconciliation are never taken without their record, and while the
+    /// fence is up nothing is recorded, so neither is taken then at all.
     Refuse,
 }
 
@@ -557,6 +558,12 @@ struct BrokerState {
     /// It is applied before every decision taken under this lock, and this broker's own store
     /// failures are reported into it where they happen.
     health: std::sync::Arc<crate::persistence::fault::JournalHealth>,
+    /// How many of the condition's faults this broker has applied.
+    ///
+    /// A fault the journal recovered from before this broker decided anything is still a fault:
+    /// the native work carried through it went unrecorded all the same. Comparing this with the
+    /// condition's own count is what finds one the condition no longer shows.
+    faults_applied: u64,
     ledger: Ledger,
     gateway: Gateway,
     instances: BTreeMap<ApplicationInstanceId, Instance>,
@@ -631,7 +638,33 @@ pub struct PinnedTable {
 #[derive(Debug)]
 pub struct Broker {
     state: Mutex<BrokerState>,
+    /// The connection a recovery writes the gap through, held by one recovery at a time.
+    ///
+    /// While the fence is up nothing that holds the broker's lock touches the store: the store is
+    /// what failed, and native arbitration waits on that lock. A recovery therefore writes what
+    /// the gap holds through a connection of its own, off the lock, and takes the lock only to
+    /// read the gap and to leave the fence. It is absent for a ledger held in memory, which has one
+    /// connection and no file, so nothing can hold its write up; that ledger's recovery takes the
+    /// lock for the write itself.
+    recorder: Mutex<Option<Ledger>>,
+    /// Where the next recovery stops before it writes the gap, for this host's own tests.
+    #[cfg(feature = "testing")]
+    recovery_pause: Mutex<Option<RecoveryPause>>,
 }
+
+/// The two ends of one armed pause: what says the recovery arrived, and what lets it go on.
+#[cfg(feature = "testing")]
+type RecoveryPause = (
+    std::sync::mpsc::SyncSender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+
+/// How many times one recovery writes the gap before it leaves the rest to the next attempt.
+///
+/// Native work goes on while the gap is written, and what it does belongs in the gap too, so a
+/// recovery that finds the gap changed writes it again. Traffic that changes it on every pass
+/// leaves the fence up until a later attempt finds a quiet enough moment.
+const RECOVERY_PASSES: usize = 8;
 
 impl Broker {
     /// Opens a broker whose durable records live beside the worker's receipt journal.
@@ -651,6 +684,12 @@ impl Broker {
         health: std::sync::Arc<crate::persistence::fault::JournalHealth>,
     ) -> Result<Self> {
         let ledger = Ledger::open(journal_path, std::sync::Arc::clone(&health))?;
+        let recorder = journal_path
+            .map(|path| Ledger::open(Some(path), std::sync::Arc::clone(&health)))
+            .transpose()?;
+        // A fault that opened and recovered before this broker existed is nothing it carried work
+        // through; one still open is applied by the condition itself.
+        let faults_applied = health.faults_opened();
         let mut arbitration = Arbitration::new();
         // A restarted worker starts from what it wrote, not from nothing. The dispatch marker is
         // read back with each resource: one that was answered comes back so a reconnect can
@@ -696,6 +735,7 @@ impl Broker {
             state: Mutex::new(BrokerState {
                 session_id,
                 health,
+                faults_applied,
                 ledger,
                 gateway: Gateway::new(),
                 instances: BTreeMap::new(),
@@ -716,6 +756,9 @@ impl Broker {
                 continuous: std::collections::BTreeSet::new(),
                 unrecorded_after: 0,
             }),
+            recorder: Mutex::new(recorder),
+            #[cfg(feature = "testing")]
+            recovery_pause: Mutex::new(None),
         })
     }
 
@@ -1064,12 +1107,15 @@ impl Broker {
             }
         }
         let mut state = self.state();
-        state.ledger.put_binding(&BindingRecord {
+        let record = BindingRecord {
             binding_id,
             application_instance_id,
             grants: grants.clone(),
             trust: trust.clone(),
             bound_at: now,
+        };
+        state.stored(now, "binding a component", |ledger| {
+            ledger.put_binding(&record)
         })?;
         state.bindings.insert(
             binding_id,
@@ -1130,7 +1176,9 @@ impl Broker {
             trust: trust.clone(),
             bound_at: TimestampMs::new(0),
         };
-        state.ledger.put_binding(&record)?;
+        state.stored(kr_ipc::now_ms(), "changing a grant", |ledger| {
+            ledger.put_binding(&record)
+        })?;
         let binding = state
             .bindings
             .get_mut(&binding_id)
@@ -1657,7 +1705,7 @@ impl Broker {
             crate::broker::ledger::TransitionCause::Dispatched,
             Some(claim.actor_id.clone()),
         );
-        state.stored(now, |ledger| {
+        state.stored(now, "a dispatch marker", |ledger| {
             ledger.mark_dispatched(&transition.resource, &event)
         })?;
         state.remember(&event);
@@ -1887,7 +1935,7 @@ impl Broker {
             crate::broker::ledger::TransitionCause::Interpreted,
             None,
         );
-        let admitted = state.stored(now, |ledger| {
+        let admitted = state.stored(now, "an interpretation", |ledger| {
             ledger.admit_resource(handle, binding_id, &entry, &interpreted, now, &event)
         })?;
         if !admitted {
@@ -2006,7 +2054,9 @@ impl Broker {
         let intent = state
             .profiles
             .prepare(profile, against, saved_conversation)?;
-        state.ledger.put_profile(&intent.profile, None)?;
+        state.stored(kr_ipc::now_ms(), "a launch profile", |ledger| {
+            ledger.put_profile(&intent.profile, None)
+        })?;
         Ok(intent)
     }
 
@@ -2028,9 +2078,9 @@ impl Broker {
         state
             .profiles
             .check_executable(intent, now, application_instance_id)?;
-        state
-            .ledger
-            .put_profile(&intent.profile, Some(application_instance_id))?;
+        state.stored(kr_ipc::now_ms(), "a launch profile", |ledger| {
+            ledger.put_profile(&intent.profile, Some(application_instance_id))
+        })?;
         state.profiles.execute(intent, now, application_instance_id)
     }
 
@@ -2046,12 +2096,15 @@ impl Broker {
         saved_conversation: Option<String>,
     ) -> Result<()> {
         let mut state = self.state();
+        // Written first and adopted second, so a launch the fence refuses leaves no reservation
+        // behind that nothing recorded.
+        state.stored(kr_ipc::now_ms(), "a launch profile", |ledger| {
+            ledger.put_profile(&profile, Some(application_instance_id))
+        })?;
         state
             .profiles
-            .adopt(profile.clone(), application_instance_id, saved_conversation);
-        state
-            .ledger
-            .put_profile(&profile, Some(application_instance_id))
+            .adopt(profile, application_instance_id, saved_conversation);
+        Ok(())
     }
 
     /// Returns the profile one instance was launched under.
@@ -2214,9 +2267,13 @@ impl Broker {
 
     /// Reconciles one upstream's records with what it still has pending.
     ///
+    /// A reconciliation is never taken without its record, so none is taken while the fence is
+    /// up; one after a storage failure goes through [`Broker::reconcile_recovered`].
+    ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::LedgerUnavailable`] when a settled record cannot be written.
+    /// Returns [`BrokerError::RichWorkFenced`] while the fence is up, and
+    /// [`BrokerError::StoreFault`] when a settled record cannot be written.
     pub fn reconcile(
         &self,
         scope: ReconcileScope,
@@ -2313,54 +2370,144 @@ impl Broker {
     /// been reconciled, which is [`Broker::reconcile_recovered`] and
     /// [`Broker::reconcile_connected`].
     ///
+    /// The fence stays up while the gap is written, and the write is made off the broker's lock
+    /// through the recovery's own connection, so native arbitration never waits on a store that
+    /// has only just come back. Native work carried meanwhile belongs in the gap too: the gap is
+    /// read again after each write, and the fence is left, under the lock and without a write,
+    /// only once what was written is everything the gap holds.
+    ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::RichWorkFenced`] while the journal condition is still faulted,
-    /// [`BrokerError::InvalidArgument`] when the gateway is not fenced, and
-    /// [`BrokerError::StoreFault`] when the gap cannot be committed, in which case the gateway
-    /// falls back to the fence rather than claiming to have recovered.
+    /// Returns [`BrokerError::RichWorkFenced`] while the journal condition is faulted, when it
+    /// faulted again while the gap was being written, and when native work changed the gap on
+    /// every pass; [`BrokerError::InvalidArgument`] when the gateway is not fenced; and
+    /// [`BrokerError::StoreFault`] when the gap cannot be written. The fence stays up in every one
+    /// of those cases.
     pub fn recover(&self, now: TimestampMs) -> Result<VolatileTransition> {
-        let mut state = self.state();
-        // The journal writes its own gap before it calls itself healthy, and this recovery is the
-        // broker's half of the same one. A store the condition still calls faulted is not one this
-        // commit may speak for.
-        if !state.health.is_healthy() {
-            return Err(BrokerError::RichWorkFenced {
-                detail: "the journal has not recovered, so the broker's gap is not committed yet"
-                    .to_owned(),
-            });
-        }
-        let beginning = state.volatile.begin_recovery(now)?;
-        let records = state.arbitration.volatile_records();
-        let row = state.volatile.row();
-        let sequence = match state.ledger.commit_recovery(&records, &beginning.gap, row) {
-            Ok(sequence) => sequence,
-            Err(error) => {
-                // Nothing was committed, so the fence goes back over a ledger that has not
-                // half-recorded a recovery, and the store's failure is already in the condition.
-                state.fence("storage failed again during recovery", now);
-                return Err(error);
-            }
-        };
-        // The gap this recovery closes is the row the ledger just wrote. Holding it here is what
-        // lets the end of this recovery mark that same row finished.
-        state.volatile.set_row(sequence);
-        // Every upstream that still has an unresolved resource owes a reconciliation before rich
-        // work comes back. Reconciling one says nothing about another's pending identifiers.
-        let owed: Vec<(ApplicationInstanceId, GatewayConnectionId)> = state
-            .arbitration
-            .iter()
-            .filter(|pending| !pending.resource.state.is_terminal())
-            .map(|pending| {
+        // One recovery at a time. The recorder is held for the whole of it, and the broker's lock
+        // only while the gap is read and while the fence is left, never across a write.
+        let mut recorder = self
+            .recorder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut written: Vec<(PendingResource, Option<BrokerBindingId>, bool)> = Vec::new();
+        for _ in 0..RECOVERY_PASSES {
+            let (records, closing, row, applied) = {
+                let state = self.state();
+                state.may_recover()?;
+                let mut closing = state.volatile.gap().cloned().ok_or_else(|| {
+                    BrokerError::invalid("the gateway is fenced with no gap open")
+                })?;
+                closing.closed_at = Nullable::some(now);
                 (
-                    pending.resource.application_instance_id,
-                    pending.resource.request.connection,
+                    state.arbitration.volatile_records(),
+                    closing,
+                    state.volatile.row(),
+                    state.faults_applied,
                 )
-            })
-            .collect();
-        state.volatile.owe_reconciliation(owed);
-        state.arbitration.clear_volatile_records();
-        Ok(beginning)
+            };
+            #[cfg(feature = "testing")]
+            self.wait_at_recovery_pause();
+            // What an earlier pass wrote is not written again; what changed since is.
+            let fresh: Vec<_> = records
+                .iter()
+                .filter(|record| !written.contains(record))
+                .cloned()
+                .collect();
+            let sequence = match recorder.as_mut() {
+                Some(recorder) => recorder.commit_recovery(&fresh, &closing, row)?,
+                // A ledger held in memory: one connection, no file, nothing to wait on.
+                None => self.state().ledger.commit_recovery(&fresh, &closing, row)?,
+            };
+            written = records;
+            let mut state = self.state();
+            // The row is the gap's from now on, so a later pass or a later recovery updates it
+            // rather than writing a second gap for the same interval.
+            state.volatile.set_row(sequence);
+            if state.faults_applied != applied {
+                return Err(BrokerError::RichWorkFenced {
+                    detail:
+                        "the journal failed again while the broker's gap was being written, so \
+                             the fence stays up"
+                            .to_owned(),
+                });
+            }
+            state.may_recover()?;
+            if state.arbitration.volatile_records() != written {
+                continue;
+            }
+            let beginning = state.volatile.begin_recovery(now)?;
+            // Every upstream that still has an unresolved resource owes a reconciliation before
+            // rich work comes back. Reconciling one says nothing about another's pending
+            // identifiers.
+            let owed: Vec<(ApplicationInstanceId, GatewayConnectionId)> = state
+                .arbitration
+                .iter()
+                .filter(|pending| !pending.resource.state.is_terminal())
+                .map(|pending| {
+                    (
+                        pending.resource.application_instance_id,
+                        pending.resource.request.connection,
+                    )
+                })
+                .collect();
+            state.volatile.owe_reconciliation(owed);
+            state.arbitration.clear_volatile_records();
+            return Ok(beginning);
+        }
+        Err(BrokerError::RichWorkFenced {
+            detail: "native work changed the gap on every pass while it was being written, so the \
+                     fence stays up until the next recovery"
+                .to_owned(),
+        })
+    }
+
+    /// Stops the next recovery immediately before it writes the gap, for this host's own tests.
+    ///
+    /// The recovery has read the gap under the broker's lock and let the lock go by then, which is
+    /// the interval in which native work has to go on. Returns the end that says the recovery has
+    /// arrived there, and the end that lets it go on; dropping that end lets it go on too. The
+    /// pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_recovery_write(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (arrived, watch) = std::sync::mpsc::sync_channel(1);
+        let (release, go) = std::sync::mpsc::sync_channel(1);
+        *self
+            .recovery_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Waits at the armed pause, where one is armed.
+    #[cfg(feature = "testing")]
+    fn wait_at_recovery_pause(&self) {
+        let pause = self
+            .recovery_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((arrived, go)) = pause {
+            let _ = arrived.send(());
+            let _ = go.recv();
+        }
+    }
+
+    /// Returns every gap the ledger holds, oldest first.
+    ///
+    /// A gap is written when a recovery commits it, so this is the record a reader of the ledger
+    /// has of each interval the broker could not write down, open or closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::StoreFault`] when the ledger cannot be read.
+    pub fn recorded_gaps(&self) -> Result<Vec<kr_protocol::gateway::EvidenceGap>> {
+        self.state().ledger.gaps()
     }
 
     /// Reconciles one upstream that a recovery owes, from what that upstream says it still holds,
@@ -2498,6 +2645,15 @@ impl Broker {
     /// Returns [`BrokerError::StoreFault`] when the setting cannot be applied.
     #[cfg(feature = "testing")]
     pub fn refuse_ledger_writes(&self, refuse: bool) -> Result<()> {
+        // Both connections, so a recovery meets the same store the broker's own writes do.
+        if let Some(recorder) = self
+            .recorder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            recorder.refuse_writes(refuse)?;
+        }
         self.state().ledger.refuse_writes(refuse)
     }
 
@@ -2514,9 +2670,9 @@ impl Broker {
         cursor: StreamCursor,
         now: TimestampMs,
     ) -> Result<()> {
-        self.state()
-            .ledger
-            .put_checkpoint(application_instance_id, cursor, now)
+        self.state().stored(now, "an adapter checkpoint", |ledger| {
+            ledger.put_checkpoint(application_instance_id, cursor, now)
+        })
     }
 
     /// Returns the cursor an adapter replays from after a restart.
@@ -3217,17 +3373,48 @@ impl BrokerState {
     ///
     /// The condition only ever raises the fence here. Lowering it is recovery's, which commits
     /// the gap first and reconciles every upstream that owes it before rich work returns.
+    ///
+    /// A fault is applied even when the journal has already recovered from it. Whatever this
+    /// broker carried in the meantime went unrecorded, and a recovery that commits no gap and
+    /// reconciles nothing would leave the ledger reading as continuous across it. A fault that
+    /// opens while a recovery is running sends that recovery back to the fence the same way,
+    /// seen or not.
     fn follow_health(&mut self, now: TimestampMs) {
-        if self.health.is_healthy()
-            || self.volatile.mode() == kr_protocol::gateway::GatewayMode::NativeOnlyVolatile
-        {
+        let opened = self.health.faults_opened();
+        let missed = opened != self.faults_applied;
+        self.faults_applied = opened;
+        let faulted = !self.health.is_healthy();
+        let fenced = self.volatile.mode() == kr_protocol::gateway::GatewayMode::NativeOnlyVolatile;
+        if !missed && (!faulted || fenced) {
             return;
         }
         let reason = self.health.condition().fault().map_or_else(
-            || "the journal stopped answering".to_owned(),
+            || "the journal failed and recovered before this broker decided anything".to_owned(),
             |fault| fault.detail.clone(),
         );
         self.fence(&reason, now);
+    }
+
+    /// Refuses a recovery that cannot begin now.
+    ///
+    /// The journal writes its own gap before it calls itself healthy, and the broker's recovery is
+    /// its half of the same one: a store the condition still calls faulted is not one this commit
+    /// may speak for. And only a fenced gateway has a gap to commit.
+    fn may_recover(&self) -> Result<()> {
+        if !self.health.is_healthy() {
+            return Err(BrokerError::RichWorkFenced {
+                detail: "the journal has not recovered, so the broker's gap is not committed yet"
+                    .to_owned(),
+            });
+        }
+        let mode = self.volatile.mode();
+        if mode != kr_protocol::gateway::GatewayMode::NativeOnlyVolatile {
+            return Err(BrokerError::invalid(format!(
+                "the gateway is {mode}, and a recovery begins from {}",
+                kr_protocol::gateway::GatewayMode::NativeOnlyVolatile
+            )));
+        }
+        Ok(())
     }
 
     /// Raises the fence, in memory and at once, from whichever mode this broker is in.
@@ -3251,15 +3438,27 @@ impl BrokerState {
         self.volatile.raise(reason, carried, now);
     }
 
-    /// Runs one ledger write, and raises the fence at once when the store fails under it.
+    /// Runs one ledger write that does not proceed without its record.
     ///
-    /// The failure is still returned. This is for writes that do not proceed without their
-    /// record; the ones that do are [`BrokerState::commit_transition`]'s to carry on.
+    /// While the fence is up it is refused before the store is reached: the store is what failed,
+    /// and a write attempted under this lock would hold native arbitration behind it. Otherwise
+    /// the write runs, and a store that fails under it raises the fence at once; the failure is
+    /// still returned. Writes that carry on without their record are
+    /// [`BrokerState::commit_transition`]'s.
     fn stored<T>(
         &mut self,
         now: TimestampMs,
+        what: &str,
         write: impl FnOnce(&mut Ledger) -> Result<T>,
     ) -> Result<T> {
+        if !self.volatile.writes_are_durable() {
+            return Err(BrokerError::RichWorkFenced {
+                detail: format!(
+                    "the journal is faulted, so {what} waits for the recovery that can write it \
+                     down"
+                ),
+            });
+        }
         let written = write(&mut self.ledger);
         if let Err(BrokerError::StoreFault { detail }) = &written {
             let detail = detail.clone();
@@ -3281,9 +3480,13 @@ impl BrokerState {
         if let Some(row) = self.volatile.row() {
             let gap = self.volatile.gap().cloned();
             if let Some(gap) = gap.as_ref() {
-                self.stored(now, |ledger| ledger.commit_gap(row, gap))?;
+                self.stored(now, "the gap's final accounting", |ledger| {
+                    ledger.commit_gap(row, gap)
+                })?;
             }
-            self.stored(now, |ledger| ledger.finish_recovery(row))?;
+            self.stored(now, "the end of the recovery", |ledger| {
+                ledger.finish_recovery(row)
+            })?;
         }
         let finished = self.volatile.finish_recovery(generation)?;
         self.continuous.clear();
@@ -3866,6 +4069,14 @@ impl BrokerState {
         actor_id: Option<ActorId>,
         on_fault: OnStoreFault,
     ) -> Result<PendingResource> {
+        if on_fault == OnStoreFault::Refuse && !self.volatile.writes_are_durable() {
+            return Err(BrokerError::RichWorkFenced {
+                detail: format!(
+                    "the journal is faulted, and a {} is never taken without its record",
+                    cause.as_str().replace('_', " ")
+                ),
+            });
+        }
         let mut event = self.next_transition_event(&transition.resource, now, cause, actor_id);
         match self.write_transition(&transition, now, &event) {
             Ok(()) => {}

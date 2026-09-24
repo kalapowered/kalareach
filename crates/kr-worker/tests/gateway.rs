@@ -2040,3 +2040,273 @@ async fn kr_req_11_37_a_store_failing_under_settlement_or_recovery_keeps_what_ha
         "each request was answered once"
     );
 }
+
+/// The scope one recovery owes on this suite's one connection.
+fn owed_scope() -> ReconcileScope {
+    ReconcileScope {
+        application_instance_id: instance(2),
+        connection: GatewayConnectionId::new(1),
+    }
+}
+
+/// KR-REQ-11.35 and KR-REQ-11.37: a fault the journal recovered from before the broker decided
+/// anything is still the broker's gap, and one that opens during a recovery sends it back.
+///
+/// Nothing asks the broker anything between the journal faulting and the journal recovering, so
+/// the condition is healthy again by the time the broker next looks. The work it carried in
+/// between went unrecorded all the same: it enters the fence it missed, commits the gap and owes
+/// the upstream a reconciliation. A second fault that opens and recovers while that recovery is
+/// running, again unseen, sends the recovery back to the fence under a new generation, and the
+/// reconciliation prepared under the old one is refused.
+#[tokio::test]
+async fn kr_req_11_37_a_fault_the_broker_never_saw_is_still_its_gap_and_its_recovery_falls_back() {
+    let mut store = common::SharedStore::open();
+    let (broker, _upstream) = gateway_sharing(&store);
+    let held = approval(&broker, "1", 2).expect("an interpretation before the fault");
+    let still_open = [Broker::downstream(
+        GatewayConnectionId::new(1),
+        UpstreamRequestId::new("1").expect("valid"),
+    )];
+
+    store.fault_acceptance();
+    store.recover_journal(3);
+    assert_eq!(
+        broker.mode(),
+        GatewayMode::NativeOnlyVolatile,
+        "the fault the broker did not see is the first thing it applies"
+    );
+    assert_eq!(
+        broker
+            .pending(held.resource_id)
+            .expect("still held")
+            .durability,
+        Durability::Volatile,
+        "and what it held lived through the gap"
+    );
+    let first = broker
+        .recover(TimestampMs::new(4))
+        .expect("the gap is committed");
+    assert_eq!(first.to, GatewayMode::Recovering);
+    assert_eq!(
+        broker.recorded_gaps().expect("the ledger reads").len(),
+        1,
+        "the interval is written down"
+    );
+
+    store.fault_acceptance();
+    store.recover_journal(5);
+    assert_eq!(
+        broker.mode(),
+        GatewayMode::NativeOnlyVolatile,
+        "a fault inside the recovery sends it back, seen or not"
+    );
+    assert!(broker.recovery_generation() > first.generation);
+    let stale = broker
+        .reconcile_recovered(
+            first.generation,
+            owed_scope(),
+            &still_open,
+            TimestampMs::new(6),
+        )
+        .expect_err("a reconciliation prepared under the recovery that fell back");
+    assert_eq!(stale.code(), ErrorCode::InvalidArgument);
+    assert_eq!(
+        broker.pending(held.resource_id).expect("still held").state,
+        PendingState::Pending,
+        "and it changed nothing"
+    );
+
+    let second = broker
+        .recover(TimestampMs::new(7))
+        .expect("the gap is committed again");
+    let (reconciliation, finished) = broker
+        .reconcile_recovered(
+            second.generation,
+            owed_scope(),
+            &still_open,
+            TimestampMs::new(8),
+        )
+        .expect("the upstream says what it still holds");
+    assert_eq!(reconciliation.still_pending, vec![held.resource_id]);
+    assert_eq!(
+        finished.map(|finished| finished.to),
+        Some(GatewayMode::Normal)
+    );
+    assert_eq!(
+        broker.recorded_gaps().expect("the ledger reads").len(),
+        1,
+        "the second fault reopened the same interval rather than opening another"
+    );
+}
+
+/// KR-REQ-11.35: native work goes on while a recovery writes the gap, and what it did is in what
+/// the recovery commits.
+///
+/// The recovery is held twice over. First at its own pause, after it has read the gap and let the
+/// broker's lock go, and then by the store itself: another connection holds the database's write
+/// lock, so the recovery's write cannot finish until it lets go. Native work is carried at both
+/// points. The recovery then finds the gap changed, writes it again, and leaves the fence only
+/// with that work committed.
+#[tokio::test]
+async fn kr_req_11_35_native_work_goes_on_while_a_recovery_is_held_at_its_write() {
+    let mut store = common::SharedStore::open();
+    let (broker, _upstream) = gateway_sharing(&store);
+    let broker = std::sync::Arc::new(broker);
+    let held = approval(&broker, "1", 2).expect("an interpretation before the fault");
+    store.fault_acceptance();
+    store.recover_journal(3);
+
+    let holder = rusqlite::Connection::open(&store.path).expect("the store opens");
+    holder
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("the write lock is taken");
+    let (arrived, release) = broker.pause_before_recovery_write();
+    let recovering = {
+        let broker = std::sync::Arc::clone(&broker);
+        std::thread::spawn(move || broker.recover(TimestampMs::new(4)))
+    };
+    arrived
+        .recv_timeout(common::LIVENESS_DEADLINE)
+        .expect("the recovery reaches its write");
+
+    // At its write, with the broker's lock released: a new request is recorded and arbitrated.
+    let (_, arrived_meanwhile) = broker
+        .forward_native(
+            GatewayConnectionId::new(1),
+            frame("2", "session/request_permission").as_bytes(),
+            TimestampMs::new(5),
+        )
+        .expect("native work goes on while the recovery waits to write");
+    let arrived_meanwhile = arrived_meanwhile.expect("it expects a response");
+    release.send(()).expect("the recovery goes on");
+
+    // In its write, which the store holds up: the upstream withdraws its first request.
+    broker
+        .upstream_resolved(&held.request, TimestampMs::new(6))
+        .expect("native work goes on while the store holds the recovery's write");
+    assert!(
+        !recovering.is_finished(),
+        "the recovery cannot finish while the store holds its write"
+    );
+    holder
+        .execute_batch("ROLLBACK")
+        .expect("the write lock is let go");
+    let recovered = recovering
+        .join()
+        .expect("the recovery is joined")
+        .expect("the gap is committed");
+    assert_eq!(recovered.to, GatewayMode::Recovering);
+
+    // What native work did while the gap was being written is what the recovery committed.
+    let recorded = broker
+        .recorded(arrived_meanwhile.resource_id)
+        .expect("the ledger reads")
+        .expect("the request recorded during the write is committed");
+    assert_eq!(recorded.durability, Durability::Volatile);
+    assert_eq!(recorded.state, PendingState::Pending);
+    assert_eq!(
+        broker
+            .recorded(held.resource_id)
+            .expect("the ledger reads")
+            .expect("the withdrawn request is committed")
+            .state,
+        PendingState::Cancelled,
+        "and so is the withdrawal made while the store held the write"
+    );
+}
+
+/// KR-REQ-11.35, KR-REQ-11.36 and KR-REQ-11.37: while the fence is up nothing that needs its
+/// record is taken, and nothing that holds the broker's lock writes to the store.
+///
+/// A component bound, a grant changed, an adapter's checkpoint and an ordinary reconciliation all
+/// need their record, and the store is what failed. Each is refused before the store is reached,
+/// so an empty list from an upstream cancels nothing, and each is taken again once the recovery
+/// is complete.
+#[tokio::test]
+async fn kr_req_11_37_nothing_that_needs_its_record_is_taken_while_the_fence_is_up() {
+    let mut store = common::SharedStore::open();
+    let (broker, _upstream) = gateway_sharing(&store);
+    let held = approval(&broker, "1", 2).expect("an interpretation before the fault");
+    store.fault_acceptance();
+    assert_eq!(broker.mode(), GatewayMode::NativeOnlyVolatile);
+
+    let bind = |at: u64| {
+        broker.bind(
+            binding(10),
+            instance(2),
+            PluginId::new("kalareach.other").expect("valid"),
+            PublisherId::new("kalareach").expect("valid"),
+            Digest256::from_bytes([6; 32]),
+            BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
+            None,
+            TimestampMs::new(at),
+        )
+    };
+    let fenced = |outcome: Result<(), BrokerError>, what: &str| {
+        let error = outcome.expect_err(what);
+        assert!(
+            matches!(error, BrokerError::RichWorkFenced { .. }),
+            "{what} is refused by the fence: {error}"
+        );
+    };
+    fenced(bind(3), "binding a component");
+    assert!(
+        broker.binding_record(binding(10)).is_none(),
+        "and nothing was bound"
+    );
+    fenced(
+        broker.withdraw_grant(binding(9), BrokerGrant::ApprovalInterpreter),
+        "changing a grant",
+    );
+    assert!(
+        broker
+            .binding_record(binding(9))
+            .expect("still bound")
+            .grants
+            .holds(BrokerGrant::ApprovalInterpreter),
+        "and the grant is as it was"
+    );
+    fenced(
+        broker.checkpoint(
+            instance(2),
+            kr_protocol::ids::StreamCursor::new(1),
+            TimestampMs::new(3),
+        ),
+        "an adapter checkpoint",
+    );
+    let reconciled = broker.reconcile(owed_scope(), &[], TimestampMs::new(3));
+    assert!(
+        matches!(reconciled, Err(BrokerError::RichWorkFenced { .. })),
+        "an ordinary reconciliation is refused by the fence: {reconciled:?}"
+    );
+    assert_eq!(
+        broker.pending(held.resource_id).expect("still held").state,
+        PendingState::Pending,
+        "and the empty list cancelled nothing"
+    );
+
+    store.recover_journal(4);
+    broker
+        .recover(TimestampMs::new(4))
+        .expect("the gap is committed");
+    let (_, finished) = broker
+        .reconcile_recovered(
+            broker.recovery_generation(),
+            owed_scope(),
+            &[Broker::downstream(
+                GatewayConnectionId::new(1),
+                UpstreamRequestId::new("1").expect("valid"),
+            )],
+            TimestampMs::new(5),
+        )
+        .expect("the upstream says what it still holds");
+    assert!(finished.is_some());
+    bind(6).expect("a component is bound once the recovery is complete");
+    broker
+        .checkpoint(
+            instance(2),
+            kr_protocol::ids::StreamCursor::new(1),
+            TimestampMs::new(6),
+        )
+        .expect("and an adapter's checkpoint is written");
+}

@@ -3891,13 +3891,18 @@ session's journal condition, `kr_worker::persistence::fault::JournalHealth`. The
 every failure of its store there, where it happens, classified from the store's own result code,
 exactly as the receipt journal does. The broker applies the condition before every decision it
 takes, so a store that fails under either of them fences rich work on the receipt path and in the
-broker alike.
+broker alike. The condition also counts the faults it has opened, and the broker applies one it
+missed even when the journal has already recovered from it: a fault is a gap whether or not the
+broker was asked anything while it lasted, and one that opens during a recovery sends that recovery
+back to the fence under a new generation.
 
 When the store fails the gateway enters `native_only_volatile`, atomically and in memory: rich work
 is fenced, every unresolved resource is marked volatile, the identifiers already claimed or
-dispatched are counted and carried, and the gap is opened. Nothing is written on the way in, so
-nothing native that follows waits on the store that failed; the gap is written when the store
-recovers.
+dispatched are counted and carried, and the gap is opened. Nothing is written on the way in, and
+nothing that holds the broker's lock writes to the store while the fence is up: a write that needs
+its record, such as binding a component, changing a grant, a launch profile, an adapter's
+checkpoint or an ordinary reconciliation, is refused before the store is reached. So nothing native
+waits on the store that failed; the gap is written when the store recovers.
 
 What continues is the qualified native forwarding path and its in-memory arbitration. A native
 request, the terminal's answer to one, the terminal's own requests and this host's answers to
@@ -3919,8 +3924,11 @@ Recovery is two steps because it can fail, and rich work comes back at the end o
 host's maintenance drives both. When the store takes writes again the journal writes its own gap
 and only then calls the condition healthy; the broker then commits its gap and every resource the
 gap touched, in whatever state each actually reached, including the ones the upstream withdrew
-inside it. A failure part way leaves nothing committed and the fence back in place, and the next
-pass starts again. The gateway is then *recovering*, which admits no rich work; what ends that is
+inside it. The broker's half runs off the session's lock and the dispatch barrier, and it writes
+through a connection of its own, off the broker's lock, while the fence stays up: native work goes
+on while the store takes the write, and what that work changed is written by another pass before
+the fence comes down. A failure part way leaves the fence in place, and the next pass starts again.
+The gateway is then *recovering*, which admits no rich work; what ends that is
 reconciling the pending identifiers with **every** upstream that still had one, and rich work
 returns with the last of them, after the gap's final accounting is written.
 

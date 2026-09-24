@@ -538,7 +538,8 @@ impl WorkerService {
                     let mut session = self.runtime.session();
                     // A store that has started answering again is a store this host may call
                     // durable, and the interval it could not is written down before it says so.
-                    self.recover_storage(&mut session);
+                    // The broker's half follows, once this lock and the barrier are released.
+                    session.recover_journal();
                     session.collect_expired();
                     // Output retention is separate from receipt retention and runs on the same
                     // tick: section 20 budgets the two stores apart, so history pressure never
@@ -548,6 +549,10 @@ impl WorkerService {
                 };
                 state == kr_protocol::session::SessionState::Closed
             };
+            // The broker's half of the same recovery, off the session's lock and the dispatch
+            // barrier. It writes its gap while native work goes on, and nothing that serves the
+            // terminal or a mutation waits on that write.
+            self.recover_broker();
             // Questions whose time ran out, whose source went or whose agent binding moved on end
             // here even when nobody is reading them, so the feed the daemon's attention store reads
             // and every client that follows it hear of it on this tick rather than at the next read.
@@ -559,39 +564,36 @@ impl WorkerService {
         }
     }
 
-    /// Takes the store out of a fault it has stopped failing with: the journal first, then the
-    /// broker.
-    ///
-    /// The journal writes its gap and only then calls the condition healthy, and the broker's
-    /// records are in the same store behind the same condition, so its half follows: it commits
-    /// its own gap and reconciles the upstreams it can, and rich work returns with the last of
-    /// them. It runs under the session and the dispatch barrier, so no mutation is decided between
-    /// the journal's recovery and the broker's.
-    fn recover_storage(&self, session: &mut crate::session::Session) {
-        session.recover_journal();
-        self.recover_broker();
-    }
-
-    /// Runs the storage half of one maintenance pass now.
+    /// Runs the storage half of one maintenance pass now: the journal first, then the broker.
     ///
     /// Maintenance does this on its own cadence, once a minute. This exists so that this host's
     /// own tests can reach the end of a storage fault without waiting for that pass, through the
-    /// same barrier and the same order. It is compiled away in every shipped build.
+    /// same barrier, the same locks and the same order. It is compiled away in every shipped
+    /// build.
     #[cfg(feature = "testing")]
     pub fn recover_storage_now(&self) {
-        let _barrier = self
-            .dispatch
-            .lock()
-            .expect("the dispatch barrier is not poisoned");
-        let mut session = self.runtime.session();
-        self.recover_storage(&mut session);
+        {
+            let _barrier = self
+                .dispatch
+                .lock()
+                .expect("the dispatch barrier is not poisoned");
+            self.runtime.session().recover_journal();
+        }
+        self.recover_broker();
     }
 
     /// Takes the broker through its half of a recovery the journal has finished.
     ///
     /// It commits the broker's gap and owes each upstream with an unresolved resource a
-    /// reconciliation, then reconciles every one whose connection is open. A store that fails
-    /// again has already raised the fence where it failed, and the next pass starts again.
+    /// reconciliation, then reconciles every one whose connection is open. A fault the journal
+    /// recovered from before the broker decided anything is still the broker's to recover from:
+    /// reading the mode applies it. A store that fails again has already raised the fence where it
+    /// failed, and the next pass starts again.
+    ///
+    /// It runs after the journal has written its own gap, and it holds neither the session's lock
+    /// nor the dispatch barrier, because the broker's gap is written while native work goes on.
+    /// Nothing rich is decided in between on the strength of that: until this recovery and its
+    /// reconciliations finish, the broker refuses rich work itself.
     fn recover_broker(&self) {
         let now = kr_ipc::now_ms();
         let mode = self.broker.mode();
