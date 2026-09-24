@@ -16,10 +16,13 @@
 //!    chain. Where the record of a parent is not updated when the parent exits, as on Windows, a
 //!    named parent proves nothing, so the walk establishes nothing past the caller there, and the
 //!    session's job object, which holds every descendant, decides.
-//! 5. **The local broker.** The same walk, to an agent this session's broker launched. An agent
-//!    whose backend the worker started runs outside the terminal and its process group, and the
-//!    helper that backend starts is this session's all the same, because the broker started that
-//!    backend for this session and knows it by its start identity.
+//! 5. **The local broker.** An agent this session's broker launched, or a process that agent
+//!    started. The broker walks the same chain to the agents it launched; on Windows, where that
+//!    walk establishes nothing, it reads the job each agent was started in, which the agent joined
+//!    before it ran and no process it starts can leave. An agent whose backend the worker started
+//!    runs outside the terminal and its process group, and the helper that backend starts is this
+//!    session's all the same, because the broker started that backend for this session and knows
+//!    it by its start identity.
 //!
 //! Any of the last three admits a source; the first two are recorded, and the third is recorded
 //! as the agent binding below. None of them is a defence against arbitrary code running under the
@@ -29,8 +32,8 @@
 //!
 //! The answer has three values, not two. A caller is inside when any check finds it there. It is
 //! outside, `NOT_IN_KR_SESSION`, only when membership and ancestry both read everything they
-//! needed and found it in neither, and the broker, walking the same chain to the agents it
-//! launched, establishes that it is under none of them. A reading that failed, or that changed while it was taken, establishes nothing, so
+//! needed and found it in neither, and the broker establishes that it is under none of the agents
+//! it launched. A reading that failed, or that changed while it was taken, establishes nothing, so
 //! a caller whose answer rests on one is neither: it is refused as
 //! [`QuestionError::Undetermined`]. Both refusals create nothing. They differ for a caller that has
 //! to refuse whatever it cannot establish, such as the guard in front of a host's first-owner
@@ -61,9 +64,10 @@
 //! calling process belongs to, whether that instance is still live, and, only when the bridge can
 //! attest the request's own thread, the binding revision the request was made under. The worker's
 //! broker is the bridge for the agents it launched. It proves membership by the kernel's parent
-//! chain, which says nothing about which of an agent's threads a request came from, so it attests
-//! no revision: a helper under a launched agent asks application-scoped questions, and they end
-//! with the agent's instance. A source that no bridge describes is application-scoped as well.
+//! chain, or on Windows by the job an agent was started in, and neither says which of an agent's
+//! threads a request came from, so it attests no revision: a helper under a launched agent asks
+//! application-scoped questions, and they end with the agent's instance. A source that no bridge
+//! describes is application-scoped as well.
 
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{AgentBindingRevision, ApplicationInstanceId, ConnectionId};
@@ -564,11 +568,77 @@ fn descends_from(
 /// This is the walk the session's own ancestry check takes, over the processes the broker launched
 /// rather than the root shell alone, so a placement is established on the same terms: every link
 /// read from the kernel and checked, and a reading that failed or changed establishing nothing.
+#[cfg(not(windows))]
 pub(crate) fn nearest_of(
     from: &ProcessStartIdentity,
     candidates: &[ProcessStartIdentity],
 ) -> Ancestry {
     walk(&Kernel, from, candidates)
+}
+
+/// Returns which of `candidates` holds `from`: the one it is, or the one whose job lists it.
+///
+/// A Windows process keeps naming a parent after that parent exits, so a walk up the parents
+/// establishes nothing here. The broker starts each agent in a job of its own instead, joined
+/// before it runs and with breakaway disabled, so the job's own list is that agent's processes.
+#[cfg(windows)]
+pub(crate) fn nearest_of(
+    from: &ProcessStartIdentity,
+    candidates: &[ProcessStartIdentity],
+) -> Ancestry {
+    let jobs: Vec<Option<std::result::Result<Vec<u32>, String>>> = candidates
+        .iter()
+        .map(|agent| {
+            crate::windows::job::agent_job(agent)
+                .map(|job| job.process_ids().map_err(|error| error.to_string()))
+        })
+        .collect();
+    held_by(from, candidates, &jobs)
+}
+
+/// Returns which of `candidates` holds `from`, given what each one's job lists.
+///
+/// `jobs` answers for each candidate in the same order: the processes its job holds, why they
+/// could not be listed, or None where the candidate was started in no job this worker keeps. The
+/// candidate itself holds `from` when it is `from`; otherwise only a job's list establishes either
+/// way whether `from` is one of its processes. A list that could not be read, or a candidate with no
+/// job, establishes nothing about any other process, so `from` is then placed under none of them
+/// only where no candidate is left in doubt.
+#[cfg(any(windows, test))]
+fn held_by(
+    from: &ProcessStartIdentity,
+    candidates: &[ProcessStartIdentity],
+    jobs: &[Option<std::result::Result<Vec<u32>, String>>],
+) -> Ancestry {
+    let pid = pid_of(from);
+    let mut undetermined = None;
+    for (index, candidate) in candidates.iter().enumerate() {
+        if from.matches(candidate) {
+            return Ancestry::Reaches(index);
+        }
+        match jobs.get(index) {
+            Some(Some(Ok(held))) if held.contains(&pid) => return Ancestry::Reaches(index),
+            Some(Some(Ok(_))) => {}
+            Some(Some(Err(why))) => {
+                undetermined.get_or_insert_with(|| {
+                    format!(
+                        "the processes that process {} started could not be listed: {why}",
+                        pid_of(candidate)
+                    )
+                });
+            }
+            Some(None) | None => {
+                undetermined.get_or_insert_with(|| {
+                    format!(
+                        "process {} was started in no job this worker keeps, so the processes it \
+                         started cannot be told from any other",
+                        pid_of(candidate)
+                    )
+                });
+            }
+        }
+    }
+    undetermined.map_or(Ancestry::ReachesNone, Ancestry::Undetermined)
 }
 
 /// Walks the parent chain from `from` until it meets one of `candidates`.
@@ -1891,13 +1961,14 @@ mod tests {
             .expect("a placement")
             .parent;
         let parent = kr_ipc::identity::process_start_identity(parent_pid).expect("its identity");
-        // This process is its own nearest candidate on every platform: no link is read.
+        // This process is its own nearest candidate on every platform: nothing else is read.
         assert_eq!(
             nearest_of(&mine, &[parent.clone(), mine.clone()]),
             Ancestry::Reaches(1)
         );
-        // Its parent is reached through the link a Unix kernel keeps current. A Windows kernel
-        // keeps the identifier after the parent exits, so there the link establishes nothing.
+        // Its parent is reached through the link a Unix kernel keeps current. On Windows an agent
+        // holds what is in the job it was started in, and the parent was started in none, so
+        // nothing below it is established.
         let above = nearest_of(&mine, std::slice::from_ref(&parent));
         if cfg!(unix) {
             assert_eq!(above, Ancestry::Reaches(0));
@@ -1905,7 +1976,7 @@ mod tests {
             assert!(matches!(above, Ancestry::Undetermined(_)), "{above:?}");
         }
         // The same identifiers with start values the kernel never reported are nobody's. Showing
-        // that needs the same link, so on Windows it is not established either.
+        // that needs the same link, or on Windows a job, so there it is not established either.
         let mut recycled = parent;
         recycled.start_value = kr_protocol::scalars::U64::new(recycled.start_value.get() ^ 0xFFFF);
         let mut stranger = mine.clone();
@@ -1983,6 +2054,77 @@ mod tests {
                 Ancestry::Reaches(0)
             );
         }
+    }
+
+    // Placement by the job each agent was started in, which is how Windows places a caller. The
+    // rule is a rule about lists, so it is checked on every platform; the jobs themselves are
+    // checked on Windows, in `crate::windows::job` and in `tests/question_bindings.rs`.
+
+    #[test]
+    fn a_process_is_placed_under_the_agent_whose_job_lists_it() {
+        let agents = [identity(250, 25), identity(260, 26)];
+        let listed = [Some(Ok(vec![250, 251])), Some(Ok(vec![260, 300]))];
+        assert_eq!(
+            held_by(&identity(300, 30), &agents, &listed),
+            Ancestry::Reaches(1)
+        );
+        // An agent is its own, whatever its job lists and whether or not it has one.
+        assert_eq!(
+            held_by(&identity(250, 25), &agents, &[None, None]),
+            Ancestry::Reaches(0)
+        );
+        // Every job read, and none lists it: it is under none of them.
+        let neither = [Some(Ok(vec![250])), Some(Ok(vec![260]))];
+        assert_eq!(
+            held_by(&identity(300, 30), &agents, &neither),
+            Ancestry::ReachesNone
+        );
+        assert_eq!(held_by(&identity(300, 30), &[], &[]), Ancestry::ReachesNone);
+        // A record of an agent that ended beside the live one that holds its identifier now, in
+        // either order: the live one's job places its process, and the live one is itself.
+        let (ended, live) = (identity(250, 20), identity(250, 25));
+        let jobs = [Some(Ok(Vec::new())), Some(Ok(vec![250, 300]))];
+        assert_eq!(
+            held_by(&identity(300, 30), &[ended.clone(), live.clone()], &jobs),
+            Ancestry::Reaches(1)
+        );
+        let swapped = [Some(Ok(vec![250, 300])), Some(Ok(Vec::new()))];
+        assert_eq!(
+            held_by(&identity(300, 30), &[live.clone(), ended.clone()], &swapped),
+            Ancestry::Reaches(0)
+        );
+        assert_eq!(
+            held_by(&live, &[ended, live.clone()], &[None, None]),
+            Ancestry::Reaches(1)
+        );
+    }
+
+    #[test]
+    fn a_job_that_cannot_say_what_it_holds_puts_no_process_outside() {
+        let agents = [identity(250, 25), identity(260, 26)];
+        let unread = [
+            Some(Err("Access is denied.".to_owned())),
+            Some(Ok(vec![260])),
+        ];
+        assert!(matches!(
+            held_by(&identity(300, 30), &agents, &unread),
+            Ancestry::Undetermined(why) if why.contains("Access is denied")
+        ));
+        // An agent started in no job this worker keeps establishes nothing about another process.
+        let unkept = [None, Some(Ok(vec![260]))];
+        assert!(matches!(
+            held_by(&identity(300, 30), &agents, &unkept),
+            Ancestry::Undetermined(why) if why.contains("no job")
+        ));
+        // A job that lists the caller places it, whatever another could not say.
+        let placed = [
+            Some(Err("Access is denied.".to_owned())),
+            Some(Ok(vec![300])),
+        ];
+        assert_eq!(
+            held_by(&identity(300, 30), &agents, &placed),
+            Ancestry::Reaches(1)
+        );
     }
 
     #[test]

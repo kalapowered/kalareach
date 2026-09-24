@@ -522,6 +522,34 @@ pub struct NativeGateway {
     teardown: std::time::Duration,
 }
 
+/// Starts the agent `command` names and reads back what the kernel started.
+///
+/// On Windows the agent is started in a job of its own, joined before it runs, and the job is kept
+/// for the broker: a Windows process keeps naming a parent after that parent exits, so the broker
+/// places a caller under an agent by what the agent's job holds rather than by a walk up the
+/// parents. Elsewhere the broker walks the parents, and the agent is started as it is.
+fn start_agent(
+    command: &mut std::process::Command,
+    program: &str,
+) -> Result<(std::process::Child, ProcessStartIdentity)> {
+    let could_not_start =
+        |error: std::io::Error| BrokerError::ledger(format!("could not start {program}: {error}"));
+    #[cfg(windows)]
+    let (child, job) = {
+        let job = crate::windows::job::AgentJob::create().map_err(could_not_start)?;
+        let child = job.start(command).map_err(could_not_start)?;
+        (child, job)
+    };
+    #[cfg(not(windows))]
+    let child = command.spawn().map_err(could_not_start)?;
+    let started = kr_ipc::identity::started_process_identity(child.id()).map_err(|error| {
+        BrokerError::ledger(format!("the started process cannot be read: {error}"))
+    })?;
+    #[cfg(windows)]
+    crate::windows::job::keep_agent(started.clone(), Arc::new(job));
+    Ok((child, started))
+}
+
 /// One agent this host started, and what it started.
 #[derive(Debug)]
 pub struct Launched {
@@ -627,15 +655,7 @@ impl NativeGateway {
             // whatever the launched process says to the host that started it.
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped());
-        let child = command.spawn().map_err(|error| {
-            BrokerError::ledger(format!(
-                "could not start {}: {error}",
-                profile.binary.resolved_path
-            ))
-        })?;
-        let started = kr_ipc::identity::started_process_identity(child.id()).map_err(|error| {
-            BrokerError::ledger(format!("the started process cannot be read: {error}"))
-        })?;
+        let (child, started) = start_agent(&mut command, &profile.binary.resolved_path)?;
         let process = ManagedProcess::new(
             application_instance_id,
             started.clone(),
