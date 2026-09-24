@@ -1409,8 +1409,11 @@ enum BroughtDown {
 /// same revision again while its answer is unknown is a later attempt at that work: it presents the
 /// same identity, the same bytes and the same comparison, so a service that already ran it answers
 /// from its receipt and runs nothing twice, and the record keeps the earliest and the latest
-/// instant any attempt was signed at. Nothing makes an attempt by itself. Section 23 retries
-/// nothing whose outcome is unknown, so a later attempt is always a caller asking for one.
+/// instant any attempt was signed at. That holds only while the service still keeps the receipt of
+/// any attempt that ran, so once it may not, the earlier publication keeps its account for a
+/// reconciliation to end and publishing again is a new publication under an identity of its own.
+/// Nothing makes an attempt by itself. Section 23 retries nothing whose outcome is unknown, so a
+/// later attempt is always a caller asking for one.
 ///
 /// # A lost answer
 ///
@@ -1471,7 +1474,8 @@ impl DraftSync {
     /// The draft and the note are read together, so the position a new publication sends against
     /// is the one that went with the revision it validated. When the publication of that revision
     /// is already out with no answer, this is a later attempt at it, under its identity and with
-    /// its bytes and its comparison, as [`SyncStore::attempt_draft`] describes.
+    /// its bytes and its comparison, for as long as that attempt is answered from a receipt rather
+    /// than run again, as [`SyncStore::attempt_draft`] describes.
     ///
     /// A refused comparison is not a failure: it is the answer that another device wrote first, and
     /// it brings that content down beside the local draft rather than over it. An answer that

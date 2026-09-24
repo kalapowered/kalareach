@@ -2252,6 +2252,129 @@ async fn a_second_call_for_a_draft_publication_that_is_out_is_refused_rather_tha
     assert_eq!(client.outstanding().expect("a count"), 0);
 }
 
+/// How long after the earliest attempt a later one is still a replay: section 9's retention of a
+/// receipt, less the two freshness windows that separate a receipt's reading from the attempts'
+/// signing times.
+fn later_attempt_window_ms() -> u64 {
+    kr_protocol::limits::DEDUPLICATION_RETENTION.get() - 2 * SERVICE_REQUEST_FRESHNESS_MS
+}
+
+#[tokio::test]
+async fn a_later_attempt_is_made_only_while_the_service_still_holds_what_an_earlier_one_left() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let draft = drafts
+        .create(draft_target(), "a prompt".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+    service.lose_the_next_answer().await;
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(NOW),
+    )
+    .await
+    .expect_err("the answer never came back");
+    let first = the_only_record(&client);
+
+    // Just inside the window the service still keeps the receipt, so an attempt under the same
+    // identity is answered from it and nothing runs twice.
+    let inside = NOW + later_attempt_window_ms() - 1;
+    service.its_clock_reads(inside).await;
+    assert_eq!(
+        sync.publish(
+            &drafts,
+            draft.draft_id,
+            draft.revision,
+            TimestampMs::new(inside),
+        )
+        .await
+        .expect("answered from the receipt"),
+        DraftPublished::Accepted { position: at(1) }
+    );
+    let sent = service.exchanges().await;
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1].request_id, first.work_id);
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    assert_eq!(accounts(&client), 1);
+}
+
+#[tokio::test]
+async fn past_the_receipts_reach_publishing_again_is_new_work_and_the_first_keeps_its_account() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client) = draft_device(directory.path(), Arc::clone(&service) as Arc<_>);
+    let draft = drafts
+        .create(draft_target(), "a prompt".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+    let collection = draft_collection(draft.draft_id);
+
+    // The write lands, its answer is lost, and the service later sweeps the receipt. Another
+    // device then removes the object, so a comparison against nothing would hold again.
+    service.lose_the_next_answer().await;
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(NOW),
+    )
+    .await
+    .expect_err("the answer never came back");
+    let first = the_only_record(&client);
+    service.sweep_the_receipt(first.work_id).await;
+    assert_eq!(
+        service.remove(&collection).await,
+        SyncPosition::removed_at(2)
+    );
+
+    // Past the window, the identity is not presented again: under it the same bytes would run a
+    // second time, and the first attempt's account would become this one's. What is sent is a new
+    // publication of the same content, under an identity of its own.
+    let after = NOW + later_attempt_window_ms();
+    service.its_clock_reads(after).await;
+    assert_eq!(
+        sync.publish(
+            &drafts,
+            draft.draft_id,
+            draft.revision,
+            TimestampMs::new(after),
+        )
+        .await
+        .expect("answered"),
+        DraftPublished::Accepted { position: at(3) }
+    );
+    let sent = service.exchanges().await;
+    assert_eq!(sent.len(), 2);
+    assert_ne!(
+        sent[1].request_id, first.work_id,
+        "the first identity is never presented again"
+    );
+    assert_ne!(
+        sent[1].ciphertext, sent[0].ciphertext,
+        "sealed again, as new work is"
+    );
+
+    // Both left this device and both are accounted for: the first as work nothing has yet
+    // established the outcome of, the second as the publication it became.
+    assert_eq!(client.outstanding().expect("a count"), 1);
+    let requests = client.store().requests().expect("requests");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.items[0], first, "the first account is untouched");
+    let exported = client.exported().expect("exported");
+    assert_eq!(exported.len(), 2, "{exported:?}");
+    assert!(
+        exported
+            .iter()
+            .any(|entry| entry.kind.contains("sent without an answer"))
+    );
+    assert!(
+        exported
+            .iter()
+            .any(|entry| entry.kind == "synchronised draft" && entry.reference.contains("write 3"))
+    );
+}
+
 // ---------------------------------------------------------------------------
 // KR-REQ-20.13 and KR-REQ-24.28: a draft publication whose answer was lost
 // ---------------------------------------------------------------------------

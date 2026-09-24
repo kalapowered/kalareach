@@ -100,6 +100,26 @@ const CONFLICT_NOTE_BYTES: u64 = 512;
 /// The most a stored conflict copy may carry, in bytes.
 const MAX_CONFLICT_COPY_BYTES: u64 = super::MAX_OBJECT_BYTES + CONFLICT_NOTE_BYTES;
 
+/// How long after the earliest attempt of a request a later attempt may still be made under its
+/// identity, in milliseconds of the instants the attempts are signed at.
+///
+/// A later attempt is a replay only while the service still holds the receipt of any earlier
+/// attempt that ran; once that receipt is gone, the same identity with the same bytes is a new
+/// request, and it can run a second time or be refused in a way that says nothing about the first.
+/// Section 9 keeps a receipt for [`kr_protocol::limits::DEDUPLICATION_RETENTION`] from the reading
+/// the service recorded it at, and that reading is the one that admitted the attempt, so it is never
+/// more than [`kr_protocol::service::SERVICE_REQUEST_FRESHNESS_MS`] before that attempt's signing
+/// time and so never more than that before the earliest. A later attempt signed at an instant is
+/// admitted, if at all, at a reading no more than one window after it. An attempt signed less than
+/// the retention less two windows after the earliest therefore reaches a service that still holds
+/// any receipt an earlier attempt left.
+///
+/// Every term is an instant this device signed with or a bound the service enforces on its own
+/// clock. Nothing here assumes this device's clock is right: an attempt signed on a wrong clock is
+/// refused by the service as outside its window, never run twice.
+const LATER_ATTEMPT_WINDOW_MS: u64 = kr_protocol::limits::DEDUPLICATION_RETENTION.get()
+    - 2 * kr_protocol::service::SERVICE_REQUEST_FRESHNESS_MS;
+
 /// How many links the walk over a store's path follows before it gives up.
 ///
 /// The walk is Unix only, and so is this.
@@ -386,6 +406,23 @@ impl RequestRecord {
         let first = self.first_signed_at_ms.as_ref().copied()?;
         let last = self.last_signed_at_ms.as_ref().copied()?;
         Some((first, last))
+    }
+
+    /// Returns true when an attempt signed at `signed_at` may still be made under this request's
+    /// identity: when any receipt an earlier attempt of it left is certain to be at the service
+    /// still, so the attempt is answered from that receipt rather than run a second time.
+    ///
+    /// The earliest attempt is the one that bounds it, counting this one, because a receipt of any
+    /// attempt that ran bears a reading no earlier than a window before the earliest signing time.
+    /// A record that names no signing time has not been sent, and nothing may be attempted again
+    /// under it.
+    #[must_use]
+    pub fn may_attempt_again(&self, signed_at: TimestampMs) -> bool {
+        let Some((first, _)) = self.signing_times() else {
+            return false;
+        };
+        let earliest = first.get().min(signed_at.get());
+        signed_at.get().saturating_sub(earliest) < LATER_ATTEMPT_WINDOW_MS
     }
 
     /// Returns this record with one more attempt's signing time in it.
@@ -1421,6 +1458,14 @@ impl SyncStore {
     /// another publication. So is one admitted under a privacy generation that is no longer in
     /// force: no attempt now could publish its answer, and ending it is a reconciliation's work.
     ///
+    /// A later attempt is made only while it is a replay, which is while any receipt an earlier
+    /// attempt left is certain to be at the service still ([`RequestRecord::may_attempt_again`]).
+    /// Past that, presenting the identity again could run the work a second time, or be refused in
+    /// a way that says nothing about the first attempt and overwrites the account of it. So the
+    /// earlier publication is left as it is, counted and with its own account, for a
+    /// reconciliation to end, and this admits a new publication of the same content under an
+    /// identity of its own. The service's comparison is what keeps the two from both landing.
+    ///
     /// Each attempt records the instant it is signed at, through [`RequestRecord::attempted_at`], in
     /// the same replacement that writes the record, so a record that says it was sent always says
     /// when, and the two instants a fence carries bound every attempt that was made.
@@ -1474,7 +1519,8 @@ impl SyncStore {
                             if record.kind == SyncObjectKind::Draft
                                 && record.object_id == object_id
                                 && record.revision == revision
-                                && record.produced_under == privacy.generation =>
+                                && record.produced_under == privacy.generation
+                                && record.may_attempt_again(signed_at) =>
                         {
                             Some((ciphertext.clone(), record))
                         }
