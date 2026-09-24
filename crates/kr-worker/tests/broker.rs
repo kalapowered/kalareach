@@ -1829,3 +1829,49 @@ fn kr_req_11_17_evidence_names_the_package_publisher_schema_and_binary_it_was_ga
         "there is nothing here to check a binary digest against"
     );
 }
+
+/// KR-REQ-12.02 and KR-REQ-11.35: a launch the fence refuses leaves the profile it would have
+/// replaced.
+///
+/// A launch's profile is written before it is kept. While the journal is faulted nothing can be
+/// written, so a preparation under a profile identifier this host already knows is refused before
+/// anything changes, and the instance launched under that identifier still reads the profile it
+/// was launched with.
+#[test]
+fn kr_req_12_02_a_launch_the_fence_refuses_leaves_the_profile_it_would_have_replaced() {
+    let mut store = common::SharedStore::open();
+    let broker =
+        Broker::open(Some(&store.path), session(), store.health()).expect("the broker opens");
+    let intent = broker
+        .prepare_launch(
+            profile(IntegrationMode::Gateway, [3; 32], "0.9.1"),
+            ForegroundMark::idle(4),
+            None,
+        )
+        .expect("the launch is prepared");
+    broker
+        .execute_launch(&intent, &ForegroundMark::idle(4), instance(2))
+        .expect("the launch runs");
+
+    store.fault_acceptance();
+    let refused = broker
+        .prepare_launch(
+            profile(IntegrationMode::Gateway, [4; 32], "1.0.0"),
+            ForegroundMark::idle(5),
+            None,
+        )
+        .expect_err("nothing can be recorded while the journal is faulted");
+    assert_eq!(
+        refused.code(),
+        kr_protocol::error::ErrorCode::StorageUnavailable
+    );
+    assert_eq!(
+        broker
+            .profile_of(instance(2))
+            .expect("the running instance keeps its profile")
+            .binary
+            .version,
+        "0.9.1",
+        "and the refused preparation replaced nothing"
+    );
+}

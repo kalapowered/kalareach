@@ -2056,12 +2056,14 @@ impl Broker {
         saved_conversation: Option<String>,
     ) -> Result<LaunchIntent> {
         let mut state = self.state();
+        // Refuse first, write second, keep third, as an execution does.
         let intent = state
             .profiles
             .prepare(profile, against, saved_conversation)?;
         state.stored(kr_ipc::now_ms(), "a launch profile", |ledger| {
             ledger.put_profile(&intent.profile, None)
         })?;
+        state.profiles.keep(intent.profile.clone());
         Ok(intent)
     }
 

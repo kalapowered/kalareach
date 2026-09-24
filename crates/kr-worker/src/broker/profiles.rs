@@ -82,14 +82,18 @@ impl ProfileStore {
         Self::default()
     }
 
-    /// Records a resolved profile and returns the intent to execute it.
+    /// Returns the intent to execute a resolved profile, without recording anything.
+    ///
+    /// The caller writes the profile's record and only then keeps it with
+    /// [`ProfileStore::keep`], so a preparation whose record could not be written leaves nothing
+    /// behind, not even a replacement for a profile of the same identifier.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::Launch`] when the boundary is not the idle root shell, because a
     /// launch intent is only ever submitted against that boundary.
     pub fn prepare(
-        &mut self,
+        &self,
         profile: LaunchProfile,
         against: ForegroundMark,
         saved_conversation: Option<String>,
@@ -97,13 +101,16 @@ impl ProfileStore {
         if !against.is_idle() {
             return Err(BrokerError::Launch(LaunchRefusal::ForegroundChanged));
         }
-        self.profiles
-            .insert(profile.profile_id.clone(), profile.clone());
         Ok(LaunchIntent {
             profile,
             prepared_against: against,
             saved_conversation,
         })
+    }
+
+    /// Keeps a profile whose record has been written.
+    pub fn keep(&mut self, profile: LaunchProfile) {
+        self.profiles.insert(profile.profile_id.clone(), profile);
     }
 
     /// Executes a prepared intent, or refuses it.
@@ -127,6 +134,8 @@ impl ProfileStore {
             self.conversations
                 .insert(conversation.clone(), application_instance_id);
         }
+        // Its record was written before this was called, with the instance it now runs as.
+        self.keep(intent.profile.clone());
         self.instances
             .insert(application_instance_id, intent.profile.profile_id.clone());
         Ok(intent.profile.clone())
@@ -362,7 +371,7 @@ mod tests {
 
     #[test]
     fn a_launch_is_never_prepared_against_an_occupied_terminal() {
-        let mut store = ProfileStore::new();
+        let store = ProfileStore::new();
         let occupied = ForegroundMark {
             application_instance_id: Some(instance(9)),
             prompt_revision: 4,
