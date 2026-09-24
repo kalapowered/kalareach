@@ -87,10 +87,13 @@ back, the timestamp, the snapshot and the latest time it saw, and the client wri
 so a checkpoint holds one generation's documents and never the delegated documents of the
 generations before it. Once the metadata has verified, the checkpoint is kept whatever happens to
 the rest of the sync, provided it fits the retained metadata budget beside the generation in use and
-beside the new one; one that does not is refused before it is kept. The latest time the client saw
-while it fetched a full mirror is kept too, in a commit of its own once the mirror has finished or
-stopped on an error, which is what lets it refuse a clock set back behind that time; a sync
-cancelled during the mirror, or refused at that commit, keeps the time the checkpoint already had.
+beside the new one, counted at the most it holds while it is published; one that does not is refused
+before it is kept. The documents it no longer holds are removed before any new one is written, so
+one generation's delegated documents never stand beside the next's, and each document it keeps
+counts at the larger of its accepted and verified sizes. The latest time the client saw while it
+fetched a full mirror is kept too, in a commit of its own once the mirror has finished or stopped on
+an error, which is what lets it refuse a clock set back behind that time; a sync cancelled during
+the mirror, or refused at that commit, keeps the time the checkpoint already had.
 
 Where a new root changes the keys that sign timestamps or snapshots, those roles may start again
 from lower versions, and the client drops their old versions when it sees the change. A sync that
@@ -188,9 +191,11 @@ document a sync then removed reads its records again and answers from what is ke
 What stays is decided before a sync keeps anything of what it verified. Its checkpoint has to fit
 beside the new generation, which is what stays if the sync succeeds, and beside the generation in
 use, which is what stays if it goes no further; the generations the repository is not on make room
-for that first. A sync that fits neither way is refused before its checkpoint is kept, and the
-generation in use stays as it was. The time the client last saw is counted at the most its document
-can hold, so what the budget counts does not move with the clock.
+for that first, and their index documents are removed before the checkpoint is published into the
+room they held; a document that cannot be removed stops the sync. A sync that fits neither way is
+refused before its checkpoint is kept, and the generation in use stays as it was. The time the
+client last saw is counted at the most its document can hold, so what the budget counts does not
+move with the clock.
 
 An installed package costs its extracted copy as well as its cached payloads. A package is staged
 whole before it is renamed into place, so room for the copy it stages and for every payload it
@@ -206,11 +211,11 @@ still needs. That is every file such a package consists of, not only the manifes
 component nobody can read is a binding that does not work, and an installed package with its files
 evicted is one that cannot run. An extracted package nothing holds goes before any cached payload:
 it is a second copy of payloads, and having it again costs only an extraction. It leaves in one
-rename, so it is removed whole or not at all. What a live package
-consists of is read from the installation or the binding that holds it, or from its own manifest
-where it is activated here; one whose files this host cannot name stops the reclaim rather than
-being guessed at. When the only thing left to evict is one of those, the sync reports the limit
-instead.
+rename, so it is removed whole or not at all, and a copy set aside that cannot then be deleted stops
+the operation, since the room it takes is not free. What a live package consists of is read from the
+installation or the binding that holds it, or from its own manifest where it is activated here; one
+whose files this host cannot name stops the reclaim rather than being guessed at. When the only
+thing left to evict is one of those, the sync reports the limit instead.
 
 ## Matching, enabling and binding
 

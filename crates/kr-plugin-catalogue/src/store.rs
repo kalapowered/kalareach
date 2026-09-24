@@ -132,16 +132,6 @@ impl WorkingDatastore {
     pub fn path(&self) -> &Path {
         &self.path
     }
-
-    /// Returns what the copy counts against the retained metadata budget, which is what
-    /// publishing it would make the accepted checkpoint count.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CatalogueError::StorageUnavailable`] when the copy cannot be read.
-    pub fn bytes(&self) -> CatalogueResult<u64> {
-        checkpoint_size(&self.path)
-    }
 }
 
 impl Drop for WorkingDatastore {
@@ -460,13 +450,14 @@ impl Store {
 
     /// Makes a verified working copy the accepted trust checkpoint, one document at a time.
     ///
-    /// Each document is written whole beside the accepted one and renamed over it, so a reader, or
-    /// an interruption, finds every document whole: the one that was accepted or the one that
-    /// verified. The working copy is left as it was, because the client goes on reading and
-    /// writing its time checkpoint there while the verified generation's payloads are fetched. A
-    /// document the working copy no longer holds is removed. The client verified each new document as no older
-    /// than the one it replaces, so a checkpoint caught part way between the two is still a set of
-    /// floors the next verification can start from.
+    /// What the working copy no longer holds goes first: the delegated documents of the generation
+    /// before, which the client never reads back. Each document it holds is then written whole
+    /// beside the accepted one and renamed over it, so a reader, or an interruption, finds every
+    /// document whole: the one that was accepted or the one that verified. A checkpoint caught at
+    /// any point therefore holds every floor, no older than before, and never one generation's
+    /// delegated documents beside the next's, so it counts no more than [`Self::publication_peak`]
+    /// says. The working copy is left as it was, because the client goes on reading and writing its
+    /// time checkpoint there while the verified generation's payloads are fetched.
     ///
     /// # Errors
     ///
@@ -489,30 +480,23 @@ impl Store {
             } else {
                 CatalogueError::PublicationUncertain {
                     detail: format!(
-                        "{changed} documents of the trust checkpoint were replaced before this \
+                        "{changed} documents of the trust checkpoint were changed before this \
                          failed: {error}"
                     ),
                 }
             }
         };
-        for relative in &verified {
-            #[cfg(test)]
-            if publish_fault::stops_at(changed) {
-                return Err(stopped(
-                    changed,
-                    CatalogueError::StorageUnavailable {
-                        detail: "the publication was made to stop".to_owned(),
-                    },
-                ));
-            }
-            let from = working.path.join(relative);
-            let bytes = std::fs::read(&from)
-                .map_err(|source| stopped(changed, CatalogueError::storage(&from, &source)))?;
-            rename_into_place(&staging, &accepted.join(relative), &bytes)
-                .map_err(|error| stopped(changed, error))?;
-            changed += 1;
-        }
+        #[cfg(test)]
+        let made_to_stop = |changed: usize| {
+            publish_fault::stops_at(changed).then(|| CatalogueError::StorageUnavailable {
+                detail: "the publication was made to stop".to_owned(),
+            })
+        };
         for relative in held.iter().filter(|relative| !verified.contains(*relative)) {
+            #[cfg(test)]
+            if let Some(error) = made_to_stop(changed) {
+                return Err(stopped(changed, error));
+            }
             let path = accepted.join(relative);
             match std::fs::remove_file(&path) {
                 Ok(()) => changed += 1,
@@ -522,7 +506,49 @@ impl Store {
                 }
             }
         }
+        for relative in &verified {
+            #[cfg(test)]
+            if let Some(error) = made_to_stop(changed) {
+                return Err(stopped(changed, error));
+            }
+            let from = working.path.join(relative);
+            let bytes = std::fs::read(&from)
+                .map_err(|source| stopped(changed, CatalogueError::storage(&from, &source)))?;
+            rename_into_place(&staging, &accepted.join(relative), &bytes)
+                .map_err(|error| stopped(changed, error))?;
+            changed += 1;
+        }
         flushed_after_publication(&accepted, &accepted)
+    }
+
+    /// Returns the most the accepted checkpoint counts at any moment while `working` is published
+    /// over it, against the retained metadata budget.
+    ///
+    /// Each document the working copy holds counts at the larger of its accepted and verified
+    /// sizes, since an interruption can leave either, and the time the client saw counts at the
+    /// most its document can hold. A document the working copy no longer holds is removed before
+    /// anything is written, so it never stands beside what replaces it and is not counted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when either copy cannot be read.
+    pub fn publication_peak(&self, working: &WorkingDatastore) -> CatalogueResult<u64> {
+        let accepted = self.datastore();
+        let size = |path: PathBuf| match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => Ok(metadata.len()),
+            Ok(_) => Ok(0),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(source) => Err(CatalogueError::storage(&path, &source)),
+        };
+        let mut peak = TIME_CHECKPOINT_BOUND;
+        for relative in files_under(&working.path)? {
+            if relative == Path::new(TIME_CHECKPOINT) {
+                continue;
+            }
+            let larger = size(working.path.join(&relative))?.max(size(accepted.join(&relative))?);
+            peak = peak.saturating_add(larger);
+        }
+        Ok(peak)
     }
 
     /// Returns what this repository's accepted trust checkpoint counts against the retained
@@ -1079,9 +1105,10 @@ impl Store {
     /// Removes the extracted packages and the cached payloads a reclaim plan names.
     ///
     /// An extracted package leaves `packages` in one rename, into staging, and is deleted from
-    /// there: a package is therefore either all there or gone, never part of one, and whatever of
-    /// it a deletion leaves in staging is removed when the store's lock is next taken. A cached
-    /// payload is one file, removed in one step. Something somebody else already removed counts as
+    /// there: a package is therefore either all there or gone, never part of one. A copy set aside
+    /// that cannot be deleted stops the reclaim as uncertain, because its room is not free; what is
+    /// left of it is removed when the store's lock is next taken. A cached payload is one file,
+    /// removed in one step. Something somebody else already removed counts as
     /// removed. A failure before anything was removed leaves the store as it was; one after is
     /// [`CatalogueError::PublicationUncertain`], because part of the plan has already happened and
     /// cannot be reported as nothing.
@@ -1110,12 +1137,20 @@ impl Store {
             let path = self.package_dir(*digest);
             let aside = self.root.join("staging").join(format!("removed-{digest}"));
             match std::fs::rename(&path, &aside) {
-                Ok(()) => {
-                    removed += 1;
-                    let _ = std::fs::remove_dir_all(&aside);
-                }
-                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(()) => removed += 1,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(source) => return Err(stopped(removed, &path, &source)),
+            }
+            // The package is gone from where readers look, and its bytes are not free until the
+            // copy set aside is gone too. One that stays is room this reclaim did not make.
+            if let Err(source) = std::fs::remove_dir_all(&aside) {
+                return Err(CatalogueError::PublicationUncertain {
+                    detail: format!(
+                        "{digest} was moved aside to make room and {} could not be removed, so \
+                         the room it takes is not free: {source}",
+                        aside.display()
+                    ),
+                });
             }
         }
         for (digest, _) in &plan.payloads {

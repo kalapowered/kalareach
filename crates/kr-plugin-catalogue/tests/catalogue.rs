@@ -2784,8 +2784,10 @@ enum Holder {
 /// does. Where the broker reports it and its manifest is gone or altered, nothing can say what it
 /// consists of, and the reclaim is refused before anything is removed.
 ///
-/// The budget holds the first two releases, installed, cached and extracted, and the third
-/// release's staging exactly once the first release's extracted copy is gone.
+/// The first release carries a payload no later release shares. The budget holds the first two
+/// releases, installed, cached and extracted, and the third release's staging exactly once that
+/// payload is gone from the cache, or the first release's extracted copy is: a reclaim that
+/// protected the first release's package but not its payloads would take the payload and succeed.
 #[tokio::test]
 async fn kr_req_11_12_an_upgraded_package_is_kept_while_the_broker_or_a_binding_holds_it() {
     for holder in [
@@ -2796,7 +2798,14 @@ async fn kr_req_11_12_an_upgraded_package_is_kept_while_the_broker_or_a_binding_
         Holder::BrokerWithAlteredManifest,
     ] {
         let home = tempfile::tempdir().expect("a temporary directory");
-        let first = Generation::build(home.path(), GenerationSpec::default()).await;
+        let first = Generation::build(
+            home.path(),
+            GenerationSpec {
+                extra_asset: Some(b"a payload only the first release carries".to_vec()),
+                ..GenerationSpec::default()
+            },
+        )
+        .await;
         let release = |generation: u64, version: &str| {
             let home = home.path().join(version);
             let keys = first.keys();
@@ -2822,20 +2831,29 @@ async fn kr_req_11_12_an_upgraded_package_is_kept_while_the_broker_or_a_binding_
             payloads_of(&third),
         );
         let presentation = presentation_size(&first);
-        assert_eq!(a.len(), 2);
-        assert!(
-            a.keys()
-                .filter(|digest| b.contains_key(digest) && c.contains_key(digest))
-                .count()
-                == 1
-        );
-        let (ma, mb, mc) = (
+        let unique = PayloadDigest::of(b"a payload only the first release carries");
+        assert_eq!(a.len(), 3);
+        assert!(!b.contains_key(&unique) && !c.contains_key(&unique));
+        let (ma, mb, mc, u) = (
             a[&first.manifest_digest()],
             b[&second.manifest_digest()],
             c[&third.manifest_digest()],
+            a[&unique],
         );
+        // Cached: the first release's manifest, the shared presentation, the unique payload and the
+        // second release's manifest; extracted: both releases. The third release stages its two
+        // files and fetches its manifest. Less the unique payload.
+        let held = (ma + presentation + u + mb) + (ma + presentation + u) + (mb + presentation);
+        let needed = (mc + presentation) + mc;
+        // A manifest removed from the extracted copy takes its bytes with it, and the room still
+        // wanted is the same.
+        let removed = if matches!(holder, Holder::BrokerWithoutManifest) {
+            ma
+        } else {
+            0
+        };
         let mut budgets = RepositoryBudgets::defaults();
-        budgets.payload_cache_bytes = U64::new(ma + 2 * mb + 2 * mc + 3 * presentation);
+        budgets.payload_cache_bytes = U64::new(held + needed - u - removed);
         let old = first.manifest_digest();
         let broker: Arc<dyn kr_plugin_catalogue::BrokerBridge> = match holder {
             Holder::Nothing | Holder::Binding => Arc::new(kr_plugin_catalogue::UnboundBroker),
@@ -2904,7 +2922,10 @@ async fn kr_req_11_12_an_upgraded_package_is_kept_while_the_broker_or_a_binding_
         match holder {
             Holder::BrokerWithoutManifest => std::fs::remove_file(&manifest).expect("removable"),
             Holder::BrokerWithAlteredManifest => {
-                std::fs::write(&manifest, b"{}").expect("writable");
+                // The same length, and not the bytes its hash names.
+                let mut bytes = std::fs::read(&manifest).expect("readable");
+                bytes[0] ^= 0x01;
+                std::fs::write(&manifest, bytes).expect("writable");
             }
             _ => {}
         }

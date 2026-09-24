@@ -1088,12 +1088,12 @@ impl Catalogue {
         };
 
         // What the repository keeps is decided before anything this sync verified is kept. The
-        // checkpoint it would publish has to fit beside the new generation, which is what stays if
-        // the sync succeeds, and beside the generation in use, which is what stays if it goes no
-        // further; generations it is not on make room for the second first. A sync that cannot
-        // fit either way is refused here, with the accepted checkpoint and the generation in use as
-        // they were.
-        let checkpoint = working.bytes()?;
+        // checkpoint, at the most it counts while it is published, has to fit beside the new
+        // generation, which is what stays if the sync succeeds, and beside the generation in use,
+        // which is what stays if it goes no further; generations it is not on make room for the
+        // second first. A sync that cannot fit either way is refused here, with the accepted
+        // checkpoint and the generation in use as they were.
+        let checkpoint = store.publication_peak(&working)?;
         self.retain_before_publication(&store, &enrolled.key, id, checkpoint, arriving, authority)?;
 
         // The metadata verified, so it becomes the accepted checkpoint now, in a commit of its
@@ -1220,7 +1220,9 @@ impl Catalogue {
                 },
             ))
         })?;
-        self.remove_unnamed_indexes(&store, &enrolled.key, id, authority);
+        // Best effort: the sync has happened whatever this does. A document it cannot remove is
+        // removed by the next sync before it keeps anything, or stops that sync.
+        let _ = self.remove_unnamed_indexes(&store, &enrolled.key, id, authority);
         Ok(synced)
     }
 
@@ -1231,7 +1233,8 @@ impl Catalogue {
     /// checkpoint beside the new generation, and the checkpoint beside the generation in use, which
     /// is what stays if the sync goes no further. The generations the second needs gone are
     /// removed in a commit of their own, decided again inside it, and their index documents after
-    /// it. Nothing is written when nothing has to go.
+    /// it, before the checkpoint is published into the room they held. Nothing is written when
+    /// nothing has to go.
     ///
     /// # Errors
     ///
@@ -1255,6 +1258,10 @@ impl Catalogue {
                 index_bytes: active.index_bytes,
             })
         };
+        // An index document no kept generation names, left by a sync that stopped, is removed
+        // before anything is decided. The records no longer count it, so one that cannot be removed
+        // stops this sync rather than holding room the budget cannot see.
+        self.remove_unnamed_indexes(store, key, id, authority)?;
         let forget = self.db.read(|records| {
             let current = records.enrolment_by_key(key)?.ok_or_else(removed)?;
             let kept = retained(&records.kept_generations(key)?);
@@ -1281,39 +1288,39 @@ impl Catalogue {
                 Ok(())
             })
         })?;
-        self.remove_unnamed_indexes(store, key, id, authority);
-        Ok(())
+        // The room those generations held is what the checkpoint is published into, so their
+        // documents have to be gone before it is.
+        self.remove_unnamed_indexes(store, key, id, authority)
     }
 
     /// Removes every index document no generation this repository keeps names.
     ///
     /// The records that named a generation it stopped keeping are already gone, so no reader is
     /// left holding a generation whose index has disappeared, and a document a sync wrote before
-    /// it stopped is removed the same way. The sync has happened whatever this does: a document it
-    /// cannot remove is left for the next sync to remove.
+    /// it stopped is removed the same way.
+    ///
+    /// # Errors
+    ///
+    /// Returns what reading the records or the directory, or removing a document, returns.
     fn remove_unnamed_indexes(
         &self,
         store: &Store,
         key: &EnrolmentKey,
         id: &RepositoryId,
         authority: &dyn Authority,
-    ) {
-        let Ok(kept) = self.db.read(|records| records.kept_generations(key)) else {
-            return;
-        };
-        let Ok(held) = store.index_documents() else {
-            return;
-        };
-        let unnamed: Vec<PayloadDigest> = held
+    ) -> CatalogueResult<()> {
+        let kept = self.db.read(|records| records.kept_generations(key))?;
+        let unnamed: Vec<PayloadDigest> = store
+            .index_documents()?
             .into_keys()
             .filter(|digest| !kept.iter().any(|kept| kept.index_digest == *digest))
             .collect();
         if unnamed.is_empty() {
-            return;
+            return Ok(());
         }
-        let _ = committed(authority, &Effect::Forgotten(id.clone()), |permit| {
+        committed(authority, &Effect::Forgotten(id.clone()), |permit| {
             store.remove_index_documents(permit, &unnamed)
-        });
+        })
     }
 
     /// Fetches every payload the index references, inside the approved budget.
@@ -2987,6 +2994,447 @@ mod tests {
                 "{stop:?}: {refusal:?}"
             );
         }
+    }
+
+    /// What a store keeps against its retained metadata budget: the checkpoint, and every index
+    /// document there, named or not.
+    fn retained_on_disk(catalogue: &Catalogue, id: &RepositoryId) -> u64 {
+        let store = catalogue.store(id).expect("enrolled");
+        store.checkpoint_bytes().expect("readable")
+            + store
+                .index_documents()
+                .expect("readable")
+                .into_values()
+                .sum::<u64>()
+    }
+
+    /// Changes one enrolment's budgets, as the owner may.
+    fn rebudget(
+        catalogue: &mut Catalogue,
+        id: &RepositoryId,
+        change: impl FnOnce(&mut RepositoryBudgets),
+    ) {
+        let mut enrolment = catalogue
+            .repository(id)
+            .expect("readable")
+            .expect("enrolled");
+        change(&mut enrolment.budgets);
+        catalogue
+            .update_enrolment(enrolment, false)
+            .expect("a budget is the owner's to change");
+    }
+
+    /// A package set aside to make room whose copy cannot then be removed is room the reclaim did
+    /// not make. The install stops as uncertain before anything of the new package is written, the
+    /// removal is recorded as unconfirmed, and the receipt says so after a restart.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_package_set_aside_that_cannot_be_removed_stops_the_install_as_uncertain() {
+        use crate::test_support::{Generation, GenerationSpec};
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let first = Generation::build(
+            home.path(),
+            GenerationSpec {
+                asset_copy: true,
+                ..GenerationSpec::default()
+            },
+        )
+        .await;
+        let second = Generation::build(
+            &home.path().join("second"),
+            GenerationSpec {
+                generation: 2,
+                package_version: "0.2.0".to_owned(),
+                keys: Some(first.keys()),
+                ..GenerationSpec::default()
+            },
+        )
+        .await;
+        let (mut catalogue, id) = enrolled_generation(home.path(), &first);
+        let environment = EnvironmentId::new(kr_protocol::scalars::Uuid::NIL);
+        let plugin = PluginId::new("kalareach/example-declarative").expect("a plugin identifier");
+        catalogue.sync(&id).await.expect("the first generation");
+        catalogue
+            .install(
+                &id,
+                environment,
+                &plugin,
+                &PackageVersion::parse("0.1.0").expect("a version"),
+                first.manifest_digest(),
+                InstallationGrant::none(),
+            )
+            .await
+            .expect("the first release");
+        catalogue
+            .uninstall(environment, &plugin)
+            .expect("uninstalled");
+        first.replace_with(&second);
+        catalogue.sync(&id).await.expect("the second generation");
+
+        // Room for the second release exactly once the first release's extracted copy is gone.
+        let store = catalogue.store(&id).expect("enrolled");
+        let cached = store.cached_payloads().expect("readable");
+        let trees = store.package_trees().expect("readable");
+        let held: u64 = cached.values().sum::<u64>() + trees.values().sum::<u64>();
+        let entry = catalogue.index(&id).expect("an index").entries[0].clone();
+        let staged = entry.manifest_size_bytes.get()
+            + entry
+                .payloads
+                .iter()
+                .map(|payload| payload.size_bytes.get())
+                .sum::<u64>();
+        let fetched = entry.manifest_size_bytes.get();
+        let old = first.manifest_digest();
+        rebudget(&mut catalogue, &id, |budgets| {
+            budgets.payload_cache_bytes =
+                kr_protocol::scalars::U64::new(held + staged + fetched - trees[&old]);
+        });
+        let held_open = store.package_dir(old).join("assets");
+        std::fs::set_permissions(&held_open, std::fs::Permissions::from_mode(0o555))
+            .expect("read-only");
+
+        let owner = Owner::acting();
+        let key = ReceiptKey::new("kr:local", "install");
+        assert_eq!(
+            catalogue.claim(&claim("install"), 1).expect("recorded"),
+            Claimed::Fresh
+        );
+        let recording = Recording::new(&owner);
+        let mut never = |_: &Transition| -> CatalogueResult<Vec<u8>> {
+            unreachable!("an action that stopped renders no answer")
+        };
+        let stopped = catalogue
+            .install_with(
+                &id,
+                environment,
+                &plugin,
+                &entry.version,
+                entry.manifest_digest,
+                InstallationGrant::none(),
+                &mut Change::settling(&recording, key.clone(), 2, &mut never),
+            )
+            .await;
+        let aside = store
+            .datastore()
+            .parent()
+            .expect("the store")
+            .join("staging")
+            .join(format!("removed-{old}"))
+            .join("assets");
+        std::fs::set_permissions(&aside, std::fs::Permissions::from_mode(0o755))
+            .expect("writable again");
+
+        let stopped = stopped.expect_err("the room was not made");
+        assert!(
+            matches!(stopped, CatalogueError::PublicationUncertain { .. }),
+            "{stopped:?}"
+        );
+        assert!(
+            matches!(
+                recording.committed().as_slice(),
+                [Committed {
+                    effect: Effect::Reclaim { packages: 1, .. },
+                    confirmed: false,
+                }]
+            ),
+            "{:?}",
+            recording.committed()
+        );
+        assert!(!store.package_dir(entry.manifest_digest).exists());
+        assert!(
+            !store
+                .cached_payloads()
+                .expect("readable")
+                .contains_key(&entry.manifest_digest),
+            "nothing of the second release was fetched"
+        );
+        let failure = recording.failure(&stopped.into());
+        assert_eq!(failure.state(), ReceiptState::Unknown);
+        catalogue
+            .settle_failure(&key, &failure, 3)
+            .expect("recorded");
+        drop(catalogue);
+        let reopened = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+        assert_eq!(
+            reopened
+                .receipt(&key)
+                .expect("readable")
+                .expect("a receipt")
+                .state,
+            ReceiptState::Unknown
+        );
+    }
+
+    /// Before a checkpoint is published into the room an older generation held, that generation's
+    /// index document has to be gone. One that cannot be removed stops the sync with the accepted
+    /// checkpoint as it was and what is kept inside the budget; once it can be removed, the sync
+    /// goes through after a restart.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_index_that_cannot_be_removed_before_publication_stops_the_sync_inside_its_budget() {
+        use crate::test_support::{Generation, GenerationSpec};
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+        let (mut catalogue, id) = enrolled_generation(home.path(), &generation);
+        catalogue.sync(&id).await.expect("the first generation");
+        generation.rewrite_as(2).await;
+        catalogue.sync(&id).await.expect("the second generation");
+        // What is kept now, the checkpoint and both indexes, is the whole budget.
+        let limit = retained_on_disk(&catalogue, &id);
+        rebudget(&mut catalogue, &id, |budgets| {
+            budgets.retained_metadata_bytes = kr_protocol::scalars::U64::new(limit);
+        });
+        // The third generation delegates, so its checkpoint is the larger, and it fits beside the
+        // generation in use only once the first generation's index is gone.
+        let third = Generation::build(
+            &home.path().join("third"),
+            GenerationSpec {
+                generation: 3,
+                keys: Some(generation.keys()),
+                delegations: vec![(
+                    "vendor".to_owned(),
+                    "packages/kalareach/*/*/*".to_owned(),
+                    false,
+                )],
+                ..GenerationSpec::default()
+            },
+        )
+        .await;
+        generation.replace_with(&third);
+        let store = catalogue.store(&id).expect("enrolled");
+        let accepted = |store: &Store| -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+            std::fs::read_dir(store.datastore())
+                .expect("readable")
+                .flatten()
+                .map(|entry| (entry.path(), std::fs::read(entry.path()).expect("readable")))
+                .collect()
+        };
+        let before = accepted(&store);
+        let index_directory = store
+            .index_path(PayloadDigest::of(b""))
+            .parent()
+            .expect("the index directory")
+            .to_owned();
+        std::fs::set_permissions(&index_directory, std::fs::Permissions::from_mode(0o555))
+            .expect("read-only");
+        let refusal = catalogue.sync(&id).await;
+        std::fs::set_permissions(&index_directory, std::fs::Permissions::from_mode(0o755))
+            .expect("writable again");
+        let refusal = refusal.expect_err("the older index could not be removed");
+        assert!(
+            matches!(refusal, CatalogueError::StorageUnavailable { .. }),
+            "{refusal:?}"
+        );
+        assert_eq!(accepted(&store), before, "the checkpoint was not published");
+        assert_eq!(
+            catalogue
+                .active(&id)
+                .expect("enrolled")
+                .map(|active| active.generation),
+            Some(2)
+        );
+        assert!(retained_on_disk(&catalogue, &id) <= limit);
+
+        drop(catalogue);
+        let mut catalogue = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+        catalogue
+            .sync(&id)
+            .await
+            .expect("the removal goes through now");
+        assert_eq!(
+            catalogue
+                .active(&id)
+                .expect("enrolled")
+                .map(|active| active.generation),
+            Some(3)
+        );
+        assert!(retained_on_disk(&catalogue, &id) <= limit);
+    }
+
+    /// A checkpoint publication stopped at any step, with consistent snapshots and three delegated
+    /// roles whose documents are named by version, keeps what is held inside a budget that fits
+    /// either whole checkpoint beside the generation in use: the documents the verification no
+    /// longer holds go before any new one arrives, so the two generations' delegated documents never
+    /// stand side by side. Every floor stays, and the publication goes through after a restart.
+    #[tokio::test]
+    async fn a_publication_stopped_at_any_step_keeps_what_is_held_inside_the_budget() {
+        use crate::test_support::{Generation, GenerationSpec};
+
+        // Three documents to remove, then eight to write.
+        for stop in 0..=11usize {
+            let home = tempfile::tempdir().expect("a temporary directory");
+            let generation = Generation::build(
+                home.path(),
+                GenerationSpec {
+                    consistent_snapshot: true,
+                    delegation_chain: 3,
+                    ..GenerationSpec::default()
+                },
+            )
+            .await;
+            let (mut catalogue, id) = enrolled_generation(home.path(), &generation);
+            catalogue.sync(&id).await.expect("the first generation");
+            let limit = retained_on_disk(&catalogue, &id);
+            rebudget(&mut catalogue, &id, |budgets| {
+                budgets.retained_metadata_bytes = kr_protocol::scalars::U64::new(limit);
+            });
+            generation.rewrite_as(2).await;
+
+            crate::store::publish_fault::stop_after(stop);
+            let outcome = catalogue.sync(&id).await;
+            crate::store::publish_fault::clear();
+            assert_eq!(
+                outcome.is_ok(),
+                stop == 11,
+                "stopped at {stop}: {outcome:?}"
+            );
+
+            drop(catalogue);
+            let mut catalogue = Catalogue::open(&home.path().join("catalogue")).expect("reopens");
+            assert!(
+                retained_on_disk(&catalogue, &id) <= limit,
+                "stopped at {stop}: {} against {limit}",
+                retained_on_disk(&catalogue, &id)
+            );
+            let (timestamp, snapshot) = floors(&catalogue, &id);
+            assert!(
+                [1, 2].contains(&timestamp) && [1, 2].contains(&snapshot),
+                "stopped at {stop}"
+            );
+            catalogue
+                .sync(&id)
+                .await
+                .unwrap_or_else(|refusal| panic!("stopped at {stop}: {refusal}"));
+            assert!(
+                retained_on_disk(&catalogue, &id) <= limit,
+                "stopped at {stop}"
+            );
+        }
+    }
+
+    /// A publication is measured at the most it holds on the way, not at the checkpoint it ends
+    /// with. The first generation's targets document is the larger, since it pins one more target,
+    /// and the second generation's last delegated document is the larger, since it pins one more
+    /// file. A stop after the second generation's delegated documents arrive and before the targets
+    /// document is replaced would hold the larger of each; so a budget that fits either whole
+    /// checkpoint beside its own index, and not that, refuses the sync before anything is kept.
+    #[tokio::test]
+    async fn a_publication_is_refused_where_its_peak_and_not_its_end_is_past_the_budget() {
+        use crate::test_support::{Generation, GenerationSpec, copy_tree};
+
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let first = Generation::build(
+            &home.path().join("first"),
+            GenerationSpec {
+                consistent_snapshot: true,
+                delegation_chain: 3,
+                extra_targets: vec![(
+                    format!(
+                        "extra/{}.json",
+                        "pinned-only-by-the-first-generation-".repeat(3)
+                    ),
+                    vec![7; 64],
+                )],
+                ..GenerationSpec::default()
+            },
+        )
+        .await;
+        let second = Generation::build(
+            &home.path().join("second"),
+            GenerationSpec {
+                generation: 2,
+                consistent_snapshot: true,
+                delegation_chain: 3,
+                asset_copy: true,
+                keys: Some(first.keys()),
+                ..GenerationSpec::default()
+            },
+        )
+        .await;
+        let publish = |from: &Generation, at: &Path| {
+            let _ = std::fs::remove_dir_all(at);
+            copy_tree(&from.directory(), at);
+        };
+
+        // The finished second checkpoint, measured in a catalogue of its own.
+        let probe_at = home.path().join("probe");
+        publish(&first, &probe_at);
+        let probe_generation = |at: &Path| -> Enrolment {
+            Enrolment::new(
+                RepositoryId::new("official").expect("a valid identifier"),
+                RepositoryKind::Official,
+                url::Url::from_directory_path(at.join("metadata")).expect("a location"),
+                url::Url::from_directory_path(at.join("targets")).expect("a location"),
+                first.root_bytes(),
+                RepositoryBudgets::defaults(),
+                CapabilityCeiling::default_ceiling(),
+            )
+            .expect("an enrolment")
+        };
+        let id = RepositoryId::new("official").expect("a valid identifier");
+        let mut probe = Catalogue::open(&home.path().join("probe-catalogue")).expect("openable");
+        probe
+            .enrol(probe_generation(&probe_at), true)
+            .expect("enrolled");
+        probe.sync(&id).await.expect("the first generation");
+        let first_index: u64 = probe
+            .store(&id)
+            .expect("enrolled")
+            .index_documents()
+            .expect("readable")
+            .into_values()
+            .sum();
+        let first_checkpoint = probe
+            .store(&id)
+            .expect("enrolled")
+            .checkpoint_bytes()
+            .expect("readable");
+        publish(&second, &probe_at);
+        probe.sync(&id).await.expect("the second generation");
+        let store = probe.store(&id).expect("enrolled");
+        let finished = store.checkpoint_bytes().expect("readable");
+        let second_index = store
+            .index_documents()
+            .expect("readable")
+            .into_values()
+            .sum::<u64>()
+            - first_index;
+
+        let at = home.path().join("case");
+        publish(&first, &at);
+        let mut catalogue = Catalogue::open(&home.path().join("catalogue")).expect("openable");
+        catalogue
+            .enrol(probe_generation(&at), true)
+            .expect("enrolled");
+        catalogue.sync(&id).await.expect("the first generation");
+        let limit = (first_checkpoint + first_index).max(finished + second_index);
+        assert!(retained_on_disk(&catalogue, &id) <= limit);
+        rebudget(&mut catalogue, &id, |budgets| {
+            budgets.retained_metadata_bytes = kr_protocol::scalars::U64::new(limit);
+        });
+        let before = retained_on_disk(&catalogue, &id);
+        publish(&second, &at);
+        let refusal = catalogue
+            .sync(&id)
+            .await
+            .expect_err("the publication's peak is past the budget");
+        assert!(
+            matches!(&refusal, CatalogueError::ResourceLimit(limit)
+                if limit.resource == crate::budget::Resource::RetainedMetadataBytes),
+            "{refusal:?}"
+        );
+        assert_eq!(retained_on_disk(&catalogue, &id), before);
+        assert_eq!(
+            catalogue
+                .active(&id)
+                .expect("enrolled")
+                .map(|active| active.generation),
+            Some(1)
+        );
     }
 
     /// A read that fails while no repository stopped keeping anything fails as it is.

@@ -203,6 +203,9 @@ pub struct GenerationSpec {
     /// presentation's bytes, in place of its real one: two signed statements that agree with each
     /// other and not with the bytes.
     pub understated_presentation: Option<u64>,
+    /// Bytes the package carries as an asset at `assets/extra.bin`, so a release can hold a
+    /// payload no other release shares.
+    pub extra_asset: Option<Vec<u8>>,
     /// The version every role's metadata is signed at, where it is not the generation number: a
     /// repository that starts its roles again from lower versions after a key change.
     pub metadata_version: Option<u64>,
@@ -235,6 +238,7 @@ impl Default for GenerationSpec {
             root_extra: Vec::new(),
             asset_copy: false,
             understated_presentation: None,
+            extra_asset: None,
             metadata_version: None,
             extra_targets: Vec::new(),
             edit_entry: None,
@@ -885,6 +889,15 @@ fn package_files(spec: &GenerationSpec) -> (PluginManifest, Vec<(String, Vec<u8>
         asset.path = kr_plugin_sdk::paths::PackagePath::new(copy).expect("a package path");
         manifest.payloads.push(asset);
     }
+    let extra = "assets/extra.bin";
+    if let Some(bytes) = &spec.extra_asset {
+        let mut asset = manifest.payloads[0].clone();
+        asset.role = kr_plugin_sdk::plugin::PayloadRole::Asset;
+        asset.path = kr_plugin_sdk::paths::PackagePath::new(extra).expect("a package path");
+        asset.digest = PayloadDigest::of(bytes);
+        asset.size_bytes = kr_protocol::scalars::U64::new(bytes.len() as u64);
+        manifest.payloads.push(asset);
+    }
     let mut manifest_json =
         serde_json::to_string_pretty(&manifest).expect("the manifest is serialisable");
     manifest_json.push('\n');
@@ -900,6 +913,9 @@ fn package_files(spec: &GenerationSpec) -> (PluginManifest, Vec<(String, Vec<u8>
     ];
     if spec.asset_copy {
         files.push((copy.to_owned(), presentation.into_bytes()));
+    }
+    if let Some(bytes) = &spec.extra_asset {
+        files.push((extra.to_owned(), bytes.clone()));
     }
     (manifest, files)
 }
