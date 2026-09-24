@@ -46,8 +46,9 @@ use kr_protocol::ids::{AttemptId, BuildId, DeviceId, DeviceKeyRevision};
 use kr_protocol::invitation::RendezvousMessage;
 use kr_protocol::method::Method;
 use kr_protocol::pairing::{
-    BundleDirection, BundleMessageType, ClientBundle, DeviceName, DevicePlatform, Locator,
-    MAX_CLIENT_ATTEMPTS, PairStatus, RendezvousOrigin, group_verification_value,
+    BundleDirection, BundleMessageType, ClientBundle, DeviceName, DevicePlatform,
+    INVITATION_LIFETIME_MS, Locator, MAX_CLIENT_ATTEMPTS, PairStatus, RendezvousOrigin,
+    group_verification_value,
 };
 use kr_protocol::preauth::{PairStatusParams, PairStatusResult};
 use kr_protocol::rendezvous::{
@@ -85,6 +86,14 @@ pub const RECONNECT_DELAYS: [Duration; 4] = [
 
 /// How many times a device that has just been committed tries to connect as what it became.
 const PAIRED_CONNECT_TRIES: usize = 4;
+
+/// How long one question to the host, or one dial of it, may take while the device waits for the
+/// owner. A host that answers nothing is asked again, and the attempt's own deadline still holds.
+pub const WAIT_STEP: Duration = Duration::from_secs(10);
+
+/// How far past an invitation's expiry, by this device's clock, it keeps asking. Two clocks never
+/// agree exactly, and the host decides expiry on its own.
+pub const RECOVERY_MARGIN_MS: u64 = 60_000;
 
 /// This device, as it pairs with hosts.
 #[derive(Clone)]
@@ -244,8 +253,8 @@ pub enum AttemptState {
     },
     /// The connection to the host was lost while the owner decides, and is being made again.
     Reconnecting {
-        /// The value both devices display, grouped.
-        value: String,
+        /// The value both devices display, grouped, once the host has answered with it.
+        value: Option<String>,
         /// When the invitation expires, once the host has said.
         expires_at_ms: Option<u64>,
     },
@@ -341,11 +350,21 @@ impl Pairing {
             Ok(None) => return None,
             Err(failure) => return Some(ended(progress, Err(failure))),
         };
-        progress.send_replace(AttemptState::Reconnecting {
-            value: group_verification_value(&pending.verification_value),
-            expires_at_ms: pending.expires_at_ms,
-        });
-        let outcome = self.await_approval(pending, None, progress).await;
+        progress.send_replace(reconnecting(&pending));
+        // The host may have committed this device already, and this device recorded it and
+        // stopped before it let the waiting attempt go. The host now answers that endpoint as the
+        // paired device, so the record is what reaches it.
+        let recorded = match self.hosts.by_device(pending.host_device_id) {
+            Ok(recorded) => recorded,
+            Err(failure) => return Some(ended(progress, Err(failure))),
+        };
+        let outcome = match recorded {
+            Some(host) if host.host_endpoint_id == pending.host_endpoint_id => self
+                .confirm_committed(host, &pending, progress)
+                .await
+                .map_err(|failure| failure.or_tries(pending.tries_left)),
+            _ => self.await_approval(pending, None, progress).await,
+        };
         Some(ended(progress, outcome))
     }
 
@@ -367,13 +386,41 @@ impl Pairing {
             })
             .await
         };
-        let ((mut attempt, admission, _record), socket) = match started {
+        let ((attempt, admission, _record), socket) = match started {
             Ok(started) => started,
             Err(refused) => return Err(self.start_failure(refused, origin, code)),
         };
+        // The attempt was charged, so every ending from here says how many tries are left.
+        let tries = Some(attempt.remaining_attempts());
+        // An invitation lives five minutes, so a code entered now cannot be open much past five
+        // minutes from now, whatever the service advertised.
+        let recover_until_ms = self
+            .clock
+            .wall_clock_ms()
+            .saturating_add(INVITATION_LIFETIME_MS)
+            .saturating_add(RECOVERY_MARGIN_MS);
+        self.exchange(
+            attempt,
+            admission,
+            Relay::new(socket, admission.attempt_id, deadline),
+            recover_until_ms,
+            progress,
+        )
+        .await
+        .map_err(|failure| failure.or_tries(tries))
+    }
+
+    /// The short-code exchange, from the room's admission to the owner's decision.
+    async fn exchange(
+        &self,
+        mut attempt: ClientAttempt,
+        admission: kr_pairing::client::ClientAdmission,
+        mut room: Relay,
+        recover_until_ms: u64,
+        progress: &watch::Sender<AttemptState>,
+    ) -> Result<PairedHost, PairingFailure> {
         let tries = Some(attempt.remaining_attempts());
         let clock = &*self.clock;
-        let mut room = Relay::new(socket, admission.attempt_id, deadline);
 
         // The room admitted the socket, and nothing the host said has arrived: every ending here
         // is the same uncertain one.
@@ -517,12 +564,16 @@ impl Pairing {
             network_config: bundle.network_config.clone(),
             proposed_grant: bundle.proposed_grant.clone(),
             verification_value: value.clone(),
+            value_confirmed: false,
             expires_at_ms: None,
+            recover_until_ms,
+            tries_left: tries,
         };
         // Kept before the finish leaves, so a device that restarts while the owner decides can
         // ask again.
         self.hosts.keep_attempt(&pending)?;
-        match preauth.finish(&request).await {
+        let finished = preauth.finish(&request).await;
+        let pending = match finished {
             Ok(finished) => {
                 if !verification_values_match(&value, &finished.verification_value) {
                     let _ = self.hosts.clear_attempt();
@@ -531,6 +582,7 @@ impl Pairing {
                         "the host's verification value is not the one this device computed",
                     ));
                 }
+                self.value_confirmed(pending)?
             }
             Err(LinkError::Refused(refusal)) => {
                 let _ = self.hosts.clear_attempt();
@@ -540,14 +592,28 @@ impl Pairing {
                 )
                 .with_tries(tries));
             }
-            // Whether the host bound the finish is unknown; asking is how to find out.
+            // Whether the host bound the finish is unknown; asking is how to find out, on a
+            // connection of its own.
             Err(LinkError::Lost(_) | LinkError::Configuration(_)) => {
+                drop(preauth);
+                drop(connection);
                 return self.await_approval(pending, None, progress).await;
             }
-        }
+        };
         progress.send_replace(awaiting(&pending));
         self.await_approval(pending, Some((connection, preauth)), progress)
             .await
+    }
+
+    /// Records that the host answered with the value this device computed, so a restart shows
+    /// it while it asks again.
+    pub(crate) fn value_confirmed(
+        &self,
+        mut pending: PendingAttempt,
+    ) -> Result<PendingAttempt, PairingFailure> {
+        pending.value_confirmed = true;
+        self.hosts.keep_attempt(&pending)?;
+        Ok(pending)
     }
 
     /// Says what a start that did not return an attempt means.
@@ -592,6 +658,18 @@ impl Pairing {
     /// host identifies a candidate by its endpoint.
     pub(crate) async fn await_approval(
         &self,
+        pending: PendingAttempt,
+        held: Option<(Connection, Box<dyn Preauth>)>,
+        progress: &watch::Sender<AttemptState>,
+    ) -> Result<PairedHost, PairingFailure> {
+        let tries = pending.tries_left;
+        self.waiting(pending, held, progress)
+            .await
+            .map_err(|failure| failure.or_tries(tries))
+    }
+
+    async fn waiting(
+        &self,
         mut pending: PendingAttempt,
         mut held: Option<(Connection, Box<dyn Preauth>)>,
         progress: &watch::Sender<AttemptState>,
@@ -601,8 +679,10 @@ impl Pairing {
         };
         let mut reconnects = 0_usize;
         loop {
+            // A host that holds the connection open and answers nothing is asked again; it does
+            // not hold the attempt past its deadline.
             let asked = match held.as_mut() {
-                Some((_, preauth)) => preauth.status(&params).await,
+                Some((_, preauth)) => within_step(preauth.status(&params)).await,
                 None => Err(LinkError::Lost("no connection".to_owned())),
             };
             match asked {
@@ -628,21 +708,17 @@ impl Pairing {
                 Err(LinkError::Lost(_) | LinkError::Configuration(_)) => {
                     // The connection is gone; it is let go of before the wait, not after.
                     drop(held.take());
-                    if pending
-                        .expires_at_ms
-                        .is_some_and(|expires| self.clock.wall_clock_ms() >= expires)
-                    {
+                    let now = self.clock.wall_clock_ms();
+                    if now >= pending.recover_until_ms {
                         let _ = self.hosts.clear_attempt();
                         return Err(PairingFailure::new(
                             FailureKind::ApprovalUnknown,
                             "the host could not be asked before the invitation expired",
                         ));
                     }
-                    progress.send_replace(AttemptState::Reconnecting {
-                        value: group_verification_value(&pending.verification_value),
-                        expires_at_ms: pending.expires_at_ms,
-                    });
-                    let delay = RECONNECT_DELAYS[reconnects.min(RECONNECT_DELAYS.len() - 1)];
+                    progress.send_replace(reconnecting(&pending));
+                    let delay = RECONNECT_DELAYS[reconnects.min(RECONNECT_DELAYS.len() - 1)]
+                        .min(Duration::from_millis(pending.recover_until_ms - now));
                     reconnects += 1;
                     tokio::time::sleep(delay).await;
                     held = self.reconnect(&pending).await;
@@ -675,11 +751,14 @@ impl Pairing {
                         "the host's verification value is not the one this device computed",
                     ));
                 }
-                self.learned_expiry(pending, expires_at_ms.get(), progress)?;
+                let newly_confirmed = !pending.value_confirmed;
+                pending.value_confirmed = true;
+                self.learned(pending, expires_at_ms.get(), newly_confirmed, progress)?;
                 Ok(None)
             }
+            // The host holds the invitation for this device and has not bound its value.
             PairStatus::Locked { expires_at_ms, .. } => {
-                self.learned_expiry(pending, expires_at_ms.get(), progress)?;
+                self.learned(pending, expires_at_ms.get(), false, progress)?;
                 Ok(None)
             }
             PairStatus::Committed {
@@ -703,15 +782,24 @@ impl Pairing {
         }
     }
 
-    /// Records the invitation's expiry the first time the host names it.
-    fn learned_expiry(
+    /// Records what a status answer taught this device: the invitation's expiry the first time
+    /// the host names it, and that the host answered with this device's value.
+    fn learned(
         &self,
         pending: &mut PendingAttempt,
         expires_at_ms: u64,
+        newly_confirmed: bool,
         progress: &watch::Sender<AttemptState>,
     ) -> Result<(), PairingFailure> {
-        if pending.expires_at_ms != Some(expires_at_ms) {
+        let new_expiry = pending.expires_at_ms != Some(expires_at_ms);
+        if new_expiry {
             pending.expires_at_ms = Some(expires_at_ms);
+            // The host's word, authenticated, can only bring the deadline forward.
+            pending.recover_until_ms = pending
+                .recover_until_ms
+                .min(expires_at_ms.saturating_add(RECOVERY_MARGIN_MS));
+        }
+        if new_expiry || newly_confirmed {
             self.hosts.keep_attempt(pending)?;
             progress.send_replace(awaiting(pending));
         }
@@ -720,19 +808,21 @@ impl Pairing {
 
     /// Dials the host again, unpaired, and opens its pre-authorisation surface.
     async fn reconnect(&self, pending: &PendingAttempt) -> Option<(Connection, Box<dyn Preauth>)> {
-        let connection = self
-            .link
-            .dial(&pending.network_config, &pending.host_endpoint_id)
-            .await
-            .ok()?;
+        let connection = within_step(
+            self.link
+                .dial(&pending.network_config, &pending.host_endpoint_id),
+        )
+        .await
+        .ok()?;
         if ConnectionPeer::of(&connection).endpoint() != pending.host_endpoint_id {
             return None;
         }
-        let preauth = self
-            .link
-            .open_unpaired(&connection, &self.candidate.unpaired())
-            .await
-            .ok()?;
+        let preauth = within_step(
+            self.link
+                .open_unpaired(&connection, &self.candidate.unpaired()),
+        )
+        .await
+        .ok()?;
         Some((connection, preauth))
     }
 
@@ -744,7 +834,7 @@ impl Pairing {
         grant_id: kr_protocol::ids::GrantId,
         progress: &watch::Sender<AttemptState>,
     ) -> Result<PairedHost, PairingFailure> {
-        let mut host = PairedHost {
+        let host = PairedHost {
             host_device_id: pending.host_device_id,
             host_key_revision: pending.host_key_revision,
             host_keys: pending.host_keys,
@@ -756,13 +846,33 @@ impl Pairing {
             name: None,
             paired_at_ms: self.clock.wall_clock_ms(),
         };
+        // The record first: a device that stops between the two keeps both, and resuming then
+        // reaches the host through the record rather than as a candidate it no longer is.
         self.hosts.record(host.clone())?;
-        self.hosts.clear_attempt()?;
+        self.confirm_committed(host, pending, progress).await
+    }
+
+    /// Connects to a host that committed this device, as the device it became, checks that the
+    /// host reports it so, and only then lets the waiting attempt go and reports the pairing.
+    ///
+    /// A host that cannot be reached leaves the attempt waiting, so the next start asks again,
+    /// until its time has passed; the record of the host stays either way, because the host
+    /// committed this device.
+    async fn confirm_committed(
+        &self,
+        mut host: PairedHost,
+        pending: &PendingAttempt,
+        progress: &watch::Sender<AttemptState>,
+    ) -> Result<PairedHost, PairingFailure> {
         progress.send_replace(AttemptState::Working {
             stage: Stage::ReachingHost,
         });
+        let device_id = host.device_id;
         let identity = self.candidate.paired_identity(device_id);
-        let mut last = None;
+        let params = PairStatusParams {
+            invitation_id: pending.invitation_id,
+        };
+        let mut last = String::new();
         for (index, delay) in RECONNECT_DELAYS
             .iter()
             .take(PAIRED_CONNECT_TRIES)
@@ -771,74 +881,110 @@ impl Pairing {
             if index > 0 {
                 tokio::time::sleep(*delay).await;
             }
-            match self.link.connect_paired(&host, &identity).await {
-                Ok(session) => {
-                    let status: Result<PairStatusResult, _> = session
-                        .read(
-                            Method::PairStatus,
-                            &PairStatusParams {
-                                invitation_id: pending.invitation_id,
-                            },
-                        )
-                        .await;
-                    match status.map(|answer| answer.status) {
-                        Ok(PairStatus::Committed {
-                            device_id: committed,
-                            ..
-                        }) if committed == device_id => {}
-                        Ok(_) => {
-                            session.close();
-                            return Err(PairingFailure::new(
-                                FailureKind::HostMismatch,
-                                "the host does not report this device as the one it committed",
-                            ));
-                        }
-                        Err(error) => {
-                            session.close();
-                            last = Some(error.to_string());
-                            continue;
-                        }
-                    }
-                    let environments: Result<EnvironmentListResult, _> =
-                        session.read(Method::EnvironmentList, &EmptyParams {}).await;
-                    session.close();
-                    host.name = environments.ok().and_then(|listed| {
-                        listed
-                            .environments
-                            .into_iter()
-                            .next()
-                            .map(|environment| environment.label)
-                    });
-                    self.hosts.record(host.clone())?;
-                    progress.send_replace(AttemptState::Paired {
-                        host: HostView::of(&host),
-                    });
-                    return Ok(host);
+            let session = match within_step(self.link.connect_paired(&host, &identity)).await {
+                Ok(session) => session,
+                Err(error) => {
+                    last = error.to_string();
+                    continue;
                 }
-                Err(error) => last = Some(error.to_string()),
+            };
+            let status: Result<PairStatusResult, LinkError> = within_step(async {
+                session
+                    .read(Method::PairStatus, &params)
+                    .await
+                    .map_err(|error| LinkError::Lost(error.to_string()))
+            })
+            .await;
+            match status.map(|answer| answer.status) {
+                Ok(PairStatus::Committed {
+                    device_id: committed,
+                    ..
+                }) if committed == device_id => {}
+                Ok(_) => {
+                    session.close();
+                    let _ = self.hosts.clear_attempt();
+                    return Err(PairingFailure::new(
+                        FailureKind::HostMismatch,
+                        "the host does not report this device as the one it committed",
+                    ));
+                }
+                Err(error) => {
+                    session.close();
+                    last = error.to_string();
+                    continue;
+                }
             }
+            let environments: Result<EnvironmentListResult, LinkError> = within_step(async {
+                session
+                    .read(Method::EnvironmentList, &EmptyParams {})
+                    .await
+                    .map_err(|error| LinkError::Lost(error.to_string()))
+            })
+            .await;
+            session.close();
+            if let Some(label) = environments.ok().and_then(|listed| {
+                listed
+                    .environments
+                    .into_iter()
+                    .next()
+                    .map(|environment| environment.label)
+            }) {
+                host.name = Some(label);
+            }
+            self.hosts.record(host.clone())?;
+            self.hosts.clear_attempt()?;
+            progress.send_replace(AttemptState::Paired {
+                host: HostView::of(&host),
+            });
+            return Ok(host);
+        }
+        if self.clock.wall_clock_ms() >= pending.recover_until_ms {
+            let _ = self.hosts.clear_attempt();
         }
         Err(PairingFailure::new(
             FailureKind::HostUnreachable,
-            format!(
-                "the host committed this device, which could not connect as it: {}",
-                last.unwrap_or_default()
-            ),
+            format!("the host committed this device, which could not connect as it: {last}"),
         ))
     }
+}
+
+/// Waits at most [`WAIT_STEP`] for one question to a host, or one connection to it.
+async fn within_step<T>(
+    step: impl std::future::Future<Output = Result<T, LinkError>>,
+) -> Result<T, LinkError> {
+    tokio::time::timeout(WAIT_STEP, step)
+        .await
+        .unwrap_or_else(|_| Err(LinkError::Lost("the host answered nothing".to_owned())))
 }
 
 /// A method that takes no parameters, as the empty map the protocol expects.
 #[derive(Serialize)]
 struct EmptyParams {}
 
-/// Shows the waiting state of `pending`.
+/// Shows the waiting state of `pending`: waiting for the owner, with the value, once the host has
+/// answered with it, and reaching the host until then.
 pub(crate) fn awaiting(pending: &PendingAttempt) -> AttemptState {
+    if !pending.value_confirmed {
+        return AttemptState::Working {
+            stage: Stage::ReachingHost,
+        };
+    }
     AttemptState::AwaitingApproval {
         value: group_verification_value(&pending.verification_value),
         expires_at_ms: pending.expires_at_ms,
         rights: pending.proposed_grant.actions.iter().copied().collect(),
         grant_expires_at_ms: expiry(&pending.proposed_grant.expiry),
+    }
+}
+
+/// Shows that the connection to the host of `pending` is being made again. The value stays on
+/// screen once the host has answered with it, and is not shown before.
+fn reconnecting(pending: &PendingAttempt) -> AttemptState {
+    AttemptState::Reconnecting {
+        value: pending
+            .value_confirmed
+            .then(|| group_verification_value(&pending.verification_value)),
+        expires_at_ms: pending.expires_at_ms,
     }
 }
 

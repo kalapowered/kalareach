@@ -98,6 +98,16 @@ impl PairingFailure {
         self.tries_left = tries_left;
         self
     }
+
+    /// The same failure, with `tries_left` when it does not say already. An attempt that was
+    /// charged shows the tries left however it ended.
+    #[must_use]
+    pub const fn or_tries(mut self, tries_left: Option<u32>) -> Self {
+        if self.tries_left.is_none() {
+            self.tries_left = tries_left;
+        }
+        self
+    }
 }
 
 impl std::fmt::Display for PairingFailure {
