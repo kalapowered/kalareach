@@ -491,10 +491,15 @@ struct WatchedLink {
     reconnect_gate: Option<Arc<Gate>>,
     /// Every status question waits here.
     status_gate: Option<Arc<Gate>>,
+    /// Every connection as a paired device waits here.
+    paired_gate: Option<Arc<Gate>>,
+    /// Every connection as a paired device fails.
+    sever_paired: bool,
     severed: Arc<AtomicBool>,
     statuses: Arc<AtomicUsize>,
     dials: AtomicUsize,
     opened: AtomicUsize,
+    paired_connects: AtomicUsize,
 }
 
 impl WatchedLink {
@@ -509,10 +514,13 @@ impl WatchedLink {
             withhold_submission_answer: false,
             reconnect_gate: None,
             status_gate: None,
+            paired_gate: None,
+            sever_paired: false,
             severed: Arc::new(AtomicBool::new(false)),
             statuses: Arc::new(AtomicUsize::new(0)),
             dials: AtomicUsize::new(0),
             opened: AtomicUsize::new(0),
+            paired_connects: AtomicUsize::new(0),
         }
     }
 }
@@ -587,10 +595,19 @@ impl HostLink for WatchedLink {
         host: &'a PairedHost,
         identity: &'a LocalIdentity,
     ) -> BoxFuture<'a, Result<Session, LinkError>> {
+        self.paired_connects.fetch_add(1, Ordering::SeqCst);
         if self.severed.load(Ordering::SeqCst) {
             return Box::pin(async { Err(severed()) });
         }
-        self.inner.connect_paired(host, identity)
+        Box::pin(async move {
+            if let Some(gate) = &self.paired_gate {
+                gate.passed().await;
+            }
+            if self.sever_paired {
+                return Err(severed());
+            }
+            self.inner.connect_paired(host, identity).await
+        })
     }
 }
 
@@ -1181,6 +1198,128 @@ async fn a_device_that_stopped_after_recording_its_host_resumes_through_the_reco
             .expect("readable")
             .is_none(),
         "the attempt is let go once the host reports the device"
+    );
+}
+
+/// KR-REQ-10.32: an attempt taken up again after its deadline, with the host's record already
+/// kept, stops at once: it keeps the record, because the host committed this device, lets the
+/// attempt go, and asks the host nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_expired_resume_keeps_the_host_and_asks_nothing() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let invited = invite_code(environment, &mut client, &viewer(), None, &owner).await;
+    let (origin, code, _) = code_of(&invited);
+
+    let device = ProductDevice::new(Arc::new(host.room.clone()), |link| Arc::new(link));
+    let (attempt, mut shown) = device.enter(&origin, &code);
+    awaiting_value(&mut shown).await;
+    let waiting = device
+        .pairing
+        .hosts
+        .waiting_attempt()
+        .expect("readable")
+        .expect("the attempt is kept while the owner decides");
+    calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+        .await
+        .expect("the owner approves");
+    let paired = outcome(attempt).await.expect("paired");
+
+    // Both records, as a stop between the two writes leaves them, found after the deadline.
+    device.pairing.hosts.keep_attempt(&waiting).expect("kept");
+    device.clock.advance(PAST_THE_DEADLINE);
+    let (link, making) = watching(|_| {});
+    let restarted = device.restarted(making);
+    let (progress, _shown) = watch::channel(AttemptState::Idle);
+    let failure = tokio::time::timeout(WATCHDOG, restarted.resume(&progress))
+        .await
+        .expect("the resumed attempt ends")
+        .expect("an attempt was waiting")
+        .expect_err("not reported as paired");
+    assert_eq!(failure.kind, FailureKind::HostUnreachable);
+    assert_eq!(failure.tries_left, Some(MAX_CLIENT_ATTEMPTS - 1));
+    assert_eq!(
+        made(&link).paired_connects.load(Ordering::SeqCst),
+        0,
+        "nothing was asked past the deadline"
+    );
+    assert!(
+        restarted
+            .hosts
+            .waiting_attempt()
+            .expect("readable")
+            .is_none(),
+        "the attempt is let go"
+    );
+    assert_eq!(
+        restarted.hosts.list().expect("readable"),
+        vec![paired],
+        "the record of the host is kept"
+    );
+}
+
+/// KR-REQ-10.32: the deadline holds while the device connects as what it became. A host that the
+/// device cannot reach as the paired device once the attempt's time has run out is not asked
+/// again: the device keeps the record and lets the attempt go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_deadline_holds_while_the_device_confirms_what_it_became() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let invited = invite_code(environment, &mut client, &viewer(), None, &owner).await;
+    let (origin, code, _) = code_of(&invited);
+
+    let paired_gate = Gate::closed();
+    let (link, making) = watching({
+        let paired_gate = Arc::clone(&paired_gate);
+        move |link| {
+            link.paired_gate = Some(paired_gate);
+            link.sever_paired = true;
+        }
+    });
+    let device = ProductDevice::new(Arc::new(host.room.clone()), making);
+    let (attempt, mut shown) = device.enter(&origin, &code);
+    awaiting_value(&mut shown).await;
+    calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+        .await
+        .expect("the owner approves");
+    let link = made(&link);
+    tokio::time::timeout(WATCHDOG, async {
+        while link.paired_connects.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the device connects as the device it became");
+
+    // Its time runs out while that first connection is on its way, and the connection fails.
+    device.clock.advance(PAST_THE_DEADLINE);
+    paired_gate.open();
+    let failure = outcome(attempt).await.expect_err("not reported as paired");
+    assert_eq!(failure.kind, FailureKind::HostUnreachable);
+    assert_eq!(failure.tries_left, Some(MAX_CLIENT_ATTEMPTS - 1));
+    assert_eq!(
+        link.paired_connects.load(Ordering::SeqCst),
+        1,
+        "no connection was tried past the deadline"
+    );
+    assert!(
+        device
+            .pairing
+            .hosts
+            .waiting_attempt()
+            .expect("readable")
+            .is_none()
+    );
+    assert_eq!(
+        device.pairing.hosts.list().expect("readable").len(),
+        1,
+        "the record of the host is kept"
     );
 }
 
