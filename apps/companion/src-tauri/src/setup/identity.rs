@@ -436,19 +436,85 @@ mod tests {
         ));
     }
 
+    /// The platform's signing tool is asked about an executable and its answer is read, and an
+    /// executable with no signature is reported as one nobody read.
+    ///
+    /// The executable is a small one this test copies and signs itself, in a temporary directory
+    /// on the internal disk. What the product bounds is the tool's answer, and on a large binary
+    /// on a slow volume the tool can take most of that bound just reading the file; a check that
+    /// depended on how fast this machine's build volume is would say nothing about the reading.
+    /// The control is the same executable with its signature taken off.
+    #[cfg(target_os = "macos")]
     #[test]
-    fn the_signature_of_this_test_binary_is_read_from_the_platform() {
+    fn a_signature_is_read_from_the_platform_and_an_unsigned_executable_is_not() {
+        let scratch = tempfile::tempdir().expect("a directory on the internal disk");
+        let signed = scratch.path().join("signed-tool");
+        std::fs::copy("/usr/bin/true", &signed).expect("a copy of a small executable");
+        let signing = std::process::Command::new(SIGNING_TOOL)
+            .args([
+                "--force",
+                "--sign",
+                "-",
+                "--identifier",
+                "to.kala.reach.signature-check",
+            ])
+            .arg(&signed)
+            .output()
+            .expect("the signing tool runs");
+        assert!(
+            signing.status.success(),
+            "the copy is signed: {}",
+            String::from_utf8_lossy(&signing.stderr)
+        );
+        let signature = read_signature(&signed.display().to_string());
+        assert!(signature.read, "{:?}", signature.refusal);
+        assert_eq!(
+            signature.identifier.as_deref(),
+            Some("to.kala.reach.signature-check"),
+            "the identifier the signature seals is read from the tool's answer"
+        );
+        assert!(signature.ad_hoc, "a signature this machine made is ad hoc");
+        assert_eq!(
+            signature.authority, None,
+            "and no authority stands behind it"
+        );
+        assert!(signature.valid, "the platform verifies what it sealed");
+
+        let unsigned = scratch.path().join("unsigned-tool");
+        std::fs::copy(&signed, &unsigned).expect("a second copy");
+        let stripping = std::process::Command::new(SIGNING_TOOL)
+            .arg("--remove-signature")
+            .arg(&unsigned)
+            .output()
+            .expect("the signing tool runs");
+        assert!(
+            stripping.status.success(),
+            "the second copy's signature is taken off: {}",
+            String::from_utf8_lossy(&stripping.stderr)
+        );
+        let signature = read_signature(&unsigned.display().to_string());
+        assert!(
+            !signature.read,
+            "an executable with no signature is not read as signed: {signature:?}"
+        );
+        assert!(
+            signature
+                .refusal
+                .as_deref()
+                .is_some_and(|said| said.contains("not signed")),
+            "and the tool's refusal is what the report says: {:?}",
+            signature.refusal
+        );
+    }
+
+    /// A platform with no signing tool reads no signature, and says why.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_platform_with_no_signing_tool_reads_no_signature() {
         let path = std::env::current_exe().expect("this test has a path");
         let signature = read_signature(&path.display().to_string());
-        if cfg!(target_os = "macos") {
-            assert!(signature.read, "{:?}", signature.refusal);
-            assert!(
-                signature.identifier.is_some(),
-                "a signature seals an identifier"
-            );
-        } else {
-            assert!(!signature.read);
-        }
+        assert!(!signature.read);
+        assert!(signature.refusal.is_some(), "{signature:?}");
     }
 
     #[test]
