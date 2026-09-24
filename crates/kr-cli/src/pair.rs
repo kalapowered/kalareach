@@ -49,6 +49,7 @@ use kr_protocol::invitation::{
 use kr_protocol::method::Method;
 use kr_protocol::pairing::{
     ConfirmationChannel, PairStatus, PairingConsumedReason, ProposedGrant, RendezvousOrigin,
+    group_verification_value,
 };
 use kr_protocol::preauth::{PairStatusParams, PairStatusResult};
 use kr_protocol::scalars::{CanonicalSet, Nullable};
@@ -285,6 +286,21 @@ impl Ceremony<'_> {
         }
     }
 
+    /// What the person at this terminal is told while an owner device confirms.
+    ///
+    /// The owner device shows the new device's verification value in its own prompt; saying it
+    /// here too, grouped the same way, lets the person at the host check both screens against it.
+    fn owner_device_note(&self) -> Option<String> {
+        match self {
+            Self::Issue { .. } => None,
+            Self::Approve { candidate } => Some(owner_device_note(
+                candidate.device_name.as_str(),
+                &platform_name(candidate),
+                &candidate.verification_value,
+            )),
+        }
+    }
+
     /// Asks the person at the controlling terminal to confirm, and refuses unless they do.
     fn confirm_at(&self, terminal: &mut Terminal) -> Result<()> {
         match self {
@@ -365,6 +381,9 @@ async fn confirmed(
             .map_err(CliError::Refused);
     }
     let expires_at_ms = challenge.request.expires_at_ms.get();
+    if let Some(note) = ceremony.owner_device_note() {
+        eprint!("{note}");
+    }
     eprintln!(
         "Confirm this on an owner device. Waiting {}.",
         remaining(expires_at_ms, kr_ipc::now_ms().get())
@@ -557,6 +576,14 @@ fn invitation(text: &str) -> Result<InvitationId> {
         .map_err(|_| CliError::Usage(format!("{text} is not an invitation identifier")))
 }
 
+/// Says which value the new device should show, grouped as both devices show it.
+fn owner_device_note(device_name: &str, platform: &str, verification_value: &str) -> String {
+    format!(
+        "{device_name} ({platform}) should show {}. Confirm on an owner device only if it does.\n",
+        group_verification_value(verification_value)
+    )
+}
+
 /// Compares a typed verification value with the host's, ignoring case, spaces and hyphens.
 fn same_value(typed: &str, expected: &str) -> bool {
     let normal = |text: &str| {
@@ -688,8 +715,9 @@ fn describe_status(invitation_id: InvitationId, result: &PairStatusResult, now_m
             expires_at_ms,
             ..
         } => format!(
-            "a device is waiting for approval, open {}; its verification value is {verification_value}",
-            remaining(expires_at_ms.get(), now_ms)
+            "a device is waiting for approval, open {}; its verification value is {}",
+            remaining(expires_at_ms.get(), now_ms),
+            group_verification_value(verification_value)
         ),
         PairStatus::Committed {
             device_id,
@@ -919,6 +947,29 @@ mod tests {
         // Module (0, 0) is the finder pattern's corner, at cell row 2 (modules 4 and 5) and
         // column 4: dark above, dark below.
         assert_eq!(cells[2][4], '\u{2588}');
+    }
+
+    /// KR-REQ-10.37: the verification value is printed in the same two groups of four the new
+    /// device shows, never as eight characters run together.
+    #[test]
+    fn a_verification_value_is_printed_grouped() {
+        let now = 1_764_000_000_000;
+        let invitation_id = InvitationId::new(Uuid::from_bytes([9; 16]));
+        let waiting = PairStatusResult {
+            status: PairStatus::AwaitingApproval {
+                attempt_id: kr_protocol::ids::AttemptId::new(Uuid::from_bytes([3; 16])),
+                verification_value: "f3c146fd".to_owned(),
+                expires_at_ms: TimestampMs::new(now + 60_000),
+            },
+            owner: kr_protocol::scalars::Nullable::null(),
+        };
+        let shown = describe_status(invitation_id, &waiting, now);
+        assert!(shown.contains("f3c1 46fd"), "{shown}");
+        assert!(!shown.contains("f3c146fd"), "{shown}");
+        assert_eq!(
+            owner_device_note("Pixel 8", "Android", "f3c146fd"),
+            "Pixel 8 (Android) should show f3c1 46fd. Confirm on an owner device only if it does.\n"
+        );
     }
 
     /// The value a person types is compared with the host's without regard to case, spaces or
