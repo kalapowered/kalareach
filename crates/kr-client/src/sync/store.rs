@@ -47,8 +47,11 @@
 //! decide what became of that request claims the same lock first. So a client value holds no
 //! authority this store has not recorded: two windows over one store cannot each conclude about the
 //! other's live call, and a claim that succeeds because the owner died permits asking the service,
-//! never concluding. The request's lock is taken **before** the store's wherever both are held,
-//! which is what keeps the two orders from crossing.
+//! never concluding. The request's lock is taken **before** the store's wherever both are held and
+//! one of them is waited for, which is what keeps the two orders from crossing. The one place it is
+//! taken inside the store's hold, an attempt at a draft publication, only tries it: a try waits on
+//! nothing, so it cannot close a cycle with a holder of the request's lock that is waiting for the
+//! store's.
 //!
 //! Each file is written to a temporary name, flushed, and renamed over its name, so a reader never
 //! sees one half written. On Unix the directory entry is flushed afterwards; on Windows nothing
@@ -238,7 +241,7 @@ impl std::fmt::Display for RequestRevision {
 ///
 /// A draft is named by the draft store's own rule and everything else by the synchronised half's,
 /// so a request, a publication and the service agree on one name whichever kind the object is.
-fn collection_of(kind: SyncObjectKind, object_id: SyncObjectId) -> String {
+pub(crate) fn collection_of(kind: SyncObjectKind, object_id: SyncObjectId) -> String {
     match kind {
         SyncObjectKind::Draft => crate::drafts::draft_collection(DraftId::new(object_id.get())),
         SyncObjectKind::Settings | SyncObjectKind::ClientSelection => {
@@ -1321,8 +1324,8 @@ impl SyncStore {
     /// is still waiting for the answer. Releasing it says this device's call is over, never that
     /// the request stopped at the service.
     ///
-    /// The request's own lock is taken **before** the store's, as it is everywhere that takes both,
-    /// so two of them can never wait on each other.
+    /// The request's own lock is taken **before** the store's, as it is everywhere that waits for
+    /// both, so two of them can never wait on each other.
     ///
     /// # Errors
     ///

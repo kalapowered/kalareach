@@ -69,7 +69,7 @@ use kr_protocol::sync::SyncObjectKind;
 
 use super::store::{
     Claimed, ConflictCopy, Dispatch, End, Outcome, PrivacyRecord, RequestRecord, RequestState,
-    Result, Settled, Settlement, Standing, SyncCheckpoint, SyncError, SyncStore,
+    Result, Settled, Settlement, Standing, SyncCheckpoint, SyncError, SyncStore, collection_of,
 };
 use super::{SyncBody, SyncObject, SyncSettings, Zeroising, sync_collection};
 use crate::drafts::DraftSealer;
@@ -702,14 +702,16 @@ impl SyncClient {
         object_id: SyncObjectId,
         now: TimestampMs,
     ) -> Result<Restored> {
-        let collection = sync_collection(kind, object_id);
         // A draft belongs to the device's draft store and is published and fetched by its own
         // synchronised half. Asking this client for one is refused before the service is called,
         // because there is no code here that could apply one and adding some would be a second way
-        // to write a draft.
+        // to write a draft. The refusal names the collection the draft is actually kept in.
         if kind == SyncObjectKind::Draft {
-            return Err(SyncError::DraftElsewhere { collection });
+            return Err(SyncError::DraftElsewhere {
+                collection: collection_of(kind, object_id),
+            });
         }
+        let collection = sync_collection(kind, object_id);
         let privacy = self.store.privacy()?;
         if privacy.fenced {
             return Err(SyncError::Fenced {
