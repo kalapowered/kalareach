@@ -139,6 +139,47 @@ impl SignedService {
         request_limit: usize,
         signed_at_ms: u64,
     ) -> Result<serde_json::Value> {
+        self.answer_at(path, method, body, request_limit, signed_at_ms)
+            .await?
+            .data()
+    }
+
+    /// Sends one signed request, signed now, and returns what the service answered: its `data`, or
+    /// the refusal it named, whole.
+    ///
+    /// For an adapter that reads a refusal as an answer: one whose code says something about the
+    /// request that the caller acts on, such as a collection that does not admit it, and one that
+    /// carries members beside its code.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Host`] for a request this client would not send, a transport failure
+    /// and an answer this client cannot read. A refusal is not an error here.
+    pub(crate) async fn answer<B: Serialize>(
+        &self,
+        path: &str,
+        method: Method,
+        body: &B,
+        request_limit: usize,
+    ) -> Result<Answer> {
+        self.answer_at(path, method, body, request_limit, now_ms())
+            .await
+    }
+
+    /// Sends one signed request under the instant its caller states, and returns what the service
+    /// answered: its `data`, or the refusal it named, whole.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::answer`], and [`ErrorCode::ClockUntrusted`] for an instant outside the window.
+    pub(crate) async fn answer_at<B: Serialize>(
+        &self,
+        path: &str,
+        method: Method,
+        body: &B,
+        request_limit: usize,
+        signed_at_ms: u64,
+    ) -> Result<Answer> {
         let document = serde_json::to_value(body).map_err(|error| {
             malformed(format!(
                 "a request could not be written: {}",
@@ -154,7 +195,7 @@ impl SignedService {
         }
         let url = format!("{}{path}", self.origin.as_str());
         let answer = self.http.post_json(&url, &request, &[]).await?;
-        data_of(&answer)
+        answer_of(&answer)
     }
 
     /// The bytes of one signed request: the document, and the credential over its digest.
@@ -242,26 +283,105 @@ impl fmt::Debug for SignedServiceRequest {
     }
 }
 
+/// What one signed call was answered.
+pub(crate) enum Answer {
+    /// The `data` of the service's envelope.
+    Data(serde_json::Value),
+    /// The refusal the service named.
+    Refused(Refusal),
+}
+
+impl fmt::Debug for Answer {
+    /// Which answer it is, and a refusal's code and status. Never the data.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Data(_) => formatter.write_str("Data(..)"),
+            Self::Refused(refusal) => formatter.debug_tuple("Refused").field(refusal).finish(),
+        }
+    }
+}
+
+impl Answer {
+    /// The `data`, or the refusal as the error the service named.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Refused`] for a refusal, classified by [`classify`].
+    pub(crate) fn data(self) -> Result<serde_json::Value> {
+        match self {
+            Self::Data(data) => Ok(data),
+            Self::Refused(refusal) => Err(refusal.into_error()),
+        }
+    }
+}
+
+/// A refusal the service named, whole: its code, the status it came with, and the members it
+/// carried beside the code.
+///
+/// Most adapters want only the error it becomes. One that reads a refusal as an answer, because
+/// the code says something about the request the caller acts on, reads the code and whichever
+/// members its contract gives that code.
+pub(crate) struct Refusal {
+    status: u16,
+    code: String,
+    message: String,
+    retry_after_seconds: Option<u64>,
+    members: serde_json::Map<String, serde_json::Value>,
+}
+
+impl fmt::Debug for Refusal {
+    /// The code and the status. Never the message or the members, which are the service's.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Refusal")
+            .field("code", &self.code)
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Refusal {
+    /// The service's own code for the refusal.
+    pub(crate) fn code(&self) -> &str {
+        &self.code
+    }
+
+    /// One member the refusal carried beside its code, when it carried it.
+    pub(crate) fn member(&self, name: &str) -> Option<&serde_json::Value> {
+        self.members.get(name)
+    }
+
+    /// The error the service named, with the delay it asked for when it named one.
+    pub(crate) fn into_error(self) -> ClientError {
+        let (code, action) = classify(&self.code, self.status);
+        ClientError::Refused {
+            error: ProtocolError::new(code, self.message),
+            retry_after_seconds: self.retry_after_seconds,
+            action,
+        }
+    }
+}
+
 /// The `data` of a service envelope, or the refusal it carried.
 ///
 /// A refusal is the service's answer about the request rather than a transport failure, so it
-/// arrives as the error the service named, with the delay it asked for when it named one.
+/// arrives whole, and becomes the error the service named when an adapter asks for the `data`.
 ///
 /// A body that is not this service's envelope is not a refusal at all: it is something in front of
 /// the service, a truncated answer, or something that is not this service. [`unreadable`] is what
 /// those become, classified by the status that carried them.
-fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
+fn answer_of(answer: &ServiceHttpAnswer) -> Result<Answer> {
     #[derive(Deserialize)]
     struct Envelope {
         ok: bool,
         #[serde(default)]
         data: Option<serde_json::Value>,
         #[serde(default)]
-        error: Option<Refusal>,
+        error: Option<serde_json::Map<String, serde_json::Value>>,
     }
 
     #[derive(Deserialize)]
-    struct Refusal {
+    struct Named {
         code: String,
         message: String,
         /// The service names this in camel case, as its whole envelope does.
@@ -279,19 +399,27 @@ fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
     if envelope.ok {
         return envelope
             .data
+            .map(Answer::Data)
             .ok_or_else(|| unreadable(answer.status, "its answer carries no data"));
     }
 
-    let Some(refusal) = envelope.error else {
+    let Some(members) = envelope.error else {
         return Err(unreadable(answer.status, "its refusal names no error"));
     };
-
-    let (code, action) = classify(&refusal.code, answer.status);
-    Err(ClientError::Refused {
-        error: ProtocolError::new(code, refusal.message),
-        retry_after_seconds: refusal.retry_after_seconds,
-        action,
-    })
+    let Ok(named) = serde_json::from_value::<Named>(serde_json::Value::Object(members.clone()))
+    else {
+        return Err(unreadable(
+            answer.status,
+            "its answer is not one this client reads",
+        ));
+    };
+    Ok(Answer::Refused(Refusal {
+        status: answer.status,
+        code: named.code,
+        message: named.message,
+        retry_after_seconds: named.retry_after_seconds,
+        members,
+    }))
 }
 
 /// The protocol code one service error code means, and what a person does about it.
@@ -310,13 +438,19 @@ fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
 /// own configuration, so `UNAUTHENTICATED` asks for that and `FORBIDDEN` says this key may not do
 /// this, which is a matter for the host's records rather than for a login.
 ///
-/// Settings sync answers three codes of its own, each about a request identity rather than about
-/// the caller. `ID_CONFLICT` is section 23's own code: another request already wore the identity,
+/// Settings sync answers three codes of its own about a request identity rather than about the
+/// caller. `ID_CONFLICT` is section 23's own code: another request already wore the identity,
 /// which is a client fault. `REQUEST_FENCED` has none, because nothing in section 23 is a request
 /// identity that was ended before it ran: it is the refusal of that identity, so it is reported as
 /// the permission it is, and with nothing for a person to do, because the device that ended the
 /// request settles it from the fence's own answer. `INVALID_ARGUMENT` is a value this client
 /// should not have sent, as `INVALID_REQUEST` is.
+///
+/// And two about a shared collection, which its adapter reads as answers before they ever become
+/// errors. `COLLECTION_ABSENT` is a collection that does not exist or does not list the caller,
+/// one answer for both, reported as the unknown object it is to this device. `KEY_EPOCH_RETIRED` is
+/// a write sealed under a key the collection no longer writes with: this device's view has fallen
+/// behind the collection's key records, which a refresh brings up to date.
 fn classify(code: &str, status: u16) -> (ErrorCode, UserAction) {
     match code {
         "UNAUTHENTICATED" => (ErrorCode::PermissionDenied, UserAction::FixConfiguration),
@@ -331,6 +465,8 @@ fn classify(code: &str, status: u16) -> (ErrorCode, UserAction) {
         }
         "ID_CONFLICT" => (ErrorCode::IdConflict, UserAction::Update),
         "REQUEST_FENCED" => (ErrorCode::PermissionDenied, UserAction::Nothing),
+        "COLLECTION_ABSENT" => (ErrorCode::UnknownSession, UserAction::Nothing),
+        "KEY_EPOCH_RETIRED" => (ErrorCode::ResyncRequired, UserAction::Resync),
         _ if status >= 500 => (ErrorCode::UpstreamUnavailable, UserAction::Wait),
         _ => (ErrorCode::InvalidArgument, UserAction::Update),
     }
@@ -439,13 +575,14 @@ mod tests {
 
     #[test]
     fn a_refusal_carries_the_services_own_message_and_nothing_else_of_the_answer() {
-        let error = data_of(&ServiceHttpAnswer {
+        let error = answer_of(&ServiceHttpAnswer {
             status: 403,
             body: format!(
                 r#"{{"ok":false,"error":{{"code":"FORBIDDEN","message":"Only the host issues its own revisions.","detail":"{NEVER_RENDERED}"}}}}"#
             )
             .into_bytes(),
         })
+        .and_then(Answer::data)
         .expect_err("a refusal");
 
         assert!(
@@ -465,7 +602,7 @@ mod tests {
 
     #[test]
     fn an_answer_this_client_cannot_read_is_reported_without_quoting_it() {
-        let error = data_of(&ServiceHttpAnswer {
+        let error = answer_of(&ServiceHttpAnswer {
             status: 200,
             body: NEVER_RENDERED.as_bytes().to_vec(),
         })
@@ -482,7 +619,7 @@ mod tests {
 
     #[test]
     fn a_success_with_no_data_is_an_unknown_outcome_rather_than_an_empty_answer() {
-        let error = data_of(&ServiceHttpAnswer {
+        let error = answer_of(&ServiceHttpAnswer {
             status: 200,
             body: br#"{"ok":true}"#.to_vec(),
         })
