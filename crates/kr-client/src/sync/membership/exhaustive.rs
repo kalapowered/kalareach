@@ -133,8 +133,12 @@ enum KeyLabel {
         /// The record's revision.
         revision: u64,
     },
-    /// Every key D withdrew that nothing carries any more, kept as one (`spend_withdrawn`).
-    Withdrawn,
+    /// Every key D withdrew that nothing carries any more, kept as one (`spend_withdrawn`), under
+    /// the first index no record, candidate or stored key carries.
+    Withdrawn {
+        /// Which of the labels kept so.
+        index: u8,
+    },
 }
 
 /// A key record of the model.
@@ -400,12 +404,18 @@ impl Environment for ModelEnv {
         members: &[Dev],
     ) -> Result<KeyLabel, MembershipError> {
         let members = mask_of(members);
-        // Every key D drew that could have left it: the candidates it sent, and those it
-        // withdrew, which include a dispatched one that never went out.
+        // Every key D drew that could have left it: the candidates it sent, those it withdrew,
+        // which include a dispatched one that never went out, and the records that applied.
+        let chain: Vec<KeyLabel> = locked(&self.service)
+            .chain
+            .iter()
+            .map(|record| record.key)
+            .collect();
         let drawn: BTreeSet<KeyLabel> = self
             .sent_keys
             .iter()
             .chain(locked(&self.file).withdrawn.iter())
+            .chain(chain.iter())
             .copied()
             .collect();
         let attempt = drawn
@@ -929,7 +939,9 @@ fn other_records(world: &World) -> Vec<ModelRecord> {
                 });
             }
             // A service can hand X the wraps of any candidate D sent, applied or not, and X can
-            // carry such a key into a record of its own.
+            // carry such a key into a record of its own, here one that keeps the current members.
+            // D refuses it whatever it lists, and a record that also removed a member would only
+            // be refused the same way.
             let exposed: BTreeSet<KeyLabel> = world
                 .sent
                 .keys()
@@ -944,15 +956,6 @@ fn other_records(world: &World) -> Vec<ModelRecord> {
                     issuer: X,
                     key,
                 });
-                for removed in devices_in(current.members & !bit(X)) {
-                    out.push(ModelRecord {
-                        revision,
-                        epoch: current.epoch + 1,
-                        members: current.members & !bit(removed),
-                        issuer: X,
-                        key,
-                    });
-                }
             }
         }
     }
@@ -1263,15 +1266,34 @@ fn canon(mut world: World) -> World {
     world
 }
 
-/// Keeps as one key every withdrawn key nothing carries any more: no record at the service, not
-/// the standing candidate, not the store.
+/// Keeps the send history and the withdrawn keys to what can still matter.
 ///
-/// Such a key matters only as one D refuses, and one X may carry into a record of its own; which
-/// of them X carries changes nothing, since D refuses each alike and none ever becomes current.
-/// They are kept as [`KeyLabel::Withdrawn`], with every device any of them was wrapped for, in
-/// D's withdrawn keys and in the send history alike. Without this, a candidate the service keeps
-/// refusing, drawn again each time with a new key, would make a new state at every attempt.
+/// A candidate that applied is a record at the service, which lists exactly the devices its key
+/// was wrapped for: what its entry in the history says of them the chain says too, and goes.
+///
+/// Every withdrawn key nothing carries any more (no record at the service, not the standing
+/// candidate, not the store) matters only as one D refuses, and one X may carry into a record of
+/// its own; which of them X carries changes nothing, since D refuses each alike and none ever
+/// becomes current. They are kept as one [`KeyLabel::Withdrawn`], the first index nothing
+/// carries, with every device any of them was wrapped for, in D's withdrawn keys and in the send
+/// history alike. Without this, a candidate the service keeps refusing, drawn again each time
+/// with a new key, would make a new state at every attempt.
 fn spend_withdrawn(world: &mut World) {
+    let own: Vec<ModelRecord> = world
+        .service
+        .chain
+        .iter()
+        .filter(|record| record.issuer == D)
+        .copied()
+        .collect();
+    world.sent.retain(|(epoch, key), members| {
+        let recorded = own
+            .iter()
+            .filter(|record| record.epoch == *epoch && record.key == *key)
+            .fold(0, |recorded, record| recorded | record.members);
+        *members &= !recorded;
+        *members != 0
+    });
     let carried: BTreeSet<KeyLabel> = world
         .service
         .chain
@@ -1286,12 +1308,16 @@ fn spend_withdrawn(world: &mut World) {
         )
         .chain(world.store.values().copied())
         .collect();
+    let target = (0..=u8::MAX)
+        .map(|index| KeyLabel::Withdrawn { index })
+        .find(|label| !carried.contains(label))
+        .expect("fewer carried keys than labels");
     let spent: BTreeSet<KeyLabel> = world
         .facts
         .withdrawn
         .iter()
         .copied()
-        .filter(|key| *key != KeyLabel::Withdrawn && !carried.contains(key))
+        .filter(|key| *key != target && !carried.contains(key))
         .collect();
     if spent.is_empty() {
         return;
@@ -1305,10 +1331,10 @@ fn spend_withdrawn(world: &mut World) {
         true
     });
     if let Some(members) = wrapped {
-        *world.sent.entry((0, KeyLabel::Withdrawn)).or_default() |= members;
+        *world.sent.entry((0, target)).or_default() |= members;
     }
     world.facts.withdrawn.retain(|key| !spent.contains(key));
-    world.facts.withdrawn.insert(KeyLabel::Withdrawn);
+    world.facts.withdrawn.insert(target);
 }
 
 /// What a canonical state keeps of the outcomes waiting to be shown: that there are some.
