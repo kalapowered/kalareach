@@ -415,7 +415,10 @@ fn each_review_is_its_own_item_and_a_repeat_is_not_another() {
             .count(),
         2
     );
-    assert_eq!(engine.consumed(AttentionSource::Semantic), Some(9));
+    assert_eq!(
+        engine.consumed(kr_attention::Origin::Environment, AttentionSource::Semantic),
+        Some(9)
+    );
 
     // The first review reported again is the same turn at the same position.
     let again = coordinator

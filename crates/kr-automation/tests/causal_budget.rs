@@ -382,7 +382,7 @@ async fn run_events_between_attention_records_leave_no_history_gap() {
     assert_eq!(engine.items().count(), 2);
     assert!(engine.items().all(|item| !item.uncertain));
     assert_eq!(
-        engine.consumed(AttentionSource::Semantic),
+        engine.consumed(kr_attention::Origin::Environment, AttentionSource::Semantic),
         Some(second_alert),
         "the state stands at the last record this consumer read"
     );

@@ -33,7 +33,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use kr_attention::event::{EventCursor, EventKind, SourceEvent};
+use kr_attention::event::{EventCursor, EventKind, Origin, SourceEvent};
 use kr_attention::{Attention, HostReading, Outcome};
 use kr_protocol::attention::AttentionSource;
 use kr_protocol::automation::{
@@ -1037,9 +1037,12 @@ impl AutomationService {
                 .register_consumer(ATTENTION_CONSUMER, ATTENTION_EVENTS, now_ms)?;
         let mut raised = 0;
         for record in self.store.pending_attention()? {
-            let stands = attention.engine()?.consumed(source).unwrap_or(0);
+            let stands = attention
+                .engine()?
+                .consumed(Origin::Environment, source)
+                .unwrap_or(0);
             if stands >= last_read && record.sequence > last_read.saturating_add(1) {
-                attention.start_from(source, record.sequence - 1)?;
+                attention.start_from(Origin::Environment, source, record.sequence - 1)?;
             }
             let event = SourceEvent::new(
                 EventCursor::new(source, record.sequence),
