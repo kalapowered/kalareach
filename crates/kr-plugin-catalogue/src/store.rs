@@ -1932,16 +1932,31 @@ mod tests {
     fn exclusive_lock_contention_refuses_concurrent_lock() {
         let (_directory, store) = store();
         let _lock1 = store.lock().expect("first lock");
-        let path = store.root.join(".lock");
+        // On Unix the lock is an advisory `flock`, which a second `lock` would wait on, so the
+        // contention is asked without waiting.
         #[cfg(unix)]
         {
             use rustix::fs::{FlockOperation, flock};
             let file = std::fs::OpenOptions::new()
                 .write(true)
-                .open(&path)
+                .open(store.root.join(".lock"))
                 .expect("open lockfile");
             let err = flock(&file, FlockOperation::NonBlockingLockExclusive).unwrap_err();
             assert_eq!(err, rustix::io::Errno::WOULDBLOCK);
+        }
+        // On Windows the lock is the open itself, shared with nobody, so a second `lock` is
+        // refused at once with a sharing violation.
+        #[cfg(windows)]
+        {
+            const ERROR_SHARING_VIOLATION: i32 = 32;
+            match store.lock() {
+                Err(CatalogueError::StorageUnavailable { detail }) => assert!(
+                    detail.ends_with(&format!("(os error {ERROR_SHARING_VIOLATION})")),
+                    "refused for another reason: {detail}"
+                ),
+                Err(other) => panic!("refused for another reason: {other:?}"),
+                Ok(_) => panic!("a second lock was granted while the first was held"),
+            }
         }
     }
 }
