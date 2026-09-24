@@ -1038,13 +1038,7 @@ fn a_mount_placed_while_reads_resolve_never_reaches_the_other_tree() {
         mount_race();
         return;
     }
-    let probe = std::process::Command::new("unshare")
-        .args(["-r", "-m", "--", "true"])
-        .status();
-    assert!(
-        probe.is_ok_and(|status| status.success()),
-        "this host does not give this account a mount namespace, so this check cannot run here"
-    );
+    a_mount_namespace_is_given();
     let binary = std::env::current_exe().expect("the test binary");
     let status = std::process::Command::new("unshare")
         .args(["-r", "-m", "--"])
@@ -1067,6 +1061,24 @@ fn a_mount_placed_while_reads_resolve_never_reaches_the_other_tree() {
     assert!(
         status.success(),
         "the reads inside the mount namespace did not hold: {status}"
+    );
+}
+
+/// Requires a mount namespace this account may create, and fails, with what the host answered,
+/// where there is none.
+#[cfg(target_os = "linux")]
+fn a_mount_namespace_is_given() {
+    let probe = std::process::Command::new("unshare")
+        .args(["-r", "-m", "--", "true"])
+        .output();
+    let refused = match &probe {
+        Ok(probe) if probe.status.success() => return,
+        Ok(probe) => String::from_utf8_lossy(&probe.stderr).trim().to_owned(),
+        Err(error) => error.to_string(),
+    };
+    panic!(
+        "this host does not give this account a mount namespace, so this check cannot run here: \
+         {refused}"
     );
 }
 
@@ -2135,13 +2147,7 @@ fn a_removal_stops_before_a_directory_mounted_into_the_tree() {
         removal_mount();
         return;
     }
-    let probe = std::process::Command::new("unshare")
-        .args(["-r", "-m", "--", "true"])
-        .status();
-    assert!(
-        probe.is_ok_and(|status| status.success()),
-        "this host does not give this account a mount namespace, so this check cannot run here"
-    );
+    a_mount_namespace_is_given();
     let binary = std::env::current_exe().expect("the test binary");
     let status = std::process::Command::new("unshare")
         .args(["-r", "-m", "--"])

@@ -3375,11 +3375,18 @@ fn with_grafts(test: &str, body: fn()) {
         }
         let probe = std::process::Command::new("unshare")
             .args(["-r", "-m", "--", "true"])
-            .status();
-        assert!(
-            probe.is_ok_and(|status| status.success()),
-            "this host does not give this account a mount namespace, so this check cannot run here"
-        );
+            .output();
+        let refused = match &probe {
+            Ok(probe) if probe.status.success() => None,
+            Ok(probe) => Some(String::from_utf8_lossy(&probe.stderr).trim().to_owned()),
+            Err(error) => Some(error.to_string()),
+        };
+        if let Some(refused) = refused {
+            panic!(
+                "this host does not give this account a mount namespace, so this check cannot \
+                 run here: {refused}"
+            );
+        }
         let status = std::process::Command::new("unshare")
             .args(["-r", "-m", "--"])
             .arg(std::env::current_exe().expect("the test binary"))

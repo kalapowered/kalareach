@@ -2541,13 +2541,7 @@ fn a_file_mounted_inside_this_repository_s_own_data_is_not_captured_around() {
         a_file_mounted_inside_administrative_data();
         return;
     }
-    let probe = std::process::Command::new("unshare")
-        .args(["-r", "-m", "--", "true"])
-        .status();
-    assert!(
-        probe.is_ok_and(|status| status.success()),
-        "this host does not give this account a mount namespace, so this check cannot run here"
-    );
+    a_mount_namespace_is_given();
     let binary = std::env::current_exe().expect("the test binary");
     let status = std::process::Command::new("unshare")
         .args(["-r", "-m", "--"])
@@ -2570,6 +2564,24 @@ fn a_file_mounted_inside_this_repository_s_own_data_is_not_captured_around() {
     assert!(
         status.success(),
         "the capture inside the mount namespace did not refuse: {status}"
+    );
+}
+
+/// Requires a mount namespace this account may create, and fails, with what the host answered,
+/// where there is none.
+#[cfg(target_os = "linux")]
+fn a_mount_namespace_is_given() {
+    let probe = std::process::Command::new("unshare")
+        .args(["-r", "-m", "--", "true"])
+        .output();
+    let refused = match &probe {
+        Ok(probe) if probe.status.success() => return,
+        Ok(probe) => String::from_utf8_lossy(&probe.stderr).trim().to_owned(),
+        Err(error) => error.to_string(),
+    };
+    panic!(
+        "this host does not give this account a mount namespace, so this check cannot run here: \
+         {refused}"
     );
 }
 
@@ -2631,13 +2643,7 @@ fn a_tree_reached_on_another_mount_is_not_taken_for_this_one() {
         two_mounts_over_one_tree();
         return;
     }
-    let probe = std::process::Command::new("unshare")
-        .args(["-r", "-m", "--", "true"])
-        .status();
-    assert!(
-        probe.is_ok_and(|status| status.success()),
-        "this host does not give this account a mount namespace, so this check cannot run here"
-    );
+    a_mount_namespace_is_given();
     let binary = std::env::current_exe().expect("the test binary");
     let status = std::process::Command::new("unshare")
         .args(["-r", "-m", "--"])
@@ -2866,13 +2872,7 @@ fn two_views_of_one_directory_are_both_looked_through() {
         two_views_of_one_target();
         return;
     }
-    let probe = std::process::Command::new("unshare")
-        .args(["-r", "-m", "--", "true"])
-        .status();
-    assert!(
-        probe.is_ok_and(|status| status.success()),
-        "this host does not give this account a mount namespace, so this check cannot run here"
-    );
+    a_mount_namespace_is_given();
     let binary = std::env::current_exe().expect("the test binary");
     let status = std::process::Command::new("unshare")
         .args(["-r", "-m", "--"])
