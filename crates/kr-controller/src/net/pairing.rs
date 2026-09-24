@@ -574,6 +574,12 @@ impl PairingHost {
         // was admitted under, which the wait for this thread and for the invitation's lock may have
         // used up. A mutation refused here leaves the owner's answer unspent. It is asked once
         // more inside the transaction that writes the invitation, after every later wait.
+        //
+        // The action's record is asked again the same way, once the challenge lock is held as well
+        // as the invitation's. A request or a completion records its action under the challenge
+        // lock, so an identifier one of them spent after the check above is found there, before
+        // the owner's answer is spent on an issue that would be refused as `ID_CONFLICT`; the
+        // answer stays for the next action. The invitation's own transaction checks once more.
         admission()?;
         let (mode, answer, slot) = match &params.mode {
             InviteMode::Direct => {
@@ -582,6 +588,9 @@ impl PairingHost {
                 let rows = self.rows.issuing(terms, action);
                 let slot = rows.write_admission().clone();
                 let (spendable, mut challenges) = self.owner.spend(&expectation)?;
+                if let Some(invited) = self.invited(&open, caller, action) {
+                    return invited;
+                }
                 // The action is recorded with the invitation, by the handle that issues it.
                 let (issued, _) = admitted(&slot, admission, None, || {
                     DirectInvitation::issue(
@@ -633,6 +642,9 @@ impl PairingHost {
                 let rows = self.rows.issuing(terms, action);
                 let slot = rows.write_admission().clone();
                 let (spendable, mut challenges) = self.owner.spend(&expectation)?;
+                if let Some(invited) = self.invited(&open, caller, action) {
+                    return invited;
+                }
                 let (issued, _) = admitted(&slot, admission, None, || {
                     HostInvitation::issue(
                         rows,
@@ -774,6 +786,12 @@ impl PairingHost {
         admission()?;
         let slot = offered.admission.clone();
         let (spendable, mut challenges) = self.owner.spend(&expectation)?;
+        // Asked again with the challenge lock held as well as the invitation's, where a request or
+        // a completion records its action: an identifier one of them spent since the check above is
+        // found before the owner's answer is spent, and the answer stays for the next action.
+        if let Some(confirmed) = self.confirmed(caller, action) {
+            return confirmed;
+        }
         let (committed, written) = match (&mut offered.mode, params.approval) {
             (
                 OpenMode::Direct(invitation),

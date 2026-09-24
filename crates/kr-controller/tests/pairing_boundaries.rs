@@ -23,11 +23,11 @@ use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ActionId, ActorId};
 use kr_protocol::invitation::{
-    InviteGrantKind, InviteMode, InviteModeKind, PairInviteParams, PairInviteResult,
-    default_rendezvous_origin,
+    InviteGrantKind, InviteMode, InviteModeKind, PairConfirmParams, PairInviteParams,
+    PairInviteResult, default_rendezvous_origin,
 };
 use kr_protocol::method::Method;
-use kr_protocol::pairing::{PairStatus, PairingConsumedReason, ProposedGrant};
+use kr_protocol::pairing::{PairStatus, PairingConsumedReason, ProposedGrant, SensitiveAction};
 use kr_protocol::preauth::{
     PairRedeemParams, PairRedeemResult, PairStatusParams, PairStatusResult,
 };
@@ -392,12 +392,13 @@ async fn an_admission_that_lapses_inside_the_write_writes_nothing() {
     host.stop().await;
 }
 
-/// KR-REQ-10.06: a completion is retained for the caller that completed it and for exactly the
-/// proof it accepted. Another paired device submitting that proof gets no success, whatever it
-/// changes; the caller that completed it gets its own answer again, and not for a proof with its
-/// signature altered.
+/// KR-REQ-10.06: a proof is accepted once, for the caller that completed it and exactly as it was
+/// accepted. The same caller completing it again under a new action, while its challenge is
+/// outstanding, is answered with the acceptance as it stands, and not for a proof with its
+/// signature altered. Another paired device submitting that proof gets no success, whatever it
+/// changes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_completion_is_retained_for_its_own_caller_and_proof_only() {
+async fn a_proof_is_accepted_once_and_only_as_it_was_accepted() {
     let owner_keys = keys();
     let host = Host::start(&owner_keys).await;
     let environment = host.environment_id;
@@ -414,7 +415,7 @@ async fn a_completion_is_retained_for_its_own_caller_and_proof_only() {
         .await
         .expect("answered");
 
-    // The same caller, on a new action, is told what its completion produced.
+    // The same caller, on a new action, is answered with the acceptance as it stands.
     let again = calls::complete(environment, &mut client, proof.clone(), presented)
         .await
         .expect("its own answer again");
@@ -808,5 +809,191 @@ async fn an_authentication_failure_says_nothing_more() {
     assert_eq!(error.code, ErrorCode::PairingAuthFailed);
     assert_eq!(error.message, AUTHENTICATION_FAILED);
     connection.close(0u32.into(), b"refused");
+    host.stop().await;
+}
+
+/// An admission that also spends `action`'s identifier on a challenge request of `caller`'s the
+/// first time it is asked, and admits every time.
+///
+/// It puts the race where it needs to be, every time: an issue or a confirmation asks its admission
+/// first after it has looked for its action's record under the invitation lock and before it takes
+/// the challenge lock to spend the owner's answer, and a request records its action under that
+/// challenge lock.
+fn racing_request(
+    pairing: &Arc<kr_controller::service::net::pairing::PairingHost>,
+    caller: &Caller,
+    action: ActionId,
+) -> Admission {
+    let pairing = Arc::clone(pairing);
+    let caller = caller.clone();
+    let asked = AtomicUsize::new(0);
+    Arc::new(move || {
+        if asked.fetch_add(1, Ordering::SeqCst) == 0 {
+            pairing
+                .request_confirmation(
+                    &caller,
+                    &OwnerConfirmationRequestParams {
+                        subject: ConfirmationSubject::EstablishClock,
+                    },
+                    (action, Digest256::from_bytes([9; 32])),
+                    &|| Ok(()),
+                )
+                .expect("the request records the identifier first");
+        }
+        Ok(())
+    })
+}
+
+fn is_id_conflict<T: std::fmt::Debug>(outcome: &Result<T, ControllerError>) -> bool {
+    matches!(
+        outcome,
+        Err(ControllerError::Refused {
+            code: ErrorCode::IdConflict,
+            ..
+        })
+    )
+}
+
+/// Section 9, KR-REQ-09.07: an identifier a request spends while an issue under the same
+/// identifier is on its way to spending the owner's answer is found before that answer is spent.
+/// The issue is `ID_CONFLICT` and writes nothing, and the answer is still there: the next action
+/// issues the invitation with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_issue_whose_identifier_is_spent_meanwhile_spends_no_confirmation() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let grant = viewer();
+    calls::confirm_subject(
+        environment,
+        &mut client,
+        issue(InviteModeKind::Direct, &grant),
+        &Signer::OwnerDevice(&owner_keys),
+    )
+    .await
+    .expect("answered");
+
+    let pairing = host.network().pairing();
+    let caller = Caller::local(ActorId::new("local:test").expect("a principal"));
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let refused = pairing.invite(
+        &caller,
+        &direct(&grant),
+        (action, Digest256::from_bytes([1; 32])),
+        host.network().network_config().expect("a configuration"),
+        &racing_request(pairing, &caller, action),
+    );
+    assert!(is_id_conflict(&refused), "{refused:?}");
+    let pending = calls::pending(&mut client).await.expect("readable");
+    assert!(
+        pending.pending.iter().any(|pending| pending.answered
+            && pending.request.action == SensitiveAction::IssueInvitation),
+        "the owner's answer is still waiting to be spent"
+    );
+    let _: PairInviteResult = calls::mutate(
+        environment,
+        &mut client,
+        Method::PairInvite,
+        &direct(&grant),
+    )
+    .await
+    .expect("the next action issues the invitation with the same answer");
+    host.stop().await;
+}
+
+/// Section 9, KR-REQ-09.07: the same for a confirmation. A request spends the confirmation's
+/// identifier while the confirmation is on its way to spending the owner's answer for the
+/// candidate; the confirmation is `ID_CONFLICT` and commits nothing, and the next action commits
+/// the pairing with the same answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_confirmation_whose_identifier_is_spent_meanwhile_spends_no_confirmation() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let grant = viewer();
+    let pairing = host.network().pairing();
+    let caller = Caller::local(ActorId::new("local:test").expect("a principal"));
+    let admitted: Admission = Arc::new(|| Ok(()));
+
+    calls::confirm_subject(
+        environment,
+        &mut client,
+        issue(InviteModeKind::Direct, &grant),
+        &owner,
+    )
+    .await
+    .expect("answered");
+    let invited = pairing
+        .invite(
+            &caller,
+            &direct(&grant),
+            (
+                ActionId::new(kr_ipc::new_uuid()),
+                Digest256::from_bytes([1; 32]),
+            ),
+            host.network().network_config().expect("a configuration"),
+            &admitted,
+        )
+        .expect("an invitation");
+    let device = Device::create().await;
+    let (connection, _candidate, _value) = calls::redeem(&device.candidate(), &invited).await;
+    let approval = pairing
+        .owner_status(
+            &caller,
+            &PairStatusParams {
+                invitation_id: invited.invitation_id,
+            },
+        )
+        .expect("the owner's view")
+        .owner
+        .0
+        .and_then(|view| view.approval.0)
+        .expect("a bound candidate");
+    calls::confirm_subject(
+        environment,
+        &mut client,
+        ConfirmationSubject::ConfirmDevice {
+            invitation_id: invited.invitation_id,
+        },
+        &owner,
+    )
+    .await
+    .expect("the candidate's confirmation, answered");
+    let params = PairConfirmParams {
+        invitation_id: invited.invitation_id,
+        approval,
+    };
+    let revision = host
+        .controller()
+        .authority_revision()
+        .await
+        .expect("a revision");
+
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let refused = pairing.confirm(
+        &caller,
+        &params,
+        (action, Digest256::from_bytes([1; 32])),
+        revision,
+        &racing_request(pairing, &caller, action),
+    );
+    assert!(is_id_conflict(&refused), "{refused:?}");
+    let committed = pairing
+        .confirm(
+            &caller,
+            &params,
+            (
+                ActionId::new(kr_ipc::new_uuid()),
+                Digest256::from_bytes([2; 32]),
+            ),
+            revision,
+            &admitted,
+        )
+        .expect("the next action commits the pairing with the same answer");
+    assert_eq!(committed.event.invitation_id, invited.invitation_id);
+    connection.close(0u32.into(), b"paired");
     host.stop().await;
 }
