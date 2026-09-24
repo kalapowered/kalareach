@@ -2483,3 +2483,100 @@ async fn a_workflow_grant_is_narrowed_by_the_configured_rights_ceiling() {
 
     host.clients.abort();
 }
+
+/// Puts a configured session number in force on this host.
+async fn admit_sessions(host: &Host, revision: u64, sessions: u64) {
+    let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
+    document.revision = revision;
+    document.ceilings.session_limit = Nullable::some(sessions);
+    write_configuration(&host._temp.environment(), &document);
+    let effective = host.controller.effective_configuration().await;
+    assert!(
+        effective.not_in_force.0.is_none(),
+        "{:?}",
+        effective.not_in_force
+    );
+}
+
+/// Reads the budget of the chain `run` belongs to.
+async fn chain_budget(
+    control: &mut LocalClient,
+    document: &WorkflowDefinition,
+    run: &WorkflowRunResult,
+) -> kr_protocol::automation::CausalBudgetSummary {
+    let read: WorkflowReadResult = typed(
+        &control
+            .request(
+                Method::WorkflowRead,
+                &WorkflowReadParams {
+                    workflow_id: Nullable::some(document.workflow_id),
+                    revision: Nullable::some(document.revision),
+                    run_id: Nullable::some(run.run_id),
+                    causal_root_id: Nullable::some(run.causal_root_id),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("workflow.read succeeds"),
+    );
+    read.remaining_causal_budget
+        .0
+        .expect("the chain this run belongs to has a budget")
+}
+
+/// A new chain may create no more sessions than the lower of ten and the session number this host
+/// admits when the chain begins, and spend no managed allowance, because this host gives a
+/// workflow none. A number the host admits later changes the ceiling of chains that begin later
+/// and of no chain already begun.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workflow_chain_inherits_the_session_number_the_host_admits_when_it_begins() {
+    let host = host().await;
+    let mut control = client(&host).await;
+    let workspace = adopted_workspace(&mut control, host.environment_id, host.work()).await;
+    host.issue(grant_id(23), &[ActionRight::ChangesetCreate]);
+    let document = definition(
+        workflow_id(23),
+        grant_id(23),
+        "a capture whose chain inherits the host's session number",
+        capture_node(workspace),
+    );
+    install(&mut control, &host, &document).await;
+    enable(&mut control, &host, &document).await;
+
+    admit_sessions(&host, 1, 3).await;
+    let mut control = client(&host).await;
+    let narrow: WorkflowRunResult = typed(
+        &start(&mut control, &host, &document, "evt-three-sessions")
+            .await
+            .expect("workflow.run succeeds"),
+    );
+    assert_eq!(narrow.status, WorkflowRunStatus::Completed, "{narrow:?}");
+    let budget = chain_budget(&mut control, &document, &narrow).await;
+    assert_eq!(budget.max_sessions.get(), 3, "the host admits three");
+    assert_eq!(budget.max_managed_spend.get(), 0, "this host gives none");
+    assert_eq!(budget.managed_spend.get(), 0, "a capture spends none");
+
+    admit_sessions(&host, 2, 64).await;
+    let mut control = client(&host).await;
+    let wide: WorkflowRunResult = typed(
+        &start(&mut control, &host, &document, "evt-sixty-four-sessions")
+            .await
+            .expect("workflow.run succeeds"),
+    );
+    assert_eq!(wide.status, WorkflowRunStatus::Completed, "{wide:?}");
+    assert_ne!(wide.causal_root_id, narrow.causal_root_id, "a second chain");
+    let budget = chain_budget(&mut control, &document, &wide).await;
+    assert_eq!(
+        budget.max_sessions.get(),
+        10,
+        "ten, when the host admits more"
+    );
+    let kept = chain_budget(&mut control, &document, &narrow).await;
+    assert_eq!(
+        kept.max_sessions.get(),
+        3,
+        "a chain already begun keeps the ceiling it inherited"
+    );
+
+    host.clients.abort();
+}
