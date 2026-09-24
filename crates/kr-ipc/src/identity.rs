@@ -1296,6 +1296,43 @@ mod tests {
         UNIX_EPOCH_AS_FILETIME + seconds * FILETIME_UNITS_PER_SECOND
     }
 
+    /// Two Windows processes created under one identifier within one second: the one a helper that
+    /// exited ran, and the one that took its identifier. Each is read as the reader reads it, from
+    /// the creation time the kernel gives, because Windows will not give an identifier to a new
+    /// process on request.
+    #[test]
+    fn two_creations_under_one_identifier_within_one_second_are_two_processes() {
+        let pid = 4242;
+        let now = filetime_at(1_800_000_000);
+        let created = filetime_at(1_758_700_000) + 1_000_000;
+        let read = |created| match windows_answer(pid, WindowsReading::Created(created), now) {
+            ProcessQuery::Present(identity) => identity,
+            other => panic!("a creation time is a start value: {other:?}"),
+        };
+        let first = read(created);
+        // The next interval the kernel counts, and the last one in the same second.
+        for later in [created + 1, filetime_at(1_758_700_001) - 1] {
+            let second = read(later);
+            assert_ne!(
+                first,
+                second,
+                "a process created {} hundred-nanosecond intervals after another under the same \
+                 identifier is another process",
+                later - created
+            );
+            assert_eq!(
+                state_from(&first, pid, ProcessQuery::Present(second.clone())),
+                ProcessState::Ended,
+                "and the first reads as ended once the second holds the identifier"
+            );
+            // In whole seconds the two are one value, which is what could not tell them apart.
+            assert_eq!(
+                (created - UNIX_EPOCH_AS_FILETIME) / FILETIME_UNITS_PER_SECOND,
+                (later - UNIX_EPOCH_AS_FILETIME) / FILETIME_UNITS_PER_SECOND
+            );
+        }
+    }
+
     #[test]
     fn a_windows_reading_that_did_not_happen_is_not_an_absent_process() {
         let pid = 4242;

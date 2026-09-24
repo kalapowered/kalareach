@@ -10,7 +10,7 @@
 //! | KR-REQ-02.04, KR-REQ-05.02 | A worker's endpoint is a pipe whose protected list names its owner and no account the machine does not already trust; a caller that holds every identity the owner holds but the owner's own is refused when it opens it; and the owner arriving over the network is refused as well |
 //! | KR-REQ-02.07 | The listener names the process at the other end of the pipe as the kernel records it: the process that connected, never the listener |
 //! | KR-REQ-05.03 | A descriptor is published under a list that grants its owner alone, and is replaced whole: a reader holding the old version still reads the old version, and a reader by name reads one version or the other and never part of one |
-//! | KR-REQ-11.52 | A process's start identity is the creation time the operating system records for that process |
+//! | KR-REQ-11.52 | A process's start identity is the creation time the operating system records for that process, and two processes started within one second carry two start values |
 //!
 //! The environment identity's list and the profile it is kept in, KR-REQ-03.08, are checked by
 //! this crate's own tests in `src/paths.rs`, which run on this platform too.
@@ -243,6 +243,23 @@ $ErrorActionPreference = 'Stop'
 $started = (Get-Process -Id $Id).StartTime
 Write-Output ([DateTimeOffset]::new($started.ToUniversalTime()).ToUnixTimeSeconds())
 ";
+
+/// Prints when the operating system says each of two processes was created, in hundreds of
+/// nanoseconds since 1970, one line each in the order given.
+///
+/// The standard library of PowerShell reads it through its own process API, not through the reader
+/// under test, and keeps the unit the kernel records.
+const CREATED_TICKS: &str = r"
+param([int]$First, [int]$Second)
+$ErrorActionPreference = 'Stop'
+foreach ($id in @($First, $Second)) {
+    $started = (Get-Process -Id $id).StartTime.ToUniversalTime()
+    Write-Output ($started.Ticks - [DateTime]::UnixEpoch.Ticks)
+}
+";
+
+/// Hundreds of nanoseconds in one second, the unit Windows records a creation time in.
+const TICKS_PER_SECOND: u64 = 10_000_000;
 
 /// KR-REQ-02.04, KR-REQ-05.02: a worker's private endpoint carries the operating system's access
 /// control. On this platform the endpoint is a named pipe rather than a file in an owner-only
@@ -479,6 +496,79 @@ fn a_process_start_identity_is_the_creation_time_the_system_records() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// KR-REQ-11.52: two processes started one after the other within one second are two start
+/// identities, because the start value is the creation time at the resolution the kernel records
+/// it.
+///
+/// The creation times are read through PowerShell as well, not through the reader under test, to
+/// establish two things about each pair before anything is asserted: that both fall in one second,
+/// which is where a start value in whole seconds gives the two processes one value; and that the
+/// kernel recorded two creation times, since two processes it stamped alike are two processes no
+/// reader can tell apart by when they started. A pair that is not both is started again.
+#[test]
+fn two_processes_started_within_one_second_carry_different_start_values() {
+    const ATTEMPTS: usize = 20;
+    let host = TempHost::create();
+    let created_ticks = script(&host, "created-ticks", CREATED_TICKS);
+    let start = || {
+        std::process::Command::new("ping.exe")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("a process to describe")
+    };
+    let mut passed_over = Vec::new();
+    for _ in 0..ATTEMPTS {
+        let mut first = start();
+        let mut second = start();
+        let pids = [first.id(), second.id()];
+        let identities = pids.map(kr_ipc::identity::process_start_identity);
+        let recorded = output_of(
+            &created_ticks,
+            &[&pids[0].to_string(), &pids[1].to_string()],
+        );
+        for child in [&mut first, &mut second] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let ticks: Vec<u64> = recorded
+            .lines()
+            .map(|line| {
+                line.trim()
+                    .parse()
+                    .unwrap_or_else(|_| panic!("PowerShell printed a creation time: {recorded:?}"))
+            })
+            .collect();
+        let [first_ticks, second_ticks] = ticks[..] else {
+            panic!("PowerShell printed two creation times: {recorded:?}");
+        };
+        if first_ticks == second_ticks
+            || first_ticks / TICKS_PER_SECOND != second_ticks / TICKS_PER_SECOND
+        {
+            passed_over.push((first_ticks, second_ticks));
+            continue;
+        }
+        let [first_identity, second_identity] =
+            identities.map(|identity| identity.expect("the kernel describes the process"));
+        assert_eq!(first_identity.pid.get(), u64::from(pids[0]));
+        assert_eq!(second_identity.pid.get(), u64::from(pids[1]));
+        assert_ne!(
+            first_identity.start_value,
+            second_identity.start_value,
+            "two processes created {} hundred-nanosecond intervals apart within one second carry \
+             different start values: {first_identity:?} and {second_identity:?}",
+            second_ticks.abs_diff(first_ticks)
+        );
+        return;
+    }
+    panic!(
+        "no pair of processes was created within one second and apart in {ATTEMPTS} attempts: \
+         {passed_over:?}"
+    );
 }
 
 /// A descriptor for `session` in `host`'s environment, naming `endpoint`.

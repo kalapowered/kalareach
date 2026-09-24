@@ -2488,6 +2488,77 @@ mod tests {
         ));
     }
 
+    /// Reads a Windows process as the worker does, from the creation time the kernel gives for it:
+    /// a `FILETIME`, hundreds of nanoseconds since the start of 1601.
+    fn windows_process(pid: u32, created: u64) -> ProcessStartIdentity {
+        // A reading taken a second after the creation.
+        let now = created + 10_000_000;
+        match kr_ipc::identity::windows_answer(
+            pid,
+            kr_ipc::identity::WindowsReading::Created(created),
+            now,
+        ) {
+            kr_ipc::identity::ProcessQuery::Present(process) => process,
+            other => panic!("a creation time is a start value: {other:?}"),
+        }
+    }
+
+    /// A tenth of a second into a second of September 2025, as a `FILETIME`.
+    const CREATED: u64 = 134_031_736_001_000_000;
+
+    /// Hundreds of nanoseconds in one second, the unit a `FILETIME` counts.
+    const FILETIME_UNITS_PER_SECOND: u64 = 10_000_000;
+
+    /// The same process in whole seconds since 1970, as the previous build read it.
+    fn in_whole_seconds(pid: u32, created: u64) -> ProcessStartIdentity {
+        ProcessStartIdentity::new(
+            u64::from(pid),
+            ProcessStartSource::WindowsProcessStartSeconds,
+            (created - 116_444_736_000_000_000) / FILETIME_UNITS_PER_SECOND,
+        )
+    }
+
+    #[test]
+    fn a_helper_that_exits_while_it_is_placed_is_not_placed_under_the_job_of_its_successor() {
+        // Helper 300 asked a question. While the broker read the jobs of the agents it launched,
+        // the helper exited, and identifier 300 went to a process created a quarter of a second
+        // later, within the same second, which runs under agent 250 and so is in that agent's job.
+        // Windows will not give an identifier to a new process on request, so both are injected
+        // as the readings the worker takes of them.
+        let successor_created = CREATED + FILETIME_UNITS_PER_SECOND / 4;
+        let helper = windows_process(300, CREATED);
+        let successor = windows_process(300, successor_created);
+        let agents = [windows_process(
+            250,
+            CREATED - 60 * FILETIME_UNITS_PER_SECOND,
+        )];
+        let listed = [Some(Ok(vec![250, 300]))];
+        // The reading taken after the lists names the successor.
+        let table = Scripted::windows().found(&successor);
+        assert!(
+            matches!(
+                held_by(&table, &helper, &agents, &listed),
+                Ancestry::Undetermined(ref why) if why.contains("no longer")
+            ),
+            "the helper's request is placed under nobody: what the job lists under 300 is the \
+             process that took the identifier"
+        );
+        // Control: in whole seconds the two are one identity, and the helper's request would be
+        // placed under the successor's agent.
+        let helper = in_whole_seconds(300, CREATED);
+        let successor = in_whole_seconds(300, successor_created);
+        assert_eq!(helper, successor);
+        let agents = [in_whole_seconds(
+            250,
+            CREATED - 60 * FILETIME_UNITS_PER_SECOND,
+        )];
+        let table = Scripted::windows().found(&successor);
+        assert_eq!(
+            held_by(&table, &helper, &agents, &listed),
+            Ancestry::Reaches(0)
+        );
+    }
+
     #[test]
     fn a_source_key_names_the_process_and_its_start_value() {
         let source = VerifiedSource {

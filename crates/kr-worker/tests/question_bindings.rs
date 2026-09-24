@@ -10,22 +10,28 @@
 //! The broker places a helper by the parent chain on Unix and by the job an agent was started in on
 //! Windows, so the placement tests are per platform and the rest run on both.
 //!
+//! A helper's own binding is its process and start value, and one test checks it where Windows can
+//! give a helper's identifier to the next one within a second: the next helper is a new source, with
+//! a new key, and the first one's caller token does not reach its question for it.
+//!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-11.62 | every test below |
+//! | KR-REQ-11.62 | every test below but the last |
+//! | KR-REQ-11.52, KR-REQ-23.31 | `a_helper_created_under_the_previous_helpers_identifier_within_one_second_is_refused_its_token` |
 
 use std::sync::Arc;
 
 use kr_protocol::broker::IntegrationMode;
 use kr_protocol::error::ErrorCode;
-use kr_protocol::identity::ProcessStartIdentity;
+use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{
     ActorId, AgentBindingRevision, AgentThreadId, ApplicationInstanceId, ConnectionId, QuestionId,
     SessionEpoch, SessionId,
 };
 use kr_protocol::question::{
-    CallerToken, Question, QuestionAnswer, QuestionAnswerParams, QuestionCreateParams,
-    QuestionEventKind, QuestionKind, QuestionReadOwnParams, QuestionReadParams, QuestionState,
+    CallerToken, Question, QuestionAnswer, QuestionAnswerParams, QuestionCancelOwnParams,
+    QuestionCreateParams, QuestionEventKind, QuestionKind, QuestionReadOwnParams,
+    QuestionReadParams, QuestionState,
 };
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
 use kr_worker::broker::{
@@ -33,7 +39,7 @@ use kr_worker::broker::{
 };
 use kr_worker::ownership::OwnershipBoundary;
 use kr_worker::persistence::JournalHealth;
-use kr_worker::questions::{Now, Questions, SessionBoundary, VerifiedSource};
+use kr_worker::questions::{Now, QuestionError, Questions, SessionBoundary, VerifiedSource};
 
 fn session() -> SessionId {
     SessionId::new(Uuid::from_bytes([7; 16]))
@@ -960,4 +966,99 @@ fn an_agents_job_is_let_go_of_with_the_last_instance_that_names_it() {
     );
     let refused = verify().expect_err("the helper is under no agent the broker knows");
     assert_eq!(refused.code(), ErrorCode::NotInKrSession, "{refused}");
+}
+
+/// Reads a Windows process as the worker does, from the creation time the kernel gives for it: a
+/// `FILETIME`, hundreds of nanoseconds since the start of 1601.
+fn windows_process(pid: u32, created: u64) -> ProcessStartIdentity {
+    // A reading taken a second after the creation.
+    let now = created + 10_000_000;
+    match kr_ipc::identity::windows_answer(
+        pid,
+        kr_ipc::identity::WindowsReading::Created(created),
+        now,
+    ) {
+        kr_ipc::identity::ProcessQuery::Present(process) => process,
+        other => panic!("a creation time is a start value: {other:?}"),
+    }
+}
+
+/// Section 11: a new execution under a reused name is a different key, so it cannot inherit the
+/// pending decisions of the one before it. On Windows a helper that exits can have its identifier
+/// given to the next helper within the same second. Windows will not do that on request, so both
+/// helpers are injected as the readings the worker takes of them, from their creation times a
+/// quarter of a second apart; the second is another source, with another key, and the first one's
+/// caller token reaches nothing for it.
+#[test]
+fn a_helper_created_under_the_previous_helpers_identifier_within_one_second_is_refused_its_token() {
+    // A tenth of a second into a second of September 2025, as a `FILETIME`, and a quarter of a
+    // second later.
+    const CREATED: u64 = 134_031_736_001_000_000;
+    const LATER: u64 = CREATED + 2_500_000;
+    let questions = Questions::open(None, session(), SessionEpoch::V1).expect("a ledger");
+    let previous = source(windows_process(4242, CREATED), 1);
+    let next = source(windows_process(4242, LATER), 2);
+    assert_ne!(
+        previous.key(),
+        next.key(),
+        "the next helper under the identifier is another source"
+    );
+    let (asked, _) = questions
+        .create(&previous, &ask("reused-identifier"), now(1_000))
+        .expect("the previous helper asks");
+    let own = QuestionReadOwnParams {
+        session_id: session(),
+        question_id: asked.question.question_id,
+        caller_token: asked.caller_token.clone(),
+        wait_ms: Nullable::null(),
+    };
+    let cancel = QuestionCancelOwnParams {
+        session_id: session(),
+        question_id: asked.question.question_id,
+        caller_token: asked.caller_token.clone(),
+    };
+    assert!(matches!(
+        questions.read_own(&next, &own, now(1_100)),
+        Err(QuestionError::TokenRejected { .. })
+    ));
+    assert!(matches!(
+        questions.cancel_own(&next, &cancel, now(1_200)),
+        Err(QuestionError::TokenRejected { .. })
+    ));
+    let (read, _) = questions
+        .read_own(&previous, &own, now(1_300))
+        .expect("the helper that asked still reads its question");
+    assert_eq!(read.question.state, QuestionState::Pending);
+
+    // Control: in whole seconds since 1970, as the previous build read a Windows process, the two
+    // helpers are one source, and the next one is served the previous one's question.
+    let whole_seconds = |pid: u64| {
+        ProcessStartIdentity::new(
+            pid,
+            ProcessStartSource::WindowsProcessStartSeconds,
+            (CREATED - 116_444_736_000_000_000) / 10_000_000,
+        )
+    };
+    assert_eq!(
+        (CREATED - 116_444_736_000_000_000) / 10_000_000,
+        (LATER - 116_444_736_000_000_000) / 10_000_000
+    );
+    let previous = source(whole_seconds(4242), 1);
+    let next = source(whole_seconds(4242), 2);
+    assert_eq!(previous.key(), next.key());
+    let (asked, _) = questions
+        .create(&previous, &ask("reused-identifier-in-seconds"), now(1_400))
+        .expect("the previous helper asks");
+    questions
+        .read_own(
+            &next,
+            &QuestionReadOwnParams {
+                session_id: session(),
+                question_id: asked.question.question_id,
+                caller_token: asked.caller_token,
+                wait_ms: Nullable::null(),
+            },
+            now(1_500),
+        )
+        .expect("in whole seconds the next helper reads the previous one's question");
 }
