@@ -1498,9 +1498,11 @@ mod tests {
     fn a_path_the_page_names_is_refused_at_the_command_boundary() {
         use tauri::Manager as _;
 
+        // Every command the page hands a path: the upload and both exports.
         let (app, window) = page_with(tauri::generate_handler![
             attachment_upload,
-            export_semantic_json
+            export_semantic_json,
+            export_asciicast
         ]);
         let refusal_code =
             |command: &str, body: serde_json::Value| refusal_of(&window, command, body);
@@ -1553,6 +1555,40 @@ mod tests {
         assert!(chosen.exists(), "the chosen destination is written");
         assert_eq!(
             refusal_code("export_semantic_json", export(&chosen)).as_deref(),
+            Some("PERMISSION_DENIED"),
+            "one dialog is one write"
+        );
+
+        // A terminal recording goes through the same gate.
+        let recording = |path: &std::path::Path| {
+            serde_json::json!({
+                "path": path.display().to_string(),
+                "title": "a session",
+                "startedAtUnixSeconds": 1,
+                "dimensions": { "columns": 80, "rows": 24 },
+                "frames": [],
+                "omissions": []
+            })
+        };
+        let named_recording = directory.path().join("named-by-the-page.cast");
+        assert_eq!(
+            refusal_code("export_asciicast", recording(&named_recording)).as_deref(),
+            Some("PERMISSION_DENIED"),
+            "a destination the page names is not one the person chose"
+        );
+        assert!(!named_recording.exists(), "and nothing is written there");
+        let chosen_recording = directory.path().join("chosen.cast");
+        state.allow_export_to(chosen_recording.clone());
+        assert_eq!(
+            refusal_code("export_asciicast", recording(&chosen_recording)),
+            None
+        );
+        assert!(
+            chosen_recording.exists(),
+            "the chosen destination is written"
+        );
+        assert_eq!(
+            refusal_code("export_asciicast", recording(&chosen_recording)).as_deref(),
             Some("PERMISSION_DENIED"),
             "one dialog is one write"
         );
