@@ -104,7 +104,8 @@ pub struct InvocationContext {
 /// Resolves one invocation against the configured integrations.
 ///
 /// The command name and the argument vector are preserved. What an enabled integration does is add
-/// flags to the end of the vector, where a command line puts an option the caller did not give.
+/// flags where a command line puts an option the caller did not give: after the options, and in
+/// front of `--` where the caller wrote one, because everything after that separator is an operand.
 #[must_use]
 pub fn resolve(
     integrations: &[CommandIntegration],
@@ -146,22 +147,24 @@ pub fn resolve(
     if integration.flags.is_empty() {
         return bypass(CommandBypassReason::NotIntegrated);
     }
-    let mut arguments = argv.to_vec();
+    // The options end at the first `--`. What follows is operands, so a word there that looks
+    // like a flag is not one the caller gave, and a flag placed there would reach the agent as an
+    // operand.
+    let options_end = argv
+        .iter()
+        .skip(1)
+        .position(|argument| argument == "--")
+        .map_or(argv.len(), |position| position + 1);
+    let given = argv.get(1..options_end).unwrap_or_default();
     // Only flags the caller did not already give. Repeating one would change what the agent sees.
     let added: Vec<String> = integration
         .flags
         .iter()
-        .filter(|flag| !arguments.contains(flag))
+        .filter(|flag| !given.contains(flag))
         .cloned()
         .collect();
-    arguments.extend(added.iter().cloned());
-    if added.is_empty() {
-        return Resolution::Integrated {
-            command,
-            arguments,
-            added,
-        };
-    }
+    let mut arguments = argv.to_vec();
+    arguments.splice(options_end..options_end, added.iter().cloned());
     Resolution::Integrated {
         command,
         arguments,
@@ -270,6 +273,56 @@ mod tests {
         let resolved = resolve(&integrations(), MANAGED, &argv(&["codex", "--kr-gateway"]));
         assert_eq!(resolved.arguments(), argv(&["codex", "--kr-gateway"]));
         assert!(resolved.establishes_backend());
+    }
+
+    /// After `--` everything is an operand, so a flag added at the end would reach the agent as
+    /// one, and a word there that looks like a flag is not a flag the caller gave.
+    #[test]
+    fn kr_req_12_07_flags_are_added_before_the_end_of_options() {
+        let resolved = resolve(&integrations(), MANAGED, &argv(&["codex", "--", "prompt"]));
+        assert_eq!(
+            resolved.arguments(),
+            argv(&["codex", "--kr-gateway", "--", "prompt"]),
+            "the flag goes in front of the separator, and the operand stays where it was"
+        );
+        let Resolution::Integrated { added, .. } = &resolved else {
+            panic!("an enabled integration adds its flags");
+        };
+        assert_eq!(added, &argv(&["--kr-gateway"]));
+
+        let resolved = resolve(
+            &integrations(),
+            MANAGED,
+            &argv(&["codex", "--model", "o", "--", "--kr-gateway", "--"]),
+        );
+        assert_eq!(
+            resolved.arguments(),
+            argv(&[
+                "codex",
+                "--model",
+                "o",
+                "--kr-gateway",
+                "--",
+                "--kr-gateway",
+                "--"
+            ]),
+            "an operand spelled like the flag is not the flag, and only the first separator counts"
+        );
+
+        let resolved = resolve(
+            &integrations(),
+            MANAGED,
+            &argv(&["codex", "--kr-gateway", "--", "prompt"]),
+        );
+        assert_eq!(
+            resolved.arguments(),
+            argv(&["codex", "--kr-gateway", "--", "prompt"]),
+            "a flag given before the separator is given"
+        );
+        let Resolution::Integrated { added, .. } = &resolved else {
+            panic!("an enabled integration adds its flags");
+        };
+        assert!(added.is_empty());
     }
 
     #[test]
