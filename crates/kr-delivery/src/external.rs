@@ -150,6 +150,16 @@ pub enum ExternalOutcome {
         /// What happened.
         detail: String,
     },
+    /// Nothing of the message left this host, and another attempt would meet the same answer.
+    ///
+    /// A mail server that offers no TLS, a server whose certificate this host cannot verify, and a
+    /// server that refused this host's credential or the recipient before any of the message was
+    /// sent are each an answer about the destination, not about this attempt. The message never
+    /// left, so there is no uncertainty to mark, and nothing is tried again.
+    Unsendable {
+        /// What happened.
+        detail: String,
+    },
     /// The destination refused the message, and a retry cannot change that.
     Refused {
         /// What the destination said.
@@ -431,6 +441,13 @@ pub fn decide_external(
             ),
             false,
         ),
+        // Nothing of the message left, and the answer was about the destination rather than the
+        // attempt, so there is neither an uncertainty to mark nor a reason to try again.
+        ExternalOutcome::Unsendable { detail } => settle(
+            DeliveryState::Abandoned,
+            format!("nothing was sent, and another attempt would meet the same answer: {detail}"),
+            false,
+        ),
         ExternalOutcome::Unknown { detail } if idempotency.supports_retry() => {
             match next_attempt(notification_id, attempt, now_ms, expires_at_ms) {
                 Some(at) => ExternalDecision {
@@ -709,6 +726,34 @@ mod tests {
             Some(notification(1).to_string()),
             "the identifier is the notification's own, so every attempt presents the same one"
         );
+    }
+
+    /// A destination that could not be sent to the way this host sends, before any of the message
+    /// left, is abandoned rather than marked uncertain: nothing reached it, and nothing will.
+    #[test]
+    fn a_message_that_never_left_for_a_reason_about_the_destination_is_abandoned() {
+        for idempotency in [
+            Idempotency::Unsupported,
+            Idempotency::Supported {
+                field: "Idempotency-Key".to_owned(),
+            },
+        ] {
+            let decision = decide_external(
+                &ExternalOutcome::Unsendable {
+                    detail: "the mail server offers no STARTTLS".to_owned(),
+                },
+                &idempotency,
+                notification(1),
+                1,
+                1_000,
+                TimestampMs::new(1_000_000),
+            );
+            assert_eq!(decision.state, DeliveryState::Abandoned);
+            assert_eq!(decision.next, NextAction::None);
+            assert_eq!(decision.next_attempt_at_ms, None);
+            assert!(!decision.left_this_host, "nothing of it left");
+            assert!(decision.detail.contains("nothing was sent"));
+        }
     }
 
     #[test]

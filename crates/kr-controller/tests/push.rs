@@ -3925,27 +3925,29 @@ fn a_webhook_answer_is_read_as_what_it_says() {
     }
 }
 
-/// KR-REQ-25.23: a destination kind this host cannot deliver to is refused where it is configured,
-/// and says why, rather than admitting content nothing will send; so is a webhook address the
-/// managed transport would refuse.
+/// KR-REQ-25.23: a destination this host cannot reach is refused where it is configured, and
+/// says why, rather than admitting content nothing will send: a Slack, Discord, Telegram or email
+/// destination with no credential kept for it, and a webhook address the managed transport would
+/// refuse.
 #[test]
 fn configuring_a_destination_this_host_cannot_reach_is_refused_with_the_reason() {
     let environment = environment();
-    for kind in [
-        DestinationKind::Slack,
-        DestinationKind::Discord,
-        DestinationKind::Telegram,
-        DestinationKind::Email,
+    for (kind, endpoint) in [
+        (DestinationKind::Slack, "#alerts"),
+        (DestinationKind::Discord, "#deployments"),
+        (DestinationKind::Telegram, "123456789"),
+        (DestinationKind::Email, "person@example.com"),
     ] {
         let mut destination = webhook(Idempotency::Unsupported);
         destination.destination = Destination::External(ExternalDestination {
             kind,
+            endpoint: endpoint.to_owned(),
             ..external_of(&destination).clone()
         });
         let refused = environment
             .module
             .configure(&destination)
-            .expect_err("a kind this host cannot deliver to");
+            .expect_err("no credential is kept for it");
         assert!(
             refused.to_string().contains("secret store"),
             "{kind}: {refused}"

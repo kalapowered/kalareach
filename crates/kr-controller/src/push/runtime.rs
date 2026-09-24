@@ -43,7 +43,8 @@ use kr_delivery::producer::RecipientAuthority;
 
 use super::client::GatewayClient;
 use super::credentials::HeldCredentials;
-use super::external::WebhookSender;
+use super::external::ExternalSenders;
+use super::mail::MailSubmission;
 use super::sender::GatewaySenders;
 use super::status::{GatewayStatus, StatusAllowance};
 use super::transport::DeliveryTransports;
@@ -91,7 +92,8 @@ struct Adapters {
     receipts: GatewayStatus,
     /// The sweep's status questions, within its share.
     unknown: GatewayStatus,
-    external: WebhookSender,
+    /// Every external destination's adapter: webhooks, the chat services and mail submission.
+    external: ExternalSenders,
 }
 
 /// The loop that drives one environment's delivery.
@@ -168,7 +170,11 @@ impl DeliveryRuntime {
                     self.runtime.clone(),
                     self.cadence.unknown,
                 ),
-                external: WebhookSender::new(Arc::clone(&transports), self.runtime.clone()),
+                external: ExternalSenders::new(
+                    Arc::clone(&transports),
+                    self.runtime.clone(),
+                    MailSubmission::verified(),
+                ),
             })
             .is_ok();
         if attached {

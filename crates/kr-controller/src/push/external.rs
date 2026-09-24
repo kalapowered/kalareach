@@ -1,4 +1,13 @@
-//! Delivering an external message to a webhook its owner configured.
+//! Delivering an external message: the one sender a pass hands every external destination to, and
+//! the webhook adapter it hands a webhook to.
+//!
+//! [`ExternalSenders`] reads a destination's kind and passes it on: a webhook to [`WebhookSender`],
+//! Slack, Discord and Telegram to [`super::chat::ChatSender`], and email to
+//! [`super::mail::MailSender`]. Each of the last four is handed the credential the pass read from
+//! this host's secret store for this attempt, after checking it is the one the destination was
+//! configured with.
+//!
+//! # Webhooks
 //!
 //! One request per attempt: `POST <endpoint>` with the composed message as JSON, the document the
 //! journal holds, and, when the destination deduplicates by a delivery identifier, that identifier
@@ -26,14 +35,16 @@
 //! [`kr_delivery::external::decide_external`] retries only a destination that deduplicates by the
 //! identifier, and marks the duplicate-delivery uncertainty otherwise.
 //!
-//! # Which kinds
+//! # The other four kinds
 //!
-//! Webhooks alone. Slack, Discord, Telegram and email each send with a credential - a Slack or
-//! Discord webhook address is itself a bearer secret, and a destination's endpoint is never a
-//! credential - which the owner hands over through `delivery.destination.secret.set` and this host
-//! keeps in its secret store once [`check_secret`] has found it the shape its service issues. A
-//! destination of any of those kinds is refused where it is configured (see
-//! [`super::DeliveryModule::configure`]).
+//! Slack, Discord, Telegram and email each send with a credential - a Slack or Discord webhook
+//! address is itself a bearer secret, a Telegram bot sends through its token and email through a
+//! mail submission account - and a destination's endpoint is never a credential. The owner hands
+//! one over through `delivery.destination.secret.set`, [`check_secret`] checks it for the shape its
+//! service issues, and this host keeps it in its secret store. A destination of one of those kinds
+//! is configured only once its credential is kept, and [`check_destination`] checks what the
+//! endpoint names: the channel a webhook posts to, a Telegram chat, or an email recipient. None of
+//! the four deduplicates by an identifier this host could choose, so none is configured with one.
 
 use std::sync::Arc;
 
@@ -176,21 +187,85 @@ pub fn check_secret(secret: &DestinationSecret) -> Result<(), String> {
     }
 }
 
-/// Why this host holds no way to deliver to a destination of `kind`, or `None` when it does.
+/// Checks what an external destination of a credentialed kind names, and how it may be retried.
 ///
-/// A paired device and a webhook need nothing beyond their own configuration. Each of the other
-/// four needs a credential from this host's secret store, and a destination's endpoint is never a
-/// credential. Configuration refuses those kinds with this reason, and a pass settles anything of
-/// those kinds with it rather than calling an adapter.
-#[must_use]
-pub const fn credential_needed(kind: DestinationKind) -> Option<&'static str> {
-    match kind {
-        DestinationKind::Push | DestinationKind::Webhook => None,
+/// The endpoint is never the credential: for Slack and Discord it names the channel the webhook
+/// posts to, for Telegram it is the chat, and for email the recipient's address. None of the four
+/// services recognises a repeat by an identifier this host chooses, so a destination of those kinds
+/// that claims one is refused: section 25 retries only where the destination deduplicates, and a
+/// claim the service does not keep would turn an unknown outcome into a second message.
+///
+/// # Errors
+///
+/// Returns the rule the destination broke.
+pub fn check_destination(destination: &ExternalDestination) -> Result<(), String> {
+    match destination.kind {
+        DestinationKind::Push | DestinationKind::Webhook => return Ok(()),
         DestinationKind::Slack | DestinationKind::Discord => {
-            Some("its webhook address is itself a bearer secret")
+            super::chat::check_channel_label(&destination.endpoint)?;
         }
-        DestinationKind::Telegram => Some("it sends through a bot token"),
-        DestinationKind::Email => Some("it sends through a mail account"),
+        DestinationKind::Telegram => super::chat::check_telegram_chat(&destination.endpoint)?,
+        DestinationKind::Email => super::mail::check_address(&destination.endpoint)
+            .map_err(|rule| format!("an email destination's recipient: {rule}"))?,
+    }
+    if destination.idempotency.supports_retry() {
+        return Err(format!(
+            "a {} destination takes no identifier it would recognise a repeat by, so it is \
+             configured without one",
+            destination.kind
+        ));
+    }
+    Ok(())
+}
+
+/// The sender a pass hands every external destination to.
+#[derive(Clone, Debug)]
+pub struct ExternalSenders {
+    webhook: WebhookSender,
+    chat: super::chat::ChatSender,
+    mail: super::mail::MailSender,
+}
+
+impl ExternalSenders {
+    /// Builds every adapter over the transports this host reaches destinations through, with mail
+    /// submitted under `mail`.
+    #[must_use]
+    pub fn new(
+        transports: Arc<dyn DeliveryTransports>,
+        runtime: tokio::runtime::Handle,
+        mail: super::mail::MailSubmission,
+    ) -> Self {
+        Self {
+            webhook: WebhookSender::new(Arc::clone(&transports), runtime.clone()),
+            chat: super::chat::ChatSender::new(transports, runtime.clone()),
+            mail: super::mail::MailSender::new(mail, runtime),
+        }
+    }
+}
+
+impl ExternalSender for ExternalSenders {
+    fn send(
+        &self,
+        destination: &ExternalDestination,
+        credential: Option<&DestinationSecret>,
+        message: &ExternalMessage,
+    ) -> ExternalOutcome {
+        match (destination.kind, credential) {
+            (DestinationKind::Webhook, _) => self.webhook.send(destination, None, message),
+            (
+                DestinationKind::Slack | DestinationKind::Discord | DestinationKind::Telegram,
+                Some(secret),
+            ) => self.chat.send(destination, secret, message),
+            (DestinationKind::Email, Some(DestinationSecret::Email { account })) => {
+                self.mail.send(destination, account, message)
+            }
+            (kind, _) => ExternalOutcome::Unsendable {
+                detail: format!(
+                    "a {kind} destination was handed to the external senders without the \
+                     credential it sends with"
+                ),
+            },
+        }
     }
 }
 

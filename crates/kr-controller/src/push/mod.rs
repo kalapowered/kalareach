@@ -14,9 +14,9 @@
 //! | [`status`] | Asking that gateway what became of one, by its identifier |
 //! | [`credentials`] | The bearer this host delivers under |
 //! | [`sender`] | Renewing it through the gateway's two-step signed exchange |
-//! | [`external`] | Delivering to a webhook, and checking a credential before it is kept |
-//! | [`chat`] | The shape of a Slack, Discord or Telegram credential and destination |
-//! | [`mail`] | The shape of a mail submission account and of a mail address |
+//! | [`external`] | The sender every external destination is handed to, and delivering to a webhook |
+//! | [`chat`] | Delivering to Slack, Discord and Telegram, and the shape of their credentials |
+//! | [`mail`] | Submitting mail over TLS under the owner's account, and the shape of an address |
 //! | [`secrets`] | Keeping an external destination's credential in the host's secret store |
 //! | [`authority`] | What an external destination's grant lets its recipient read |
 //!
@@ -344,42 +344,68 @@ impl DeliveryModule {
         })
     }
 
-    /// Records a destination: a paired device, or a webhook.
+    /// Records a destination: a paired device, a webhook, or a Slack, Discord, Telegram or email
+    /// destination.
     ///
-    /// Section 25 documents webhook, Slack, email, Discord and Telegram delivery. This host
-    /// delivers to a webhook, whose address is where it sends and nothing more. The other four
-    /// each need a credential from this host's secret store - a Slack or Discord webhook address is
-    /// itself a bearer secret, Telegram sends through a bot token and email through a mail
-    /// account - and a destination's endpoint is never a credential, so a destination of those
-    /// kinds is refused here, where the refusal says why, rather than admitting content for a
-    /// destination nothing can reach.
+    /// Section 25 documents all five external kinds. A webhook's address is where it sends and
+    /// nothing more, and it is checked here the way the managed transport checks it. Each of the
+    /// other four sends with a credential kept in this host's secret store - a Slack or Discord
+    /// webhook address is itself a bearer secret, Telegram sends through a bot token and email
+    /// through a mail submission account - and a destination's endpoint is never a credential. So
+    /// one of those kinds is configured only once its credential is kept under the identifier, and
+    /// the record is given the stamp that credential was stored with, whatever the caller put
+    /// there: the record names the credential it actually sends with. Its endpoint and its retry
+    /// claim are checked for its kind ([`external::check_destination`]).
+    ///
+    /// A destination that sends with no credential replaces whatever was configured under its
+    /// identifier, and a credential kept for what it replaced goes with it.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::InvalidArgument`] for a kind this host cannot deliver to or a
-    /// webhook address it will not send to, and [`ControllerError::Storage`] when the journal
-    /// cannot be written.
+    /// Returns [`ControllerError::InvalidArgument`] for a webhook address this host will not send
+    /// to, an endpoint or a retry claim its kind does not take, or a credentialed kind with no
+    /// credential of its kind kept under the identifier, and [`ControllerError::Storage`] when the
+    /// secret store or the journal cannot be read or written.
     pub fn configure(&self, record: &DestinationRecord) -> Result<()> {
         let mut record = record.clone();
         if let Destination::External(external) = &mut record.destination {
-            if let Some(needs) = external::credential_needed(external.kind) {
-                return Err(ControllerError::InvalidArgument(format!(
-                    "a {} destination needs a credential from this host's secret store, because \
-                     {needs}, and a destination's endpoint is never a credential: this host \
-                     delivers to webhooks",
-                    external.kind
-                )));
+            if external.kind.credential().is_none() {
+                external::webhook_origin(&external.endpoint)
+                    .map_err(ControllerError::InvalidArgument)?;
             }
-            external::webhook_origin(&external.endpoint)
-                .map_err(ControllerError::InvalidArgument)?;
-            external.credential = None;
+            external::check_destination(external).map_err(ControllerError::InvalidArgument)?;
         }
         self.with(|producer| {
-            // A destination that sends with no credential replaces whatever was configured under
-            // its identifier, and a credential kept for what it replaced goes with it: it would
-            // otherwise be picked up by a destination of that kind configured here later, which
-            // nobody gave it to.
-            self.secrets.remove(&record.id)?;
+            match &mut record.destination {
+                Destination::External(external) => match external.kind.credential() {
+                    Some(kind) => {
+                        let held = self.secrets.get(&record.id)?.ok_or_else(|| {
+                            ControllerError::InvalidArgument(format!(
+                                "a {kind} destination sends with a credential this host keeps in \
+                                 its secret store, and none is kept under {}: hand it over with \
+                                 delivery.destination.secret.set first",
+                                record.id
+                            ))
+                        })?;
+                        if held.secret.kind() != kind {
+                            return Err(ControllerError::InvalidArgument(format!(
+                                "the credential kept under {} is for a {} destination, not a \
+                                 {kind} one",
+                                record.id,
+                                held.secret.kind()
+                            )));
+                        }
+                        external.credential = Some(held.stamp);
+                    }
+                    None => {
+                        external.credential = None;
+                        self.secrets.remove(&record.id)?;
+                    }
+                },
+                // A paired device replaces whatever was configured under its identifier, and a
+                // credential kept for what it replaced goes with it.
+                Destination::Push(_) => self.secrets.remove(&record.id)?,
+            }
             producer
                 .journal_mut()
                 .configure_destination(&record)
@@ -964,23 +990,54 @@ impl DeliveryModule {
         clock: &dyn Clock,
     ) -> Result<()> {
         let destination = record.as_external().expect("an external destination");
-        if let Some(needs) = external::credential_needed(destination.kind) {
-            // Configuration refuses these kinds, so nothing is admitted for one. A record that
-            // reached here anyway is settled without calling an adapter: nothing could send it,
-            // and an attempt that never left is not an outcome anybody has to wonder about.
-            return self.settle(
-                delivery,
-                DeliveryState::Revoked,
-                &format!(
-                    "this host holds no credential for a {} destination: {needs}",
-                    destination.kind
-                ),
-                now_ms,
-            );
-        }
+        // The credential this attempt sends with: the one kept for the destination now, and only
+        // when it is the one the destination was configured with. A credential replaced since, or
+        // one that has gone, is not used to send what was admitted under another: nothing is
+        // sent, and the record says why.
+        let held = match destination.kind.credential() {
+            None => None,
+            Some(kind) => match self.secrets.get(&record.id) {
+                Ok(Some(held))
+                    if held.secret.kind() == kind
+                        && destination.credential.as_ref() == Some(&held.stamp) =>
+                {
+                    Some(held)
+                }
+                Ok(Some(_)) => {
+                    return self.settle(
+                        delivery,
+                        DeliveryState::Revoked,
+                        "the credential kept for this destination is not the one it was \
+                         configured with, so nothing admitted under the earlier one is sent with \
+                         it",
+                        now_ms,
+                    );
+                }
+                Ok(None) => {
+                    return self.settle(
+                        delivery,
+                        DeliveryState::Revoked,
+                        "this host keeps no credential for this destination",
+                        now_ms,
+                    );
+                }
+                Err(error) => {
+                    return self.settle(
+                        delivery,
+                        DeliveryState::Abandoned,
+                        &format!("this host's secret store could not be read: {error}"),
+                        now_ms,
+                    );
+                }
+            },
+        };
         let message = client::message_from(&delivery.content)?;
         let attempt = delivery.attempt;
-        let outcome = external.send(destination, None, &message);
+        let outcome = external.send(
+            destination,
+            held.as_ref().map(|held| &held.secret),
+            &message,
+        );
         let answered_at_ms = clock.now_ms().max(now_ms);
         let decision = kr_delivery::external::decide_external(
             &outcome,
