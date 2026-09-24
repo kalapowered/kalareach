@@ -19,7 +19,7 @@ use futures_util::{SinkExt, StreamExt};
 use iroh::endpoint::Connection;
 use kr_client::ClientError;
 use kr_client::pairing::BoxFuture;
-use kr_client::pairing::candidate::{AttemptState, Candidate, CandidateRoom, Pairing};
+use kr_client::pairing::candidate::{AttemptState, Candidate, CandidateRoom, Pairing, Stage};
 use kr_client::pairing::clock::DeviceClock;
 use kr_client::pairing::failure::FailureKind;
 use kr_client::pairing::invitation::{Invitation, read_invitation};
@@ -264,6 +264,21 @@ async fn awaiting_value(shown: &mut watch::Receiver<AttemptState>) -> String {
     value
 }
 
+/// Waits until an attempt shows a state `until` accepts, or ends, and returns that state.
+async fn reached(
+    shown: &mut watch::Receiver<AttemptState>,
+    mut until: impl FnMut(&AttemptState) -> bool,
+) -> AttemptState {
+    tokio::time::timeout(
+        WATCHDOG,
+        shown.wait_for(|state| until(state) || matches!(state, AttemptState::Ended { .. })),
+    )
+    .await
+    .expect("the attempt gets there")
+    .expect("the attempt runs")
+    .clone()
+}
+
 /// Waits for an attempt to end and returns how.
 async fn outcome(
     attempt: tokio::task::JoinHandle<Result<PairedHost, kr_client::pairing::PairingFailure>>,
@@ -478,6 +493,12 @@ struct WatchedLink {
     sever_after_finish: bool,
     /// Answer this many status questions, and then none, with the connection held open.
     answers_before_silence: Option<usize>,
+    /// Let the host take a finish or a direct proof, and never pass its answer on.
+    withhold_submission_answer: bool,
+    /// Every dial after the first waits here.
+    reconnect_gate: Option<Arc<Gate>>,
+    /// Every status question waits here.
+    status_gate: Option<Arc<Gate>>,
     severed: Arc<AtomicBool>,
     statuses: Arc<AtomicUsize>,
     dials: AtomicUsize,
@@ -493,11 +514,31 @@ impl WatchedLink {
             lose_finish_answer: false,
             sever_after_finish: false,
             answers_before_silence: None,
+            withhold_submission_answer: false,
+            reconnect_gate: None,
+            status_gate: None,
             severed: Arc::new(AtomicBool::new(false)),
             statuses: Arc::new(AtomicUsize::new(0)),
             dials: AtomicUsize::new(0),
             opened: AtomicUsize::new(0),
         }
+    }
+}
+
+/// A gate a test opens once. Whatever waits at it passes once it is open, and not before.
+struct Gate(watch::Sender<bool>);
+
+impl Gate {
+    fn closed() -> Arc<Self> {
+        Arc::new(Self(watch::channel(false).0))
+    }
+
+    fn open(&self) {
+        self.0.send_replace(true);
+    }
+
+    async fn passed(&self) {
+        let _ = self.0.subscribe().wait_for(|open| *open).await;
     }
 }
 
@@ -511,14 +552,20 @@ impl HostLink for WatchedLink {
         network: &'a NetworkConfig,
         endpoint: &'a EndpointKey,
     ) -> BoxFuture<'a, Result<Connection, LinkError>> {
-        self.dials.fetch_add(1, Ordering::SeqCst);
+        let earlier = self.dials.fetch_add(1, Ordering::SeqCst);
         if self.severed.load(Ordering::SeqCst) {
             return Box::pin(async { Err(severed()) });
         }
-        match &self.elsewhere {
-            Some((network, endpoint)) => self.inner.dial(network, endpoint),
-            None => self.inner.dial(network, endpoint),
-        }
+        let gate = self.reconnect_gate.as_ref().filter(|_| earlier > 0);
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                gate.passed().await;
+            }
+            match &self.elsewhere {
+                Some((network, endpoint)) => self.inner.dial(network, endpoint).await,
+                None => self.inner.dial(network, endpoint).await,
+            }
+        })
     }
 
     fn open_unpaired<'a>(
@@ -535,6 +582,8 @@ impl HostLink for WatchedLink {
                 lose_finish_answer: self.lose_finish_answer,
                 sever_after_finish: self.sever_after_finish,
                 answers_before_silence: self.answers_before_silence,
+                withhold_submission_answer: self.withhold_submission_answer,
+                status_gate: self.status_gate.clone(),
                 severed: Arc::clone(&self.severed),
                 statuses: Arc::clone(&self.statuses),
             }) as Box<dyn Preauth>)
@@ -560,6 +609,8 @@ struct Watched {
     lose_finish_answer: bool,
     sever_after_finish: bool,
     answers_before_silence: Option<usize>,
+    withhold_submission_answer: bool,
+    status_gate: Option<Arc<Gate>>,
     severed: Arc<AtomicBool>,
     statuses: Arc<AtomicUsize>,
 }
@@ -581,6 +632,9 @@ impl Preauth for Watched {
     ) -> BoxFuture<'a, Result<PairFinishResult, LinkError>> {
         Box::pin(async move {
             let mut finished = self.inner.finish(request).await?;
+            if self.withhold_submission_answer {
+                std::future::pending::<()>().await;
+            }
             if self.sever_after_finish {
                 self.severed.store(true, Ordering::SeqCst);
             }
@@ -603,7 +657,11 @@ impl Preauth for Watched {
         params: &'a PairRedeemParams,
     ) -> BoxFuture<'a, Result<PairRedeemResult, LinkError>> {
         Box::pin(async move {
-            Ok(match self.inner.redeem(params).await? {
+            let redeemed = self.inner.redeem(params).await?;
+            if self.withhold_submission_answer && matches!(params, PairRedeemParams::Direct(_)) {
+                std::future::pending::<()>().await;
+            }
+            Ok(match redeemed {
                 PairRedeemResult::Locked {
                     attempt_id,
                     verification_value,
@@ -621,6 +679,9 @@ impl Preauth for Watched {
         params: &'a PairStatusParams,
     ) -> BoxFuture<'a, Result<PairStatusResult, LinkError>> {
         Box::pin(async move {
+            if let Some(gate) = &self.status_gate {
+                gate.passed().await;
+            }
             if self.severed.load(Ordering::SeqCst) {
                 return Err(severed());
             }
@@ -888,6 +949,8 @@ fn made(handle: &Arc<Mutex<Option<Arc<WatchedLink>>>>) -> Arc<WatchedLink> {
 /// KR-REQ-10.32, KR-REQ-10.37: a finish whose answer never arrived is not a refusal. The host
 /// took it, so the device keeps its record of the attempt, asks again on a connection of its own,
 /// shows the value only once the host has answered with it, and pairs when the owner approves.
+/// The test holds the device at each step, its next dial and then its status question, so every
+/// state it checks is the one the device is in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_finish_whose_answer_was_lost_is_asked_about_again() {
     let owner_keys = keys();
@@ -898,47 +961,179 @@ async fn a_finish_whose_answer_was_lost_is_asked_about_again() {
     let invited = invite_code(environment, &mut client, &viewer(), None, &owner).await;
     let (origin, code, _) = code_of(&invited);
 
-    let (link, making) = watching(|link| link.lose_finish_answer = true);
+    let (reconnects, statuses) = (Gate::closed(), Gate::closed());
+    let (link, making) = watching({
+        let (reconnects, statuses) = (Arc::clone(&reconnects), Arc::clone(&statuses));
+        move |link| {
+            link.lose_finish_answer = true;
+            link.reconnect_gate = Some(reconnects);
+            link.status_gate = Some(statuses);
+        }
+    });
     let device = ProductDevice::new(Arc::new(host.room.clone()), making);
     let (attempt, mut shown) = device.enter(&origin, &code);
-    let seen = record(shown.clone());
-    awaiting_value(&mut shown).await;
-    assert!(
-        device
-            .pairing
-            .hosts
-            .waiting_attempt()
-            .expect("readable")
-            .is_some(),
-        "the device kept its record of the attempt"
+
+    // The answer is lost: the device keeps its record and is about to dial again.
+    assert_eq!(
+        reached(&mut shown, |state| matches!(
+            state,
+            AttemptState::Reconnecting { .. }
+        ))
+        .await,
+        AttemptState::Reconnecting {
+            value: None,
+            expires_at_ms: None,
+        },
+        "no value is shown before the host has answered with it"
     );
-    {
-        let seen = seen.lock().expect("the record");
-        let first = seen
-            .iter()
-            .position(shows_a_value)
-            .expect("a value was shown");
-        assert!(
-            matches!(seen[first], AttemptState::AwaitingApproval { .. }),
-            "the first value shown is the one the host answered with: {seen:?}"
-        );
-        assert!(
-            seen[..first]
-                .iter()
-                .any(|state| matches!(state, AttemptState::Reconnecting { value: None, .. })),
-            "the device asked again, showing no value yet: {seen:?}"
-        );
-    }
-    assert!(
-        made(&link).opened.load(Ordering::SeqCst) >= 2,
+    let kept = device
+        .pairing
+        .hosts
+        .waiting_attempt()
+        .expect("readable")
+        .expect("the device kept its record of the attempt");
+    assert!(!kept.value_confirmed);
+
+    // Connected again and asking, and the host has not answered yet: still no value.
+    reconnects.open();
+    assert_eq!(
+        reached(&mut shown, |state| matches!(
+            state,
+            AttemptState::Working { .. }
+        ))
+        .await,
+        AttemptState::Working {
+            stage: Stage::ReachingHost,
+        }
+    );
+    assert_eq!(
+        made(&link).opened.load(Ordering::SeqCst),
+        2,
         "the device asked on a connection of its own"
     );
+
+    // The host answers: the value is the one it answered with, which is the owner's.
+    statuses.open();
+    let value = awaiting_value(&mut shown).await;
+    let PairStatus::AwaitingApproval {
+        verification_value, ..
+    } = owner_status(&mut client, &invited).await
+    else {
+        panic!("the owner is asked to approve the device");
+    };
+    assert_eq!(value, group_verification_value(&verification_value));
     let confirmed =
         calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
             .await
             .expect("the owner approves");
     let paired = outcome(attempt).await.expect("paired");
     assert_eq!(paired.device_id, confirmed.device_id);
+}
+
+/// KR-REQ-10.32: a host that takes a finish or a direct proof and holds its answer back does not
+/// hold the device: after one bounded step the device asks again on a connection of its own, and
+/// pairs when the owner approves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withheld_finish_or_proof_answer_is_asked_about_again() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+
+    let invited = invite_code(environment, &mut client, &viewer(), None, &owner).await;
+    let (origin, code, _) = code_of(&invited);
+    let (link, making) = watching(|link| link.withhold_submission_answer = true);
+    let device = ProductDevice::new(Arc::new(host.room.clone()), making);
+    let (attempt, mut shown) = device.enter(&origin, &code);
+    awaiting_value(&mut shown).await;
+    assert_eq!(made(&link).opened.load(Ordering::SeqCst), 2, "code");
+    calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+        .await
+        .expect("the owner approves");
+    outcome(attempt).await.expect("paired by code");
+
+    let invited = issue_direct(environment, &mut client, &owner).await;
+    let (link, making) = watching(|link| link.withhold_submission_answer = true);
+    let device = ProductDevice::new(Arc::new(host.room.clone()), making);
+    let (attempt, mut shown) = device.redeem(&direct_text(&invited));
+    awaiting_value(&mut shown).await;
+    assert_eq!(made(&link).opened.load(Ordering::SeqCst), 2, "direct");
+    calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+        .await
+        .expect("the owner approves");
+    outcome(attempt).await.expect("paired directly");
+}
+
+/// KR-REQ-10.32: the attempt's own deadline holds while the host keeps answering. A device the
+/// owner has not approved by then stops asking, says the approval is unknown with the tries it has
+/// left, and lets the attempt go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_still_waiting_is_not_asked_past_the_deadline() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let invited = invite_code(environment, &mut client, &viewer(), None, &owner).await;
+    let (origin, code, _) = code_of(&invited);
+
+    let device = ProductDevice::new(Arc::new(host.room.clone()), |link| Arc::new(link));
+    let (attempt, mut shown) = device.enter(&origin, &code);
+    awaiting_value(&mut shown).await;
+    device.clock.advance(PAST_THE_DEADLINE);
+    let failure = outcome(attempt).await.expect_err("not paired");
+    assert_eq!(failure.kind, FailureKind::ApprovalUnknown);
+    assert_eq!(failure.tries_left, Some(MAX_CLIENT_ATTEMPTS - 1));
+    assert!(
+        device
+            .pairing
+            .hosts
+            .waiting_attempt()
+            .expect("readable")
+            .is_none()
+    );
+    assert!(
+        matches!(
+            owner_status(&mut client, &invited).await,
+            PairStatus::AwaitingApproval { .. }
+        ),
+        "the host was still waiting for its owner"
+    );
+}
+
+/// KR-REQ-10.19: a resumed attempt that cannot read this device's record of its hosts stops, and
+/// still says how many tries the device has left with the code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resume_that_cannot_read_the_records_still_says_how_many_tries_are_left() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let invited = invite_code(environment, &mut client, &viewer(), None, &owner).await;
+    let (origin, code, _) = code_of(&invited);
+
+    let device = ProductDevice::new(Arc::new(host.room.clone()), |link| Arc::new(link));
+    let (attempt, mut shown) = device.enter(&origin, &code);
+    awaiting_value(&mut shown).await;
+    attempt.abort();
+    let _ = attempt.await;
+    std::fs::write(
+        device.directory.path().join("pairing").join("hosts.json"),
+        b"not a record of hosts",
+    )
+    .expect("written");
+
+    let restarted = device.restarted(|link| Arc::new(link));
+    let (progress, _shown) = watch::channel(AttemptState::Idle);
+    let failure = tokio::time::timeout(WATCHDOG, restarted.resume(&progress))
+        .await
+        .expect("the resumed attempt ends")
+        .expect("an attempt was waiting")
+        .expect_err("not paired");
+    assert_eq!(failure.kind, FailureKind::StoreFailed);
+    assert_eq!(failure.tries_left, Some(MAX_CLIENT_ATTEMPTS - 1));
 }
 
 /// KR-REQ-10.32: a device that stopped after it recorded its host, and before it let the waiting

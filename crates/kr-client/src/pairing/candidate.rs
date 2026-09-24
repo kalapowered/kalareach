@@ -356,7 +356,9 @@ impl Pairing {
         // paired device, so the record is what reaches it.
         let recorded = match self.hosts.by_device(pending.host_device_id) {
             Ok(recorded) => recorded,
-            Err(failure) => return Some(ended(progress, Err(failure))),
+            Err(failure) => {
+                return Some(ended(progress, Err(failure.or_tries(pending.tries_left))));
+            }
         };
         let outcome = match recorded {
             Some(host) if host.host_endpoint_id == pending.host_endpoint_id => self
@@ -525,11 +527,12 @@ impl Pairing {
         progress.send_replace(AttemptState::Working {
             stage: Stage::ReachingHost,
         });
-        let connection = self
-            .link
-            .dial(&bundle.network_config, &bundle.endpoint_id)
-            .await
-            .map_err(|error| link_failed(&error, tries))?;
+        let connection = within(
+            WAIT_STEP,
+            self.link.dial(&bundle.network_config, &bundle.endpoint_id),
+        )
+        .await
+        .map_err(|error| link_failed(&error, tries))?;
         // The live peer is the connection's own. kr-pairing refuses one that is not the bundle's
         // endpoint before this device offers anything on the connection.
         let request = attempt
@@ -539,11 +542,13 @@ impl Pairing {
                 clock,
             )
             .map_err(|error| step_failed(&error, tries))?;
-        let mut preauth = self
-            .link
-            .open_unpaired(&connection, &self.candidate.unpaired())
-            .await
-            .map_err(|error| link_failed(&error, tries))?;
+        let mut preauth = within(
+            WAIT_STEP,
+            self.link
+                .open_unpaired(&connection, &self.candidate.unpaired()),
+        )
+        .await
+        .map_err(|error| link_failed(&error, tries))?;
         let selection = preauth.selection();
         if selection.endpoint_id != bundle.endpoint_id || selection.device_id != bundle.device_id {
             return Err(PairingFailure::new(
@@ -572,7 +577,9 @@ impl Pairing {
         // Kept before the finish leaves, so a device that restarts while the owner decides can
         // ask again.
         self.hosts.keep_attempt(&pending)?;
-        let finished = preauth.finish(&request).await;
+        // A host that takes the finish and holds its answer back is asked again, on a connection
+        // of its own, like one whose answer was lost.
+        let finished = within(self.step(&pending), preauth.finish(&request)).await;
         let pending = match finished {
             Ok(finished) => {
                 if !verification_values_match(&value, &finished.verification_value) {
@@ -679,10 +686,19 @@ impl Pairing {
         };
         let mut reconnects = 0_usize;
         loop {
-            // A host that holds the connection open and answers nothing is asked again; it does
-            // not hold the attempt past its deadline.
+            // The attempt's own deadline holds on every pass, whatever the host last said: a host
+            // that keeps answering that the owner has not decided does not hold the device past
+            // it, and neither does one that holds the connection open and answers nothing.
+            if self.clock.wall_clock_ms() >= pending.recover_until_ms {
+                let _ = self.hosts.clear_attempt();
+                return Err(PairingFailure::new(
+                    FailureKind::ApprovalUnknown,
+                    "the attempt's time ran out before the host said it committed this device or \
+                     ended the invitation",
+                ));
+            }
             let asked = match held.as_mut() {
-                Some((_, preauth)) => within_step(preauth.status(&params)).await,
+                Some((_, preauth)) => within(self.step(&pending), preauth.status(&params)).await,
                 None => Err(LinkError::Lost("no connection".to_owned())),
             };
             match asked {
@@ -695,7 +711,7 @@ impl Pairing {
                                 .committed(&pending, device_id, grant_id, progress)
                                 .await;
                         }
-                        None => tokio::time::sleep(STATUS_INTERVAL).await,
+                        None => tokio::time::sleep(STATUS_INTERVAL.min(self.left(&pending))).await,
                     }
                 }
                 Err(LinkError::Refused(refusal)) => {
@@ -708,19 +724,14 @@ impl Pairing {
                 Err(LinkError::Lost(_) | LinkError::Configuration(_)) => {
                     // The connection is gone; it is let go of before the wait, not after.
                     drop(held.take());
-                    let now = self.clock.wall_clock_ms();
-                    if now >= pending.recover_until_ms {
-                        let _ = self.hosts.clear_attempt();
-                        return Err(PairingFailure::new(
-                            FailureKind::ApprovalUnknown,
-                            "the host could not be asked before the invitation expired",
-                        ));
-                    }
                     progress.send_replace(reconnecting(&pending));
                     let delay = RECONNECT_DELAYS[reconnects.min(RECONNECT_DELAYS.len() - 1)]
-                        .min(Duration::from_millis(pending.recover_until_ms - now));
+                        .min(self.left(&pending));
                     reconnects += 1;
                     tokio::time::sleep(delay).await;
+                    if self.left(&pending).is_zero() {
+                        continue;
+                    }
                     held = self.reconnect(&pending).await;
                     if held.is_some() {
                         progress.send_replace(awaiting(&pending));
@@ -728,6 +739,21 @@ impl Pairing {
                 }
             }
         }
+    }
+
+    /// How long `pending` has left, by this device's clock.
+    fn left(&self, pending: &PendingAttempt) -> Duration {
+        Duration::from_millis(
+            pending
+                .recover_until_ms
+                .saturating_sub(self.clock.wall_clock_ms()),
+        )
+    }
+
+    /// How long one question to the host of `pending`, or one connection to it, may take: a step,
+    /// and never past the attempt's deadline.
+    pub(crate) fn step(&self, pending: &PendingAttempt) -> Duration {
+        WAIT_STEP.min(self.left(pending))
     }
 
     /// Reads one status answer. Returns the committed identities once the host committed.
@@ -808,7 +834,8 @@ impl Pairing {
 
     /// Dials the host again, unpaired, and opens its pre-authorisation surface.
     async fn reconnect(&self, pending: &PendingAttempt) -> Option<(Connection, Box<dyn Preauth>)> {
-        let connection = within_step(
+        let connection = within(
+            self.step(pending),
             self.link
                 .dial(&pending.network_config, &pending.host_endpoint_id),
         )
@@ -817,7 +844,8 @@ impl Pairing {
         if ConnectionPeer::of(&connection).endpoint() != pending.host_endpoint_id {
             return None;
         }
-        let preauth = within_step(
+        let preauth = within(
+            self.step(pending),
             self.link
                 .open_unpaired(&connection, &self.candidate.unpaired()),
         )
@@ -881,14 +909,15 @@ impl Pairing {
             if index > 0 {
                 tokio::time::sleep(*delay).await;
             }
-            let session = match within_step(self.link.connect_paired(&host, &identity)).await {
+            let session = match within(WAIT_STEP, self.link.connect_paired(&host, &identity)).await
+            {
                 Ok(session) => session,
                 Err(error) => {
                     last = error.to_string();
                     continue;
                 }
             };
-            let status: Result<PairStatusResult, LinkError> = within_step(async {
+            let status: Result<PairStatusResult, LinkError> = within(WAIT_STEP, async {
                 session
                     .read(Method::PairStatus, &params)
                     .await
@@ -914,7 +943,7 @@ impl Pairing {
                     continue;
                 }
             }
-            let environments: Result<EnvironmentListResult, LinkError> = within_step(async {
+            let environments: Result<EnvironmentListResult, LinkError> = within(WAIT_STEP, async {
                 session
                     .read(Method::EnvironmentList, &EmptyParams {})
                     .await
@@ -948,13 +977,17 @@ impl Pairing {
     }
 }
 
-/// Waits at most [`WAIT_STEP`] for one question to a host, or one connection to it.
-async fn within_step<T>(
+/// Waits at most `bound` for one question to a host, or one connection to it. A host that has not
+/// answered by then is treated as a connection lost: what it decided is asked again, not assumed.
+pub(crate) async fn within<T>(
+    bound: Duration,
     step: impl std::future::Future<Output = Result<T, LinkError>>,
 ) -> Result<T, LinkError> {
-    tokio::time::timeout(WAIT_STEP, step)
-        .await
-        .unwrap_or_else(|_| Err(LinkError::Lost("the host answered nothing".to_owned())))
+    tokio::time::timeout(bound, step).await.unwrap_or_else(|_| {
+        Err(LinkError::Lost(
+            "the host answered nothing in time".to_owned(),
+        ))
+    })
 }
 
 /// A method that takes no parameters, as the empty map the protocol expects.
