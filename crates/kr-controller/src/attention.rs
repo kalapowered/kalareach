@@ -416,6 +416,10 @@ pub struct AttentionModule {
     /// before it takes the store. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     before_store: Pause,
+    /// Where this module's own tests stop a save of the time contract as it begins, before it
+    /// waits for its turn.
+    #[cfg(test)]
+    save_entry: Pause,
     /// Where this module's own tests stop a save of the time contract, between reading what it
     /// keeps and writing it.
     #[cfg(test)]
@@ -494,6 +498,8 @@ impl AttentionModule {
             wake: Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "testing")]
             before_store: Pause::default(),
+            #[cfg(test)]
+            save_entry: Pause::default(),
             #[cfg(test)]
             in_save: Pause::default(),
         };
@@ -584,6 +590,8 @@ impl AttentionModule {
     /// One save at a time, from reading the state to recording it as kept: two saves that crossed
     /// could write an older state over a newer one and still record the newer as kept.
     fn keep_time(&self) {
+        #[cfg(test)]
+        self.save_entry.wait();
         let _saving = self
             .time_saving
             .lock()
@@ -4002,9 +4010,9 @@ mod tests {
     /// and a store opened again reads it back.
     ///
     /// Two saves are made to cross. The first is stopped between reading what it keeps and writing
-    /// it; the wall clock is then set back, and a second save starts with the rollback to keep.
-    /// The second waits for the first, so the rollback is what is written last and what a restart
-    /// reads: had the first written after it, a restart would trust the clock again.
+    /// it; the wall clock is then set back, and a second save begins with the rollback to keep
+    /// while the first holds the saves' turn. The rollback is what is written last and what a
+    /// restart reads: had the first written after it, a restart would trust the clock again.
     #[tokio::test(flavor = "multi_thread")]
     async fn what_the_time_contract_must_keep_is_written_beside_the_store() {
         use kr_worker::action::adapter::{
@@ -4069,7 +4077,9 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("the first save has read what it keeps");
 
-        // The clock is set back while that save is stopped, and a second save starts.
+        // The clock is set back while that save is stopped, and a second reading observes the
+        // rollback and begins its own save.
+        let (entered, enter) = first.save_entry.arm();
         wall.set(WALL);
         let rolling_back = {
             let first = Arc::clone(&first);
@@ -4077,11 +4087,22 @@ mod tests {
                 let _ = first.reading();
             })
         };
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(
-            !rolling_back.is_finished(),
-            "the second save waits for the first"
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the second save has begun");
+        assert_eq!(
+            first.time.trust(),
+            kr_protocol::action::WallClockTrust::Unresolved,
+            "the rollback was observed before its save began"
         );
+        assert!(first.time.unsaved());
+        // The stopped save holds the saves' turn from its reading to its writing, so the second
+        // cannot write in between, whenever it runs.
+        assert!(
+            first.time_saving.try_lock().is_err(),
+            "the first save holds the turn while it is stopped"
+        );
+        enter.send(()).expect("the second save goes on");
         release.send(()).expect("the first save is let go");
         stepping.join().expect("the first save finishes");
         rolling_back.join().expect("the second save finishes");
