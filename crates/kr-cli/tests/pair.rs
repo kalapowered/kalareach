@@ -5,8 +5,8 @@
 //! internal disk and put on the network on loopback alone, with no relay and no discovery; it keeps
 //! its keys in its own temporary host and has no owner when it starts. `kr` runs on a real
 //! pseudo-terminal where the first owner's confirmation needs one, and on plain pipes where what is
-//! tested is that it refuses. A build of this crate alone that has not built the daemon yet prints
-//! why and stops rather than testing something else.
+//! tested is that it refuses. A build of this crate alone that has not built the daemon yet fails
+//! and says why, rather than counting a check it did not run as one that passed.
 //!
 //! Where a test needs a live session, this test hosts one itself, in the daemon's environment: a
 //! real session whose real worker answers whether a process is one of its own, published where
@@ -68,14 +68,13 @@ impl Drop for Host {
 }
 
 impl Host {
-    async fn start() -> Option<Self> {
-        let Some(controller) = beside_this_test("kr-controller") else {
-            eprintln!(
-                "skipped: the kr-controller executable is not built beside this test; a workspace \
-                 test run builds it"
-            );
-            return None;
-        };
+    async fn start() -> Self {
+        let controller = beside_this_test("kr-controller").unwrap_or_else(|| {
+            panic!(
+                "the kr-controller executable is not built beside this test, so this check cannot \
+                 run; a workspace test run builds it, and so does `cargo build -p kr-controller`"
+            )
+        });
         let temp = kr_ipc::testing::TempHost::create();
         // The configuration document is what puts a host on the network: this one joins on
         // loopback alone, and selects no relay and no discovery.
@@ -129,7 +128,7 @@ impl Host {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        Some(host)
+        host
     }
 
     fn log(&self) -> String {
@@ -482,9 +481,7 @@ fn copy_into(source: &Path, directory: &Path) -> PathBuf {
 /// scans; the invitation it issued is then read and withdrawn by the same owner.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_first_owner_invitation_is_confirmed_at_the_terminal() {
-    let Some(host) = Host::start().await else {
-        return;
-    };
+    let host = Host::start().await;
     let mut terminal = host.on_terminal(&["pair", "invite", "--owner", "--direct"], &[]);
     terminal
         .output
@@ -533,9 +530,7 @@ async fn a_first_owner_invitation_is_confirmed_at_the_terminal() {
 /// and output on pipes, `kr` refuses before asking anything, and nothing is issued.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_first_owner_is_not_confirmed_without_a_terminal() {
-    let Some(host) = Host::start().await else {
-        return;
-    };
+    let host = Host::start().await;
     let output = host.kr(&["pair", "invite", "--owner", "--direct"]);
     assert_eq!(
         output.status.code(),
@@ -554,9 +549,7 @@ async fn the_first_owner_is_not_confirmed_without_a_terminal() {
 /// confirmed: with `KR_SESSION` or `KR_ATTACHMENT` set, `kr` refuses on a real terminal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_first_owner_is_not_confirmed_inside_a_session() {
-    let Some(host) = Host::start().await else {
-        return;
-    };
+    let host = Host::start().await;
     for variable in ["KR_SESSION", "KR_ATTACHMENT"] {
         let terminal = host.on_terminal(
             &["pair", "invite", "--owner", "--direct"],
@@ -576,9 +569,7 @@ async fn the_first_owner_is_not_confirmed_inside_a_session() {
 /// session descriptor that cannot be read), the first owner is not confirmed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_first_owner_is_not_confirmed_where_membership_is_unknown() {
-    let Some(host) = Host::start().await else {
-        return;
-    };
+    let host = Host::start().await;
     host.unreadable_descriptor();
     let terminal = host.on_terminal(&["pair", "invite", "--owner", "--direct"], &[]);
     let (succeeded, printed) = terminal.finish();
@@ -595,9 +586,7 @@ async fn the_first_owner_is_not_confirmed_where_membership_is_unknown() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_first_owner_is_not_confirmed_where_an_environment_cannot_be_read() {
     use std::os::unix::fs::DirBuilderExt as _;
-    let Some(host) = Host::start().await else {
-        return;
-    };
+    let host = Host::start().await;
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -624,9 +613,7 @@ async fn the_first_owner_is_not_confirmed_where_an_environment_cannot_be_read() 
 /// ask the person.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_first_owner_is_confirmed_outside_a_live_session() {
-    let Some(host) = Host::start().await else {
-        return;
-    };
+    let host = Host::start().await;
     let _session = host.session("exec cat");
     let mut terminal = host.on_terminal(&["pair", "invite", "--owner", "--direct"], &[]);
     terminal
@@ -643,9 +630,7 @@ async fn the_first_owner_is_confirmed_outside_a_live_session() {
 /// with `KR_SESSION` and `KR_ATTACHMENT` unset: the session's worker recognises it as its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_first_owner_is_not_confirmed_by_a_session_that_hides_its_variables() {
-    let Some(host) = Host::start().await else {
-        return;
-    };
+    let host = Host::start().await;
     // The session's shell waits for the session to be published, which is what makes it a
     // session `kr` can find, before it runs `kr` inside it.
     let published = host.temp.root().join("published");
@@ -673,9 +658,7 @@ async fn the_first_owner_is_not_confirmed_by_a_session_that_hides_its_variables(
 /// follows is such a case: the worker can say neither that it is inside nor that it is outside.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_first_owner_is_not_confirmed_where_a_worker_cannot_establish_membership() {
-    let Some(host) = Host::start().await else {
-        return;
-    };
+    let host = Host::start().await;
     let _session = host.session("exec cat");
     let terminal = host.nested_on_terminal(70, &["pair", "invite", "--owner", "--direct"]);
     let (succeeded, printed) = terminal.finish();
@@ -692,9 +675,7 @@ async fn the_first_owner_is_not_confirmed_where_a_worker_cannot_establish_member
 /// refused before anything is asked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_with_no_owner_pairs_its_owner_first() {
-    let Some(host) = Host::start().await else {
-        return;
-    };
+    let host = Host::start().await;
     let output = host.kr(&["pair", "invite", "--view", "--direct"]);
     assert_eq!(output.status.code(), Some(8));
     assert!(
