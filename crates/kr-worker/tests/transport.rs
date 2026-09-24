@@ -5012,12 +5012,14 @@ async fn kr_req_07_67_a_terminal_exit_ends_the_connection_and_an_attachment_clos
     }
 }
 
-/// KR-REQ-07.67: a terminal exiting stops the live backend this host dedicated to it, whether or
-/// not anything about the connection has happened.
+/// KR-REQ-07.67 and KR-REQ-07.61: a terminal exiting stops the live backend this host dedicated to
+/// it, whether or not anything about the connection has happened.
 ///
 /// The connection stays open and the backend this host launched stays live for the whole of this
 /// test. The terminal exits well after any window a teardown could have waited, and the backend is
-/// stopped, because what is watched is the process rather than the socket.
+/// stopped, because what is watched is the process rather than the socket. The backend is a child
+/// the broker started and recorded by the identity the kernel gave it, and it is that recorded
+/// child that is stopped.
 // Unix only: Windows has no managed gateway.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -7143,10 +7145,11 @@ async fn upstream_asks(owner: &Arc<Duplex>, id: u32) -> kr_protocol::ids::Pendin
     }
 }
 
-/// KR-REQ-11.35, KR-REQ-11.36 and KR-REQ-11.37: the receipt journal faults while native traffic
-/// and competing rich answers are live. Native traffic goes on in both directions, rich work is
-/// fenced at the next decision, no identifier that was carried across the fault is answered
-/// twice, and rich work comes back only once the gap is committed and the upstream is reconciled.
+/// KR-REQ-07.57, KR-REQ-11.35, KR-REQ-11.36 and KR-REQ-11.37: the receipt journal faults while
+/// native traffic and competing rich answers are live. Native traffic goes on in both directions,
+/// which is section 11's native forwarding exception to a journal fault, rich work is fenced at the
+/// next decision, no identifier that was carried across the fault is answered twice, and rich work
+/// comes back only once the gap is committed and the upstream is reconciled.
 ///
 /// Before the fault one request has a rich answer admitted and not yet sent, one is answerable, and
 /// one has been answered by the terminal. The fault is the receipt journal's own: the store refuses
