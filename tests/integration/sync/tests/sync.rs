@@ -663,6 +663,7 @@ async fn kr_req_20_13_a_draft_is_published_as_a_draft_and_never_as_an_execution_
         let drafts = DraftSync::new(
             Arc::clone(&run.service) as Arc<dyn SyncBackupService>,
             Arc::clone(&run.sealer) as Arc<dyn DraftSealer>,
+            SyncStore::open(run.directory.path().join("drafts-sync")).expect("a device's store"),
         );
         let here = DraftStore::open(run.directory.path().join("drafts-one"), device(1))
             .expect("a draft store");
