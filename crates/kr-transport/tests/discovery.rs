@@ -34,9 +34,16 @@ fn loopback() -> Option<SocketAddr> {
     Some("127.0.0.1:0".parse().expect("a loopback address"))
 }
 
+/// How long a connection may take to open a direct path.
+///
+/// An endpoint tries for a direct path as a connection starts and then again on its own schedule,
+/// at least once a minute, so on a loaded machine a path whose first attempts were lost opens at
+/// the next one.
+const DIRECT_PATH_PATIENCE: Duration = Duration::from_secs(90);
+
 /// Waits until `check` holds, or fails the test saying what did not happen.
-async fn eventually(what: &str, mut check: impl FnMut() -> bool) {
-    let deadline = Instant::now() + PATIENCE;
+async fn eventually(what: &str, patience: Duration, mut check: impl FnMut() -> bool) {
+    let deadline = Instant::now() + patience;
     while !check() {
         assert!(Instant::now() < deadline, "{what}");
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -197,9 +204,11 @@ async fn an_endpoint_reaches_exactly_the_relay_pkarr_and_dns_services_it_selecte
     // The publisher: the signed record is published to the selected publisher, and a reader of
     // that publisher finds it naming the relay. Nothing is published to the resolver.
     let id = host.endpoint.id();
-    eventually("the record is published to the selected publisher", || {
-        publisher.publications(&id) > 0
-    })
+    eventually(
+        "the record is published to the selected publisher",
+        PATIENCE,
+        || publisher.publications(&id) > 0,
+    )
     .await;
     let reader = side(
         &EndpointConfig {
@@ -353,11 +362,15 @@ async fn the_public_record_names_the_relay_and_never_a_direct_address() {
 
     // The connection then opens a direct path to one of the host's direct addresses, although the
     // device was given the host's identity alone and the record it resolved carries none of them.
-    eventually("the connection opens a direct path to the host", || {
-        connection.paths().iter().any(
+    eventually(
+        "the connection opens a direct path to the host",
+        DIRECT_PATH_PATIENCE,
+        || {
+            connection.paths().iter().any(
             |path| matches!(path.remote_addr(), TransportAddr::Ip(addr) if direct.contains(addr)),
         )
-    })
+        },
+    )
     .await;
 
     device.endpoint.close().await;
