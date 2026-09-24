@@ -1032,7 +1032,7 @@ fn a_name_that_resolves_through_another_mount_is_refused() {
 /// because a check that returned early would be counted as one that passed.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "needs a mount namespace this account may create (`unshare -r -m`), which the build box and core-ci's Linux runner deny by default; run it with --ignored on a Linux host that allows one"]
+#[ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; run it with `cargo test -- --ignored` on a Linux host that allows one"]
 fn a_mount_placed_while_reads_resolve_never_reaches_the_other_tree() {
     if std::env::var_os("KR_AUTHORITY_MOUNT_RACE").is_some() {
         mount_race();
@@ -2129,7 +2129,7 @@ fn an_exclusive_directory_admits_nobody_its_mode_does_not() {
 /// because a check that returned early would be counted as one that passed.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "needs a mount namespace this account may create (`unshare -r -m`), which the build box and core-ci's Linux runner deny by default; run it with --ignored on a Linux host that allows one"]
+#[ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; run it with `cargo test -- --ignored` on a Linux host that allows one"]
 fn a_removal_stops_before_a_directory_mounted_into_the_tree() {
     if std::env::var_os("KR_AUTHORITY_REMOVAL_MOUNT").is_some() {
         removal_mount();

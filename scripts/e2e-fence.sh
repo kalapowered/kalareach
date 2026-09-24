@@ -155,6 +155,8 @@ for entry in document.get("sessions", []):
     # shellcheck disable=SC2046,SC2086
     ps -o pid=,command= -p $(printf '%s' "$left" | tr '\n' ' ') || true
     failed=1
+    # A process still running may be reading the run's directories, so they are kept for it.
+    keep=1
   else
     echo "no process this run started is still running"
   fi
@@ -170,7 +172,7 @@ for entry in document.get("sessions", []):
     done <<<"$left"
     left="$(jobs_left)"
     if [ -n "$left" ]; then
-      echo "FAILED: these are still loaded after their removal; $run_root is kept"
+      echo "FAILED: these are still loaded after their removal"
       printf '%s\n' "$left" | sed 's/^/  /'
       keep=1
     fi
@@ -179,6 +181,8 @@ for entry in document.get("sessions", []):
   fi
   if [ "$keep" -eq 0 ]; then
     rm -rf "${run_root:?}"
+  else
+    echo "$run_root is kept"
   fi
   # A run whose processes outlived it did not pass, whatever the last command returned.
   if [ "$failed" -ne 0 ] && [ "$status" -eq 0 ]; then

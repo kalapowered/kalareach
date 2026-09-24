@@ -202,7 +202,7 @@ for entry in document.get("sessions", []):
     done <<<"$left"
     left="$(jobs_left)"
     if [ -n "$left" ]; then
-      echo "FAILED: these are still loaded after their removal; $run_root is kept"
+      echo "FAILED: these are still loaded after their removal"
       printf '%s\n' "$left" | sed 's/^/  /'
       keep=1
     fi
@@ -211,6 +211,8 @@ for entry in document.get("sessions", []):
   fi
   if [ "$keep" -eq 0 ]; then
     rm -rf "${run_root:?}"
+  else
+    echo "$run_root is kept"
   fi
   # A run that left something behind did not pass, whatever the last command returned.
   if [ "$failed" -ne 0 ] && [ "$status" -eq 0 ]; then

@@ -2533,7 +2533,7 @@ fn a_version_number_is_never_reused() {
 /// because a check that returned early would be counted as one that passed.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "needs a mount namespace this account may create (`unshare -r -m`), which the build box and core-ci's Linux runner deny by default; run it with --ignored on a Linux host that allows one"]
+#[ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; run it with `cargo test -- --ignored` on a Linux host that allows one"]
 fn a_file_mounted_inside_this_repository_s_own_data_is_not_captured_around() {
     const NOT_EXERCISED: i32 = 42;
 
@@ -2623,7 +2623,7 @@ fn a_file_mounted_inside_administrative_data() {
 /// because a check that returned early would be counted as one that passed.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "needs a mount namespace this account may create (`unshare -r -m`), which the build box and core-ci's Linux runner deny by default; run it with --ignored on a Linux host that allows one"]
+#[ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; run it with `cargo test -- --ignored` on a Linux host that allows one"]
 fn a_tree_reached_on_another_mount_is_not_taken_for_this_one() {
     const NOT_EXERCISED: i32 = 42;
 
@@ -2858,7 +2858,7 @@ fn a_directory_whose_name_only_looks_administrative_is_still_looked_through() {
 /// because a check that returned early would be counted as one that passed.
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "needs a mount namespace this account may create (`unshare -r -m`), which the build box and core-ci's Linux runner deny by default; run it with --ignored on a Linux host that allows one"]
+#[ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; run it with `cargo test -- --ignored` on a Linux host that allows one"]
 fn two_views_of_one_directory_are_both_looked_through() {
     const NOT_EXERCISED: i32 = 42;
 

@@ -3409,7 +3409,7 @@ fn with_grafts(test: &str, body: fn()) {
 #[test]
 #[cfg_attr(
     target_os = "linux",
-    ignore = "needs a mount namespace this account may create (`unshare -r -m`), which the build box and core-ci's Linux runner deny by default; run it with --ignored on a Linux host that allows one"
+    ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; run it with `cargo test -- --ignored` on a Linux host that allows one"
 )]
 fn bind_mount_and_cross_device_grafts_are_refused() {
     with_grafts("bind_mount_and_cross_device_grafts_are_refused", || {
@@ -3486,7 +3486,7 @@ fn bind_mount_and_cross_device_grafts_are_refused() {
 #[test]
 #[cfg_attr(
     target_os = "linux",
-    ignore = "needs a mount namespace this account may create (`unshare -r -m`), which the build box and core-ci's Linux runner deny by default; run it with --ignored on a Linux host that allows one"
+    ignore = "needs a mount namespace this account may create (`unshare -r -m`), which Ubuntu 24.04 and later deny an unprivileged account by default; run it with `cargo test -- --ignored` on a Linux host that allows one"
 )]
 fn recursive_removal_refuses_a_grafted_mount() {
     with_grafts("recursive_removal_refuses_a_grafted_mount", || {
