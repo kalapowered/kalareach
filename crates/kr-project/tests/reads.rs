@@ -68,11 +68,12 @@ mod linux {
 
     use super::{Fixture, bounded, support};
 
-    /// What one enclosed child did, in its own words.
+    /// What one enclosed child did, in its own words, and the environment it was given.
     struct Outcome {
         status: Option<i32>,
         stdout: String,
         stderr: String,
+        environment: Vec<(OsString, OsString)>,
     }
 
     /// One child to start inside the boundary.
@@ -151,6 +152,7 @@ mod linux {
             status: status.code(),
             stdout,
             stderr,
+            environment,
         }
     }
 
@@ -414,11 +416,23 @@ mod linux {
         );
 
         // The process's own environment, under the kernel's process tree. Git reads it as
-        // configuration and prints its first entry, the search path this host gives every Git
-        // child, with the key in lower case. The control is the owner's ruleset: a read grant on
-        // that tree is one the mount check refuses on a host with a filesystem mounted beneath it,
-        // which is most hosts.
+        // configuration and prints an entry of it, with the key in lower case. The control is the
+        // owner's ruleset: a read grant on that tree is one the mount check refuses on a host with
+        // a filesystem mounted beneath it, which is most hosts.
         let environ = Path::new("/proc/self/environ");
+        let entries = |outcome: &Outcome| -> Vec<String> {
+            outcome
+                .environment
+                .iter()
+                .map(|(key, value)| {
+                    format!(
+                        "{}={}",
+                        key.to_string_lossy().to_ascii_lowercase(),
+                        value.to_string_lossy()
+                    )
+                })
+                .collect()
+        };
         let confined = read_as_configuration(
             &fixture,
             &location,
@@ -426,12 +440,24 @@ mod linux {
             Vec::new(),
             bounded_reads(&fixture),
         );
-        assert_refused(&confined, "path=", "the process tree");
+        assert_refused(&confined, "the child's environment", "the process tree");
+        for entry in entries(&confined) {
+            assert!(
+                !confined.stdout.contains(&entry) && !confined.stderr.contains(&entry),
+                "nothing of the environment was read, and {entry} was"
+            );
+        }
         let owner =
             read_as_configuration(&fixture, &location, environ, Vec::new(), Reads::Everywhere);
+        let printed: Vec<&str> = owner.stdout.lines().collect();
         assert!(
-            owner.stdout.starts_with("path="),
-            "the owner's reads reach it, and Git read the environment as configuration: {} {}",
+            owner.status == Some(0)
+                && !printed.is_empty()
+                && printed
+                    .iter()
+                    .all(|line| entries(&owner).iter().any(|entry| entry == line)),
+            "the owner's reads reach it, and Git printed entries of the environment the child was \
+             given: {} {}",
             owner.stdout,
             owner.stderr
         );
@@ -623,6 +649,14 @@ mod linux {
             .expect("the owner's audit reads the include");
     }
 
+    /// A grant with a filesystem mounted beneath it is refused with the reason, on this host's own
+    /// mount table.
+    ///
+    /// The host's device tree always has filesystems mounted beneath it, so it stands in for a
+    /// granted directory with one. Its control is not here, because no test can take the host's
+    /// own mounts away: the comparison is tested with and without the one mount over the same
+    /// directories in `boundary::linux`, and the test after this one runs the same operation over
+    /// the same location with the mount and without it.
     #[test]
     fn a_granted_directory_with_a_filesystem_mounted_beneath_it_is_refused_with_the_reason() {
         let fixture = Fixture::create();
@@ -651,16 +685,6 @@ mod linux {
             said.contains("a filesystem is mounted at /dev/") && said.contains("beneath /dev,"),
             "the refusal names the mount point and the granted directory: {said}"
         );
-        // The control: the same invocation lent a directory that is itself a mount point and has
-        // nothing mounted beneath it.
-        let granted = profile
-            .run(
-                &GitRequest::read(&location, &arguments)
-                    .reading(&[Path::new("/dev/shm")])
-                    .admitted(bounded()),
-            )
-            .expect("a grant with nothing mounted beneath it is not refused");
-        assert!(granted.success, "and it runs: {}", granted.stderr);
     }
 
     /// Tells the run of this test inside a mount namespace where the location is.
@@ -697,6 +721,17 @@ mod linux {
         let work = tempfile::TempDir::new().expect("a directory on the internal disk");
         let location = support::ordinary_repository(work.path(), "location");
         std::fs::create_dir(location.join("mounted")).expect("a directory to mount over");
+        // The control: the same bounded status of the same location, here, where nothing is
+        // mounted beneath it. Inside the namespace the one difference is the mount.
+        let fixture = Fixture::create();
+        let profile = fixture.service().profile();
+        let repository = OpenedRepository::open(profile, fixture.environment_id(), &location)
+            .expect("the repository opens");
+        let status: [&OsStr; 2] = [OsStr::new("status"), OsStr::new("--porcelain")];
+        let unmounted = profile
+            .run(&repository.read(&status).admitted(bounded()))
+            .expect("a bounded status over a location with nothing mounted beneath it runs");
+        assert!(unmounted.success, "and succeeds: {}", unmounted.stderr);
         let output = std::process::Command::new(bwrap)
             .args(["--unshare-user", "--dev-bind", "/", "/", "--tmpfs"])
             .arg(location.join("mounted"))
@@ -749,8 +784,8 @@ mod linux {
                 && said.contains(&format!("beneath {},", location.display())),
             "the refusal names the mount point and the location: {said}"
         );
-        // The control: the owner's status of the same location, with the same mount beneath it.
-        // The check is made for a caller bounded by a grant, and the owner's reads are the owner's.
+        // The owner's own status of the same location is unchanged: the check is made for a caller
+        // bounded by a grant. This is not the control, which is the same bounded status outside.
         let owner = profile
             .run(&repository.read(&status))
             .expect("the owner's status starts");
