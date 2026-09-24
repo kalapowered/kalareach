@@ -611,7 +611,7 @@ impl Store {
     /// link or not a directory, the lock cannot be acquired, or staging cannot be cleared.
     pub fn lock(&self) -> CatalogueResult<StoreLock> {
         let layout = self.layout()?;
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         lock_pause::run();
         let lock = acquire(&layout.repository)?;
         // Staging is cleared through the handle opened before any wait for the lock: a link put in
@@ -1976,8 +1976,9 @@ pub(crate) mod index_pause {
 }
 
 /// What the unit tests run after an operation opened the store and before it waits for the lock,
-/// to reach a directory replaced while the operation waits.
-#[cfg(test)]
+/// to reach a directory replaced while the operation waits. Only the Unix tests replace one, with
+/// a symbolic link, so the hook exists only where they run.
+#[cfg(all(test, unix))]
 pub(crate) mod lock_pause {
     use std::cell::RefCell;
 
