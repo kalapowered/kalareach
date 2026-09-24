@@ -13,6 +13,10 @@ name = "kr-hook"
 path = "src/main.rs"
 
 [dependencies]
+# The registration and the credential beside it are read through one handle on their directory,
+# without following a link, so the files read are the files that directory holds.
+cap-fs-ext.workspace = true
+cap-std.workspace = true
 clap.workspace = true
 # The launch credential is read into the host's own zeroising buffer, so the copy this process
 # holds is wiped when it is dropped rather than left for whatever reuses the memory.

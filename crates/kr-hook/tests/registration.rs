@@ -322,6 +322,58 @@ fn kr_req_05_09_a_credential_outside_the_registration_s_directory_is_refused() {
     assert!(!kr_hook::registration::whole(&unnamed));
 }
 
+/// KR-REQ-05.09: a credential beside the registration that is a link is not the worker's file,
+/// wherever it points and however closed its target is: out of the registration's directory, or to
+/// another file in it. The forwarder reads it through the registration's directory without
+/// following it, presents nothing and reaches nothing.
+#[test]
+fn kr_req_05_09_a_credential_that_is_a_link_is_refused() {
+    for leaves_the_directory in [true, false] {
+        let launch = Launch::new();
+        let (endpoint, listener) = launch.listen("e.sock");
+        let target = if leaves_the_directory {
+            let elsewhere = launch.placed.host.root().join("target");
+            std::fs::create_dir_all(&elsewhere).expect("a directory");
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o700))
+                    .expect("made private");
+            }
+            elsewhere.join("credential")
+        } else {
+            launch.directory.join("credential.real")
+        };
+        kr_ipc::paths::create_new_owner_only_file(&target, CREDENTIAL.as_bytes())
+            .expect("a closed credential the link points at");
+        std::fs::remove_file(launch.credential()).expect("the launch's own credential is removed");
+        // A link inside the directory is relative, the kind a directory handle would follow.
+        let pointing_at = if leaves_the_directory {
+            target.clone()
+        } else {
+            PathBuf::from("credential.real")
+        };
+        std::os::unix::fs::symlink(&pointing_at, launch.credential()).expect("a link in its place");
+        launch.publish(&launch.whole(&endpoint));
+
+        let mut relay = launch.start();
+        let status = wait(&mut relay);
+        let what = if leaves_the_directory {
+            "a link out of the directory"
+        } else {
+            "a link inside the directory"
+        };
+        assert!(!status.success(), "{what}: the relay fails");
+        let mut said = String::new();
+        std::io::Read::read_to_string(relay.stderr.as_mut().expect("its diagnostics"), &mut said)
+            .expect("the diagnostics are read");
+        assert!(said.contains("could not be read"), "{what}: {said}");
+        assert!(
+            accepted(&listener, Duration::ZERO).is_none(),
+            "{what}: nothing is reached through a linked credential"
+        );
+    }
+}
+
 /// Waits for a relay that is expected to end on its own, within its deadline.
 fn wait(relay: &mut std::process::Child) -> std::process::ExitStatus {
     let started = Instant::now();

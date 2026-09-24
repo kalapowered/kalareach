@@ -288,7 +288,8 @@ impl Registration {
     /// users, or does not say what a registration says.
     pub fn read(paths: &Paths, within: Duration) -> Result<Self, RegistrationError> {
         let deadline = Instant::now() + within;
-        let text = wait_for_whole(&paths.registration, deadline, within)?;
+        let (directory, name) = open_directory(&paths.registration)?;
+        let text = wait_for_whole(&directory, &paths.registration, &name, deadline, within)?;
         let mut endpoint = None;
         let mut framing = FramingName::JsonLines;
         let mut credential_path = None;
@@ -310,10 +311,16 @@ impl Registration {
             detail: "names no credential file".to_owned(),
         })?;
         check_beside(&paths.registration, &credential_path)?;
-        let credential = wait_for(&credential_path, MAX_CREDENTIAL_BYTES, deadline, within)?;
-        let credential = SecretVec::new(credential);
-        check_owner_only(&credential_path)?;
-        let credential = trimmed(credential);
+        let credential_name = credential_path.file_name().unwrap_or_default();
+        let credential = wait_for(
+            &directory,
+            &credential_path,
+            credential_name,
+            MAX_CREDENTIAL_BYTES,
+            deadline,
+            within,
+        )?;
+        let credential = trimmed(SecretVec::new(credential));
         if credential.len() != CREDENTIAL_HEX_LENGTH
             || !credential.expose().iter().all(u8::is_ascii_hexdigit)
         {
@@ -381,9 +388,53 @@ impl Registration {
     }
 }
 
+/// Opens the directory a registration is in, once, so that it and the credential beside it are
+/// read through one handle: a directory swapped for another in between cannot change which files
+/// are read.
+///
+/// # Errors
+///
+/// Returns [`RegistrationError::Malformed`] for a registration path with no directory or name, and
+/// [`RegistrationError::Missing`] or [`RegistrationError::Unreadable`] when the directory cannot be
+/// opened.
+fn open_directory(
+    registration: &Path,
+) -> Result<(cap_std::fs::Dir, std::ffi::OsString), RegistrationError> {
+    let (Some(directory), Some(name)) = (registration.parent(), registration.file_name()) else {
+        return Err(RegistrationError::Malformed {
+            detail: format!(
+                "path {} names no file in a directory",
+                registration.display()
+            ),
+        });
+    };
+    let directory = if directory.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        directory
+    };
+    let opened = cap_std::fs::Dir::open_ambient_dir(directory, cap_std::ambient_authority())
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                RegistrationError::Missing {
+                    path: directory.to_path_buf(),
+                    waited: Duration::ZERO,
+                }
+            } else {
+                RegistrationError::Unreadable {
+                    path: directory.to_path_buf(),
+                    detail: error.to_string(),
+                }
+            }
+        })?;
+    Ok((opened, name.to_os_string()))
+}
+
 /// Reads the registration, waiting until the deadline for it to be a whole record.
 fn wait_for_whole(
+    directory: &cap_std::fs::Dir,
     path: &Path,
+    name: &std::ffi::OsStr,
     deadline: Instant,
     within: Duration,
 ) -> Result<String, RegistrationError> {
@@ -392,8 +443,8 @@ fn wait_for_whole(
         // Whether the deadline has passed is decided before the read, so the last read is taken
         // after it: a registration published whole by then is found.
         let expired = Instant::now() >= deadline;
-        match read_bounded(path, MAX_REGISTRATION_BYTES) {
-            Ok(content) => {
+        match read_bounded(directory, name, MAX_REGISTRATION_BYTES) {
+            Ok((content, _)) => {
                 if let Some(text) = String::from_utf8(content).ok().filter(|text| whole(text)) {
                     return Ok(text);
                 }
@@ -438,17 +489,26 @@ pub fn whole(text: &str) -> bool {
         })
 }
 
-/// Reads one file the worker writes, waiting for it until the deadline.
+/// Reads the credential file the worker writes, waiting for it until the deadline, and refuses one
+/// somebody other than this user can read.
+///
+/// The file is opened through the registration's directory, without following a link, and its
+/// owner and mode are read from the opened file: what is checked is what is read.
 fn wait_for(
+    directory: &cap_std::fs::Dir,
     path: &Path,
+    name: &std::ffi::OsStr,
     limit: u64,
     deadline: Instant,
     within: Duration,
 ) -> Result<Vec<u8>, RegistrationError> {
     loop {
         let expired = Instant::now() >= deadline;
-        match read_bounded(path, limit) {
-            Ok(content) => return Ok(content),
+        match read_bounded(directory, name, limit) {
+            Ok((content, metadata)) => {
+                check_owner_only(path, &metadata)?;
+                return Ok(content);
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if expired {
                     return Err(RegistrationError::Missing {
@@ -468,10 +528,25 @@ fn wait_for(
     }
 }
 
-/// Reads at most `limit` bytes of one file, and refuses a file longer than that.
-fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+/// Reads at most `limit` bytes of one file in `directory`, refusing a link and a file longer than
+/// that, and returns what the opened file's own metadata says.
+fn read_bounded(
+    directory: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+    limit: u64,
+) -> std::io::Result<(Vec<u8>, cap_std::fs::Metadata)> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
     use std::io::Read as _;
-    let file = std::fs::File::open(path)?;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let file = directory.open_with(name, &options)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "it is not a regular file",
+        ));
+    }
     let mut content = Vec::new();
     file.take(limit + 1).read_to_end(&mut content)?;
     if content.len() as u64 > limit {
@@ -480,7 +555,7 @@ fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
             format!("it is longer than {limit} bytes"),
         ));
     }
-    Ok(content)
+    Ok((content, metadata))
 }
 
 /// Refuses a credential file that is not in the registration's own directory.
@@ -506,18 +581,18 @@ fn check_beside(registration: &Path, credential: &Path) -> Result<(), Registrati
     }
 }
 
-/// Refuses a credential file somebody other than this user can read.
+/// Refuses a credential file somebody other than this user can read, from the opened file's own
+/// metadata.
 ///
 /// The worker writes the file owner-only into an owner-only directory. One that is open to another
 /// account is not a file this forwarder presents: the exchange it holds is already somebody else's
 /// too.
 #[cfg(unix)]
-fn check_owner_only(path: &Path) -> Result<(), RegistrationError> {
-    use std::os::unix::fs::MetadataExt as _;
-    let metadata = std::fs::metadata(path).map_err(|error| RegistrationError::Unreadable {
-        path: path.to_path_buf(),
-        detail: error.to_string(),
-    })?;
+fn check_owner_only(
+    path: &Path,
+    metadata: &cap_std::fs::Metadata,
+) -> Result<(), RegistrationError> {
+    use cap_std::fs::MetadataExt as _;
     if metadata.uid() != kr_ipc::paths::current_uid() || metadata.mode() & 0o077 != 0 {
         return Err(RegistrationError::Exposed {
             path: path.to_path_buf(),
@@ -529,7 +604,10 @@ fn check_owner_only(path: &Path) -> Result<(), RegistrationError> {
 /// Where the platform has no mode bits to read, the worker publishes no credential file, and one
 /// that is there was written by the host's own protected publication or not at all.
 #[cfg(not(unix))]
-fn check_owner_only(_path: &Path) -> Result<(), RegistrationError> {
+fn check_owner_only(
+    _path: &Path,
+    _metadata: &cap_std::fs::Metadata,
+) -> Result<(), RegistrationError> {
     Ok(())
 }
 
