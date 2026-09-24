@@ -2245,9 +2245,10 @@ async fn kr_req_11_37_nothing_that_needs_its_record_is_taken_while_the_fence_is_
     let fenced = |outcome: Result<(), BrokerError>, what: &str| {
         let error = outcome.expect_err(what);
         assert!(
-            matches!(error, BrokerError::RichWorkFenced { .. }),
-            "{what} is refused by the fence: {error}"
+            matches!(error, BrokerError::LedgerUnavailable { .. }),
+            "{what} is refused because nothing can be recorded: {error}"
         );
+        assert_eq!(error.code(), ErrorCode::StorageUnavailable);
     };
     fenced(bind(3), "binding a component");
     assert!(
@@ -2274,10 +2275,11 @@ async fn kr_req_11_37_nothing_that_needs_its_record_is_taken_while_the_fence_is_
         ),
         "an adapter checkpoint",
     );
-    let reconciled = broker.reconcile(owed_scope(), &[], TimestampMs::new(3));
-    assert!(
-        matches!(reconciled, Err(BrokerError::RichWorkFenced { .. })),
-        "an ordinary reconciliation is refused by the fence: {reconciled:?}"
+    fenced(
+        broker
+            .reconcile(owed_scope(), &[], TimestampMs::new(3))
+            .map(|_| ()),
+        "an ordinary reconciliation",
     );
     assert_eq!(
         broker.pending(held.resource_id).expect("still held").state,

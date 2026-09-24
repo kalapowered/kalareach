@@ -2277,7 +2277,7 @@ impl Broker {
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::RichWorkFenced`] while the fence is up, and
+    /// Returns [`BrokerError::LedgerUnavailable`] while the fence is up, and
     /// [`BrokerError::StoreFault`] when a settled record cannot be written.
     pub fn reconcile(
         &self,
@@ -3457,7 +3457,7 @@ impl BrokerState {
         write: impl FnOnce(&mut Ledger) -> Result<T>,
     ) -> Result<T> {
         if !self.volatile.writes_are_durable() {
-            return Err(BrokerError::RichWorkFenced {
+            return Err(BrokerError::LedgerUnavailable {
                 detail: format!(
                     "the journal is faulted, so {what} waits for the recovery that can write it \
                      down"
@@ -4075,7 +4075,7 @@ impl BrokerState {
         on_fault: OnStoreFault,
     ) -> Result<PendingResource> {
         if on_fault == OnStoreFault::Refuse && !self.volatile.writes_are_durable() {
-            return Err(BrokerError::RichWorkFenced {
+            return Err(BrokerError::LedgerUnavailable {
                 detail: format!(
                     "the journal is faulted, and a {} is never taken without its record",
                     cause.as_str().replace('_', " ")
