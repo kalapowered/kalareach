@@ -1257,6 +1257,13 @@ mod tests {
         (app, window)
     }
 
+    /// Where the bundle's pages are served from: under the application's own scheme, except on
+    /// Windows, where the web view serves it over `http` on a name of its own.
+    #[cfg(windows)]
+    const BUNDLE: &str = "http://tauri.localhost";
+    #[cfg(not(windows))]
+    const BUNDLE: &str = "tauri://localhost";
+
     /// Calls `command` the way the page does, through the invoke path, and returns what it was
     /// refused with: the refusal's code, or the invoke layer's own sentence when the refusal came
     /// from there, or nothing when the call succeeded.
@@ -1271,7 +1278,7 @@ mod tests {
                 cmd: command.into(),
                 callback: tauri::ipc::CallbackFn(0),
                 error: tauri::ipc::CallbackFn(1),
-                url: "tauri://localhost".parse().expect("the bundle's address"),
+                url: BUNDLE.parse().expect("the bundle's address"),
                 body: tauri::ipc::InvokeBody::Json(body),
                 headers: Default::default(),
                 invoke_key: tauri::test::INVOKE_KEY.to_owned(),
