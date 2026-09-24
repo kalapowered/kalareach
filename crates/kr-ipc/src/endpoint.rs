@@ -23,6 +23,9 @@ pub struct Listener {
     inner: platform::Listener,
     endpoint: Endpoint,
     owner_uid: u32,
+    /// The send buffer every accepted connection is given, for this repository's own tests.
+    #[cfg(all(unix, feature = "testing"))]
+    send_buffer: Option<usize>,
 }
 
 impl Listener {
@@ -38,7 +41,28 @@ impl Listener {
             inner,
             endpoint: endpoint.clone(),
             owner_uid: crate::paths::current_uid(),
+            #[cfg(all(unix, feature = "testing"))]
+            send_buffer: None,
         })
+    }
+
+    /// Binds the endpoint as [`Listener::bind`] does, and gives every connection it accepts a send
+    /// buffer of `bytes`, for this repository's own tests.
+    ///
+    /// A peer that has stopped reading holds what the sending side's buffer holds, and that differs
+    /// between platforms and their settings. A test that needs the accepting side's writer to stop
+    /// early, or part way through a frame, sets that buffer here instead of relying on a default.
+    /// The operating system may round the size up (Linux doubles it), and it stays of that order.
+    /// This is compiled away outside this repository's own tests.
+    ///
+    /// # Errors
+    ///
+    /// As [`Listener::bind`].
+    #[cfg(all(unix, feature = "testing"))]
+    pub fn bind_with_send_buffer(endpoint: &Endpoint, bytes: usize) -> Result<Self> {
+        let mut listener = Self::bind(endpoint)?;
+        listener.send_buffer = Some(bytes);
+        Ok(listener)
     }
 
     /// Returns the address this listener is bound to.
@@ -69,7 +93,16 @@ impl Listener {
                 Err(error) => return Err(error),
             };
             match peer.authorise(self.owner_uid) {
-                Ok(()) => return Ok((connection, peer)),
+                Ok(()) => {
+                    #[cfg(all(unix, feature = "testing"))]
+                    if let Some(bytes) = self.send_buffer {
+                        rustix::net::sockopt::set_socket_send_buffer_size(&connection.0, bytes)
+                            .map_err(|error| {
+                                IpcError::socket("set the send buffer", error.into())
+                            })?;
+                    }
+                    return Ok((connection, peer));
+                }
                 // Refusing one caller is not a reason to stop serving the owner.
                 Err(IpcError::PeerRejected { .. }) => drop(connection),
                 Err(error) => return Err(error),
