@@ -194,6 +194,9 @@ pub struct EndpointPool {
     transport: TransportIdentityKeyPair,
     bind: Option<SocketAddr>,
     endpoints: Mutex<Endpoints>,
+    /// How many endpoints the pool has begun to bind, which its tests read without the lock.
+    #[cfg(test)]
+    binds: std::sync::atomic::AtomicUsize,
 }
 
 /// The pool's record: the endpoints open, and the ones still closing.
@@ -205,6 +208,10 @@ pub struct EndpointPool {
 struct Endpoints {
     open: Vec<(Services, Endpoint)>,
     closing: Vec<(Services, watch::Receiver<bool>)>,
+    /// Holds every close the pool starts until a test opens it, so a test decides when a close
+    /// finishes rather than guessing how long one takes.
+    #[cfg(test)]
+    close_gate: Option<watch::Receiver<bool>>,
 }
 
 impl Endpoints {
@@ -216,7 +223,13 @@ impl Endpoints {
         self.open = kept;
         for (held, endpoint) in closing {
             let (closed, watching) = watch::channel(false);
+            #[cfg(test)]
+            let gate = self.close_gate.clone();
             tokio::spawn(async move {
+                #[cfg(test)]
+                if let Some(mut gate) = gate {
+                    let _ = gate.wait_for(|open| *open).await;
+                }
                 endpoint.close().await;
                 let _ = closed.send(true);
             });
@@ -260,6 +273,8 @@ impl EndpointPool {
             transport,
             bind: None,
             endpoints: Mutex::new(Endpoints::default()),
+            #[cfg(test)]
+            binds: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -289,6 +304,8 @@ impl EndpointPool {
         }
         endpoints.start_closing(|held| held.share_a_relay(&services));
         endpoints.closed(|held| held.share_a_relay(&services)).await;
+        #[cfg(test)]
+        self.binds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let endpoint = kr_transport::endpoint::bind_dialer(&config, &self.transport).await?;
         endpoints.open.push((services, endpoint.clone()));
         Ok(endpoint)
@@ -499,35 +516,25 @@ mod tests {
         .await
     }
 
-    /// Starts a connection from `endpoint` that never completes, because its peer is a socket that
-    /// reads nothing. Closing the endpoint then waits while the connection drains, which is how
-    /// long an endpoint that is closing keeps its relay.
-    async fn stalled_connection(
-        endpoint: &Endpoint,
-    ) -> (std::net::UdpSocket, tokio::task::JoinHandle<()>) {
-        let sink = std::net::UdpSocket::bind("127.0.0.1:0").expect("a loopback socket");
-        let hint = sink.local_addr().expect("an address").to_string();
-        let address = EndpointConfig::from_network_config(&network(&[], None, &[hint.as_str()]))
-            .expect("a configuration")
-            .peer_addr(
-                TransportIdentityKeyPair::generate()
-                    .expect("a key")
-                    .public(),
-            )
-            .expect("an address");
-        let dialling = endpoint.clone();
-        let connecting = tokio::spawn(async move {
-            let _ = dialling.connect(address, ALPN).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        (sink, connecting)
+    /// Holds every close `pool` starts until the returned gate is opened.
+    async fn hold_closes(pool: &EndpointPool) -> watch::Sender<bool> {
+        let (gate, held) = watch::channel(false);
+        pool.endpoints.lock().await.close_gate = Some(held);
+        gate
     }
 
+    fn binds(pool: &EndpointPool) -> usize {
+        pool.binds.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How long a test watches for something that must not happen while a close is held.
+    const WATCHING: std::time::Duration = std::time::Duration::from_millis(300);
+
     /// A caller that stops waiting while an endpoint on a shared relay is being closed leaves the
-    /// pool whole: every endpoint that did not share the relay is still recorded, a connection
-    /// live on one of them stays up, and the endpoint that did share the relay is closed all the
-    /// same. A request made at once afterwards for another configuration on that relay binds its
-    /// endpoint only once the old one has finished closing.
+    /// pool whole: every endpoint that did not share the relay is still recorded, and a connection
+    /// live on one of them stays up. The close it started stays recorded too, so a request made at
+    /// once afterwards for another configuration on that relay binds nothing until the old
+    /// endpoint has finished closing.
     #[tokio::test]
     async fn stopping_part_way_loses_no_endpoint_and_binds_nothing_on_a_relay_still_held() {
         let peer_key = TransportIdentityKeyPair::generate().expect("a key");
@@ -548,6 +555,7 @@ mod tests {
             EndpointPool::new(TransportIdentityKeyPair::generate().expect("a key"))
                 .bound_to("127.0.0.1:0".parse().expect("loopback")),
         );
+        let gate = hold_closes(&pool).await;
         let unrelated = network(&[], None, &[peer_address.as_str()]);
         let live = IrohLink::new(Arc::clone(&pool))
             .dial(&unrelated, peer_key.public())
@@ -567,18 +575,32 @@ mod tests {
         );
         let kept = pool.endpoint(&unrelated).await.expect("an endpoint");
         let closing = pool.endpoint(&relayed).await.expect("an endpoint");
-        let (_sink, _connecting) = stalled_connection(&closing).await;
+        assert_eq!(binds(&pool), 2);
 
         assert!(
             !stop_at_first_wait(pool.endpoint(&replacing)).await,
             "the replacement waits for the endpoint on the shared relay to close"
         );
-        assert!(!closing.is_closed(), "which is still closing");
-        pool.endpoint(&again).await.expect("an endpoint");
+        let asking = tokio::spawn({
+            let (pool, again) = (Arc::clone(&pool), again.clone());
+            async move { pool.endpoint(&again).await }
+        });
+        tokio::time::sleep(WATCHING).await;
+        assert_eq!(
+            binds(&pool),
+            2,
+            "nothing is bound on the relay while the endpoint on it is closing"
+        );
+        assert!(!asking.is_finished());
+        assert!(!closing.is_closed());
+
+        gate.send_replace(true);
+        asking.await.expect("the request ran").expect("an endpoint");
         assert!(
             closing.is_closed(),
-            "an endpoint on the relay is bound only once the one before it has finished closing"
+            "the endpoint on the relay finished closing before another was bound on it"
         );
+        assert_eq!(binds(&pool), 3, "and then exactly one was bound");
         assert!(
             pool.holds(&unrelated).await,
             "the unrelated endpoint is still recorded"
@@ -601,8 +623,11 @@ mod tests {
     /// endpoint has finished closing.
     #[tokio::test]
     async fn a_pool_close_stopped_part_way_binds_nothing_on_a_relay_still_held() {
-        let pool = EndpointPool::new(TransportIdentityKeyPair::generate().expect("a key"))
-            .bound_to("127.0.0.1:0".parse().expect("loopback"));
+        let pool = Arc::new(
+            EndpointPool::new(TransportIdentityKeyPair::generate().expect("a key"))
+                .bound_to("127.0.0.1:0".parse().expect("loopback")),
+        );
+        let gate = hold_closes(&pool).await;
         let relayed = network(&["https://relay.example.test"], None, &[]);
         let again = network(
             &["https://relay.example.test"],
@@ -610,13 +635,26 @@ mod tests {
             &[],
         );
         let first = pool.endpoint(&relayed).await.expect("an endpoint");
-        let (_sink, _connecting) = stalled_connection(&first).await;
         assert!(!stop_at_first_wait(pool.close()).await);
-        pool.endpoint(&again).await.expect("an endpoint");
+        let asking = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            async move { pool.endpoint(&again).await }
+        });
+        tokio::time::sleep(WATCHING).await;
+        assert_eq!(
+            binds(&pool),
+            1,
+            "nothing is bound while the old endpoint is closing"
+        );
+        assert!(!first.is_closed());
+
+        gate.send_replace(true);
+        asking.await.expect("the request ran").expect("an endpoint");
         assert!(
             first.is_closed(),
             "the relay is used again only once the old endpoint has finished closing"
         );
+        assert_eq!(binds(&pool), 2);
         pool.close().await;
     }
 
