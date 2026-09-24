@@ -2231,30 +2231,14 @@ impl ProjectService {
                         admitting,
                     },
                 ));
-                let Some(bound) = project.source.clone() else {
-                    return Err(ProjectError::PermissionDenied {
-                        detail: format!(
-                            "repository {} is bound to no source location, so no location \
-                             reaches it; the owner binds it to one first",
-                            project.project_repository_id
-                        )
-                        .into(),
-                    });
-                };
-                let wanted = LocationUse {
-                    purpose: LocationPurpose::Source,
-                    environment_id: self.environment_id,
-                    admitting,
-                };
-                let source = self.locations().admit(bound.location_id, &wanted)?;
-                reach.push((Arc::clone(&source), wanted));
-                let opened = self.open_through(
-                    &source,
-                    &RelativeName::parse(&bound.relative_path)?,
-                    admission_for(self.locations(), reach.clone()),
-                )?;
-                opened.require_identity(project.identity)?;
-                opened
+                self.open_through_source(&project, admitting, &mut reach)?
+            }
+            // A caller bounded by a grant reaches every name through a location, and a workspace
+            // of the repository's own tree is no exception: the repository is read through the
+            // source location it is bound to, with that caller's reads bounded, and through
+            // nothing else.
+            None if performed.grant().is_some() => {
+                self.open_through_source(&project, admitting, &mut reach)?
             }
             None => OpenedRepository::open_recorded(
                 &self.profile,
@@ -3010,6 +2994,46 @@ impl ProjectService {
                 .writable()
                 .and_then(|mut store| store.keep_workspace_staging(row.workspace_id, why)),
         };
+    }
+
+    /// Opens a registered repository through the source location it is bound to, for a caller
+    /// that location has to admit, and adds that use to what the request reaches.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::PermissionDenied`] for a repository bound to no source location or a
+    /// location that does not admit the caller, and the refusal the descent or the identity check
+    /// gives.
+    fn open_through_source(
+        &self,
+        project: &ProjectRow,
+        admitting: Admitting,
+        reach: &mut Vec<(Arc<HeldLocation>, LocationUse)>,
+    ) -> Result<OpenedRepository> {
+        let Some(bound) = project.source.clone() else {
+            return Err(ProjectError::PermissionDenied {
+                detail: format!(
+                    "repository {} is bound to no source location, so no location reaches it; \
+                     the owner binds it to one first",
+                    project.project_repository_id
+                )
+                .into(),
+            });
+        };
+        let wanted = LocationUse {
+            purpose: LocationPurpose::Source,
+            environment_id: self.environment_id,
+            admitting,
+        };
+        let source = self.locations().admit(bound.location_id, &wanted)?;
+        reach.push((Arc::clone(&source), wanted));
+        let opened = self.open_through(
+            &source,
+            &RelativeName::parse(&bound.relative_path)?,
+            admission_for(self.locations(), reach.clone()),
+        )?;
+        opened.require_identity(project.identity)?;
+        Ok(opened)
     }
 
     /// Returns how a removal reaches a workspace's tree.

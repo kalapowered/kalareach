@@ -306,6 +306,47 @@ fn an_independent_clone_has_its_own_object_store() {
     );
 }
 
+/// A caller bounded by a grant reaches every name through a location, and a workspace of the
+/// repository's own tree is no exception: the repository is read through the source location it is
+/// bound to, with that caller's reads bounded, or not at all. A repository adopted by its path is
+/// bound to none, so such a caller is refused before anything reads it.
+#[test]
+fn a_caller_bounded_by_a_grant_reaches_a_shared_workspace_only_through_a_source_location() {
+    let fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, "shared-for-a-grant");
+    let params = WorkspaceCreateParams {
+        project_repository_id: project,
+        label: "in place".to_owned(),
+        kind: WorkspaceKind::SharedExisting,
+        isolation: Nullable(None),
+        policy: include_everything(),
+        base_revision: Nullable(None),
+        base_change_set_id: Nullable(None),
+        destination: Nullable(None),
+        preview_only: false,
+    };
+    let grant = kr_protocol::ids::GrantId::new(Uuid::from_bytes([7; 16]));
+    let submitted = action("workspace.create", 91);
+    let refusal = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &params,
+            Performed::from(Some(&submitted)).bounded_by(grant),
+        )
+        .expect_err("a caller bounded by a grant does not read the owner's tree by its path");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
+    assert!(
+        refusal.to_string().contains("bound to no source location"),
+        "and it is told why: {refusal}"
+    );
+    // The control: the owner's same request makes the workspace.
+    fixture
+        .service()
+        .workspace_create(&actor(), &params, Some(&action("workspace.create", 92)))
+        .expect("the owner's shared workspace is the repository's own tree");
+}
+
 #[test]
 fn a_shared_workspace_is_the_users_own_tree_and_nothing_is_relocated() {
     let fixture = Fixture::create();
