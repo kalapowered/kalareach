@@ -17,16 +17,19 @@
  * system's text recognition reads there; the structure only says where to look and what state the
  * page is in. So no style, clip, cover, colour or animation can make a word count that is not drawn:
  * a word that is not drawn is not read. The picture is taken as the page draws itself, with nothing
- * paused, and only at rest: no animation that ends may be running just before it or just after it.
+ * paused, and only while the page stands still: two pictures are taken under a watch that refuses
+ * them if any animation or transition ran, began or ended at any moment between, or if they differ.
  * Its words are compared with the claim's whole and in order, so a longer word, a digit joined to a
  * letter or a moved decimal point is a different claim, and a claim of nothing is never met. What
  * must be absent is counted in the structure with hidden elements included, so a hidden copy fails
  * the claim instead of passing it. Before any claim, each check is given pages made to fail it and
  * one made to pass it, and must refuse the first and accept the second.
  *
- * Usage: `assert-voice-surface.ts <harness address> <text reader> <image directory>`. The text
- * reader prints the text it recognises in the image it is given; the one image being read is kept
- * in the directory, so the last one stays for whoever reads a failure.
+ * Usage: `assert-voice-surface.ts <harness address> <text reader> <image directory>` asserts the
+ * surface. The text reader prints the text it recognises in the image it is given; the one image
+ * being read is kept in the directory, so the last one stays for whoever reads a failure.
+ * `assert-voice-surface.ts --desktop-shots <harness address> <screenshot directory>` takes the
+ * desktop window's screenshots, by the same rule, for the device script to read and claim.
  *
  * KR-REQ-15.09: managed content access disclosed in the provider choice.
  * KR-REQ-15.19: the provider and context scope shown before voice starts.
@@ -89,8 +92,11 @@ function unproved(row: string, clause: string, why: string): void {
   console.log(`unproved ${row} | ${clause} | ${why}`)
 }
 
+/** A check refused what it was shown. The only failure a page made to fail a check may cause. */
+class Refusal extends Error {}
+
 function expect(condition: boolean, message: string): void {
-  if (!condition) throw new Error(message)
+  if (!condition) throw new Refusal(message)
 }
 
 /** Words quoted as they were checked. */
@@ -142,6 +148,102 @@ function atRest(): boolean {
     .every((animation) => animation.playState !== 'running' || animation.effect?.getComputedTiming().endTime === Infinity)
 }
 
+/** What the page keeps while it is watched. */
+interface RestWatch {
+  moved: boolean
+  readonly before: Set<Animation>
+  readonly stop: () => void
+}
+
+/**
+ * Starts watching the page: from now on any CSS animation or transition that runs, starts,
+ * repeats, ends or is cancelled marks the page as moved, and the animations there now are kept to
+ * compare with later. Answers whether the page is at rest as the watch begins. Runs in the page.
+ */
+function startWatch(): boolean {
+  const types = [
+    'animationstart',
+    'animationiteration',
+    'animationend',
+    'animationcancel',
+    'transitionrun',
+    'transitionstart',
+    'transitionend',
+    'transitioncancel'
+  ]
+  const watch: RestWatch = {
+    moved: false,
+    before: new Set(document.getAnimations()),
+    stop: () => {
+      for (const type of types) window.removeEventListener(type, mark, true)
+    }
+  }
+  function mark(): void {
+    watch.moved = true
+  }
+  for (const type of types) window.addEventListener(type, mark, true)
+  const holder = window as unknown as { krRestWatch?: RestWatch }
+  holder.krRestWatch = watch
+  return document
+    .getAnimations()
+    .every((animation) => animation.playState !== 'running' || animation.effect?.getComputedTiming().endTime === Infinity)
+}
+
+/**
+ * Ends the watch, and answers whether the page stood still for the whole of it: nothing moved, no
+ * animation is there that was not there when it began, and none that ends is running. Runs in the
+ * page.
+ */
+function stopWatch(): boolean {
+  const holder = window as unknown as { krRestWatch?: RestWatch }
+  const watch = holder.krRestWatch
+  delete holder.krRestWatch
+  if (!watch) return false
+  watch.stop()
+  const now = document.getAnimations()
+  return (
+    !watch.moved &&
+    now.every((animation) => watch.before.has(animation)) &&
+    now.every((animation) => animation.playState !== 'running' || animation.effect?.getComputedTiming().endTime === Infinity)
+  )
+}
+
+/** Whether two pictures are the same, byte for byte. */
+function sameBytes(one: Uint8Array, other: Uint8Array): boolean {
+  return one.length === other.length && one.every((byte, index) => byte === other[index])
+}
+
+/**
+ * Takes two pictures of the same place while watching the page, and answers whether they count:
+ * the page was at rest when the watch began, stood still until it ended, and the two pictures are
+ * the same to the byte. Whatever moved at any moment between them, the pictures are not used.
+ *
+ * Motion a page script drives frame by frame, as the companion's sheet springs are, is no animation
+ * the watch can see; it is caught when it changes the pictures, and motion between them does. A
+ * change a script makes and undoes around both pictures, without moving in between, is beyond what
+ * pictures can establish.
+ */
+async function stillPictures(
+  page: Page,
+  take: () => Promise<Uint8Array>,
+  keep: () => Promise<Uint8Array>
+): Promise<boolean> {
+  if (!(await page.evaluate(startWatch))) {
+    await page.evaluate(stopWatch)
+    return false
+  }
+  let first: Uint8Array
+  let second: Uint8Array
+  try {
+    first = await take()
+    second = await keep()
+  } catch (error) {
+    await page.evaluate(stopWatch).catch(() => undefined)
+    throw error
+  }
+  return (await page.evaluate(stopWatch)) && sameBytes(first, second)
+}
+
 /** The text the system's text recognition reads in one image. */
 function readImage(image: string): string {
   try {
@@ -154,11 +256,12 @@ function readImage(image: string): string {
 }
 
 /**
- * What a person can read in the one element `locator` names, once the page is at rest: the element
- * is brought into view, every animation that ends has ended, and the place is captured as the screen
- * draws it, with nothing paused and the caret left as it is, then read by text recognition. A
- * picture is not used when an animation that ends is running after it was taken. Null while there
- * is no such picture: the claim then waits, and fails when it never comes.
+ * What a person can read in the one element `locator` names, taken while the page stands still: the
+ * element is brought into view, every animation that ends has ended, and two pictures of the place
+ * are taken as the screen draws it, with nothing paused and the caret left as it is, under a watch
+ * that refuses them if anything moved in between (see `stillPictures`). The second is read by text
+ * recognition. Null while there is no such picture: the claim then waits, and fails when it never
+ * comes.
  */
 async function readOnScreen(locator: Locator): Promise<string | null> {
   const page = locator.page()
@@ -166,8 +269,12 @@ async function readOnScreen(locator: Locator): Promise<string | null> {
   try {
     await locator.scrollIntoViewIfNeeded({ timeout: 1_000 })
     await page.waitForFunction(atRest, undefined, { timeout: 2_000 })
-    await locator.screenshot({ path: image, caret: 'initial', timeout: 1_000 })
-    if (!(await page.evaluate(atRest))) return null
+    const still = await stillPictures(
+      page,
+      () => locator.screenshot({ caret: 'initial', timeout: 1_000 }),
+      () => locator.screenshot({ path: image, caret: 'initial', timeout: 1_000 })
+    )
+    if (!still) return null
   } catch {
     return null
   }
@@ -191,13 +298,13 @@ async function readUntil(
     }
     await locator.page().waitForTimeout(100)
   } while (Date.now() < deadline)
-  throw new Error(`${what} never read ${wanted} on screen; it read ${last}`)
+  throw new Refusal(`${what} never read ${wanted} on screen; it read ${last}`)
 }
 
 /** The place reads each of the phrases, every word whole and in order. Nothing asked is never read. */
 function readsAll(locator: Locator, what: string, phrases: readonly string[]): Promise<void> {
   const wanted = phrases.map(wordsOf)
-  if (wanted.length === 0) return Promise.reject(new Error(`nothing was asked of ${what}`))
+  if (wanted.length === 0) return Promise.reject(new Refusal(`nothing was asked of ${what}`))
   return readUntil(locator, what, quoted(phrases), (read) => wanted.every((run) => includesRun(read, run)))
 }
 
@@ -220,7 +327,7 @@ async function readSomewhere(page: Page, text: string): Promise<void> {
     }
     await page.waitForTimeout(100)
   } while (Date.now() < deadline)
-  throw new Error(`no element on screen read "${text}"; the last one read ${last}`)
+  throw new Refusal(`no element on screen read "${text}"; the last one read ${last}`)
 }
 
 /** Whether one box lies wholly inside another, to the half pixel. */
@@ -369,7 +476,10 @@ function describedBy(page: Page, name: string, words: readonly string[]): Step {
       )
       expect(texts.every((text) => text !== null), `an id the "${name}" button names is on no element: ${ids.join(' ')}`)
       const described = texts.join(' ')
-      for (const word of words) expect(described.includes(word), `the description does not show "${word}": ${described}`)
+      const read = wordsOf(described)
+      for (const word of words) {
+        expect(includesRun(read, wordsOf(word)), `the description does not read "${word}": ${described}`)
+      }
     }
   }
 }
@@ -667,7 +777,9 @@ async function refuses(page: Page, html: string, step: Step): Promise<void> {
   try {
     await step.run()
   } catch (error) {
-    if (error instanceof ReaderFailure) throw error
+    // Only the check's own refusal counts. A text reader that failed, or anything else that went
+    // wrong, says nothing about the page, and ends the run.
+    if (!(error instanceof Refusal)) throw error
     passed = false
     console.log(`[assert-voice-surface] "${step.says}" refused ${html}: ${error instanceof Error ? error.message : String(error)}`)
   }
@@ -703,7 +815,12 @@ const HIDDEN_END: readonly string[] = [
   '<style>@keyframes kr-hidden { from, to { opacity: 0 } } .kr-hidden { animation: kr-hidden 1s infinite }</style>' +
     '<p>The visible start <span class="kr-hidden">and the hidden end</span></p>',
   '<style>@keyframes kr-late { to { opacity: 0 } } .kr-late { animation: kr-late 4s steps(1, end) forwards }</style>' +
-    '<p>The visible start <span class="kr-late">and the hidden end</span></p>'
+    '<p>The visible start <span class="kr-late">and the hidden end</span></p>',
+  '<style>.kr-flash { opacity: 0 } .kr-flash.kr-on { animation: kr-flash 100ms linear } ' +
+    '@keyframes kr-flash { from, to { opacity: 1 } }</style>' +
+    '<p>The visible start <span class="kr-flash">and the hidden end</span></p>' +
+    '<script>const end = document.querySelector(".kr-flash"); setInterval(() => { end.classList.remove("kr-on"); ' +
+    'void end.offsetWidth; end.classList.add("kr-on") }, 150)</script>'
 ]
 
 const CONTROLS = '<div role="group" aria-label="Call controls"><button>Stop the voice</button></div>'
@@ -813,7 +930,102 @@ async function checkTheChecks(): Promise<void> {
   console.log('[assert-voice-surface] every check refused each page made to fail it and passed the page made to pass it')
 }
 
+/**
+ * The desktop window's screenshots, for the device script to read and claim. Each is taken once the
+ * page carries its words and none of the words it must lack, hidden elements included, and only
+ * while the page stands still, by the same rule as every picture here. Prints one line per
+ * screenshot, tab-separated: `shot`, its row, its file, how it was reached, the words it must show
+ * and the words it must lack, each list joined by `|`.
+ */
+async function shootDesktop(base: string, directory: string): Promise<void> {
+  const browser = await chromium.launch({ headless: true })
+  try {
+    const page = await browser.newPage({ viewport: { width: 1280, height: 800 } })
+    const target: Target = { surface: 'desktop', engine: chromium, engineName: 'Chromium' }
+    const shoot = async (
+      row: string,
+      name: string,
+      how: string,
+      words: readonly string[],
+      without: readonly string[] = []
+    ): Promise<void> => {
+      for (const word of words) await page.getByText(word, { exact: false }).first().waitFor({ timeout: 5_000 })
+      for (const word of without) {
+        expect((await page.getByText(word, { exact: false }).count()) === 0, `${name} carried "${word}"`)
+      }
+      const path = `${directory}/${name}`
+      let kept = false
+      for (let attempt = 0; attempt < 5 && !kept; attempt += 1) {
+        await page.waitForFunction(atRest, undefined, { timeout: 5_000 })
+        kept = await stillPictures(
+          page,
+          () => page.screenshot({ fullPage: true, caret: 'initial' }),
+          () => page.screenshot({ path, fullPage: true, caret: 'initial' })
+        )
+      }
+      expect(kept, `${name} was never taken while the page stood still`)
+      console.log(['shot', row, name, how, words.join('|'), without.join('|')].join('\t'))
+    }
+    const startCall = async (): Promise<void> => {
+      await pressing(page, 'Start voice session').run()
+      await page.getByRole('heading', { name: 'Voice session', exact: true }).waitFor({ timeout: 5_000 })
+    }
+
+    await opening(page, base, target).run()
+    await shoot('KR-REQ-15.09, KR-REQ-15.19', 'kr-voice-desktop-15.09-disclosure.png', 'of the provider choice', [
+      'Voice model',
+      'gpt-live-1',
+      'What this gives access to',
+      'Audio travels directly',
+      'Sessions this call can reach',
+      'Session 1',
+      'What will be sent',
+      '8,000 tokens',
+      'Not sent',
+      'What it costs',
+      'a second',
+      'Start voice session'
+    ])
+    await opening(page, base, target, '&voice_terms=unread').run()
+    await shoot(
+      'KR-REQ-15.19',
+      'kr-voice-desktop-15.19-no-terms.png',
+      'of the provider choice without the service terms',
+      ['could not read the managed', 'What will be sent'],
+      ['Start voice session']
+    )
+    await opening(page, base, target, '&voice_capture=unavailable').run()
+    await startCall()
+    await shoot('KR-REQ-15.36', 'kr-voice-desktop-15.36-capture-unavailable.png', 'after the start control was pressed', [
+      'No microphone available',
+      'Nothing spoken while the microphone was not carrying'
+    ])
+    await hostDoes(page, 'setVoiceCapture', 'muted_by_person').run()
+    await shoot('KR-REQ-15.36', 'kr-voice-desktop-15.36-muted.png', 'after the call reported the microphone muted', [
+      'Microphone muted',
+      'Nothing spoken while the microphone was not carrying'
+    ])
+    await opening(page, base, target).run()
+    await startCall()
+    await shoot('KR-REQ-15.22', 'kr-voice-desktop-15.22-call-screen.png', 'of a running call', [
+      'Stop the voice',
+      'Cancel what the agent is doing',
+      'End session'
+    ])
+  } finally {
+    await browser.close()
+  }
+}
+
 async function main(): Promise<void> {
+  if (addressArgument === '--desktop-shots') {
+    const [, , , address, directory] = process.argv
+    if (!address || !directory) {
+      throw new Error('usage: assert-voice-surface.ts --desktop-shots <harness address> <screenshot directory>')
+    }
+    await shootDesktop(address.replace(/\/$/, ''), directory)
+    return
+  }
   if (!readerArgument || !imagesArgument) {
     throw new Error(
       'usage: assert-voice-surface.ts <harness address> <text reader> <image directory>; ' +

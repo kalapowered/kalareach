@@ -12,12 +12,13 @@
 #
 # What a person can see is read from the screen: every claim that something is on screen, in the
 # browser engines, the desktop window and the phones alike, is held to what the system's text
-# recognition reads in an image of it, taken as the page draws itself and at rest, every word whole
-# and in order. A page's structure only says where to look. What must be absent is counted in the
-# structure with hidden elements included, and in a picture or a page's accessible text wherever its
-# letters appear in a row, so a near copy fails the claim. The picture checks are first held to
-# pictures made to fail them. Without text recognition that passes them (macOS's Vision framework,
-# compiled here with swiftc) nothing a person sees can be checked, and the run says so.
+# recognition reads in an image of it, taken as the page draws itself while it stands still, every
+# word whole and in order. A page's structure only says where to look. What must be absent is
+# counted in the structure with hidden elements included, and in a picture or a page's accessible
+# text wherever its letters appear in a row, so a near copy fails the claim. The picture checks are
+# first held to pictures made to fail them. Without text recognition that passes them (macOS's
+# Vision framework, compiled here with swiftc) nothing a person sees can be checked, and the run
+# says so.
 #
 # The page is the harness: the real screen against the scripted host. Its starting state comes from
 # the address (voice_terms, voice_capture, voice_broker), later changes from the host's controls,
@@ -298,11 +299,18 @@ check_the_readers() {
 }
 
 # Runs one picture check, writes what it did beside what it had to do, and answers whether they
-# agree.
+# agree. A reader or conversion that failed is neither a pass nor a refusal, so it agrees with
+# nothing.
 reader_verdict() {
-    local want=$1 what=$2 got
+    local want=$1 what=$2 got rc
     shift 2
-    if "$@"; then got=passed; else got=refused; fi
+    "$@"
+    rc=$?
+    case "$rc" in
+        0) got=passed ;;
+        1) got=refused ;;
+        *) got="a failed reading (exit $rc)" ;;
+    esac
     printf '%s: %s; it must be %s\n' "$what" "$got" "$want" >>"$artefacts/reader-check.log"
     [ "$got" = "$want" ]
 }
@@ -321,20 +329,23 @@ print(" " + " ".join(re.findall(r"[$€£]?(?:[^\W_]|(?<=\d)[.,](?=\d))+", text)
 ' "$1"
 }
 
-# True when each of the phrases after the image path is read in it, every word whole and in order.
-# Nothing asked, a phrase with no words, or a reader or conversion that failed is never a pass.
-# Every variable here is local: a caller's own word lists must come back exactly as they went in.
+# Whether each of the phrases after the image path is read in it, every word whole and in order:
+# 0 when it is, 1 when it is not, and 2 when the reader or a conversion failed, which says nothing
+# about the image and is never taken for either answer. Nothing asked, or a phrase with no words, is
+# never read. Every variable here is local: a caller's own word lists must come back exactly as
+# they went in.
 image_shows() {
     local image=$1 text words phrase wanted
     shift
     [ "$#" -gt 0 ] || return 1
-    text="$("$ocr" "$image" 2>/dev/null)" || return 1
-    words="$(words_of "$text")" || return 1
+    text="$("$ocr" "$image" 2>/dev/null)" || return 2
+    words="$(words_of "$text")" || return 2
     for phrase in "$@"; do
-        wanted="$(words_of "$phrase")" || return 1
+        wanted="$(words_of "$phrase")" || return 2
         [ -n "${wanted// /}" ] || return 1
         [[ "$words" == *"$wanted"* ]] || return 1
     done
+    return 0
 }
 
 # The letters and digits of a text alone, in lower case, with nothing between them.
@@ -342,16 +353,18 @@ letters_of() {
     printf '%s' "$1" | LC_ALL=C tr -cd '[:alnum:]' | LC_ALL=C tr '[:upper:]' '[:lower:]'
 }
 
-# True when none of the phrases after the image path is read in it. Absence errs the other way from
-# presence: a phrase counts as there wherever its letters appear in a row, even inside a longer
-# word, so a near copy of what must be absent fails the claim instead of passing it.
+# Whether none of the phrases after the image path is read in it: 0 when none is, 1 when one is, and
+# 2 when the reader or a conversion failed. Absence errs the other way from presence: a phrase
+# counts as there wherever its letters appear in a row, even inside a longer word, so a near copy of
+# what must be absent fails the claim instead of passing it.
 image_lacks() {
-    local image=$1 text letters phrase
+    local image=$1 text letters phrase wanted
     shift
-    text="$("$ocr" "$image" 2>/dev/null)" || return 1
-    letters="$(letters_of "$text")" || return 1
+    text="$("$ocr" "$image" 2>/dev/null)" || return 2
+    letters="$(letters_of "$text")" || return 2
     for phrase in "$@"; do
-        [[ "$letters" == *"$(letters_of "$phrase")"* ]] && return 1
+        wanted="$(letters_of "$phrase")" || return 2
+        [[ "$letters" == *"$wanted"* ]] && return 1
     done
     return 0
 }
@@ -904,61 +917,16 @@ run_desktop() {
         fail "no text recognition that passed its own checks, so no desktop screenshot can be checked"
         return 0
     }
-    # Each screenshot is taken once the page carries every one of its words and none of the words
-    # after `--without`, hidden elements included, and is then read with the same text recognition
-    # as the phones' screenshots: its PROVED line is made only of the words read in the image, and
-    # of the words neither the page nor the image carried. The screenshots are of the whole page.
+    # The surface assertions take the screenshots, each once the page carries every one of its words
+    # and none of the words after `--without`, hidden elements included, and only while the page
+    # stands still, by the one rule every picture follows. Each is then read here with the same text
+    # recognition as the phones' screenshots: its PROVED line is made only of the words read in the
+    # image, and of the words neither the page nor the image carried. The screenshots are of the
+    # whole page.
     local where='desktop window, headless Chromium, 1280x800'
-    ( cd "$companion" && node --input-type=module -e "
-      import { chromium } from '@playwright/test';
-      const browser = await chromium.launch({ headless: true });
-      const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
-      const open = async (query) => {
-        await page.goto('http://localhost:$port/harness.html?surface=desktop&tab=voice' + query);
-        await page.waitForSelector('.kr-voice');
-      };
-      // The page is photographed as it draws itself, with nothing paused and the caret left as it
-      // is, and only at rest: no animation that ends may be running just before the picture or just
-      // after it. One that never ends is part of how the page looks, and is shown as it is.
-      const atRest = () => document.getAnimations().every((animation) =>
-        animation.playState !== 'running' || animation.effect?.getComputedTiming().endTime === Infinity);
-      const shoot = async (row, name, how, words, without = []) => {
-        for (const word of words) await page.getByText(word, { exact: false }).first().waitFor({ timeout: 5000 });
-        for (const word of without) {
-          if ((await page.getByText(word, { exact: false }).count()) !== 0) throw new Error(name + ' carried ' + word);
-        }
-        for (let attempt = 1; ; attempt += 1) {
-          await page.waitForFunction(atRest, undefined, { timeout: 5000 });
-          await page.screenshot({ path: '$shots/' + name, fullPage: true, caret: 'initial' });
-          if (await page.evaluate(atRest)) break;
-          if (attempt === 5) throw new Error(name + ' was never taken at rest');
-        }
-        console.log(['shot', row, name, how, words.join('|'), without.join('|')].join('\t'));
-      };
-      const start = async () => {
-        await page.getByRole('button', { name: 'Start voice session' }).click();
-        await page.getByRole('heading', { name: 'Voice session', exact: true }).waitFor({ timeout: 5000 });
-      };
-      await open('');
-      await shoot('KR-REQ-15.09, KR-REQ-15.19', 'kr-voice-desktop-15.09-disclosure.png', 'of the provider choice',
-        ['Voice model', 'gpt-live-1', 'What this gives access to', 'Audio travels directly', 'Sessions this call can reach',
-         'Session 1', 'What will be sent', '8,000 tokens', 'Not sent', 'What it costs', 'a second', 'Start voice session']);
-      await open('&voice_terms=unread');
-      await shoot('KR-REQ-15.19', 'kr-voice-desktop-15.19-no-terms.png', 'of the provider choice without the service terms',
-        ['could not read the managed', 'What will be sent'], ['Start voice session']);
-      await open('&voice_capture=unavailable');
-      await start();
-      await shoot('KR-REQ-15.36', 'kr-voice-desktop-15.36-capture-unavailable.png', 'after the start control was pressed',
-        ['No microphone available', 'Nothing spoken while the microphone was not carrying']);
-      await page.evaluate(() => window.krTestHost.setVoiceCapture('muted_by_person'));
-      await shoot('KR-REQ-15.36', 'kr-voice-desktop-15.36-muted.png', 'after the call reported the microphone muted',
-        ['Microphone muted', 'Nothing spoken while the microphone was not carrying']);
-      await open('');
-      await start();
-      await shoot('KR-REQ-15.22', 'kr-voice-desktop-15.22-call-screen.png', 'of a running call',
-        ['Stop the voice', 'Cancel what the agent is doing', 'End session']);
-      await browser.close();
-    " ) >"$artefacts/desktop.log" 2>&1 || { fail "desktop screenshots; see $artefacts/desktop.log"; return 0; }
+    node --experimental-strip-types "$companion/test/voice/assert-voice-surface.ts" --desktop-shots \
+        "http://localhost:$port" "$shots" >"$artefacts/desktop.log" 2>&1 ||
+        { fail "desktop screenshots; see $artefacts/desktop.log"; return 0; }
     local kind row name how seen unseen wanted unwanted words
     while IFS=$'\t' read -r kind row name how seen unseen; do
         [ "$kind" = shot ] || continue
