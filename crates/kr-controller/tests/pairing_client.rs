@@ -9,13 +9,13 @@
 #![cfg(unix)]
 
 mod net_support;
+#[path = "../../kr-client/tests/support/room_tls.rs"]
+mod room_tls;
 
-use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
 use iroh::endpoint::Connection;
 use kr_client::ClientError;
 use kr_client::pairing::BoxFuture;
@@ -29,7 +29,7 @@ use kr_client::pairing::owner::{
     ReviewOutcome, SessionChannel, Subject,
 };
 use kr_client::pairing::paired::{PairedHost, PairedHosts};
-use kr_client::pairing::room::{RoomConnector, RoomError, RoomSocket};
+use kr_client::pairing::room::{RoomError, RoomSocket};
 use kr_client::session::Session;
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::MemoryStore;
@@ -58,21 +58,13 @@ use kr_protocol::pairing::{
 use kr_protocol::preauth::{
     PairFinishResult, PairRedeemParams, PairRedeemResult, PairStatusParams, PairStatusResult,
 };
-use kr_protocol::rendezvous::{
-    ClientFrame, ServiceFrame, decode_client_frame, decode_message, encode_frame, encode_message,
-};
+use kr_protocol::rendezvous::{ClientFrame, ServiceFrame, decode_message, encode_message};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Digest256, EndpointKey, Nullable, SecretBytes32};
 use kr_transport::handshake::LocalIdentity;
 use net_support::pairing::{self as calls, Signer};
 use net_support::{Host, proposal};
-use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose};
-use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
-use tokio_rustls::TlsAcceptor;
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
-use tokio_websockets::{Message, ServerBuilder};
 
 /// How long a test waits for a pairing step before it fails as stuck.
 const WATCHDOG: Duration = Duration::from_secs(60);
@@ -1320,135 +1312,30 @@ async fn a_resumed_attempt_says_how_many_tries_are_left() {
     );
 }
 
-/// A certificate authority a test trusts, which issues a room's certificate.
-struct Authority {
-    der: CertificateDer<'static>,
-    issuer: Issuer<'static, KeyPair>,
-}
-
-impl Authority {
-    fn new(name: &str) -> Self {
-        let mut params = CertificateParams::new(Vec::new()).expect("certificate parameters");
-        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-        params
-            .distinguished_name
-            .push(DnType::CommonName, name.to_owned());
-        let key = KeyPair::generate().expect("a key pair");
-        let certificate = params.self_signed(&key).expect("a certificate");
-        Self {
-            der: certificate.der().clone(),
-            issuer: Issuer::new(params, key),
-        }
-    }
-
-    /// The product's room connector, trusting this authority alone.
-    fn connector(&self) -> RoomConnector {
-        let mut roots = RootCertStore::empty();
-        roots.add(self.der.clone()).expect("a root");
-        RoomConnector::with_tls(
-            ClientConfig::builder_with_provider(Arc::new(
-                tokio_rustls::rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .expect("protocol versions")
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-        )
-    }
-
-    fn acceptor(&self) -> TlsAcceptor {
-        let key = KeyPair::generate().expect("a key pair");
-        let leaf = CertificateParams::new(vec!["127.0.0.1".to_owned()])
-            .expect("certificate parameters")
-            .signed_by(&key, &self.issuer)
-            .expect("a certificate");
-        TlsAcceptor::from(Arc::new(
-            ServerConfig::builder_with_provider(Arc::new(
-                tokio_rustls::rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .expect("protocol versions")
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![leaf.der().clone(), self.der.clone()],
-                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
-            )
-            .expect("a server configuration"),
-        ))
-    }
-}
-
-/// The host's room behind TLS on loopback, as the service serves it: each candidate socket at
-/// `/api/pair/room/<locator>/candidate` is carried into `room`. Returns the origin it answers at.
+/// The host's room behind the rendezvous harness's TLS, as the service serves it: each candidate
+/// socket is carried into `room`. Returns the origin it answers at.
 async fn room_behind_tls(
-    authority: &Authority,
+    authority: &room_tls::Authority,
     room: net_support::room::TestRoom,
 ) -> RendezvousOrigin {
-    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-        .await
-        .expect("a loopback port");
-    let port = listener.local_addr().expect("an address").port();
-    let acceptor = authority.acceptor();
-    tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            let (acceptor, room) = (acceptor.clone(), room.clone());
-            tokio::spawn(async move {
-                let Ok(stream) = acceptor.accept(stream).await else {
-                    return;
-                };
-                let Ok((request, end)) = ServerBuilder::new().accept(stream).await else {
-                    return;
-                };
-                let Some(locator) = request
-                    .uri()
-                    .path()
-                    .strip_prefix("/api/pair/room/")
-                    .and_then(|rest| rest.strip_suffix("/candidate"))
-                else {
-                    return;
-                };
-                let socket = room.candidate(locator);
-                let (mut to_device, mut from_device) = end.split();
-                let RoomSocket {
-                    outgoing,
-                    mut incoming,
-                } = socket;
-                let down = async move {
-                    while let Some(frame) = incoming.recv().await {
-                        let frame = Message::binary(encode_frame(&frame).expect("a frame"));
-                        if to_device.send(frame).await.is_err() {
-                            return;
-                        }
-                    }
-                    let _ = to_device.close().await;
-                };
-                let up = async move {
-                    while let Some(Ok(message)) = from_device.next().await {
-                        if message.is_close() {
-                            return;
-                        }
-                        if !message.is_binary() {
-                            continue;
-                        }
-                        let Ok(frame) = decode_client_frame(message.as_payload()) else {
-                            return;
-                        };
-                        if outgoing.send(frame).await.is_err() {
-                            return;
-                        }
-                    }
-                };
-                tokio::join!(down, up);
-            });
+    room_tls::serve(authority, move |stream, _| {
+        let room = room.clone();
+        async move {
+            let Some((locator, role, end)) = room_tls::upgrade(stream).await else {
+                return;
+            };
+            if role == "candidate" {
+                room_tls::carry(end, room.candidate(&locator)).await;
+            }
         }
-    });
-    RendezvousOrigin::new(format!("https://127.0.0.1:{port}")).expect("an origin")
+    })
+    .await
 }
 
 /// KR-REQ-10.23, KR-REQ-10.19: the room socket the product opens over TLS pairs when a host
-/// answers in the room, so the endings the scripted room behind TLS plays are the room's, not the
-/// socket's.
+/// answers in the room. This is the room harness the failure suite's scripts play their endings
+/// through (kr-client `tests/pairing_failures.rs`), so those endings are the room's and not the
+/// harness's or the socket's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_pairs_through_a_room_behind_tls() {
     let owner_keys = keys();
@@ -1456,7 +1343,7 @@ async fn a_device_pairs_through_a_room_behind_tls() {
     let environment = host.environment_id;
     let mut client = host.client().await;
     let owner = Signer::OwnerDevice(&owner_keys);
-    let authority = Authority::new("rendezvous test authority");
+    let authority = room_tls::Authority::new("rendezvous test authority");
     let origin = room_behind_tls(&authority, host.room.clone()).await;
     let invited = invite_code(environment, &mut client, &viewer(), Some(&origin), &owner).await;
     let (named, code, _) = code_of(&invited);
