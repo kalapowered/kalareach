@@ -12,7 +12,7 @@ use std::time::Duration;
 use iroh::Endpoint;
 use iroh::endpoint::Connection;
 use kr_cbor::CanonicalValue;
-use kr_crypto::connect::PairedPeer;
+use kr_crypto::connect::{PairedPeer, sign_connect};
 use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Request, Response};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::extension::{
@@ -20,15 +20,15 @@ use kr_protocol::extension::{
 };
 use kr_protocol::frame::{StreamHeader, StreamKind, StreamResource};
 use kr_protocol::hello::{
-    ALPN, ClientOffer, ConnectProof, ConnectReply, HelloReply, HostSelection, PROTOCOL_VERSION,
-    ProtocolVersion, ReceiveLimits,
+    ALPN, ActionWindow, ClientOffer, ConnectAccepted, ConnectProof, ConnectReply, HelloReply,
+    HostSelection, PROTOCOL_VERSION, ProtocolVersion, ReceiveLimits,
 };
 use kr_protocol::ids::{
-    AttachmentId, BuildId, ConnectionId, ControllerGeneration, EnvironmentId, RequestId, SessionId,
-    TransferId,
+    ActionWindowId, AttachmentId, BuildId, ConnectionId, ControllerGeneration, EnvironmentId,
+    RequestId, SessionId, TransferId,
 };
 use kr_protocol::method::{Method, MethodVersion};
-use kr_protocol::scalars::{CanonicalSet, EndpointKey, Nullable, Uuid};
+use kr_protocol::scalars::{CanonicalSet, DurationMs, EndpointKey, Nullable, TimestampMs, Uuid};
 use kr_transport::clock::ManualClock;
 use kr_transport::codec::{FrameReader, FrameWriter};
 use kr_transport::config::EndpointConfig;
@@ -346,8 +346,8 @@ async fn an_offer_with_no_shared_major_is_refused_as_an_unsupported_schema() {
     let error = handshake::connect(&connection, &client.identity, &host.record)
         .await
         .expect_err("a refusal");
-    let TransportError::Handshake(error) = error else {
-        panic!("a version mismatch is a handshake refusal, not {error}");
+    let TransportError::Refused(error) = error else {
+        panic!("a version mismatch is the host's refusal, not {error}");
     };
     assert_eq!(error.code, ErrorCode::UnsupportedSchema);
 
@@ -378,8 +378,8 @@ async fn a_send_queue_too_small_for_a_transfer_is_refused_at_hello() {
     let error = handshake::connect(&connection, &client.identity, &host.record)
         .await
         .expect_err("a refusal");
-    let TransportError::Handshake(error) = error else {
-        panic!("an unusable send queue is a handshake refusal, not {error}");
+    let TransportError::Refused(error) = error else {
+        panic!("an unusable send queue is the host's refusal, not {error}");
     };
     assert_eq!(error.code, ErrorCode::InvalidArgument);
 
@@ -410,8 +410,8 @@ async fn a_peer_that_cannot_prove_the_paired_key_is_refused() {
     let error = handshake::connect(&connection, &client.identity, &host.record)
         .await
         .expect_err("a refusal");
-    let TransportError::Handshake(error) = error else {
-        panic!("a failed proof is a handshake refusal, not {error}");
+    let TransportError::Refused(error) = error else {
+        panic!("a failed proof is the host's refusal, not {error}");
     };
     assert_eq!(error.code, ErrorCode::PermissionDenied);
 
@@ -1537,4 +1537,291 @@ fn attachment_header(connection_id: ConnectionId, transfer: u8) -> StreamHeader 
             transfer_id: Nullable::some(TransferId::new(Uuid::from_bytes([transfer; 16]))),
         },
     }
+}
+
+/// What a scripted host does on a client's first stream, once it has read the offer.
+#[derive(Clone)]
+enum HostScript {
+    /// Ends the stream without a reply.
+    NoReply,
+    /// Refuses the offer with this error.
+    RefuseOffer(ProtocolError),
+    /// Selects limits the client cannot work within.
+    SelectUnusableLimits,
+    /// Selects, reads the connection proof, and ends the stream without a reply.
+    NoProofReply,
+    /// Selects, reads the connection proof, and refuses it with this error.
+    RefuseProof(ProtocolError),
+    /// Selects, reads the connection proof, and accepts it with a valid proof of its own and an
+    /// action window bound to another connection.
+    AcceptForAnotherConnection,
+    /// Selects for a candidate, reads its first call, and answers it with this error.
+    AnswerWithError(ProtocolError),
+    /// Selects for a candidate, reads its first call, and answers another request.
+    AnswerAnotherRequest,
+    /// Selects for a candidate, reads its first call, and ends the stream without an answer.
+    AnswerNothing,
+}
+
+/// Runs `script` as the host on the first connection `host` accepts, and holds the connection
+/// until the client lets it go.
+fn spawn_scripted(host: &Side, script: HostScript) -> JoinHandle<()> {
+    let endpoint = host.endpoint.clone();
+    let record = host.record;
+    let keys = host.keys.clone();
+    tokio::spawn(async move {
+        let connection = accept_connection(&endpoint).await;
+        let (send, recv) = connection.accept_bi().await.expect("a stream");
+        let mut reader = FrameReader::new(recv, StreamKind::Control);
+        let mut writer = FrameWriter::new(send, StreamKind::Control);
+        let offer: ClientOffer = reader
+            .read_message()
+            .await
+            .expect("a frame")
+            .expect("an offer");
+        let mut selection = HostSelection {
+            host_nonce: fresh_nonce().expect("a nonce"),
+            client_nonce: offer.client_nonce,
+            connection_id: ConnectionId::new(Uuid::from_bytes([7; 16])),
+            selected_version: PROTOCOL_VERSION,
+            capabilities: CanonicalSet::new(),
+            limits: ReceiveLimits::default(),
+            endpoint_id: record.endpoint_id,
+            device_id: record.device_id,
+            device_key_revision: record.device_key_revision,
+            boot_epoch: epochs().boot_epoch,
+            clock_epoch: epochs().clock_epoch,
+            extensions: extension::select(&offer.extensions, &[]),
+        };
+        match script {
+            HostScript::NoReply => {
+                writer.finish_and_flush(Duration::from_secs(1)).await;
+            }
+            HostScript::RefuseOffer(error) => {
+                writer
+                    .write_message(&HelloReply::Refused(error))
+                    .await
+                    .expect("the refusal is sent");
+            }
+            HostScript::SelectUnusableLimits => {
+                selection.limits.max_send_queue_bytes = kr_protocol::scalars::U64::new(
+                    kr_transport::scheduler::MIN_SEND_QUEUE_BYTES as u64 - 1,
+                );
+                writer
+                    .write_message(&HelloReply::Selected(Box::new(selection.clone())))
+                    .await
+                    .expect("the selection is sent");
+            }
+            HostScript::NoProofReply
+            | HostScript::RefuseProof(_)
+            | HostScript::AcceptForAnotherConnection => {
+                writer
+                    .write_message(&HelloReply::Selected(Box::new(selection.clone())))
+                    .await
+                    .expect("the selection is sent");
+                let _: ConnectProof = reader
+                    .read_message()
+                    .await
+                    .expect("a frame")
+                    .expect("a proof");
+                match script {
+                    HostScript::RefuseProof(error) => writer
+                        .write_message(&ConnectReply::Refused(error))
+                        .await
+                        .expect("the refusal is sent"),
+                    HostScript::AcceptForAnotherConnection => {
+                        let signature = sign_connect(
+                            &keys.authorisation,
+                            &offer,
+                            &selection,
+                            &EndpointKey::from_bytes(*connection.remote_id().as_bytes()),
+                            &record.endpoint_id,
+                        )
+                        .expect("the host's proof");
+                        let accepted = ConnectAccepted {
+                            host_proof: ConnectProof { signature },
+                            action_window: ActionWindow {
+                                action_window_id: ActionWindowId::new(
+                                    "a-window-of-another-connection",
+                                )
+                                .expect("a window identifier"),
+                                connection_id: ConnectionId::new(Uuid::from_bytes([9; 16])),
+                                boot_epoch: selection.boot_epoch,
+                                issued_at_ms: TimestampMs::new(1),
+                                valid_for_ms: DurationMs::new(60_000),
+                            },
+                        };
+                        writer
+                            .write_message(&ConnectReply::Accepted(Box::new(accepted)))
+                            .await
+                            .expect("the acceptance is sent");
+                    }
+                    _ => writer.finish_and_flush(Duration::from_secs(1)).await,
+                }
+            }
+            HostScript::AnswerWithError(_)
+            | HostScript::AnswerAnotherRequest
+            | HostScript::AnswerNothing => {
+                writer
+                    .write_message(&HelloReply::Selected(Box::new(selection.clone())))
+                    .await
+                    .expect("the selection is sent");
+                let request: Request = reader
+                    .read_message()
+                    .await
+                    .expect("a frame")
+                    .expect("a call");
+                match script {
+                    HostScript::AnswerWithError(error) => writer
+                        .write_message(&Response {
+                            request_id: request.request_id,
+                            outcome: Outcome::Error(error),
+                        })
+                        .await
+                        .expect("the answer is sent"),
+                    HostScript::AnswerAnotherRequest => writer
+                        .write_message(&Response {
+                            request_id: RequestId::new(request.request_id.get() + 1),
+                            outcome: Outcome::Error(ProtocolError::new(
+                                ErrorCode::PairingAuthFailed,
+                                "an answer to a request nobody made",
+                            )),
+                        })
+                        .await
+                        .expect("the answer is sent"),
+                    _ => writer.finish_and_flush(Duration::from_secs(1)).await,
+                }
+            }
+        }
+        connection.closed().await;
+    })
+}
+
+/// The error the paired handshake ends with against a host that plays `script`.
+async fn paired_ending(script: HostScript) -> TransportError {
+    let (host, client) = paired_pair().await;
+    let answering = spawn_scripted(&host, script);
+    let connection = client
+        .endpoint
+        .connect(direct_addr(&host), ALPN)
+        .await
+        .expect("a connection");
+    let error = handshake::connect(&connection, &client.identity, &host.record)
+        .await
+        .expect_err("the handshake ends");
+    drop(connection);
+    answering.abort();
+    error
+}
+
+/// The error a candidate's surface ends with against a host that plays `script`: in its offer,
+/// or in its first call.
+async fn candidate_ending(script: HostScript) -> TransportError {
+    let (host, client) = paired_pair().await;
+    let answering = spawn_scripted(&host, script);
+    let connection = client
+        .endpoint
+        .connect(direct_addr(&host), ALPN)
+        .await
+        .expect("a connection");
+    let error = match handshake::connect_unpaired(&connection, &client.identity).await {
+        Err(error) => error,
+        Ok(mut surface) => surface
+            .call::<_, kr_protocol::preauth::PairStatusResult>(
+                Method::PairStatus,
+                &kr_protocol::preauth::PairStatusParams {
+                    invitation_id: kr_protocol::ids::InvitationId::new(Uuid::from_bytes([3; 16])),
+                },
+            )
+            .await
+            .expect_err("the call ends"),
+    };
+    drop(connection);
+    answering.abort();
+    error
+}
+
+fn refused(error: TransportError) -> ProtocolError {
+    let TransportError::Refused(error) = error else {
+        panic!("the host's own answer is a refusal, not {error}");
+    };
+    error
+}
+
+fn concluded(error: TransportError) -> ProtocolError {
+    let TransportError::Handshake(error) = error else {
+        panic!("what this side concluded is a handshake failure, not {error}");
+    };
+    error
+}
+
+/// An error the host sends in reply to the offer is the host's refusal, whatever its code; a reply
+/// that never came, and a selection the client cannot work within, are the client's own
+/// conclusions, and stay handshake failures.
+#[tokio::test]
+async fn a_refused_offer_is_told_apart_from_what_the_client_concluded() {
+    let sent = ProtocolError::new(ErrorCode::RateLimited, "later");
+    assert_eq!(
+        refused(paired_ending(HostScript::RefuseOffer(sent.clone())).await),
+        sent
+    );
+    assert_eq!(
+        concluded(paired_ending(HostScript::NoReply).await).code,
+        ErrorCode::ResourceUnavailable
+    );
+    assert_eq!(
+        concluded(paired_ending(HostScript::SelectUnusableLimits).await).code,
+        ErrorCode::InvalidArgument
+    );
+}
+
+/// An error the host sends in reply to the connection proof is the host's refusal; a reply that
+/// never came, and an acceptance bound to another connection, are the client's own conclusions.
+#[tokio::test]
+async fn a_refused_proof_is_told_apart_from_what_the_client_concluded() {
+    let sent = ProtocolError::new(ErrorCode::PermissionDenied, "not this key");
+    assert_eq!(
+        refused(paired_ending(HostScript::RefuseProof(sent.clone())).await),
+        sent
+    );
+    assert_eq!(
+        concluded(paired_ending(HostScript::NoProofReply).await).code,
+        ErrorCode::PermissionDenied
+    );
+    let unbound = concluded(paired_ending(HostScript::AcceptForAnotherConnection).await);
+    assert_eq!(unbound.code, ErrorCode::PermissionDenied);
+    assert!(
+        unbound.message.contains("action window"),
+        "{}",
+        unbound.message
+    );
+}
+
+/// A candidate tells the host's refusal of its offer, and the host's error answer to its call,
+/// apart from what it concluded itself: no reply to the offer, no answer to the call, and an
+/// answer to another request, whatever code that answer carried.
+#[tokio::test]
+async fn a_candidates_refusals_are_told_apart_from_what_it_concluded() {
+    let sent = ProtocolError::new(ErrorCode::UnsupportedSchema, "no version in common");
+    assert_eq!(
+        refused(candidate_ending(HostScript::RefuseOffer(sent.clone())).await),
+        sent
+    );
+    assert_eq!(
+        concluded(candidate_ending(HostScript::NoReply).await).code,
+        ErrorCode::ResourceUnavailable
+    );
+    let answered = ProtocolError::new(ErrorCode::InvalidArgument, "not a status question");
+    assert_eq!(
+        refused(candidate_ending(HostScript::AnswerWithError(answered.clone())).await),
+        answered
+    );
+    assert_eq!(
+        concluded(candidate_ending(HostScript::AnswerNothing).await).code,
+        ErrorCode::ResourceUnavailable
+    );
+    assert_eq!(
+        concluded(candidate_ending(HostScript::AnswerAnotherRequest).await).code,
+        ErrorCode::InvalidArgument
+    );
 }
