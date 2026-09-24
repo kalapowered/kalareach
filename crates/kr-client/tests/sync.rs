@@ -13,8 +13,8 @@ use kr_client::drafts::{
     Published as DraftPublished, SyncCheckpoint as DraftCheckpoint, draft_collection,
 };
 use kr_client::services::{
-    ServiceFuture, SyncBackupService, SyncExchanged, SyncPosition, SyncRequestFence,
-    SyncRequestStatus, SyncRevision,
+    ServiceFuture, SyncBackupService, SyncExchanged, SyncPosition, SyncRecoveryId,
+    SyncRequestFence, SyncRequestStatus, SyncRevision,
 };
 use kr_client::sync::{
     Claimed, ClientSelection, ConflictCopy, Dispatch, Outcome, PrivacyRecord, Publication,
@@ -47,6 +47,23 @@ fn at(write_sequence: u64) -> SyncPosition {
         None,
     )
 }
+
+/// The same place, in the history a restore recorded as `recovery`.
+fn in_history(position: SyncPosition, recovery: Option<SyncRecoveryId>) -> SyncPosition {
+    SyncPosition {
+        recovery: Nullable::from(recovery),
+        ..position
+    }
+}
+
+/// The recovery one restore of the service records.
+fn recovery(byte: u8) -> SyncRecoveryId {
+    SyncRecoveryId::new(Uuid::from_bytes([byte; 16]))
+}
+
+/// How long the service keeps a receipt, which is also how long a collection put back answers
+/// that a request signed before the restore may have run.
+const RECEIPT_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 /// Somewhere a test can hold one call at the wire while it changes something else.
 ///
@@ -261,9 +278,81 @@ struct Service {
     copies: Mutex<BTreeMap<SyncConflictId, String>>,
     /// Whether the service can be told about a person's choice.
     resolve_unreachable: Mutex<bool>,
+    /// The recovery the service's last restore recorded, which every answer names, or none for a
+    /// service never put back.
+    recovery: Mutex<Option<SyncRecoveryId>>,
+}
+
+/// What an export of the service holds, which a restore puts back.
+#[derive(Clone, Debug, Default)]
+struct Export {
+    objects: BTreeMap<String, (SyncPosition, Vec<u8>)>,
+    removals: BTreeMap<String, u64>,
+    receipts: BTreeMap<(String, Uuid), Receipt>,
+    receipt_of: BTreeMap<Uuid, String>,
+    copies: BTreeMap<SyncConflictId, String>,
 }
 
 impl Service {
+    /// The recovery every answer names now.
+    async fn history(&self) -> Option<SyncRecoveryId> {
+        *self.recovery.lock().await
+    }
+
+    /// Takes an export: everything the service holds, as it holds it now.
+    async fn export(&self) -> Export {
+        Export {
+            objects: self.objects.lock().await.clone(),
+            removals: self.removals.lock().await.clone(),
+            receipts: self.receipts.lock().await.clone(),
+            receipt_of: self.receipt_of.lock().await.clone(),
+            copies: self.copies.lock().await.clone(),
+        }
+    }
+
+    /// Puts the service back from an export, under a recovery of its own.
+    ///
+    /// What the deployed service does: every collection holds what the export held, at the places
+    /// the export held them, and every place it names from now on, a receipt's included, is in the
+    /// history the restore began. Its account of swept receipts starts at the restore plus the
+    /// retention, so for that long a fence cannot say that a request signed before the restore
+    /// never ran: the history it replaced may have run it, and no export brought the receipt back.
+    async fn put_back(&self, export: &Export, recovery: SyncRecoveryId) {
+        let history = Some(recovery);
+        *self.recovery.lock().await = history;
+        *self.objects.lock().await = export
+            .objects
+            .iter()
+            .map(|(collection, (position, bytes))| {
+                (
+                    collection.clone(),
+                    (in_history(*position, history), bytes.clone()),
+                )
+            })
+            .collect();
+        *self.removals.lock().await = export.removals.clone();
+        *self.receipts.lock().await = export
+            .receipts
+            .iter()
+            .map(|(key, receipt)| {
+                let mut receipt = receipt.clone();
+                receipt.recorded = match receipt.recorded {
+                    Recorded::Applied(position) => Recorded::Applied(in_history(position, history)),
+                    Recorded::Refused(copy, current) => Recorded::Refused(
+                        copy,
+                        current.map(|position| in_history(position, history)),
+                    ),
+                    fenced @ Recorded::Fenced { .. } => fenced,
+                };
+                (key.clone(), receipt)
+            })
+            .collect();
+        *self.receipt_of.lock().await = export.receipt_of.clone();
+        *self.copies.lock().await = export.copies.clone();
+        let restored_at = self.service_now().await;
+        let mut mark = self.swept_through_ms.lock().await;
+        *mark = (*mark).max(restored_at + RECEIPT_RETENTION_MS);
+    }
     /// Forgets everything, which is what a reset or a replaced service looks like to a device.
     async fn reset(&self) {
         self.objects.lock().await.clear();
@@ -294,7 +383,7 @@ impl Service {
             .lock()
             .await
             .insert(collection.to_owned(), next);
-        SyncPosition::removed_at(next, None)
+        SyncPosition::removed_at(next, self.history().await)
     }
 
     /// Puts one object in a collection at a position of the caller's choosing.
@@ -484,8 +573,9 @@ impl Service {
                     "that identity already answered a different request",
                 )));
             }
-            return Ok(answer(receipt.recorded));
+            return Ok(answer(receipt.recorded, self.history().await));
         }
+        let history = self.history().await;
         let mut objects = self.objects.lock().await;
         let mut removals = self.removals.lock().await;
         // Where the collection stands: the live object, else the removal that took its place, else
@@ -496,7 +586,7 @@ impl Service {
             .or_else(|| {
                 removals
                     .get(collection)
-                    .map(|sequence| SyncPosition::removed_at(*sequence, None))
+                    .map(|sequence| SyncPosition::removed_at(*sequence, history))
             });
         // The comparison is against the object the caller named, which is the only part of a
         // position the exchange carries. The order beside it is the service's own answer.
@@ -512,6 +602,7 @@ impl Service {
                 .await
                 .take()
                 .unwrap_or_else(|| at(current.map_or(1, |position| position.write_sequence + 1)));
+            let next = in_history(next, history);
             removals.remove(collection);
             objects.insert(collection.to_owned(), (next, ciphertext.to_vec()));
             Recorded::Applied(next)
@@ -534,18 +625,19 @@ impl Service {
             },
         );
         self.receipt_of.lock().await.insert(request_id, key.0);
-        Ok(answer(recorded))
+        Ok(answer(recorded, history))
     }
 }
 
-/// The reply a receipt records, as the exchange itself would have answered.
-fn answer(recorded: Recorded) -> SyncExchanged {
+/// The reply a receipt records, as the exchange itself would have answered, in the history the
+/// service answers from now.
+fn answer(recorded: Recorded, recovery: Option<SyncRecoveryId>) -> SyncExchanged {
     match recorded {
         Recorded::Applied(position) => SyncExchanged::Applied { position },
         Recorded::Refused(conflict_id, current) => SyncExchanged::Refused {
             retained: Some(conflict_id),
             current,
-            recovery: None,
+            recovery,
         },
         Recorded::Fenced { .. } => unreachable!("a fenced identity never answers an exchange"),
     }
@@ -623,8 +715,9 @@ impl SyncBackupService for Service {
             if *self.status_unreachable.lock().await {
                 return Err(lost("the service could not be asked"));
             }
+            let recovery = self.history().await;
             if std::mem::take(&mut *self.status_misses_the_receipt.lock().await) {
-                return Ok(SyncRequestStatus::Unknown { recovery: None });
+                return Ok(SyncRequestStatus::Unknown { recovery });
             }
             Ok(
                 match self
@@ -637,13 +730,13 @@ impl SyncBackupService for Service {
                     Some(Recorded::Applied(position)) => SyncRequestStatus::Applied { position },
                     Some(Recorded::Refused(conflict_id, _)) => SyncRequestStatus::Refused {
                         retained: Some(conflict_id),
-                        recovery: None,
+                        recovery,
                     },
                     Some(Recorded::Fenced { never_ran }) => SyncRequestStatus::Fenced {
                         never_ran,
-                        recovery: None,
+                        recovery,
                     },
-                    None => SyncRequestStatus::Unknown { recovery: None },
+                    None => SyncRequestStatus::Unknown { recovery },
                 },
             )
         })
@@ -669,6 +762,7 @@ impl SyncBackupService for Service {
             }
             let key = (collection.to_owned(), request_id);
             let now = self.service_now().await;
+            let recovery = self.history().await;
             // The receipts and the mark are read under one hold, in the order a sweep takes them,
             // so this decision sees a sweep whole or not at all.
             let mut receipts = self.receipts.lock().await;
@@ -707,11 +801,11 @@ impl SyncBackupService for Service {
                 Recorded::Applied(position) => SyncRequestFence::Applied { position },
                 Recorded::Refused(conflict_id, _) => SyncRequestFence::Refused {
                     retained: Some(conflict_id),
-                    recovery: None,
+                    recovery,
                 },
                 Recorded::Fenced { never_ran } => SyncRequestFence::Fenced {
                     never_ran,
-                    recovery: None,
+                    recovery,
                 },
             })
         })
@@ -4306,6 +4400,537 @@ async fn an_accepted_write_answered_at_or_behind_the_place_it_replaced_is_never_
 }
 
 // ---------------------------------------------------------------------------
+// KR-REQ-20.13 across a restore: a collection put back from an archive
+// ---------------------------------------------------------------------------
+
+/// Seals what another device wrote, so the object the service holds opens here.
+fn sealed_object(object: &SyncObject) -> Vec<u8> {
+    DeviceSealer::new(0x5a)
+        .seal(&kr_cbor::to_canonical_vec(object).expect("canonical bytes"))
+        .expect("sealed")
+}
+
+/// Publishes the object this device holds once more, as a new revision of it.
+async fn publish_again(client: &SyncClient, mine: &mut SyncObject, at_ms: u64) -> Published {
+    mine.revision = fresh_revision().expect("a revision");
+    client.store().put_object(mine).expect("stored");
+    client
+        .publish(mine.object_id, TimestampMs::new(at_ms))
+        .await
+        .expect("answered")
+}
+
+#[tokio::test]
+async fn a_note_in_one_history_meets_its_collection_put_back_in_another_and_follows_it() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let mut mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+
+    // Five writes, and an export of the service taken after the third.
+    let mut archive = None;
+    for write in 1..=5 {
+        assert_eq!(
+            publish_again(&client, &mut mine, NOW + write).await,
+            Published::Accepted {
+                position: at(write)
+            }
+        );
+        if write == 3 {
+            archive = Some(service.export().await);
+        }
+    }
+
+    // The service is put back from that export, under a recovery of its own. The note names write
+    // five in the history the restore replaced, and the collection holds write three in the
+    // history the restore began: the two places do not compare, so this is a collection put back
+    // and not a service that went back.
+    let restored = recovery(0xb0);
+    service
+        .put_back(&archive.expect("an archive"), restored)
+        .await;
+    let sent_before = service.exchanges().await.len();
+    mine.body = SyncBody::Settings(settings(&[("theme", "solarised")], &[]));
+    let answered = publish_again(&client, &mut mine, NOW + 6).await;
+    let Published::Conflicted {
+        copy,
+        position,
+        other_revision,
+    } = answered
+    else {
+        panic!("a collection put back brings its content down beside this device's: {answered:?}");
+    };
+    assert_eq!(position, in_history(at(3), Some(restored)));
+
+    // Both versions stay readable: this device's own object, untouched, and the collection's,
+    // kept beside it for the person to choose from.
+    assert_eq!(
+        client.store().object(object_id).expect("read"),
+        Some(mine.clone())
+    );
+    let copies = client.store().conflicts(object_id).expect("copies").items;
+    assert_eq!(copies.len(), 1);
+    assert_eq!(copies[0].conflict_id, copy);
+    assert_eq!(copies[0].other.revision, other_revision);
+    assert_ne!(copies[0].other.revision, mine.revision);
+    // The note follows the collection as it now stands.
+    assert_eq!(
+        client
+            .store()
+            .checkpoint(object_id)
+            .expect("a note")
+            .expect("one stands")
+            .position,
+        in_history(at(3), Some(restored))
+    );
+    // Nothing was written on this device's behalf: the one exchange since the restore is the
+    // publication it asked for, which was refused.
+    assert_eq!(service.exchanges().await.len(), sent_before + 1);
+    // The account of what left under the history the restore replaced is kept.
+    assert!(
+        client
+            .store()
+            .publications()
+            .expect("records")
+            .items
+            .iter()
+            .any(|record| record.position == at(5)),
+        "the publication of write five is still what the account says left"
+    );
+
+    // The person keeps their own version: the copy goes, and the next publication compares
+    // against the collection as it now stands and lands after it, in the restored history. The
+    // account of each history's newest publication stays beside the other's.
+    client
+        .resolve(copy)
+        .await
+        .expect("resolved")
+        .expect("the copy was held");
+    assert_eq!(
+        publish_again(&client, &mut mine, NOW + 7).await,
+        Published::Accepted {
+            position: in_history(at(4), Some(restored))
+        }
+    );
+    let published: Vec<SyncPosition> = client
+        .store()
+        .publications()
+        .expect("records")
+        .items
+        .iter()
+        .map(|record| record.position)
+        .collect();
+    assert!(published.contains(&at(5)), "{published:?}");
+    assert!(
+        published.contains(&in_history(at(4), Some(restored))),
+        "{published:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_service_that_went_back_in_its_own_history_is_still_refused() {
+    // The negative control: the same five writes and the same service at write three, in the same
+    // history, which is a service that went back and not a collection put back.
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let mut mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    let mut archive = None;
+    for write in 1..=5 {
+        publish_again(&client, &mut mine, NOW + write).await;
+        if write == 3 {
+            archive = Some(service.export().await);
+        }
+    }
+    let archive = archive.expect("an archive");
+    *service.objects.lock().await = archive.objects.clone();
+
+    mine.revision = fresh_revision().expect("a revision");
+    client.store().put_object(&mine).expect("stored");
+    let refused = client
+        .publish(object_id, TimestampMs::new(NOW + 6))
+        .await
+        .expect_err("the service holds an earlier write than the note, in the same history");
+    assert!(
+        matches!(
+            refused,
+            SyncError::StaleCheckpoint {
+                expected: 5,
+                found: 3,
+                ..
+            }
+        ),
+        "{refused}"
+    );
+    assert!(
+        client
+            .store()
+            .conflicts(object_id)
+            .expect("copies")
+            .is_empty()
+    );
+    assert_eq!(
+        client
+            .fetch(
+                SyncObjectKind::Settings,
+                object_id,
+                TimestampMs::new(NOW + 7)
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        Err(SyncError::StaleCheckpoint {
+            object_id,
+            expected: 5,
+            found: 3,
+        }
+        .to_string())
+    );
+}
+
+#[tokio::test]
+async fn a_fetch_from_a_collection_put_back_keeps_both_versions_and_writes_nothing_away() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let collection = sync_collection(SyncObjectKind::Settings, object_id);
+    let mut mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    for write in 1..=5 {
+        publish_again(&client, &mut mine, NOW + write).await;
+    }
+
+    // The collection is put back to a version another device wrote, under a recovery of its own.
+    let theirs = object(
+        object_id,
+        2,
+        SyncBody::Settings(settings(&[("theme", "light")], &[])),
+        NOW,
+    );
+    let restored = recovery(0xb1);
+    let archive = Export {
+        objects: [(collection.clone(), (at(3), sealed_object(&theirs)))].into(),
+        ..Export::default()
+    };
+    service.put_back(&archive, restored).await;
+    let sent_before = service.exchanges().await.len();
+
+    let fetched = client
+        .fetch(
+            SyncObjectKind::Settings,
+            object_id,
+            TimestampMs::new(NOW + 6),
+        )
+        .await
+        .expect("a collection put back is followed");
+    assert_eq!(fetched.object(), &theirs);
+    let copy = fetched.copy().expect("a copy beside this device's own");
+    assert_eq!(
+        client.store().object(object_id).expect("read"),
+        Some(mine.clone()),
+        "this device's own settings are never replaced"
+    );
+    assert_eq!(
+        client.store().conflicts(object_id).expect("copies").items[0].conflict_id,
+        copy
+    );
+    assert_eq!(
+        client
+            .store()
+            .checkpoint(object_id)
+            .expect("a note")
+            .expect("one stands")
+            .position,
+        in_history(at(3), Some(restored))
+    );
+    assert_eq!(
+        service.exchanges().await.len(),
+        sent_before,
+        "a fetch writes nothing to the service"
+    );
+}
+
+#[tokio::test]
+async fn an_answer_from_a_history_the_collection_was_put_back_from_moves_nothing() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(GatedService::new());
+    let one = gated_client(directory.path(), "shared", &service);
+    let two = gated_client(directory.path(), "shared", &service);
+    let object_id = fresh_object_id().expect("an identity");
+    let collection = sync_collection(SyncObjectKind::Settings, object_id);
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    one.store().put_object(&mine).expect("stored");
+    let theirs = |write: u64| {
+        object(
+            object_id,
+            2,
+            SyncBody::Settings(settings(&[("theme", "light")], &[])),
+            NOW + write,
+        )
+    };
+    service
+        .inner
+        .hold(&collection, at(4), sealed_object(&theirs(4)))
+        .await;
+    assert!(
+        one.store()
+            .record_checkpoint(
+                object_id,
+                SyncCheckpoint {
+                    position: at(4),
+                    published_revision: Nullable::null(),
+                },
+            )
+            .expect("a note")
+    );
+
+    // A fetch is answered at write four, in the history the service has, and the answer is held on
+    // its way back.
+    service.hold_the_next_fetch().await;
+    let late = tokio::spawn({
+        let one = Arc::clone(&one);
+        async move {
+            one.fetch(
+                SyncObjectKind::Settings,
+                object_id,
+                TimestampMs::new(NOW + 1),
+            )
+            .await
+        }
+    });
+    service.wait_for_a_publication().await;
+
+    // Meanwhile the service is put back, another device writes, and another window reads the
+    // collection at write five in the restored history.
+    let restored = recovery(0xb2);
+    let archive = service.inner.export().await;
+    service.inner.put_back(&archive, restored).await;
+    service
+        .inner
+        .hold(
+            &collection,
+            in_history(at(5), Some(restored)),
+            sealed_object(&theirs(5)),
+        )
+        .await;
+    two.fetch(
+        SyncObjectKind::Settings,
+        object_id,
+        TimestampMs::new(NOW + 2),
+    )
+    .await
+    .expect("the collection put back is followed");
+    let note = |client: &SyncClient| {
+        client
+            .store()
+            .checkpoint(object_id)
+            .expect("a note")
+            .expect("one stands")
+            .position
+    };
+    assert_eq!(note(&two), in_history(at(5), Some(restored)));
+
+    // The held answer arrives. It is in the history the collection was put back from, which this
+    // device has seen replaced, so nothing follows from it: the note stays where the restored
+    // history put it.
+    service.let_it_go();
+    let refused = late
+        .await
+        .expect("the task finished")
+        .expect_err("an answer from a history this device does not follow");
+    assert!(
+        matches!(refused, SyncError::UnfollowedHistory { .. }),
+        "{refused}"
+    );
+    assert_eq!(refused.code(), ErrorCode::ResyncRequired);
+    assert_eq!(note(&one), in_history(at(5), Some(restored)));
+
+    // Within the restored history the order rules hold as they always did: an answer behind the
+    // note is a service that went back.
+    service
+        .inner
+        .hold(
+            &collection,
+            in_history(at(3), Some(restored)),
+            sealed_object(&theirs(3)),
+        )
+        .await;
+    assert!(matches!(
+        one.fetch(
+            SyncObjectKind::Settings,
+            object_id,
+            TimestampMs::new(NOW + 3)
+        )
+        .await
+        .expect_err("write three is behind write five in the same history"),
+        SyncError::StaleCheckpoint {
+            expected: 5,
+            found: 3,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn a_publication_answered_in_a_history_the_device_has_since_left_keeps_only_its_account() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(GatedService::new());
+    let one = gated_client(directory.path(), "shared", &service);
+    let two = gated_client(directory.path(), "shared", &service);
+    let object_id = fresh_object_id().expect("an identity");
+    let collection = sync_collection(SyncObjectKind::Settings, object_id);
+    let mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    one.store().put_object(&mine).expect("stored");
+    service
+        .inner
+        .hold(&collection, at(4), sealed_object(&mine))
+        .await;
+    assert!(
+        one.store()
+            .record_checkpoint(
+                object_id,
+                SyncCheckpoint {
+                    position: at(4),
+                    published_revision: Nullable::null(),
+                },
+            )
+            .expect("a note")
+    );
+
+    // The publication is applied at write five and its answer is held on the way back.
+    service.hold_the_answer_instead().await;
+    let publishing = tokio::spawn({
+        let one = Arc::clone(&one);
+        async move { one.publish(object_id, TimestampMs::new(NOW + 1)).await }
+    });
+    service.wait_for_a_publication().await;
+
+    // The service is put back from an export that holds that write, and another window reads the
+    // collection in the restored history.
+    let restored = recovery(0xb3);
+    let archive = service.inner.export().await;
+    service.inner.put_back(&archive, restored).await;
+    two.fetch(
+        SyncObjectKind::Settings,
+        object_id,
+        TimestampMs::new(NOW + 2),
+    )
+    .await
+    .expect("the collection put back is followed");
+
+    // The held answer names write five in the history the collection was put back from. The
+    // write left this device all the same, so its own record is the account of it; nothing else
+    // is written from it.
+    service.let_it_go();
+    let refused = publishing
+        .await
+        .expect("the task finished")
+        .expect_err("an answer from a history this device has left");
+    assert!(
+        matches!(refused, SyncError::UnfollowedHistory { .. }),
+        "{refused}"
+    );
+    assert_eq!(one.outstanding().expect("a count"), 0);
+    let left = one.store().what_left().expect("what left");
+    assert!(
+        left.requests
+            .items
+            .iter()
+            .any(|record| record.state == RequestState::Diverged { position: at(5) }),
+        "the request's own record accounts for the write"
+    );
+    assert!(
+        left.publications.is_empty(),
+        "no publication record claims a write in a history this device does not follow"
+    );
+    assert_eq!(
+        one.store()
+            .checkpoint(object_id)
+            .expect("a note")
+            .expect("one stands")
+            .position,
+        in_history(at(5), Some(restored)),
+        "the note is where the restored history put it"
+    );
+    assert!(
+        one.exported()
+            .expect("exported")
+            .iter()
+            .any(|entry| entry.kind.contains("under another history")),
+        "and what left under it is named"
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_from_a_collection_put_back_empty_frees_the_next_publication() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (client, object_id) = device_client(directory.path(), "one", &service);
+    let mut mine = object(
+        object_id,
+        1,
+        SyncBody::Settings(settings(&[("theme", "dark")], &[])),
+        NOW,
+    );
+    // An export taken before this device's first write, and then the write.
+    let archive = service.export().await;
+    publish_again(&client, &mut mine, NOW).await;
+
+    // The service is put back from that export, so the collection holds nothing. The note names a
+    // write the restored collection never had, and a publication against it is refused: the
+    // refusal says the collection has never held the object, in the history the restore began.
+    let restored = recovery(0xb4);
+    service.put_back(&archive, restored).await;
+    let sent_before = service.exchanges().await.len();
+    mine.revision = fresh_revision().expect("a revision");
+    client.store().put_object(&mine).expect("stored");
+    client
+        .publish(object_id, TimestampMs::new(NOW + 1))
+        .await
+        .expect_err("refused, and nothing is held to bring down");
+    assert_eq!(
+        client.store().checkpoint(object_id).expect("a note"),
+        None,
+        "the note follows the collection: there is no place to name"
+    );
+    assert_eq!(service.exchanges().await.len(), sent_before + 1);
+
+    // Nothing publishes again on its own. The next publication the person asks for compares
+    // against nothing, which is what the collection holds, and lands.
+    assert_eq!(
+        publish_again(&client, &mut mine, NOW + 2).await,
+        Published::Accepted {
+            position: in_history(at(1), Some(restored))
+        }
+    );
+    assert_eq!(service.exchanges().await.len(), sent_before + 2);
+}
+
+// ---------------------------------------------------------------------------
 // KR-REQ-18.05: encrypted settings sync, named beside the rest of the feature
 // ---------------------------------------------------------------------------
 
@@ -7764,7 +8389,9 @@ async fn a_late_refusal_names_the_copy_the_service_kept_and_when_the_content_lef
                 &claim(client.store(), staged.work_id),
                 &staged,
                 Outcome::Refused {
-                    retained: Some(conflict_id)
+                    retained: Some(conflict_id),
+                    current: None,
+                    recovery: None,
                 },
             )
             .expect("settled")

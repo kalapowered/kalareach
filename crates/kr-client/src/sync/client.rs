@@ -68,13 +68,15 @@ use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::sync::SyncObjectKind;
 
 use super::store::{
-    Claimed, ConflictCopy, Dispatch, End, Outcome, PrivacyRecord, RequestRecord, RequestState,
-    Result, Settled, Settlement, Standing, SyncCheckpoint, SyncError, SyncStore, collection_of,
+    Across, Basis, Claimed, ConflictCopy, Crossing, Dispatch, End, Outcome, PrivacyRecord,
+    RequestRecord, RequestState, Result, Settled, Settlement, Standing, SyncCheckpoint, SyncError,
+    SyncStore, collection_of,
 };
 use super::{SyncBody, SyncObject, SyncSettings, Zeroising, sync_collection};
 use crate::drafts::DraftSealer;
 use crate::services::{
-    SyncBackupService, SyncExchanged, SyncPosition, SyncRequestFence, SyncRequestStatus,
+    SyncBackupService, SyncExchanged, SyncPosition, SyncRecoveryId, SyncRequestFence,
+    SyncRequestStatus,
 };
 
 /// What became of a publication.
@@ -452,6 +454,9 @@ impl SyncClient {
                 // The settlement is durable before this is raised. An answer this device's records
                 // cannot follow is one it may not carry on from, and the caller is told which it
                 // is rather than left to meet it at some later comparison that may never come.
+                if settled.across == Across::Unfollowed {
+                    return Err(SyncError::UnfollowedHistory { object_id });
+                }
                 if let Some(held) = settled.diverged {
                     return Err(diverged(object_id, held, position));
                 }
@@ -468,14 +473,24 @@ impl SyncClient {
                     },
                 })
             }
-            Ok(SyncExchanged::Refused { retained, .. }) => {
+            Ok(SyncExchanged::Refused {
+                retained,
+                current,
+                recovery,
+            }) => {
                 // The service answered the comparison and refused it, so this write did not replace
                 // the object. That is settled first, along with the account of whatever the service
                 // kept of it, so a fetch this device cannot make does not leave a refusal it
                 // already knows about sitting outstanding.
-                let settled =
-                    self.store
-                        .settle(&dispatch, &staged, Outcome::Refused { retained })?;
+                let settled = self.store.settle(
+                    &dispatch,
+                    &staged,
+                    Outcome::Refused {
+                        retained,
+                        current,
+                        recovery,
+                    },
+                )?;
                 if let Settlement::Discarded {
                     produced_under,
                     current,
@@ -485,6 +500,9 @@ impl SyncClient {
                         produced_under,
                         current,
                     });
+                }
+                if settled.across == Across::Unfollowed {
+                    return Err(SyncError::UnfollowedHistory { object_id });
                 }
                 self.keep_what_the_service_holds(&staged, retained, now)
                     .await
@@ -525,7 +543,7 @@ impl SyncClient {
             .ok_or_else(|| SyncError::DraftElsewhere {
                 collection: collection.clone(),
             })?;
-        let (position, other) = self.fetch_current(staged, &collection).await?;
+        let (position, other, basis) = self.fetch_current(staged.object_id, &collection).await?;
         // A refusal keeps a copy whatever this device holds. The comparison did not replace the
         // object, so what came down is another device's content and the person chooses between the
         // two; that is not the fetch's question of whether the two are the same content at all.
@@ -552,8 +570,14 @@ impl SyncClient {
                 // the note is this device's own, and what came down is the other device's.
                 published_revision: Nullable::null(),
             },
+            basis,
             |_| Ok(Some(copy)),
         )?;
+        if applied.across == Across::Unfollowed {
+            return Err(SyncError::UnfollowedHistory {
+                object_id: staged.object_id,
+            });
+        }
         // A note that two histories both claim is a note this device may not move, and the caller
         // is told which rather than left to meet it at some later comparison that may never come.
         forked(staged.object_id, applied.note, position)?;
@@ -645,20 +669,20 @@ impl SyncClient {
             .map_err(|error| Box::new(error).into())
     }
 
-    /// Fetches what the service holds now, diagnosing a service that has gone back or forked.
+    /// Fetches what the service holds now, diagnosing a service that has gone back or forked, and
+    /// hands back the history the fetch was made against.
     async fn fetch_current(
         &self,
-        staged: &RequestRecord,
+        object_id: SyncObjectId,
         collection: &str,
-    ) -> Result<(SyncPosition, SyncObject)> {
+    ) -> Result<(SyncPosition, SyncObject, Basis)> {
+        // The note and the history before the call leaves, so the answer is compared with what this
+        // device held when it asked, and read against the history it asked in.
+        let (note, basis) = self.store.checkpoint_and_basis(object_id)?;
         let (position, ciphertext) = self.service.fetch(collection).await?;
-        diagnose(
-            staged.object_id,
-            staged.expected.as_ref().copied(),
-            position,
-        )?;
-        let other = self.open_object(collection, staged.object_id, &ciphertext)?;
-        Ok((position, other))
+        diagnose(object_id, note.map(|note| note.position), position)?;
+        let other = self.open_object(collection, object_id, &ciphertext)?;
+        Ok((position, other, basis))
     }
 
     /// Fetches one object and keeps what the service holds beside this device's own.
@@ -703,8 +727,9 @@ impl SyncClient {
         }
         // The note this device holds **before** it asks, so a reply another observation overtook is
         // not mistaken for a service that went back. The note may move while this call is out; that
-        // is two answers arriving out of order, and the store keeps the later of them.
-        let note = self.store.checkpoint(object_id)?;
+        // is two answers arriving out of order, and the store keeps the later of them. The history
+        // is taken with it, and the answer is read against that history when it is applied.
+        let (note, basis) = self.store.checkpoint_and_basis(object_id)?;
         let (position, ciphertext) = self.service.fetch(&collection).await?;
         diagnose(object_id, note.map(|note| note.position), position)?;
         let other = self.open_object(&collection, object_id, &ciphertext)?;
@@ -721,10 +746,11 @@ impl SyncClient {
                 position,
                 published_revision: Nullable::null(),
             },
+            basis,
             // A device that holds nothing is seeing this object for the first time, and there is
             // nothing for it to conflict with. One that holds another revision has two versions of
             // the same object, which is a choice rather than a replacement.
-            |held| match held {
+            |held: Option<&SyncObject>| match held {
                 Some(held) if held.revision != other.revision => Ok(Some(self.copy_of(
                     object_id,
                     held.revision,
@@ -748,6 +774,9 @@ impl SyncClient {
                     current,
                 });
             }
+        }
+        if applied.across == Across::Unfollowed {
+            return Err(SyncError::UnfollowedHistory { object_id });
         }
         // The note is compared again inside the hold that writes it, against whatever it names by
         // then. A fetch that started against one note and finished against another can meet a fork
@@ -936,19 +965,29 @@ impl SyncClient {
                 }
                 Claimed::Gone => continue,
             };
-            match ask_about(&*self.service, &self.store, &staged).await? {
+            match ask_about(&*self.service, &self.store, &dispatch, &staged).await? {
                 Answer::Applied(position) => {
                     let settled =
                         self.store
                             .settle(&dispatch, &staged, Outcome::Accepted { position })?;
                     count_settled(&settled, &mut report);
                 }
-                Answer::Refused(retained) => {
-                    self.settle_refusal(&dispatch, &staged, retained, now, &mut report)
+                Answer::Refused { retained, recovery } => {
+                    self.settle_refusal(&dispatch, &staged, retained, recovery, now, &mut report)
                         .await?;
                 }
-                Answer::Fenced { never_ran } => {
-                    end_fenced(&self.store, &dispatch, &staged, never_ran, &mut report)?;
+                Answer::Fenced {
+                    never_ran,
+                    recovery,
+                } => {
+                    end_fenced(
+                        &self.store,
+                        &dispatch,
+                        &staged,
+                        never_ran,
+                        recovery,
+                        &mut report,
+                    )?;
                 }
                 Answer::Open => report.unresolved = report.unresolved.saturating_add(1),
             }
@@ -967,17 +1006,28 @@ impl SyncClient {
         dispatch: &Dispatch,
         staged: &RequestRecord,
         retained: Option<SyncConflictId>,
+        recovery: Option<SyncRecoveryId>,
         now: TimestampMs,
         report: &mut Reconciled,
     ) -> Result<()> {
-        let settled = self
-            .store
-            .settle(dispatch, staged, Outcome::Refused { retained })?;
+        // A receipt says what the refusal was told, not where the object stands now, so it names
+        // no place to follow.
+        let settled = self.store.settle(
+            dispatch,
+            staged,
+            Outcome::Refused {
+                retained,
+                current: None,
+                recovery,
+            },
+        )?;
         count_settled(&settled, report);
         // The copy belongs to the generation that admitted the work. A settlement the late-result
         // rule discarded may keep none, because a copy is retained content and the cleanup that
-        // opened this generation has already removed it.
+        // opened this generation has already removed it. One from a history this device does not
+        // follow keeps none either: the next pass reads the collection as it stands.
         if settled.settlement == Settlement::Published
+            && settled.across != Across::Unfollowed
             && self
                 .keep_what_the_service_holds(staged, retained, now)
                 .await
@@ -1336,11 +1386,18 @@ pub(crate) enum Answer {
     /// The service applied the write, leaving the object here, as the receipt recorded it.
     Applied(SyncPosition),
     /// The service refused the comparison, and kept this copy of the refused write when it kept one.
-    Refused(Option<SyncConflictId>),
+    Refused {
+        /// The copy the service kept of the refused write, when it kept one.
+        retained: Option<SyncConflictId>,
+        /// The history the collection answered from.
+        recovery: Option<SyncRecoveryId>,
+    },
     /// The request is fenced, and the service says whether anything ever ran under it.
     Fenced {
         /// Whether the service established that nothing ever ran under the identity.
         never_ran: bool,
+        /// The history the collection answered from, which is the one the fence holds in.
+        recovery: Option<SyncRecoveryId>,
     },
     /// Nothing established an outcome: the service could not be asked, it holds no receipt under
     /// the generation in force, or it could not be asked to end the request.
@@ -1367,9 +1424,18 @@ pub(crate) enum Answer {
 /// A service that cannot be asked, for the status or for the fence, leaves the answer open. That is
 /// also where a fence the service refuses as out of its reach ends up: the work stays counted, and
 /// the same instants are presented again next time.
+///
+/// A request admitted in a history the collection has since been put back from is the one case
+/// where no receipt ends the request at once, whatever the generation. It is never attempted again,
+/// and the history that replaced the one it was admitted in holds no receipt of it, so waiting could
+/// end only by an attempt still on its way landing in the collection as it now stands. The fence
+/// stops that attempt, and its answer says what is left to account for: a restored collection
+/// cannot say for a while that nothing ran, so the account stays. A status answer from a history
+/// this device does not follow settles nothing.
 pub(crate) async fn ask_about(
     service: &dyn SyncBackupService,
     store: &SyncStore,
+    dispatch: &Dispatch,
     staged: &RequestRecord,
 ) -> Result<Answer> {
     let collection = staged.collection();
@@ -1378,10 +1444,21 @@ pub(crate) async fn ask_about(
     };
     Ok(match status {
         SyncRequestStatus::Applied { position } => Answer::Applied(position),
-        SyncRequestStatus::Refused { retained, .. } => Answer::Refused(retained),
-        SyncRequestStatus::Fenced { never_ran, .. } => Answer::Fenced { never_ran },
-        SyncRequestStatus::Unknown { .. } => {
-            if !store.beyond_its_generation(staged)? {
+        SyncRequestStatus::Refused { retained, recovery } => Answer::Refused { retained, recovery },
+        SyncRequestStatus::Fenced {
+            never_ran,
+            recovery,
+        } => Answer::Fenced {
+            never_ran,
+            recovery,
+        },
+        SyncRequestStatus::Unknown { recovery } => {
+            let end_now = match store.crossed(dispatch, staged, recovery)? {
+                Crossing::Unfollowed => return Ok(Answer::Open),
+                Crossing::Crossed => true,
+                Crossing::InHistory => store.beyond_its_generation(staged)?,
+            };
+            if !end_now {
                 return Ok(Answer::Open);
             }
             let Some((first_signed_at, last_signed_at)) = staged.signing_times() else {
@@ -1396,9 +1473,17 @@ pub(crate) async fn ask_about(
                 )
                 .await
             {
-                Ok(SyncRequestFence::Fenced { never_ran, .. }) => Answer::Fenced { never_ran },
+                Ok(SyncRequestFence::Fenced {
+                    never_ran,
+                    recovery,
+                }) => Answer::Fenced {
+                    never_ran,
+                    recovery,
+                },
                 Ok(SyncRequestFence::Applied { position }) => Answer::Applied(position),
-                Ok(SyncRequestFence::Refused { retained, .. }) => Answer::Refused(retained),
+                Ok(SyncRequestFence::Refused { retained, recovery }) => {
+                    Answer::Refused { retained, recovery }
+                }
                 Err(_) => Answer::Open,
             }
         }
@@ -1412,7 +1497,7 @@ pub(crate) async fn ask_about(
 /// the account of the write is kept by its own record.
 pub(crate) fn count_settled(settled: &Settled, report: &mut Reconciled) {
     report.settled = report.settled.saturating_add(1);
-    if settled.diverged.is_some() {
+    if settled.diverged.is_some() || settled.across == Across::Unfollowed {
         report.diverged = report.diverged.saturating_add(1);
     }
 }
@@ -1428,15 +1513,18 @@ pub(crate) fn end_fenced(
     dispatch: &Dispatch,
     staged: &RequestRecord,
     never_ran: bool,
+    recovery: Option<SyncRecoveryId>,
     report: &mut Reconciled,
 ) -> Result<()> {
-    match store.close_fenced(dispatch, staged.work_id, never_ran)? {
+    match store.close_fenced(dispatch, staged.work_id, never_ran, recovery)? {
         End::NeverRan => report.fenced = report.fenced.saturating_add(1),
         End::Unaccounted => {
             report.fenced = report.fenced.saturating_add(1);
             report.accounts_kept = report.accounts_kept.saturating_add(1);
         }
-        End::Nothing => report.unresolved = report.unresolved.saturating_add(1),
+        End::Nothing | End::Unfollowed => {
+            report.unresolved = report.unresolved.saturating_add(1);
+        }
     }
     Ok(())
 }
@@ -1476,14 +1564,23 @@ pub(crate) async fn finish_resolutions(
 /// in the order come from two histories, and this device's note is about a collection that no
 /// longer exists. The recovery is the explicit one: forget the checkpoint and start the object
 /// again against the service this device now talks to.
-pub(crate) fn forked(object_id: SyncObjectId, note: Standing, found: SyncPosition) -> Result<()> {
+pub(crate) fn forked(
+    object_id: SyncObjectId,
+    note: Option<Standing>,
+    found: SyncPosition,
+) -> Result<()> {
     match note {
-        Standing::Forked { held } => Err(SyncError::ForkedHistory {
+        Some(Standing::Forked { held }) => Err(SyncError::ForkedHistory {
             object_id,
             expected: held,
             found,
         }),
-        Standing::Later | Standing::Same | Standing::Earlier => Ok(()),
+        // A note in another recovery's history was one the collection was put back from, and the
+        // answer replaced it: a collection put back is followed, not refused.
+        Some(
+            Standing::Later | Standing::Same | Standing::Earlier | Standing::OtherHistory { .. },
+        )
+        | None => Ok(()),
     }
 }
 
@@ -1559,7 +1656,9 @@ fn diagnose(
     if found.is_removal() || found.write_sequence == 0 {
         return Err(SyncError::NotAWrite { object_id, found });
     }
-    let Some(held) = held else {
+    // Places compare only within one history. An answer in another is read against the history of
+    // the collection where it is applied, and nothing is compared across the two.
+    let Some(held) = held.filter(|held| held.recovery() == found.recovery()) else {
         return Ok(());
     };
     if found.write_sequence < held.write_sequence {

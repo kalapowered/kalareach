@@ -52,14 +52,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ClientError, Result};
 use crate::retry::UserAction;
-use crate::services::{SyncExchanged, SyncPosition};
+use crate::services::{SyncExchanged, SyncPosition, SyncRecoveryId};
 use crate::sync::client::{
     Answer, ask_about, count_settled, diverged, end_fenced, finish_resolutions, forked,
 };
 use crate::sync::store::standing;
 use crate::sync::{
-    Claimed, InGeneration, Outcome, Reconciled, Resolutions, Settlement, Standing, SyncError,
-    SyncStore,
+    Across, Claimed, InGeneration, Outcome, Reconciled, Resolutions, Settlement, Standing,
+    SyncError, SyncStore,
 };
 
 /// The most a draft's synchronised payload may carry, in bytes.
@@ -804,11 +804,80 @@ impl DraftStore {
                 Some(held) => standing(held.position, checkpoint.position),
                 None => Standing::Later,
             };
+            if matches!(
+                stands,
+                Standing::Earlier | Standing::Forked { .. } | Standing::OtherHistory { .. }
+            ) {
+                return Ok(stands);
+            }
+            self.write_bytes(&self.checkpoint_path(draft_id), &bytes)?;
+            Ok(stands)
+        })();
+        drop(guard);
+        outcome
+    }
+
+    /// Records where a draft reached on the service, for an answer the synchronisation store has
+    /// read in the history of the draft's collection it reads, and says where it stood against the
+    /// note already here.
+    ///
+    /// As [`Self::record_checkpoint`], with one difference: a note in another recovery's history is
+    /// from a history the collection was put back from, and it is replaced rather than left
+    /// standing, because no place in it compares with this one.
+    pub(crate) fn answered_checkpoint(
+        &self,
+        draft_id: DraftId,
+        checkpoint: SyncCheckpoint,
+    ) -> Result<Standing> {
+        let bytes = kr_cbor::to_canonical_vec(&checkpoint)?;
+        let guard = self.exclusive()?;
+        let outcome = (|| {
+            let stands = match self.read_checkpoint(draft_id)? {
+                Some(held) => standing(held.position, checkpoint.position),
+                None => Standing::Later,
+            };
             if matches!(stands, Standing::Earlier | Standing::Forked { .. }) {
                 return Ok(stands);
             }
             self.write_bytes(&self.checkpoint_path(draft_id), &bytes)?;
             Ok(stands)
+        })();
+        drop(guard);
+        outcome
+    }
+
+    /// Follows the collection with a draft's note after a refusal read in the history of the
+    /// collection this device reads, when the note is in another.
+    ///
+    /// The note takes where the refusal says the draft stands, or goes when the refusal names no
+    /// place: a note from a history the collection was put back from names nothing the service holds
+    /// now, and a publication that compared against it would be refused for ever where the
+    /// collection has never held the draft. A note in this history is left for the fetch that
+    /// follows.
+    pub(crate) fn follow_refusal(
+        &self,
+        draft_id: DraftId,
+        current: Option<SyncPosition>,
+        recovery: Option<SyncRecoveryId>,
+    ) -> Result<()> {
+        let guard = self.exclusive()?;
+        let outcome = (|| {
+            let Some(held) = self.read_checkpoint(draft_id)? else {
+                return Ok(());
+            };
+            if held.position.recovery() == recovery {
+                return Ok(());
+            }
+            match current {
+                Some(position) => {
+                    let bytes = kr_cbor::to_canonical_vec(&SyncCheckpoint {
+                        position,
+                        published_revision: Nullable::null(),
+                    })?;
+                    self.write_bytes(&self.checkpoint_path(draft_id), &bytes)
+                }
+                None => self.remove_file(&self.checkpoint_path(draft_id)),
+            }
         })();
         drop(guard);
         outcome
@@ -1597,6 +1666,11 @@ impl DraftSync {
                 )?;
                 // The settlement is durable before this is raised. An answer this device's records
                 // cannot follow is one it may not carry on from, and the caller is told which.
+                if settled.across == Across::Unfollowed {
+                    return Err(SyncError::UnfollowedHistory {
+                        object_id: attempt.record.object_id,
+                    });
+                }
                 if let Some(held) = settled.diverged {
                     return Err(diverged(attempt.record.object_id, held, position));
                 }
@@ -1613,14 +1687,22 @@ impl DraftSync {
                     },
                 })
             }
-            Ok(SyncExchanged::Refused { retained, .. }) => {
+            Ok(SyncExchanged::Refused {
+                retained,
+                current,
+                recovery,
+            }) => {
                 // The refusal is settled first and on its own, along with the account of whatever
                 // the service kept of this write, so a fetch this device cannot make costs the copy
                 // rather than the knowledge that the write did not land.
                 let settled = self.store.settle_draft(
                     &attempt.dispatch,
                     &attempt.record,
-                    Outcome::Refused { retained },
+                    Outcome::Refused {
+                        retained,
+                        current,
+                        recovery,
+                    },
                     drafts,
                 )?;
                 if let Settlement::Discarded {
@@ -1631,6 +1713,11 @@ impl DraftSync {
                     return Ok(Published::Discarded {
                         produced_under,
                         current,
+                    });
+                }
+                if settled.across == Across::Unfollowed {
+                    return Err(SyncError::UnfollowedHistory {
+                        object_id: attempt.record.object_id,
                     });
                 }
                 Ok(
@@ -1768,7 +1855,7 @@ impl DraftSync {
                 }
                 Claimed::Gone => continue,
             };
-            match ask_about(&*self.service, &self.store, &staged).await? {
+            match ask_about(&*self.service, &self.store, &dispatch, &staged).await? {
                 Answer::Applied(position) => {
                     let settled = self.store.settle_draft(
                         &dispatch,
@@ -1778,17 +1865,25 @@ impl DraftSync {
                     )?;
                     count_settled(&settled, &mut report);
                 }
-                Answer::Refused(retained) => {
+                Answer::Refused { retained, recovery } => {
+                    // A receipt says what the refusal was told, not where the draft stands now, so
+                    // it names no place to follow.
                     let settled = self.store.settle_draft(
                         &dispatch,
                         &staged,
-                        Outcome::Refused { retained },
+                        Outcome::Refused {
+                            retained,
+                            current: None,
+                            recovery,
+                        },
                         drafts,
                     )?;
                     count_settled(&settled, &mut report);
                     // The copy belongs to the generation that admitted the work, and a fetch this
-                    // device cannot make costs it rather than the settlement.
+                    // device cannot make costs it rather than the settlement. One from a history
+                    // this device does not follow keeps none: the next pass reads the collection.
                     if settled.settlement == Settlement::Published
+                        && settled.across != Across::Unfollowed
                         && !matches!(
                             self.bring_down(
                                 drafts,
@@ -1804,8 +1899,18 @@ impl DraftSync {
                         report.copies_not_taken = report.copies_not_taken.saturating_add(1);
                     }
                 }
-                Answer::Fenced { never_ran } => {
-                    end_fenced(&self.store, &dispatch, &staged, never_ran, &mut report)?;
+                Answer::Fenced {
+                    never_ran,
+                    recovery,
+                } => {
+                    end_fenced(
+                        &self.store,
+                        &dispatch,
+                        &staged,
+                        never_ran,
+                        recovery,
+                        &mut report,
+                    )?;
                 }
                 Answer::Open => report.unresolved = report.unresolved.saturating_add(1),
             }
@@ -1882,6 +1987,8 @@ impl DraftSync {
         now: TimestampMs,
     ) -> crate::sync::Result<BroughtDown> {
         let object_id = SyncObjectId::new(draft_id.get());
+        // The history of the draft's collection the fetch is made against, taken as it leaves.
+        let basis = self.store.basis(object_id)?;
         let (position, ciphertext) = self.service.fetch(&draft_collection(draft_id)).await?;
         if position.is_removal() || position.write_sequence == 0 {
             return Err(SyncError::NotAWrite {
@@ -1901,20 +2008,27 @@ impl DraftSync {
             })
             .into());
         }
-        let applied = self.store.apply_under_generation(produced_under, || {
-            let copy = drafts.keep_copy(draft_id, &remote, retained, now)?;
-            // Where the object stands is this device's to remember; the revision beside it in the
-            // note is not, because the revision that fetch carried is the other device's counter
-            // and nothing about this device's own copies follows from it.
-            let note = drafts.record_checkpoint(
-                draft_id,
-                SyncCheckpoint {
-                    position,
-                    published_revision: Nullable::null(),
-                },
-            )?;
-            Ok((copy, note))
-        })?;
+        let applied = self.store.apply_under_history(
+            produced_under,
+            object_id,
+            basis,
+            position.recovery(),
+            || {
+                let copy = drafts.keep_copy(draft_id, &remote, retained, now)?;
+                // Where the object stands is this device's to remember; the revision beside it in
+                // the note is not, because the revision that fetch carried is the other device's
+                // counter and nothing about this device's own copies follows from it. A note from a
+                // history the collection was put back from is replaced by it.
+                let note = drafts.answered_checkpoint(
+                    draft_id,
+                    SyncCheckpoint {
+                        position,
+                        published_revision: Nullable::null(),
+                    },
+                )?;
+                Ok((copy, note))
+            },
+        )?;
         let (copy, note) = match applied {
             InGeneration::Applied(written) => written,
             InGeneration::Discarded {
@@ -1926,8 +2040,11 @@ impl DraftSync {
                     current,
                 });
             }
+            InGeneration::Unfollowed => {
+                return Err(SyncError::UnfollowedHistory { object_id });
+            }
         };
-        forked(object_id, note, position)?;
+        forked(object_id, Some(note), position)?;
         Ok(BroughtDown::Kept(Box::new(Fetched {
             remote,
             position,

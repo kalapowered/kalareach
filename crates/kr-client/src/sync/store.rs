@@ -7,7 +7,8 @@
 //! | Requests | One record of each publication this device admitted, settings, a client's position and drafts alike, and where it got to | **It depends on where it got to.** Work that never left is removed; a request that reached the service is an account of what left, and stays. |
 //! | Conflict copies | What the service held when a write of this device's lost | Removed. It is content another device produced. |
 //! | Checkpoints | Where each object reached on the service | Removed. It is production state, not content, and losing it costs a comparison. |
-//! | Publications | That this device published a collection, and where the write landed | **Kept.** It is the only account of what left, and section 24 shows what left rather than pretending it did not. |
+//! | Histories | Which recovery of each collection this device reads it in, and the ones it saw the collection put back from | **Kept.** It holds no content, and forgetting it would let an answer from a history this device has seen replaced move a note again. |
+//! | Publications | That this device published a collection, and where the write landed, one record for each history it landed in | **Kept.** It is the only account of what left, and section 24 shows what left rather than pretending it did not. |
 //! | Pinned labels | The labels a person pinned | **Kept**, and excluded from what is published while privacy mode is on. |
 //!
 //! # One request, one record
@@ -32,6 +33,21 @@
 //! it: both are the draft store's, and a settlement that moves a draft's note is handed the draft
 //! store to write it in. A draft store's lock is only ever taken inside this store's hold and
 //! never the other way round, so the two cannot wait on each other.
+//!
+//! # One history at a time
+//!
+//! A restore puts a collection back, and the places the service names from then on are places in
+//! the history the restore began: a new recovery identity. Places compare only within one history,
+//! so this store keeps, beside each collection, the recovery it reads the collection in and the ones
+//! it has seen the collection put back from. Every call carries its basis, the recovery this store
+//! read the collection in when the call left, and an answer is read against both
+//! ([`Across`]). In the history this store reads, every order rule applies. A recovery it has not
+//! met, answering a call made against the history it reads, is the collection put back: the store
+//! moves to it, and the note follows the collection as it now stands, in the hold that moves it. A
+//! recovery it has seen replaced, or one it has not met answering a call made before the store moved
+//! on, is a history this store does not follow: nothing is written from it but the account of what
+//! left. Nothing is compared across two histories, and nothing is written into the device's own
+//! objects because of one.
 //!
 //! # One store, one lock
 //!
@@ -70,7 +86,7 @@ use serde::{Deserialize, Serialize};
 use super::SyncObject;
 use crate::drafts::{DraftStore, SyncCheckpoint as DraftCheckpoint};
 use crate::retry::UserAction;
-use crate::services::SyncPosition;
+use crate::services::{SyncPosition, SyncRecoveryId};
 
 /// The extension of a stored object this device holds.
 const OBJECT_EXTENSION: &str = "object";
@@ -82,6 +98,8 @@ const REQUEST_EXTENSION: &str = "request";
 const CONFLICT_EXTENSION: &str = "conflict";
 /// The extension of the record that this device published a collection.
 const PUBLICATION_EXTENSION: &str = "published";
+/// The extension of the record of which history of a collection this device reads it in.
+const HISTORY_EXTENSION: &str = "history";
 /// The extension of the lock one dispatch is owned through.
 const CALLOUT_EXTENSION: &str = "callout";
 /// The extension of a file being written, which is not yet a file.
@@ -147,6 +165,96 @@ pub struct SyncCheckpoint {
     pub published_revision: Nullable<SyncRevisionId>,
 }
 
+/// Which history of one collection this device reads it in.
+///
+/// A collection with no record here is read in no recovery at all, which is what a service never
+/// put back names and what every collection was before this device met a restore. The record is
+/// written the first time the collection is put back, in the hold that moves its note.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct History {
+    /// The recovery the collection is read in.
+    current: Nullable<SyncRecoveryId>,
+    /// Every recovery this device has seen the collection put back from, oldest first.
+    replaced: Vec<Nullable<SyncRecoveryId>>,
+}
+
+impl History {
+    /// The history of a collection this device has never seen put back.
+    const fn never_put_back() -> Self {
+        Self {
+            current: Nullable::null(),
+            replaced: Vec::new(),
+        }
+    }
+
+    /// Where an answer in `answered`, to a call made against `basis`, stands against this history.
+    fn across(&self, basis: Basis, answered: Option<SyncRecoveryId>) -> Across {
+        if self.current.0 == answered {
+            return Across::Same;
+        }
+        if self.replaced.contains(&Nullable(answered)) {
+            return Across::Unfollowed;
+        }
+        // A recovery this device has not met. Only a call made against the history it reads can
+        // move it there: a call made before another answer moved it cannot say which of the two
+        // histories came later, and recovery identities carry no order of their own.
+        if basis.0 == self.current.0 {
+            Across::PutBack {
+                replaced: self.current.0,
+            }
+        } else {
+            Across::Unfollowed
+        }
+    }
+
+    /// This history, moved to the recovery a collection was put back into.
+    fn moved_to(mut self, recovery: Option<SyncRecoveryId>) -> Self {
+        self.replaced.push(self.current);
+        self.current = Nullable(recovery);
+        self
+    }
+}
+
+/// The history of one collection a call was made against: the recovery this device read the
+/// collection in when the call left.
+///
+/// Every call carries one, taken under the store's lock as the call leaves, and every answer is
+/// read against it. An answer can move this device into another history only when the call it
+/// answers was made against the one the device still reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Basis(Option<SyncRecoveryId>);
+
+impl Basis {
+    /// Returns the recovery the collection was read in when the call left, or none for a
+    /// collection never put back.
+    #[must_use]
+    pub const fn recovery(self) -> Option<SyncRecoveryId> {
+        self.0
+    }
+}
+
+/// Where one answer stood against the history of its collection this device reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Across {
+    /// The answer is in the history this device reads the collection in, and every order rule
+    /// applies to it.
+    Same,
+    /// The collection was put back. The answer is in a history this device had not met, answering
+    /// a call made against the one it read, and the device now reads the collection in the
+    /// answer's history. Nothing is compared across the two: the note follows the collection as it
+    /// now stands, and the device's own object is never replaced because of it.
+    PutBack {
+        /// The history the collection was put back from.
+        replaced: Option<SyncRecoveryId>,
+    },
+    /// The answer is in a history this device does not follow: one it has seen the collection put
+    /// back from, or one it had not met, answering a call made before the device moved to the
+    /// history it reads now. Nothing is written from it but the account of what left, and the next
+    /// call, made against the history the device reads, asks again.
+    Unfollowed,
+}
+
 /// This device's whole account of one publication request.
 ///
 /// One request identity, one file, replaced whole at every step. A device that stops part way
@@ -175,6 +283,15 @@ pub struct RequestRecord {
     /// A result carries it back, and the publication is accepted only when it is still the
     /// generation in force. An older one belongs to work privacy mode cancelled.
     pub produced_under: U64,
+    /// The history of the collection this work was admitted in: the recovery this device read the
+    /// collection in, null for one never put back.
+    ///
+    /// Work admitted in a history the collection has since been put back from is never attempted
+    /// again, and a service that holds no receipt of it in the history it serves now is asked to
+    /// end it at once. A record written before this member existed has none and reads as null,
+    /// which is the history every collection was read in then.
+    #[serde(default = "Nullable::null")]
+    pub admitted_under: Nullable<SyncRecoveryId>,
     /// The earliest instant any attempt under this identity was signed at.
     ///
     /// Null while the work is admitted and not sent, and written in the same replacement that
@@ -563,7 +680,24 @@ pub enum Outcome {
     Refused {
         /// What the service called the copy it kept of the refused write, when it kept one.
         retained: Option<SyncConflictId>,
+        /// Where the object stood when the refusal was answered, when the answer said so: the write
+        /// that beat this one, or a removal's place. Nothing when the collection had never held the
+        /// object, and nothing when the answer said nothing about where it stands.
+        current: Option<SyncPosition>,
+        /// The history the refusal was answered in.
+        recovery: Option<SyncRecoveryId>,
     },
+}
+
+impl Outcome {
+    /// Returns the history the answer came from.
+    #[must_use]
+    pub const fn recovery(&self) -> Option<SyncRecoveryId> {
+        match self {
+            Self::Accepted { position } => position.recovery(),
+            Self::Refused { recovery, .. } => *recovery,
+        }
+    }
 }
 
 /// What settling one publication did, and where its answer stood against what this device held.
@@ -590,6 +724,8 @@ pub struct Settled {
     /// Nothing where none found one, including where there was nothing to compare: a refusal
     /// replaced nothing, and a request something else had already settled has nothing left.
     pub diverged: Option<SyncPosition>,
+    /// Where the answer stood against the history of the collection this device reads.
+    pub across: Across,
 }
 
 /// What applying one fetch's answer did.
@@ -599,8 +735,10 @@ pub struct Fetched {
     pub settlement: Settlement,
     /// The copy kept beside this device's own content, when one was kept.
     pub copy: Option<SyncConflictId>,
-    /// Where the answer stood against the note this device held.
-    pub note: Standing,
+    /// Where the answer stood against the note this device held, when the answer was applied.
+    pub note: Option<Standing>,
+    /// Where the answer stood against the history of the collection this device reads.
+    pub across: Across,
 }
 
 /// Where one answer stands against a position this device already established.
@@ -622,6 +760,15 @@ pub enum Standing {
         /// What the record this device holds names that place in the order.
         held: SyncPosition,
     },
+    /// A place in another recovery's history, which no place in this one can be compared with.
+    ///
+    /// A record this device holds stands against one: only an answer read against the history of
+    /// the collection moves a record across a restore, and it does so in the hold that moves the
+    /// history.
+    OtherHistory {
+        /// What the record this device holds names.
+        held: SyncPosition,
+    },
 }
 
 /// What ending one request at the service left behind.
@@ -640,6 +787,21 @@ pub enum End {
     Unaccounted,
     /// There was nothing to end: the work never left, or something had already ended it.
     Nothing,
+    /// The fence was answered from a history of the collection this device does not follow, so it
+    /// ended nothing this device can count on, and the request stays counted.
+    Unfollowed,
+}
+
+/// What a status answer that holds no receipt says about the history a request was admitted in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Crossing {
+    /// Admitted in the history the collection is read in, so the request may still be on its way.
+    InHistory,
+    /// Admitted in a history the collection has since been put back from. It is never attempted
+    /// again, and it is ended at once.
+    Crossed,
+    /// The answer was in a history this device does not follow, and it settles nothing.
+    Unfollowed,
 }
 
 /// What running one step under the late-result rule did.
@@ -654,6 +816,8 @@ pub enum InGeneration<T> {
         /// The generation in force now.
         current: u64,
     },
+    /// The answer was in a history of the collection this device does not follow, so nothing ran.
+    Unfollowed,
 }
 
 /// What settling one publication did.
@@ -805,13 +969,16 @@ pub enum SyncError {
         /// The generation in force now.
         current: u64,
     },
-    /// The service holds an earlier write of the object than this device's note names.
+    /// The service holds an earlier write of the object than this device's note names, in the same
+    /// history.
     ///
-    /// A service that was reset or replaced leaves one, and so does one restored from a backup.
-    /// Write sequences only ever go forward, so a smaller one is provable rather than guessed at,
-    /// whether a fetch shows it or the answer to one of this device's own writes puts the write
-    /// behind the place it replaced. The publication is refused and there is nothing to fetch;
-    /// forgetting the checkpoint is the explicit recovery, and nothing does it automatically.
+    /// A service that was reset or replaced without saying so leaves one. Write sequences only ever
+    /// go forward within one history, so a smaller one is provable rather than guessed at, whether a
+    /// fetch shows it or the answer to one of this device's own writes puts the write behind the
+    /// place it replaced. A collection put back from an archive names a history of its own and is
+    /// never this: it is followed rather than refused. The publication is refused and there is
+    /// nothing to fetch; forgetting the checkpoint is the explicit recovery, and nothing does it
+    /// automatically.
     #[error(
         "object {object_id} reached write {expected} on the service, which now holds write {found}; forget its checkpoint to start again"
     )]
@@ -842,9 +1009,11 @@ pub enum SyncError {
     ///
     /// Two devices cannot produce this: one write sequence names one write for the life of a
     /// collection, and a write takes the next place after the one it replaced, so an answer that
-    /// puts one of this device's writes at the very place that write replaced is this case too. A service whose history forked can, and so can a collection rebuilt from
-    /// somewhere else, and neither is something this device may write a note from. The recovery is
-    /// the same as for a service that went back: forget the checkpoint and start the object again.
+    /// puts one of this device's writes at the very place that write replaced is this case too. A
+    /// service whose history forked without saying so can, and neither is something this device may
+    /// write a note from. A collection put back from an archive names a history of its own and is
+    /// never this. The recovery is the same as for a service that went back: forget the checkpoint
+    /// and start the object again.
     #[error(
         "object {object_id} reached {expected} on the service, which now holds {found} in that same place; forget its checkpoint to start again"
     )]
@@ -855,6 +1024,20 @@ pub enum SyncError {
         expected: SyncPosition,
         /// The position the service answered with, under the same write sequence.
         found: SyncPosition,
+    },
+    /// The service answered from a history of the collection this device does not follow.
+    ///
+    /// Either one this device has seen the collection put back from, or one it had not met,
+    /// answering a call made before another answer moved this device to the history it reads now.
+    /// Recovery identities carry no order of their own, so such an answer cannot say whether it is
+    /// older or newer than what this device reads, and nothing but the account of what left is
+    /// written from it. Asking again asks the history this device reads.
+    #[error(
+        "object {object_id} was answered from a history of its collection this device does not follow; ask again"
+    )]
+    UnfollowedHistory {
+        /// The object.
+        object_id: SyncObjectId,
     },
     /// The client failed.
     #[error("{0}")]
@@ -894,6 +1077,9 @@ impl SyncError {
             | Self::Crypto(_) => ErrorCode::InvalidArgument,
             Self::Fenced { .. } | Self::LateResult { .. } => ErrorCode::PermissionDenied,
             Self::StaleCheckpoint { .. } | Self::ForkedHistory { .. } => ErrorCode::DraftConflict,
+            // Nothing followed from the answer, and a fresh read of the history this device reads
+            // is what follows.
+            Self::UnfollowedHistory { .. } => ErrorCode::ResyncRequired,
             // What became of the publication is not known yet, and what makes it known is the
             // answer to the call that is out rather than another one beside it.
             Self::InFlight { .. } => ErrorCode::OutcomeUnknown,
@@ -925,6 +1111,7 @@ impl SyncError {
             | Self::LateResult { .. }
             | Self::StaleCheckpoint { .. }
             | Self::ForkedHistory { .. }
+            | Self::UnfollowedHistory { .. }
             | Self::Encoding(_)
             | Self::Crypto(_) => UserAction::Nothing,
         }
@@ -1170,6 +1357,10 @@ impl SyncStore {
     /// arrive out of order: a publication is accepted, another device writes, a fetch brings that
     /// down, and only then does the first answer come back naming the write before it.
     ///
+    /// A place in another history than the one this device reads the collection in stands nowhere,
+    /// and this returns false: a collection put back is followed by the answers that show it, read
+    /// against the call they answer, never by a note handed in from outside that reading.
+    ///
     /// # Errors
     ///
     /// Returns [`SyncError::Storage`] when the note cannot be read or written.
@@ -1179,9 +1370,17 @@ impl SyncStore {
         checkpoint: SyncCheckpoint,
     ) -> Result<bool> {
         let guard = self.lock()?;
-        let outcome = self.write_checkpoint(object_id, checkpoint);
+        let outcome = (|| {
+            if self.read_history(object_id)?.current.0 != checkpoint.position.recovery() {
+                return Ok(None);
+            }
+            self.write_checkpoint(object_id, checkpoint).map(Some)
+        })();
         drop(guard);
-        Ok(matches!(outcome?, Standing::Later | Standing::Same))
+        Ok(matches!(
+            outcome?,
+            Some(Standing::Later | Standing::Same | Standing::OtherHistory { .. })
+        ))
     }
 
     /// Writes a checkpoint unless the note that stands does not follow from this answer.
@@ -1195,6 +1394,10 @@ impl SyncStore {
     /// a collection, so two answers claiming one place in the order come from two histories, and
     /// replacing a note this device established with one from the other history would leave it
     /// comparing against a state the service it is talking to may never have held.
+    ///
+    /// A note in another recovery's history is replaced, because the caller has read this answer
+    /// against the history of the collection and found it in the one this device reads: the note
+    /// is from a history the collection was put back from, and no place in it compares with this.
     ///
     /// The caller holds the lock.
     fn write_checkpoint(
@@ -1222,20 +1425,106 @@ impl SyncStore {
         Ok(stands)
     }
 
-    /// Forgets where an object reached on the service.
+    /// Follows the collection with the note after a refusal read in the history this device reads
+    /// the collection in, when the note is in another.
+    ///
+    /// The note is from a history the collection was put back from, so it names nothing the service
+    /// holds now, and a publication that compared against it would be refused for ever where the
+    /// collection has never held the object. It takes where the refusal says the object stands, and
+    /// goes where the refusal names no place. A note in this history is the fetch's to move, as it
+    /// always was.
+    ///
+    /// The caller holds the lock.
+    fn follow_refusal(
+        &self,
+        held: &RequestRecord,
+        current: Option<SyncPosition>,
+        recovery: Option<SyncRecoveryId>,
+        drafts: Option<&DraftStore>,
+    ) -> Result<()> {
+        let current = current.filter(|position| position.write_sequence != 0);
+        match held.revision {
+            RequestRevision::Object(_) => {
+                let Some(note) = self.read_checkpoint(held.object_id)? else {
+                    return Ok(());
+                };
+                if note.position.recovery() == recovery {
+                    return Ok(());
+                }
+                let path = self.path(held.object_id, CHECKPOINT_EXTENSION);
+                match current {
+                    Some(position) => {
+                        let bytes = kr_cbor::to_canonical_vec(&SyncCheckpoint {
+                            position,
+                            published_revision: Nullable::null(),
+                        })?;
+                        self.write_bytes(&path, &bytes)
+                    }
+                    None => self.remove_file(&path),
+                }
+            }
+            RequestRevision::Draft(_) => match drafts {
+                Some(drafts) => drafts
+                    .follow_refusal(DraftId::new(held.object_id.get()), current, recovery)
+                    .map_err(SyncError::from),
+                None => Ok(()),
+            },
+        }
+    }
+
+    /// Forgets where an object reached on the service, and which history of its collection this
+    /// device reads.
     ///
     /// A device signed out of the service, or starting again against a different one, has a note
     /// naming a write nothing holds. Forgetting it costs the next publication a comparison and
     /// a fetch; keeping it costs a comparison against a number that means nothing. Nothing does it
     /// automatically, because a note that looks stale and is not is a note whose object another
-    /// device has just written.
+    /// device has just written. The history goes with it: another service's collection is not one
+    /// this device has seen put back, whatever recovery it names. A draft's note is the draft
+    /// store's to forget, and this forgets the history of the draft's collection.
     ///
     /// # Errors
     ///
-    /// Returns [`SyncError::Storage`] when the note cannot be removed.
+    /// Returns [`SyncError::Storage`] when the note or the history cannot be removed.
     pub fn forget_checkpoint(&self, object_id: SyncObjectId) -> Result<()> {
         let guard = self.lock()?;
-        let outcome = self.remove_file(&self.path(object_id, CHECKPOINT_EXTENSION));
+        let outcome = self
+            .remove_file(&self.path(object_id, CHECKPOINT_EXTENSION))
+            .and_then(|()| self.remove_file(&self.path(object_id, HISTORY_EXTENSION)));
+        drop(guard);
+        outcome
+    }
+
+    /// Returns the history of one collection a call about to leave is made against: the recovery
+    /// this device reads the collection in.
+    ///
+    /// A call takes it as it leaves, and hands it back with the answer, so the answer is read
+    /// against the history the call was made against.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Storage`] when the record cannot be read.
+    pub fn basis(&self, object_id: SyncObjectId) -> Result<Basis> {
+        let guard = self.lock()?;
+        let outcome = self.read_basis(object_id);
+        drop(guard);
+        outcome
+    }
+
+    /// Returns the note beside an object and the history a call about it is made against, under
+    /// one hold, which is what a fetch compares its answer with.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Storage`] when a record cannot be read.
+    pub fn checkpoint_and_basis(
+        &self,
+        object_id: SyncObjectId,
+    ) -> Result<(Option<SyncCheckpoint>, Basis)> {
+        let guard = self.lock()?;
+        let outcome = self
+            .read_checkpoint(object_id)
+            .and_then(|note| Ok((note, self.read_basis(object_id)?)));
         drop(guard);
         outcome
     }
@@ -1334,6 +1623,7 @@ impl SyncStore {
                 .read_object(object_id)?
                 .ok_or(SyncError::Unknown { object_id })?;
             let note = self.read_checkpoint(object_id)?;
+            let history = self.read_history(object_id)?;
             let ciphertext = seal(&object)?;
             let record = RequestRecord {
                 // A fresh identity nothing else can know yet, which is why admission needs no claim
@@ -1346,6 +1636,7 @@ impl SyncStore {
                 // says nothing is there rather than naming a place nothing occupies.
                 expected: note.map_or(Nullable::null(), |note| Nullable::some(note.position)),
                 produced_under: privacy.generation,
+                admitted_under: history.current,
                 first_signed_at_ms: Nullable::null(),
                 last_signed_at_ms: Nullable::null(),
                 state: RequestState::Admitted {
@@ -1451,14 +1742,15 @@ impl SyncStore {
                 // The state was written two statements above and it is the only one this reaches.
                 unreachable!("the record this call wrote says it was dispatched");
             };
-            Ok((ciphertext, signed_at))
+            Ok((ciphertext, signed_at, self.read_basis(object_id)?))
         })();
         drop(guard);
-        let (ciphertext, signed_at) = outcome?;
+        let (ciphertext, signed_at, basis) = outcome?;
         Ok((
             Dispatch {
                 directory: self.directory.clone(),
                 work_id,
+                basis,
                 _lock: owned,
             },
             ciphertext,
@@ -1486,13 +1778,20 @@ impl SyncStore {
         };
         let path = self.named(work_id, REQUEST_EXTENSION);
         let guard = self.lock()?;
-        let held = self.read_request(&path);
+        let held = self.read_request(&path).and_then(|record| match record {
+            Some(record) => {
+                let basis = self.read_basis(record.object_id)?;
+                Ok(Some((record, basis)))
+            }
+            None => Ok(None),
+        });
         drop(guard);
         Ok(match held? {
-            Some(record) if record.dispatched() => Claimed::Taken(
+            Some((record, basis)) if record.dispatched() => Claimed::Taken(
                 Dispatch {
                     directory: self.directory.clone(),
                     work_id,
+                    basis,
                     _lock: owned,
                 },
                 Box::new(record),
@@ -1514,13 +1813,25 @@ impl SyncStore {
     ///
     /// Returns [`SyncError::Storage`] when the lock cannot be taken.
     pub fn claim_request(&self, work_id: Uuid) -> Result<Option<Dispatch>> {
-        Ok(
-            Lock::try_take(&self.named(work_id, CALLOUT_EXTENSION))?.map(|owned| Dispatch {
-                directory: self.directory.clone(),
-                work_id,
-                _lock: owned,
-            }),
-        )
+        let Some(owned) = Lock::try_take(&self.named(work_id, CALLOUT_EXTENSION))? else {
+            return Ok(None);
+        };
+        // The history the answer is read against is the collection's, when the record still says
+        // which collection that is. A record that has gone leaves nothing an answer could write.
+        let guard = self.lock()?;
+        let basis = self
+            .read_request(&self.named(work_id, REQUEST_EXTENSION))
+            .and_then(|record| match record {
+                Some(record) => self.read_basis(record.object_id),
+                None => Ok(Basis(None)),
+            });
+        drop(guard);
+        Ok(Some(Dispatch {
+            directory: self.directory.clone(),
+            work_id,
+            basis: basis?,
+            _lock: owned,
+        }))
     }
 
     /// Makes one attempt at publishing a draft: the first, which admits the publication, or a later
@@ -1584,9 +1895,14 @@ impl SyncStore {
                     generation: privacy.generation.get(),
                 });
             }
-            // The publication already out for this revision, under the generation in force. A
-            // record this build cannot read is not one an attempt can be made from, so it is left
-            // where it is and counted, as it is everywhere else.
+            // The publication already out for this revision, under the generation in force and in the
+            // history of the collection this device reads. A publication admitted in a history the
+            // collection has since been put back from is never attempted again: the receipt of an
+            // attempt the replaced history ran is not in the history that replaced it, so a later
+            // attempt there could run a second time. A record this build cannot read is not one an
+            // attempt can be made from, so it is left where it is and counted, as it is everywhere
+            // else.
+            let history = self.read_history(object_id)?;
             let out =
                 self.read_requests()?
                     .items
@@ -1597,6 +1913,7 @@ impl SyncStore {
                                 && record.object_id == object_id
                                 && record.revision == revision
                                 && record.produced_under == privacy.generation
+                                && record.admitted_under == history.current
                                 && record.may_attempt_again(signed_at) =>
                         {
                             Some((ciphertext.clone(), record))
@@ -1612,7 +1929,7 @@ impl SyncStore {
                 };
                 let sent = held.attempted_at(signed_at);
                 self.write_request(&sent)?;
-                return Ok((sent, ciphertext, lock));
+                return Ok((sent, ciphertext, lock, Basis(history.current.0)));
             }
 
             let ciphertext = Bytes::new(seal()?);
@@ -1630,6 +1947,7 @@ impl SyncStore {
                 // No note is no position, which is the comparison a first publication makes.
                 expected: Nullable::from(expected),
                 produced_under: privacy.generation,
+                admitted_under: history.current,
                 first_signed_at_ms: Nullable::null(),
                 last_signed_at_ms: Nullable::null(),
                 state: RequestState::Dispatched {
@@ -1643,14 +1961,15 @@ impl SyncStore {
                 self.retire(work_id)?;
                 return Err(error);
             }
-            Ok((sent, ciphertext, lock))
+            Ok((sent, ciphertext, lock, Basis(history.current.0)))
         })();
         drop(guard);
-        let (record, ciphertext, lock) = outcome?;
+        let (record, ciphertext, lock, basis) = outcome?;
         Ok(Attempt {
             dispatch: Dispatch {
                 directory: self.directory.clone(),
                 work_id: record.work_id,
+                basis,
                 _lock: lock,
             },
             record,
@@ -1726,7 +2045,13 @@ impl SyncStore {
     ///
     /// Returns [`SyncError::OtherRequest`] when the dispatch is held for a different request, and
     /// [`SyncError::Storage`] when a record cannot be read, written or removed.
-    pub fn close_fenced(&self, dispatch: &Dispatch, work_id: Uuid, never_ran: bool) -> Result<End> {
+    pub fn close_fenced(
+        &self,
+        dispatch: &Dispatch,
+        work_id: Uuid,
+        never_ran: bool,
+        recovery: Option<SyncRecoveryId>,
+    ) -> Result<End> {
         dispatch.owns(&self.directory, work_id)?;
         let path = self.named(work_id, REQUEST_EXTENSION);
         let guard = self.lock()?;
@@ -1737,6 +2062,13 @@ impl SyncStore {
             };
             if !held.dispatched() {
                 return Ok(End::Nothing);
+            }
+            // A fence holds in the history that answered it. One this device does not follow ends
+            // nothing it can count on: the history the collection is read in may still run the
+            // request, so it stays counted and the next pass asks again.
+            if self.follow_history(held.object_id, dispatch.basis, recovery)? == Across::Unfollowed
+            {
+                return Ok(End::Unfollowed);
             }
             if never_ran {
                 self.remove_file(&path)?;
@@ -1766,6 +2098,44 @@ impl SyncStore {
         let outcome = self.read_privacy();
         drop(guard);
         Ok(outcome?.generation.get() > record.produced_under.get())
+    }
+
+    /// Reads a status answer that holds no receipt against the history of the collection, and says
+    /// whether the request was admitted in a history the collection has since been put back from.
+    ///
+    /// Such a request is never attempted again, and the history that replaced the one it was
+    /// admitted in holds no receipt of it, so waiting could end only by an attempt still on its way
+    /// landing in the collection as it now stands. A reconciliation ends it at once instead, whatever
+    /// privacy generation is in force: the fence stops any attempt still on its way, and its answer
+    /// says what is left to account for.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::OtherRequest`] when the dispatch is held for a different request, and
+    /// [`SyncError::Storage`] when the history cannot be read or written.
+    pub fn crossed(
+        &self,
+        dispatch: &Dispatch,
+        record: &RequestRecord,
+        answered: Option<SyncRecoveryId>,
+    ) -> Result<Crossing> {
+        dispatch.owns(&self.directory, record.work_id)?;
+        let guard = self.lock()?;
+        let outcome = (|| {
+            if self.follow_history(record.object_id, dispatch.basis, answered)?
+                == Across::Unfollowed
+            {
+                return Ok(Crossing::Unfollowed);
+            }
+            // The collection is read in the answer's history from here on.
+            Ok(if record.admitted_under.0 == answered {
+                Crossing::InHistory
+            } else {
+                Crossing::Crossed
+            })
+        })();
+        drop(guard);
+        outcome
     }
 
     /// Takes back every piece of work that was admitted and never sent.
@@ -1908,6 +2278,10 @@ impl SyncStore {
             }
             let privacy = self.read_privacy()?;
             let in_force = privacy.generation.get() == held.produced_under.get();
+            // Where the answer stands against the history of the collection, decided in the hold
+            // that writes whatever follows from it, and moved there when the collection was put
+            // back. The history is no content, so a late generation moves it too.
+            let across = self.follow_history(held.object_id, dispatch.basis, outcome.recovery())?;
 
             let (settled, diverged) = match outcome {
                 Outcome::Accepted { position } => {
@@ -1916,25 +2290,45 @@ impl SyncStore {
                     // the order counts from one; neither is somewhere a write this device sent can
                     // have landed, and an answer this device cannot read is one it declines.
                     a_write_landed_at(held.object_id, position)?;
-                    // A write takes the next place after the one it replaced, so an answer at that
-                    // place or behind it is not a later state of the history this request was
-                    // made against: a smaller write sequence is a service that went back, and the
-                    // same one is two histories claiming one place. It is recorded as that and
-                    // never as applied. The request's own record is the account of what left, and
-                    // nothing else is written from it: no note and no publication record, because
-                    // both would describe a history this device cannot follow.
-                    if let Some(replaced) = not_past(held.expected.as_ref().copied(), position) {
+                    if across == Across::Unfollowed {
+                        // It ran in a history this device does not follow. The request's own
+                        // record is the account of what left under it, and nothing else is written
+                        // from it: no note and no publication record.
+                        (RequestState::Diverged { position }, None)
+                    } else if let Some(replaced) =
+                        not_past(held.expected.as_ref().copied(), position)
+                    {
+                        // A write takes the next place after the one it replaced, so an answer at
+                        // that place or behind it, in the same history, is not a later state of
+                        // the history this request was made against: a smaller write sequence is a
+                        // service that went back, and the same one is two histories claiming one
+                        // place. It is recorded as that and never as applied. The request's own
+                        // record is the account of what left, and nothing else is written from it:
+                        // no note and no publication record, because both would describe a history
+                        // this device cannot follow.
                         (RequestState::Diverged { position }, Some(replaced))
                     } else {
+                        // In a collection put back, nothing is compared across the restore: the
+                        // service compared the revision this write named against what the
+                        // collection it serves now holds, and that is what put the write there.
                         self.accepted_at(&held, position, in_force, drafts)?
                     }
                 }
-                Outcome::Refused { retained } => (
-                    RequestState::Refused {
-                        retained: retained.map_or_else(Nullable::null, Nullable::some),
-                    },
-                    None,
-                ),
+                Outcome::Refused {
+                    retained,
+                    current,
+                    recovery,
+                } => {
+                    if in_force && across != Across::Unfollowed {
+                        self.follow_refusal(&held, current, recovery, drafts)?;
+                    }
+                    (
+                        RequestState::Refused {
+                            retained: retained.map_or_else(Nullable::null, Nullable::some),
+                        },
+                        None,
+                    )
+                }
             };
             // One replacement of one file ends the request. Everything the answer still owes the
             // store is derived from this record afterwards, so a stop anywhere from here leaves
@@ -1954,6 +2348,7 @@ impl SyncStore {
                     }
                 },
                 diverged,
+                across,
             })
         })();
         drop(guard);
@@ -2032,7 +2427,7 @@ impl SyncStore {
                     });
                 };
                 drafts
-                    .record_checkpoint(
+                    .answered_checkpoint(
                         DraftId::new(held.object_id.get()),
                         DraftCheckpoint {
                             position,
@@ -2147,6 +2542,7 @@ impl SyncStore {
                 }
             },
             diverged: None,
+            across: Across::Same,
         })
     }
 
@@ -2158,7 +2554,7 @@ impl SyncStore {
         record: &RequestRecord,
         position: SyncPosition,
     ) -> Result<Standing> {
-        let path = self.path(record.object_id, PUBLICATION_EXTENSION);
+        let path = self.publication_path(record.object_id, position.recovery());
         Ok(match self.read_optional::<Publication>(&path)? {
             Some(held) => standing(held.position, position),
             None => Standing::Later,
@@ -2177,6 +2573,10 @@ impl SyncStore {
     /// settling a refusal answers with a copy whatever is held, because the service refused the
     /// comparison and what it holds is another device's.
     ///
+    /// The answer is read against the history of the collection the fetch was made against,
+    /// `basis`, in the same hold. One in a history this device does not follow writes nothing, and
+    /// one from a collection put back moves this device to the history it names, the note with it.
+    ///
     /// # Errors
     ///
     /// Returns whatever `copy` failed with, and [`SyncError::Storage`] when a record cannot be
@@ -2186,6 +2586,7 @@ impl SyncStore {
         produced_under: u64,
         object_id: SyncObjectId,
         checkpoint: SyncCheckpoint,
+        basis: Basis,
         copy: impl FnOnce(Option<&SyncObject>) -> Result<Option<ConflictCopy>>,
     ) -> Result<Fetched> {
         let guard = self.lock()?;
@@ -2198,7 +2599,17 @@ impl SyncStore {
                         current: privacy.generation.get(),
                     },
                     copy: None,
-                    note: Standing::Later,
+                    note: None,
+                    across: Across::Same,
+                });
+            }
+            let across = self.follow_history(object_id, basis, checkpoint.position.recovery())?;
+            if across == Across::Unfollowed {
+                return Ok(Fetched {
+                    settlement: Settlement::Published,
+                    copy: None,
+                    note: None,
+                    across,
                 });
             }
             // What this device holds is read inside the hold and handed to the decision, because a
@@ -2217,7 +2628,8 @@ impl SyncStore {
             Ok(Fetched {
                 settlement: Settlement::Published,
                 copy: kept.map(|copy: ConflictCopy| copy.conflict_id),
-                note,
+                note: Some(note),
+                across,
             })
         })();
         drop(guard);
@@ -2233,16 +2645,25 @@ impl SyncStore {
     /// lock: a cleanup cannot land between the check and the writes. The draft store's own lock is
     /// taken inside that hold, which is the one order the two are ever taken in.
     ///
+    /// The answer is read against the history of the collection too, in the same hold, as a
+    /// fetch of a setting's is: `answered` is the recovery it named and `basis` the history the
+    /// fetch was made against. `apply` runs only for an answer in the history this device reads,
+    /// which is the one a collection put back has just moved it to when it was put back.
+    ///
     /// Returns what `apply` produced, or, under a generation privacy mode has fenced or moved past,
-    /// that nothing ran and which generation is in force instead.
+    /// that nothing ran and which generation is in force instead, or that the answer was in a
+    /// history this device does not follow.
     ///
     /// # Errors
     ///
-    /// Returns whatever `apply` failed with, and [`SyncError::Storage`] when the privacy record
-    /// cannot be read.
-    pub fn apply_under_generation<T>(
+    /// Returns whatever `apply` failed with, and [`SyncError::Storage`] when the privacy record or
+    /// the history cannot be read or written.
+    pub fn apply_under_history<T>(
         &self,
         produced_under: u64,
+        object_id: SyncObjectId,
+        basis: Basis,
+        answered: Option<SyncRecoveryId>,
         apply: impl FnOnce() -> Result<T>,
     ) -> Result<InGeneration<T>> {
         let guard = self.lock()?;
@@ -2253,6 +2674,10 @@ impl SyncStore {
                     produced_under,
                     current: privacy.generation.get(),
                 });
+            }
+            let across = self.follow_history(object_id, basis, answered)?;
+            if across == Across::Unfollowed {
+                return Ok(InGeneration::Unfollowed);
             }
             Ok(InGeneration::Applied(apply()?))
         })();
@@ -2459,7 +2884,7 @@ impl SyncStore {
     /// The caller holds the lock.
     fn write_publication(&self, publication: &Publication) -> Result<Standing> {
         let bytes = kr_cbor::to_canonical_vec(publication)?;
-        let path = self.path(publication.object_id, PUBLICATION_EXTENSION);
+        let path = self.publication_path(publication.object_id, publication.position.recovery());
         // A record already naming a later write stands, for the reason a checkpoint does: two
         // answers can arrive out of order, and writing the older one would say this device
         // published less recently than it did. The service's own order decides it, so there is one
@@ -2690,6 +3115,70 @@ impl SyncStore {
 
     fn path(&self, object_id: SyncObjectId, extension: &str) -> PathBuf {
         self.named(object_id.get(), extension)
+    }
+
+    /// Where the publication record of one object in one history is kept.
+    ///
+    /// One record for each history an object was published in, so an account in a history the
+    /// collection was put back from is never replaced by one in the history that replaced it,
+    /// whichever answer arrives last. A collection never put back keeps the name it always had.
+    fn publication_path(
+        &self,
+        object_id: SyncObjectId,
+        recovery: Option<SyncRecoveryId>,
+    ) -> PathBuf {
+        match recovery {
+            None => self.path(object_id, PUBLICATION_EXTENSION),
+            Some(recovery) => self
+                .directory
+                .join(format!("{object_id}.{recovery}.{PUBLICATION_EXTENSION}")),
+        }
+    }
+
+    /// Reads which history of one collection this device reads it in.
+    ///
+    /// A record this build cannot read is removed and read as the history of a collection never put
+    /// back, as a note it cannot read is removed: what the record kept this device from following
+    /// is an answer from a history the collection was put back from, and such an answer is read as
+    /// the collection put back again, which moves notes and nothing else.
+    ///
+    /// The caller holds the lock.
+    fn read_history(&self, object_id: SyncObjectId) -> Result<History> {
+        let path = self.path(object_id, HISTORY_EXTENSION);
+        match self.read_optional::<History>(&path) {
+            Ok(history) => Ok(history.unwrap_or_else(History::never_put_back)),
+            Err(SyncError::Corrupt { .. } | SyncError::Encoding(_)) => {
+                self.remove_file(&path)?;
+                Ok(History::never_put_back())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Returns the history a call about one collection leaving now is made against.
+    ///
+    /// The caller holds the lock.
+    fn read_basis(&self, object_id: SyncObjectId) -> Result<Basis> {
+        Ok(Basis(self.read_history(object_id)?.current.0))
+    }
+
+    /// Reads one answer against the history of its collection, and moves this device to the
+    /// answer's history when the collection was put back.
+    ///
+    /// The caller holds the lock, and writes whatever follows from the answer in the same hold.
+    fn follow_history(
+        &self,
+        object_id: SyncObjectId,
+        basis: Basis,
+        answered: Option<SyncRecoveryId>,
+    ) -> Result<Across> {
+        let history = self.read_history(object_id)?;
+        let across = history.across(basis, answered);
+        if let Across::PutBack { .. } = across {
+            let bytes = encode_readable(&history.moved_to(answered))?;
+            self.write_bytes(&self.path(object_id, HISTORY_EXTENSION), &bytes.0)?;
+        }
+        Ok(across)
     }
 
     fn named(&self, id: Uuid, extension: &str) -> PathBuf {
@@ -2955,6 +3444,9 @@ impl Lock {
 pub struct Dispatch {
     directory: PathBuf,
     work_id: Uuid,
+    /// The history of the collection the call under this dispatch is made against, taken when the
+    /// dispatch was granted.
+    basis: Basis,
     _lock: Lock,
 }
 
@@ -2963,6 +3455,12 @@ impl Dispatch {
     #[must_use]
     pub const fn request(&self) -> Uuid {
         self.work_id
+    }
+
+    /// Returns the history of the collection the call under this dispatch is made against.
+    #[must_use]
+    pub const fn basis(&self) -> Basis {
+        self.basis
     }
 
     /// Refuses a decision this dispatch does not cover.
@@ -3094,6 +3592,10 @@ fn largest_publishable_object() -> u64 {
 /// A draft's note is held to this rule as well, so there is one answer to where a position stands
 /// whichever store keeps the note.
 pub(crate) fn standing(held: SyncPosition, offered: SyncPosition) -> Standing {
+    // Places compare only within one history. A place in another says nothing about this one.
+    if held.recovery() != offered.recovery() {
+        return Standing::OtherHistory { held };
+    }
     match offered.write_sequence.cmp(&held.write_sequence) {
         std::cmp::Ordering::Greater => Standing::Later,
         std::cmp::Ordering::Equal if offered.revision == held.revision => Standing::Same,
@@ -3114,7 +3616,10 @@ fn forked_at(comparisons: impl IntoIterator<Item = Option<Standing>>) -> Option<
         .flatten()
         .find_map(|stood| match stood {
             Standing::Forked { held } => Some(held),
-            Standing::Later | Standing::Same | Standing::Earlier => None,
+            Standing::Later
+            | Standing::Same
+            | Standing::Earlier
+            | Standing::OtherHistory { .. } => None,
         })
 }
 
@@ -3145,7 +3650,11 @@ fn a_write_landed_at(object_id: SyncObjectId, position: SyncPosition) -> Result<
 /// It is a rule about a write's own answer and nothing else. An answer to a read may name exactly
 /// the place this device already holds, which is the same write said again.
 fn not_past(replaced: Option<SyncPosition>, landed: SyncPosition) -> Option<SyncPosition> {
-    replaced.filter(|replaced| landed.write_sequence <= replaced.write_sequence)
+    // Only within one history: the place a write replaced in a history the collection was put
+    // back from is not a place in the history the write landed in.
+    replaced.filter(|replaced| {
+        replaced.recovery() == landed.recovery() && landed.write_sequence <= replaced.write_sequence
+    })
 }
 
 fn storage(path: &Path, source: std::io::Error) -> SyncError {
