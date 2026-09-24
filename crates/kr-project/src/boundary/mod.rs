@@ -84,7 +84,7 @@
 //! | --- | --- | --- | --- | --- |
 //! | macOS | A per-invocation sandbox profile, applied by the system's own launcher before it runs Git | The same profile | The same profile | Not confined, so such an invocation is refused |
 //! | Linux | Landlock, with the execute right only on Git's own program and helper directory | Landlock's TCP rules for a remote operation, and a system-call filter that makes a socket only of what the boundary can account for | Landlock, from the opened directory handles | Landlock, with no rule on the whole filesystem: the granted objects and the named support set only |
-//! | Windows — **refused, and never run** | An application container whose grants on the repository carry no execute right | The container's capabilities: none at all for a local operation | The container's grants, inside a job object that ends every descendant | Refused, as every invocation is |
+//! | Windows: **refused, and never run** | An application container whose grants on the repository carry no execute right | The container's capabilities: none at all for a local operation | The container's grants, inside a job object that ends every descendant | Refused, as every invocation is |
 //!
 //! The Windows row is what the code there would do. **It has never been executed, and this host
 //! runs no repository operation on that platform**: two of the three guarantees are not things an
