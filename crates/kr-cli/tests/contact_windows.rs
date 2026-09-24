@@ -412,7 +412,7 @@ fn created_at(pid: u32) -> u64 {
             "-NonInteractive",
             "-Command",
             &format!(
-                "[DateTimeOffset]::new((Get-Process -Id {pid}).StartTime).ToUnixTimeSeconds()"
+                "[DateTimeOffset]::new((Get-Process -Id {pid}).StartTime.ToUniversalTime()).ToUnixTimeSeconds()"
             ),
         ])
         .stdin(std::process::Stdio::null())

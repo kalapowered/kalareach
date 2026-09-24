@@ -241,7 +241,7 @@ const CREATED_AT: &str = r"
 param([int]$Id)
 $ErrorActionPreference = 'Stop'
 $started = (Get-Process -Id $Id).StartTime
-Write-Output ([DateTimeOffset]::new($started).ToUnixTimeSeconds())
+Write-Output ([DateTimeOffset]::new($started.ToUniversalTime()).ToUnixTimeSeconds())
 ";
 
 /// KR-REQ-02.04, KR-REQ-05.02: a worker's private endpoint carries the operating system's access
