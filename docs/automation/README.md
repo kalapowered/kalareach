@@ -230,6 +230,11 @@ the unit it derives them for. Nothing a caller sends names any of them.
   * Maximum actions: 100
   * Maximum created sessions: 10
   * Maximum lifetime: one hour
+* **Inherited ceilings.** A chain inherits from its host, when its root run is admitted, the most
+  sessions the host admits, so its created-session ceiling is the lower of that and ten, and the
+  managed allowance it may spend, which is none: this host gives a workflow no managed allowance
+  and no action kind spends one. Its descendants are held to the root's record, so a ceiling the
+  host raises later widens no chain already running, and a re-arm keeps the ceilings.
 * **Reservation before dispatch.** Each run, action and created session is reserved against the
   chain's durable budget in one transaction with the refusal it may produce, so two concurrent
   dispatches cannot both take the last of an allowance.
@@ -247,17 +252,38 @@ the unit it derives them for. Nothing a caller sends names any of them.
   causality another service lost: a workflow that reaches this host again through an outside
   service arrives as a new external trigger.
 
-## Admission and concurrency
+## Limits, deadlines and admission
 
-Admission limits govern runs before execution begins:
-* **Per-workflow concurrency.** Defaults to 4 concurrent runs and 100 pending runs per definition.
-* **Per-host rate limiting.** A sliding-window rate limit enforces maximum workflow invocations host-wide.
-* **Per-grant rate limiting.** Individual grants enforce separate sliding-window invocation quotas.
+Section 17's per-workflow limits and section 25's per-host and per-grant rates are decided from
+the workflow journal, inside the transaction that records the run they admit, so a restart finds
+each of them as it stood and two admissions that arrive together cannot both take the last place.
 
-A breached limit pauses the workflow revision and records one attention item, in one
-transaction, so the workflow stops rather than being refused one request at a time. Enabling
-the revision again is what clears the pause. A revision is installed disabled: `workflow.enable`
-is what makes it runnable, and `workflow.pause` stops it.
+* **Four running, a hundred waiting.** A workflow runs at most four runs at once. A run admitted
+  while four are running waits as pending, and the answer to `workflow.run` says so; the host's
+  dispatcher starts the oldest pending run when a slot frees, and a paused or disabled revision
+  starts none. A hundred-and-first pending run is a limit exceeded.
+* **Rates.** At most 600 runs a minute are admitted host-wide and 120 a minute under one grant.
+  The admissions they count are the journal's, so neither a restart nor a reopened service is a
+  way past them, and an unauthenticated callback, which is a new external trigger, counts like
+  any other.
+* **Run deadline and action wait.** A definition may shorten section 17's 30-minute run deadline
+  and ten-minute action wait, and may neither lengthen them nor set one to nothing. A run's
+  deadline starts when the run starts running. The host waits for an action no longer than its
+  wait or its run's deadline, whichever passes first, reading its clock at least every quarter
+  second while it waits, and then asks the action to stop. A kind that can be stopped settles
+  cancelled, which says the host stopped asking and not that the world is as it was; a kind that
+  cannot settles unknown, and its dependants pause for review. Neither change-set kind can be
+  stopped once it has begun. A run past its deadline dispatches nothing further: the nodes still
+  waiting and the run itself are cancelled.
+* **The host's clock.** Deadlines, waits and a chain's lifetime are measured on the daemon's own
+  reading of UTC, the later of the wall clock and its clock floor, so a wall clock wound back
+  extends none of them.
+
+A limit exceeded, whether a full queue, a rate, a run deadline or an action's wait, pauses the
+workflow revision and records one attention item, in one transaction, so the workflow stops
+rather than being refused one request at a time. Enabling the revision again is what clears the
+pause. A revision is installed disabled: `workflow.enable` is what makes it runnable, and
+`workflow.pause` stops it.
 
 ## Durability, execution, and restart
 
@@ -277,7 +303,8 @@ the daemon's registry, because a causal budget has to survive a reboot as well a
   already settled is never dispatched a second time. When the daemon starts, it recovers the
   journal before it serves anything: a node that was running when the host stopped may have been
   dispatched, so it is settled as unknown and its dependants pause for review, and the runs the
-  journal holds as waiting or running are marked to resume. Nothing executes yet. The resumed
+  journal holds as running are marked to resume; a run that was waiting for a slot waits on.
+  Nothing executes yet. The resumed
   runs and the pending triggers run only once the daemon's start has passed every gate it has,
   the configuration it puts into force among them, whose withdrawal of authority may owe a fence
   that has to be up first; a start that fails executes nothing. Only nodes that were never
@@ -288,8 +315,9 @@ the daemon's registry, because a causal budget has to survive a reboot as well a
   when the run started, decides whether a node still has anything owed to it, so a cancellation
   that arrives while an earlier node is running still stops the next one. Cancellation is
   terminal: an action that reports back after its node was cancelled does not settle the node,
-  and a run that was cancelled is never recorded as completed. Nothing is claimed about an
-  external side effect an already dispatched action may have had.
+  and a run that was cancelled is never recorded as completed. An active action is asked to stop
+  when it outlives its wait or its run's deadline. Nothing is claimed about an external side
+  effect an already dispatched action may have had.
 
 ## The event stream and its consumers
 
