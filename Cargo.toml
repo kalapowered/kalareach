@@ -161,6 +161,8 @@ spake2 = "=0.4.0"
 subtle = "=2.6.1"
 sysctl = "=0.6.0"
 sysinfo = "=0.33.1"
+# The windowing library Tauri draws with, for a test that needs a window of its own.
+tao = { version = "=0.35.3", default-features = false }
 # `custom-protocol` is what makes a built application serve its interface from the bundle instead
 # of from a development server. It is not implied by an optimised profile.
 tauri = { version = "=2.11.5", default-features = false, features = ["common-controls-v6", "wry"] }
