@@ -132,7 +132,7 @@ jobs:
       # in project locations. Ubuntu 24.04 denies an unprivileged account that namespace unless
       # AppArmor's restriction on it is lifted, and each check fails rather than passes where it
       # cannot make one, so the workspace test above leaves them out. This step lifts the
-      # restriction for itself on this runner and puts it back when the checks are done, shows the
+      # restriction for itself on this runner and puts it back however the step ends, shows the
       # namespace refused before and given after, and runs the seven by name. A name that matched
       # no test would run nothing and still exit 0, so the step counts the seven it saw pass.
       - name: Mount checks inside a mount namespace of this account's own
@@ -141,14 +141,6 @@ jobs:
         run: |
           set -euo pipefail
           restriction=kernel.apparmor_restrict_unprivileged_userns
-          before="$(sysctl -n "$restriction")" || exit 1
-          echo "$restriction is $before"
-          if unshare -r -m true; then
-            echo "before the change: unshare -r -m was given"
-          else
-            echo "before the change: unshare -r -m was refused"
-          fi
-          sudo sysctl -w "$restriction=0" || exit 1
           checks=(
             a_file_mounted_inside_this_repository_s_own_data_is_not_captured_around
             a_tree_reached_on_another_mount_is_not_taken_for_this_one
@@ -160,21 +152,37 @@ jobs:
           )
           log="$RUNNER_TEMP/mount-checks.log"
           : >"$log"
-          failed=0
+          before="$(sysctl -n "$restriction")"
+          echo "$restriction is $before"
           if unshare -r -m true; then
-            echo "after the change: unshare -r -m was given"
-            cargo test --locked -p kr-changeset --test capture -- --ignored --exact --color never \
-              "${checks[@]:0:3}" 2>&1 | tee -a "$log" || failed=1
-            cargo test --locked -p kr-transfer --test authority -- --ignored --exact --color never \
-              "${checks[@]:3:2}" 2>&1 | tee -a "$log" || failed=1
-            cargo test --locked -p kr-project --test locations -- --ignored --exact --color never \
-              "${checks[@]:5:2}" 2>&1 | tee -a "$log" || failed=1
+            echo "before the change: unshare -r -m was given"
           else
-            echo "after the change: unshare -r -m was still refused" >&2
-            failed=1
+            echo "before the change: unshare -r -m was refused"
           fi
-          # Put back what this runner had, so no later step runs under the change.
-          sudo sysctl -w "$restriction=$before" || failed=1
+          # However the step ends from here on, the runner's own setting is put back first, and a
+          # setting that could not be put back fails the step.
+          put_back() {
+            local status=$?
+            if ! sudo sysctl -w "$restriction=$before"; then
+              echo "$restriction could not be put back to $before" >&2
+              status=1
+            fi
+            exit "$status"
+          }
+          trap put_back EXIT
+          sudo sysctl -w "$restriction=0"
+          if ! unshare -r -m true; then
+            echo "after the change: unshare -r -m was still refused" >&2
+            exit 1
+          fi
+          echo "after the change: unshare -r -m was given"
+          failed=0
+          cargo test --locked -p kr-changeset --test capture -- --ignored --exact --color never \
+            "${checks[@]:0:3}" 2>&1 | tee -a "$log" || failed=1
+          cargo test --locked -p kr-transfer --test authority -- --ignored --exact --color never \
+            "${checks[@]:3:2}" 2>&1 | tee -a "$log" || failed=1
+          cargo test --locked -p kr-project --test locations -- --ignored --exact --color never \
+            "${checks[@]:5:2}" 2>&1 | tee -a "$log" || failed=1
           passed=0
           for check in "${checks[@]}"; do
             if grep -q -F -x "test $check ... ok" "$log"; then
