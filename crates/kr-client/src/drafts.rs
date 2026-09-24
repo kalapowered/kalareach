@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{
     AgentBindingRevision, ApplicationInstanceId, AttachmentId, DeviceId, DraftId, DraftRevision,
-    SessionId, SyncObjectId,
+    SessionId, SyncConflictId, SyncObjectId,
 };
 use kr_protocol::scalars::{Nullable, TimestampMs, Uuid};
 use kr_protocol::sync::SyncObjectKind;
@@ -53,10 +53,13 @@ use serde::{Deserialize, Serialize};
 use crate::error::{ClientError, Result};
 use crate::retry::UserAction;
 use crate::services::{SyncExchanged, SyncPosition};
-use crate::sync::client::{Answer, ask_about, count_settled, diverged, end_fenced, forked};
+use crate::sync::client::{
+    Answer, ask_about, count_settled, diverged, end_fenced, finish_resolutions, forked,
+};
 use crate::sync::store::standing;
 use crate::sync::{
-    Claimed, InGeneration, Outcome, Reconciled, Settlement, Standing, SyncError, SyncStore,
+    Claimed, InGeneration, Outcome, Reconciled, Resolutions, Settlement, Standing, SyncError,
+    SyncStore,
 };
 
 /// The most a draft's synchronised payload may carry, in bytes.
@@ -70,10 +73,13 @@ pub const MAX_DRAFT_BYTES: usize = kr_protocol::sync::MAX_SYNC_OBJECT_PLAINTEXT_
 
 /// What this device's own notes on a stored draft may add to an encoded record.
 ///
-/// [`Draft::conflict_of`] is local: it says which draft a copy belongs beside, and the service never
-/// carries it. A copy also carries its own identity and the time it arrived. Allowing for those
+/// [`Draft::conflict_of`] and [`Draft::retained`] are local: they say which draft a copy belongs
+/// beside and which copy the service kept of the write it beat, and the service never carries
+/// either. A copy also carries its own identity and the time it arrived. Allowing for those
 /// separately is what keeps a payload that is exactly at the limit storable when it arrives here as
-/// a copy, rather than refusing to keep content the service was already carrying.
+/// a copy, rather than refusing to keep content the service was already carrying. Each identity is
+/// sixteen bytes where the payload carries a null, and each time at most eight more, which is
+/// forty-eight of these sixty-four.
 const LOCAL_FIELDS_BYTES: usize = 64;
 
 /// The most a stored draft record may carry, in bytes.
@@ -168,6 +174,17 @@ pub struct Draft {
     /// Local. The synchronised payload never carries it: which draft a copy sits beside is this
     /// device's note about its own screen, not a fact about the object.
     pub conflict_of: Nullable<DraftId>,
+    /// The copy the service kept of this device's refused write, when this draft is the content
+    /// that beat it and the service kept one.
+    ///
+    /// A refusal is one choice with two sides: the content this device offered, which the service
+    /// kept as a copy of its own, and the content that won, which came down beside the person's
+    /// draft as this one. Choosing about this copy is choosing about that refused write, so this is
+    /// the one copy on the service the choice takes with it. [`DraftSync::resolve`] reads it.
+    ///
+    /// Local, as `conflict_of` is: it names something on this device's account with the service,
+    /// not a fact about the draft.
+    pub retained: Nullable<SyncConflictId>,
     /// When it was created.
     pub created_at_ms: TimestampMs,
     /// When it was last changed.
@@ -531,6 +548,7 @@ impl DraftStore {
             text,
             attachments: Vec::new(),
             conflict_of: Nullable::null(),
+            retained: Nullable::null(),
             created_at_ms: now,
             updated_at_ms: now,
         };
@@ -635,8 +653,11 @@ impl DraftStore {
                 }
                 .into());
             }
-            // When it was created is the stored draft's, whatever the caller handed back.
+            // When it was created is the stored draft's, whatever the caller handed back, and so is
+            // the copy the service kept of the write this draft beat: that is this device's account
+            // with the service, not something an edit changes.
             draft.created_at_ms = stored.created_at_ms;
+            draft.retained = stored.retained;
             Self::encode_payload(&draft)?;
             self.write(&draft)?;
             Ok(draft)
@@ -657,11 +678,21 @@ impl DraftStore {
     /// copy that arrived at the service's limit may therefore be a few bytes too large to publish
     /// again from here, and shortening it is the person's own next edit.
     ///
+    /// `retained` names the copy the service kept of this device's refused write, when this content
+    /// is what beat it, and it is kept on the copy as [`Draft::retained`]. A fetch that answers no
+    /// refusal names none.
+    ///
     /// # Errors
     ///
     /// Returns [`DraftError::Storage`] when the file cannot be written, and
     /// [`DraftError::TooLarge`] when the content does not fit the storage bound.
-    pub fn keep_copy(&self, of: DraftId, content: &Draft, now: TimestampMs) -> Result<Draft> {
+    pub fn keep_copy(
+        &self,
+        of: DraftId,
+        content: &Draft,
+        retained: Option<SyncConflictId>,
+        now: TimestampMs,
+    ) -> Result<Draft> {
         let copy = Draft {
             draft_id: DraftId::new(fresh_uuid()?),
             revision: DraftRevision::new(1),
@@ -671,6 +702,7 @@ impl DraftStore {
             text: content.text.clone(),
             attachments: content.attachments.clone(),
             conflict_of: Nullable::some(of),
+            retained: Nullable::from(retained),
             created_at_ms: now,
             updated_at_ms: now,
         };
@@ -810,8 +842,9 @@ impl DraftStore {
 
     /// Returns the bytes a synchronised copy of this draft is sealed from.
     ///
-    /// This device's note about which draft a copy sits beside is left out: it is local, and a
-    /// service that carried it would be carrying one device's screen layout.
+    /// This device's notes about which draft a copy sits beside and which copy the service kept of
+    /// the write it beat are left out: both are local, and a service that carried them would be
+    /// carrying one device's screen layout and one device's account.
     ///
     /// # Errors
     ///
@@ -820,6 +853,7 @@ impl DraftStore {
     pub fn encode_payload(draft: &Draft) -> Result<Vec<u8>> {
         let payload = Draft {
             conflict_of: Nullable::null(),
+            retained: Nullable::null(),
             ..draft.clone()
         };
         encode_within(&payload, MAX_DRAFT_BYTES)
@@ -1371,6 +1405,15 @@ pub struct Fetched {
     pub copy: Draft,
 }
 
+/// What recording the person's choice about one copy did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resolved {
+    /// The copy the person chose about, as this device kept it. The store no longer holds it.
+    pub copy: Draft,
+    /// What asking the service to drop the copies chosen about established.
+    pub service: Resolutions,
+}
+
 /// What bringing a draft down beside the local one did.
 enum BroughtDown {
     /// It was kept beside the local draft, and the note was written.
@@ -1478,9 +1521,9 @@ impl DraftSync {
     /// than run again, as [`SyncStore::attempt_draft`] describes.
     ///
     /// A refused comparison is not a failure: it is the answer that another device wrote first, and
-    /// it brings that content down beside the local draft rather than over it. An answer that
-    /// arrives after privacy mode has moved past the publication's generation is
-    /// [`Published::Discarded`]. Any other failure leaves the
+    /// it brings that content down beside the local draft rather than over it, naming on the copy
+    /// the copy the service kept of this device's write. An answer that arrives after privacy mode
+    /// has moved past the publication's generation is [`Published::Discarded`]. Any other failure leaves the
     /// publication counted rather than guessing at whether it landed.
     ///
     /// # Errors
@@ -1591,7 +1634,13 @@ impl DraftSync {
                 }
                 Ok(
                     match self
-                        .bring_down(drafts, draft_id, attempt.record.produced_under.get(), now)
+                        .bring_down(
+                            drafts,
+                            draft_id,
+                            attempt.record.produced_under.get(),
+                            retained,
+                            now,
+                        )
                         .await?
                     {
                         BroughtDown::Kept(fetched) => Published::Conflicted {
@@ -1656,7 +1705,7 @@ impl DraftSync {
             });
         }
         match self
-            .bring_down(drafts, draft_id, privacy.generation.get(), now)
+            .bring_down(drafts, draft_id, privacy.generation.get(), None, now)
             .await?
         {
             BroughtDown::Kept(fetched) => Ok(*fetched),
@@ -1744,6 +1793,7 @@ impl DraftSync {
                                 drafts,
                                 DraftId::new(staged.object_id.get()),
                                 staged.produced_under.get(),
+                                retained,
                                 now,
                             )
                             .await,
@@ -1763,6 +1813,56 @@ impl DraftSync {
         Ok(report)
     }
 
+    /// Records the person's choice about one copy kept beside a draft, and drops the copy the
+    /// service kept of the write it beat.
+    ///
+    /// The choice itself is the person's, as it always was: a draft that should say what the copy
+    /// says is edited through [`DraftStore::update`] like any other. What this does is take the
+    /// copy out of the draft store and tell the service. The copy the service kept of this device's
+    /// refused write goes as well, and no other, because another refused write is another version
+    /// the person has not decided about.
+    ///
+    /// The choice is recorded in the synchronisation store before the copy goes, and before the
+    /// service is asked, so a stop between leaves the copy to choose about again rather than a
+    /// choice the service never hears of, and a service that cannot be asked leaves the choice
+    /// recorded for [`crate::sync::SyncClient::finish_resolutions`] to ask again.
+    ///
+    /// It sends identifiers and no content, so privacy mode does not stop it: dropping a copy takes
+    /// content off the service rather than putting any there.
+    ///
+    /// Returns nothing when the draft store holds no such copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Storage`] when a record cannot be read or written, and, through
+    /// [`SyncError::Client`], whatever the draft store failed with.
+    pub async fn resolve(
+        &self,
+        drafts: &DraftStore,
+        copy: DraftId,
+    ) -> crate::sync::Result<Option<Resolved>> {
+        let held = match drafts.load(copy) {
+            Ok(held) => held,
+            Err(ClientError::Draft(error)) if matches!(*error, DraftError::Unknown { .. }) => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        // A draft that sits beside no other is not a copy, and there is nothing to choose about.
+        if !held.conflict_of.is_present() {
+            return Ok(None);
+        }
+        if let Some(retained) = held.retained.as_ref().copied() {
+            self.store.drop_kept_copy(retained)?;
+        }
+        drafts.remove(copy)?;
+        let service = finish_resolutions(&*self.service, &self.store).await?;
+        Ok(Some(Resolved {
+            copy: held,
+            service,
+        }))
+    }
+
     /// Brings what the service holds for a draft down beside it, under the generation the work it
     /// answers was started under.
     ///
@@ -1777,6 +1877,7 @@ impl DraftSync {
         drafts: &DraftStore,
         draft_id: DraftId,
         produced_under: u64,
+        retained: Option<SyncConflictId>,
         now: TimestampMs,
     ) -> crate::sync::Result<BroughtDown> {
         let object_id = SyncObjectId::new(draft_id.get());
@@ -1800,7 +1901,7 @@ impl DraftSync {
             .into());
         }
         let applied = self.store.apply_under_generation(produced_under, || {
-            let copy = drafts.keep_copy(draft_id, &remote, now)?;
+            let copy = drafts.keep_copy(draft_id, &remote, retained, now)?;
             // Where the object stands is this device's to remember; the revision beside it in the
             // note is not, because the revision that fetch carried is the other device's counter
             // and nothing about this device's own copies follows from it.
@@ -2421,6 +2522,7 @@ mod tests {
             text,
             attachments: Vec::new(),
             conflict_of: Nullable::null(),
+            retained: Nullable::null(),
             created_at_ms: TimestampMs::new(at),
             updated_at_ms: TimestampMs::new(at),
         }
@@ -2503,10 +2605,26 @@ mod tests {
         let local = store
             .create(open_target(), "mine".to_owned(), TimestampMs::new(1))
             .expect("a draft");
+        // Both of this device's own notes are set, which is the widest a copy is stored at: the
+        // draft it sits beside and the copy the service kept of the write it beat.
+        let retained = SyncConflictId::new(Uuid::from_bytes([9; 16]));
         let copy = store
-            .keep_copy(local.draft_id, &remote, TimestampMs::new(1_760_000_000_001))
+            .keep_copy(
+                local.draft_id,
+                &remote,
+                Some(retained),
+                TimestampMs::new(1_760_000_000_001),
+            )
             .expect("a copy of a draft the service was carrying");
         assert_eq!(copy.conflict_of, Nullable::some(local.draft_id));
+        assert_eq!(copy.retained, Nullable::some(retained));
+        // Neither note is anything the service carries.
+        assert_eq!(
+            DraftStore::decode_payload(&DraftStore::encode_payload(&copy).expect("a payload"))
+                .expect("read back")
+                .retained,
+            Nullable::null()
+        );
         assert_eq!(copy.text, remote.text);
         assert_eq!(copy.target, remote.target);
         assert_eq!(copy.state, remote.state);
@@ -2532,8 +2650,13 @@ mod tests {
         let theirs = edited(&mine, "what the other device wrote");
 
         let copy = store
-            .keep_copy(mine.draft_id, &theirs, TimestampMs::new(2))
+            .keep_copy(mine.draft_id, &theirs, None, TimestampMs::new(2))
             .expect("a copy");
+        assert_eq!(
+            copy.retained,
+            Nullable::null(),
+            "a fetch answers no refusal"
+        );
         assert_ne!(copy.draft_id, mine.draft_id);
         assert_eq!(copy.conflict_of, Nullable::some(mine.draft_id));
         assert_eq!(copy.text, "what the other device wrote");

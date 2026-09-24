@@ -2677,6 +2677,15 @@ async fn a_lost_answer_to_a_draft_the_service_refused_brings_the_other_content_d
     assert_eq!(copy.conflict_of, Nullable::some(draft.draft_id));
     assert_eq!(copy.text, theirs.text);
     assert_eq!(
+        copy.retained.as_ref().copied(),
+        service
+            .copies_in(&draft_collection(draft.draft_id))
+            .await
+            .first()
+            .copied(),
+        "the copy names what the service kept of the write it beat"
+    );
+    assert_eq!(
         drafts.checkpoint(draft.draft_id).expect("a note"),
         Some(DraftCheckpoint {
             position: at(1),
@@ -2977,6 +2986,317 @@ async fn an_accepted_draft_answered_at_the_place_it_replaced_is_never_recorded_a
             .iter()
             .any(|entry| entry.kind.contains("under another history"))
     );
+}
+
+// ---------------------------------------------------------------------------
+// KR-REQ-20.13: the copy the service kept of a refused draft
+// ---------------------------------------------------------------------------
+
+/// A draft this device publishes after another device has written the same draft, so the
+/// comparison is refused and the service keeps this device's write as a copy of its own.
+async fn a_refused_draft(
+    directory: &std::path::Path,
+    service: &Arc<Service>,
+) -> (DraftStore, DraftSync, SyncClient, Draft, Draft) {
+    let (drafts, sync, client) = draft_device(directory, Arc::clone(service) as Arc<_>);
+    let draft = drafts
+        .create(draft_target(), "mine".to_owned(), TimestampMs::new(NOW))
+        .expect("a draft");
+    let (theirs, sealed) = their_write_of(&draft);
+    service
+        .compare_exchange(
+            &draft_collection(draft.draft_id),
+            fresh_request_id(),
+            NOW,
+            None,
+            &sealed,
+        )
+        .await
+        .expect("the other device's write");
+    (drafts, sync, client, draft, theirs)
+}
+
+#[tokio::test]
+async fn a_refused_draft_names_the_copy_the_service_kept_on_the_copy_kept_beside_it() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client, draft, theirs) = a_refused_draft(directory.path(), &service).await;
+    let collection = draft_collection(draft.draft_id);
+
+    let published = sync
+        .publish(
+            &drafts,
+            draft.draft_id,
+            draft.revision,
+            TimestampMs::new(NOW),
+        )
+        .await
+        .expect("answered");
+    let DraftPublished::Conflicted {
+        copy,
+        remote_revision,
+        position,
+    } = published
+    else {
+        panic!("another device wrote first: {published:?}");
+    };
+    assert_eq!(position, at(1));
+    assert_eq!(remote_revision, theirs.revision);
+
+    // The service kept this device's refused write, and the copy that beat it names that copy: the
+    // two sides of one choice.
+    let kept = service.copies_in(&collection).await;
+    assert_eq!(kept.len(), 1);
+    let copy = drafts.load(copy).expect("the copy");
+    assert_eq!(copy.conflict_of, Nullable::some(draft.draft_id));
+    assert_eq!(copy.retained, Nullable::some(kept[0]));
+    assert_eq!(copy.text, theirs.text);
+
+    // The refusal's own record is the account of what the service still holds, and it can be
+    // dropped; the person's draft is exactly as it was.
+    let record = the_only_record(&client);
+    assert_eq!(
+        record.state,
+        RequestState::Refused {
+            retained: Nullable::some(kept[0]),
+        }
+    );
+    let exported = client.exported().expect("exported");
+    assert_eq!(exported.len(), 1);
+    assert!(exported[0].reference.contains(&kept[0].to_string()));
+    assert!(exported[0].reference.contains(&collection));
+    assert!(exported[0].deletable);
+    assert_eq!(drafts.load(draft.draft_id).expect("the draft"), draft);
+}
+
+#[tokio::test]
+async fn the_persons_choice_about_a_draft_copy_leaves_no_copy_on_either_side() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client, draft, _) = a_refused_draft(directory.path(), &service).await;
+    let collection = draft_collection(draft.draft_id);
+    let DraftPublished::Conflicted { copy, .. } = sync
+        .publish(
+            &drafts,
+            draft.draft_id,
+            draft.revision,
+            TimestampMs::new(NOW),
+        )
+        .await
+        .expect("answered")
+    else {
+        panic!("another device wrote first");
+    };
+
+    // The person keeps their own draft. The copy goes from this device, and the copy the service
+    // kept of the write it beat goes from the service.
+    let resolved = sync
+        .resolve(&drafts, copy)
+        .await
+        .expect("resolved")
+        .expect("there was such a copy");
+    assert_eq!(resolved.copy.draft_id, copy);
+    assert_eq!(
+        resolved.service,
+        Resolutions {
+            dropped: 1,
+            pending: 0,
+        }
+    );
+    assert!(service.copies_in(&collection).await.is_empty());
+    assert_eq!(
+        drafts.list().expect("a listing").drafts,
+        vec![draft.clone()],
+        "the person's draft, and nothing beside it"
+    );
+    assert!(client.store().requests().expect("requests").is_empty());
+    assert_eq!(client.exported().expect("exported"), Vec::new());
+    assert_eq!(client.outstanding().expect("a count"), 0);
+
+    // Choosing about a copy that is already gone, or about a draft that is no copy, is nothing.
+    assert!(
+        sync.resolve(&drafts, copy)
+            .await
+            .expect("answered")
+            .is_none()
+    );
+    assert!(
+        sync.resolve(&drafts, draft.draft_id)
+            .await
+            .expect("answered")
+            .is_none()
+    );
+    assert_eq!(drafts.load(draft.draft_id).expect("the draft"), draft);
+}
+
+#[tokio::test]
+async fn a_choice_about_a_draft_copy_the_service_cannot_hear_yet_stays_recorded() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client, draft, _) = a_refused_draft(directory.path(), &service).await;
+    let collection = draft_collection(draft.draft_id);
+    let DraftPublished::Conflicted { copy, .. } = sync
+        .publish(
+            &drafts,
+            draft.draft_id,
+            draft.revision,
+            TimestampMs::new(NOW),
+        )
+        .await
+        .expect("answered")
+    else {
+        panic!("another device wrote first");
+    };
+
+    // The choice is recorded before the service is asked, so a service that cannot be told leaves
+    // the choice made: the copy is gone here, and the service's copy is still named as to go.
+    service.stop_dropping_copies().await;
+    let resolved = sync
+        .resolve(&drafts, copy)
+        .await
+        .expect("resolved")
+        .expect("there was such a copy");
+    assert_eq!(
+        resolved.service,
+        Resolutions {
+            dropped: 0,
+            pending: 1,
+        }
+    );
+    assert_eq!(drafts.list().expect("a listing").drafts.len(), 1);
+    assert_eq!(service.copies_in(&collection).await.len(), 1);
+    let exported = client.exported().expect("exported");
+    assert_eq!(exported.len(), 1);
+    assert!(exported[0].deletable);
+
+    // The settings client asks again for every choice recorded in the store it shares, and asks
+    // about the draft's copy in the draft's own collection.
+    service.drop_copies_again().await;
+    assert_eq!(
+        client.finish_resolutions().await.expect("asked"),
+        Resolutions {
+            dropped: 1,
+            pending: 0,
+        }
+    );
+    assert!(service.copies_in(&collection).await.is_empty());
+    assert_eq!(client.exported().expect("exported"), Vec::new());
+}
+
+#[tokio::test]
+async fn a_stop_anywhere_after_a_draft_is_refused_leaves_one_account_of_the_copy_the_service_kept()
+{
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client, draft, theirs) = a_refused_draft(directory.path(), &service).await;
+    let collection = draft_collection(draft.draft_id);
+
+    // The comparison is refused and the answer is lost, so the record says only that it was sent.
+    service.lose_the_next_answer().await;
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(NOW),
+    )
+    .await
+    .expect_err("the answer never came back");
+    let dispatched = the_only_record(&client);
+    let kept = service.copies_in(&collection).await;
+    assert_eq!(kept.len(), 1);
+    let path = directory
+        .path()
+        .join("sync")
+        .join(format!("{}.request", dispatched.work_id));
+
+    // Stopped after the refusal reached the record and before anything came down. The record is
+    // the account of the copy the service holds: nothing is waiting, and it can be dropped.
+    leave_record_as_it_was(
+        &path,
+        &RequestRecord {
+            state: RequestState::Refused {
+                retained: Nullable::some(kept[0]),
+            },
+            ..dispatched.clone()
+        },
+    );
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    assert_eq!(accounts(&client), 1);
+    assert_eq!(drafts.list().expect("a listing").drafts.len(), 1);
+
+    // Stopped after the copy was kept beside the draft and before the note. The copy names the
+    // service's copy, and the account is still the one record.
+    let copy = drafts
+        .keep_copy(
+            draft.draft_id,
+            &theirs,
+            Some(kept[0]),
+            TimestampMs::new(NOW),
+        )
+        .expect("a copy");
+    assert_eq!(accounts(&client), 1);
+    assert_eq!(client.exported().expect("exported").len(), 1);
+
+    // And after the note: still one account, until the person chooses.
+    drafts
+        .record_checkpoint(
+            draft.draft_id,
+            DraftCheckpoint {
+                position: at(1),
+                published_revision: Nullable::null(),
+            },
+        )
+        .expect("a note");
+    assert_eq!(accounts(&client), 1);
+    sync.resolve(&drafts, copy.draft_id)
+        .await
+        .expect("resolved")
+        .expect("there was such a copy");
+    assert_eq!(accounts(&client), 0);
+    assert!(service.copies_in(&collection).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_refusal_whose_other_content_never_came_down_is_still_dropped_on_request() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let service = Arc::new(Service::default());
+    let (drafts, sync, client, draft, _) = a_refused_draft(directory.path(), &service).await;
+    let collection = draft_collection(draft.draft_id);
+
+    // The refusal is settled but the other content cannot be brought down, so no copy sits beside
+    // the draft to choose about. The account of the service's copy stands on its own.
+    service.stop_serving_what_it_holds().await;
+    sync.publish(
+        &drafts,
+        draft.draft_id,
+        draft.revision,
+        TimestampMs::new(NOW),
+    )
+    .await
+    .expect_err("the copy could not be brought down");
+    assert_eq!(client.outstanding().expect("a count"), 0);
+    assert_eq!(drafts.list().expect("a listing").drafts.len(), 1);
+    let kept = service.copies_in(&collection).await;
+    assert_eq!(kept.len(), 1);
+    let exported = client.exported().expect("exported");
+    assert_eq!(exported.len(), 1);
+    assert!(exported[0].deletable);
+
+    // Asking for exactly that copy to go is the explicit deletion section 24 offers.
+    assert_eq!(
+        client
+            .drop_kept_copy(kept[0])
+            .await
+            .expect("asked")
+            .expect("this device holds that refusal"),
+        Resolutions {
+            dropped: 1,
+            pending: 0,
+        }
+    );
+    assert!(service.copies_in(&collection).await.is_empty());
+    assert_eq!(client.exported().expect("exported"), Vec::new());
+    assert_eq!(drafts.load(draft.draft_id).expect("the draft"), draft);
 }
 
 // ---------------------------------------------------------------------------

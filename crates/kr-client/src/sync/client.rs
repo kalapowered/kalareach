@@ -634,24 +634,7 @@ impl SyncClient {
     ///
     /// Returns [`SyncError::Storage`] when the records cannot be read or removed.
     pub async fn finish_resolutions(&self) -> Result<Resolutions> {
-        let mut report = Resolutions::default();
-        for record in self.store.resolutions()? {
-            let RequestState::Resolving { retained } = record.state else {
-                continue;
-            };
-            if self
-                .service
-                .resolve(&record.collection(), retained)
-                .await
-                .is_ok()
-            {
-                self.store.close_resolution(record.work_id)?;
-                report.dropped = report.dropped.saturating_add(1);
-            } else {
-                report.pending = report.pending.saturating_add(1);
-            }
-        }
-        Ok(report)
+        finish_resolutions(&*self.service, &self.store).await
     }
 
     /// Seals one object, clearing the encoding it made on the way.
@@ -1456,6 +1439,35 @@ pub(crate) fn end_fenced(
         End::Nothing => report.unresolved = report.unresolved.saturating_add(1),
     }
     Ok(())
+}
+
+/// Asks the service to drop every copy the person has chosen about that it has not yet dropped,
+/// whichever kind of object the copy is of.
+///
+/// Each is asked about in the collection its own record names, so a draft's copy is dropped from
+/// the draft's collection. One the service could not be asked about stays recorded for the next
+/// call rather than failing the rest.
+pub(crate) async fn finish_resolutions(
+    service: &dyn SyncBackupService,
+    store: &SyncStore,
+) -> Result<Resolutions> {
+    let mut report = Resolutions::default();
+    for record in store.resolutions()? {
+        let RequestState::Resolving { retained } = record.state else {
+            continue;
+        };
+        if service
+            .resolve(&record.collection(), retained)
+            .await
+            .is_ok()
+        {
+            store.close_resolution(record.work_id)?;
+            report.dropped = report.dropped.saturating_add(1);
+        } else {
+            report.pending = report.pending.saturating_add(1);
+        }
+    }
+    Ok(report)
 }
 
 /// Refuses an answer that claims a place in the order this device has already given to another.
