@@ -419,6 +419,35 @@ mod tests {
         assert!(stream.read_frame().await.is_err(), "a cut frame is refused");
     }
 
+    /// A frame read from a bridge is bounded however its bytes arrive: exactly the bound is a frame,
+    /// and one byte more is refused when the newline comes in the final read.
+    #[tokio::test]
+    async fn a_frame_read_from_a_bridge_is_bounded_whichever_read_ends_it() {
+        let bound = crate::broker::gateway::MAX_NATIVE_FRAME_BYTES;
+        for (length, accepted) in [(bound, true), (bound + 1, false)] {
+            let (here, mut there) = tokio::io::duplex(1 << 16);
+            let (reader, writer) = tokio::io::split(here);
+            // Everything but the last byte was read before; the last byte and the newline come in
+            // the read that ends the frame.
+            let mut stream = BridgeStream::new(
+                Box::new(reader),
+                Box::new(writer),
+                vec![b'x'; length - 1],
+                Framing::new(NativeFraming::JsonLines),
+            );
+            there.write_all(b"x\n").await.expect("written");
+            let read = stream.read_frame().await;
+            if accepted {
+                assert_eq!(
+                    read.expect("a frame at the bound").map(|body| body.len()),
+                    Some(bound)
+                );
+            } else {
+                assert!(read.is_err(), "a body of {length} bytes is refused");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_frame_past_the_bound_is_not_written() {
         let (here, _there) = tokio::io::duplex(1 << 16);

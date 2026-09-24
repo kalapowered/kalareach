@@ -68,6 +68,9 @@ impl Framing {
                     Self::check_partial(buffer.len())?;
                     return Ok(None);
                 };
+                // A line whose newline arrived in the same read that carried it past the bound is
+                // as long as one that never ended. The bound is on the body, whenever it ends.
+                Self::check_complete(end)?;
                 let body = buffer.drain(..=end).take(end).collect();
                 Ok(Some(body))
             }
@@ -122,6 +125,16 @@ impl Framing {
             return Err(BrokerError::invalid(format!(
                 "a native frame is at most {MAX_NATIVE_FRAME_BYTES} bytes and this one has not \
                  ended after {held}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_complete(length: usize) -> Result<()> {
+        if length > MAX_NATIVE_FRAME_BYTES {
+            return Err(BrokerError::invalid(format!(
+                "this frame is {length} bytes and a native frame is at most \
+                 {MAX_NATIVE_FRAME_BYTES}"
             )));
         }
         Ok(())
@@ -186,5 +199,40 @@ mod tests {
         let framing = Framing::new(NativeFraming::LengthPrefixed);
         let mut buffer = format!("{}\n", MAX_NATIVE_FRAME_BYTES + 1).into_bytes();
         assert!(framing.decode(&mut buffer).is_err());
+    }
+
+    /// A JSON line is bounded however its bytes arrive: a body of exactly the bound is a frame, and
+    /// one byte more is refused even when the newline comes in the same read that crosses the
+    /// bound, which is the read the unterminated-line check never sees.
+    #[test]
+    fn a_json_line_is_bounded_whichever_read_ends_it() {
+        let framing = Framing::new(NativeFraming::JsonLines);
+        for (length, accepted) in [
+            (MAX_NATIVE_FRAME_BYTES, true),
+            (MAX_NATIVE_FRAME_BYTES + 1, false),
+        ] {
+            // Everything but the last byte and the newline arrives first, and is waited on.
+            let mut buffer = vec![b'x'; length - 1];
+            assert!(
+                framing
+                    .decode(&mut buffer)
+                    .expect("still readable")
+                    .is_none(),
+                "an unterminated line at or under the bound waits"
+            );
+            // Then the last byte and the newline together.
+            buffer.extend_from_slice(b"x\n");
+            let decoded = framing.decode(&mut buffer);
+            if accepted {
+                assert_eq!(
+                    decoded
+                        .expect("a frame at the bound")
+                        .map(|body| body.len()),
+                    Some(MAX_NATIVE_FRAME_BYTES)
+                );
+            } else {
+                assert!(decoded.is_err(), "a body of {length} bytes is refused");
+            }
+        }
     }
 }

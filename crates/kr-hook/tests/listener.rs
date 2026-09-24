@@ -473,7 +473,8 @@ async fn kr_req_05_09_a_bridge_the_installation_did_not_put_in_place_is_refused(
 /// for that one on every platform: the forwarder reaches it over loopback only, presents exactly
 /// the credential the owner-only file holds and its own process as the operating system reads it,
 /// declares which bridge it is, and waits for the admission before it answers `{}`. A listener that
-/// closes without admitting it changes nothing about its answer.
+/// closes without admitting it, or never answers at all, changes nothing about its answer, and the
+/// one that never answers cannot hold it past its deadline.
 #[test]
 fn kr_req_12_14_over_loopback_the_forwarder_presents_the_launch_credential() {
     let placed = Placed::new();
@@ -489,7 +490,7 @@ fn kr_req_12_14_over_loopback_the_forwarder_presents_the_launch_credential() {
             .expect("owner-only");
     }
 
-    for admit in [true, false] {
+    for answer in ["admit", "close", "withhold"] {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
         let port = listener.local_addr().expect("its address").port();
         let registration = files.join("registration");
@@ -537,19 +538,37 @@ fn kr_req_12_14_over_loopback_the_forwarder_presents_the_launch_credential() {
             .collect();
         assert!(launch_credential.authenticates(&bytes));
 
-        if admit {
-            stream
-                .write_all(b"{\"kr_bridge\":{\"admitted\":\"hook\"}}\n")
-                .expect("admitted");
-        }
-        drop(stream);
-        let ran = running.join().expect("the forwarder ran");
-        assert_eq!(ran.code, Some(0), "{}", ran.stderr);
-        assert_eq!(ran.stdout, b"{}\n");
+        let ran = match answer {
+            "admit" => {
+                stream
+                    .write_all(b"{\"kr_bridge\":{\"admitted\":\"hook\"}}\n")
+                    .expect("admitted");
+                drop(stream);
+                running.join().expect("the forwarder ran")
+            }
+            "close" => {
+                drop(stream);
+                running.join().expect("the forwarder ran")
+            }
+            _ => {
+                // The connection stays open and says nothing until the forwarder has ended.
+                let ran = running.join().expect("the forwarder ran");
+                drop(stream);
+                assert!(
+                    ran.took < std::time::Duration::from_secs(1),
+                    "a listener that never answers held the hook for {:?}, past the one-second \
+                     SessionEnd timeout",
+                    ran.took
+                );
+                ran
+            }
+        };
+        assert_eq!(ran.code, Some(0), "{answer}: {}", ran.stderr);
+        assert_eq!(ran.stdout, b"{}\n", "{answer}");
         assert_eq!(
-            ran.stderr.contains("without admitting"),
-            !admit,
-            "a refusal is said on standard error only: {}",
+            ran.stderr.is_empty(),
+            answer == "admit",
+            "{answer}: anything but an admission is said on standard error only: {}",
             ran.stderr
         );
     }

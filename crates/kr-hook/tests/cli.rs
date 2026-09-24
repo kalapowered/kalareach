@@ -84,6 +84,30 @@ fn outside_a_launch_a_hook_answers_neutrally_and_reaches_for_nothing() {
     }
 }
 
+/// A `SessionEnd` payload, the event with the shortest timeout the package registers.
+const SESSION_END: &[u8] = br#"{"session_id":"4d1c0a57-1b1e-4c3a-9d2e-6a0f0c5b7e11","transcript_path":"/tmp/t.jsonl","cwd":"/tmp","hook_event_name":"SessionEnd","reason":"clear"}"#;
+
+/// KR-REQ-11.42, KR-REQ-12.18: an application that never closes a hook's input cannot hold the
+/// hook open. The hook answers `{}` and exits 0 at its own deadline, inside the one-second timeout
+/// the package registers for `SessionEnd`.
+#[test]
+fn kr_req_12_18_a_hook_whose_input_never_closes_still_answers_in_time() {
+    let placed = Placed::new();
+    let ran = common::run_holding_input(placed.command(&["claude-code", "hook"]), SESSION_END);
+    assert_eq!(ran.code, Some(0), "{}", ran.stderr);
+    assert_eq!(ran.stdout, b"{}\n");
+    assert!(
+        ran.took >= kr_hook::claude_code::hook::HOOK_DEADLINE,
+        "it waited for its input until its deadline: {:?}",
+        ran.took
+    );
+    assert!(
+        ran.took < std::time::Duration::from_secs(1),
+        "answered in {:?}, inside the one-second SessionEnd timeout",
+        ran.took
+    );
+}
+
 /// KR-REQ-11.42: the relay needs a registration, and says so rather than guessing at a socket.
 #[test]
 fn the_relay_without_a_registration_fails_and_says_why() {

@@ -80,13 +80,29 @@ pub struct Ran {
     pub took: Duration,
 }
 
-/// Runs a command to its end with `input` on standard input.
+/// Runs a command to its end with `input` on standard input, which is then closed.
 ///
 /// # Panics
 ///
 /// Panics when the process does not end within [`LIVENESS`].
 #[must_use]
-pub fn run_with_input(mut command: Command, input: &[u8]) -> Ran {
+pub fn run_with_input(command: Command, input: &[u8]) -> Ran {
+    run(command, input, false)
+}
+
+/// Runs a command to its end with `input` on standard input, which is held open until it ends.
+///
+/// An application that never closes a hook's input must not be able to hold the hook open.
+///
+/// # Panics
+///
+/// Panics when the process does not end within [`LIVENESS`].
+#[must_use]
+pub fn run_holding_input(command: Command, input: &[u8]) -> Ran {
+    run(command, input, true)
+}
+
+fn run(mut command: Command, input: &[u8], hold: bool) -> Ran {
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -95,8 +111,15 @@ pub fn run_with_input(mut command: Command, input: &[u8]) -> Ran {
     let mut child = command.spawn().expect("the forwarder starts");
     let mut stdin = child.stdin.take().expect("its input");
     let input = input.to_vec();
+    let (release, released) = std::sync::mpsc::channel::<()>();
     let writing = std::thread::spawn(move || {
         let _ = stdin.write_all(&input);
+        let _ = stdin.flush();
+        if hold {
+            // Held until the process has ended, then closed.
+            let _ = released.recv();
+        }
+        drop(stdin);
     });
     let mut stdout = child.stdout.take().expect("its output");
     let mut stderr = child.stderr.take().expect("its diagnostics");
@@ -122,6 +145,7 @@ pub fn run_with_input(mut command: Command, input: &[u8]) -> Ran {
         std::thread::sleep(Duration::from_millis(5));
     };
     let took = started.elapsed();
+    drop(release);
     let _ = writing.join();
     Ran {
         code: status.code(),

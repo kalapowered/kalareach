@@ -26,7 +26,7 @@ const BRIDGE: Bridge = Bridge {
 /// The package registers a one-second timeout for `SessionEnd` and five seconds for the other four
 /// events. Claude Code cancels a hook that reaches its timeout and discards its output, so the
 /// deadline sits well inside the shorter one.
-pub const HOOK_DEADLINE: Duration = Duration::from_millis(750);
+pub const HOOK_DEADLINE: Duration = Duration::from_millis(500);
 
 /// The most of a hook's input this forwarder reads.
 ///
