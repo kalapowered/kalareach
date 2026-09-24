@@ -393,6 +393,13 @@ const KINDS: [(&str, &[ActionRight]); 15] = [
     ("view sessions", &[ActionRight::SessionView]),
 ];
 
+/// What `rights` let a device do, in the words a person is shown on every surface: the owner's
+/// prompt, the pairing screen and the list of paired hosts.
+#[must_use]
+pub fn describe_rights(rights: &kr_protocol::scalars::CanonicalSet<ActionRight>) -> String {
+    authority(rights).unwrap_or_else(|| "do what the host allows".to_owned())
+}
+
 /// What `rights` let a device do, in words, or `None` when a right has no words here.
 fn authority(rights: &kr_protocol::scalars::CanonicalSet<ActionRight>) -> Option<String> {
     if rights.contains(&ActionRight::HostManage) {

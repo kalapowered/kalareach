@@ -206,6 +206,8 @@ pub struct HostView {
     pub name: Option<String>,
     /// True when this device became an owner of the host.
     pub owner: bool,
+    /// What this device may do there, in words.
+    pub authority: String,
     /// When this device's grant ends, if it does.
     pub grant_expires_at_ms: Option<u64>,
 }
@@ -217,6 +219,7 @@ impl HostView {
         Self {
             name: host.name.clone(),
             owner: host.is_owner(),
+            authority: super::owner::describe_rights(&host.proposed_grant.actions),
             grant_expires_at_ms: expiry(&host.proposed_grant.expiry),
         }
     }
@@ -248,6 +251,8 @@ pub enum AttemptState {
         expires_at_ms: Option<u64>,
         /// The rights the device would receive.
         rights: Vec<ActionRight>,
+        /// What they would let it do, in words.
+        authority: String,
         /// When those rights would end, if they would.
         grant_expires_at_ms: Option<u64>,
     },
@@ -1017,6 +1022,7 @@ pub(crate) fn awaiting(pending: &PendingAttempt) -> AttemptState {
         value: group_verification_value(&pending.verification_value),
         expires_at_ms: pending.expires_at_ms,
         rights: pending.proposed_grant.actions.iter().copied().collect(),
+        authority: super::owner::describe_rights(&pending.proposed_grant.actions),
         grant_expires_at_ms: expiry(&pending.proposed_grant.expiry),
     }
 }
