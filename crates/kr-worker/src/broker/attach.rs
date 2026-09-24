@@ -385,11 +385,30 @@ pub async fn deliver_to_views(
     }
 }
 
+/// Says whether one page of a replay is news the views have not been told, and remembers it.
+///
+/// A reset is news: it starts the stream again, and positions from another generation mean
+/// nothing here, so what was reported is forgotten. A loss is news when it reaches past the
+/// highest loss already told, whichever page or recovery told it: the same loss found again is
+/// not, and a later one is, because a view that started again after the first has not been told
+/// about the second.
+fn news_in(replay: &crate::broker::TransitionReplay, reported: &mut u64) -> bool {
+    if replay.reset {
+        *reported = 0;
+    }
+    let lost = replay.lost_through.is_some_and(|lost| lost > *reported);
+    if let Some(lost) = replay.lost_through {
+        *reported = (*reported).max(lost);
+    }
+    replay.reset || lost
+}
+
 /// Replays what the views have not been told about, in bounded pages.
 ///
 /// The broker's lock is taken for one page at a time, so a connection that is far behind recovers
-/// without holding every other caller behind its read. A loss the views were already told about,
-/// by this recovery's earlier page or by an earlier recovery, is not told again.
+/// without holding every other caller behind its read. Each page is checked for news: a loss the
+/// views were already told about, by an earlier page or an earlier recovery, is not told again,
+/// and one that grew since, while the lock was given back between pages, is.
 async fn recover_views(
     broker: &Arc<Broker>,
     runtime: &Arc<crate::runtime::SessionRuntime>,
@@ -397,9 +416,7 @@ async fn recover_views(
     cursor: &mut crate::broker::ReplayCursor,
     reported: &mut u64,
 ) {
-    // One recovery is one piece of news, however many pages it reads. The lock is given back
-    // between pages, so a view can install its fresh state part way through; telling the views
-    // again for a later page would send that view back for another one it does not need.
+    // Whether this recovery has told the views anything, for a read that fails part way.
     let mut told = false;
     loop {
         let replay = match broker.replay_after(*cursor) {
@@ -416,19 +433,11 @@ async fn recover_views(
                 return;
             }
         };
-        // Positions mean nothing across two generations, so a reset forgets what was reported.
-        if replay.reset {
-            *reported = 0;
-        }
-        let lost = replay.lost_through.is_some_and(|lost| lost > *reported);
-        if (replay.reset || lost) && !told {
+        if news_in(&replay, reported) {
             told = true;
             runtime
                 .session()
                 .resync_all_views(kr_protocol::recovery::ResyncReason::AgentStreamGap);
-        }
-        if let Some(lost) = replay.lost_through {
-            *reported = (*reported).max(lost);
         }
         for transition in replay.events {
             if transition.sequence <= cursor.sequence && !replay.reset {
@@ -1245,4 +1254,49 @@ pub fn hello_frame(
     })
     .to_string()
     .into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page(reset: bool, lost_through: Option<u64>) -> crate::broker::TransitionReplay {
+        crate::broker::TransitionReplay {
+            events: Vec::new(),
+            cursor: crate::broker::ReplayCursor {
+                generation: 1,
+                sequence: 0,
+            },
+            reset,
+            lost_through,
+            more: false,
+        }
+    }
+
+    #[test]
+    fn a_loss_is_news_once_and_a_later_loss_is_news_again() {
+        let mut reported = 0;
+        assert!(!news_in(&page(false, None), &mut reported), "nothing lost");
+        assert!(
+            news_in(&page(false, Some(5)), &mut reported),
+            "a first loss"
+        );
+        assert!(
+            !news_in(&page(false, Some(5)), &mut reported),
+            "the same loss on a later page or in a later recovery"
+        );
+        assert!(
+            news_in(&page(false, Some(9)), &mut reported),
+            "a loss that grew while the lock was given back, even inside one recovery"
+        );
+        assert!(!news_in(&page(false, Some(9)), &mut reported));
+        assert!(
+            news_in(&page(true, None), &mut reported),
+            "a reset starts the stream again"
+        );
+        assert!(
+            news_in(&page(false, Some(3)), &mut reported),
+            "and a loss after it is measured in the new generation's positions"
+        );
+    }
 }
