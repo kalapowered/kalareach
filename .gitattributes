@@ -8,3 +8,11 @@
 # signed, hashed or run. Every text file here is committed with LF endings and none needs another,
 # so one rule for every file is the rule that still holds when the next pinned file is added.
 * -text
+
+# The one exception is a batch file, which cmd.exe runs. cmd.exe finds a label by reading the file
+# itself in blocks and relies on CRLF line ends to do it, so a batch file checked out with LF endings
+# can fail a `goto` or a `call :label` depending on where its lines happen to fall. A batch file is
+# committed with LF endings like everything else and checked out with CRLF endings on every
+# platform, so the bytes cmd.exe reads are the ones it expects.
+*.bat text eol=crlf
+*.cmd text eol=crlf
