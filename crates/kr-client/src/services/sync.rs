@@ -84,8 +84,9 @@
 //! declared size and where it stands, and nothing sealed. A key record renders its collection,
 //! epoch, revision and how many members it names, and nothing else.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use kr_protocol::collection_keys::CollectionKeyRecord;
@@ -538,7 +539,6 @@ struct ObjectRecord {
 
 /// One object a reader named that the collection no longer holds.
 #[derive(Deserialize)]
-#[expect(dead_code, reason = "held to its schema and never read")]
 struct RemovedObject {
     object_id: SyncObjectId,
     write_sequence: U64,
@@ -576,7 +576,6 @@ struct ConflictRecord {
 #[derive(Deserialize)]
 struct CompareAnswer {
     changed: Vec<ObjectRecord>,
-    #[expect(dead_code, reason = "held to its schema and never read")]
     removed: Vec<RemovedObject>,
     revisions: Vec<ObjectPosition>,
     conflicts: Vec<ConflictRecord>,
@@ -701,11 +700,23 @@ impl fmt::Debug for SyncHeldCopy {
     }
 }
 
+/// One object a reader named that the collection no longer holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyncRemoved {
+    /// The object.
+    pub object_id: SyncObjectId,
+    /// Where its removal came in its order of writes, or nothing when the collection never held it.
+    pub position: Option<SyncPosition>,
+}
+
 /// What one comparison found in a collection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyncComparison {
-    /// The objects the collection holds.
+    /// The objects the collection holds that the reader did not hold at the revision it holds them
+    /// at.
     pub objects: Vec<SyncHeldObject>,
+    /// The objects the reader named that the collection no longer holds.
+    pub removed: Vec<SyncRemoved>,
     /// The copies waiting for a choice, when they were asked for, in the order they were kept.
     pub copies: Vec<SyncHeldCopy>,
     /// Whether more copies were waiting than this page carried.
@@ -804,6 +815,118 @@ pub struct MembershipListing {
     pub head: KeyHead,
 }
 
+/// A shared comparison read over several pages, folded into one answer.
+///
+/// Every page is read whole: the objects it brought, the objects it says the collection no longer
+/// holds, and the listing of every object the collection holds. One rule merges them: what a later
+/// page says of an object replaces what an earlier page said, because a later page is a later
+/// reading. Every request is built from the fold's own state, so what it names stays within what
+/// the service reads: one revision an object, and after the first page only the objects the
+/// collection lists.
+#[derive(Debug, Default)]
+struct ObjectFold {
+    /// What the reader holds, one revision an object.
+    known: BTreeMap<SyncObjectId, SyncRevision>,
+    /// What the pages said of each object, the latest word kept.
+    said: BTreeMap<SyncObjectId, Said>,
+    /// The objects the latest page listed, at the revisions it listed them at, or nothing before
+    /// the first page.
+    listed: Option<BTreeMap<SyncObjectId, SyncRevision>>,
+}
+
+/// What one page said of one object.
+#[derive(Debug)]
+enum Said {
+    /// Its content, at a revision.
+    Held(SyncHeldObject),
+    /// That the collection no longer holds it.
+    Removed(SyncRemoved),
+}
+
+impl ObjectFold {
+    /// A fold over what the reader holds, each object once at the last revision named for it, as
+    /// the service reads a list.
+    fn holding(known: &[KnownRevision]) -> Self {
+        Self {
+            known: known
+                .iter()
+                .map(|held| (held.object_id, held.revision))
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    /// What the next request names as held: everything before the first page, and after it only
+    /// the objects the collection lists, which is at most what one collection holds.
+    fn held(&self) -> Vec<KnownRevision> {
+        self.known
+            .iter()
+            .filter(|(object_id, _)| {
+                self.listed
+                    .as_ref()
+                    .is_none_or(|listed| listed.contains_key(object_id))
+            })
+            .map(|(object_id, revision)| KnownRevision {
+                object_id: *object_id,
+                revision: *revision,
+            })
+            .collect()
+    }
+
+    /// Takes one page, and says whether it brought any object.
+    fn absorb(
+        &mut self,
+        page: &SyncComparison,
+        listed: BTreeMap<SyncObjectId, SyncRevision>,
+    ) -> Result<bool> {
+        for object in &page.objects {
+            let revision =
+                object.position.revision.0.ok_or_else(|| {
+                    contrary("an object a comparison carries without its revision")
+                })?;
+            self.known.insert(object.object_id, revision);
+            self.said
+                .insert(object.object_id, Said::Held(object.clone()));
+        }
+        for removed in &page.removed {
+            self.known.remove(&removed.object_id);
+            self.said.insert(removed.object_id, Said::Removed(*removed));
+        }
+        self.listed = Some(listed);
+        Ok(!page.objects.is_empty())
+    }
+
+    /// Whether the latest page lists an object the reader does not hold at the revision listed.
+    fn missing(&self) -> bool {
+        self.listed.as_ref().is_some_and(|listed| {
+            listed
+                .iter()
+                .any(|(object_id, revision)| self.known.get(object_id) != Some(revision))
+        })
+    }
+
+    /// The objects and the removals the pages brought, the latest word on each. An object the
+    /// pages brought that the latest listing leaves out, with no page saying it went, is an answer
+    /// this client does not follow.
+    fn answer(self) -> Result<(Vec<SyncHeldObject>, Vec<SyncRemoved>)> {
+        let listed = self.listed.unwrap_or_default();
+        let mut objects = Vec::new();
+        let mut removed = Vec::new();
+        for (object_id, said) in self.said {
+            match said {
+                Said::Held(object) if listed.contains_key(&object_id) => objects.push(object),
+                Said::Held(_) => {
+                    return Err(contrary(
+                        "an object a comparison brought that its listing leaves out",
+                    ));
+                }
+                Said::Removed(gone) => removed.push(gone),
+            }
+        }
+        Ok((objects, removed))
+    }
+}
+
 /// What the service answered one request, read before it is read as one contract or another.
 enum Reply<T> {
     /// The answer's `data`.
@@ -876,22 +999,24 @@ impl ManagedSyncService {
     }
 
     /// Reads every object a shared collection holds that the reader does not hold at the revision
-    /// the collection holds it at, and a page of the copies its refusals kept when `with_copies`
-    /// asks, from the cursor `after`.
+    /// the collection holds it at, every object the reader holds that the collection no longer
+    /// does, and a page of the copies its refusals kept when `with_copies` asks, from the cursor
+    /// `after`.
     ///
     /// `known` is what the reader holds: each object at the revision it holds it at, which the
     /// service leaves out. The service answers a page of objects at a time and names every object
-    /// the collection holds, so this follows the pages, adding what each one brought to what the
-    /// reader holds, until nothing the collection names is missing. A page that brings nothing
-    /// while something is missing is an answer this client does not follow, and so is a collection
-    /// still moving after [`MAX_COMPARISON_PAGES`] pages.
+    /// the collection holds, so this folds the pages into one answer: each page read whole,
+    /// what a later page says of an object replacing what an earlier one said, and each request
+    /// built from what the pages have brought. It follows them until nothing the collection names
+    /// is missing. A page that brings nothing while something is missing is an answer this client
+    /// does not follow, and so is a collection still moving after [`MAX_COMPARISON_PAGES`] pages.
     ///
     /// Every object and copy names the epoch it is sealed under, and the comparison names where the
     /// collection's key records stood at its last page.
     ///
     /// # Errors
     ///
-    /// As [`Self::compare`], and a reader that names more objects than a collection holds is
+    /// As [`Self::compare`], and a reader that names more than [`MAX_KNOWN_REVISIONS`] objects is
     /// refused before anything is sent. A collection that does not list this installation is
     /// `None`.
     pub async fn compare_shared(
@@ -906,52 +1031,40 @@ impl ManagedSyncService {
                 "a comparison names at most {MAX_KNOWN_REVISIONS} objects the reader holds"
             )));
         }
-        let mut known = known.to_vec();
-        let mut objects: Vec<SyncHeldObject> = Vec::new();
+        let mut fold = ObjectFold::holding(known);
         // The copies are the first page's: it is the one request that asks for them.
         let mut first: Option<SyncComparison> = None;
-        let mut request = self.compare_body(
-            Address::shared(collection),
-            None,
-            with_copies,
-            after,
-            known.clone(),
-        )?;
-        for _ in 0..MAX_COMPARISON_PAGES {
+        for page in 0..MAX_COMPARISON_PAGES {
+            let request = if page == 0 {
+                self.compare_body(
+                    Address::shared(collection),
+                    None,
+                    with_copies,
+                    after,
+                    fold.held(),
+                )?
+            } else {
+                self.compare_body(Address::shared(collection), None, false, None, fold.held())?
+            };
             let answer: CompareAnswer = match reply(self.ask(&request, None).await?, false)? {
                 Reply::Data(data) => read(data, "what a comparison answered")?,
                 Reply::Absent => return Ok(None),
                 Reply::Retired(_) => return Err(retired_where_no_write_was()),
             };
-            let listed: Vec<KnownRevision> = answer
+            let listed = answer
                 .revisions
                 .iter()
-                .map(|position| KnownRevision {
-                    object_id: position.object_id,
-                    revision: position.revision,
-                })
+                .map(|position| (position.object_id, position.revision))
                 .collect();
             let page = comparison(answer)?;
-            let brought = !page.objects.is_empty();
-            for object in &page.objects {
-                let revision = object.position.revision.0.ok_or_else(|| {
-                    contrary("an object a comparison carries without its revision")
-                })?;
-                known.retain(|held| held.object_id != object.object_id);
-                known.push(KnownRevision {
-                    object_id: object.object_id,
-                    revision,
-                });
-                objects.retain(|held| held.object_id != object.object_id);
-                objects.push(object.clone());
-            }
-            let head = page.head;
-            let stored = page.stored;
+            let brought = fold.absorb(&page, listed)?;
+            let (head, stored) = (page.head, page.stored);
             let first = first.get_or_insert(page);
-            let missing = listed.iter().any(|named| !known.contains(named));
-            if !missing {
+            if !fold.missing() {
+                let (objects, removed) = fold.answer()?;
                 return Ok(Some(SyncComparison {
                     objects,
+                    removed,
                     copies: std::mem::take(&mut first.copies),
                     more_copies: first.more_copies,
                     next_copies_after: first.next_copies_after,
@@ -964,15 +1077,6 @@ impl ManagedSyncService {
                     "a comparison that names an object the reader lacks and carries none",
                 ));
             }
-            // The objects that are left, with no copies: the first page carried those. What the
-            // reader holds is named only for objects the collection still lists, which keeps the
-            // request within what the service reads.
-            let held = known
-                .iter()
-                .filter(|held| listed.iter().any(|named| named.object_id == held.object_id))
-                .copied()
-                .collect();
-            request = self.compare_body(Address::shared(collection), None, false, None, held)?;
         }
         Err(contrary(
             "a collection that kept changing while it was read",
@@ -1163,7 +1267,7 @@ impl ManagedSyncService {
         &self,
         collection: &CollectionRef,
         resume: Option<Inventory>,
-        pages: usize,
+        pages: NonZeroUsize,
     ) -> Result<Option<Inventory>> {
         let (mut inventory, mut after) = match resume {
             // A read that already reached the end has nothing to continue.
@@ -1174,7 +1278,7 @@ impl ManagedSyncService {
             }
             None => (Inventory::default(), None),
         };
-        for _ in 0..pages.max(1) {
+        for _ in 0..pages.get() {
             let known = inventory
                 .objects
                 .iter()
@@ -1910,6 +2014,16 @@ fn comparison(answer: CompareAnswer) -> Result<SyncComparison> {
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let removed = answer
+        .removed
+        .iter()
+        .map(|removed| SyncRemoved {
+            object_id: removed.object_id,
+            // A removal takes a place in the object's order; nought is an object never held.
+            position: (removed.write_sequence.get() != 0)
+                .then(|| SyncPosition::removed_at(removed.write_sequence.get())),
+        })
+        .collect();
     let copies = answer
         .conflicts
         .into_iter()
@@ -1928,6 +2042,7 @@ fn comparison(answer: CompareAnswer) -> Result<SyncComparison> {
         .collect::<Result<Vec<_>>>()?;
     Ok(SyncComparison {
         objects,
+        removed,
         copies,
         more_copies: answer.more_conflicts,
         next_copies_after: answer.next_conflicts_after_sequence.get(),

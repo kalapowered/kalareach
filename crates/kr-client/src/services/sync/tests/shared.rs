@@ -173,6 +173,11 @@ fn code_of(error: &ClientError) -> ErrorCode {
     error.code()
 }
 
+/// A budget of pages.
+fn budget(pages: usize) -> std::num::NonZeroUsize {
+    std::num::NonZeroUsize::new(pages).expect("a budget of at least one page")
+}
+
 /* -------------------------------------------------------------------------- */
 /* Each member's mapping and refusal: key records                              */
 /* -------------------------------------------------------------------------- */
@@ -728,7 +733,7 @@ async fn an_inventory_reads_every_object_and_every_copy_with_its_epoch_to_the_en
     ]);
 
     let inventory = client
-        .inventory(&collection, None, 16)
+        .inventory(&collection, None, budget(16))
         .await
         .expect("an answer")
         .expect("a member");
@@ -782,7 +787,7 @@ async fn an_inventory_reads_every_object_and_every_copy_with_its_epoch_to_the_en
     recorder.answering_with(vec![refusal(404, "COLLECTION_ABSENT", "not a member")]);
     assert_eq!(
         client
-            .inventory(&collection, None, 16)
+            .inventory(&collection, None, budget(16))
             .await
             .expect("an answer"),
         None
@@ -816,7 +821,7 @@ async fn an_inventory_reads_every_object_and_every_copy_with_its_epoch_to_the_en
     ] {
         recorder.answering(pages);
         let refused = client
-            .inventory(&collection, None, 16)
+            .inventory(&collection, None, budget(16))
             .await
             .expect_err("not followed");
         assert_eq!(code_of(&refused), ErrorCode::OutcomeUnknown);
@@ -1219,6 +1224,31 @@ async fn a_shared_comparison_follows_every_page_of_objects_the_reader_lacks() {
         serde_json::to_value(&held).expect("known")
     );
 
+    // A reader may name one object many times, as the service reads a list; each object is named
+    // once, so the requests stay within what the service reads.
+    let one = vec![held[0]; MAX_KNOWN_REVISIONS];
+    let wider: Vec<u64> = (0..66).collect();
+    recorder.answering(vec![
+        object_page(&wider[1..65], &wider, &sealed_object),
+        object_page(&wider[65..], &wider, &sealed_object),
+    ]);
+    let before = recorder.requests();
+    let compared = client
+        .compare_shared(&collection, &one, false, None)
+        .await
+        .expect("an answer")
+        .expect("a member");
+    assert_eq!(compared.objects.len(), 65);
+    assert_eq!(recorder.requests() - before, 2);
+    assert_eq!(
+        recorder.last_body()["compare"]["known"]
+            .as_array()
+            .expect("known")
+            .len(),
+        65,
+        "the object held and the sixty-four the first page brought, each once"
+    );
+
     // A page that brings nothing while an object is missing, and a collection that keeps moving,
     // are not followed; nor is a reader naming more than the service reads.
     recorder.answering(vec![object_page(&[], &listed, &sealed_object)]);
@@ -1244,6 +1274,172 @@ async fn a_shared_comparison_follows_every_page_of_objects_the_reader_lacks() {
             .is_err()
     );
     assert_eq!(recorder.requests(), before, "nothing was sent");
+}
+
+/// A page of a shared comparison built from explicit objects: `changed` brought with content,
+/// `removed` with the place their removal took, and `listed` as every object the collection holds.
+fn fold_page(
+    changed: &[(Uuid, SyncRevision)],
+    removed: &[(Uuid, u64)],
+    listed: &[(Uuid, SyncRevision)],
+) -> serde_json::Value {
+    let sealed_object = serde_json::to_value(sealed(b"theme=dark")).expect("an object");
+    let mut page = compared_shared(
+        &listed
+            .iter()
+            .map(|(object, revision)| (*object, *revision, 1, 1))
+            .collect::<Vec<_>>(),
+        &[],
+        false,
+        0,
+        KeyHead {
+            epoch: 1,
+            revision: 2,
+        },
+    );
+    page["changed"] = changed
+        .iter()
+        .map(|(object, revision)| {
+            serde_json::json!({
+                "kind": "settings",
+                "object_id": object.to_string(),
+                "revision": revision.to_string(),
+                "write_sequence": "1",
+                "key_epoch": "1",
+                "object": sealed_object,
+                "updated_at": "2026-09-24T10:00:00.000Z",
+            })
+        })
+        .collect();
+    page["removed"] = removed
+        .iter()
+        .map(|(object, write_sequence)| {
+            serde_json::json!({
+                "object_id": object.to_string(),
+                "write_sequence": write_sequence.to_string(),
+            })
+        })
+        .collect();
+    page
+}
+
+/// A shared comparison over several pages is one answer: an object the reader held that the
+/// collection removed comes back as removed, with the place its removal took; an object removed
+/// between two pages is removed in the answer; one written again after that is the object again;
+/// and an object the pages brought that the collection stops listing without any page saying it
+/// went is not an answer this client follows.
+#[tokio::test]
+async fn a_shared_comparison_folds_removals_and_later_words_across_pages() {
+    let (client, recorder) = sync_client();
+    let collection = shared_collection(installation(0x41), 0x42);
+    let (a, b, c, x, y) = (
+        identity(0x91),
+        identity(0x92),
+        identity(0x93),
+        identity(0x94),
+        identity(0x95),
+    );
+    let (ra, rb, rc, rx, ry, ra2) = (
+        revision(0xa1),
+        revision(0xa2),
+        revision(0xa3),
+        revision(0xa4),
+        revision(0xa5),
+        revision(0xa6),
+    );
+
+    // Held and since removed, and one the collection never held.
+    recorder.answering(vec![fold_page(&[(b, rb)], &[(a, 5), (c, 0)], &[(b, rb)])]);
+    let compared = client
+        .compare_shared(
+            &collection,
+            &[
+                KnownRevision {
+                    object_id: SyncObjectId::new(a),
+                    revision: ra,
+                },
+                KnownRevision {
+                    object_id: SyncObjectId::new(c),
+                    revision: rc,
+                },
+            ],
+            false,
+            None,
+        )
+        .await
+        .expect("an answer")
+        .expect("a member");
+    assert_eq!(
+        compared.removed,
+        vec![
+            SyncRemoved {
+                object_id: SyncObjectId::new(a),
+                position: Some(SyncPosition::removed_at(5)),
+            },
+            SyncRemoved {
+                object_id: SyncObjectId::new(c),
+                position: None,
+            },
+        ]
+    );
+    assert_eq!(compared.objects.len(), 1);
+
+    // Removed between two pages.
+    recorder.answering(vec![
+        fold_page(&[(a, ra), (b, rb)], &[], &[(a, ra), (b, rb), (c, rc)]),
+        fold_page(&[(c, rc)], &[(a, 7)], &[(b, rb), (c, rc)]),
+    ]);
+    let compared = client
+        .compare_shared(&collection, &[], false, None)
+        .await
+        .expect("an answer")
+        .expect("a member");
+    assert_eq!(
+        compared
+            .objects
+            .iter()
+            .map(|object| object.object_id)
+            .collect::<Vec<_>>(),
+        vec![SyncObjectId::new(b), SyncObjectId::new(c)]
+    );
+    assert_eq!(
+        compared.removed,
+        vec![SyncRemoved {
+            object_id: SyncObjectId::new(a),
+            position: Some(SyncPosition::removed_at(7)),
+        }]
+    );
+
+    // Removed, then written again: the later word is the object.
+    recorder.answering(vec![
+        fold_page(&[(a, ra)], &[], &[(a, ra), (x, rx), (y, ry)]),
+        fold_page(&[(x, rx)], &[(a, 3)], &[(x, rx), (y, ry)]),
+        fold_page(&[(a, ra2), (y, ry)], &[], &[(a, ra2), (x, rx), (y, ry)]),
+    ]);
+    let compared = client
+        .compare_shared(&collection, &[], false, None)
+        .await
+        .expect("an answer")
+        .expect("a member");
+    assert!(compared.removed.is_empty());
+    let brought: Vec<_> = compared
+        .objects
+        .iter()
+        .map(|object| (object.object_id, object.position.revision.0))
+        .collect();
+    assert!(brought.contains(&(SyncObjectId::new(a), Some(ra2))));
+    assert_eq!(brought.len(), 3);
+
+    // Brought, then no longer listed, with no page saying it went.
+    recorder.answering(vec![
+        fold_page(&[(a, ra)], &[], &[(a, ra), (b, rb)]),
+        fold_page(&[(b, rb)], &[], &[(b, rb)]),
+    ]);
+    let refused = client
+        .compare_shared(&collection, &[], false, None)
+        .await
+        .expect_err("not followed");
+    assert_eq!(code_of(&refused), ErrorCode::OutcomeUnknown);
 }
 
 /// Copies outlive the objects they were refused against, so an inventory has no bound on how many
@@ -1300,7 +1496,7 @@ async fn an_inventory_reads_under_a_budget_and_resumes_past_two_thousand_copies(
     );
 
     let mut inventory = client
-        .inventory(&collection, None, 10)
+        .inventory(&collection, None, budget(10))
         .await
         .expect("an answer")
         .expect("a member");
@@ -1314,7 +1510,7 @@ async fn an_inventory_reads_under_a_budget_and_resumes_past_two_thousand_copies(
     let mut calls = 1;
     while !inventory.is_complete() {
         inventory = client
-            .inventory(&collection, Some(inventory), 10)
+            .inventory(&collection, Some(inventory), budget(10))
             .await
             .expect("an answer")
             .expect("a member");
@@ -1346,7 +1542,7 @@ async fn an_inventory_reads_under_a_budget_and_resumes_past_two_thousand_copies(
     // An inventory that reached the end has nothing to continue.
     let before = recorder.requests();
     let done = client
-        .inventory(&collection, Some(inventory.clone()), 10)
+        .inventory(&collection, Some(inventory.clone()), budget(10))
         .await
         .expect("an answer")
         .expect("a member");
