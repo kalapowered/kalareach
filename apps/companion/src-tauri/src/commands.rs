@@ -468,14 +468,8 @@ pub async fn voice_start(
     prepared: kr_protocol::scalars::Digest256,
     expected_rate_version: Option<String>,
 ) -> Result<VoiceStarted> {
-    // One call at a time. A second offer would leave the first call's media running with nothing
-    // holding it, and this device has one microphone.
-    if crate::audio::holding_a_call() {
-        return Err(CommandError::refused(
-            "this device is already holding a voice call",
-        ));
-    }
-
+    // What the page sent is parsed before anything else is asked, so a start that is not a start's
+    // shape is refused as that, whatever this device is doing.
     let mut sessions = Vec::with_capacity(session_ids.len());
     for value in &session_ids {
         sessions.push(
@@ -492,6 +486,14 @@ pub async fn voice_start(
                 .map_err(|_| CommandError::invalid("that is not an amount in minor units"))?,
         )),
     };
+
+    // One call at a time. A second offer would leave the first call's media running with nothing
+    // holding it, and this device has one microphone.
+    if crate::audio::holding_a_call() {
+        return Err(CommandError::refused(
+            "this device is already holding a voice call",
+        ));
+    }
 
     let call = crate::audio::DesktopVoiceCall::new()?;
     let offer_sdp = call.offer().await?;
@@ -1217,6 +1219,17 @@ mod tests {
         })
     }
 
+    /// This process holds at most one voice call, in the one holder every voice command reads, so
+    /// a test that holds a call, or calls a command that starts or stops one, takes turns with it.
+    static CALL_HOLDER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Takes this test's turn with the call holder, whatever a failed test left the lock in.
+    fn turn_with_the_call_holder() -> std::sync::MutexGuard<'static, ()> {
+        CALL_HOLDER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn every_named_command_is_unique() {
         let mut seen = BTreeSet::new();
@@ -1338,6 +1351,9 @@ mod tests {
         let error = refusal.expect_err("that is not a session identifier");
         assert_eq!(error.code, kr_protocol::error::ErrorCode::InvalidArgument);
 
+        // The voice stop below closes whatever call this process holds.
+        let _turn = turn_with_the_call_holder();
+
         // Every command in the table that performs a method. A command added to the table and not
         // here is not found below, which fails this test rather than leaving it unchecked.
         let (_app, window) = page_with(tauri::generate_handler![
@@ -1411,6 +1427,66 @@ mod tests {
                 "{command} answers a shape its method does not take"
             );
         }
+    }
+
+    /// KR-REQ-10.01: a voice start parses what the page sent before it asks whether this device is
+    /// holding a call. With a call held, a start whose session list or budget is not what it claims
+    /// to be is refused with `INVALID_ARGUMENT` rather than as a second call, and the same start in
+    /// its right shape is refused for the running call, which the refusals leave running.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn a_voice_start_parses_what_the_page_sent_before_it_asks_whether_a_call_is_held() {
+        /// Stops the call this test holds, however the test ends.
+        struct Held;
+        impl Drop for Held {
+            fn drop(&mut self) {
+                crate::audio::stop_active_call();
+            }
+        }
+
+        let _turn = turn_with_the_call_holder();
+        let (_app, window) = page_with(tauri::generate_handler![voice_start]);
+        let prepared = serde_json::to_value(kr_protocol::scalars::Digest256::from_bytes([0; 32]))
+            .expect("a digest");
+        let start = |session_ids: serde_json::Value, budget: serde_json::Value| {
+            serde_json::json!({
+                "subject": {},
+                "sessionIds": session_ids,
+                "durationSeconds": 60,
+                "reasoningBudgetMinor": budget,
+                "prepared": prepared,
+            })
+        };
+
+        crate::audio::hold_call(crate::audio::DesktopVoiceCall::new().expect("a call"))
+            .expect("this device holds the call");
+        let _held = Held;
+
+        let not_a_session = start(
+            serde_json::json!(["the session I was looking at"]),
+            serde_json::Value::Null,
+        );
+        assert_eq!(
+            refusal_of(&window, "voice_start", not_a_session).as_deref(),
+            Some("INVALID_ARGUMENT"),
+            "a session list that names no session is refused as that, not as a second call"
+        );
+        let not_an_amount = start(serde_json::json!([]), serde_json::json!("a lot"));
+        assert_eq!(
+            refusal_of(&window, "voice_start", not_an_amount).as_deref(),
+            Some("INVALID_ARGUMENT"),
+            "a budget that is not an amount is refused as that, not as a second call"
+        );
+        let well_formed = start(serde_json::json!([]), serde_json::Value::Null);
+        assert_eq!(
+            refusal_of(&window, "voice_start", well_formed).as_deref(),
+            Some("PERMISSION_DENIED"),
+            "a start in its right shape is refused for the call this device is holding"
+        );
+        assert!(
+            crate::audio::holding_a_call(),
+            "and the refused starts left that call running"
+        );
     }
 
     /// KR-REQ-13.21: a command that is handed a path acts only on one the platform gave this
