@@ -1,13 +1,14 @@
 # Answering approvals from a declarative package
 
-A package with no component can answer an approval its application asks for. Three declarations have
-to agree. The connector table says where an answer goes, the manifest registers an action that
-answers through that place, and every call to the action names the pending resource it answers. A
-document drawn for one request can also say that its controls are for that request alone.
+A package with no component can declare everything an answer to its application's approval needs.
+Three declarations have to agree. The connector table says where an answer goes, the manifest
+registers an action that answers through that place, and every call to the action names the pending
+resource it answers. A document drawn for one request can also say that its controls are for that
+request alone.
 
 All of this is in version 0.1.1 of the package contract. A package that uses any of it declares
-`"sdk_range": ">=0.1.1, <0.2.0"`, so a host on 0.1.0 refuses it by its range rather than failing
-to read it.
+`"sdk_range": ">=0.1.1, <0.2.0"`. A host on 0.1.0 cannot read the new members and refuses such a
+package.
 
 The examples use the Claude Code Channels surface. Claude Code relays a tool approval as
 `notifications/claude/channel/permission_request` with `params.request_id`, and it reads the answer
@@ -154,6 +155,10 @@ another instance's is `PERMISSION_DENIED` and an answered one is `QUESTION_RESOL
 
 The upstream identifier never comes from the caller. It is the one the host recorded with the
 resource when the request arrived.
+
+This host transmits no plugin action's effect. After these checks it refuses the call as
+`UNSUPPORTED_CAPABILITY`, before anything is marked, and the request stays pending for another
+answer, such as the one a person gives in the terminal.
 
 ## Showing a control for one request
 
