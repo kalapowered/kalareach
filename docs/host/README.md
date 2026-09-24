@@ -2690,8 +2690,9 @@ with no stated error, because not knowing is its own state.
 ## Attention, review and what changed since a visit
 
 The environment has one attention store, and the control daemon holds it. It keeps one inbox for
-every session the environment runs, each actor's acknowledgements, review state, visits and the
-one quiet-hours window, beside the daemon's other state as `attention.sqlite3`. It lives with the
+every session the environment runs and for the environment's own workflows, each actor's
+acknowledgements, review state, visits and the one quiet-hours window, beside the daemon's other
+state as `attention.sqlite3`. It lives with the
 daemon because it has to outlive every session: review work a session produced stays after the
 session has ended, and a paired device reads one inbox rather than one per session. What a session
 records stays in the session's own journal. The store keeps none of a session's text, only where
@@ -2767,9 +2768,45 @@ ago is history rather than a notification to send now, so the replay restores ea
 age it had, where the anchor that age is measured from belongs to this boot, and starts the age
 here where it does not. Its timers wait for the first page each session answers with.
 
+### The workflow journal's alerts
+
+The environment has a source of its own beside the sessions': the workflow journal (see *The
+automation service*). When one of a workflow revision's own limits is breached, or a causal chain
+runs out of budget, the journal commits one attention record with the pause, and when a paused
+revision is enabled again it commits one that ends the pause's item. The daemon reads these records
+as the journal's registered attention consumer, at its start and every two seconds after. It
+registers again before every pass, which also tells it how far the journal records it as having
+read. Registering matters to the journal: it removes a record of an attention type only once every
+consumer registered for that type has passed it, and never removes a type nobody has registered
+for. The store removes nothing from the journal.
+
+A pass reads the records past the store's own cursor, commits what they raise or end, and only then
+tells the journal how far the store has read; the journal keeps the furthest position it is told. A
+daemon that stops before the store's commit leaves the journal where it was, so the next pass reads
+the same records again. One that stops after the commit has nothing left to read, and the next pass
+tells the journal all the same, whether or not a later record has arrived. A record is therefore
+neither lost nor counted twice. The journal numbers every event it holds in one stream, a run's
+events among them, and hands the store only its attention records, so a jump in their numbers is
+other events rather than a range retention took.
+
+A journal that records the store as having read further than the store's cursor says the store lost
+what it had written, or was put back to an earlier copy. The pass then reads again what the journal
+still keeps of that range and, in one write, feeds it, records the whole range as a gap and moves
+the cursor to its end. Every automation item still unresolved is uncertain afterwards, because the
+journal may have let records of that range go. A pass that stops before that write has written
+nothing, and the next one does the recovery again, whole.
+
+Each record that raises an item carries the grant the paused revision or chain acts under, read
+from the journal when the store takes the record: the grant the revision names, or the one the
+chain's root run acts under. Neither ever changes. An item whose grant the journal cannot name is
+the owner's alone. A record announces nothing by itself: once a pass has read to the end of the
+journal's records, the timer pass decides what an item it raised is owed, as it does for a session
+after a page that reached the head of both its sources. `workflow.read` shows as alerts the
+attention records the journal does not yet record the store as having taken.
+
 ### The rule set
 
-Eight rules, each with a stable identifier that outlives any change to the wording it produces.
+Nine rules, each with a stable identifier that outlives any change to the wording it produces.
 
 | Rule | What raises it | Starts at | While it stands |
 | --- | --- | --- | --- |
@@ -2781,6 +2818,7 @@ Eight rules, each with a stable identifier that outlives any change to the wordi
 | `attention.adapter_failed` | An adapter failed | notable | urgent after five minutes, then every five |
 | `attention.host_contact_lost` | Contact with the host was lost | notable | urgent after a minute, then every five |
 | `attention.application_notice` | An `OSC 9`, `OSC 99` or `OSC 777` sequence | informational | announced once |
+| `attention.automation_paused` | One of its own limits paused a workflow revision or a causal chain | notable | announced once |
 
 The idle reminder counts from the moment the request became pending, not from the last output: a
 session printing continuously while a question waits still owes the reminder, and a silent session
@@ -2789,6 +2827,11 @@ the item rather than announced again.
 
 An approval is one item per session and request: the same upstream identifier in two sessions is
 two approvals, because each session's agent is waiting on its own.
+
+A paused workflow is one item per revision, however many refusals the pause produced, and
+enabling that revision again ends it. An exhausted causal chain is one item per chain. Nothing
+records the end of a chain's exhaustion, so its item stays in the inbox, and each actor
+acknowledges it for themselves.
 
 An application notice is the one untrusted rule. Any process writing to the terminal can emit one,
 so the item says so and the rule cannot raise any other kind of item; nothing a notice says makes
@@ -2892,8 +2935,9 @@ them: replaying a record the engine has already consumed changes nothing, which 
 rebuild safe to run twice. What people and clients put there is not, and no replay restores it:
 the acknowledgements, the per-actor revisions, the visits and their log views, the quiet-hours
 window and the identities already given to announcements are records in their own right, and the
-store is where they live. It keeps a cursor for each session's two sources, and a write changes
-the rows a decision changed rather than the whole store.
+store is where they live. It keeps a cursor for each session's two sources and one for the
+workflow journal's attention records, and a write changes the rows a decision changed rather than
+the whole store.
 
 The daemon is the one owner of the store, for as long as it is running, and the environment's
 singleton lock is what makes it one daemon. The store also keeps its own claim, for a second
@@ -2954,7 +2998,9 @@ what is waiting rather than a queue of everything that was ever decided.
 
 A jump in a source's sequence means the records between were evicted. The engine records the range,
 names the session it belongs to, marks every unresolved item of that session and source uncertain,
-and leaves it in the inbox; an item of another session is not touched by it. A gap is never an
+and leaves it in the inbox; an item of another session is not touched by it. The workflow journal's
+records are the exception: a jump there is other events, and their only gap is the one a recovery
+records. A gap is never an
 approval and never a completion: an approval whose answer may have been in the missing range stays
 pending and says the host cannot tell. A gap with no known end says that nothing after its start
 can be read at all. The store keeps the last sixty-four gaps.
@@ -2994,11 +3040,15 @@ refused, before anything is dispatched, rather than an existing actor's being de
 
 The owner at this machine sees the whole store. A paired device sees what its grant admits: a
 session's items, review state and visits when the grant's selectors admit that session and it
-carries `session.view`, and the environment's own items when it carries `host.manage`. The same
-scope bounds a read's items, the gaps it reports and where it may continue from. `attention.read`
-and `attention.acknowledge` are reads of the caller's current view rather than rights of their
-own, so a device holding only `host.manage` reads the environment's items and none of any session.
-A read may name one session to narrow the inbox to it.
+carries `session.view`; a paused workflow revision's or causal chain's item when it carries
+`automation.manage` and the revision, or the chain's root run, acts under that same grant, which is
+how `workflow.read` decides what a device is shown; and the environment's other items when it
+carries `host.manage`. An automation item whose grant the journal could not name is shown to no
+device. The same scope bounds a read's items, the gaps it reports and where it may continue from; a
+gap in the workflow journal's records is shown to a grant that carries `automation.manage`.
+`attention.read` and `attention.acknowledge` are reads of the caller's current view rather than
+rights of their own, so a device holding only `host.manage` reads the environment's own items and
+none of any session or workflow. A read may name one session to narrow the inbox to it.
 
 An item's text and a change's text come from retained content: a question's wording, a command
 line, what an application printed. The store keeps none of it. When the owner reads the inbox, the
