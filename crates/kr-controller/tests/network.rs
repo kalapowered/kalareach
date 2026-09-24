@@ -1911,8 +1911,9 @@ async fn the_remote_path_ending_takes_neither_the_worker_nor_a_local_attachment(
     daemon.stop().await;
 }
 
-/// What a relay says when it turns an endpoint away because the allowance is spent.
-const ALLOWANCE_SPENT: &str = "the relay allowance for this period is used up";
+/// What a relay says when it turns an endpoint away because the allowance is spent: the kind token a
+/// managed relay starts that refusal with, then the words for a person.
+const ALLOWANCE_SPENT: &str = "allowance_spent: the relay allowance for this period is used up";
 
 /// What a metered relay may still forward, and what it did once it could not.
 #[derive(Debug)]
@@ -2485,8 +2486,9 @@ async fn a_relay_quota_disconnect_leaves_the_terminal_worker_running() {
 /// whose only path is the relay; then the relay's allowance is spent, and the relay closes what it
 /// admitted and turns away whoever comes back. The connection already established on its direct
 /// path carries on, and a new connection made with the direct addresses the invitation carried
-/// succeeds. A new connection that needs the relay fails, and the failure says that the relay's
-/// allowance is spent, rather than looking like a host that went away.
+/// succeeds. A new connection that needs the relay fails at once, as the relay's refusal: its code
+/// is an exhausted allowance, it names the relay on the route and carries what the relay said, and
+/// it offers what may still work, rather than looking like a host that went away.
 #[ignore = "starts a control daemon; run through scripts/end-to-end.sh"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_exhausted_relay_is_the_reported_reason_a_new_connection_fails() {
@@ -2560,7 +2562,8 @@ async fn an_exhausted_relay_is_the_reported_reason_a_new_connection_fails() {
     .expect("a new connection by the invitation's direct addresses");
     drop(again);
 
-    // A new connection that needs the relay fails, and the failure says why.
+    // A new connection that needs the relay fails, at once, and the failure says why.
+    let started = tokio::time::Instant::now();
     let refused = NetworkTransport::connect(
         &relayed.endpoint,
         EndpointAddr::new(host_id).with_relay_url(relay.url.clone()),
@@ -2570,6 +2573,7 @@ async fn an_exhausted_relay_is_the_reported_reason_a_new_connection_fails() {
     )
     .await
     .expect_err("nothing reaches the host through a relay that refuses");
+    let took = started.elapsed();
     let report = refused.to_string().to_lowercase();
     assert!(
         report.contains("relay")
@@ -2578,6 +2582,34 @@ async fn an_exhausted_relay_is_the_reported_reason_a_new_connection_fails() {
                 .any(|word| report.contains(word)),
         "the failure says the relay's allowance is spent, rather than looking like a host that \
          went away: {refused}"
+    );
+    let kr_client::ClientError::Transport(kr_transport::TransportError::RelayRefused(refusal)) =
+        &refused
+    else {
+        panic!("the failure is the relay's refusal: {refused}");
+    };
+    assert_eq!(refusal.relay, relay.url, "the relay on the route refused");
+    assert_eq!(
+        refusal.kind,
+        kr_transport::error::RelayRefusalKind::AllowanceSpent
+    );
+    assert_eq!(
+        refusal.reason, "the relay allowance for this period is used up",
+        "what the relay said reaches the device"
+    );
+    assert_eq!(
+        refusal.alternatives,
+        [
+            kr_transport::error::RouteAlternative::AnotherRelay,
+            kr_transport::error::RouteAlternative::RestoredAllowance,
+        ],
+        "a device whose only path is the relay is offered what a relay-only device can use"
+    );
+    assert_eq!(refused.code(), ErrorCode::QuotaExceeded);
+    assert!(
+        took < Duration::from_secs(10),
+        "a device with nothing but the refusing relay is told well before the attempt's \
+         30-second deadline: it took {took:?}"
     );
 
     drop(established);

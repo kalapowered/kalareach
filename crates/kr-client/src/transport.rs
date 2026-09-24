@@ -94,7 +94,10 @@ impl NetworkTransport {
     ///
     /// # Errors
     ///
-    /// Returns a transport failure, including the host's refusal when the handshake fails.
+    /// Returns a transport failure, including the host's refusal when the handshake fails. When a
+    /// relay on the route turned this device away and nothing else reached the host, the failure is
+    /// [`kr_transport::TransportError::RelayRefused`], naming the relay, what it said and what may
+    /// still work, rather than a host that did not answer.
     pub async fn connect(
         endpoint: &Endpoint,
         host_addr: impl Into<EndpointAddr>,
@@ -103,10 +106,7 @@ impl NetworkTransport {
         send_limits: SendLimits,
     ) -> Result<Self> {
         send_limits.check()?;
-        let connection = endpoint
-            .connect(host_addr, ALPN)
-            .await
-            .map_err(|error| kr_transport::TransportError::Connect(error.to_string()))?;
+        let connection = kr_transport::endpoint::connect(endpoint, host_addr, ALPN).await?;
         let authorised = handshake::connect(&connection, identity, host_record).await?;
         let streams = Arc::new(StreamRegistry::with_limits(
             authorised.connection_id,

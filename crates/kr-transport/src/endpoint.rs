@@ -1,15 +1,21 @@
-//! Building an iroh endpoint from an explicit selection.
+//! Building an iroh endpoint from an explicit selection, and dialling from it.
 //!
 //! The whole of this module exists to make one guarantee visible: an endpoint reaches exactly the
 //! services its [`EndpointConfig`] names. It starts from `presets::Minimal`, which sets the
 //! cryptographic provider and nothing else, and then adds each selected service by hand. It never
 //! uses `presets::N0`, `RelayMode::Default` or `RelayMode::Staging`, so no public default can
 //! arrive by inheritance.
+//!
+//! [`connect`] is the dialling half: it opens a connection and, when a relay the connection needed
+//! turned this endpoint away, says so rather than reporting a peer that did not answer.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use iroh::endpoint::{Builder, QuicTransportConfig, presets};
-use iroh::{Endpoint, RelayMode, SecretKey};
+use iroh::endpoint::{Builder, Connection, QuicTransportConfig, RelayStatus, presets};
+use iroh::{
+    Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr, Watcher,
+};
 use iroh_mainline_address_lookup::DhtAddressLookup;
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use iroh_relay::tls::CaTlsConfig;
@@ -19,7 +25,7 @@ use kr_protocol::limits::{INACTIVITY_THRESHOLD, KEEPALIVE_INTERVAL, MAX_SEND_QUE
 use rustls_pki_types::CertificateDer;
 
 use crate::config::{EndpointConfig, PublishedAddresses};
-use crate::error::{Result, TransportError};
+use crate::error::{RelayRefusal, Result, TransportError};
 
 /// How often an idle connection sends a QUIC keepalive.
 ///
@@ -126,6 +132,158 @@ async fn bind(
         .bind()
         .await
         .map_err(|error| TransportError::Bind(error.to_string()))
+}
+
+/// Opens a connection to `peer`, and names the relay that turned this endpoint away when that is
+/// why no path opened.
+///
+/// iroh keeps the reason a relay gave for refusing this endpoint, but only for this endpoint's home
+/// relay, and only until its next attempt to reach that relay. So the relay status is followed for
+/// the whole attempt, and a refusal counts only when it came from a relay on this connection's
+/// route: a relay the address names, or one this endpoint already holds for the peer, both of which
+/// iroh tries. A home relay that refused but is not on the route says nothing about this
+/// connection. A relay on the route that is not this endpoint's home relay leaves no reason to
+/// read, so a failure through it is reported as any other failure is.
+///
+/// An endpoint with no IP transport of its own has nothing but relays to try, so once every relay
+/// on its route has refused it the attempt ends there rather than at its deadline. An endpoint that
+/// can take a direct path lets the attempt run, because an address hint or local discovery can
+/// still open one, and the refusal is the reason only if none does.
+///
+/// # Errors
+///
+/// Returns [`TransportError::RelayRefused`] when a relay on the route refused this endpoint and
+/// nothing else reached the peer, and [`TransportError::Connect`] for any other failure.
+pub async fn connect(
+    endpoint: &Endpoint,
+    peer: impl Into<EndpointAddr>,
+    alpn: &[u8],
+) -> Result<Connection> {
+    let peer: EndpointAddr = peer.into();
+    let peer_id = peer.id;
+    let named: BTreeSet<RelayUrl> = peer.relay_urls().cloned().collect();
+    let direct = !endpoint.bound_sockets().is_empty();
+    let mut statuses = endpoint.home_relay_status();
+    let mut refusals = Refusals::default();
+    refusals.observe(statuses.get().iter().map(RelayObservation::of));
+    let mut watching = true;
+
+    let attempt = endpoint.connect(peer, alpn);
+    tokio::pin!(attempt);
+    loop {
+        if !direct {
+            let route = route(endpoint, peer_id, &named).await;
+            if let Some((relay, reason)) = refusals.throughout(&route) {
+                return Err(refused(relay, reason, direct));
+            }
+        }
+        tokio::select! {
+            outcome = &mut attempt => {
+                let error = match outcome {
+                    Ok(connection) => return Ok(connection),
+                    Err(error) => error,
+                };
+                let route = route(endpoint, peer_id, &named).await;
+                return Err(match refusals.on(&route) {
+                    Some((relay, reason)) => refused(relay, reason, direct),
+                    None => TransportError::Connect(error.to_string()),
+                });
+            }
+            changed = statuses.updated(), if watching => match changed {
+                Ok(value) => refusals.observe(value.iter().map(RelayObservation::of)),
+                // Every handle on the endpoint is gone, so nothing will change again, and the
+                // attempt ends on its own.
+                Err(_) => watching = false,
+            },
+        }
+    }
+}
+
+/// Returns the relays a connection to `peer` can go through: the ones its address names and the
+/// ones this endpoint already holds for the peer.
+async fn route(
+    endpoint: &Endpoint,
+    peer: EndpointId,
+    named: &BTreeSet<RelayUrl>,
+) -> BTreeSet<RelayUrl> {
+    let mut relays = named.clone();
+    if let Some(known) = endpoint.remote_info(peer).await {
+        relays.extend(known.addrs().filter_map(|address| match address.addr() {
+            TransportAddr::Relay(relay) => Some(relay.clone()),
+            _ => None,
+        }));
+    }
+    relays
+}
+
+/// Returns the failure a refusal by `relay` is.
+fn refused(relay: &RelayUrl, reason: &str, direct: bool) -> TransportError {
+    TransportError::RelayRefused(RelayRefusal::from_reason(relay.clone(), reason, direct))
+}
+
+/// What one relay's status says about whether it refuses this endpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RelayObservation {
+    relay: RelayUrl,
+    /// Whether the endpoint is connected to the relay now.
+    connected: bool,
+    /// The reason the relay gave, when it refused the endpoint's latest attempt to reach it.
+    refused: Option<String>,
+    /// Whether the latest attempt to reach the relay failed, for that reason or any other.
+    failed: bool,
+}
+
+impl RelayObservation {
+    fn of(status: &RelayStatus) -> Self {
+        Self {
+            relay: status.url().clone(),
+            connected: status.is_connected(),
+            refused: status.auth_denied_reason().map(ToOwned::to_owned),
+            failed: status.last_error().is_some(),
+        }
+    }
+}
+
+/// The refusals this endpoint's relays last gave it, by relay.
+#[derive(Debug, Default)]
+struct Refusals(BTreeMap<RelayUrl, String>);
+
+impl Refusals {
+    /// Takes in what the relay status says now.
+    ///
+    /// A refusal stands while the endpoint dials the relay again, because the relay has said
+    /// nothing newer. It ends when the relay admits the endpoint, and when the latest attempt
+    /// failed for another cause, since then the refusal is no longer why the relay cannot be
+    /// reached.
+    fn observe(&mut self, observations: impl IntoIterator<Item = RelayObservation>) {
+        for observation in observations {
+            match observation.refused {
+                Some(reason) => {
+                    self.0.insert(observation.relay, reason);
+                }
+                None if observation.connected || observation.failed => {
+                    self.0.remove(&observation.relay);
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// Returns the refusal of the first relay on `route` that refused, if one did.
+    fn on<'a>(&'a self, route: &'a BTreeSet<RelayUrl>) -> Option<(&'a RelayUrl, &'a str)> {
+        route
+            .iter()
+            .find_map(|relay| self.0.get(relay).map(|reason| (relay, reason.as_str())))
+    }
+
+    /// Returns the refusal to report when every relay on `route` refused, which leaves an endpoint
+    /// with no direct transport nothing else to try.
+    fn throughout<'a>(&'a self, route: &'a BTreeSet<RelayUrl>) -> Option<(&'a RelayUrl, &'a str)> {
+        if route.is_empty() || !route.iter().all(|relay| self.0.contains_key(relay)) {
+            return None;
+        }
+        self.on(route)
+    }
 }
 
 /// Returns the relay selection.
@@ -335,6 +493,111 @@ mod tests {
         let endpoint = bind_dialer(&config, &identity).await.expect("an endpoint");
         assert_eq!(endpoint.bound_sockets(), Vec::<std::net::SocketAddr>::new());
         endpoint.close().await;
+    }
+
+    fn relay(name: &str) -> RelayUrl {
+        format!("https://{name}.reach.kala.to")
+            .parse()
+            .expect("a relay URL")
+    }
+
+    fn refusing(name: &str, reason: &str) -> RelayObservation {
+        RelayObservation {
+            relay: relay(name),
+            connected: false,
+            refused: Some(reason.to_owned()),
+            failed: true,
+        }
+    }
+
+    fn relays(names: &[&str]) -> BTreeSet<RelayUrl> {
+        names.iter().map(|name| relay(name)).collect()
+    }
+
+    /// KR-REQ-17.40: a refusal is a connection's reason only when the relay that gave it is on
+    /// that connection's route. A home relay that refused this endpoint says nothing about a route
+    /// through another relay, and a route with a relay left that did not refuse is not refused
+    /// throughout, so an endpoint with no direct transport still waits for that relay.
+    #[test]
+    fn a_refusal_counts_only_for_a_relay_on_the_route() {
+        let mut refusals = Refusals::default();
+        refusals.observe([refusing("relay-1", "allowance_spent: spent")]);
+
+        assert_eq!(refusals.on(&relays(&["relay-2"])), None);
+        assert_eq!(refusals.throughout(&relays(&["relay-2"])), None);
+        assert_eq!(refusals.throughout(&relays(&[])), None);
+
+        let only = relays(&["relay-1"]);
+        assert_eq!(
+            refusals.on(&only),
+            Some((&relay("relay-1"), "allowance_spent: spent"))
+        );
+        assert_eq!(
+            refusals.throughout(&only),
+            Some((&relay("relay-1"), "allowance_spent: spent"))
+        );
+
+        let both = relays(&["relay-1", "relay-2"]);
+        assert_eq!(
+            refusals.on(&both),
+            Some((&relay("relay-1"), "allowance_spent: spent")),
+            "a failed attempt through both is reported as the refusal it met"
+        );
+        assert_eq!(
+            refusals.throughout(&both),
+            None,
+            "the relay that did not refuse can still carry the attempt"
+        );
+
+        refusals.observe([refusing("relay-2", "stopping: this relay is stopping")]);
+        assert_eq!(
+            refusals.throughout(&both),
+            Some((&relay("relay-1"), "allowance_spent: spent"))
+        );
+    }
+
+    /// KR-REQ-17.40: a refusal stands while the endpoint dials the relay again, and ends when the
+    /// relay admits it or when the latest attempt failed for another cause.
+    #[test]
+    fn a_refusal_lasts_until_the_relay_says_something_newer() {
+        let only = relays(&["relay-1"]);
+        let redialling = RelayObservation {
+            relay: relay("relay-1"),
+            connected: false,
+            refused: None,
+            failed: false,
+        };
+        let unreachable = RelayObservation {
+            failed: true,
+            ..redialling.clone()
+        };
+        let admitted = RelayObservation {
+            connected: true,
+            ..redialling.clone()
+        };
+
+        let mut refusals = Refusals::default();
+        refusals.observe([refusing("relay-1", "allowance_spent: spent")]);
+        refusals.observe([redialling]);
+        assert!(
+            refusals.on(&only).is_some(),
+            "dialling again is not an answer"
+        );
+
+        refusals.observe([unreachable]);
+        assert_eq!(
+            refusals.on(&only),
+            None,
+            "a relay that cannot be reached is not refusing"
+        );
+
+        refusals.observe([refusing("relay-1", "allowance_spent: spent")]);
+        refusals.observe([admitted]);
+        assert_eq!(
+            refusals.on(&only),
+            None,
+            "a relay that admits the endpoint is not refusing"
+        );
     }
 
     /// KR-REQ-10.02: discovery is configured only when selected, apart from the relay choice.
