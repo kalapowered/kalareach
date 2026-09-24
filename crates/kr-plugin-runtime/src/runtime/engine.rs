@@ -45,7 +45,7 @@ use crate::runtime::error::{RuntimeError, RuntimeResult};
 pub const EPOCH_TICK_MS: u64 = 1;
 
 /// The version of the engine this host is built against.
-pub const ENGINE_VERSION: &str = "48.0.2";
+pub const ENGINE_VERSION: &str = "48.0.3";
 
 /// The target this host compiles machine code for.
 pub const TARGET: &str = env!("KR_PLUGIN_TARGET");

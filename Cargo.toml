@@ -196,7 +196,7 @@ uuid = { version = "=1.26.1", features = ["v4"] }
 vtparse = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb" }
 # The component engine, pinned to one exact release. A compiled-code cache entry is only valid for
 # the version that produced it, so the pin is part of the cache key rather than a convenience.
-wasmtime = { version = "=48.0.2", default-features = false, features = ["addr2line", "component-model", "cranelift", "demangle", "gc", "gc-drc", "gc-null", "runtime", "std"] }
+wasmtime = { version = "=48.0.3", default-features = false, features = ["addr2line", "component-model", "cranelift", "demangle", "gc", "gc-drc", "gc-null", "runtime", "std"] }
 wezterm-escape-parser = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb", features = ["std"] }
 wezterm-surface = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb" }
 wezterm-term = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb" }
