@@ -1583,11 +1583,25 @@ fn a_helper_directory_reached_through_a_link_is_named_as_the_directory_it_resolv
         prefix.join("libexec").join("git-core"),
     )
     .expect("a link to Git's own helper directory");
-    let asked = std::process::Command::new(&copy)
-        .arg("--exec-path")
-        .env_clear()
-        .output()
-        .expect("the copy runs");
+    // Another test's child, started while the copy was being written, holds it open for writing
+    // until that child executes its own program, and the kernel will not execute a file open for
+    // writing. So the copy is asked until that has passed.
+    let mut attempts = 0;
+    let asked = loop {
+        match std::process::Command::new(&copy)
+            .arg("--exec-path")
+            .env_clear()
+            .output()
+        {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 100 =>
+            {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => break other.expect("the copy runs"),
+        }
+    };
     let reported = std::path::PathBuf::from(String::from_utf8_lossy(&asked.stdout).trim());
     let through_a_link =
         reported != std::fs::canonicalize(&reported).expect("the reported directory resolves");
