@@ -1749,14 +1749,17 @@ impl StagedPackage {
                 ));
             }
             replaced.push(target);
-            let mut directory = package.try_clone()?;
+            let mut directory = package
+                .try_clone()
+                .map_err(|error| stopped(&replaced, error))?;
             for component in relative.parent().into_iter().flat_map(Path::components) {
                 let next = open_child(
                     &directory.dir,
                     &directory.path.join(component),
                     Path::new(component.as_os_str()),
                     false,
-                )?;
+                )
+                .map_err(|error| stopped(&replaced, error))?;
                 touched.insert(directory.path.clone(), directory);
                 directory = next;
             }
