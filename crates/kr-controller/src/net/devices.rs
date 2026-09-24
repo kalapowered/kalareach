@@ -229,19 +229,20 @@ pub struct ObservedUtc {
     pub behind_ms: u64,
 }
 
-/// How much of the bounded offline validity one boot had measured as spent.
+/// How much of the bounded offline validity this host has measured as spent since one
+/// synchronisation.
 ///
-/// The bound is measured from a synchronisation in UTC and runs on the continuous clock. Written
-/// against the boot it was measured in, as a grant deadline is, because a reading of the boot
-/// clock means nothing after the next boot: within this one, it says how long has passed since,
-/// across a restart of this daemon and a machine asleep alike.
+/// The bound is measured from a synchronisation in UTC and runs on the continuous clock. The time
+/// spent is evidence about that synchronisation whatever boot measured it, so it outlives a
+/// reboot; the boot-clock reading it was measured at is bound to its boot, as a grant deadline
+/// is, because it says how long has passed since only within that boot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoredOfflineAnchor {
     /// The synchronisation the bound is measured from, in UTC milliseconds.
     pub synchronised_at_ms: u64,
-    /// When the time below was measured, in milliseconds since this boot.
+    /// When the time below was measured, in milliseconds since the boot it was measured in.
     pub anchored_boot_ms: u64,
-    /// How long had passed since the synchronisation then.
+    /// How long had passed since the synchronisation then, at least.
     pub elapsed_ms: u64,
 }
 
@@ -502,10 +503,9 @@ impl DeviceDirectory {
                      observed_ms INTEGER NOT NULL,
                      untrusted_at_ms INTEGER
                  );
-                 CREATE TABLE IF NOT EXISTS network_offline_anchor (
-                     id INTEGER PRIMARY KEY NOT NULL CHECK (id = 0),
+                 CREATE TABLE IF NOT EXISTS network_offline_anchors (
+                     synchronised_at_ms INTEGER PRIMARY KEY NOT NULL,
                      boot_value BLOB NOT NULL,
-                     synchronised_at_ms INTEGER NOT NULL,
                      anchored_boot_ms INTEGER NOT NULL,
                      elapsed_ms INTEGER NOT NULL
                  );",
@@ -993,9 +993,12 @@ impl DeviceDirectory {
         Ok(Some(u64::try_from(deadline).unwrap_or_default()))
     }
 
-    /// Records how much of the offline bound this boot has measured as spent.
+    /// Records how much of the offline bound this host has measured as spent since one
+    /// synchronisation.
     ///
-    /// One record, replaced by the next: the bound is measured from one synchronisation at a time.
+    /// One record per synchronisation, so recording a new one never replaces the record the
+    /// policy on disk is measured from: a stop between the two writes leaves that record as it
+    /// was. The time spent only rises, whichever boot records it.
     ///
     /// # Errors
     ///
@@ -1008,14 +1011,14 @@ impl DeviceDirectory {
         let stored = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
         self.with(|connection| {
             connection.execute(
-                "INSERT INTO network_offline_anchor
-                     (id, boot_value, synchronised_at_ms, anchored_boot_ms, elapsed_ms)
-                 VALUES (0, ?1, ?2, ?3, ?4)
-                 ON CONFLICT (id) DO UPDATE SET boot_value = ?1, synchronised_at_ms = ?2,
-                     anchored_boot_ms = ?3, elapsed_ms = ?4",
+                "INSERT INTO network_offline_anchors
+                     (synchronised_at_ms, boot_value, anchored_boot_ms, elapsed_ms)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (synchronised_at_ms) DO UPDATE SET boot_value = ?2,
+                     anchored_boot_ms = ?3, elapsed_ms = MAX(elapsed_ms, ?4)",
                 params![
-                    boot.value.as_slice(),
                     stored(anchor.synchronised_at_ms),
+                    boot.value.as_slice(),
                     stored(anchor.anchored_boot_ms),
                     stored(anchor.elapsed_ms),
                 ],
@@ -1024,36 +1027,58 @@ impl DeviceDirectory {
         Ok(())
     }
 
-    /// Returns what the boot this host is running in recorded of the offline bound, when it
-    /// recorded anything.
+    /// Returns what this host recorded of the offline bound measured from `synchronised_at_ms`,
+    /// and whether it was recorded in `boot`, the boot this host is running in.
     ///
-    /// A record from an earlier boot is not returned: the boot clock it was measured on has gone
-    /// with that boot.
+    /// The time spent is returned whatever boot recorded it. The boot-clock reading is only worth
+    /// anything in the boot it was taken in, which is what the second value says.
     ///
     /// # Errors
     ///
     /// Returns an error when the table cannot be read.
-    pub fn offline_anchor_in(&self, boot: &BootIdentity) -> Result<Option<StoredOfflineAnchor>> {
-        let row: Option<(Vec<u8>, i64, i64, i64)> = self.with(|connection| {
+    pub fn offline_anchor_for(
+        &self,
+        synchronised_at_ms: u64,
+        boot: &BootIdentity,
+    ) -> Result<Option<(StoredOfflineAnchor, bool)>> {
+        let row: Option<(Vec<u8>, i64, i64)> = self.with(|connection| {
             connection
                 .query_row(
-                    "SELECT boot_value, synchronised_at_ms, anchored_boot_ms, elapsed_ms
-                     FROM network_offline_anchor WHERE id = 0",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    "SELECT boot_value, anchored_boot_ms, elapsed_ms
+                     FROM network_offline_anchors WHERE synchronised_at_ms = ?1",
+                    params![i64::try_from(synchronised_at_ms).unwrap_or(i64::MAX)],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()
         })?;
         let read = |value: i64| u64::try_from(value).unwrap_or_default();
-        Ok(row
-            .filter(|(recorded, ..)| recorded.as_slice() == boot.value.as_slice())
-            .map(
-                |(_, synchronised_at_ms, anchored_boot_ms, elapsed_ms)| StoredOfflineAnchor {
-                    synchronised_at_ms: read(synchronised_at_ms),
+        Ok(row.map(|(recorded, anchored_boot_ms, elapsed_ms)| {
+            (
+                StoredOfflineAnchor {
+                    synchronised_at_ms,
                     anchored_boot_ms: read(anchored_boot_ms),
                     elapsed_ms: read(elapsed_ms),
                 },
-            ))
+                recorded.as_slice() == boot.value.as_slice(),
+            )
+        }))
+    }
+
+    /// Forgets the offline bound's records for every synchronisation but `kept`, or for all of
+    /// them when there is no bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the rows cannot be removed.
+    pub fn forget_offline_anchors_except(&self, kept: Option<u64>) -> Result<()> {
+        self.with(|connection| {
+            connection.execute(
+                "DELETE FROM network_offline_anchors
+                 WHERE ?1 IS NULL OR synchronised_at_ms != ?1",
+                params![kept.map(|kept| i64::try_from(kept).unwrap_or(i64::MAX))],
+            )
+        })?;
+        Ok(())
     }
 
     /// Records that this host's wall clock could not be trusted to decide an expiry.

@@ -1688,14 +1688,14 @@ in UTC. The count starts when the policy that holds the bound is restored at sta
 synchronised, whether or not a device ever asks: the daemon notes how long has passed since the
 synchronisation, at an instant on the continuous clock. A new maximum keeps the time already spent,
 so a shorter bound never ends later than the one it replaces; only a new synchronisation starts the
-count again. The count is written down against the boot, as a device's grant deadline is, so a
-daemon restarted in the same boot finds the bound as far gone as it was. Once the continuous clock
-passes the bound's end, the moment in UTC that implies becomes the floor every decision stands on,
-a workflow's under a device's grant included, and it is written down like any other floor. A wall
-clock wound back does not bring the bound back, and neither does a restart, into the same boot or a
-new one: it stays out until the owner changes the bound or the authority feed synchronises. No
-grant's expiry is recorded for it. The network's record task notices the end too, when nothing
-asks.
+count again. The time spent is written down for each synchronisation: when the count starts, when
+a decision or a relayed write finds the bound run out, and at every mark of the network's record
+task. A daemon restarted in the same boot adds the boot clock's time since the record; one started
+after a reboot keeps the recorded time and adds only what UTC shows. A wall clock wound back does
+not bring the bound back, and neither does a restart: it stays out until the owner changes the
+bound or the authority feed synchronises. No grant's expiry is recorded for it, and it moves no
+clock floor. The count can only run out early, which is right for a refusal and is no reading of
+UTC.
 
 What the subject decides stays the subject's, and the conditional requirements the daemon cannot
 evaluate are exactly those: whose subject it is. A device detaches the attachment its own

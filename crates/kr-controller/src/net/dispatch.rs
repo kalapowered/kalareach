@@ -196,14 +196,15 @@ impl FrameSink for ControlStream {
 /// floor another decision raised ends it at once.
 ///
 /// What the poll reads of time, it keeps. Its reading of UTC raises the floor every later decision
-/// stands on, and a lapse it finds, by UTC or on the continuous clock, is owed its record, which
-/// is written outside the poll by the relay, the next decision or the network's record task. A
-/// clock wound back after the poll refused therefore gives nothing back: not to the batch decided
-/// again, and not to a connection that comes after this one.
+/// stands on, and a lapse it finds is owed its record: by UTC, the floor it read; on the continuous
+/// clock, the time the offline bound has spent. Both are written outside the poll, by the relay,
+/// the next decision or the network's record task. A clock wound back after the poll refused
+/// therefore gives nothing back: not to the batch decided again, and not to a connection that comes
+/// after this one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RelayGrant {
     epoch: u64,
-    offline: Option<super::OfflineEnd>,
+    until: Option<kr_transport::clock::ContinuousInstant>,
     lapses_at_ms: Option<u64>,
 }
 
@@ -213,10 +214,11 @@ impl RelayGrant {
         if controller.authority_epoch() != self.epoch {
             return false;
         }
-        if let Some(offline) = self.offline
-            && offline.passed(controller.clock.now())
+        if self
+            .until
+            .is_some_and(|until| controller.clock.now() >= until)
         {
-            controller.keep_lapse(offline.lapsed_at_ms);
+            controller.owe_offline_time();
             return false;
         }
         if let Some(lapses_at_ms) = self.lapses_at_ms {
@@ -2381,7 +2383,7 @@ impl RemoteConnection {
             .ok()?;
         Some(RelayGrant {
             epoch,
-            offline: decision.offline,
+            until: decision.offline_until,
             lapses_at_ms: decision.decided.lapses_at_ms,
         })
     }
@@ -3124,7 +3126,7 @@ mod write_boundary {
     fn decided_now(controller: &Controller) -> RelayGrant {
         RelayGrant {
             epoch: controller.authority_epoch(),
-            offline: None,
+            until: None,
             lapses_at_ms: None,
         }
     }
@@ -3288,13 +3290,10 @@ mod write_boundary {
         let relaying = Relaying {
             grant: RelayGrant {
                 epoch: controller.authority_epoch(),
-                offline: Some(crate::service::net::OfflineEnd {
-                    until: controller
-                        .clock
-                        .now()
-                        .checked_add(Duration::from_millis(30)),
-                    lapsed_at_ms: kr_ipc::now_ms().get() + 30,
-                }),
+                until: controller
+                    .clock
+                    .now()
+                    .checked_add(Duration::from_millis(30)),
                 lapses_at_ms: None,
             },
             redecide: &redecide,
@@ -3360,7 +3359,7 @@ mod write_boundary {
             let relaying = Relaying {
                 grant: RelayGrant {
                     epoch: controller.authority_epoch(),
-                    offline: None,
+                    until: None,
                     lapses_at_ms: Some(lapses_at_ms),
                 },
                 redecide: &redecide,
@@ -3461,7 +3460,7 @@ mod write_boundary {
             let relaying = Relaying {
                 grant: RelayGrant {
                     epoch: controller.authority_epoch(),
-                    offline: None,
+                    until: None,
                     lapses_at_ms: Some(lapses_at_ms),
                 },
                 redecide: &redecide,
@@ -3521,7 +3520,7 @@ mod write_boundary {
         let relaying = Relaying {
             grant: RelayGrant {
                 epoch: controller.authority_epoch(),
-                offline: None,
+                until: None,
                 lapses_at_ms: Some(lapses_at_ms),
             },
             redecide: &redecide,
@@ -3561,6 +3560,79 @@ mod write_boundary {
         controller
             .decide_for_device(&expiring, &expiring_record, wound_back)
             .expect_err("and for another connection after a restart");
+        drop(controller);
+    }
+
+    /// An offline bound the boundary finds run out on the continuous clock stops the batch, and
+    /// the boundary writes nothing itself: it owes the record of the time the bound has spent, and
+    /// the step outside the poll that settles the floor writes it down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bound_the_boundary_finds_run_out_is_written_down_outside_the_poll() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::super::tests::daemon(&temp).await;
+        let stream = HeldStream::new(false);
+        let output = output(&controller, &stream);
+        let frame = batch();
+        let synchronised = kr_ipc::now_ms().get();
+        controller
+            .update_policy(|policy| {
+                policy.set_offline_validity(Some(kr_protocol::sharing::OfflineValidityPolicy {
+                    maximum_offline_ms: DurationMs::new(200),
+                    last_synchronised_at_ms: Nullable::some(
+                        kr_protocol::scalars::TimestampMs::new(synchronised),
+                    ),
+                }));
+            })
+            .expect("the owner's choice is recorded");
+        let (lasting, lasting_record) = super::super::tests::granted(
+            kr_protocol::grant::GrantExpiry::Never,
+            controller.policy().authority_revision(),
+        );
+        let decision = controller
+            .decide_for_device(
+                &lasting,
+                &lasting_record,
+                super::super::tests::listing(&temp, synchronised),
+            )
+            .expect("inside the bound");
+        let recorded = |controller: &Controller| {
+            controller
+                .devices()
+                .offline_anchor_for(synchronised, &controller.boot_identity)
+                .expect("reads the record")
+                .expect("the bound's time is recorded")
+                .0
+                .elapsed_ms
+        };
+
+        let redecide = || true;
+        let relaying = Relaying {
+            grant: RelayGrant {
+                epoch: controller.authority_epoch(),
+                until: decision.offline_until,
+                lapses_at_ms: None,
+            },
+            redecide: &redecide,
+        };
+        let (written, ()) = tokio::join!(output.write(&frame, Some(relaying)), async {
+            stream.waited(1).await;
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            stream.writer.add_permits(1);
+        });
+        assert_eq!(written, Written::Undecided);
+        assert!(stream.reached().is_empty());
+        assert!(
+            recorded(&controller) < 200,
+            "the boundary wrote nothing itself"
+        );
+
+        // What the relay and the record task do outside the poll.
+        controller.settle_floor();
+        assert!(
+            recorded(&controller) > 200,
+            "the time the bound has spent is written down"
+        );
+        drop(output);
         drop(controller);
     }
 }

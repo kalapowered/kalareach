@@ -408,6 +408,10 @@ pub struct Controller {
     /// runs: the floor holds UTC still until the clock catches up. Taken when the policy holding
     /// the bound is restored, accepted or synchronised, and changed only under the policy's lock.
     offline_anchor: std::sync::Mutex<Option<net::OfflineAnchor>>,
+    /// True while the time the offline bound has spent is owed its record: a poll found the bound
+    /// run out, or a write of the time failed. The next step that settles the clock floor writes
+    /// it.
+    offline_time_owed: std::sync::atomic::AtomicBool,
     /// This host's half of the remote authority feed: the revisions only it issues, the revocation
     /// records it retains, and the synchronisation it owes before it serves remote work again.
     feed: std::sync::Mutex<crate::grants::AuthorityFeed>,
@@ -718,6 +722,12 @@ impl Controller {
                 floor: &utc_floor,
             },
         )?;
+        // A record for any other synchronisation is one a policy write never reached.
+        if let Err(error) = devices
+            .forget_offline_anchors_except(offline_anchor.map(|anchor| anchor.synchronised_at_ms()))
+        {
+            eprintln!("kr-controller: could not forget stale offline bound records: {error}");
+        }
         // The automation service reads the grant each definition names from the stores this
         // daemon already holds (the grant store, and a paired device's own record), under this
         // daemon's own policy, and carries out its change-set nodes through the change-set
@@ -807,6 +817,7 @@ impl Controller {
             authority_epoch: std::sync::atomic::AtomicU64::new(0),
             utc_floor,
             offline_anchor: std::sync::Mutex::new(offline_anchor),
+            offline_time_owed: std::sync::atomic::AtomicBool::new(false),
             feed: std::sync::Mutex::new(feed),
             changesets,
             automation,
@@ -1865,7 +1876,8 @@ impl Controller {
         let value = change(&mut candidate);
         // The offline bound's time is taken with the policy that holds it: a change measured from
         // another synchronisation starts it again, and any other change keeps the time already
-        // spent. Written down before the policy, and put back when the policy is not.
+        // spent. Its record is written before the policy and is one of its own, so a stop between
+        // the two leaves the record the policy on disk is measured from as it was.
         let mut anchor = self
             .offline_anchor
             .lock()
@@ -1874,34 +1886,21 @@ impl Controller {
         let next = net::offline_anchor(
             candidate.offline_validity(),
             previous,
-            &net::AnchorSources {
-                clock: &*self.clock,
-                boot_clock: &*self.shared_clock,
-                wall_clock: &net::wall_clock_now_ms,
-                boot: &self.boot_identity,
-                devices: &self.devices,
-                floor: &self.utc_floor,
-            },
+            &self.anchor_sources(),
         )?;
         let snapshot = candidate.snapshot();
-        if let Err(error) = self.sharing.grants().store_policy(&snapshot) {
-            if next != previous
-                && let Some(previous) = previous
-                && let Err(restore) = self
-                    .devices
-                    .record_offline_anchor(&self.boot_identity, &previous.stored())
-            {
-                eprintln!(
-                    "kr-controller: could not put back the offline bound's record after a failed \
-                     policy write: {restore}"
-                );
-            }
-            return Err(error);
-        }
+        self.sharing.grants().store_policy(&snapshot)?;
         self.floor_written.fetch_max(
             snapshot.utc_floor_ms.get(),
             std::sync::atomic::Ordering::SeqCst,
         );
+        if next != previous
+            && let Err(error) = self
+                .devices
+                .forget_offline_anchors_except(next.map(|next| next.synchronised_at_ms()))
+        {
+            eprintln!("kr-controller: could not forget stale offline bound records: {error}");
+        }
         *held = candidate;
         *anchor = next;
         // Published with the policy, under its lock, so a decision that reads this epoch reads the
@@ -2008,14 +2007,20 @@ impl Controller {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Writes down a clock floor still owed its record, for a caller holding no decision of its
-    /// own.
+    /// Writes down a clock floor still owed its record, and the time the offline bound has spent
+    /// when that is owed, for a caller holding no decision of its own.
     pub(crate) fn settle_floor(&self) {
         let policy = self
             .policy
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.write_owed_floor(&policy);
+        if self
+            .offline_time_owed
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.write_offline_time(&policy);
+        }
     }
 
     /// Returns which workers have not yet acknowledged the environment's authority revision.
