@@ -575,8 +575,10 @@ impl Drop for WindowGuard<'_> {
 ///
 /// # Errors
 ///
-/// Returns the first refusal or mismatch. A client that cannot verify the host's proof never
-/// enables an authorised stream, whatever the host said.
+/// Returns the first refusal or mismatch: [`TransportError::Refused`] when the host refused the
+/// offer or the proof itself, and [`TransportError::Handshake`] for what this side concluded, such
+/// as a reply that never came or a selection or acceptance it cannot use. A client that cannot
+/// verify the host's proof never enables an authorised stream, whatever the host said.
 pub async fn connect(
     connection: &Connection,
     identity: &LocalIdentity,
@@ -603,7 +605,7 @@ pub async fn connect(
         })?;
     let selection = match reply {
         HelloReply::Selected(selection) => *selection,
-        HelloReply::Refused(error) => return Err(TransportError::Handshake(error)),
+        HelloReply::Refused(error) => return Err(TransportError::Refused(error)),
     };
     check_extensions(&offer, &selection)?;
     // The host is expected to have refused this itself; a client that took the selection anyway
@@ -631,7 +633,7 @@ pub async fn connect(
         })?;
     let accepted = match reply {
         ConnectReply::Accepted(accepted) => *accepted,
-        ConnectReply::Refused(error) => return Err(TransportError::Handshake(error)),
+        ConnectReply::Refused(error) => return Err(TransportError::Refused(error)),
     };
 
     // The client checks the same bindings the host did, from its own side. A host that selected a
@@ -696,9 +698,11 @@ impl CandidateConnection {
     ///
     /// # Errors
     ///
-    /// Returns the host's refusal, a framing failure, or a stream failure. A refusal is the host's
-    /// own protocol error: a candidate that asked for something this surface does not serve is
-    /// told so rather than disconnected.
+    /// Returns [`TransportError::Refused`] with the host's own protocol error when the host answers
+    /// with one: a candidate that asked for something this surface does not serve is told so
+    /// rather than disconnected. Returns [`TransportError::Handshake`] when this side concluded
+    /// the call failed: the response stream ended with no answer, or the answer was to another
+    /// request. Otherwise a framing failure or a stream failure.
     pub async fn call<P, R>(&mut self, method: kr_protocol::method::Method, params: &P) -> Result<R>
     where
         P: serde::Serialize + ?Sized,
@@ -731,7 +735,7 @@ impl CandidateConnection {
         }
         match response.outcome {
             kr_protocol::envelope::Outcome::Ok(value) => Ok(value.to_typed()?),
-            kr_protocol::envelope::Outcome::Error(error) => Err(TransportError::Handshake(error)),
+            kr_protocol::envelope::Outcome::Error(error) => Err(TransportError::Refused(error)),
         }
     }
 }
@@ -744,9 +748,11 @@ impl CandidateConnection {
 ///
 /// # Errors
 ///
-/// Returns the host's refusal when no offered version is supported, or a stream failure. A host
-/// that answers with an acceptance is refused here: a connection with no paired record must not be
-/// treated as authorised however the host replied.
+/// Returns [`TransportError::Refused`] with the host's refusal, for example when no offered version
+/// is supported; [`TransportError::Handshake`] when no reply came or the selection names an
+/// extension this side did not offer; or a stream failure. A host that answers with an acceptance
+/// is refused here: a connection with no paired record must not be treated as authorised however
+/// the host replied.
 pub async fn connect_unpaired(
     connection: &Connection,
     identity: &LocalIdentity,
@@ -769,7 +775,7 @@ pub async fn connect_unpaired(
         })?;
     let selection = match reply {
         HelloReply::Selected(selection) => *selection,
-        HelloReply::Refused(error) => return Err(TransportError::Handshake(error)),
+        HelloReply::Refused(error) => return Err(TransportError::Refused(error)),
     };
     check_extensions(&offer, &selection)?;
     Ok(CandidateConnection {

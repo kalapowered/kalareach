@@ -42,9 +42,18 @@ pub enum TransportError {
     /// A value could not be encoded or decoded as KR-CBOR-1.
     #[error("the message was not canonical: {0}")]
     Cbor(#[from] kr_cbor::CborError),
-    /// The handshake failed. The peer receives the protocol error; this side keeps the detail.
+    /// The handshake failed by this side's own conclusion: the peer sent nothing, sent something
+    /// this side cannot accept, or answered another request. When this side is the one refusing,
+    /// the peer receives the protocol error; this side keeps the detail.
     #[error("the handshake failed: {0}")]
     Handshake(ProtocolError),
+    /// The peer refused, with a protocol error it sent: a `Refused` reply to the offer or to the
+    /// connection proof, or an error answer on the pre-authorisation pairing surface.
+    ///
+    /// It is kept apart from [`Self::Handshake`] because only the peer's own answer says what the
+    /// peer decided. A reply that never came, or a stream that ended, says nothing about that.
+    #[error("the peer refused: {0}")]
+    Refused(ProtocolError),
     /// A cryptographic check failed.
     #[error("the connection proof failed: {0}")]
     Crypto(#[from] kr_crypto::CryptoError),
@@ -78,7 +87,7 @@ impl TransportError {
     #[must_use]
     pub fn to_protocol_error(&self) -> ProtocolError {
         match self {
-            Self::Handshake(error) => error.clone(),
+            Self::Handshake(error) | Self::Refused(error) => error.clone(),
             Self::Configuration { .. } | Self::Bind(_) => {
                 ProtocolError::new(ErrorCode::HostNotConfigured, "the host is not configured")
             }
