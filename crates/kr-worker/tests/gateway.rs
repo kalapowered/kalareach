@@ -2227,7 +2227,8 @@ async fn kr_req_11_35_native_work_goes_on_while_a_recovery_is_held_at_its_write(
 /// A component bound, a grant changed, an adapter's checkpoint and an ordinary reconciliation all
 /// need their record, and the store is what failed. Each is refused before the store is reached,
 /// so an empty list from an upstream cancels nothing, and each is taken again once the recovery
-/// is complete.
+/// is complete. While the recovery runs, an ordinary reconciliation is refused too: reconciling is
+/// then the recovery's own, which writes without waiting for the store.
 #[tokio::test]
 async fn kr_req_11_37_nothing_that_needs_its_record_is_taken_while_the_fence_is_up() {
     let mut store = common::SharedStore::open();
@@ -2297,6 +2298,15 @@ async fn kr_req_11_37_nothing_that_needs_its_record_is_taken_while_the_fence_is_
     broker
         .recover(TimestampMs::new(4))
         .expect("the gap is committed");
+    let during = broker
+        .reconcile(owed_scope(), &[], TimestampMs::new(4))
+        .expect_err("a reconciliation during a recovery is the recovery's own");
+    assert_eq!(during.code(), ErrorCode::InvalidArgument);
+    assert_eq!(
+        broker.pending(held.resource_id).expect("still held").state,
+        PendingState::Pending,
+        "and that empty list cancelled nothing either"
+    );
     let (_, finished) = broker
         .reconcile_recovered(
             broker.recovery_generation(),
@@ -2342,9 +2352,15 @@ async fn kr_req_11_37_a_recovery_finishes_without_waiting_for_a_busy_store() {
     holder
         .execute_batch("BEGIN IMMEDIATE")
         .expect("the write lock is taken");
+    let asked = std::time::Instant::now();
     assert!(
         broker.reconcile_connected(TimestampMs::new(5)).is_none(),
         "the finish is not written while another connection holds the store"
+    );
+    let took = asked.elapsed();
+    assert!(
+        took < kr_worker::broker::ledger::BUSY_TIMEOUT / 2,
+        "and it was refused at once, not after waiting for the store: {took:?}"
     );
     assert!(
         store.health().is_healthy(),

@@ -52,8 +52,8 @@ use crate::persistence::stores::ContentClass;
 /// The schema version this build reads.
 pub const SCHEMA_VERSION: i64 = 5;
 
-/// How long the ledger waits for another connection to finish writing.
-const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long the ledger waits for another connection to finish writing, outside prompt mode.
+pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// One binding, as the ledger holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]

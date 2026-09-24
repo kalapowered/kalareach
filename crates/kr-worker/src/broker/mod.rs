@@ -2275,11 +2275,14 @@ impl Broker {
     /// Reconciles one upstream's records with what it still has pending.
     ///
     /// A reconciliation is never taken without its record, so none is taken while the fence is
-    /// up; one after a storage failure goes through [`Broker::reconcile_recovered`].
+    /// up. One after a storage failure is part of the recovery and goes through
+    /// [`Broker::reconcile_recovered`], which writes it without waiting for the store; this one is
+    /// refused while a recovery is running.
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::LedgerUnavailable`] while the fence is up, and
+    /// Returns [`BrokerError::LedgerUnavailable`] while the fence is up,
+    /// [`BrokerError::InvalidArgument`] while a recovery is running, and
     /// [`BrokerError::StoreFault`] when a settled record cannot be written.
     pub fn reconcile(
         &self,
@@ -2287,7 +2290,14 @@ impl Broker {
         still_open: &[DownstreamRequestId],
         now: TimestampMs,
     ) -> Result<Reconciliation> {
-        self.state().reconcile_in(scope, still_open, now)
+        let mut state = self.state();
+        if state.volatile.mode() == kr_protocol::gateway::GatewayMode::Recovering {
+            return Err(BrokerError::invalid(
+                "a recovery is running, and a reconciliation after a storage failure is the \
+                 recovery's own",
+            ));
+        }
+        state.reconcile_in(scope, still_open, now)
     }
 
     /// Returns one binding as it stands now.
@@ -3449,10 +3459,18 @@ impl BrokerState {
     /// accounting, because they are one decision with leaving the fence. What it must not do is
     /// hold native arbitration behind another connection's write: a store another connection is
     /// writing refuses these writes at once, and the recovery tries again on a later pass.
+    ///
+    /// The connection waits again afterwards on every path, a panic included: this lock is taken
+    /// again after one, and native work must not inherit a connection that reads a busy store as
+    /// "not now".
     fn promptly<T>(&mut self, work: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         self.ledger.set_prompt(true)?;
-        let done = work(self);
+        let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(self)));
         let restored = self.ledger.set_prompt(false);
+        let done = match done {
+            Ok(done) => done,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
         let done = done?;
         restored?;
         Ok(done)
