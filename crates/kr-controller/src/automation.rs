@@ -578,6 +578,24 @@ async fn dispatch(
     }
     let woken = service.events();
     loop {
+        // A run nothing in this daemon executes any longer, because its execution ended without
+        // settling it, is taken up again, so it does not hold one of its workflow's places until
+        // the next restart.
+        let taken_up = {
+            let service = Arc::clone(&service);
+            let daemon = Arc::clone(&daemon);
+            blocking(move || service.recover(daemon.now_ms())).await
+        };
+        match taken_up {
+            Ok(runs) => {
+                for run in runs {
+                    execute_apart(&service, run);
+                }
+            }
+            Err(error) => eprintln!(
+                "kr-controller: the workflow runs nothing is executing were not taken up: {error}"
+            ),
+        }
         let admitted = {
             let service = Arc::clone(&service);
             let daemon = Arc::clone(&daemon);
@@ -681,11 +699,13 @@ impl AutomationModule {
                 })?;
         let service = Arc::new(service);
         // What a stopped daemon left unfinished is recovered here, before this daemon serves a
-        // single request. Recovering later would race a run a caller started in the meantime,
-        // which recovery would take for an interrupted one.
+        // single request, and every dispatcher pass takes up whatever a run's execution leaves
+        // unsettled after that. A run a caller starts is held from inside the transaction that
+        // makes it running, so no recovery takes it for an interrupted one.
         let resumed = {
             let service = Arc::clone(&service);
-            blocking(move || service.recover(kr_ipc::now_ms().get()))
+            let daemon = Arc::clone(&daemon);
+            blocking(move || service.recover(daemon.now_ms()))
                 .await
                 .map_err(|error| ControllerError::RegistryUnavailable {
                     detail: format!(

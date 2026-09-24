@@ -93,6 +93,54 @@ pub struct StartedRun {
     run_id: WorkflowRunId,
     definition: WorkflowDefinition,
     causal: CausalContext,
+    _executes: Executes,
+}
+
+/// The runs this process has made running and not yet finished executing.
+///
+/// A run the journal holds as running and this set does not is one nobody executes, which
+/// [`AutomationService::recover`] takes up.
+#[derive(Debug, Default)]
+struct Executing(std::sync::Mutex<std::collections::HashSet<WorkflowRunId>>);
+
+impl Executing {
+    /// Takes `run_id`'s place, or answers `None` when something in this process holds it.
+    fn hold(self: &Arc<Self>, run_id: WorkflowRunId) -> Option<Executes> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(run_id)
+            .then(|| Executes {
+                executing: Arc::clone(self),
+                run_id,
+            })
+    }
+
+    /// Takes the place of a run this process has just made, which nothing else can hold.
+    fn hold_new(self: &Arc<Self>, run_id: WorkflowRunId) -> Result<Executes> {
+        self.hold(run_id).ok_or_else(|| {
+            AutomationError::InvalidArgument(format!(
+                "run {run_id} is already being executed in this process"
+            ))
+        })
+    }
+}
+
+/// One run's place in [`Executing`], given back when its execution ends, however it ends.
+#[derive(Debug)]
+struct Executes {
+    executing: Arc<Executing>,
+    run_id: WorkflowRunId,
+}
+
+impl Drop for Executes {
+    fn drop(&mut self) {
+        self.executing
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.run_id);
+    }
 }
 
 /// What admitting one trigger came to: a run that starts now, or one that waits for a slot.
@@ -173,6 +221,7 @@ pub enum Answer {
 /// The central automation service of an environment.
 pub struct AutomationService {
     store: Arc<WorkflowStore>,
+    executing: Arc<Executing>,
     ceilings: Arc<dyn crate::HostCeilings>,
     authority: Arc<dyn AuthoritySource>,
     environment_id: EnvironmentId,
@@ -222,6 +271,7 @@ impl AutomationService {
 
         Self {
             store,
+            executing: Arc::default(),
             ceilings,
             authority,
             environment_id,
@@ -584,10 +634,13 @@ impl AutomationService {
             run_id, definition, event_id, &causal, now_ms, placement, inherited,
         )?;
         Ok(match placement {
+            // Held from inside the transaction that makes it running, so no pass of
+            // [`Self::recover`] finds it running and unheld.
             crate::admission::Placement::Start => Admitted::Started(Box::new(StartedRun {
                 run_id,
                 definition: definition.clone(),
                 causal,
+                _executes: self.executing.hold_new(run_id)?,
             })),
             crate::admission::Placement::Queue => Admitted::Queued(WorkflowRunResult {
                 run_id,
@@ -646,21 +699,26 @@ impl AutomationService {
         }
     }
 
-    /// Admits and executes the runs pending triggers have started, and the queued runs a free
-    /// slot lets start, one pass.
+    /// Takes up the runs nothing executes, admits and executes the runs pending triggers have
+    /// started, and starts the queued runs a free slot lets start, one pass.
     ///
-    /// A host that runs each started run on a task of its own uses [`Self::admit_triggers`],
-    /// [`Self::start_queued`] and [`Self::execute`] instead. This is the same pass, executing each
-    /// run in turn.
+    /// A host that runs each started run on a task of its own uses [`Self::recover`],
+    /// [`Self::admit_triggers`], [`Self::start_queued`] and [`Self::execute`] instead. This is the
+    /// same pass, executing each run in turn.
     ///
     /// # Errors
     ///
     /// Returns the reason the pass stopped part way, after executing every run it committed
     /// before it stopped.
     pub async fn dispatch_triggers(&self, now_ms: u64) -> Result<Vec<TriggerDecision>> {
+        let resumed = self.recover(now_ms)?;
         let admitted = self.admit_triggers(now_ms);
         let queued = self.start_queued(now_ms);
-        for started in admitted.started.into_iter().chain(queued.started) {
+        for started in resumed
+            .into_iter()
+            .chain(admitted.started)
+            .chain(queued.started)
+        {
             // A run that stopped on a refusal has recorded its pause; the decision already says
             // the run was started.
             let _ = self.execute(started).await;
@@ -689,16 +747,19 @@ impl AutomationService {
         };
         for workflow_id in workflows {
             loop {
+                // Held from inside the transaction that makes it running, as an admitted run is.
                 let claimed = self.store.claim_queued_run(
                     workflow_id,
                     kr_protocol::automation::DEFAULT_WORKFLOW_CONCURRENT_RUNS,
                     now_ms,
+                    |run_id| self.executing.hold_new(run_id),
                 );
                 match claimed {
-                    Ok(Some((run, definition))) => started.started.push(StartedRun {
+                    Ok(Some((run, definition, executes))) => started.started.push(StartedRun {
                         run_id: run.run_id,
                         definition,
                         causal: CausalContext::of_run(&run),
+                        _executes: executes,
                     }),
                     Ok(None) => break,
                     Err(error) => {
@@ -771,15 +832,23 @@ impl AutomationService {
         Ok((decisions, started))
     }
 
-    /// Picks up the runs a stopped host left running.
+    /// Takes up the runs the journal holds as running that nothing in this process is executing.
     ///
-    /// A node that was running when the host stopped may have been dispatched, and nothing this
-    /// host holds says whether its action happened, so it is settled as unknown: its dependants
-    /// pause for review rather than running on a guess, and no edge fires from it. Every other
-    /// node is as the journal left it, and executing the returned runs dispatches exactly the
-    /// nodes that were never dispatched and whose predecessors are authoritative, each only after
-    /// its grant is read again and only before the run's deadline. A run that was waiting for a
-    /// slot waits on, for [`Self::start_queued`].
+    /// Those are the runs a stopped host left running, and the runs whose execution in this
+    /// process ended without settling them: a journal write that failed part way, a task that
+    /// panicked, or a caller that stopped waiting. Each holds one of its workflow's four places
+    /// for as long as it stands, so the host asks this at start and again on every dispatcher
+    /// pass, and a place is never kept by a run nobody executes. A run this process admitted or
+    /// claimed is held from inside the transaction that made it running until its execution ends,
+    /// so it is never taken up twice.
+    ///
+    /// A node that was running may have been dispatched, and nothing this host holds says
+    /// whether its action happened, so it is settled as unknown: its dependants pause for review
+    /// rather than running on a guess, and no edge fires from it. Every other node is as the
+    /// journal left it, and executing the returned runs dispatches exactly the nodes that were
+    /// never dispatched and whose predecessors are authoritative, each only after its grant is
+    /// read again and only before the run's deadline. A run that was waiting for a slot waits on,
+    /// for [`Self::start_queued`].
     ///
     /// # Errors
     ///
@@ -787,11 +856,19 @@ impl AutomationService {
     pub fn recover(&self, now_ms: u64) -> Result<Vec<StartedRun>> {
         let mut resumed = Vec::new();
         for run in self.store.running_runs()? {
-            self.store.settle_interrupted_nodes(
+            let Some(executes) = self.executing.hold(run.run_id) else {
+                continue;
+            };
+            // Its execution may have ended between the reading above and the hold, and one that
+            // settled the run leaves nothing to take up.
+            if !self.store.settle_interrupted_run(
                 run.run_id,
-                "this host stopped while the action was dispatched, so its outcome is not known",
+                "the execution that dispatched this action ended before the action reported, so \
+                 its outcome is not known",
                 now_ms,
-            )?;
+            )? {
+                continue;
+            }
             let Some(installed) = self.store.get_definition(run.workflow_id, run.revision)? else {
                 continue;
             };
@@ -799,6 +876,7 @@ impl AutomationService {
                 run_id: run.run_id,
                 definition: installed.definition,
                 causal: CausalContext::of_run(&run),
+                _executes: executes,
             });
         }
         Ok(resumed)

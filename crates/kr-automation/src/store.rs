@@ -2473,7 +2473,8 @@ impl WorkflowStore {
 
     /// Starts the oldest pending run of one workflow, when fewer than `running_limit` of its runs
     /// are running and its revision is enabled and unpaused, and answers it with the definition
-    /// it runs.
+    /// it runs and what `hold` made of it inside the transaction, before the run is running for
+    /// anyone else to read.
     ///
     /// The count, the choice and the move to running are one transaction, so two callers cannot
     /// both take the last slot or both start the same run. The run's deadline starts here, because
@@ -2482,12 +2483,13 @@ impl WorkflowStore {
     /// # Errors
     ///
     /// Returns a storage error when the rows cannot be read or written.
-    pub fn claim_queued_run(
+    pub fn claim_queued_run<H>(
         &self,
         workflow_id: WorkflowId,
         running_limit: u64,
         now_ms: u64,
-    ) -> Result<Option<(StoredRunRecord, WorkflowDefinition)>> {
+        hold: impl FnOnce(WorkflowRunId) -> Result<H>,
+    ) -> Result<Option<(StoredRunRecord, WorkflowDefinition, H)>> {
         self.write(|journal| {
             if journal.runs_in(workflow_id, WorkflowRunStatus::Running)? >= running_limit {
                 return Ok(None);
@@ -2527,7 +2529,8 @@ impl WorkflowStore {
                     WorkflowRunStatus::Pending.as_str(),
                 ],
             )?;
-            Ok(Some((run, installed.definition)))
+            let held = hold(run.run_id)?;
+            Ok(Some((run, installed.definition, held)))
         })
     }
 
@@ -2955,22 +2958,35 @@ impl WorkflowStore {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Settles every node of a run that was running when the host stopped as unknown.
+    /// Takes up a run whose execution ended without settling it, if the journal still holds it as
+    /// running, and settles every node of it that was running as unknown.
     ///
     /// The node was claimed for dispatch, so its action may have been performed, and nothing this
     /// host holds says whether it was. Each settlement commits its event, as any other does.
-    /// Returns how many nodes were settled.
+    /// Returns whether the run is still running, which is whether there is anything to take up: a
+    /// run whose execution settled it after the caller last read it is left as it is.
     ///
     /// # Errors
     ///
     /// Returns a storage error when the rows cannot be read or written.
-    pub fn settle_interrupted_nodes(
+    pub fn settle_interrupted_run(
         &self,
         run_id: WorkflowRunId,
         reason: &str,
         now_ms: u64,
-    ) -> Result<usize> {
+    ) -> Result<bool> {
         self.write(|journal| {
+            let status: Option<String> = journal
+                .conn
+                .query_row(
+                    "SELECT status FROM workflow_runs WHERE run_id = ?1",
+                    params![run_id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if status.as_deref() != Some(WorkflowRunStatus::Running.as_str()) {
+                return Ok(false);
+            }
             let mut stmt = journal
                 .conn
                 .prepare("SELECT node_id FROM node_receipts WHERE run_id = ?1 AND status = ?2")?;
@@ -2981,9 +2997,8 @@ impl WorkflowStore {
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             drop(stmt);
-            let mut settled = 0;
             for node_id in &interrupted {
-                if journal.settle_node(&NodeSettlement {
+                journal.settle_node(&NodeSettlement {
                     run_id,
                     node_id,
                     status: NodeStatus::Unknown,
@@ -2991,11 +3006,9 @@ impl WorkflowStore {
                     error: Some(reason),
                     produced: None,
                     at_ms: now_ms,
-                })? {
-                    settled += 1;
-                }
+                })?;
             }
-            Ok(settled)
+            Ok(true)
         })
     }
 

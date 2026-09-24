@@ -917,3 +917,55 @@ async fn a_run_a_restart_finds_past_its_deadline_is_stopped_for_it() {
     );
     assert_eq!(service.store().pending_attention().expect("reads").len(), 1);
 }
+
+/// A run whose execution ends without settling it, here because the task executing it stopped
+/// mid-action, is taken up by the same service without a restart, so it does not hold one of its
+/// workflow's places until the host next starts. While its execution is still under way nothing
+/// takes it up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_whose_execution_ended_unsettled_is_taken_up_without_a_restart() {
+    let gated = Arc::new(Gated::new());
+    let service = Arc::new(
+        AutomationService::in_memory(common::host(
+            Arc::clone(&gated) as Arc<dyn ActionRunner>,
+            common::every_right(&[grant_id(23)]),
+            Arc::new(ManualClock::new(1_000)),
+        ))
+        .expect("a service"),
+    );
+    let definition = one_node(workflow_id(23), grant_id(23));
+    installed(&service, &definition);
+
+    let running = {
+        let service = Arc::clone(&service);
+        let params = run_params(&definition, "evt-abandoned");
+        tokio::spawn(async move { service.submit_run(&params, 1_000).await })
+    };
+    entered(&gated, 1).await;
+    assert!(
+        service.recover(1_000).expect("reads").is_empty(),
+        "a run under way is not taken up"
+    );
+
+    running.abort();
+    let _ = running.await;
+    let taken_up = service.recover(1_100).expect("takes up");
+    assert_eq!(taken_up.len(), 1, "the run nothing executes is taken up");
+    assert!(
+        service.recover(1_100).expect("reads").is_empty(),
+        "and is taken up once"
+    );
+    let answered = service
+        .execute(taken_up.into_iter().next().expect("the run"))
+        .await
+        .expect("the run answers");
+    assert_eq!(
+        answered.status,
+        WorkflowRunStatus::Paused,
+        "the action it dispatched has an outcome nobody knows: {answered:?}"
+    );
+    assert_eq!(
+        statuses(&service, answered.run_id),
+        vec![NodeStatus::Unknown]
+    );
+}
