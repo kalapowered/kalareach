@@ -3627,15 +3627,20 @@ pub(crate) fn admission_for(
     policy: &LocationPolicy,
     reach: Vec<(Arc<HeldLocation>, LocationUse)>,
 ) -> Option<ReadAdmission> {
-    let bounded = reach
-        .iter()
-        .any(|(_, wanted)| matches!(wanted.admitting, Admitting::Caller(Some(_))));
+    let bounded = performed_for_a_grant(reach.iter().map(|(_, wanted)| wanted));
     let admission = policy.read_admission(reach)?;
     Some(if bounded {
         admission.bounded()
     } else {
         admission
     })
+}
+
+/// Returns whether a request that reaches locations for these uses is performed for a caller
+/// bounded by a grant.
+fn performed_for_a_grant<'a>(uses: impl IntoIterator<Item = &'a LocationUse>) -> bool {
+    uses.into_iter()
+        .any(|wanted| matches!(wanted.admitting, Admitting::Caller(Some(_))))
 }
 
 /// Returns the location a repository was created through, and its name beneath it, when the
@@ -3917,6 +3922,39 @@ pub(crate) fn new_uuid() -> Uuid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_for_a_caller_bounded_by_a_grant_is_one_whose_reads_are_bounded() {
+        let owner = LocationUse {
+            purpose: LocationPurpose::Source,
+            environment_id: EnvironmentId::new(Uuid::from_bytes([1; 16])),
+            admitting: Admitting::Caller(None),
+        };
+        let decision = LocationUse {
+            admitting: Admitting::OwnerDecision,
+            ..owner
+        };
+        let grant = LocationUse {
+            admitting: Admitting::Caller(Some(kr_protocol::ids::GrantId::new(Uuid::from_bytes(
+                [5; 16],
+            )))),
+            ..owner
+        };
+        assert!(!performed_for_a_grant([&owner]), "the owner's own use");
+        assert!(
+            !performed_for_a_grant([&decision]),
+            "the owner deciding about a location"
+        );
+        assert!(performed_for_a_grant([&grant]), "a grant's use");
+        assert!(
+            performed_for_a_grant([&owner, &grant]),
+            "any use of a grant's in one request"
+        );
+        assert!(
+            !performed_for_a_grant(std::iter::empty()),
+            "a request that reached no location is the owner's"
+        );
+    }
 
     #[test]
     fn a_label_is_bounded_and_carries_no_control_character() {
