@@ -1102,12 +1102,8 @@ fn kr_req_12_05_no_second_process_runs_against_one_saved_conversation() {
     let reservation = broker
         .execute_launch(&first, &ForegroundMark::idle(4), instance(2))
         .expect("the first execution runs");
-    broker
-        .register_launched(
-            reservation,
-            IntegrationMode::Gateway,
-            Some(managed(instance(2), true)),
-        )
+    reservation
+        .register(IntegrationMode::Gateway, Some(managed(instance(2), true)))
         .expect("the instance is registered")
         .commit();
 
@@ -1178,12 +1174,8 @@ fn kr_req_12_02_an_instance_one_path_holds_cannot_be_taken_by_another() {
             .version,
         "0.9.1"
     );
-    broker
-        .register_launched(
-            reservation,
-            IntegrationMode::Gateway,
-            Some(managed(instance(2), true)),
-        )
+    reservation
+        .register(IntegrationMode::Gateway, Some(managed(instance(2), true)))
         .expect("the launch registers the instance it reserved")
         .commit();
     assert_eq!(
@@ -1261,12 +1253,8 @@ fn kr_req_12_02_a_failed_launch_gives_back_only_its_own() {
     let reservation = broker
         .execute_launch(&intent, &ForegroundMark::idle(4), instance(2))
         .expect("the retry runs");
-    let registered = broker
-        .register_launched(
-            reservation,
-            IntegrationMode::Gateway,
-            Some(managed(instance(2), true)),
-        )
+    let registered = reservation
+        .register(IntegrationMode::Gateway, Some(managed(instance(2), true)))
         .expect("the instance is registered");
     assert!(broker.binding_state(instance(2)).is_ok());
     registered.abandon();
@@ -1289,16 +1277,92 @@ fn kr_req_12_02_a_failed_launch_gives_back_only_its_own() {
     let reservation = broker
         .execute_launch(&intent, &ForegroundMark::idle(4), instance(2))
         .expect("the retry runs");
-    broker
-        .register_launched(
-            reservation,
-            IntegrationMode::Gateway,
-            Some(managed(instance(2), true)),
-        )
+    reservation
+        .register(IntegrationMode::Gateway, Some(managed(instance(2), true)))
         .expect("and registers")
         .commit();
     assert_eq!(broker.conversation_owner("thread-7"), Some(instance(2)));
     assert!(broker.binding_state(instance(2)).is_ok());
+}
+
+/// A launch holds its identifier until its guard finishes, whatever ends the instance meanwhile:
+/// nothing can register over it, so the guard giving back later cannot remove an instance another
+/// path registered.
+#[test]
+fn kr_req_12_02_a_launch_holds_its_identifier_until_its_guard_finishes() {
+    let broker = Broker::open(None, session(), JournalHealth::shared()).expect("the broker opens");
+    let intent = broker
+        .prepare_launch(
+            profile(IntegrationMode::Gateway, [3; 32], "0.9.1"),
+            ForegroundMark::idle(4),
+            None,
+        )
+        .expect("the launch is prepared");
+    let registered = broker
+        .execute_launch(&intent, &ForegroundMark::idle(4), instance(2))
+        .expect("the launch runs")
+        .register(IntegrationMode::Gateway, Some(managed(instance(2), true)))
+        .expect("the instance is registered");
+    let ended = broker.end(instance(2), kr_worker::broker::InstanceEnding::NativeExit);
+    assert!(ended.instance_ended);
+    broker
+        .register_instance(instance(2), IntegrationMode::NativeTerminal, None, None)
+        .expect_err("the launch still holds the identifier");
+    registered.abandon();
+    broker
+        .register_instance(instance(2), IntegrationMode::NativeTerminal, None, None)
+        .expect("free once the launch has finished");
+    assert_eq!(
+        broker
+            .binding_state(instance(2))
+            .expect("the later instance is live")
+            .mode,
+        IntegrationMode::NativeTerminal,
+        "and the finished launch took nothing of it"
+    );
+}
+
+/// A reservation registers on the broker that made it, and giving one back touches that broker
+/// alone.
+#[test]
+fn kr_req_12_02_a_reservation_registers_on_its_own_broker() {
+    let first = Broker::open(None, session(), JournalHealth::shared()).expect("a broker opens");
+    let second = Broker::open(None, session(), JournalHealth::shared()).expect("another opens");
+    let intent = |broker: &Broker| {
+        broker
+            .prepare_launch(
+                profile(IntegrationMode::Gateway, [3; 32], "0.9.1"),
+                ForegroundMark::idle(4),
+                None,
+            )
+            .expect("the launch is prepared")
+    };
+    let first_intent = intent(&first);
+    let second_intent = intent(&second);
+    let on_first = first
+        .execute_launch(&first_intent, &ForegroundMark::idle(4), instance(2))
+        .expect("the first broker's launch runs");
+    let on_second = second
+        .execute_launch(&second_intent, &ForegroundMark::idle(4), instance(2))
+        .expect("the second broker's launch runs");
+    let registered_first = on_first
+        .register(IntegrationMode::Gateway, Some(managed(instance(2), true)))
+        .expect("registered on the first broker");
+    assert!(first.binding_state(instance(2)).is_ok());
+    assert!(
+        second.binding_state(instance(2)).is_err(),
+        "the first broker's reservation registered nothing on the second"
+    );
+    on_second
+        .register(IntegrationMode::Gateway, Some(managed(instance(2), true)))
+        .expect("registered on the second broker")
+        .commit();
+    registered_first.abandon();
+    assert!(first.binding_state(instance(2)).is_err());
+    assert!(
+        second.binding_state(instance(2)).is_ok(),
+        "giving the first launch back took nothing of the second broker's"
+    );
 }
 
 /// KR-REQ-11.16: a probe declares what it will do and how long it may take before it runs, and a

@@ -131,7 +131,8 @@ pub use crate::broker::process::{
     stop_backend,
 };
 pub use crate::broker::profiles::{
-    ForegroundMark, LaunchIntent, LaunchReservation, ProfileStore, RegisteredLaunch, new_profile_id,
+    ForegroundMark, LaunchIntent, LaunchReservation, ProfileStore, RegisteredLaunch,
+    RegistrationRefused, new_profile_id,
 };
 pub use crate::broker::semantic::{GrantLowerBound, HistoryFilter, Replay, SemanticLog};
 pub use crate::broker::tokens::{Invocation, TokenStore};
@@ -578,6 +579,14 @@ struct BrokerState {
     bindings: BTreeMap<BrokerBindingId, Binding>,
     tokens: TokenStore,
     profiles: ProfileStore,
+    /// The launches that hold an instance's identifier and have not finished, by their token.
+    ///
+    /// A launch holds its identifier from its execution until its guard commits or gives it back,
+    /// whatever ends the instance meanwhile, so no other path can take the identifier and no
+    /// give-back can reach an instance another launch holds.
+    launches: BTreeMap<ApplicationInstanceId, u64>,
+    /// The token the next executed launch holds its instance by.
+    next_launch: u64,
     arbitration: Arbitration,
     capabilities: CapabilityOwner,
     volatile: VolatileState,
@@ -750,6 +759,8 @@ impl Broker {
                 bindings: BTreeMap::new(),
                 tokens: TokenStore::new(),
                 profiles,
+                launches: BTreeMap::new(),
+                next_launch: 1,
                 arbitration,
                 capabilities: CapabilityOwner::new(),
                 volatile,
@@ -794,9 +805,9 @@ impl Broker {
     /// restarted worker never issues a cursor an adapter has already passed, and a replay from
     /// before the restart is a visible gap rather than a silently empty answer.
     ///
-    /// An identifier another path holds is refused: one already registered, and one a launch has
-    /// reserved or an adoption has recorded. A launch registers its own instance through
-    /// [`Broker::register_launched`], with the reservation that proves the identifier is its own.
+    /// An identifier another path holds is refused: one already registered, and one a launch holds
+    /// or an adoption has recorded. A launch registers its own instance through
+    /// [`LaunchReservation::register`], with the reservation that proves the identifier is its own.
     ///
     /// # Errors
     ///
@@ -816,45 +827,45 @@ impl Broker {
         Ok(())
     }
 
-    /// Registers the instance one executed launch reserved, with the process it started.
+    /// Registers the instance one executed launch reserved, for [`LaunchReservation::register`].
     ///
-    /// The reservation is consumed, so only the launch that holds it can register its instance,
-    /// and what comes back owns the instance until the launch commits it. A failure here gives
-    /// the reservation back with it.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::LedgerUnavailable`] when the checkpoint cannot be read, and
-    /// [`BrokerError::InvalidArgument`] when the identifier is already registered, which no
-    /// reservation leaves possible.
-    pub fn register_launched<'a>(
+    /// The launch's token must still hold the identifier, and nothing may be registered under it:
+    /// both hold for as long as the reservation exists, so this refuses only a registration no
+    /// reservation could make.
+    pub(crate) fn register_reserved(
         &self,
-        reservation: LaunchReservation<'a>,
+        application_instance_id: ApplicationInstanceId,
+        token: u64,
         mode: IntegrationMode,
+        profile_id: Option<LaunchProfileId>,
         process: Option<ManagedProcess>,
-    ) -> Result<RegisteredLaunch<'a>> {
-        let application_instance_id = reservation.application_instance_id();
+    ) -> Result<()> {
         let semantic = self.resumed_semantics(application_instance_id)?;
         let mut state = self.state();
+        if state.launches.get(&application_instance_id) != Some(&token) {
+            return Err(BrokerError::invalid(format!(
+                "{application_instance_id} is not held by this launch"
+            )));
+        }
         if state.instances.contains_key(&application_instance_id) {
             return Err(BrokerError::invalid(format!(
                 "{application_instance_id} is already registered, and a launch registers only the \
                  instance it reserved"
             )));
         }
-        let (broker, application_instance_id, profile) = reservation.into_parts();
-        state.insert_instance(
-            application_instance_id,
-            mode,
-            Some(profile.profile_id.clone()),
-            process,
-            semantic,
-        );
-        Ok(RegisteredLaunch::new(
-            broker,
-            application_instance_id,
-            profile,
-        ))
+        state.insert_instance(application_instance_id, mode, profile_id, process, semantic);
+        Ok(())
+    }
+
+    /// Lets go of one launch's hold on its identifier, because the launch has committed.
+    ///
+    /// From here the instance is an ordinary instance: it ends when it ends, and its identifier is
+    /// free once it has.
+    pub(crate) fn commit_launch(&self, application_instance_id: ApplicationInstanceId, token: u64) {
+        let mut state = self.state();
+        if state.launches.get(&application_instance_id) == Some(&token) {
+            state.launches.remove(&application_instance_id);
+        }
     }
 
     /// Records an application instance the host detected rather than started, with the profile it
@@ -1158,11 +1169,19 @@ impl Broker {
     /// registered that instance, before the process it started can be used. A launch that fails
     /// after that point gives all of it back, so a retry is not refused for a launch that never
     /// happened and nothing is left describing a process that was stopped. Only the guards a launch
-    /// holds call this, [`LaunchReservation`] and [`RegisteredLaunch`], and no other path can
-    /// register or adopt an identifier either of them holds, so what is given back is the launch's
-    /// own.
-    pub(crate) fn give_back_launch(&self, application_instance_id: ApplicationInstanceId) {
+    /// holds call this, [`LaunchReservation`] and [`RegisteredLaunch`], with their token, and it
+    /// gives back only while that token still holds the identifier: no other path can register or
+    /// adopt an identifier a launch holds, so what is given back is the launch's own.
+    pub(crate) fn give_back_launch(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+        token: u64,
+    ) {
         let mut state = self.state();
+        if state.launches.get(&application_instance_id) != Some(&token) {
+            return;
+        }
+        state.launches.remove(&application_instance_id);
         let removed = state.instances.remove(&application_instance_id);
         if let Some(agent) = removed.and_then(|instance| instance.process) {
             release_agent_job(&state.instances, &agent.process);
@@ -2175,7 +2194,7 @@ impl Broker {
     /// Executes a prepared launch, or refuses it, and reserves its instance for it.
     ///
     /// What comes back is the launch's hold on the instance: it registers the instance through
-    /// [`Broker::register_launched`], and dropping it gives back what this took.
+    /// [`LaunchReservation::register`], and dropping it gives back what this took.
     ///
     /// # Errors
     ///
@@ -2201,10 +2220,14 @@ impl Broker {
         let profile = state
             .profiles
             .execute(intent, now, application_instance_id)?;
+        let token = state.next_launch;
+        state.next_launch = state.next_launch.saturating_add(1);
+        state.launches.insert(application_instance_id, token);
         Ok(LaunchReservation::new(
             self,
             application_instance_id,
             profile,
+            token,
         ))
     }
 
@@ -3670,11 +3693,17 @@ impl BrokerState {
 
     /// Refuses an identifier another path already holds.
     ///
-    /// Registered, reserved by an executed launch, or recorded by an adoption: whichever path
-    /// holds it owns it until that path gives it back, and nothing else may take it, so nothing
-    /// else can later remove what that path owns. Both maps are read here, under the one lock the
-    /// acquisition that follows takes.
+    /// Registered, held by a launch that has not finished, reserved by a profile or recorded by an
+    /// adoption: whichever path holds it owns it until that path gives it back, and nothing else
+    /// may take it, so nothing else can later remove what that path owns. Every map is read here,
+    /// under the one lock the acquisition that follows takes.
     fn check_unheld(&self, application_instance_id: ApplicationInstanceId) -> Result<()> {
+        if self.launches.contains_key(&application_instance_id) {
+            return Err(BrokerError::invalid(format!(
+                "{application_instance_id} is held by a launch that has not finished, and only \
+                 that launch may register it"
+            )));
+        }
         if self.instances.contains_key(&application_instance_id) {
             return Err(BrokerError::invalid(format!(
                 "{application_instance_id} is already registered, and one identifier names one \

@@ -565,6 +565,12 @@ pub struct NativeGateway {
     /// learns which one it has to find stopped.
     #[cfg(feature = "testing")]
     last_started: Option<ProcessStartIdentity>,
+    /// Where a failed launch stops before it undoes anything, for this host's own tests.
+    #[cfg(feature = "testing")]
+    cleanup_pause: Option<(
+        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
 }
 
 /// Stops a process a launch started, and waits for it, because the launch failed after it.
@@ -687,7 +693,27 @@ impl NativeGateway {
             runtime_directory: runtime_directory.to_path_buf(),
             #[cfg(feature = "testing")]
             last_started: None,
+            #[cfg(feature = "testing")]
+            cleanup_pause: None,
         })
+    }
+
+    /// Stops the next launch that fails after its process started, before it undoes anything, for
+    /// this host's own tests.
+    ///
+    /// Returns the end that says the launch has arrived there and the end that lets it go on. The
+    /// pause fires once. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_cleanup(
+        &mut self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (arrived, watch) = std::sync::mpsc::sync_channel(1);
+        let (release, go) = std::sync::mpsc::sync_channel(1);
+        self.cleanup_pause = Some((arrived, go));
+        (watch, release)
     }
 
     /// Returns the last process a launch of this gateway started, for this host's own tests.
@@ -808,53 +834,6 @@ impl NativeGateway {
         {
             self.last_started = Some(started.clone());
         }
-        let published = self.publish(
-            reservation,
-            &started,
-            credential,
-            mode,
-            now,
-            &credential_path,
-            &registration_path,
-        );
-        match published {
-            Ok((registration, registered)) => {
-                let profile = registered.commit();
-                self.launch.expected_process = Some(started.clone());
-                self.registration = Some(registration);
-                Ok(Launched {
-                    child,
-                    process: started,
-                    profile,
-                })
-            }
-            Err(error) => {
-                // What the launch took went back with its guard; the process it started is
-                // stopped and waited for here.
-                stop_started(child, &started);
-                Err(error)
-            }
-        }
-    }
-
-    /// Hands a started process its private exchange, records it, and publishes the registration.
-    ///
-    /// The credential file is created new, so one already there makes this fail and is left alone.
-    /// Once this has written it, the file is this launch's own, and a later failure removes it
-    /// again: the name is free for a retry, and no secret is left behind for a process that was
-    /// stopped.
-    #[allow(clippy::too_many_arguments)]
-    fn publish<'b>(
-        &self,
-        reservation: crate::broker::LaunchReservation<'b>,
-        started: &ProcessStartIdentity,
-        credential: Credential,
-        mode: kr_protocol::broker::IntegrationMode,
-        now: kr_protocol::scalars::TimestampMs,
-        credential_path: &std::path::Path,
-        registration_path: &std::path::Path,
-    ) -> Result<(Registration, crate::broker::RegisteredLaunch<'b>)> {
-        let application_instance_id = self.launch.application_instance_id;
         let process = ManagedProcess::new(
             application_instance_id,
             started.clone(),
@@ -870,45 +849,92 @@ impl NativeGateway {
             true,
             now,
         );
-        process.write_registration(credential_path)?;
-        let recorded = self.record(
-            reservation,
-            started,
-            process,
-            mode,
-            credential_path,
-            registration_path,
-        );
-        if recorded.is_err() {
+        // The credential file is created new, so one already there makes this fail and is left
+        // alone. Once this has written it, the file is this launch's own, and a later failure
+        // removes it again: the name is free for a retry, and no secret is left behind for a
+        // process that was stopped.
+        if let Err(error) = process.write_registration(&credential_path) {
+            return Err(self.fail_after_start(child, &started, reservation, None, error));
+        }
+        let registered = match reservation.register(mode, Some(process)) {
+            Ok(registered) => registered,
+            Err(refused) => {
+                let crate::broker::profiles::RegistrationRefused { error, reservation } = *refused;
+                return Err(self.fail_after_start(
+                    child,
+                    &started,
+                    reservation,
+                    Some(&credential_path),
+                    error,
+                ));
+            }
+        };
+        let profile_id = registered.profile().profile_id.clone();
+        match self.publish(&profile_id, &started, &credential_path, &registration_path) {
+            Ok(registration) => {
+                let profile = registered.commit();
+                self.launch.expected_process = Some(started.clone());
+                self.registration = Some(registration);
+                Ok(Launched {
+                    child,
+                    process: started,
+                    profile,
+                })
+            }
+            Err(error) => Err(self.fail_after_start(
+                child,
+                &started,
+                registered,
+                Some(&credential_path),
+                error,
+            )),
+        }
+    }
+
+    /// Undoes a launch that failed after its process started, in the order that keeps its hold.
+    ///
+    /// The process is stopped and waited for first, and the credential it was given is removed;
+    /// only then is the launch's hold on its instance dropped, which gives back the instance and
+    /// its conversation. Giving them back first would let another launch take the conversation
+    /// while the process that holds it is still running.
+    fn fail_after_start<Held>(
+        &mut self,
+        child: std::process::Child,
+        started: &ProcessStartIdentity,
+        held: Held,
+        credential_path: Option<&std::path::Path>,
+        error: BrokerError,
+    ) -> BrokerError {
+        #[cfg(feature = "testing")]
+        if let Some((arrived, go)) = self.cleanup_pause.take() {
+            let _ = arrived.send(());
+            let _ = go.recv();
+        }
+        stop_started(child, started);
+        if let Some(credential_path) = credential_path {
             // Best effort: a file that cannot be removed now is refused as a stale name by the
             // next launch's create, which is the safe way round.
             let _ = std::fs::remove_file(credential_path);
         }
-        recorded
+        drop(held);
+        error
     }
 
-    /// Registers a started process with the broker and publishes the registration that names it.
+    /// Publishes the registration that names a started process.
     ///
-    /// The registration is the launch's until it commits: a registration file that cannot be
-    /// written drops the guard, which gives the instance back.
-    fn record<'b>(
+    /// Whole or not at all: a forwarder that looks while it is being written finds nothing rather
+    /// than an empty or partial record.
+    fn publish(
         &self,
-        reservation: crate::broker::LaunchReservation<'b>,
+        profile_id: &kr_protocol::ids::LaunchProfileId,
         started: &ProcessStartIdentity,
-        process: ManagedProcess,
-        mode: kr_protocol::broker::IntegrationMode,
         credential_path: &std::path::Path,
         registration_path: &std::path::Path,
-    ) -> Result<(Registration, crate::broker::RegisteredLaunch<'b>)> {
-        let application_instance_id = self.launch.application_instance_id;
-        let profile_id = reservation.profile().profile_id.clone();
-        let registered = self
-            .broker
-            .register_launched(reservation, mode, Some(process))?;
+    ) -> Result<Registration> {
         let registration = Registration::new(
             self.endpoint.address().clone(),
-            profile_id,
-            application_instance_id,
+            profile_id.clone(),
+            self.launch.application_instance_id,
             started.clone(),
             credential_path.to_path_buf(),
         );
@@ -919,8 +945,6 @@ impl NativeGateway {
             registration.to_file(),
             self.launch.framing.name()
         );
-        // Whole or not at all: a forwarder that looks while it is being written must find nothing
-        // rather than an empty or partial record.
         kr_ipc::paths::write_owner_only_file(registration_path, published.as_bytes()).map_err(
             |error| {
                 BrokerError::ledger(format!(
@@ -929,7 +953,7 @@ impl NativeGateway {
                 ))
             },
         )?;
-        Ok((registration, registered))
+        Ok(registration)
     }
 
     /// Returns the address a launched process is told to connect to.

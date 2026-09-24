@@ -2352,6 +2352,97 @@ async fn kr_req_12_02_a_launch_that_fails_after_its_process_started_leaves_nothi
     let _ = std::fs::remove_dir_all(&directory);
 }
 
+/// KR-REQ-12.02: a launch that fails after its process started keeps its conversation until that
+/// process is stopped, so no other launch can take the conversation while the failed one's process
+/// still runs.
+#[cfg(unix)]
+#[tokio::test]
+async fn kr_req_12_02_a_failed_launch_holds_its_conversation_until_its_process_is_stopped() {
+    let directory = private_directory();
+    let broker = broker_for_launch();
+    let occupied = directory.join("registration");
+    std::fs::create_dir(&occupied).expect("the registration's name is taken");
+    std::fs::write(occupied.join("held"), b"held").expect("by a directory that is not empty");
+    let mut gateway = kr_worker::broker::NativeGateway::bind(
+        Arc::clone(&broker),
+        &directory,
+        launch_for(None, None),
+    )
+    .expect("the endpoint binds");
+    let (arrived, release) = gateway.pause_before_cleanup();
+    let intent = broker
+        .prepare_launch(
+            sleeping_profile(),
+            kr_worker::broker::ForegroundMark::idle(4),
+            Some("thread-9".to_owned()),
+        )
+        .expect("the launch is prepared");
+    let launching = std::thread::spawn(move || {
+        let failed = gateway.launch(
+            &intent,
+            &kr_worker::broker::ForegroundMark::idle(4),
+            IntegrationMode::Gateway,
+            TimestampMs::new(1),
+        );
+        (gateway, failed)
+    });
+    arrived
+        .recv_timeout(LIVENESS_DEADLINE)
+        .expect("the failed launch reaches its cleanup");
+
+    assert_eq!(
+        broker.conversation_owner("thread-9"),
+        Some(instance()),
+        "the failed launch still holds the conversation while its process runs"
+    );
+    let competing = broker
+        .prepare_launch(
+            kr_protocol::broker::LaunchProfile {
+                profile_id: kr_protocol::ids::LaunchProfileId::new("lp-2").expect("valid"),
+                ..sleeping_profile()
+            },
+            kr_worker::broker::ForegroundMark::idle(4),
+            Some("thread-9".to_owned()),
+        )
+        .expect("another launch is prepared");
+    let other = ApplicationInstanceId::new(Uuid::from_bytes([9; 16]));
+    let refused = broker
+        .execute_launch(
+            &competing,
+            &kr_worker::broker::ForegroundMark::idle(4),
+            other,
+        )
+        .expect_err("another launch cannot take the conversation meanwhile");
+    assert!(
+        matches!(
+            refused,
+            kr_worker::broker::BrokerError::Launch(
+                kr_protocol::broker::LaunchRefusal::ConversationAlreadyLive { .. }
+            )
+        ),
+        "{refused}"
+    );
+
+    release.send(()).expect("the cleanup goes on");
+    let (gateway, failed) = launching.join().expect("the launch returns");
+    failed.expect_err("the registration cannot be published");
+    let started = gateway
+        .last_started()
+        .cloned()
+        .expect("the backend was started before the failure");
+    assert_eq!(
+        kr_ipc::identity::process_state(&started),
+        kr_ipc::identity::ProcessState::Ended,
+        "the process was stopped"
+    );
+    assert_eq!(
+        broker.conversation_owner("thread-9"),
+        None,
+        "and only then was the conversation given back"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
 /// KR-REQ-12.02: a second launch for an instance that is live is refused before anything starts,
 /// and the first process and its record are left as they were.
 ///
