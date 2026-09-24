@@ -312,6 +312,57 @@ async fn a_credential_of_the_wrong_shape_is_refused_and_never_repeated() {
     host.stop().await;
 }
 
+/// KR-REQ-25.23: parameters that do not read as this method's are refused in one fixed sentence,
+/// so a credential sent where the object belongs, under a tag of its own or as a field's name is
+/// never repeated back. Nothing is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parameters_that_do_not_read_are_refused_without_repeating_them() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner).await;
+    let mut control = host.client().await;
+    let url = slack_url();
+    let malformed = [
+        serde_json::json!({ "destination_id": "team", "secret": url }),
+        serde_json::json!({ "destination_id": "team", "secret": { "kind": url } }),
+        serde_json::json!({
+            "destination_id": "team",
+            "secret": { "kind": "slack", "webhook_url": url, url.clone(): "extra" },
+        }),
+        serde_json::json!({
+            "destination_id": "team",
+            "secret": { "kind": "telegram", "bot_token": 12, "webhook_url": url },
+        }),
+        serde_json::json!({ "destination_id": "team", "secret": [url] }),
+    ];
+    for params in &malformed {
+        let answer = control
+            .mutate(
+                Method::DeliveryDestinationSecretSet,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                params,
+            )
+            .await
+            .expect("the call reaches the daemon");
+        let error = answer.expect_err("parameters that do not read are refused");
+        let rendered = format!("{error:?} {error}");
+        assert!(
+            !rendered.contains(SECRET_PART),
+            "the refusal of {params} repeats the credential: {rendered}"
+        );
+        assert_eq!(error.code, ErrorCode::InvalidArgument, "{rendered}");
+    }
+    assert!(
+        secrets_of(&host)
+            .get(&identifier("team"))
+            .expect("the store reads")
+            .is_none(),
+        "nothing was kept"
+    );
+    drop(control);
+    host.stop().await;
+}
+
 /// KR-REQ-25.23: storing a destination's credential is the owner's own act at this machine. A
 /// paired device is refused whatever its grant carries, host management included, and nothing is
 /// kept.

@@ -3566,8 +3566,7 @@ impl Controller {
                             .to_owned(),
                     ));
                 }
-                let params: kr_protocol::delivery::DeliveryDestinationSecretSetParams =
-                    parse(&mutation.params)?;
+                let params = secret_params(&mutation.params)?;
                 destination_identifier(&params.destination_id)?;
                 crate::push::external::check_secret(&params.secret)
                     .map_err(ControllerError::InvalidArgument)?;
@@ -4989,8 +4988,7 @@ impl Controller {
         mutation: &MutationRequest,
         carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
-        let params: kr_protocol::delivery::DeliveryDestinationSecretSetParams =
-            parse(&mutation.params)?;
+        let params = secret_params(&mutation.params)?;
         let destination_id = destination_identifier(&params.destination_id)?;
         crate::push::external::check_secret(&params.secret)
             .map_err(ControllerError::InvalidArgument)?;
@@ -8567,6 +8565,24 @@ async fn record_outcome(
     })
     .await
     .map_err(|error| ControllerError::supervision(error.to_string()))?
+}
+
+/// The one refusal of parameters that do not read as `delivery.destination.secret.set`'s.
+const SECRET_PARAMS_REFUSAL: &str = "delivery.destination.secret.set takes a destination_id and \
+     one secret: {kind: slack or discord, webhook_url}, {kind: telegram, bot_token} or {kind: \
+     email, account: {server, port, security, username, password, from_address}}";
+
+/// Reads the parameters of `delivery.destination.secret.set`.
+///
+/// They carry a credential, and a decoder's own account of what it could not read quotes what it
+/// was given: a webhook address sent where the object belongs, a field named with a token. So
+/// every refusal here is one fixed sentence that repeats nothing the request carried.
+fn secret_params(
+    params: &ParamsValue,
+) -> Result<kr_protocol::delivery::DeliveryDestinationSecretSetParams> {
+    params
+        .to_typed()
+        .map_err(|_| ControllerError::InvalidArgument(SECRET_PARAMS_REFUSAL.to_owned()))
 }
 
 /// Reads a notification destination's identifier out of a request.
