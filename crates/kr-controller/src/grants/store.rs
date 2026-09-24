@@ -1307,7 +1307,16 @@ impl GrantDirectory {
             Some(None) => Ok(Some(Vec::new())),
             Some(Some(encoded)) if encoded.is_empty() => Ok(None),
             Some(Some(encoded)) => {
-                kr_cbor::from_canonical_slice(&encoded, &kr_cbor::Limits::DEFAULT)
+                // Written by this host, one entry for every grant the revocation withdrew, so it is
+                // bounded by its own length rather than by what one message may carry: a subtree
+                // larger than a message's collection bound is still read back whole.
+                let limits = kr_cbor::Limits {
+                    max_message_len: encoded.len(),
+                    max_items: encoded.len(),
+                    max_collection_len: encoded.len(),
+                    ..kr_cbor::Limits::DEFAULT
+                };
+                kr_cbor::from_canonical_slice(&encoded, &limits)
                     .map(Some)
                     .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
             }

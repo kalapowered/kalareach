@@ -8,7 +8,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-09.08 | `a_device_revocation_is_performed_once_however_long_its_first_attempt_waits`, `a_retry_while_a_device_revocation_runs_is_told_it_has_not_finished`, `a_share_whose_record_was_never_written_is_answered_from_what_it_wrote_after_a_restart`, `a_revocation_whose_record_was_never_written_is_answered_from_the_rows_after_a_restart`, `an_authority_change_whose_attempt_ended_unrecorded_is_not_performed_again`, `a_refused_authority_change_is_refused_the_same_way_when_it_is_sent_again`, `an_unfinished_key_registration_is_not_answered_with_another_actions_registration`, `an_unfinished_revocation_pays_the_fence_it_still_owes_before_it_is_answered`, `an_unfinished_revocation_of_a_grant_still_standing_is_unknown`, `an_unfinished_device_revocation_is_answered_only_once_the_device_record_is_revoked`, `a_revocation_answered_from_the_rows_names_only_what_it_withdrew`, `a_device_revocation_answered_from_the_rows_names_only_what_it_withdrew`, `an_unfinished_device_revocation_is_not_answered_while_the_device_holds_live_grants`, `a_device_revocation_on_a_floor_ahead_of_the_clock_names_only_what_it_withdrew`, `an_unfinished_destination_credential_is_unknown`, `a_claim_excludes_every_other_attempt_and_is_never_taken_over`, `a_claimed_revocation_writes_what_it_withdrew_beside_its_claim`, `an_earlier_receipts_table_migrates_once_and_its_open_claims_are_unfinished` |
+//! | KR-REQ-09.08 | `a_device_revocation_is_performed_once_however_long_its_first_attempt_waits`, `a_retry_while_a_device_revocation_runs_is_told_it_has_not_finished`, `a_share_whose_record_was_never_written_is_answered_from_what_it_wrote_after_a_restart`, `a_revocation_whose_record_was_never_written_is_answered_from_the_rows_after_a_restart`, `an_authority_change_whose_attempt_ended_unrecorded_is_not_performed_again`, `a_refused_authority_change_is_refused_the_same_way_when_it_is_sent_again`, `an_unfinished_key_registration_is_not_answered_with_another_actions_registration`, `an_unfinished_revocation_pays_the_fence_it_still_owes_before_it_is_answered`, `an_unfinished_revocation_of_a_grant_still_standing_is_unknown`, `an_unfinished_device_revocation_is_answered_only_once_the_device_record_is_revoked`, `a_revocation_answered_from_the_rows_names_only_what_it_withdrew`, `a_device_revocation_answered_from_the_rows_names_only_what_it_withdrew`, `an_unfinished_device_revocation_is_not_answered_while_the_device_holds_live_grants`, `a_device_revocation_on_a_floor_ahead_of_the_clock_names_only_what_it_withdrew`, `a_withdrawal_larger_than_one_message_is_read_back_and_its_fence_settled`, `an_unfinished_destination_credential_is_unknown`, `a_claim_excludes_every_other_attempt_and_is_never_taken_over`, `a_claimed_revocation_writes_what_it_withdrew_beside_its_claim`, `an_earlier_receipts_table_migrates_once_and_its_open_claims_are_unfinished` |
 //! | KR-REQ-09.18 | `a_decision_that_reads_the_clock_waits_for_the_floor_whatever_the_grants_expiry`, `a_delegation_is_not_refused_as_expired_on_a_reading_this_host_could_not_write`, `a_paired_device_refused_while_the_floor_is_owed_is_told_storage_is_unavailable` |
 //! | KR-REQ-10.40 | `a_grant_carries_every_field_section_ten_names`, `the_host_intersects_the_grant_with_policy_on_every_request`, `a_delegation_narrows_and_never_extends`, `revoking_a_parent_revokes_every_descendant` |
 //! | KR-REQ-10.41 | `a_method_is_decided_from_the_registry_table_and_never_from_a_capability` |
@@ -2958,6 +2958,106 @@ async fn a_revocation_whose_record_was_never_written_is_answered_from_the_rows_a
     assert_eq!(
         again.barrier.authority_revision, again.authority_revision,
         "the answer and its barrier are one moment"
+    );
+}
+
+/// KR-REQ-09.08 and 10.45: a revocation that withdrew more grants than one message's collection
+/// bound, and ended before its fence, still has its withdrawal read back whole, and its retry
+/// settles the fence it owes.
+///
+/// The retry raises that fence and is then refused on its own connection, as every retry that
+/// raises one is; the answer a later retry would carry names more grants than one control frame
+/// may hold, which the caller's decoder refuses whatever produced it. What is asserted is the
+/// record and the fence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withdrawal_larger_than_one_message_is_read_back_and_its_fence_settled() {
+    let host = Serving::start().await;
+    let controller = &host.controller;
+    let parent = grant(1, None, &[ActionRight::SessionView], GrantExpiry::Never);
+    controller
+        .sharing()
+        .grants()
+        .issue(&record(parent.clone()), || Ok(()))
+        .expect("written");
+    let children = kr_cbor::Limits::DEFAULT.max_collection_len + 4;
+    for index in 0..children {
+        let child = Grant {
+            grant_id: GrantId::new(Uuid::from_bytes(
+                (0x1000_u128 + index as u128).to_be_bytes(),
+            )),
+            parent_grant_id: Nullable::some(parent.grant_id),
+            recipient_device_id: device_id(0xf2),
+            ..parent.clone()
+        };
+        controller
+            .sharing()
+            .grants()
+            .issue(&record(child), || Ok(()))
+            .expect("written");
+    }
+    let before = controller.policy().authority_revision();
+    let mut client = host.client().await;
+    let action_id = kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x71; 16]));
+    let mutation = client
+        .compose(
+            Method::GrantRevoke,
+            action_id,
+            kr_protocol::envelope::ActionTarget::environment(host.temp.environment_id()),
+            &kr_protocol::sharing::GrantRevokeParams {
+                grant_id: parent.grant_id,
+            },
+        )
+        .await
+        .expect("the revocation is composed");
+    let actor = kr_protocol::ids::ActorId::new(format!("local:{}", kr_ipc::paths::current_uid()))
+        .expect("a principal");
+    let digest =
+        kr_protocol::digest::mutation_digest(&mutation, &actor).expect("the payload digest");
+    let kr_controller::grants::ActionClaim::Claimed { hold } = controller
+        .sharing()
+        .grants()
+        .claim_action(&actor, action_id, &digest, kr_ipc::now_ms().get())
+        .expect("the attempt claims its action")
+    else {
+        panic!("the attempt claims its action");
+    };
+    controller
+        .sharing()
+        .grants()
+        .revoke_claimed(
+            parent.grant_id,
+            kr_ipc::now_ms().get(),
+            || Ok(()),
+            Some(&hold),
+        )
+        .expect("the rows are withdrawn");
+    drop(hold);
+    assert_eq!(
+        controller
+            .sharing()
+            .grants()
+            .recorded_withdrawal(&actor, action_id)
+            .expect("the record reads back")
+            .expect("the claim holds one")
+            .len(),
+        children + 1,
+        "every grant the revocation withdrew"
+    );
+
+    let _ = client.repeat(&mutation).await;
+    assert_eq!(
+        controller.policy().authority_revision().get(),
+        before.get() + 1,
+        "the fence the withdrawal owed ran, once"
+    );
+    assert!(
+        controller
+            .sharing()
+            .grants()
+            .fence_owed()
+            .expect("readable")
+            .is_empty(),
+        "and nothing is owed now"
     );
 }
 
