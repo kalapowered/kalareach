@@ -586,6 +586,53 @@ carrying the control's revision, which is what section 11 requires a host to rec
 against when the invocation reaches it. Rechecking is the host's, so a control this client shows
 that it should not have is a control the host then refuses.
 
+## Pairing
+
+`pairing` is the side of pairing that runs on the device being added, and on an owner device when it
+answers its hosts. kr-pairing holds the state machines and the proofs and no transport; this module
+runs the candidate's half over the transport a host serves. A front end builds one `Pairing` from
+its parts (the device's keys, its attempt budget and clock, how it opens a room, how it reaches a
+host, and its records of paired hosts) and calls `pair_by_code`, `pair_directly` or `resume`.
+Progress arrives on a `watch` channel as `AttemptState`, and an attempt that fails ends as a
+`PairingFailure`. Neither carries a secret, a key, a transcript, a challenge or a proof, so a front
+end can hand them to a screen as they are.
+
+A code goes through one room socket. The device sends the four locator characters, and nothing else,
+to the rendezvous service it is set to use, at `/api/pair/room/<locator>/candidate`, over TLS the
+platform verifier checks. kr-pairing charges the attempt budget before that lookup, so a service
+that cannot be reached still costs a try. The exchange then moves to iroh, to the endpoint the
+host's authenticated bundle pinned, and `pair.finish` is sent only once the device has checked that
+the live peer is that endpoint. A direct invitation goes to `pair.redeem` under the same check, and
+no proof leaves the device for any other peer.
+
+The verification value is computed here, from the transcript, and grouped `f3c1 46fd` by the
+function the host and the command line use. The device shows it only once the host's answer to
+`pair.finish` names the same value; an answer naming another ends the attempt as `host_mismatch`,
+and nothing is shown.
+
+`invitation` reads the one invitation text there is: unpadded base64url over the canonical KR-CBOR-1
+payload, the text a QR code carries. The older JSON forms are not invitations. A code payload that
+names a service other than the one the device is set to use says so, and a front end asks the person
+before it opens any connection there.
+
+Every wait has an end. A code attempt may recover an answer it lost until the invitation's five
+minutes and one more have passed; a direct one until the invitation's own expiry and one more
+minute. Each wait for the host inside that is bounded as well, so a host that stops answering ends
+the attempt instead of holding it open: as `timed_out` during the exchange, and as
+`approval_unknown` once the host may already have added the device, because then nothing the device
+can see says whether it did. A refusal is read from what the host sent, never from what the
+transport concluded about the connection. An attempt still waiting for its owner is kept in
+`paired`, and `resume` takes it up after a restart; a device the host committed while it was away
+finds its record and confirms that instead.
+
+`owner` is the owner device's half. It reads `owner.confirmation.pending` over the device's
+authorised session, checks each challenge against what it would authorise, and describes it in one
+line: what, on which host, and for how long. A challenge whose display does not match its digest is
+marked as one this device cannot check, and nothing is signed for it. The platform's ceremony is a
+trait the application implements; it is asked with that line and the challenge's remaining
+lifetime, and only a confirmation inside that lifetime is signed, on `owner_device_presence`, and
+completed.
+
 ## Managed services
 
 `services` holds one trait per managed service section 17 names (account login, relay leases, push,
@@ -1087,6 +1134,11 @@ not one of them, so an account password reset returns an account and nothing els
 | Row | What this library does for it |
 | --- | --- |
 | KR-REQ-04.23 | The local path is a socket and the remote path is iroh, behind one seam, so a caller chooses a host rather than a transport |
+| KR-REQ-10.23 | A code pairs through the product client and a room, with the budget on disk, and the committed device reads its own `pair.status` over its authorised connection (`a_device_pairs_by_code_through_the_product_client` in `crates/kr-controller/tests/pairing_client.rs`, and through a room behind TLS in `a_device_pairs_through_a_room_behind_tls`). A host's confirmation tag with one bit flipped ends the attempt ambiguous before anything is trusted (`a_host_tag_that_does_not_verify_ends_the_attempt_before_anything_is_trusted`) |
+| KR-REQ-10.27 | The candidate's room socket, its TLS verification and its frames (`crates/kr-client/tests/pairing_room.rs`), what each way a room can fail is called (`crates/kr-client/tests/pairing_failures.rs`), and `pair.finish` bound to the peer the connection authenticated (`the_finish_is_bound_to_the_endpoint_the_client_authenticated`) |
+| KR-REQ-10.36 | `a_device_pairs_directly_through_the_product_client`: a direct invitation redeemed over iroh and committed. In `a_direct_redemption_proves_nothing_to_the_wrong_host_and_shows_no_wrong_value`, a secret with one bit flipped is refused and locks nothing, and no proof goes to a host the invitation did not pin |
+| KR-REQ-10.37 | The value both devices show is computed on the device and shown grouped only when the host's answer agrees (`a_finish_answered_with_another_value_shows_no_value`, `a_direct_redemption_proves_nothing_to_the_wrong_host_and_shows_no_wrong_value`) |
+| KR-REQ-10.38 | One invitation format: what `pair.invite` issues reads back in this reader in both modes (`the_hosts_invitation_reads_back_in_the_companion_reader`), and `crates/kr-client/tests/pairing_invitation.rs` reads the payloads `fixtures/pairing/codes.json` publishes and refuses everything else |
 | KR-REQ-10.46 | `services::authority` carries the durable authority feed, and the seven legs in `tests/integration/sync/tests/authority.rs` hold a live deployment and this client's feed record to the retention, validation, revision, acknowledgement and staleness rules together |
 | KR-REQ-10.47 | `sync::StoredCollectionKeys` keeps a collection key in the operating system's credential store, or in the owner-only directory section 10 offers in its place. The `crates/kr-client/src/sync/keys.rs` tests check that directory on Unix, directory and files both, which is where those modes mean something; the credential store itself is `a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again`, which writes one item named for the run and takes it away again, and does nothing until a run sets `KR_TEST_PLATFORM_SECRET_STORE=1`, because on a person's own machine that store is their login keyring |
 | KR-REQ-11.46 | The controls a client offers, and what each one does to a session |

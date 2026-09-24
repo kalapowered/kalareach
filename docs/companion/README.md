@@ -61,6 +61,11 @@ that means, and each rule is a fact about a file here rather than a convention:
 - **Exports are written where a dialog put them.** The page asks for a destination, the platform's
   own save dialog answers, and the backend remembers that answer for exactly one write. A path the
   page names is refused.
+- **Pairing's secrets stay native.** The page types a code or asks for the pasteboard to be read,
+  and is shown views: an invitation's service and proposed rights in words, an attempt's state, the
+  grouped value both devices show, and a confirmation's description. It is never sent an
+  invitation's text or secret, a key, a transcript, a challenge or a proof, and it cannot complete
+  a confirmation: `owner.confirmation.complete` is a method only native code calls.
 
 `src-tauri/tests/boundary.rs` reads those files and holds them to those sentences.
 
@@ -69,6 +74,51 @@ page runs, and the terminal library assigns `toString` to one of its own namespa
 is being evaluated; against a frozen inherited property that assignment throws and the window comes
 up empty. The setting is written into `tauri.conf.json` as `false` rather than left out, so the
 choice is visible where the rest of the boundary is.
+
+## Pairing with a host
+
+"Pair with a host" is where this computer becomes one of a host's devices, and it runs in native
+code, in `src-tauri/src/device`. The page asks for a code or for the pasteboard to be read, and
+native code does the rest with `kr-client`'s pairing module:
+
+- This computer's keys are in the platform's secret store, the Keychain, the Credential Manager or
+  the Secret Service, under "KalaReach Companion". The name it offers a host is its host name.
+- A code's tries are counted in `pairing-budget` in the application's data directory, under a key
+  kept in the same store, so a restart, a reboot or a second copy of the application spends from
+  the same five.
+- The hosts it is paired with, and an attempt still waiting for its owner, are records in
+  `pairing`, each written whole and renamed into place. They hold no secret.
+- The service it pairs through is `https://reach.kala.to` until the person picks another, and the
+  choice is kept in `pairing-origin`.
+
+An invitation on the pasteboard is read by native code, not by the page. A code invitation that
+names a service other than this computer's raises the system's own alert before anything connects
+there, and declining it connects nowhere. Each change reaches the page as a view on the
+`kr://pairing` event.
+
+`src-tauri/tests/pairing.rs` pairs this computer both ways against kr-controller's in-process host
+and answers a confirmation as its owner. It keeps every view and every command result the page was
+sent, and finds in none of them the invitation's text or secret, the code's secret characters, a
+challenge's nonce or identifier, a digest a confirmation covers, or a key.
+
+## An owner's confirmations
+
+On a computer that is one of a host's owner devices, `src-tauri/src/owner.rs` asks each such host
+every two seconds what it wants confirmed. The requests head Attention, and each row has its title,
+its description in one line, the time left, and a button named for this computer's ceremony:
+"Confirm with Touch ID", "Confirm with your password" on a Mac without Touch ID, or "Confirm with
+Windows Hello". A computer with no ceremony, Linux among them, shows no button and says where to
+confirm instead. A request whose description does not match what it would authorise says it could
+not be checked, and has no button either.
+
+The button sends native code a reference and nothing else. Native code finds the request it listed
+under that reference and asks the operating system, which draws the prompt and prints the
+request's description in it:
+`LAContext` on macOS, and Windows Hello through `UserConsentVerifier` for this window on Windows.
+The prompt is bounded by the challenge's remaining lifetime. Only a confirmation inside it signs,
+with this computer's key, and completes the challenge; when the time runs out the prompt is
+dismissed and the answer is "not confirmed". Nothing on the page can answer the prompt, so a click
+that desktop automation synthesises can start a review and cannot finish one.
 
 ## The design system
 
@@ -120,6 +170,11 @@ pnpm -C apps/companion build       # the production bundle
 cargo test -p companion-tauri      # the backend, including the boundary
 ```
 
+On Windows the same command runs `tests/windows_hello.rs`, which reads what Windows reports about
+Windows Hello and checks that the page is sent that ceremony or none. Its tests that raise Windows
+Hello's dialog are ignored: they need a signed-in desktop with Windows Hello set up, and the file
+says how to run them there.
+
 The end-to-end run builds a second entry, `harness.html`, which is the same application against a
 host that answers without a machine behind it. The production build has one entry and does not carry
 it.
@@ -134,3 +189,7 @@ pnpm -C apps/companion tauri build
 
 macOS is the first target. Windows and Linux compile from the same source; their packaging is not
 covered by the checks above.
+
+On Windows, with Microsoft's linker, the build links the application manifest into every binary it
+makes, the test binaries included. The native dialogs need version 6 of the common controls, and a
+binary without the manifest that selects it cannot start.
