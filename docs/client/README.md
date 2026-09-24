@@ -108,14 +108,47 @@ been published once. What goes to the service is the record the store holds, rea
 note under one hold of the lock, so a caller cannot publish text this device does not have and
 cannot send an older revision against a position another publisher has just advanced. A note that
 already names a later write stands, so an answer that arrives late does not undo what a fetch
-has already learnt. A refused comparison is an answer rather than a failure: what the service holds
-comes down **beside** the local draft under a fresh identity, never over it, and the person chooses.
-Reconnecting never replaces their text.
+has already learnt, and so does a note naming the same place in the service's order under another
+name, which is a second history rather than a later write. A refused comparison is an answer rather
+than a failure: what the service holds comes down **beside** the local draft under a fresh identity,
+never over it, and the person chooses. Reconnecting never replaces their text.
 
-Every exchange carries an identity for the request itself, which is what a service answers about
-afterwards. This half sends a fresh identity per attempt. It keeps no record of a publication it
-has sent, so it has nothing to present a second time and every call is a first attempt, and an
-answer it loses is one nothing later establishes: the settlement below is the settings half's.
+`DraftSync` takes the device's `sync::SyncStore`, the one the settings client keeps its records in,
+and a draft publication is accounted for and settled there by the same rules as a setting.
+
+- Each publication keeps one request record, written before the call leaves and replaced whole at
+  every step, so a device that stops anywhere comes back to one account of it. Admitting it and
+  making the first attempt are one step, under the hold the privacy fence is decided in, so no
+  draft sits between the two for a cancellation to find. `SyncClient::outstanding` counts a draft
+  that left without an answer, and `SyncClient::exported` names it.
+- A publication has one request identity, chosen when it is admitted. Publishing the same revision
+  again while the answer is unknown presents that identity with the same bytes and the same
+  comparison, and the service answers from its receipt if an earlier attempt ran. The record keeps
+  the earliest and the latest instant any attempt was signed at, which is what a fence carries. A
+  later attempt is a replay only while the service is sure to hold that receipt still. Section 9
+  keeps one for thirty days from the reading that admitted the attempt, so an identity is presented
+  again only by an attempt signed less than that, less two freshness windows, after the earliest.
+  After that the first publication keeps its own account and publishing again is new work under a
+  new identity. Nothing makes an attempt by itself, and a second call while one is out is refused
+  rather than sent beside it.
+- `DraftSync::reconcile_unsettled` settles a publication whose answer was lost the way the settings
+  client settles its own. It asks about the request's identity: an applied receipt moves the note
+  beside the draft unless the note already names a later write, and a refused one brings the other
+  content down beside the draft. While the generation that admitted it is in force, a publication
+  the service holds no receipt for stays counted. Once privacy mode has moved past that generation,
+  the settings client's cleanup fences it with the two recorded instants and settles it too,
+  leaving no account where the service says nothing ran and keeping the account where it cannot
+  say so. The note is written in the draft store before the record that ends the request, so a stop
+  between the two leaves the request counted and the next pass writes the same note again.
+- A refusal names the copy the service kept of this device's write on the copy that comes down
+  beside the draft, as `Draft::retained`. `DraftSync::resolve` records the person's choice about that
+  copy: it takes the copy out of the draft store and drops the one copy on the service that answers
+  it. The choice is recorded before the service is asked, so a service that cannot be told hears of
+  it from `SyncClient::finish_resolutions` later. A refusal whose other content never came down is
+  listed in `exported` as deletable, and `SyncClient::drop_kept_copy` drops it.
+- While privacy mode is on, no draft is published and none is fetched. An answer that comes back
+  for work from an earlier generation is `drafts::Published::Discarded`, or a late result for a
+  fetch. The account of what left stays, no note moves and no copy comes down.
 
 Sealing goes through `drafts::DraftSealer`. `sync::CollectionSealer` is the implementation this
 crate carries; a client that seals differently supplies its own.
@@ -124,7 +157,8 @@ crate carries; a client that seals differently supplies its own.
 
 `sync` is the other half of what a synchronisation service carries. Drafts travel through
 `drafts::DraftSync`; settings and a client's own position travel through `sync::SyncClient`, under
-the same compare-and-swap discipline and the same sealing seam.
+the same compare-and-swap discipline and the same sealing seam, and both keep their request records
+in one `sync::SyncStore`.
 
 - A publication sends the object the store holds against the position the note beside it names,
   which is never the object's own revision. A revision is a fresh 128-bit value for every write
@@ -398,8 +432,8 @@ client never depends on a host crate:
 | `fence` | Stops production at the generation. A publication after it is refused. |
 | `cancel_undispatched` | Discards the ciphertext of every request that was admitted and never sent, reconciles what had already been dispatched and counts whatever the service could not account for. It reports what that reconciliation established as well as the total. |
 | `remove_retained` | Removes the conflict copies, the checkpoints and the work that never left, and reports the bytes and records it actually deleted. It reconciles afterwards, so the ciphertext of a request nothing can account for goes as well. Work admitted under a later generation is another cleanup's. |
-| `reconcile_unsettled` | Asks the service what became of every dispatch this device has no answer for, under the identity each request carried, and settles it. A service that cannot be asked leaves the work counted rather than failing the step. |
-| `outstanding` | How many dispatched publications have no settled outcome, read from the durable records rather than from what is running. An abandoned call, a failed connection and a restart all leave one counted, and a record this build cannot read counts too. Cleanup is complete when it is nought, and it reaches nought after a lost answer because the two cleanup steps reconcile before they measure. |
+| `reconcile_unsettled` | Asks the service what became of every dispatch this device has no answer for, under the identity each request carried, and settles it. A service that cannot be asked leaves the work counted rather than failing the step. A draft publication is settled here once privacy mode has moved past the generation that admitted it; before that it is the draft half's, through `DraftSync::reconcile_unsettled`, and this counts it as unresolved. |
+| `outstanding` | How many dispatched publications, settings and drafts alike, have no settled outcome, read from the durable records rather than from what is running. An abandoned call, a failed connection and a restart all leave one counted, and a record this build cannot read counts too. Cleanup is complete when it is nought, and it reaches nought after a lost answer because the two cleanup steps reconcile before they measure. |
 | `kept` | What stays, and why: the device's own settings, the labels the person pinned, and the record of what has already been published. |
 | `exported` | What has already left, shown rather than claimed to be erased: a write the service accepted after the fence, a refused write the service kept a copy of, a dispatch nothing has established the outcome of, and a request ended too late for a receipt to say whether it ran. Suppressing a result does not undo an upload. A copy the service kept of a refused write is the one entry marked deletable, because the service drops such a copy when asked and `drop_kept_copy` is the asking; nothing else is, because this client publishes writes and offers no operation that removes a published object. |
 | `accepts_result` | A result is published only under the generation in force. An answer to work admitted earlier is discarded and moves nothing. |
@@ -844,9 +878,9 @@ not one of them, so an account password reset returns an account and nothing els
 | KR-PERF-006 | The client's own share of a reconnect: it holds no work of its own between a host's answer and a screen a terminal can draw. What the attach and the host spend is theirs |
 | KR-REQ-17.14 | A session, a draft and a control need no managed service, and none of them changes when one is configured |
 | KR-REQ-23.57 | The retry rules: which classes of request may be retried automatically, and what a person is offered for the rest |
-| KR-REQ-24.13 | A draft outlives its attachment, its connection and another device's write, and is never replaced by remote content |
-| KR-REQ-20.13 | Per-object revisions and compare-and-swap writes, a lost comparison kept beside rather than resolved by a clock, the person's choice leaving no copy on the device or the service, the settlement of a write whose answer was lost through the request's own identity, the closed kind set that no restore can reach host authority through, and drafts that stay drafts. The legs in `tests/integration/sync/tests/sync.rs` hold a live deployment to the same rules through `services::sync`, with two client stores under one installation |
-| §24 privacy | The fence, the cancellation, the removal, the pinned-label rule, a publication in flight when privacy mode is enabled, work whose caller walked away staying outstanding, and the settlement of a dispatch whose answer was lost: applied, refused, and a request the service holds no receipt for, which stays counted under the generation in force and is ended at the service once privacy mode has moved past it, keeping the account of what left wherever the service cannot establish that nothing ran. A client fenced by privacy mode sends a live deployment nothing (`kr_req_24_28_a_client_fenced_by_privacy_mode_publishes_nothing_and_keeps_its_pinned_labels`). Turning the generation on is the host's, and this client is one subsystem of it |
+| KR-REQ-24.13 | A draft outlives its attachment, its connection and another device's write, and is never replaced by remote content. A draft settled after its answer was lost is still never submitted |
+| KR-REQ-20.13 | Per-object revisions and compare-and-swap writes, a lost comparison kept beside rather than resolved by a clock, the person's choice leaving no copy on the device or the service, the settlement of a write whose answer was lost through the request's own identity, for a draft as for a setting, the closed kind set that no restore can reach host authority through, and drafts that stay drafts. The legs in `tests/integration/sync/tests/sync.rs` hold a live deployment to the same rules through `services::sync`, with two client stores under one installation |
+| §24 privacy | The fence, the cancellation, the removal, the pinned-label rule, a publication in flight when privacy mode is enabled, a draft's as well as a setting's, work whose caller walked away staying outstanding, and the settlement of a dispatch whose answer was lost: applied, refused, and a request the service holds no receipt for, which stays counted under the generation in force and is ended at the service once privacy mode has moved past it, keeping the account of what left wherever the service cannot establish that nothing ran. A client fenced by privacy mode sends a live deployment nothing (`kr_req_24_28_a_client_fenced_by_privacy_mode_publishes_nothing_and_keeps_its_pinned_labels`). Turning the generation on is the host's, and this client is one subsystem of it |
 | KR-REQ-18.05 | The encrypted settings sync part only: the service holds ciphertext in a declared size bucket and never a setting, against a live deployment as well as the suite's own service (`kr_req_18_05_a_setting_is_stored_sealed_in_a_declared_bucket`), and the feature names its three parts and which of them are optional. A device receives a collection key only through its own wrap in a record it accepted, and only after its hosts committed its pairing and the owner confirmed the addition and the join (`a_production_device_receives_its_key_through_its_own_wrap_and_keeps_it_in_its_store`, `nothing_is_sealed_to_a_device_its_host_has_not_committed` in `crates/kr-client/tests/membership.rs`, against the suite's own service and hosts). Nothing here performs a history backup or produces recovery material |
 | KR-REQ-20.11 | The sync-collection half: removing a device gives the members that stay a fresh key at the next epoch that the removed device has no wrap of, and publication stays fenced until that record is installed (`removing_a_device_gives_the_rest_a_key_it_cannot_open`, `every_new_epoch_has_a_freshly_drawn_key`, `publication_stays_fenced_from_a_recorded_removal_until_its_record_is_installed` in `crates/kr-client/tests/membership.rs`, and the reconciler's exhaustive test in `crates/kr-client/src/sync/membership/exhaustive.rs`) |
 | KR-REQ-20.14 | `a_kit_round_trips_through_its_printable_and_scanned_forms`, `the_printed_kit_is_the_document_the_fixture_publishes`, `a_mistyped_kit_fails_on_its_checksum_before_anything_is_derived`, `a_kit_read_by_hand_forgives_the_letters_the_alphabet_leaves_out` and `a_kit_value_whose_spacing_would_change_when_read_is_refused` in `crates/kr-client/tests/recovery.rs`, with `fixtures/crypto/kdf.json` and `fixtures/crypto/recovery-kit.json` |
