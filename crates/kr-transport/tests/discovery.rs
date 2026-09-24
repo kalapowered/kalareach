@@ -34,12 +34,15 @@ fn loopback() -> Option<SocketAddr> {
     Some("127.0.0.1:0".parse().expect("a loopback address"))
 }
 
-/// How long a connection may take to open a direct path.
+/// The direct addresses an endpoint has found for itself, which are what it offers a peer on a
+/// connection.
 ///
-/// An endpoint tries for a direct path as a connection starts and then again on its own schedule,
-/// at least once a minute, so on a loaded machine a path whose first attempts were lost opens at
-/// the next one.
-const DIRECT_PATH_PATIENCE: Duration = Duration::from_secs(90);
+/// These are not the sockets it bound: a socket bound to the unspecified address answers on the
+/// machine's addresses, so the endpoint names those it can use, and never the unspecified address
+/// itself.
+fn direct_addresses(endpoint: &Endpoint) -> Vec<SocketAddr> {
+    endpoint.addr().ip_addrs().copied().collect()
+}
 
 /// Waits until `check` holds, or fails the test saying what did not happen.
 async fn eventually(what: &str, patience: Duration, mut check: impl FnMut() -> bool) {
@@ -324,11 +327,13 @@ async fn the_public_record_names_the_relay_and_never_a_direct_address() {
         PublishedAddresses::RelayOnly
     );
     let host = side(&selection, 1, true).await;
-    let direct = host.endpoint.bound_sockets();
-    assert!(!direct.is_empty(), "the host has direct addresses to keep");
     tokio::time::timeout(PATIENCE, host.endpoint.online())
         .await
         .expect("the host reaches its relay");
+    eventually("the host has direct addresses to keep", PATIENCE, || {
+        !direct_addresses(&host.endpoint).is_empty()
+    })
+    .await;
 
     let device = side(&selection, 2, false).await;
     let record = resolve_naming(&device.endpoint, host.endpoint.id(), &relay.url).await;
@@ -362,13 +367,17 @@ async fn the_public_record_names_the_relay_and_never_a_direct_address() {
 
     // The connection then opens a direct path to one of the host's direct addresses, although the
     // device was given the host's identity alone and the record it resolved carries none of them.
+    // The host can have more than one, such as a loopback address and the machine's global address.
+    // The connection keeps one direct path, and which address that is depends on which path opened
+    // first, so any of them counts.
     eventually(
-        "the connection opens a direct path to the host",
-        DIRECT_PATH_PATIENCE,
+        "the connection opens a direct path to one of the host's direct addresses",
+        PATIENCE,
         || {
+            let direct = direct_addresses(&host.endpoint);
             connection.paths().iter().any(
-            |path| matches!(path.remote_addr(), TransportAddr::Ip(addr) if direct.contains(addr)),
-        )
+                |path| matches!(path.remote_addr(), TransportAddr::Ip(addr) if direct.contains(addr)),
+            )
         },
     )
     .await;
