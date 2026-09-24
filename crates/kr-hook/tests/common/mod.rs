@@ -23,6 +23,12 @@ pub const FORWARDER_VARIABLES: &[&str] = &["KR_REGISTRATION", "KR_CREDENTIAL", "
 /// measures separately.
 pub const LIVENESS: Duration = Duration::from_secs(60);
 
+/// How long the first start of a placed program may take.
+///
+/// On macOS the operating system checks a program at a new path the first time it starts, and on
+/// a loaded machine that check alone has taken longer than [`LIVENESS`]. Nothing is measured here.
+pub const FIRST_START_WITHIN: Duration = Duration::from_secs(300);
+
 /// A host tree of its own, with the forwarder copied into it.
 pub struct Placed {
     /// The tree, removed when this is dropped.
@@ -48,7 +54,12 @@ impl Placed {
         // The first start of a program at a new path is the one the operating system checks, and
         // on macOS that check can take seconds. It is taken here, once, so a test that measures how
         // promptly the forwarder answers measures the forwarder.
-        let warmed = run_with_input(placed.command(&["--version"]), b"");
+        let warmed = run(
+            placed.command(&["--version"]),
+            b"",
+            false,
+            FIRST_START_WITHIN,
+        );
         assert_eq!(
             warmed.code,
             Some(0),
@@ -90,7 +101,7 @@ pub struct Ran {
 /// Panics when the process does not end within [`LIVENESS`].
 #[must_use]
 pub fn run_with_input(command: Command, input: &[u8]) -> Ran {
-    run(command, input, false)
+    run(command, input, false, LIVENESS)
 }
 
 /// Runs a command to its end with `input` on standard input, which is held open until it ends.
@@ -102,10 +113,10 @@ pub fn run_with_input(command: Command, input: &[u8]) -> Ran {
 /// Panics when the process does not end within [`LIVENESS`].
 #[must_use]
 pub fn run_holding_input(command: Command, input: &[u8]) -> Ran {
-    run(command, input, true)
+    run(command, input, true, LIVENESS)
 }
 
-fn run(mut command: Command, input: &[u8], hold: bool) -> Ran {
+fn run(mut command: Command, input: &[u8], hold: bool, within: Duration) -> Ran {
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -140,10 +151,10 @@ fn run(mut command: Command, input: &[u8], hold: bool) -> Ran {
         if let Some(status) = child.try_wait().expect("the forwarder can be waited on") {
             break status;
         }
-        if started.elapsed() > LIVENESS {
+        if started.elapsed() > within {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("the forwarder did not end within {LIVENESS:?}");
+            panic!("the forwarder did not end within {within:?}");
         }
         std::thread::sleep(Duration::from_millis(5));
     };
