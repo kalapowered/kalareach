@@ -77,7 +77,7 @@ pub use crate::source_workflow::{
     QuiescenceManager, QuiescenceReservation, ReviewerTurn, SourceWorkflowCoordinator,
 };
 pub use crate::store::{
-    Acted, ActionKey, ActionRecord, AttentionOutboxRecord, AttentionSubject, Breach,
+    Acted, ActionKey, ActionRecord, AttentionOutboxRecord, AttentionSubject, Breach, Continuation,
     InstalledDefinition, Journal, JournalEvent, JournalEventKind, NodeSettlement, Outlived,
     StoredRunRecord, Submitted, WorkflowStore,
 };

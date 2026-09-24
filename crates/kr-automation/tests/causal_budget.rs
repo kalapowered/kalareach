@@ -50,8 +50,14 @@ fn test_grant_id(v: u8) -> GrantId {
 /// A definition names a grant and the host reads it from its own store, so every suite that runs
 /// one puts that grant in first. What a narrower or withdrawn grant does is its own suite's
 /// subject.
+/// Grant 1 carries every right; grant 2 carries only the change-set right, and no management.
 fn authority() -> std::sync::Arc<kr_automation::GrantTable> {
-    common::every_right(&[test_grant_id(1)])
+    let table = common::every_right(&[test_grant_id(1)]);
+    table.insert(common::grant_of(
+        test_grant_id(2),
+        &[kr_protocol::rights::ActionRight::ChangesetCreate],
+    ));
+    table
 }
 
 /// A one-node workflow triggered by `trigger`, whose node's success produces the event its action
@@ -582,17 +588,27 @@ async fn rearm_is_authorised_and_refuses_late_descendants() {
     budget.exhaust();
     service.store().save_budget(&budget).unwrap();
 
-    // Without the management right nothing changes.
-    let refused = service.rearm(root, false, 2_000).expect_err("no right");
+    // Under a grant without the management right nothing changes, and neither does it under a
+    // grant this host does not hold.
+    let refused = service
+        .rearm(root, test_grant_id(2), 2_000)
+        .expect_err("no right");
     assert!(
         refused.to_string().contains("automation.manage"),
         "{refused}"
     );
+    service
+        .rearm(root, test_grant_id(9), 2_000)
+        .expect_err("no such grant");
     assert!(service.store().get_budget(root).unwrap().unwrap().exhausted);
 
-    service
-        .rearm(root, true, 2_000)
+    let continued = service
+        .rearm(root, test_grant_id(1), 2_000)
         .expect("an authorised rearm");
+    assert!(
+        continued.is_empty(),
+        "a chain exhausted by hand refused no descendant to continue from"
+    );
     let rearmed = service.store().get_budget(root).unwrap().unwrap();
     assert!(!rearmed.exhausted);
     assert_eq!(rearmed.generation, 1);
@@ -778,4 +794,238 @@ async fn an_external_callback_is_a_new_external_trigger() {
         .await
         .expect_err("a replayed callback is deduplicated");
     assert!(repeat.to_string().contains("duplicate trigger"), "{repeat}");
+}
+
+/// A runner whose node named `slow` waits for a permit the test hands out, and whose every other
+/// node succeeds at once.
+struct Selective {
+    permits: Arc<tokio::sync::Semaphore>,
+    entered: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl kr_automation::ActionRunner for Selective {
+    fn cancel(&self, _dispatch: &kr_automation::Dispatch<'_>) -> kr_automation::Cancellation {
+        kr_automation::Cancellation::Unsupported
+    }
+
+    fn execute(
+        &self,
+        dispatch: &kr_automation::Dispatch<'_>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = kr_automation::Result<kr_automation::ActionOutcome>>
+                + Send,
+        >,
+    > {
+        let kind = dispatch.node.action_kind;
+        let gated = dispatch.node.node_id == "slow";
+        let permits = Arc::clone(&self.permits);
+        let entered = Arc::clone(&self.entered);
+        Box::pin(async move {
+            if gated {
+                entered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                permits
+                    .acquire()
+                    .await
+                    .expect("the gate stays open")
+                    .forget();
+            }
+            Ok(kr_automation::ActionOutcome::Success {
+                output: kr_automation::stand_in_output(kind),
+            })
+        })
+    }
+}
+
+/// A one-node workflow triggered by `trigger`, with the node named `node_id`.
+fn one_step(
+    id: u8,
+    name: &str,
+    trigger: &str,
+    node_id: &str,
+    kind: WorkflowActionKind,
+) -> WorkflowDefinition {
+    let mut def = create_workflow_definition(
+        test_wf_id(id),
+        1,
+        name,
+        test_grant_id(1),
+        vec![common::node(node_id, kind)],
+        vec![],
+    );
+    def.trigger.event_type = trigger.to_owned();
+    def
+}
+
+/// An authorised rearm continues the chain it rearms: the descendant the exhausted budget refused
+/// runs once, in the same chain and the new generation, and spends the new budget. A descendant
+/// of a run from the old generation that settles after the rearm stays refused, and a second
+/// rearm has nothing left to continue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rearm_continues_its_chain_once_and_late_descendants_stay_refused() {
+    let runner = Arc::new(Selective {
+        permits: Arc::new(tokio::sync::Semaphore::new(0)),
+        entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    });
+    let clock = Arc::new(ManualClock::new(1_000));
+    let journal = tempfile::tempdir().expect("a journal directory");
+    let service = Arc::new(
+        AutomationService::open(
+            journal.path(),
+            common::host(
+                Arc::clone(&runner) as Arc<dyn kr_automation::ActionRunner>,
+                authority(),
+                Arc::clone(&clock) as Arc<dyn kr_automation::HostClock>,
+            ),
+        )
+        .expect("the journal opens"),
+    );
+    // The producer's success triggers a slow workflow and a quick one. The quick one's success
+    // triggers the workflow the exhausted chain refuses; the slow one's triggers a late one.
+    let producer = one_step(20, "producer", "manual", "p", WorkflowActionKind::RunTests);
+    let slow = one_step(
+        21,
+        "slow",
+        "tests.passed",
+        "slow",
+        WorkflowActionKind::RequestReview,
+    );
+    let quick = one_step(
+        22,
+        "quick",
+        "tests.passed",
+        "q",
+        WorkflowActionKind::MaterializeChangeset,
+    );
+    let refused = one_step(
+        23,
+        "refused",
+        "changeset.materialized",
+        "d",
+        WorkflowActionKind::AttentionNotice,
+    );
+    let late = one_step(
+        24,
+        "late",
+        "review.completed",
+        "e",
+        WorkflowActionKind::AttentionNotice,
+    );
+    for def in [&producer, &slow, &quick, &refused, &late] {
+        install_and_enable(&service, def, 1_000);
+    }
+
+    let root = service
+        .submit_run(&run_params(&producer, "evt-root"), 1_000)
+        .await
+        .expect("the root runs")
+        .causal_root_id;
+    // Two more runs fit the chain: the slow one and the quick one.
+    let mut budget = service.store().get_budget(root).unwrap().unwrap();
+    budget.total_runs = budget.max_runs - 2;
+    service.store().save_budget(&budget).unwrap();
+    let admitted = service.admit_triggers(1_100);
+    assert!(admitted.stopped.is_none(), "{:?}", admitted.stopped);
+    assert_eq!(admitted.started.len(), 2, "{:?}", admitted.decisions);
+    let mut executing = None;
+    for run in admitted.started {
+        let record = service
+            .store()
+            .get_run_record(run.run_id())
+            .unwrap()
+            .expect("recorded");
+        if record.workflow_id == slow.workflow_id {
+            let service = Arc::clone(&service);
+            executing = Some(tokio::spawn(async move { service.execute(run).await }));
+        } else {
+            let ran = service.execute(run).await.expect("the quick run answers");
+            assert_eq!(ran.status, WorkflowRunStatus::Completed, "{ran:?}");
+        }
+    }
+    let executing = executing.expect("the slow run started");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while runner.entered.load(std::sync::atomic::Ordering::SeqCst) < 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the slow action began"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // The quick run's success triggers a third descendant, which the full chain refuses.
+    let exhausted = only(service.admit_triggers(1_150).decisions);
+    assert_eq!(exhausted.workflow_id, refused.workflow_id);
+    assert_eq!(
+        code(exhausted.outcome.as_ref().expect_err("refused")),
+        ErrorCode::CausalLimit
+    );
+
+    // Under a grant without the management right, nothing is rearmed or continued.
+    service
+        .rearm(root, test_grant_id(2), 1_200)
+        .expect_err("no right");
+    assert!(service.store().get_budget(root).unwrap().unwrap().exhausted);
+
+    let continued = service
+        .rearm(root, test_grant_id(1), 1_300)
+        .expect("an authorised rearm");
+    assert_eq!(continued.len(), 1, "the refused descendant is continued");
+    let continuation = continued.into_iter().next().expect("one run");
+    let record = service
+        .store()
+        .get_run_record(continuation.run_id())
+        .unwrap()
+        .expect("recorded");
+    assert_eq!(record.workflow_id, refused.workflow_id);
+    assert_eq!(record.causal_root_id, root, "the same chain");
+    assert_eq!(record.generation, 1, "the new generation");
+    assert_eq!(
+        record.depth, 3,
+        "where the refused descendant would have stood"
+    );
+    let ran = service
+        .execute(continuation)
+        .await
+        .expect("the continuation runs");
+    assert_eq!(ran.status, WorkflowRunStatus::Completed, "{ran:?}");
+    let rearmed = service.store().get_budget(root).unwrap().unwrap();
+    assert_eq!(rearmed.generation, 1);
+    assert_eq!(
+        rearmed.total_runs, 1,
+        "the continuation spent the new budget"
+    );
+    assert!(!rearmed.exhausted);
+
+    // The slow run is from the old generation. What its success triggers is refused.
+    runner.permits.add_permits(1);
+    let slow_ran = executing
+        .await
+        .expect("the task ends")
+        .expect("the slow run answers");
+    assert_eq!(slow_ran.status, WorkflowRunStatus::Completed);
+    let stale = only(service.dispatch_triggers(1_500).await.expect("a pass"));
+    assert_eq!(stale.workflow_id, late.workflow_id);
+    let refusal = stale
+        .outcome
+        .expect_err("a late descendant cannot spend the new budget");
+    assert!(
+        refusal.to_string().contains("stale causal generation"),
+        "{refusal}"
+    );
+    assert!(
+        service
+            .store()
+            .list_runs(Some(late.workflow_id))
+            .unwrap()
+            .is_empty(),
+        "the late descendant never ran"
+    );
+
+    // The continuation was spent: a second rearm has nothing to continue.
+    assert!(
+        service
+            .rearm(root, test_grant_id(1), 1_600)
+            .expect("an authorised rearm")
+            .is_empty()
+    );
 }

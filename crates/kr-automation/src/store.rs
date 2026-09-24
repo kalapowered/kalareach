@@ -57,8 +57,8 @@ pub const WORKFLOW_DB_NAME: &str = "workflows.db";
 /// installed journal holds any of them, and a journal at one of them is refused by name rather than
 /// read as if its rows said what this build expects. Version 5 stores each node's output as its
 /// kind's typed output rather than as text. Version 6 keeps the admissions the host-wide and
-/// per-grant rates count, a run that waits for a slot as pending, and the ceilings a chain
-/// inherited.
+/// per-grant rates count, a run that waits for a slot as pending, the ceilings a chain inherited,
+/// and the descendants an exhausted chain refused, which an authorised rearm continues it from.
 pub const WORKFLOW_SCHEMA_VERSION: u32 = 6;
 
 /// The columns [`Journal::parse_run_record`] expects, in order.
@@ -330,6 +330,22 @@ pub struct NodeSettlement<'a> {
     pub produced: Option<&'a str>,
     /// When the outcome arrived.
     pub at_ms: u64,
+}
+
+/// A descendant a chain's exhausted budget refused, kept for the authorised rearm that continues
+/// the chain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Continuation {
+    /// The workflow the refused trigger would have run.
+    pub workflow_id: WorkflowId,
+    /// Its revision.
+    pub revision: u64,
+    /// The trigger's event identifier, which deduplicates the run the continuation becomes.
+    pub event_id: String,
+    /// The run whose node produced the trigger.
+    pub parent_run_id: WorkflowRunId,
+    /// That node.
+    pub parent_node_id: String,
 }
 
 /// A limit one run exceeded, and what the host did about the action it was waiting for.
@@ -1192,6 +1208,26 @@ impl<'c> Journal<'c> {
             if budget.attention_emitted && !was_emitted {
                 self.record_exhaustion(causal_ctx.root_id, &err.to_string(), now_ms)?;
             }
+            // A descendant the exhausted chain refused is where an authorised rearm continues the
+            // chain from, so it is kept with the refusal, under the generation that refused it.
+            if let Some(parent) = &causal_ctx.parent {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO chain_continuations (
+                        causal_root_id, generation, workflow_id, revision, event_id,
+                        parent_run_id, parent_node_id, refused_at_ms
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        causal_ctx.root_id.to_string(),
+                        stored(causal_ctx.generation),
+                        wf_id_str,
+                        rev,
+                        event_id,
+                        parent.run_id.to_string(),
+                        parent.node_id,
+                        stored(now_ms),
+                    ],
+                )?;
+            }
             return Err(err);
         }
         self.save_budget(&budget)?;
@@ -1618,6 +1654,25 @@ impl<'c> Journal<'c> {
         Ok(true)
     }
 
+    /// Reads the descendants one generation of a chain's budget refused, oldest first.
+    fn continuations(&self, root_id: CausalRootId, generation: u64) -> Result<Vec<Continuation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT workflow_id, revision, event_id, parent_run_id, parent_node_id
+             FROM chain_continuations WHERE causal_root_id = ?1 AND generation = ?2
+             ORDER BY refused_at_ms, rowid",
+        )?;
+        let rows = stmt.query_map(params![root_id.to_string(), stored(generation)], |row| {
+            Ok(Continuation {
+                workflow_id: WorkflowId::new(parse_stored_uuid(&row.get::<_, String>(0)?)?),
+                revision: u64::try_from(row.get::<_, i64>(1)?).unwrap_or_default(),
+                event_id: row.get(2)?,
+                parent_run_id: WorkflowRunId::new(parse_stored_uuid(&row.get::<_, String>(3)?)?),
+                parent_node_id: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Reads where every node of one run stands.
     fn node_statuses(&self, run_id: WorkflowRunId) -> Result<HashMap<String, NodeStatus>> {
         let mut stmt = self
@@ -2001,6 +2056,20 @@ impl WorkflowStore {
             CREATE INDEX IF NOT EXISTS run_admissions_by_time
                 ON run_admissions (admitted_at_ms);
 
+            -- One row per descendant a chain's exhausted budget refused: where an authorised rearm
+            -- continues the chain from, each once, in the generation the rearm establishes.
+            CREATE TABLE IF NOT EXISTS chain_continuations (
+                causal_root_id TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                workflow_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                event_id TEXT NOT NULL,
+                parent_run_id TEXT NOT NULL,
+                parent_node_id TEXT NOT NULL,
+                refused_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (workflow_id, revision, event_id)
+            );
+
             -- One row per action, written in the transaction that performed it. Exactly one of
             -- the three outcome columns is set: there is no row for an action still under way.
             CREATE TABLE IF NOT EXISTS action_records (
@@ -2316,19 +2385,45 @@ impl WorkflowStore {
         })
     }
 
-    /// Rearms the budget under an authorised administrative request.
+    /// Rearms a chain's budget under an authorised administrative request, and continues the chain
+    /// from where its exhausted budget stopped it, in one transaction.
+    ///
+    /// The budget moves to a new generation with fresh counters. Every descendant the budget of
+    /// the generation it leaves refused is handed to `continue_with` once, with the new
+    /// generation, and is gone from the journal whatever `continue_with` makes of it: a
+    /// continuation is single use. A continuation from any earlier generation is discarded
+    /// unread. What `continue_with` writes commits with the rearm, and an error from it undoes
+    /// both.
     ///
     /// # Errors
     ///
-    /// Returns [`AutomationError::InvalidArgument`] for a root this journal holds no budget for.
-    pub fn rearm_budget(&self, root_id: CausalRootId, now_ms: u64) -> Result<CausalBudget> {
+    /// Returns [`AutomationError::InvalidArgument`] for a root this journal holds no budget for,
+    /// a storage error, and whatever `continue_with` returns.
+    pub fn rearm_budget<T>(
+        &self,
+        root_id: CausalRootId,
+        now_ms: u64,
+        mut continue_with: impl FnMut(&Journal<'_>, &Continuation, u64) -> Result<Option<T>>,
+    ) -> Result<(CausalBudget, Vec<T>)> {
         self.write(|journal| {
             let mut budget = journal.load_budget(root_id)?.ok_or_else(|| {
                 AutomationError::InvalidArgument("causal root not found".to_owned())
             })?;
+            let left = budget.generation;
             budget.rearm(now_ms);
             journal.save_budget(&budget)?;
-            Ok(budget)
+            let continuations = journal.continuations(root_id, left)?;
+            journal.conn.execute(
+                "DELETE FROM chain_continuations WHERE causal_root_id = ?1",
+                params![root_id.to_string()],
+            )?;
+            let mut continued = Vec::new();
+            for continuation in &continuations {
+                if let Some(value) = continue_with(journal, continuation, budget.generation)? {
+                    continued.push(value);
+                }
+            }
+            Ok((budget, continued))
         })
     }
 

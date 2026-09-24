@@ -47,6 +47,7 @@ use kr_protocol::ids::{
     CausalRootId, EnvironmentId, GrantId, PluginId, WorkflowId, WorkflowRunId, WorkspaceId,
 };
 use kr_protocol::method::Method;
+use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Nullable, TimestampMs, U64, Uuid};
 
 use crate::Host;
@@ -1101,29 +1102,92 @@ impl AutomationService {
         })
     }
 
-    /// Authorised rearm establishing a new budget for an exhausted causal chain.
+    /// Rearms a causal chain under an authorised administrative request, and continues it.
     ///
-    /// Requires explicit management right (`ActionRight::AutomationManage`). A replayed or late
-    /// event reaches the dispatcher without this right and cannot rearm anything; a descendant of
-    /// a run from the old generation is refused afterwards by the generation check.
+    /// The request is made under `grant_id`, which this host's grant store must hold as live, for
+    /// this environment, with the right to manage automation; a replayed or late event carries no
+    /// grant and cannot rearm anything. In one transaction, the chain's budget moves to a new
+    /// generation with fresh counters, and every descendant the exhausted budget refused is
+    /// admitted once, as a run of the same chain in the new generation, under its own workflow's
+    /// grant and limits: the chain goes on from where it was stopped. A continuation whose
+    /// workflow no longer runs, or whose admission is refused, is spent all the same. A descendant
+    /// of a run from the old generation that arrives afterwards is refused, and so is a replay of
+    /// one the rearm continued. Returns the continued runs that start now; one that waits for a
+    /// slot starts when one frees.
     ///
     /// # Errors
     ///
-    /// Returns [`AutomationError::PermissionDenied`] without the management right.
+    /// Returns [`AutomationError::PermissionDenied`] for a grant that does not carry the right or
+    /// does not cover this environment, the grant store's refusal for a grant it does not hold as
+    /// live, [`AutomationError::InvalidArgument`] for a chain this journal holds no budget for, and
+    /// a storage error.
     pub fn rearm(
         &self,
         causal_root_id: CausalRootId,
-        has_manage_right: bool,
+        grant_id: GrantId,
         now_ms: u64,
-    ) -> Result<()> {
-        if !has_manage_right {
-            return Err(AutomationError::PermissionDenied(
-                "rearm requires automation.manage right".to_owned(),
-            ));
+    ) -> Result<Vec<StartedRun>> {
+        let grant = self.authority.grant(grant_id, now_ms)?;
+        if !grant.permits(ActionRight::AutomationManage)
+            || !grant.environment_selector.admits(self.environment_id)
+        {
+            return Err(AutomationError::PermissionDenied(format!(
+                "grant {grant_id} does not carry automation.manage in environment {}, which a \
+                 rearm needs",
+                self.environment_id
+            )));
         }
+        let (_budget, continued) = self.store.rearm_budget(
+            causal_root_id,
+            now_ms,
+            |journal, continuation, generation| {
+                self.continue_chain(journal, continuation, generation, now_ms)
+            },
+        )?;
+        Ok(continued)
+    }
 
-        self.store.rearm_budget(causal_root_id, now_ms)?;
-        Ok(())
+    /// Admits one continuation of a rearmed chain, inside the rearm's transaction.
+    fn continue_chain(
+        &self,
+        journal: &Journal<'_>,
+        continuation: &crate::store::Continuation,
+        generation: u64,
+        now_ms: u64,
+    ) -> Result<Option<StartedRun>> {
+        let Some(installed) =
+            journal.definition(continuation.workflow_id, continuation.revision)?
+        else {
+            return Ok(None);
+        };
+        if !installed.enabled || installed.paused {
+            return Ok(None);
+        }
+        let Some(parent) = journal.run_record(continuation.parent_run_id)? else {
+            return Ok(None);
+        };
+        let admitted = descendant_context(
+            journal,
+            &installed.definition,
+            &parent,
+            &continuation.parent_node_id,
+        )
+        .map(|causal| causal.in_generation(generation))
+        .and_then(|causal| {
+            self.admit(
+                journal,
+                &installed.definition,
+                &continuation.event_id,
+                causal,
+                now_ms,
+            )
+        });
+        match admitted {
+            Ok(Admitted::Started(run)) => Ok(Some(*run)),
+            Ok(Admitted::Queued(_)) => Ok(None),
+            Err(error) if error.is_decided() => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Delivers the attention items the journal owes to an attention state.

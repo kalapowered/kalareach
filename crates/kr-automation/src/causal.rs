@@ -73,6 +73,15 @@ impl CausalContext {
         }
     }
 
+    /// The same position in the chain, in the budget generation an authorised rearm established.
+    ///
+    /// Only the rearm that continues a chain from a descendant its exhausted budget refused asks
+    /// for this; every other descendant keeps its parent's generation.
+    #[must_use]
+    pub(crate) fn in_generation(self, generation: u64) -> Self {
+        Self { generation, ..self }
+    }
+
     /// Rebuilds the context a run was admitted under, from the run's own record.
     #[must_use]
     pub fn of_run(run: &StoredRunRecord) -> Self {
