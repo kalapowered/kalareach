@@ -3930,7 +3930,10 @@ on while the store takes the write, and what that work changed is written by ano
 the fence comes down. A failure part way leaves the fence in place, and the next pass starts again.
 The gateway is then *recovering*, which admits no rich work; what ends that is
 reconciling the pending identifiers with **every** upstream that still had one, and rich work
-returns with the last of them, after the gap's final accounting is written.
+returns with the last of them, after the gap's final accounting is written. The reconciliations and
+that final accounting are written under the broker's lock, because they and the fence coming down
+are one decision, and they take the store's lock without waiting for it: a store another connection
+is writing refuses them at once, is not counted as failed, and leaves the finish to a later pass.
 
 A connection that stayed open through the whole gap has carried every frame of it in both
 directions, so what its upstream still holds is what the host holds for it, unresolved; the host

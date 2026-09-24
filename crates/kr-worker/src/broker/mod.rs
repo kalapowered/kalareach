@@ -2552,18 +2552,24 @@ impl Broker {
         // a recovery that failed carries a list about a moment that has passed, and applying it
         // first would cancel resources that are current before the refusal was reported.
         state.volatile.check_generation(generation)?;
-        let reconciliation = state.reconcile_in(scope, still_open, now)?;
-        // This upstream is reconciled. Rich work comes back when every one that owed a
-        // reconciliation has given it, and not before.
-        if state
-            .volatile
-            .reconciled(generation, scope.application_instance_id, scope.connection)?
-            > 0
-        {
-            return Ok((reconciliation, None));
-        }
-        let finished = state.finish_recovery(generation, now)?;
-        Ok((reconciliation, Some(finished)))
+        // The writes go under the lock, which is what makes the reconciliation and the finish one
+        // decision, and they take the store's lock without waiting for it: a store another
+        // connection is writing refuses them at once, and the upstream asks again.
+        state.promptly(|state| {
+            let reconciliation = state.reconcile_in(scope, still_open, now)?;
+            // This upstream is reconciled. Rich work comes back when every one that owed a
+            // reconciliation has given it, and not before.
+            if state.volatile.reconciled(
+                generation,
+                scope.application_instance_id,
+                scope.connection,
+            )? > 0
+            {
+                return Ok((reconciliation, None));
+            }
+            let finished = state.finish_recovery(generation, now)?;
+            Ok((reconciliation, Some(finished)))
+        })
     }
 
     /// Reconciles every upstream a recovery owes whose connection is still open, and finishes the
@@ -2583,59 +2589,43 @@ impl Broker {
     /// until that upstream is back and says what it still holds through
     /// [`Broker::reconcile_recovered`]. A restoration does not change that.
     ///
-    /// A store that fails again raises the fence, and the next call tries again once the journal
-    /// has recovered. Returns the transition back to normal operation when this finished the
-    /// recovery.
+    /// Its writes take the store's lock without waiting for it, so a store another connection is
+    /// writing leaves this pass with nothing done and the next one tries again. A store that fails
+    /// again raises the fence, and the next call tries again once the journal has recovered.
+    /// Returns the transition back to normal operation when this finished the recovery.
     pub fn reconcile_connected(&self, now: TimestampMs) -> Option<VolatileTransition> {
         let mut state = self.state();
         if state.volatile.mode() != kr_protocol::gateway::GatewayMode::Recovering {
             return None;
         }
-        let generation = state.volatile.generation();
-        for (application_instance_id, connection) in state.volatile.owed() {
-            if !state.continuous.contains(&connection)
-                || state.gateway.connection(connection).is_none()
-            {
-                continue;
-            }
-            let of_scope = |pending: &&Pending| {
-                pending.resource.application_instance_id == application_instance_id
-                    && pending.resource.request.connection == connection
-                    && !pending.resource.state.is_terminal()
-            };
-            let in_flight = state.arbitration.iter().filter(of_scope).any(|pending| {
-                matches!(
-                    pending.transmitter,
-                    Some(Transmitter::Native | Transmitter::Host | Transmitter::Rich(_))
-                )
-            });
-            if in_flight {
-                continue;
-            }
-            let still_open: Vec<DownstreamRequestId> = state
-                .arbitration
-                .iter()
-                .filter(of_scope)
-                .map(|pending| pending.resource.request.clone())
-                .collect();
-            let scope = ReconcileScope {
-                application_instance_id,
-                connection,
-            };
-            if state.reconcile_in(scope, &still_open, now).is_err()
-                || state
-                    .volatile
-                    .reconciled(generation, application_instance_id, connection)
-                    .is_err()
-            {
-                // The store failed again and the fence is back up; a later pass starts again.
-                return None;
-            }
-        }
-        if !state.volatile.owed().is_empty() {
-            return None;
-        }
-        state.finish_recovery(generation, now).ok()
+        state
+            .promptly(|state| Ok(state.reconcile_connected_in(now)))
+            .ok()
+            .flatten()
+    }
+
+    /// Announces, once, when the next recovery's write waits for the store's lock, for this
+    /// host's own tests.
+    ///
+    /// The recovery writes through its own connection, and this is how a test knows that
+    /// connection is waiting for the store, not merely about to write. It is compiled away in
+    /// every shipped build.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::InvalidArgument`] for a ledger held in memory, which has no
+    /// connection of the recovery's own, and [`BrokerError::StoreFault`] when the connection cannot
+    /// be changed.
+    #[cfg(feature = "testing")]
+    pub fn announce_when_a_recovery_waits_for_the_store(
+        &self,
+    ) -> Result<std::sync::mpsc::Receiver<()>> {
+        self.recorder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .ok_or_else(|| BrokerError::invalid("a ledger held in memory has no recorder"))?
+            .announce_the_next_wait()
     }
 
     /// Makes every later write to this broker's ledger fail, or lets writes through again.
@@ -3398,6 +3388,72 @@ impl BrokerState {
             |fault| fault.detail.clone(),
         );
         self.fence(&reason, now);
+    }
+
+    /// Reconciles every owed upstream whose connection stayed open, and finishes the recovery when
+    /// none is left. See [`Broker::reconcile_connected`].
+    fn reconcile_connected_in(&mut self, now: TimestampMs) -> Option<VolatileTransition> {
+        let generation = self.volatile.generation();
+        for (application_instance_id, connection) in self.volatile.owed() {
+            if !self.continuous.contains(&connection)
+                || self.gateway.connection(connection).is_none()
+            {
+                continue;
+            }
+            let of_scope = |pending: &&Pending| {
+                pending.resource.application_instance_id == application_instance_id
+                    && pending.resource.request.connection == connection
+                    && !pending.resource.state.is_terminal()
+            };
+            let in_flight = self.arbitration.iter().filter(of_scope).any(|pending| {
+                matches!(
+                    pending.transmitter,
+                    Some(Transmitter::Native | Transmitter::Host | Transmitter::Rich(_))
+                )
+            });
+            if in_flight {
+                continue;
+            }
+            let still_open: Vec<DownstreamRequestId> = self
+                .arbitration
+                .iter()
+                .filter(of_scope)
+                .map(|pending| pending.resource.request.clone())
+                .collect();
+            let scope = ReconcileScope {
+                application_instance_id,
+                connection,
+            };
+            if self.reconcile_in(scope, &still_open, now).is_err()
+                || self
+                    .volatile
+                    .reconciled(generation, application_instance_id, connection)
+                    .is_err()
+            {
+                // The store failed again, which raised the fence, or another connection held it;
+                // a later pass starts again.
+                return None;
+            }
+        }
+        if !self.volatile.owed().is_empty() {
+            return None;
+        }
+        self.finish_recovery(generation, now).ok()
+    }
+
+    /// Runs writes made under this lock during a recovery, taking the store's lock without waiting.
+    ///
+    /// A recovery that is finishing takes this lock for its reconciliation and its final
+    /// accounting, because they are one decision with leaving the fence. What it must not do is
+    /// hold native arbitration behind another connection's write: a store another connection is
+    /// writing refuses these writes at once, and the recovery tries again on a later pass.
+    fn promptly<T>(&mut self, work: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.ledger.set_prompt(true)?;
+        let done = work(self);
+        let restored = self.ledger.set_prompt(false);
+        let done = done?;
+        restored?;
+        Ok(done)
     }
 
     /// Refuses a recovery that cannot begin now.

@@ -329,7 +329,7 @@ fn state_from(text: &str) -> Result<PendingState> {
 
 /// Writes one transition event inside the transaction that commits the transition.
 fn write_event(
-    health: &JournalHealth,
+    faults: &Faults,
     transaction: &rusqlite::Transaction<'_>,
     event: &TransitionEvent,
 ) -> Result<()> {
@@ -363,13 +363,13 @@ fn write_event(
                 i64::try_from(event.recorded_at.get()).unwrap_or(i64::MAX),
             ],
         )
-        .map_err(|error| store_fault(health, error))?;
+        .map_err(|error| faults.of(error))?;
     Ok(())
 }
 
 /// Writes one pending resource's row, on a connection or inside a transaction.
 fn put_pending_in(
-    health: &JournalHealth,
+    faults: &Faults,
     connection: &Connection,
     resource: &PendingResource,
     decoder: Option<BrokerBindingId>,
@@ -401,7 +401,7 @@ fn put_pending_in(
                 i64::try_from(resource.recorded_at.get()).unwrap_or(i64::MAX),
             ],
         )
-        .map_err(|error| store_fault(health, error))?;
+        .map_err(|error| faults.of(error))?;
     Ok(())
 }
 
@@ -463,18 +463,65 @@ fn outcome_from(text: &str) -> Result<ClientRequestOutcome> {
 #[derive(Debug)]
 pub struct Ledger {
     connection: Connection,
-    health: std::sync::Arc<JournalHealth>,
+    faults: Faults,
 }
 
-/// Turns one failure of the store into the fault it is, and reports it to the journal condition.
-///
-/// The condition classifies the store's own result code, so a full store and a failing one are
-/// told apart by what the store said rather than by its message.
-fn store_fault(health: &JournalHealth, error: rusqlite::Error) -> BrokerError {
-    health.observe(&error, kr_ipc::now_ms().get());
-    BrokerError::StoreFault {
-        detail: error.to_string(),
+/// Where a failure of one ledger's store is reported, and how a busy store is read.
+#[derive(Clone, Debug)]
+struct Faults {
+    health: std::sync::Arc<JournalHealth>,
+    /// Set while this connection takes the store's lock without waiting for it.
+    prompt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Faults {
+    /// Turns one failure of the store into what it is.
+    ///
+    /// A store another connection is writing, met by a write that does not wait, is busy and not
+    /// failing: nothing is reported, and the write is simply not made now. Everything else is a
+    /// fault of the store, reported to the journal condition where it happened, which classifies
+    /// the store's own result code, so a full store and a failing one are told apart by what the
+    /// store said rather than by its message.
+    fn of(&self, error: rusqlite::Error) -> BrokerError {
+        let busy = matches!(
+            &error,
+            rusqlite::Error::SqliteFailure(failure, _)
+                if matches!(
+                    failure.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+        );
+        if busy && self.prompt.load(std::sync::atomic::Ordering::Acquire) {
+            return BrokerError::LedgerUnavailable {
+                detail: format!(
+                    "another writer holds the store, and this write does not wait: {error}"
+                ),
+            };
+        }
+        self.health.observe(&error, kr_ipc::now_ms().get());
+        BrokerError::StoreFault {
+            detail: error.to_string(),
+        }
     }
+}
+
+/// Where the next wait for the store's lock is announced, for this host's own tests.
+#[cfg(feature = "testing")]
+static ANNOUNCED_WAIT: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<()>>> =
+    std::sync::Mutex::new(None);
+
+/// Waits for the store's lock as patiently as the busy timeout, and announces the first wait.
+#[cfg(feature = "testing")]
+fn announce_the_wait(attempt: i32) -> bool {
+    let waiting = ANNOUNCED_WAIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(waiting) = waiting {
+        let _ = waiting.send(());
+    }
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    attempt < 1_000
 }
 
 impl Ledger {
@@ -488,19 +535,73 @@ impl Ledger {
         path: Option<&std::path::Path>,
         health: std::sync::Arc<JournalHealth>,
     ) -> Result<Self> {
+        let faults = Faults {
+            health,
+            prompt: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
         let connection = match path {
             Some(path) => Connection::open(path),
             None => Connection::open_in_memory(),
         }
-        .map_err(|error| store_fault(&health, error))?;
-        let ledger = Self { connection, health };
+        .map_err(|error| faults.of(error))?;
+        let ledger = Self { connection, faults };
         ledger.prepare()?;
         Ok(ledger)
     }
 
-    /// Turns one failure of this ledger's store into the fault it is, reported where it happened.
+    /// Turns one failure of this ledger's store into what it is, reported where it happened.
     fn fault(&self, error: rusqlite::Error) -> BrokerError {
-        store_fault(&self.health, error)
+        self.faults.of(error)
+    }
+
+    /// Makes this connection take the store's lock without waiting for it, or wait again.
+    ///
+    /// While it does, a write that finds another connection holding the store answers at once
+    /// with [`BrokerError::LedgerUnavailable`] rather than after the busy timeout, and that is not
+    /// a fault of the store. It is for writes made under the broker's lock during a recovery,
+    /// which must never hold native arbitration behind somebody else's write.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::StoreFault`] when the connection cannot be changed.
+    pub fn set_prompt(&self, prompt: bool) -> Result<()> {
+        if prompt {
+            self.connection
+                .busy_timeout(std::time::Duration::ZERO)
+                .map_err(|error| self.fault(error))?;
+            self.faults
+                .prompt
+                .store(true, std::sync::atomic::Ordering::Release);
+        } else {
+            self.faults
+                .prompt
+                .store(false, std::sync::atomic::Ordering::Release);
+            self.connection
+                .busy_timeout(BUSY_TIMEOUT)
+                .map_err(|error| self.fault(error))?;
+        }
+        Ok(())
+    }
+
+    /// Announces, once, when this connection next waits for the store's lock, for this host's own
+    /// tests.
+    ///
+    /// The wait itself is as patient as the busy timeout. It is compiled away in every shipped
+    /// build.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::StoreFault`] when the connection cannot be changed.
+    #[cfg(feature = "testing")]
+    pub fn announce_the_next_wait(&self) -> Result<std::sync::mpsc::Receiver<()>> {
+        let (waiting, announced) = std::sync::mpsc::sync_channel(1);
+        *ANNOUNCED_WAIT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(waiting);
+        self.connection
+            .busy_handler(Some(announce_the_wait))
+            .map_err(|error| self.fault(error))?;
+        Ok(announced)
     }
 
     /// Makes every later write to this ledger fail, or lets writes through again.
@@ -848,8 +949,8 @@ impl Ledger {
             .connection
             .unchecked_transaction()
             .map_err(|error| self.fault(error))?;
-        put_pending_in(&self.health, &transaction, resource, None, false)?;
-        write_event(&self.health, &transaction, event)?;
+        put_pending_in(&self.faults, &transaction, resource, None, false)?;
+        write_event(&self.faults, &transaction, event)?;
         transaction.commit().map_err(|error| self.fault(error))
     }
 
@@ -876,11 +977,11 @@ impl Ledger {
         now: TimestampMs,
         event: &TransitionEvent,
     ) -> Result<bool> {
-        let health = std::sync::Arc::clone(&self.health);
+        let faults = self.faults.clone();
         let transaction = self
             .connection
             .transaction()
-            .map_err(|error| store_fault(&health, error))?;
+            .map_err(|error| faults.of(error))?;
         let consumed = transaction
             .execute(
                 "INSERT OR IGNORE INTO broker_consumed_sources
@@ -896,13 +997,11 @@ impl Ledger {
                     i64::try_from(now.get()).unwrap_or(i64::MAX),
                 ],
             )
-            .map_err(|error| store_fault(&health, error))?;
+            .map_err(|error| faults.of(error))?;
         if consumed != 1 {
             // Nothing was written, and the rollback makes that true of the whole transaction
             // rather than only of this statement.
-            transaction
-                .rollback()
-                .map_err(|error| store_fault(&health, error))?;
+            transaction.rollback().map_err(|error| faults.of(error))?;
             return Ok(false);
         }
         transaction
@@ -915,7 +1014,7 @@ impl Ledger {
                     i64::try_from(entry.decoded_at.get()).unwrap_or(i64::MAX),
                 ],
             )
-            .map_err(|error| store_fault(&health, error))?;
+            .map_err(|error| faults.of(error))?;
         let updated = transaction
             .execute(
                 "UPDATE broker_pending
@@ -927,14 +1026,12 @@ impl Ledger {
                     binding_id.get().as_bytes().as_slice(),
                 ],
             )
-            .map_err(|error| store_fault(&health, error))?;
+            .map_err(|error| faults.of(error))?;
         if updated != 1 {
             // The request this interpretation is about is not one this ledger holds as pending.
             // Consuming its source and recording a decoder against it would leave evidence about
             // nothing, so the whole transaction goes back.
-            transaction
-                .rollback()
-                .map_err(|error| store_fault(&health, error))?;
+            transaction.rollback().map_err(|error| faults.of(error))?;
             return Err(BrokerError::PreconditionFailed {
                 detail: format!(
                     "pending resource {} is not a pending row this ledger holds",
@@ -942,10 +1039,8 @@ impl Ledger {
                 ),
             });
         }
-        write_event(&self.health, &transaction, event)?;
-        transaction
-            .commit()
-            .map_err(|error| store_fault(&health, error))?;
+        write_event(&self.faults, &transaction, event)?;
+        transaction.commit().map_err(|error| faults.of(error))?;
         Ok(true)
     }
 
@@ -967,7 +1062,7 @@ impl Ledger {
         dispatched: bool,
     ) -> Result<()> {
         put_pending_in(
-            &self.health,
+            &self.faults,
             &self.connection,
             resource,
             decoder,
@@ -1037,7 +1132,7 @@ impl Ledger {
                 held.unwrap_or_else(|| "absent".to_owned())
             )));
         }
-        write_event(&self.health, &transaction, event)?;
+        write_event(&self.faults, &transaction, event)?;
         transaction.commit().map_err(|error| self.fault(error))
     }
 
@@ -1252,7 +1347,7 @@ impl Ledger {
                 resource.resource_id, resource.state
             )));
         }
-        write_event(&self.health, &transaction, event)?;
+        write_event(&self.faults, &transaction, event)?;
         transaction.commit().map_err(|error| self.fault(error))
     }
 
@@ -1276,11 +1371,11 @@ impl Ledger {
         gap: &EvidenceGap,
         row: Option<i64>,
     ) -> Result<i64> {
-        let health = std::sync::Arc::clone(&self.health);
+        let faults = self.faults.clone();
         let transaction = self
             .connection
             .transaction()
-            .map_err(|error| store_fault(&health, error))?;
+            .map_err(|error| faults.of(error))?;
         for (resource, decoder, dispatched) in records {
             transaction
                 .execute(
@@ -1307,7 +1402,7 @@ impl Ledger {
                         i64::try_from(resource.recorded_at.get()).unwrap_or(i64::MAX),
                     ],
                 )
-                .map_err(|error| store_fault(&health, error))?;
+                .map_err(|error| faults.of(error))?;
         }
         let sequence = match row {
             Some(row) => {
@@ -1322,7 +1417,7 @@ impl Ledger {
                             encode(gap)?,
                         ],
                     )
-                    .map_err(|error| store_fault(&health, error))?;
+                    .map_err(|error| faults.of(error))?;
                 row
             }
             None => {
@@ -1338,13 +1433,11 @@ impl Ledger {
                             encode(gap)?,
                         ],
                     )
-                    .map_err(|error| store_fault(&health, error))?;
+                    .map_err(|error| faults.of(error))?;
                 transaction.last_insert_rowid()
             }
         };
-        transaction
-            .commit()
-            .map_err(|error| store_fault(&health, error))?;
+        transaction.commit().map_err(|error| faults.of(error))?;
         Ok(sequence)
     }
 

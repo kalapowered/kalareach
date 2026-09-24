@@ -2144,9 +2144,9 @@ async fn kr_req_11_37_a_fault_the_broker_never_saw_is_still_its_gap_and_its_reco
 ///
 /// The recovery is held twice over. First at its own pause, after it has read the gap and let the
 /// broker's lock go, and then by the store itself: another connection holds the database's write
-/// lock, so the recovery's write cannot finish until it lets go. Native work is carried at both
-/// points. The recovery then finds the gap changed, writes it again, and leaves the fence only
-/// with that work committed.
+/// lock, and the recovery's own connection announces when it has begun waiting for that lock.
+/// Native work is carried at both points, the second only once that wait has begun. The recovery
+/// then finds the gap changed, writes it again, and leaves the fence only with that work committed.
 #[tokio::test]
 async fn kr_req_11_35_native_work_goes_on_while_a_recovery_is_held_at_its_write() {
     let mut store = common::SharedStore::open();
@@ -2160,6 +2160,9 @@ async fn kr_req_11_35_native_work_goes_on_while_a_recovery_is_held_at_its_write(
     holder
         .execute_batch("BEGIN IMMEDIATE")
         .expect("the write lock is taken");
+    let waiting = broker
+        .announce_when_a_recovery_waits_for_the_store()
+        .expect("the recovery has a connection of its own");
     let (arrived, release) = broker.pause_before_recovery_write();
     let recovering = {
         let broker = std::sync::Arc::clone(&broker);
@@ -2179,6 +2182,9 @@ async fn kr_req_11_35_native_work_goes_on_while_a_recovery_is_held_at_its_write(
         .expect("native work goes on while the recovery waits to write");
     let arrived_meanwhile = arrived_meanwhile.expect("it expects a response");
     release.send(()).expect("the recovery goes on");
+    waiting
+        .recv_timeout(common::LIVENESS_DEADLINE)
+        .expect("the recovery's write waits for the store");
 
     // In its write, which the store holds up: the upstream withdraws its first request.
     broker
@@ -2311,4 +2317,56 @@ async fn kr_req_11_37_nothing_that_needs_its_record_is_taken_while_the_fence_is_
             TimestampMs::new(6),
         )
         .expect("and an adapter's checkpoint is written");
+}
+
+/// KR-REQ-11.35 and KR-REQ-11.37: a recovery finishes without waiting for a store another
+/// connection is writing, and without calling that store failed.
+///
+/// Finishing takes the broker's lock, because the finish and the fence coming down are one
+/// decision. Another connection holds the database's write lock, so the finish cannot be written:
+/// it is refused at once rather than after the busy timeout, nothing is reported to the journal
+/// condition, and the broker stays recovering. Once the store is free, the next pass finishes.
+#[tokio::test]
+async fn kr_req_11_37_a_recovery_finishes_without_waiting_for_a_busy_store() {
+    let mut store = common::SharedStore::open();
+    let (broker, _upstream) = gateway_sharing(&store);
+    approval(&broker, "1", 2).expect("an interpretation before the fault");
+    store.fault_acceptance();
+    store.recover_journal(3);
+    broker
+        .recover(TimestampMs::new(4))
+        .expect("the gap is committed");
+    assert_eq!(broker.mode(), GatewayMode::Recovering);
+
+    let holder = rusqlite::Connection::open(&store.path).expect("the store opens");
+    holder
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("the write lock is taken");
+    assert!(
+        broker.reconcile_connected(TimestampMs::new(5)).is_none(),
+        "the finish is not written while another connection holds the store"
+    );
+    assert!(
+        store.health().is_healthy(),
+        "a busy store is not a failed one: had the finish waited out the busy timeout, the store \
+         would have been reported failed"
+    );
+    assert_eq!(
+        broker.mode(),
+        GatewayMode::Recovering,
+        "and the broker is still recovering"
+    );
+    holder
+        .execute_batch("ROLLBACK")
+        .expect("the write lock is let go");
+
+    let finished = broker
+        .reconcile_connected(TimestampMs::new(6))
+        .expect("the next pass finishes");
+    assert_eq!(finished.to, GatewayMode::Normal);
+    assert_eq!(
+        broker.recorded_gaps().expect("the ledger reads").len(),
+        1,
+        "with the gap's final accounting written"
+    );
 }
