@@ -150,11 +150,11 @@ pub fn boot_elapsed_ms() -> u64 {
     windows::interrupt_time() / 10_000
 }
 
-/// The one place in this crate that calls the operating system without a safe interface.
+/// One of the three places in this crate that call the operating system without a safe interface.
 ///
-/// The workspace forbids unsafe code; this crate denies it and relaxes the rule here alone, because
-/// no safe interface exposes a boot-scoped continuous clock on this platform with the resolution a
-/// five-second deadline needs.
+/// The workspace forbids unsafe code; this crate denies it and relaxes the rule for this module,
+/// because no safe interface exposes a boot-scoped continuous clock on this platform with the
+/// resolution a five-second deadline needs.
 #[cfg(windows)]
 mod windows {
     #![expect(

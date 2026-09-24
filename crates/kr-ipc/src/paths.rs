@@ -672,7 +672,7 @@ fn check_owner_only(path: &Path, _metadata: &std::fs::Metadata) -> Result<()> {
 /// back from the handle it just opened and refuses one that has been widened, because a directory
 /// that already existed is a directory this host did not create.
 ///
-/// This is one of the two places in this crate that leave safe Rust. The list comes from
+/// This is one of the three places in this crate that leave safe Rust. The list comes from
 /// `advapi32` and is applied by `kernel32`, and reading one back is four more calls into the same
 /// library.
 #[cfg(windows)]
