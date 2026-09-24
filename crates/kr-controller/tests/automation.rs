@@ -2256,10 +2256,11 @@ fn issue_grant(
 /// clock and nothing the refusal left behind.
 ///
 /// What it does not establish: it rests on the host not stalling for an hour. A stall or a
-/// suspension of an hour between setting the bound and the decisions taken under it would run the
-/// hour-long bound out, or carry UTC past the synchronisation, and fail the test; no ordinary load
-/// comes near that, where the 200 ms this test used to rely on did. A controller that took its
-/// clocks from the test would let it advance them by hand instead.
+/// suspension of an hour after the bound is set would run the hour-long bound out and fail a
+/// decision the test expects to be permitted. One of an hour and more between reading the wall
+/// clock and setting the bound would carry UTC past the synchronisation, and then UTC, not the
+/// continuous clock, could be what refuses the narrowed bound while every other step still passes.
+/// A controller that took its clocks from the test would let it advance them by hand instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_workflow_grant_is_held_to_the_offline_bound_on_the_continuous_clock() {
     use kr_automation::{AuthoritySource, AutomationError};
