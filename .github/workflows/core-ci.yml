@@ -840,18 +840,42 @@ jobs:
           echo "CARGO_BUILD_JOBS=$(sysctl -n hw.logicalcpu)" >> "$GITHUB_ENV"
 
       # The host runs the first Git on PATH, and on this runner that is Homebrew's. These steps run
-      # the Git of Apple's command-line developer tools instead, the Git of a Mac with nothing else
-      # installed. The entry put on PATH is a symbolic link, which the host resolves to the Git it
-      # names; that Git and the helper directory it reports have no symbolic link in their paths.
-      - name: Put the developer tools' Git first
+      # Apple's own Git instead, the newest of those in the Xcodes this runner has: the Git of a Mac
+      # with Xcode. It goes first on PATH as a two-line script that runs it by its own path, so the
+      # Git that runs finds its helper directory and templates where Xcode put them, and the host,
+      # which asks the copy of Git in that helper directory whether it is the same program, runs
+      # that copy itself.
+      - name: Put Apple's Git first
         timeout-minutes: 2
         run: |
-          git_directory="$RUNNER_TEMP/developer-tools-git"
-          mkdir -p "$git_directory"
-          ln -s /Library/Developer/CommandLineTools/usr/bin/git "$git_directory/git"
-          echo "$git_directory" >> "$GITHUB_PATH"
-          "$git_directory/git" --version
-          "$git_directory/git" --exec-path
+          set -euo pipefail
+          newest=""
+          newest_version=""
+          for developer in /Applications/Xcode_*.app/Contents/Developer; do
+            application="${developer%/Contents/Developer}"
+            # The image gives each Xcode more than one name; the others are links to the same one.
+            if [ -L "$application" ] || [ ! -x "$developer/usr/bin/git" ]; then
+              continue
+            fi
+            version="$("$developer/usr/bin/git" --version | awk '{ print $3 }')"
+            later="$(printf '%s\n%s\n' "${newest_version:-0}" "$version" | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1)"
+            if [ -z "$newest" ] || { [ "$later" = "$version" ] && [ "$version" != "$newest_version" ]; }; then
+              newest="$developer/usr/bin/git"
+              newest_version="$version"
+            fi
+          done
+          if [ -z "$newest" ]; then
+            echo "no Xcode on this runner has a Git in it" >&2
+            exit 1
+          fi
+          directory="$RUNNER_TEMP/apple-git"
+          mkdir -p "$directory"
+          printf '%s\n' '#!/bin/sh' "exec \"$newest\" \"\$@\"" > "$directory/git"
+          chmod +x "$directory/git"
+          echo "$directory" >> "$GITHUB_PATH"
+          cat "$directory/git"
+          "$directory/git" --version
+          "$directory/git" --exec-path
 
       - name: Install the pinned toolchain
         timeout-minutes: 5
@@ -972,7 +996,8 @@ jobs:
       #   KR_SHELL_PACKAGES names one, and this job builds none. The shell-packages job builds the
       #   packages and drives them through the contract and qualification suites; these two cases
       #   run where KR_SHELL_PACKAGES names a built package.
-      # - The cases that need another filesystem, which the step after this one runs where one is.
+      # - The cases that need another filesystem, and the two timed cases, which the two steps after
+      #   this one run.
       - name: Test
         if: ${{ !cancelled() }}
         timeout-minutes: 70
@@ -993,6 +1018,8 @@ jobs:
           --skip bind_mount_and_cross_device_grafts_are_refused
           --skip recursive_removal_refuses_a_grafted_mount
           --skip a_removal_stops_before_a_disk_image_attached_inside_the_tree
+          --skip kr_req_12_04_an_admitted_operation_leaves_the_session_boundary_before_it_transmits
+          --skip kr_req_11_38_a_worker_is_told_when_the_queue_overflowed
 
       # The cases that put another filesystem in or beside a tree: a disk image attached inside a
       # location or a tree, and a repository whose own data is on another filesystem. Each one says
@@ -1047,6 +1074,32 @@ jobs:
             echo "a case above says it was not exercised" >&2
             exit 1
           fi
+          for case in "${cases[@]}"; do
+            if ! grep -q "^test $case \.\.\. ok\$" "$log"; then
+              echo "$case did not pass here" >&2
+              exit 1
+            fi
+          done
+
+      # Two cases whose verdicts are timings: two prompts that must overlap rather than queue behind
+      # one another, and a queue that must overflow before a slow component drains it. On this
+      # runner's three processors the rest of each suite, running beside it, takes the processor
+      # time the case measures, so the test step leaves them out by name and they run here one at a
+      # time, as the rust job runs its timed suites serially. A case that did not pass here by name
+      # fails the step.
+      - name: The timed cases, one at a time
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          cases=(
+            kr_req_12_04_an_admitted_operation_leaves_the_session_boundary_before_it_transmits
+            kr_req_11_38_a_worker_is_told_when_the_queue_overflowed
+          )
+          log="$RUNNER_TEMP/timed-cases.log"
+          cargo test --locked --workspace --exclude kr-sync-integration \
+            --test agent_service --test service -- \
+            --exact --test-threads=1 "${cases[@]}" 2>&1 | tee "$log"
           for case in "${cases[@]}"; do
             if ! grep -q "^test $case \.\.\. ok\$" "$log"; then
               echo "$case did not pass here" >&2
