@@ -4147,10 +4147,14 @@ impl Controller {
             let admission: Arc<dyn crate::catalogue::Admission> = Arc::new(
                 crate::catalogue::DaemonAdmission::new(Arc::clone(self), carried),
             );
-            // No owner confirmation reaches the catalogue here: this host's owners are its paired
-            // owner devices, and the catalogue verifies a confirmation under one enrolled signer.
-            // Its two confirmed methods are refused, rather than taken under whoever asked.
-            let confirmations: Option<&dyn crate::sharing::OwnerConfirmations> = None;
+            // The owner's own ceremony, checked by this host's pairing service against its owner
+            // devices. `None` is a host that is not on the network and so has no owner device, and
+            // the two confirmed methods are then refused rather than performed under the identity
+            // of whoever asked.
+            let pairing = self.network.get().map(|guard| Arc::clone(guard.pairing()));
+            let confirmations = pairing
+                .as_deref()
+                .map(|host| host as &dyn crate::sharing::OwnerConfirmations);
             return self
                 .catalogue
                 .write_frame(actor_id, mutation, method, confirmations, admission)

@@ -777,3 +777,48 @@ async fn a_resubmitted_catalogue_action_is_answered_from_its_own_record() {
     raw.close();
     host.stop().await;
 }
+
+/// KR-REQ-10.05: the catalogue's confirmed decisions are this host's owner's, confirmed on its owner
+/// devices and on nothing else. A proof of exactly this enrolment signed with a key that is not an
+/// owner device's is refused and trusts nothing; the owner device's own proof then trusts it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_catalogue_decision_is_confirmed_by_an_owner_device_and_by_nothing_else() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (_device, session) = net_support::paired_device(&host, &owner, CATALOGUE_RIGHTS).await;
+    let published = Published::create();
+    let environment_id = host.environment_id;
+
+    let stranger = DeviceKeys::generate().expect("keys that are no owner device's");
+    let refused = remote_mutation(
+        &session,
+        environment_id,
+        Method::CatalogueAdd,
+        &add_params(&host, &stranger, &published),
+    )
+    .await
+    .expect_err("a key that is no owner device's confirms nothing");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    let listed: wire::CatalogueListResult = typed(
+        &remote_read::<_, ParamsValue>(
+            &session,
+            Method::CatalogueList,
+            &wire::CatalogueListParams { environment_id },
+        )
+        .await
+        .expect("catalogue.list answers a device"),
+    );
+    assert!(listed.catalogues.is_empty(), "nothing was trusted");
+
+    let _: wire::CatalogueAddResult = typed(
+        &remote_mutation(
+            &session,
+            environment_id,
+            Method::CatalogueAdd,
+            &add_params(&host, &owner, &published),
+        )
+        .await
+        .expect("the owner device's own proof trusts it"),
+    );
+    host.stop().await;
+}

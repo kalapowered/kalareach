@@ -1112,6 +1112,14 @@ impl RemoteConnection {
                     admitted_revision: validated,
                     deadline: Some(accepted.deadline),
                 };
+                // The owner's own ceremony, checked by this host's pairing service against its owner
+                // devices; a host with none refuses the two confirmed methods rather than
+                // performing them under the identity of whoever asked.
+                let pairing = self
+                    .controller
+                    .network
+                    .get()
+                    .map(|guard| Arc::clone(guard.pairing()));
                 let controller = Arc::clone(&self.controller);
                 let admitting = Arc::clone(&self.controller);
                 let mutation = mutation.clone();
@@ -1123,11 +1131,9 @@ impl RemoteConnection {
                 // waits for its own lock, for the repository's and for downloads, and asks about
                 // the registration again where the change becomes durable.
                 let effect = tokio::spawn(async move {
-                    // No owner confirmation reaches the catalogue here: this host's owners are its
-                    // paired owner devices, and the catalogue verifies a confirmation under one
-                    // enrolled signer. Its two confirmed methods are refused, rather than taken
-                    // under whoever asked.
-                    let confirmations: Option<&dyn crate::sharing::OwnerConfirmations> = None;
+                    let confirmations = pairing
+                        .as_deref()
+                        .map(|host| host as &dyn crate::sharing::OwnerConfirmations);
                     let admission: Arc<dyn crate::catalogue::Admission> =
                         Arc::new(crate::catalogue::DaemonAdmission::new(admitting, carried));
                     controller

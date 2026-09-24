@@ -50,6 +50,7 @@ use super::invitations::{ActionSubject, InvitationRows, PairingAction, another_s
 use super::lifetimes::GrantLifetimes;
 use super::pairing::HostPairingClock;
 use crate::error::{ControllerError, Result};
+use crate::sharing::ConfirmedAction;
 
 /// Who is asking, as the host authenticated them.
 #[derive(Clone, Debug)]
@@ -448,13 +449,15 @@ impl OwnerAuthority {
         .map_err(refusal)
     }
 
-    /// Spends a presented proof for `effect`, once, immediately before the effect.
+    /// Spends a presented proof for `effect`, once, immediately before the effect, and returns the
+    /// evidence of it.
     ///
     /// Authority can change between the verification and the spend, so the signer is looked up
     /// among the owner devices again, the proof verified again and the challenge consumed; the
     /// consumption is then written to the acceptance record, whose transaction reads the signer's
     /// authority once more. A crash between the two wastes the confirmation and never leaves an
-    /// effect without its record.
+    /// effect without its record. The evidence carries the challenge's own boot and deadline, for
+    /// an effect that asks again at its commit whether the confirmation still covers it.
     ///
     /// # Errors
     ///
@@ -466,7 +469,7 @@ impl OwnerAuthority {
         expectation: &ConfirmationExpectation<'_>,
         proof: &OwnerConfirmationProof,
         effect: &str,
-    ) -> Result<()> {
+    ) -> Result<ConfirmedAction> {
         if !matches!(
             proof.channel,
             ConfirmationChannel::OwnerDevicePresence | ConfirmationChannel::PairedOwnerDevice
@@ -478,21 +481,22 @@ impl OwnerAuthority {
         let signer = self.owner_device_key(proof.signer_key_id)?;
         let mut state = self.state();
         answered_otherwise(&state, proof)?;
-        kr_pairing::confirm::accept_confirmation(
+        let confirmed = ConfirmedAction::verify(
+            expectation,
             &mut state.ledger,
             &self.clock,
             &proof.request,
             proof,
             &signer,
             HostEnrolment::Enrolled,
-            expectation,
         )
-        .map_err(refusal)?;
+        .map_err(|error| confirmation_required(&error.to_string()))?;
         state
             .entries
             .remove(proof.request.confirmation_id.get().as_bytes());
         drop(state);
-        self.rows.record_consumed(proof, effect, kr_ipc::now_ms())
+        self.rows.record_consumed(proof, effect, kr_ipc::now_ms())?;
+        Ok(confirmed)
     }
 
     /// Returns the authorisation key of the live owner device whose key `signer` identifies.

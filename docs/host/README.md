@@ -1411,12 +1411,14 @@ revoking authority must never turn into a weaker way to confirm.
 
 **Owner confirmations.** Six actions need a fresh confirmation bound to the exact action. A caller
 asks with `owner.confirmation.request`, naming a subject; the host fills in the action, the digest,
-the destination keys and the rights itself. The project service's location decisions are confirmed
-by the same owner devices: their challenges are issued in the same ledger and listed the same way,
-and the proof the caller presents with the decision is checked against the owner device that
-signed it, then spent into the same acceptance record. `owner.confirmation.pending` lists what an owner can
+the destination keys and the rights itself. `owner.confirmation.pending` lists what an owner can
 still answer, with the full grant and, for a device, its keys and verification value, to the local
-owner and to paired devices holding `host.manage`. `owner.confirmation.complete` verifies a proof
+owner and to paired devices holding `host.manage`. The project service's location decisions and the
+catalogue's two confirmed decisions, trusting a repository root and granting an executable
+capability, are confirmed by the same owner devices: their challenges are in the same ledger and
+listed the same way, and the proof the caller presents with the decision is checked against the
+owner device that signed it and against the answer an owner device already recorded, then spent
+into the same acceptance record. `owner.confirmation.complete` verifies a proof
 against an enrolled signer (a live paired device holding `host.manage`, on an owner-device channel)
 and records the answer, with the caller that completed it and the proof itself. A proof is accepted
 once: the same proof completed again under another action, while its challenge is outstanding, is

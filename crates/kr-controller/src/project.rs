@@ -166,6 +166,7 @@ impl OwnerAuthority for HostOwner {
                 proof,
                 "project.location",
             )
+            .map(|_| ())
             .map_err(|error| error.to_protocol_error())
     }
 }

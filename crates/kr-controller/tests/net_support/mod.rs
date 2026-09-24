@@ -239,6 +239,47 @@ impl Host {
         &self.controller
     }
 
+    /// Signs the owner's confirmation of one sensitive action against this host's own ledger.
+    ///
+    /// The challenge is the host's, issued here and consumed exactly once when the method presents
+    /// it, so nothing a suite writes down can stand in for the ceremony. The owner half is the
+    /// suite's for the same reason pairing's is: user presence is not something a daemon decides.
+    /// `owner` is the owner device the host was started with, whose ceremony it is.
+    #[must_use]
+    pub fn confirm(
+        &self,
+        owner: &DeviceKeys,
+        action: kr_protocol::pairing::SensitiveAction,
+        digest: kr_protocol::scalars::Digest256,
+    ) -> kr_protocol::pairing::OwnerConfirmationProof {
+        let request = self
+            .network
+            .pairing()
+            .owner()
+            .challenge(kr_controller::service::net::owner::Resolved {
+                action,
+                digest,
+                destination: None,
+                rights: CanonicalSet::new(),
+                display: kr_protocol::confirmation::ConfirmationDisplay::Described(
+                    kr_protocol::confirmation::DescribedAction {
+                        action,
+                        action_digest: digest,
+                        destination_keys: kr_protocol::scalars::Nullable::null(),
+                        destination_rights: CanonicalSet::new(),
+                    },
+                ),
+                first_owner: false,
+            })
+            .expect("a challenge");
+        kr_pairing::confirm::sign_confirmation(
+            &owner.authorisation,
+            &request,
+            kr_protocol::pairing::ConfirmationChannel::OwnerDevicePresence,
+        )
+        .expect("a proof")
+    }
+
     /// Stops the daemon and its network the way its process ending would.
     pub async fn stop(self) {
         self.clients.abort();

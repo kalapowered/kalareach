@@ -1626,6 +1626,41 @@ impl PairingHost {
     }
 }
 
+/// The catalogue's two confirmed decisions, trusting a repository root and granting an executable
+/// capability, are this host's owner's, confirmed on its owner devices like every other one.
+///
+/// The challenge has to be one this host issued and still holds, answered by a live owner device of
+/// this host after its own ceremony, and it is spent here, once, into the acceptance record. A
+/// challenge the caller made up, one for another action or another digest, and one signed by
+/// anything but an owner device authorise nothing, and each is refused as the catalogue refuses
+/// every confirmation that does not stand, `PERMISSION_DENIED`.
+impl crate::sharing::OwnerConfirmations for PairingHost {
+    fn accept(
+        &self,
+        action: SensitiveAction,
+        action_digest: Digest256,
+        proof: &kr_protocol::pairing::OwnerConfirmationProof,
+    ) -> Result<crate::sharing::ConfirmedAction> {
+        // A catalogue action sends authority to no device and grants no session right. What it
+        // changes is what this host will trust or run.
+        let rights = CanonicalSet::new();
+        let expectation = self.owner.expectation(action, action_digest, None, &rights);
+        self.owner
+            .spend_presented(&expectation, proof, "catalogue")
+            .map_err(|error| ControllerError::PermissionDenied {
+                detail: error.to_string(),
+            })
+    }
+
+    fn host_device_id(&self) -> DeviceId {
+        self.identity.device_id
+    }
+
+    fn clock(&self) -> &dyn kr_pairing::platform::PairingClock {
+        &self.clock
+    }
+}
+
 impl PairingSurface for PairingHost {
     fn call(
         &self,
