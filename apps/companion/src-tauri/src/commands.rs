@@ -1341,9 +1341,9 @@ mod tests {
     /// reads that take nothing from the page go straight to that question, and the upload, which
     /// takes a path rather than a map, refuses one that nobody dropped. A voice start and a voice
     /// stop take their values one by one rather than as a map, and refuse values that are not what
-    /// they claim to be in the same way. The stop closes the call this device is holding before it
-    /// parses anything, on purpose: section 15 keeps a local stop available whatever else fails,
-    /// and that closure contacts nothing.
+    /// they claim to be in the same way; a phone build refuses every start before reading it. The
+    /// stop closes the call this device is holding before it parses anything, on purpose: section
+    /// 15 keeps a local stop available whatever else fails, and that closure contacts nothing.
     #[test]
     fn parameters_that_are_not_the_methods_shape_are_refused_before_anything_is_sent() {
         let refusal: Result<kr_protocol::session::SessionReadParams> =
@@ -1419,6 +1419,10 @@ mod tests {
             let expected = match *command {
                 "host_info" | "environment_list" => "HOST_NOT_CONFIGURED",
                 "attachment_upload" => "PERMISSION_DENIED",
+                // A phone opens no call in this process, so a phone build refuses every start
+                // before it reads one.
+                #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+                "voice_start" => "RESOURCE_UNAVAILABLE",
                 _ => "INVALID_ARGUMENT",
             };
             assert_eq!(
