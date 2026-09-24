@@ -4183,6 +4183,7 @@ dependencies = [
  "kr-ipc",
  "kr-project",
  "kr-protocol",
+ "kr-transfer",
  "rusqlite",
  "serde",
  "serde_json",

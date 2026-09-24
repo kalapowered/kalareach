@@ -442,7 +442,34 @@ fn each_action_kind_takes_its_complete_typed_parameters() {
         edit(&mut params);
         serde_json::to_value(params).expect("changeset.capture's parameters")
     };
+    let affected = |path: &str| kr_protocol::changeset::AffectedVersion {
+        path: path.to_owned(),
+        expected_worktree_digest: Nullable::null(),
+        expected_index_object_id: Nullable::null(),
+        expected_index_mode: Nullable::null(),
+        check_index: false,
+    };
     let accepted_by_the_method = [
+        (
+            WorkflowActionKind::ApplyDiff,
+            apply(&|params| {
+                params.affected = vec![affected("src/lib.rs")];
+                params.paths = vec!["src/lib.rs".to_owned()];
+            }),
+        ),
+        // A versioned reference reads no affected path, so the method takes one it could not read.
+        (
+            WorkflowActionKind::ApplyDiff,
+            apply(&|params| {
+                params.destination = DestinationClass::VersionedReference;
+                params.expected_reference =
+                    Nullable::some(kr_protocol::changeset::ExpectedReference {
+                        name: "refs/heads/main".to_owned(),
+                        expected_old_value: Nullable::null(),
+                    });
+                params.affected = vec![affected("../outside")];
+            }),
+        ),
         (
             WorkflowActionKind::ApplyDiff,
             apply(&|params| {
@@ -507,6 +534,25 @@ fn each_action_kind_takes_its_complete_typed_parameters() {
             WorkflowActionKind::ApplyDiff,
             apply(&|params| params.destination = DestinationClass::SharedExisting),
             "limitation",
+        ),
+        (
+            WorkflowActionKind::ApplyDiff,
+            apply(&|params| params.affected = vec![affected("../outside")]),
+            "affected path 1",
+        ),
+        (
+            WorkflowActionKind::ApplyDiff,
+            apply(&|params| {
+                params.destination = DestinationClass::SharedExisting;
+                params.preflight_only = true;
+                params.affected = vec![affected("src/lib.rs"), affected("/etc/hosts")];
+            }),
+            "affected path 2",
+        ),
+        (
+            WorkflowActionKind::ApplyDiff,
+            apply(&|params| params.paths = vec!["src/lib.rs".to_owned()]),
+            "asked for by name",
         ),
         (
             WorkflowActionKind::CreateSession,

@@ -263,10 +263,14 @@ fn session_request_refusal(node_id: &str, params: &SessionCreateParams) -> Resul
 
 /// Refuses an apply node whose parameters `diff.apply` refuses on the request alone.
 ///
-/// The method reads the destination's workspace for every class, a versioned reference needs the
-/// reference and the value it is expected to hold, and a direct apply to a shared working tree is
-/// chosen only after every limitation of that class has been shown. The limitations are the
-/// method's own words, read from it rather than restated here.
+/// These are every refusal on the method's path before its first reading of the host, and no
+/// other: the method reads the destination's workspace for every class; a versioned reference
+/// needs the reference, the value it is expected to hold and a name the method's reference rule
+/// admits; a direct apply to a shared working tree is chosen only after every limitation of that
+/// class has been shown; and a proposal or a direct apply reads each affected path through the
+/// transfer name rule and writes only paths the request describes. The limitations and the name
+/// rule are the method's own, called rather than restated; the reference rule is private to the
+/// method and restated here.
 fn apply_request_refusal(node_id: &str, params: &DiffApplyParams) -> Result<()> {
     let refused = |why: &str| {
         Err(AutomationError::InvalidArgument(format!(
@@ -297,17 +301,47 @@ fn apply_request_refusal(node_id: &str, params: &DiffApplyParams) -> Result<()> 
                 );
             }
         }
-        DestinationClass::SharedExisting if !params.preflight_only => {
-            for limitation in kr_changeset::apply::limitations(DestinationClass::SharedExisting) {
-                if !params.acknowledged_limitations.contains(&limitation) {
+        DestinationClass::Proposal | DestinationClass::SharedExisting => {
+            if params.destination == DestinationClass::SharedExisting && !params.preflight_only {
+                for limitation in kr_changeset::apply::limitations(DestinationClass::SharedExisting)
+                {
+                    if !params.acknowledged_limitations.contains(&limitation) {
+                        return refused(&format!(
+                            "a direct apply to a shared working tree acknowledges every \
+                             limitation of that destination, and this one is missing: \
+                             {limitation}"
+                        ));
+                    }
+                }
+            }
+            // The preflight reads what each affected path holds beneath the destination's own
+            // handle, through the same name rule, and a name that rule refuses is one it can never
+            // read, whatever the destination holds.
+            for (position, affected) in params.affected.iter().enumerate() {
+                if let Err(escape) = kr_transfer::RelativeName::parse(&affected.path) {
                     return refused(&format!(
-                        "a direct apply to a shared working tree acknowledges every limitation \
-                         of that destination, and this one is missing: {limitation}"
+                        "affected path {} is not a name beneath the destination: {escape}",
+                        position + 1
+                    ));
+                }
+            }
+            // Every path the apply writes is one the request says what it expects to find at, so
+            // a path asked for by name and not described is refused whatever the version holds:
+            // one the version does not hold, and one the preflight could not check.
+            for (position, path) in params.paths.iter().enumerate() {
+                if !params
+                    .affected
+                    .iter()
+                    .any(|affected| affected.path == *path)
+                {
+                    return refused(&format!(
+                        "path {} is asked for by name and is not among the affected paths the \
+                         request says what it expects to find at",
+                        position + 1
                     ));
                 }
             }
         }
-        DestinationClass::Proposal | DestinationClass::SharedExisting => {}
     }
     Ok(())
 }
