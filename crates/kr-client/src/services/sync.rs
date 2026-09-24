@@ -10,11 +10,13 @@
 //! reads them, holds them to the rules a service checks without a key, and carries the object they
 //! describe.
 //!
-//! # One route, five members
+//! # One route, eight members
 //!
 //! `sync.compare_exchange` is one signed method at one path, and a request asks for exactly one of
-//! five things: an exchange, a comparison, a resolution, the status of a request identity, or a
-//! fence of one. Each is signed under the same credential.
+//! eight things: an exchange, a comparison, a resolution, the status of a request identity, a fence
+//! of one, a read of a collection's key records, the offer of the record that follows its newest,
+//! or the list of shared collections whose newest record names this installation. Each is signed
+//! under the same credential.
 //!
 //! # Which collection a call reaches
 //!
@@ -26,8 +28,30 @@
 //! is named by the object's own identity: one object, one collection, on both sides. A name neither
 //! function produced is refused before anything is sent.
 //!
-//! A collection belongs to the installation whose key signs for it, because the service derives it
-//! from that key. Two installations therefore never reach one collection, whatever they name.
+//! Such a collection belongs to the installation whose key signs for it, because the service
+//! derives it from that key, and it is what [`SyncBackupService`] addresses.
+//!
+//! A collection two or more devices share is named by a [`CollectionRef`] instead: it lives in the
+//! namespace of the installation that started it, its home, and holds several objects, each named
+//! inside it by the same per-object name. Every request about it names the home, every write names
+//! the key epoch its object is sealed under, and the service admits only the devices its newest key
+//! record lists. The `_shared` calls address one: [`ManagedSyncService::exchange_shared`],
+//! [`ManagedSyncService::status_shared`], [`ManagedSyncService::fence_shared`],
+//! [`ManagedSyncService::compare_shared`] and [`ManagedSyncService::resolve_shared`].
+//! [`ManagedSyncService::inventory`] reads everything one holds, each with the epoch it is sealed
+//! under, and [`ManagedSyncService::memberships`] lists the shared collections whose newest record
+//! names this installation. Its key records are this client's [`KeyRecordService`].
+//!
+//! # Two refusals that are answers
+//!
+//! In a shared collection the service answers two things with refusals a caller acts on rather
+//! than reports. `COLLECTION_ABSENT` is a collection that does not exist or whose newest record
+//! does not list this installation, one answer for both. `KEY_EPOCH_RETIRED` is a write sealed
+//! under an epoch the collection has retired: nothing was stored or held, the refusal names the
+//! collection's epoch and revision, and it is the request's receipt. The `_shared` calls return
+//! both as [`Keyed`] answers, and the key-record reads return the first as [`KeyRecords::Absent`]
+//! and [`RecordAt::Absent`]. A collection only its home writes answers neither, so for it both stay
+//! errors.
 //!
 //! # What it keeps
 //!
@@ -37,7 +61,8 @@
 //! signed at the instant its caller recorded, never at a reading taken here, and a request's bytes
 //! are a function of what the caller passed and nothing else, so the same attempt made twice is the
 //! same document twice: the service answers a retry from its receipt only when nothing its digest
-//! covers has changed.
+//! covers has changed. The digest covers the key epoch a write names, so a retry names the epoch the
+//! first attempt named.
 //!
 //! # What an answer may carry
 //!
@@ -45,33 +70,42 @@
 //! gives it: an answer missing one is an error rather than a default. A member it does not read is
 //! let through. The service and this client are deployed on their own schedules, so the service can
 //! add a member before this client knows of it, and refusing a whole answer over that would leave
-//! a write the service had applied unsettled until this client caught up. A sealed object is the
-//! exception and stays a closed schema, because what is stored has to be exactly what was sealed.
+//! a write the service had applied unsettled until this client caught up. A sealed object and a key
+//! record are the exceptions and stay closed schemas, because what is stored has to be exactly what
+//! was sealed or signed.
 //!
 //! # What is never rendered
 //!
 //! An exchange carries a sealed object and a comparison answers with them. Under this module's
 //! rule the types that hold one write their own [`std::fmt::Debug`]: what the object is, its
-//! declared size and where it stands, and nothing sealed.
+//! declared size and where it stands, and nothing sealed. A key record renders its collection,
+//! epoch, revision and how many members it names, and nothing else.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
+use kr_protocol::collection_keys::CollectionKeyRecord;
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::{DraftId, SyncCollectionId, SyncConflictId, SyncObjectId};
+use kr_protocol::ids::{DraftId, InstallationId, SyncCollectionId, SyncConflictId, SyncObjectId};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, U64, Uuid};
 use kr_protocol::service::GatewayOrigin;
-use kr_protocol::sync::{SealedSyncObject, SyncObjectKind};
+use kr_protocol::sync::{
+    MAX_SYNC_CONFLICT_COPIES, MAX_SYNC_OBJECTS_PER_COLLECTION, SealedSyncObject, SyncObjectKind,
+};
 use serde::{Deserialize, Serialize};
 
 use super::relay::{ServiceHttp, ServiceSigner};
-use super::signed::{SignedService, malformed, unreadable_answer};
+use super::signed::{Answer, Refusal, SignedService, malformed, unreadable_answer};
 use super::{
-    ServiceFuture, SyncBackupService, SyncExchanged, SyncPosition, SyncRequestFence,
-    SyncRequestStatus, SyncRevision,
+    KeyHead, Keyed, ServiceFuture, SyncBackupService, SyncExchanged, SyncPosition,
+    SyncRequestFence, SyncRequestStatus, SyncRevision,
 };
 use crate::error::{ClientError, Result};
+use crate::sync::membership::{
+    CollectionRef, KeyRecordService, KeyRecords, RecordAt, RekeyAnswer, RekeyFence, RekeyStatus,
+};
 
 /// Where every settings-sync member is served.
 pub const SYNC_EXCHANGE_PATH: &str = "/api/sync/exchange";
@@ -108,6 +142,17 @@ pub const SYNC_ANSWER_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
 /// refuses one first, so a caller that carried a figure from somewhere else is told which rule it
 /// broke rather than being refused by the service.
 pub const MAX_SYNC_COUNTER: u64 = (1 << 53) - 1;
+
+/// The most key records one read follows, across every page the service answers it with.
+///
+/// Every revision of a collection's records is kept for the collection's life, and a device that
+/// joins reads them all from the first. One revision is one change of who holds the key, so a
+/// collection reaches this only after thousands of them; a read past it is refused as an answer
+/// this client will not hold, rather than one that grows without bound.
+pub const MAX_KEY_RECORDS_READ: usize = 4096;
+
+/// The most shared collections one listing follows, across every page the service answers it with.
+pub const MAX_MEMBERSHIPS_READ: usize = 4096;
 
 /* -------------------------------------------------------------------------- */
 /* Which collection a call reaches                                             */
@@ -155,6 +200,36 @@ impl Collection {
     }
 }
 
+/// Where one request goes: the service's collection, and the namespace it lives in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Address {
+    /// The service's name for the collection.
+    collection_id: SyncCollectionId,
+    /// The installation whose namespace it lives in, or nothing for the signer's own.
+    ///
+    /// Left out of the request when it is nothing, so a request about a collection only its home
+    /// writes is the document it always was.
+    home: Option<InstallationId>,
+}
+
+impl Address {
+    /// The collection one object lives in, in the signer's own namespace.
+    const fn own(collection: Collection) -> Self {
+        Self {
+            collection_id: collection.id,
+            home: None,
+        }
+    }
+
+    /// A collection two or more devices share, in its home's namespace.
+    const fn shared(collection: &CollectionRef) -> Self {
+        Self {
+            collection_id: collection.collection_id,
+            home: Some(collection.home),
+        }
+    }
+}
+
 /* -------------------------------------------------------------------------- */
 /* What a client sends                                                         */
 /* -------------------------------------------------------------------------- */
@@ -168,6 +243,9 @@ enum SyncRequest<'a> {
     Resolve(ResolveBody),
     Status(StatusBody),
     Fence(FenceBody),
+    Keys(KeysBody),
+    Rekey(RekeyBody<'a>),
+    Memberships(MembershipsBody),
 }
 
 /// Write one object, if the service still holds the revision the writer expects.
@@ -175,6 +253,11 @@ enum SyncRequest<'a> {
 struct ExchangeBody<'a> {
     request_id: Uuid,
     collection_id: SyncCollectionId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    home: Option<InstallationId>,
+    /// The epoch of the key the object is sealed under, in a collection a key record has claimed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_epoch: Option<U64>,
     kind: SyncObjectKind,
     object_id: SyncObjectId,
     /// The revision this write replaces, or null when it names no object.
@@ -185,14 +268,15 @@ struct ExchangeBody<'a> {
 }
 
 impl fmt::Debug for ExchangeBody<'_> {
-    /// What the object is, how large it declares itself and whether the write names a revision.
-    /// Never the ciphertext or the nonce.
+    /// What the object is, how large it declares itself, whether the write names a revision and
+    /// which epoch it names. Never the ciphertext or the nonce.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ExchangeBody")
             .field("kind", &self.kind)
             .field("size_bucket_bytes", &self.object.size_bucket_bytes)
             .field("expects_an_object", &self.expected_revision.is_some())
+            .field("key_epoch", &self.key_epoch)
             .finish_non_exhaustive()
     }
 }
@@ -202,16 +286,30 @@ impl fmt::Debug for ExchangeBody<'_> {
 struct CompareBody {
     collection_id: SyncCollectionId,
     #[serde(skip_serializing_if = "Option::is_none")]
+    home: Option<InstallationId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     kind: Option<SyncObjectKind>,
+    /// The objects the reader already holds at the revision named, which the answer leaves out.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    known: Vec<KnownRevision>,
     with_conflicts: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     conflicts_after_sequence: Option<U64>,
+}
+
+/// One object a reader already holds.
+#[derive(Clone, Copy, Debug, Serialize)]
+struct KnownRevision {
+    object_id: SyncObjectId,
+    revision: SyncRevision,
 }
 
 /// Drop copies the person has chosen about.
 #[derive(Debug, Serialize)]
 struct ResolveBody {
     collection_id: SyncCollectionId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    home: Option<InstallationId>,
     conflict_ids: Vec<SyncConflictId>,
 }
 
@@ -219,6 +317,8 @@ struct ResolveBody {
 #[derive(Debug, Serialize)]
 struct StatusBody {
     collection_id: SyncCollectionId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    home: Option<InstallationId>,
     request_id: Uuid,
 }
 
@@ -226,9 +326,38 @@ struct StatusBody {
 #[derive(Debug, Serialize)]
 struct FenceBody {
     collection_id: SyncCollectionId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    home: Option<InstallationId>,
     request_id: Uuid,
     first_signed_at_ms: U64,
     last_signed_at_ms: U64,
+}
+
+/// Read a collection's key records after a revision.
+#[derive(Debug, Serialize)]
+struct KeysBody {
+    collection_id: SyncCollectionId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    home: Option<InstallationId>,
+    after_revision: U64,
+}
+
+/// Offer the key record that follows the collection's newest, under a request identity.
+#[derive(Debug, Serialize)]
+struct RekeyBody<'a> {
+    request_id: Uuid,
+    collection_id: SyncCollectionId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    home: Option<InstallationId>,
+    /// Its `Debug` names the collection, epoch, revision and member count, and nothing else.
+    record: &'a CollectionKeyRecord,
+}
+
+/// List the shared collections whose newest record lists the signer.
+#[derive(Debug, Serialize)]
+struct MembershipsBody {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    after: Option<String>,
 }
 
 /* -------------------------------------------------------------------------- */
@@ -299,6 +428,12 @@ struct ExchangeAnswer {
     current_revision: Nullable<SyncRevision>,
     current_write_sequence: U64,
     conflict: Nullable<ConflictSummary>,
+    /// The collection's epoch, in a collection a key record has claimed.
+    #[serde(default)]
+    key_epoch: Option<U64>,
+    /// The revision of the collection's newest key record, beside the epoch.
+    #[serde(default)]
+    key_revision: Option<U64>,
     #[expect(dead_code, reason = "held to its schema and never read")]
     stored: SyncUsage,
 }
@@ -318,6 +453,7 @@ enum StatusState {
     Applied,
     Refused,
     Fenced,
+    Retired,
     Unknown,
 }
 
@@ -328,7 +464,22 @@ enum ReceiptOutcome {
     Written,
     Removed,
     Conflict,
+    Retired,
+    Rekeyed,
+    RekeyRefused,
     Fenced,
+}
+
+impl ReceiptOutcome {
+    /// The state a status query and a fence answer this outcome as, which is the service's rule.
+    const fn state(self) -> StatusState {
+        match self {
+            Self::Written | Self::Removed | Self::Rekeyed => StatusState::Applied,
+            Self::Conflict | Self::RekeyRefused => StatusState::Refused,
+            Self::Retired => StatusState::Retired,
+            Self::Fenced => StatusState::Fenced,
+        }
+    }
 }
 
 /// What a status query and a fence answer.
@@ -341,13 +492,18 @@ struct StatusAnswer {
     request_id: Uuid,
     state: StatusState,
     never_ran: bool,
-    #[expect(dead_code, reason = "held to its schema and never read")]
     outcome: Nullable<ReceiptOutcome>,
     #[expect(dead_code, reason = "held to its schema and never read")]
     record: Nullable<ObjectSummary>,
     current_revision: Nullable<SyncRevision>,
     current_write_sequence: Nullable<U64>,
     conflict_id: Nullable<SyncConflictId>,
+    /// The epoch the recorded answer named, when it named one.
+    #[serde(default)]
+    key_epoch: Option<U64>,
+    /// The key record revision the recorded answer named, beside the epoch.
+    #[serde(default)]
+    key_revision: Option<U64>,
     #[expect(dead_code, reason = "held to its schema and never read")]
     recorded_at: Nullable<String>,
 }
@@ -359,6 +515,8 @@ struct ObjectRecord {
     object_id: SyncObjectId,
     revision: SyncRevision,
     write_sequence: U64,
+    #[serde(default)]
+    key_epoch: Option<U64>,
     object: SealedSyncObject,
     #[expect(dead_code, reason = "held to its schema and never read")]
     updated_at: String,
@@ -374,11 +532,12 @@ struct RemovedObject {
 
 /// Where one object stands.
 #[derive(Deserialize)]
-#[expect(dead_code, reason = "held to its schema and never read")]
 struct ObjectPosition {
     object_id: SyncObjectId,
     revision: SyncRevision,
     write_sequence: U64,
+    #[serde(default)]
+    key_epoch: Option<U64>,
 }
 
 /// One copy, with its content, as a comparison answers it.
@@ -392,6 +551,8 @@ struct ConflictRecord {
     /// The revision the object held when the write was refused, or empty text when it held none.
     current_revision: String,
     current_write_sequence: U64,
+    #[serde(default)]
+    key_epoch: Option<U64>,
     object: SealedSyncObject,
     #[expect(dead_code, reason = "held to its schema and never read")]
     recorded_at: String,
@@ -403,12 +564,60 @@ struct CompareAnswer {
     changed: Vec<ObjectRecord>,
     #[expect(dead_code, reason = "held to its schema and never read")]
     removed: Vec<RemovedObject>,
-    #[expect(dead_code, reason = "held to its schema and never read")]
     revisions: Vec<ObjectPosition>,
     conflicts: Vec<ConflictRecord>,
     next_conflicts_after_sequence: U64,
     more_conflicts: bool,
+    #[serde(default)]
+    key_epoch: Option<U64>,
+    #[serde(default)]
+    key_revision: Option<U64>,
     stored: SyncUsage,
+}
+
+/// What `sync.compare_exchange` answers for a read of key records.
+#[derive(Deserialize)]
+struct KeysAnswer {
+    records: Vec<CollectionKeyRecord>,
+    more: bool,
+    #[expect(dead_code, reason = "held to its schema and never read")]
+    key_revision: U64,
+    #[expect(dead_code, reason = "held to its schema and never read")]
+    key_epoch: Nullable<U64>,
+}
+
+/// What a `rekey` did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RekeyState {
+    Applied,
+    Refused,
+}
+
+/// What `sync.compare_exchange` answers for the offer of a key record.
+#[derive(Deserialize)]
+struct RekeyResult {
+    state: RekeyState,
+    key_revision: U64,
+    #[expect(dead_code, reason = "held to its schema and never read")]
+    key_epoch: Nullable<U64>,
+}
+
+/// One shared collection a membership listing names.
+#[derive(Deserialize)]
+struct MembershipEntry {
+    home: InstallationId,
+    collection_id: SyncCollectionId,
+    key_revision: U64,
+    key_epoch: U64,
+}
+
+/// What `sync.compare_exchange` answers for a membership listing.
+#[derive(Deserialize)]
+struct MembershipsAnswer {
+    memberships: Vec<MembershipEntry>,
+    more: bool,
+    next_after: Nullable<String>,
 }
 
 /// One object a collection holds, as a comparison read it.
@@ -420,18 +629,21 @@ pub struct SyncHeldObject {
     pub kind: SyncObjectKind,
     /// Where it stands: the write that put it there, and that write's place in the order.
     pub position: SyncPosition,
+    /// The epoch of the key it is sealed under, in a collection a key record has claimed.
+    pub epoch: Option<u64>,
     /// The sealed object, in canonical KR-CBOR-1, which is what a sealer opens.
     pub ciphertext: Vec<u8>,
 }
 
 impl fmt::Debug for SyncHeldObject {
-    /// What the object is and where it stands. Never the sealed object.
+    /// What the object is, where it stands and its epoch. Never the sealed object.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SyncHeldObject")
             .field("object_id", &self.object_id)
             .field("kind", &self.kind)
             .field("position", &self.position)
+            .field("epoch", &self.epoch)
             .finish_non_exhaustive()
     }
 }
@@ -452,12 +664,16 @@ pub struct SyncHeldCopy {
     /// Where the object stood when the write was refused: the write that beat it, or the place a
     /// removal took when the object held none. Nothing when the collection had never held it.
     pub current: Option<SyncPosition>,
+    /// The epoch of the key the refused content is sealed under, in a collection a key record has
+    /// claimed.
+    pub epoch: Option<u64>,
     /// The refused write's sealed object, in canonical KR-CBOR-1, which is what a sealer opens.
     pub ciphertext: Vec<u8>,
 }
 
 impl fmt::Debug for SyncHeldCopy {
-    /// Which copy it is, what it is about and where the object stood. Never the sealed object.
+    /// Which copy it is, what it is about, where the object stood and its epoch. Never the sealed
+    /// object.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SyncHeldCopy")
@@ -466,6 +682,7 @@ impl fmt::Debug for SyncHeldCopy {
             .field("object_id", &self.object_id)
             .field("kind", &self.kind)
             .field("current", &self.current)
+            .field("epoch", &self.epoch)
             .finish_non_exhaustive()
     }
 }
@@ -481,8 +698,94 @@ pub struct SyncComparison {
     pub more_copies: bool,
     /// The cursor to read the next page of copies from.
     pub next_copies_after: u64,
+    /// Where the collection's key records stood, in a collection a key record has claimed.
+    pub head: Option<KeyHead>,
     /// How the collection stands.
     pub stored: SyncUsage,
+}
+
+/// Where one object a shared collection holds stands, and the epoch it is sealed under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InventoryObject {
+    /// The object.
+    pub object_id: SyncObjectId,
+    /// Where it stands.
+    pub position: SyncPosition,
+    /// The epoch of the key it is sealed under, in a collection a key record has claimed.
+    pub epoch: Option<u64>,
+}
+
+/// One copy a shared collection keeps of a refused write, and the epoch it is sealed under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InventoryCopy {
+    /// Its place in the order the collection recorded its copies.
+    pub sequence: u64,
+    /// The copy.
+    pub conflict_id: SyncConflictId,
+    /// The object the refused write was about.
+    pub object_id: SyncObjectId,
+    /// What kind of object the refused write carried.
+    pub kind: SyncObjectKind,
+    /// The epoch of the key the refused content is sealed under, in a collection a key record has
+    /// claimed.
+    pub epoch: Option<u64>,
+}
+
+/// Everything a shared collection holds, each with the epoch it is sealed under: every object and
+/// every copy, read page by page to the end.
+///
+/// It is what a member reads before it forgets an epoch's key: the key goes only once nothing
+/// the collection holds is sealed under it. Objects are as the last page found them, which is the
+/// newest account of each; copies are every one the pages reached, in the order they were kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Inventory {
+    /// Where the collection's key records stood when the last page was read.
+    pub head: Option<KeyHead>,
+    /// Every object.
+    pub objects: Vec<InventoryObject>,
+    /// Every copy.
+    pub copies: Vec<InventoryCopy>,
+}
+
+impl Inventory {
+    /// Every epoch something the collection holds is sealed under.
+    #[must_use]
+    pub fn epochs(&self) -> BTreeSet<u64> {
+        self.objects
+            .iter()
+            .filter_map(|object| object.epoch)
+            .chain(self.copies.iter().filter_map(|copy| copy.epoch))
+            .collect()
+    }
+
+    /// Whether anything the collection holds is sealed under this epoch.
+    #[must_use]
+    pub fn holds_epoch(&self, epoch: u64) -> bool {
+        self.epochs().contains(&epoch)
+    }
+}
+
+/// One shared collection whose newest key record listed this installation when the service's
+/// index last heard of it.
+///
+/// The index can be behind the collection, and it admits nobody: a device reads the records
+/// themselves before it trusts any of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MembershipListing {
+    /// The collection.
+    pub collection: CollectionRef,
+    /// The epoch and revision of the record the index last heard of.
+    pub head: KeyHead,
+}
+
+/// What the service answered one request, read before it is read as one contract or another.
+enum Reply<T> {
+    /// The answer's `data`.
+    Data(T),
+    /// A write sealed under a retired epoch; the refusal named the collection's head.
+    Retired(KeyHead),
+    /// The collection does not exist, or does not list the signer.
+    Absent,
 }
 
 /* -------------------------------------------------------------------------- */
@@ -499,7 +802,8 @@ impl ManagedSyncService {
     /// Builds a client against one gateway.
     ///
     /// The key `signer` holds is the installation the collections belong to: the service derives
-    /// every collection a request reaches from the key that signed it.
+    /// every collection a request reaches from the key that signed it, and in a shared collection
+    /// admits it by that key.
     #[must_use]
     pub fn new(
         origin: GatewayOrigin,
@@ -535,72 +839,420 @@ impl ManagedSyncService {
         after: Option<u64>,
     ) -> Result<SyncComparison> {
         let named = Collection::named(collection)?;
-        self.comparison(named, None, with_copies, after).await
+        let data = self
+            .ask(
+                &self.compare_body(Address::own(named), None, with_copies, after, Vec::new())?,
+                None,
+            )
+            .await?
+            .data()?;
+        comparison(read(data, "what a comparison answered")?)
     }
 
-    /// One comparison of one collection.
-    async fn comparison(
+    /// Reads what a shared collection holds, and the copies its refusals kept when `with_copies`
+    /// asks, a page of copies at a time from `after`.
+    ///
+    /// Every object and copy names the epoch it is sealed under, and the comparison names where the
+    /// collection's key records stood.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::compare`]. A collection that does not list this installation is `None`.
+    pub async fn compare_shared(
         &self,
-        collection: Collection,
-        kind: Option<SyncObjectKind>,
+        collection: &CollectionRef,
         with_copies: bool,
         after: Option<u64>,
-    ) -> Result<SyncComparison> {
-        if let Some(cursor) = after {
-            a_counter("a cursor", cursor)?;
+    ) -> Result<Option<SyncComparison>> {
+        let request = self.compare_body(
+            Address::shared(collection),
+            None,
+            with_copies,
+            after,
+            Vec::new(),
+        )?;
+        match reply(self.ask(&request, None).await?, false)? {
+            Reply::Data(data) => Ok(Some(comparison(read(data, "what a comparison answered")?)?)),
+            Reply::Absent => Ok(None),
+            Reply::Retired(_) => Err(retired_where_no_write_was()),
         }
-        let data = self
-            .call
-            .call(
-                SYNC_EXCHANGE_PATH,
-                Method::SyncCompareExchange,
-                &SyncRequest::Compare(CompareBody {
-                    collection_id: collection.id,
-                    kind,
-                    with_conflicts: with_copies,
-                    conflicts_after_sequence: after.map(U64::new),
-                }),
-                MAX_SYNC_REQUEST_BYTES,
-            )
-            .await?;
-        let answer: CompareAnswer = serde_json::from_value(data)
-            .map_err(|error| unreadable_answer("what a comparison answered", &error))?;
+    }
 
-        let objects = answer
-            .changed
-            .into_iter()
-            .map(|held| {
-                Ok(SyncHeldObject {
-                    object_id: held.object_id,
-                    kind: held.kind,
-                    position: SyncPosition::at(held.write_sequence.get(), held.revision),
-                    ciphertext: encoded(&held.object)?,
+    /// Writes one object into a shared collection, sealed under `epoch`.
+    ///
+    /// `object` is the per-object name this crate gives the object's kind and identity, which
+    /// names it inside the collection. `epoch` is part of what the request asks, so a retry names
+    /// the epoch the first attempt named: the service answers it from its receipt, whatever the
+    /// collection's epoch has become since.
+    ///
+    /// # Errors
+    ///
+    /// As [`SyncBackupService::compare_exchange`]. A write under a retired epoch is
+    /// [`Keyed::Retired`] and a collection that does not list this installation [`Keyed::Absent`],
+    /// both answers rather than errors.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each is a separate fact the request states: where, what, under which key, as which request, when, and against which revision"
+    )]
+    pub async fn exchange_shared(
+        &self,
+        collection: &CollectionRef,
+        object: &str,
+        epoch: u64,
+        request_id: Uuid,
+        signed_at_ms: u64,
+        expected: Option<SyncPosition>,
+        ciphertext: &[u8],
+    ) -> Result<Keyed<SyncExchanged>> {
+        let named = Collection::named(object)?;
+        a_counter("a key epoch", epoch)?;
+        let sealed = sealed_object(ciphertext)?;
+        let request = exchange_body(
+            Address::shared(collection),
+            named,
+            Some(epoch),
+            request_id,
+            expected,
+            &sealed,
+        );
+        match reply(self.ask(&request, Some(signed_at_ms)).await?, true)? {
+            Reply::Data(data) => {
+                let answer: ExchangeAnswer = read(data, "what an exchange answered")?;
+                let head = head_of(answer.key_epoch, answer.key_revision)?;
+                Ok(Keyed::Answered {
+                    answer: exchanged(answer, named.object_id)?,
+                    head,
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let copies = answer
-            .conflicts
-            .into_iter()
-            .map(|copy| {
-                Ok(SyncHeldCopy {
+            }
+            Reply::Retired(head) => Ok(Keyed::Retired { head }),
+            Reply::Absent => Ok(Keyed::Absent),
+        }
+    }
+
+    /// Asks what a shared collection recorded about one write's request identity.
+    ///
+    /// A member removed after it sent the write is still answered, from the receipt.
+    ///
+    /// # Errors
+    ///
+    /// As [`SyncBackupService::request_status`]. A write refused for a retired epoch is
+    /// [`Keyed::Retired`], and an installation no record of the collection has listed
+    /// [`Keyed::Absent`].
+    pub async fn status_shared(
+        &self,
+        collection: &CollectionRef,
+        request_id: Uuid,
+    ) -> Result<Keyed<SyncRequestStatus>> {
+        let request = SyncRequest::Status(StatusBody {
+            collection_id: collection.collection_id,
+            home: Some(collection.home),
+            request_id,
+        });
+        match reply(self.ask(&request, None).await?, false)? {
+            Reply::Data(data) => {
+                let answer = status_answer(data, request_id, "what a status query answered")?;
+                let (outcome, head) = write_outcome(&answer)?;
+                Ok(match outcome {
+                    WriteOutcome::Applied(position) => Keyed::Answered {
+                        answer: SyncRequestStatus::Applied { position },
+                        head,
+                    },
+                    WriteOutcome::Refused(retained) => Keyed::Answered {
+                        answer: SyncRequestStatus::Refused { retained },
+                        head,
+                    },
+                    WriteOutcome::Fenced { never_ran } => Keyed::Answered {
+                        answer: SyncRequestStatus::Fenced { never_ran },
+                        head,
+                    },
+                    WriteOutcome::Unknown => Keyed::Answered {
+                        answer: SyncRequestStatus::Unknown,
+                        head,
+                    },
+                    WriteOutcome::Retired(head) => Keyed::Retired { head },
+                })
+            }
+            Reply::Absent => Ok(Keyed::Absent),
+            Reply::Retired(_) => Err(retired_where_no_write_was()),
+        }
+    }
+
+    /// Ends one write's request identity in a shared collection, naming the earliest and latest
+    /// instant an attempt under it was signed at, and says what became of it.
+    ///
+    /// # Errors
+    ///
+    /// As [`SyncBackupService::fence_request`]. A write refused for a retired epoch is
+    /// [`Keyed::Retired`], and an installation no record of the collection has listed
+    /// [`Keyed::Absent`].
+    pub async fn fence_shared(
+        &self,
+        collection: &CollectionRef,
+        request_id: Uuid,
+        first_signed_at_ms: u64,
+        last_signed_at_ms: u64,
+    ) -> Result<Keyed<SyncRequestFence>> {
+        let request = fence_body(
+            Address::shared(collection),
+            request_id,
+            first_signed_at_ms,
+            last_signed_at_ms,
+        )?;
+        match reply(self.ask(&request, None).await?, false)? {
+            Reply::Data(data) => {
+                let answer = status_answer(data, request_id, "what a fence answered")?;
+                let (outcome, head) = write_outcome(&answer)?;
+                Ok(match outcome {
+                    WriteOutcome::Applied(position) => Keyed::Answered {
+                        answer: SyncRequestFence::Applied { position },
+                        head,
+                    },
+                    WriteOutcome::Refused(retained) => Keyed::Answered {
+                        answer: SyncRequestFence::Refused { retained },
+                        head,
+                    },
+                    WriteOutcome::Fenced { never_ran } => Keyed::Answered {
+                        answer: SyncRequestFence::Fenced { never_ran },
+                        head,
+                    },
+                    WriteOutcome::Unknown => return Err(fence_answered_unknown()),
+                    WriteOutcome::Retired(head) => Keyed::Retired { head },
+                })
+            }
+            Reply::Absent => Ok(Keyed::Absent),
+            Reply::Retired(_) => Err(retired_where_no_write_was()),
+        }
+    }
+
+    /// Drops the copy a shared collection kept of one refused write, because the person has
+    /// chosen.
+    ///
+    /// # Errors
+    ///
+    /// As [`SyncBackupService::resolve`]. A collection that does not list this installation is
+    /// `None`.
+    pub async fn resolve_shared(
+        &self,
+        collection: &CollectionRef,
+        retained: SyncConflictId,
+    ) -> Result<Option<bool>> {
+        let request = resolve_body(Address::shared(collection), retained);
+        match reply(self.ask(&request, None).await?, false)? {
+            Reply::Data(data) => Ok(Some(dropped(data)?)),
+            Reply::Absent => Ok(None),
+            Reply::Retired(_) => Err(retired_where_no_write_was()),
+        }
+    }
+
+    /// Reads everything a shared collection holds, each with the epoch it is sealed under, page by
+    /// page to the end.
+    ///
+    /// The first page names every object; each later page reads the next copies from the cursor
+    /// the one before ended at, naming every object already read so its content is not sent
+    /// again. A cursor that does not move on, or more copies than a collection can keep, is an
+    /// answer this client does not follow.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::compare_shared`]. A collection that does not list this installation is `None`.
+    pub async fn inventory(&self, collection: &CollectionRef) -> Result<Option<Inventory>> {
+        let most_copies =
+            usize::try_from(MAX_SYNC_OBJECTS_PER_COLLECTION * MAX_SYNC_CONFLICT_COPIES)
+                .unwrap_or(usize::MAX);
+        let mut copies: Vec<InventoryCopy> = Vec::new();
+        let mut known: Vec<KnownRevision> = Vec::new();
+        let mut after: Option<u64> = None;
+        loop {
+            let request = self.compare_body(
+                Address::shared(collection),
+                None,
+                true,
+                after,
+                known.clone(),
+            )?;
+            let answer: CompareAnswer = match reply(self.ask(&request, None).await?, false)? {
+                Reply::Data(data) => read(data, "what a comparison answered")?,
+                Reply::Absent => return Ok(None),
+                Reply::Retired(_) => return Err(retired_where_no_write_was()),
+            };
+            let head = head_of(answer.key_epoch, answer.key_revision)?;
+            let objects = answer
+                .revisions
+                .iter()
+                .map(|position| {
+                    Ok(InventoryObject {
+                        object_id: position.object_id,
+                        position: SyncPosition::at(
+                            position.write_sequence.get(),
+                            position.revision,
+                        ),
+                        epoch: epoch_in(head, position.key_epoch)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for copy in &answer.conflicts {
+                if after.is_some_and(|cursor| copy.sequence.get() <= cursor)
+                    || copies
+                        .last()
+                        .is_some_and(|last| copy.sequence.get() <= last.sequence)
+                {
+                    return Err(contrary("a page of copies that does not follow the cursor"));
+                }
+                copies.push(InventoryCopy {
                     sequence: copy.sequence.get(),
                     conflict_id: copy.conflict_id,
                     object_id: copy.object_id,
                     kind: copy.kind,
-                    expected_revision: copy.expected_revision,
-                    current: copy_position(&copy.current_revision, copy.current_write_sequence)?,
-                    ciphertext: encoded(&copy.object)?,
+                    epoch: epoch_in(head, copy.key_epoch)?,
+                });
+            }
+            if copies.len() > most_copies {
+                return Err(contrary("more copies than one collection keeps"));
+            }
+            let next = answer.next_conflicts_after_sequence.get();
+            if !answer.more_conflicts {
+                return Ok(Some(Inventory {
+                    head,
+                    objects,
+                    copies,
+                }));
+            }
+            if answer.conflicts.is_empty() || after.is_some_and(|cursor| next <= cursor) {
+                return Err(contrary(
+                    "more copies behind a cursor that does not move on",
+                ));
+            }
+            after = Some(next);
+            known = answer
+                .revisions
+                .iter()
+                .map(|position| KnownRevision {
+                    object_id: position.object_id,
+                    revision: position.revision,
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(SyncComparison {
-            objects,
-            copies,
-            more_copies: answer.more_conflicts,
-            next_copies_after: answer.next_conflicts_after_sequence.get(),
-            stored: answer.stored,
-        })
+                .collect();
+        }
     }
+
+    /// Lists the shared collections whose newest key record names this installation, page by page
+    /// to the end.
+    ///
+    /// The listing is the service's index, which each collection brings up to date after it keeps
+    /// a record: it can be behind, it admits nobody, and a device reads the records themselves
+    /// before it trusts one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the service refuses the listing, when a cursor does not move on, and
+    /// when more than [`MAX_MEMBERSHIPS_READ`] collections come back.
+    pub async fn memberships(&self) -> Result<Vec<MembershipListing>> {
+        let mut listed: Vec<MembershipListing> = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let request = SyncRequest::Memberships(MembershipsBody {
+                after: after.clone(),
+            });
+            let answer: MembershipsAnswer = read(
+                self.ask(&request, None).await?.data()?,
+                "what a membership listing answered",
+            )?;
+            for entry in &answer.memberships {
+                a_counter("a key record revision", entry.key_revision.get())?;
+                a_counter("a key epoch", entry.key_epoch.get())?;
+                listed.push(MembershipListing {
+                    collection: CollectionRef {
+                        home: entry.home,
+                        collection_id: entry.collection_id,
+                    },
+                    head: KeyHead {
+                        epoch: entry.key_epoch.get(),
+                        revision: entry.key_revision.get(),
+                    },
+                });
+            }
+            if listed.len() > MAX_MEMBERSHIPS_READ {
+                return Err(contrary("more shared collections than one listing follows"));
+            }
+            if !answer.more {
+                return Ok(listed);
+            }
+            let next = answer.next_after.0.ok_or_else(|| {
+                contrary("more shared collections with no cursor to continue from")
+            })?;
+            if answer.memberships.is_empty()
+                || after
+                    .as_deref()
+                    .is_some_and(|cursor| next.as_str() <= cursor)
+            {
+                return Err(contrary(
+                    "more shared collections behind a cursor that does not move on",
+                ));
+            }
+            after = Some(next);
+        }
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* One call                                                                */
+    /* ---------------------------------------------------------------------- */
+
+    /// Sends one request, signed at the instant the caller states or now, and returns what was
+    /// answered, a refusal included.
+    async fn ask(&self, request: &SyncRequest<'_>, signed_at_ms: Option<u64>) -> Result<Answer> {
+        match signed_at_ms {
+            Some(signed_at_ms) => {
+                self.call
+                    .answer_at(
+                        SYNC_EXCHANGE_PATH,
+                        Method::SyncCompareExchange,
+                        request,
+                        MAX_SYNC_REQUEST_BYTES,
+                        signed_at_ms,
+                    )
+                    .await
+            }
+            None => {
+                self.call
+                    .answer(
+                        SYNC_EXCHANGE_PATH,
+                        Method::SyncCompareExchange,
+                        request,
+                        MAX_SYNC_REQUEST_BYTES,
+                    )
+                    .await
+            }
+        }
+    }
+
+    /// The request one comparison makes.
+    #[expect(
+        clippy::unused_self,
+        reason = "a method so each request is built beside the calls that send it"
+    )]
+    fn compare_body(
+        &self,
+        address: Address,
+        kind: Option<SyncObjectKind>,
+        with_copies: bool,
+        after: Option<u64>,
+        known: Vec<KnownRevision>,
+    ) -> Result<SyncRequest<'static>> {
+        if let Some(cursor) = after {
+            a_counter("a cursor", cursor)?;
+        }
+        Ok(SyncRequest::Compare(CompareBody {
+            collection_id: address.collection_id,
+            home: address.home,
+            kind,
+            known,
+            with_conflicts: with_copies,
+            conflicts_after_sequence: after.map(U64::new),
+        }))
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* A collection only its home writes                                       */
+    /* ---------------------------------------------------------------------- */
 
     /// One exchange: the write, under the identity and the instant the caller states.
     async fn exchange(
@@ -613,69 +1265,27 @@ impl ManagedSyncService {
     ) -> Result<SyncExchanged> {
         let named = Collection::named(collection)?;
         let object = sealed_object(ciphertext)?;
-        let data = self
-            .call
-            .call_at(
-                SYNC_EXCHANGE_PATH,
-                Method::SyncCompareExchange,
-                &SyncRequest::Exchange(ExchangeBody {
-                    request_id,
-                    collection_id: named.id,
-                    kind: named.kind,
-                    object_id: named.object_id,
-                    // The comparison is about identity, so it names the revision and only the
-                    // revision. No position and a removal's position both name no object; the
-                    // place in the order beside a revision is this client's to compare answers by,
-                    // and it never travels.
-                    expected_revision: expected.and_then(|position| position.revision.0),
-                    object: &object,
-                }),
-                MAX_SYNC_REQUEST_BYTES,
-                signed_at_ms,
-            )
-            .await?;
-        let answer: ExchangeAnswer = serde_json::from_value(data)
-            .map_err(|error| unreadable_answer("what an exchange answered", &error))?;
-
-        Ok(match answer.state {
-            // Where the service put the write, as it stated it. A removal's place, and a place of
-            // nought, come back as the service said them rather than as something a caller would
-            // rather read: a caller that publishes writes declines both, and that is its decision.
-            ExchangeState::Written | ExchangeState::Removed => SyncExchanged::Applied {
-                position: SyncPosition {
-                    write_sequence: answer.current_write_sequence.get(),
-                    revision: answer.current_revision,
-                },
-            },
-            ExchangeState::Conflict => SyncExchanged::Refused {
-                retained: match answer.conflict.0 {
-                    // A copy is of the refused write, so it is of this object. One naming another
-                    // is a copy a resolution of this object must never be pointed at.
-                    Some(copy) if copy.object_id != named.object_id => {
-                        return Err(contrary("a refusal whose copy is of another object"));
-                    }
-                    Some(copy) => Some(copy.conflict_id),
-                    None => None,
-                },
-            },
-        })
+        let request = exchange_body(
+            Address::own(named),
+            named,
+            None,
+            request_id,
+            expected,
+            &object,
+        );
+        let data = self.ask(&request, Some(signed_at_ms)).await?.data()?;
+        exchanged(read(data, "what an exchange answered")?, named.object_id)
     }
 
     /// One status query: what the service recorded about one request identity.
     async fn status(&self, collection: &str, request_id: Uuid) -> Result<SyncRequestStatus> {
         let named = Collection::named(collection)?;
-        let data = self
-            .call
-            .call(
-                SYNC_EXCHANGE_PATH,
-                Method::SyncCompareExchange,
-                &SyncRequest::Status(StatusBody {
-                    collection_id: named.id,
-                    request_id,
-                }),
-                MAX_SYNC_REQUEST_BYTES,
-            )
-            .await?;
+        let request = SyncRequest::Status(StatusBody {
+            collection_id: named.id,
+            home: None,
+            request_id,
+        });
+        let data = self.ask(&request, None).await?.data()?;
         let answer = status_answer(data, request_id, "what a status query answered")?;
         Ok(match answer.state {
             StatusState::Applied => SyncRequestStatus::Applied {
@@ -688,6 +1298,8 @@ impl ManagedSyncService {
                 never_ran: answer.never_ran,
             },
             StatusState::Unknown => SyncRequestStatus::Unknown,
+            // A write that named no epoch cannot have named a retired one.
+            StatusState::Retired => return Err(retired_where_no_epoch_was()),
         })
     }
 
@@ -701,27 +1313,13 @@ impl ManagedSyncService {
         last_signed_at_ms: u64,
     ) -> Result<SyncRequestFence> {
         let named = Collection::named(collection)?;
-        a_counter("the earliest signing time", first_signed_at_ms)?;
-        a_counter("the latest signing time", last_signed_at_ms)?;
-        if first_signed_at_ms > last_signed_at_ms {
-            return Err(malformed(
-                "a fence names the earliest signing time no later than the latest",
-            ));
-        }
-        let data = self
-            .call
-            .call(
-                SYNC_EXCHANGE_PATH,
-                Method::SyncCompareExchange,
-                &SyncRequest::Fence(FenceBody {
-                    collection_id: named.id,
-                    request_id,
-                    first_signed_at_ms: U64::new(first_signed_at_ms),
-                    last_signed_at_ms: U64::new(last_signed_at_ms),
-                }),
-                MAX_SYNC_REQUEST_BYTES,
-            )
-            .await?;
+        let request = fence_body(
+            Address::own(named),
+            request_id,
+            first_signed_at_ms,
+            last_signed_at_ms,
+        )?;
+        let data = self.ask(&request, None).await?.data()?;
         let answer = status_answer(data, request_id, "what a fence answered")?;
         Ok(match answer.state {
             StatusState::Applied => SyncRequestFence::Applied {
@@ -736,40 +1334,16 @@ impl ManagedSyncService {
             // A fence either finds an outcome or makes one, so the service never answers one with
             // "unknown". Inventing an answer for it here would be this client deciding whether a
             // request ended, which is the one thing a fence exists to have the service decide.
-            StatusState::Unknown => {
-                return Err(contrary(
-                    "a fence with \"unknown\", which a fence never answers",
-                ));
-            }
+            StatusState::Unknown => return Err(fence_answered_unknown()),
+            StatusState::Retired => return Err(retired_where_no_epoch_was()),
         })
     }
 
     /// One resolution: drops the copy one refusal kept.
     async fn drop_copy(&self, collection: &str, retained: SyncConflictId) -> Result<bool> {
         let named = Collection::named(collection)?;
-        let data = self
-            .call
-            .call(
-                SYNC_EXCHANGE_PATH,
-                Method::SyncCompareExchange,
-                &SyncRequest::Resolve(ResolveBody {
-                    collection_id: named.id,
-                    conflict_ids: vec![retained],
-                }),
-                MAX_SYNC_REQUEST_BYTES,
-            )
-            .await?;
-        let answer: ResolveAnswer = serde_json::from_value(data)
-            .map_err(|error| unreadable_answer("what a resolution answered", &error))?;
-        // One copy was named, so one was dropped or none was: a copy nobody holds any more is
-        // already resolved, which the service answers as nought rather than as a refusal.
-        match answer.resolved.get() {
-            0 => Ok(false),
-            1 => Ok(true),
-            _ => Err(contrary(
-                "a resolution of one copy that dropped more than one",
-            )),
-        }
+        let request = resolve_body(Address::own(named), retained);
+        dropped(self.ask(&request, None).await?.data()?)
     }
 
     /// One fetch: the object a collection holds, and where it stands.
@@ -777,9 +1351,15 @@ impl ManagedSyncService {
         let named = Collection::named(collection)?;
         // A read for one kind, which is the whole of what section 20 lets the service know about
         // an object it cannot read.
-        let comparison = self
-            .comparison(named, Some(named.kind), false, None)
-            .await?;
+        let request = self.compare_body(
+            Address::own(named),
+            Some(named.kind),
+            false,
+            None,
+            Vec::new(),
+        )?;
+        let data = self.ask(&request, None).await?.data()?;
+        let comparison = comparison(read(data, "what a comparison answered")?)?;
         let held = comparison
             .objects
             .into_iter()
@@ -797,6 +1377,170 @@ impl ManagedSyncService {
             return Err(contrary("a read for one kind with an object of another"));
         }
         Ok((held.position, held.ciphertext))
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* Key records                                                             */
+    /* ---------------------------------------------------------------------- */
+
+    /// One page of key records after a revision, or nothing when the collection does not list this
+    /// installation.
+    async fn keys_page(
+        &self,
+        collection: &CollectionRef,
+        after: u64,
+    ) -> Result<Option<KeysAnswer>> {
+        a_counter("a key record revision", after)?;
+        let request = SyncRequest::Keys(KeysBody {
+            collection_id: collection.collection_id,
+            home: Some(collection.home),
+            after_revision: U64::new(after),
+        });
+        match reply(self.ask(&request, None).await?, false)? {
+            Reply::Data(data) => Ok(Some(read(data, "what a read of key records answered")?)),
+            Reply::Absent => Ok(None),
+            Reply::Retired(_) => Err(retired_where_no_write_was()),
+        }
+    }
+
+    /// Every key record after a revision, page by page to the newest.
+    ///
+    /// The records are passed on as the service answered them: whether they form a chain from the
+    /// revision asked about is for the reader to establish, because a chain it cannot follow is an
+    /// answer it acts on. Only the paging is held here, so a read ends: it follows a page only while
+    /// the page moves the cursor on, and it stops at [`MAX_KEY_RECORDS_READ`] records.
+    async fn read_records_after(
+        &self,
+        collection: &CollectionRef,
+        after: u64,
+    ) -> Result<KeyRecords> {
+        let mut records: Vec<CollectionKeyRecord> = Vec::new();
+        let mut cursor = after;
+        loop {
+            let Some(page) = self.keys_page(collection, cursor).await? else {
+                return Ok(KeyRecords::Absent);
+            };
+            let last = page
+                .records
+                .last()
+                .map(|record| record.payload.revision.get());
+            records.extend(page.records);
+            if records.len() > MAX_KEY_RECORDS_READ {
+                return Err(contrary("more key records than one read follows"));
+            }
+            match last {
+                Some(last) if page.more && last > cursor => cursor = last,
+                // The newest was reached, or a page that does not move the cursor on: what was
+                // answered is handed over, and the reader decides what it follows.
+                _ => return Ok(KeyRecords::Records(records)),
+            }
+        }
+    }
+
+    /// The key record at one revision.
+    async fn read_record_at(&self, collection: &CollectionRef, revision: u64) -> Result<RecordAt> {
+        let after = revision
+            .checked_sub(1)
+            .ok_or_else(|| malformed("key record revisions count from one"))?;
+        Ok(match self.keys_page(collection, after).await? {
+            None => RecordAt::Absent,
+            Some(page) => page
+                .records
+                .into_iter()
+                .next()
+                .map_or(RecordAt::Missing, RecordAt::Record),
+        })
+    }
+
+    /// Offers the record that follows the collection's newest, under a request identity.
+    async fn offer(
+        &self,
+        collection: &CollectionRef,
+        request_id: Uuid,
+        signed_at_ms: u64,
+        record: &CollectionKeyRecord,
+    ) -> Result<RekeyAnswer> {
+        // The service admits a record only for the collection and the home the request names, and
+        // only one whose structure holds; one it would refuse for either never leaves this device.
+        if record.payload.collection_id != collection.collection_id
+            || record.payload.home != collection.home
+        {
+            return Err(malformed(
+                "a key record is offered to the collection and home it names",
+            ));
+        }
+        record.check_structure().map_err(|rule| {
+            malformed(format!(
+                "that key record is not one a service admits: {rule}"
+            ))
+        })?;
+        let request = SyncRequest::Rekey(RekeyBody {
+            request_id,
+            collection_id: collection.collection_id,
+            home: Some(collection.home),
+            record,
+        });
+        let answer: RekeyResult = read(
+            self.ask(&request, Some(signed_at_ms)).await?.data()?,
+            "what the offer of a key record answered",
+        )?;
+        let revision = answer.key_revision.get();
+        Ok(match answer.state {
+            RekeyState::Applied if revision == record.payload.revision.get() => {
+                RekeyAnswer::Applied { revision }
+            }
+            RekeyState::Applied => {
+                return Err(contrary(
+                    "an applied key record at another revision than its own",
+                ));
+            }
+            RekeyState::Refused => RekeyAnswer::Refused { revision },
+        })
+    }
+
+    /// What the service recorded about one offer of a key record.
+    async fn offer_status(
+        &self,
+        collection: &CollectionRef,
+        request_id: Uuid,
+    ) -> Result<RekeyStatus> {
+        let request = SyncRequest::Status(StatusBody {
+            collection_id: collection.collection_id,
+            home: Some(collection.home),
+            request_id,
+        });
+        let data = self.ask(&request, None).await?.data()?;
+        let answer = status_answer(data, request_id, "what a status query answered")?;
+        Ok(match offer_outcome(&answer)? {
+            OfferOutcome::Unknown => RekeyStatus::Unknown,
+            OfferOutcome::Applied(revision) => RekeyStatus::Applied { revision },
+            OfferOutcome::Refused(revision) => RekeyStatus::Refused { revision },
+            OfferOutcome::Fenced { never_ran } => RekeyStatus::Fenced { never_ran },
+        })
+    }
+
+    /// Ends one offer of a key record and says what became of it.
+    async fn offer_fence(
+        &self,
+        collection: &CollectionRef,
+        request_id: Uuid,
+        first_signed_at_ms: u64,
+        last_signed_at_ms: u64,
+    ) -> Result<RekeyFence> {
+        let request = fence_body(
+            Address::shared(collection),
+            request_id,
+            first_signed_at_ms,
+            last_signed_at_ms,
+        )?;
+        let data = self.ask(&request, None).await?.data()?;
+        let answer = status_answer(data, request_id, "what a fence answered")?;
+        Ok(match offer_outcome(&answer)? {
+            OfferOutcome::Unknown => return Err(fence_answered_unknown()),
+            OfferOutcome::Applied(revision) => RekeyFence::Applied { revision },
+            OfferOutcome::Refused(revision) => RekeyFence::Refused { revision },
+            OfferOutcome::Fenced { never_ran } => RekeyFence::Fenced { never_ran },
+        })
     }
 }
 
@@ -848,6 +1592,378 @@ impl SyncBackupService for ManagedSyncService {
     }
 }
 
+impl KeyRecordService for ManagedSyncService {
+    fn records_after<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        after: u64,
+    ) -> ServiceFuture<'a, KeyRecords> {
+        Box::pin(self.read_records_after(collection, after))
+    }
+
+    fn record_at<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        revision: u64,
+    ) -> ServiceFuture<'a, RecordAt> {
+        Box::pin(self.read_record_at(collection, revision))
+    }
+
+    fn rekey<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        request_id: Uuid,
+        signed_at_ms: u64,
+        record: &'a CollectionKeyRecord,
+    ) -> ServiceFuture<'a, RekeyAnswer> {
+        Box::pin(self.offer(collection, request_id, signed_at_ms, record))
+    }
+
+    fn rekey_status<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        request_id: Uuid,
+    ) -> ServiceFuture<'a, RekeyStatus> {
+        Box::pin(self.offer_status(collection, request_id))
+    }
+
+    fn rekey_fence<'a>(
+        &'a self,
+        collection: &'a CollectionRef,
+        request_id: Uuid,
+        first_signed_at_ms: u64,
+        last_signed_at_ms: u64,
+    ) -> ServiceFuture<'a, RekeyFence> {
+        Box::pin(self.offer_fence(
+            collection,
+            request_id,
+            first_signed_at_ms,
+            last_signed_at_ms,
+        ))
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Requests                                                                    */
+/* -------------------------------------------------------------------------- */
+
+/// The request one exchange makes.
+fn exchange_body<'a>(
+    address: Address,
+    named: Collection,
+    key_epoch: Option<u64>,
+    request_id: Uuid,
+    expected: Option<SyncPosition>,
+    object: &'a SealedSyncObject,
+) -> SyncRequest<'a> {
+    SyncRequest::Exchange(ExchangeBody {
+        request_id,
+        collection_id: address.collection_id,
+        home: address.home,
+        key_epoch: key_epoch.map(U64::new),
+        kind: named.kind,
+        object_id: named.object_id,
+        // The comparison is about identity, so it names the revision and only the revision. No
+        // position and a removal's position both name no object; the place in the order beside a
+        // revision is this client's to compare answers by, and it never travels.
+        expected_revision: expected.and_then(|position| position.revision.0),
+        object,
+    })
+}
+
+/// The request one fence makes, with its instants held to the rules the service reads them by.
+fn fence_body(
+    address: Address,
+    request_id: Uuid,
+    first_signed_at_ms: u64,
+    last_signed_at_ms: u64,
+) -> Result<SyncRequest<'static>> {
+    a_counter("the earliest signing time", first_signed_at_ms)?;
+    a_counter("the latest signing time", last_signed_at_ms)?;
+    if first_signed_at_ms > last_signed_at_ms {
+        return Err(malformed(
+            "a fence names the earliest signing time no later than the latest",
+        ));
+    }
+    Ok(SyncRequest::Fence(FenceBody {
+        collection_id: address.collection_id,
+        home: address.home,
+        request_id,
+        first_signed_at_ms: U64::new(first_signed_at_ms),
+        last_signed_at_ms: U64::new(last_signed_at_ms),
+    }))
+}
+
+/// The request one resolution makes.
+fn resolve_body(address: Address, retained: SyncConflictId) -> SyncRequest<'static> {
+    SyncRequest::Resolve(ResolveBody {
+        collection_id: address.collection_id,
+        home: address.home,
+        conflict_ids: vec![retained],
+    })
+}
+
+/* -------------------------------------------------------------------------- */
+/* Answers                                                                     */
+/* -------------------------------------------------------------------------- */
+
+/// Reads the answer to a request about a shared collection, taking its two answering refusals as
+/// answers.
+///
+/// `KEY_EPOCH_RETIRED` is an answer only to a write, so `write` says whether one was sent; any
+/// other refusal is the error the service named.
+fn reply(answer: Answer, write: bool) -> Result<Reply<serde_json::Value>> {
+    match answer {
+        Answer::Data(data) => Ok(Reply::Data(data)),
+        Answer::Refused(refusal) => match refusal.code() {
+            "COLLECTION_ABSENT" => Ok(Reply::Absent),
+            "KEY_EPOCH_RETIRED" if write => Ok(Reply::Retired(retired_head(&refusal)?)),
+            "KEY_EPOCH_RETIRED" => Err(retired_where_no_write_was()),
+            _ => Err(refusal.into_error()),
+        },
+    }
+}
+
+/// The collection's epoch and revision a retired refusal names, both of which it must name.
+fn retired_head(refusal: &Refusal) -> Result<KeyHead> {
+    let counter = |name: &str| -> Result<u64> {
+        let value = refusal.member(name).ok_or_else(|| {
+            contrary("a retired epoch without the collection's epoch and revision")
+        })?;
+        let counter: U64 = serde_json::from_value(value.clone())
+            .map_err(|error| unreadable_answer("what a retired epoch named", &error))?;
+        Ok(counter.get())
+    };
+    Ok(KeyHead {
+        epoch: counter("key_epoch")?,
+        revision: counter("key_revision")?,
+    })
+}
+
+/// Reads one answer as the shape the contract gives it.
+fn read<T: for<'de> Deserialize<'de>>(data: serde_json::Value, what: &str) -> Result<T> {
+    serde_json::from_value(data).map_err(|error| unreadable_answer(what, &error))
+}
+
+/// What one exchange did, as the service stated it.
+fn exchanged(answer: ExchangeAnswer, object_id: SyncObjectId) -> Result<SyncExchanged> {
+    Ok(match answer.state {
+        // Where the service put the write, as it stated it. A removal's place, and a place of
+        // nought, come back as the service said them rather than as something a caller would
+        // rather read: a caller that publishes writes declines both, and that is its decision.
+        ExchangeState::Written | ExchangeState::Removed => SyncExchanged::Applied {
+            position: SyncPosition {
+                write_sequence: answer.current_write_sequence.get(),
+                revision: answer.current_revision,
+            },
+        },
+        ExchangeState::Conflict => SyncExchanged::Refused {
+            retained: match answer.conflict.0 {
+                // A copy is of the refused write, so it is of this object. One naming another is a
+                // copy a resolution of this object must never be pointed at.
+                Some(copy) if copy.object_id != object_id => {
+                    return Err(contrary("a refusal whose copy is of another object"));
+                }
+                Some(copy) => Some(copy.conflict_id),
+                None => None,
+            },
+        },
+    })
+}
+
+/// What one resolution did: dropped the one copy it named, or found it already gone.
+fn dropped(data: serde_json::Value) -> Result<bool> {
+    let answer: ResolveAnswer = read(data, "what a resolution answered")?;
+    // One copy was named, so one was dropped or none was: a copy nobody holds any more is already
+    // resolved, which the service answers as nought rather than as a refusal.
+    match answer.resolved.get() {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(contrary(
+            "a resolution of one copy that dropped more than one",
+        )),
+    }
+}
+
+/// What one comparison found, as the service stated it.
+fn comparison(answer: CompareAnswer) -> Result<SyncComparison> {
+    let head = head_of(answer.key_epoch, answer.key_revision)?;
+    let objects = answer
+        .changed
+        .into_iter()
+        .map(|held| {
+            Ok(SyncHeldObject {
+                object_id: held.object_id,
+                kind: held.kind,
+                position: SyncPosition::at(held.write_sequence.get(), held.revision),
+                epoch: epoch_in(head, held.key_epoch)?,
+                ciphertext: encoded(&held.object)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let copies = answer
+        .conflicts
+        .into_iter()
+        .map(|copy| {
+            Ok(SyncHeldCopy {
+                sequence: copy.sequence.get(),
+                conflict_id: copy.conflict_id,
+                object_id: copy.object_id,
+                kind: copy.kind,
+                expected_revision: copy.expected_revision,
+                current: copy_position(&copy.current_revision, copy.current_write_sequence)?,
+                epoch: epoch_in(head, copy.key_epoch)?,
+                ciphertext: encoded(&copy.object)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(SyncComparison {
+        objects,
+        copies,
+        more_copies: answer.more_conflicts,
+        next_copies_after: answer.next_conflicts_after_sequence.get(),
+        head,
+        stored: answer.stored,
+    })
+}
+
+/// Where the collection's key records stood, as an answer named it: both the epoch and the
+/// revision, or neither.
+fn head_of(key_epoch: Option<U64>, key_revision: Option<U64>) -> Result<Option<KeyHead>> {
+    match (key_epoch, key_revision) {
+        (Some(epoch), Some(revision)) => Ok(Some(KeyHead {
+            epoch: epoch.get(),
+            revision: revision.get(),
+        })),
+        (None, None) => Ok(None),
+        _ => Err(contrary(
+            "a key epoch without its record revision, or the other way round",
+        )),
+    }
+}
+
+/// The epoch one object or copy is sealed under, which is named exactly when the collection has a
+/// key record, and never above the collection's own.
+fn epoch_in(head: Option<KeyHead>, epoch: Option<U64>) -> Result<Option<u64>> {
+    match (head, epoch) {
+        (Some(head), Some(epoch)) if epoch.get() <= head.epoch => Ok(Some(epoch.get())),
+        (Some(_), Some(_)) => Err(contrary(
+            "an object sealed under an epoch after the collection's",
+        )),
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(contrary(
+            "an object with no epoch in a collection that has one",
+        )),
+        (None, Some(_)) => Err(contrary(
+            "an object with an epoch in a collection that has none",
+        )),
+    }
+}
+
+/// What a status query or a fence found about a write's identity in a shared collection.
+enum WriteOutcome {
+    /// Applied, leaving the object at this position.
+    Applied(SyncPosition),
+    /// Refused, with the copy the service kept when it kept one.
+    Refused(Option<SyncConflictId>),
+    /// Fenced before it ran.
+    Fenced {
+        /// Whether the service also established that it never ran.
+        never_ran: bool,
+    },
+    /// No receipt is held for it.
+    Unknown,
+    /// Refused for naming a retired epoch; the receipt names the collection's head.
+    Retired(KeyHead),
+}
+
+/// Reads what a status query or a fence answered about a write's identity, with the head its
+/// receipt named.
+///
+/// In a shared collection one identity is one name whichever member used it and whatever it
+/// carried, so the outcome is read beside the state and must be one the state is answered as. A
+/// write's identity answers only a write's outcomes: one that names the offer of a key record is
+/// an answer about another request.
+fn write_outcome(answer: &StatusAnswer) -> Result<(WriteOutcome, Option<KeyHead>)> {
+    let head = head_of(answer.key_epoch, answer.key_revision)?;
+    let outcome = match consistent_outcome(answer)? {
+        None => WriteOutcome::Unknown,
+        Some(ReceiptOutcome::Written | ReceiptOutcome::Removed) => {
+            WriteOutcome::Applied(recorded_position(answer)?)
+        }
+        Some(ReceiptOutcome::Conflict) => WriteOutcome::Refused(answer.conflict_id.0),
+        Some(ReceiptOutcome::Fenced) => WriteOutcome::Fenced {
+            never_ran: answer.never_ran,
+        },
+        Some(ReceiptOutcome::Retired) => WriteOutcome::Retired(head.ok_or_else(|| {
+            contrary("a retired write whose receipt names no epoch and revision")
+        })?),
+        Some(ReceiptOutcome::Rekeyed | ReceiptOutcome::RekeyRefused) => {
+            return Err(contrary(
+                "an answer about the offer of a key record for a write's identity",
+            ));
+        }
+    };
+    Ok((outcome, head))
+}
+
+/// What a status query or a fence found about the identity of a key record offer.
+enum OfferOutcome {
+    /// Applied: the record is the collection's at this revision.
+    Applied(u64),
+    /// Refused; the collection held this revision.
+    Refused(u64),
+    /// Fenced before it ran.
+    Fenced {
+        /// Whether the service also established that it never ran.
+        never_ran: bool,
+    },
+    /// No receipt is held for it.
+    Unknown,
+}
+
+/// Reads what a status query or a fence answered about the identity of a key record offer.
+///
+/// An offer's identity answers only an offer's outcomes and a fence: one that names a write's is
+/// an answer about another request.
+fn offer_outcome(answer: &StatusAnswer) -> Result<OfferOutcome> {
+    let revision = || {
+        answer
+            .key_revision
+            .map(U64::get)
+            .ok_or_else(|| contrary("an answer about a key record offer that names no revision"))
+    };
+    Ok(match consistent_outcome(answer)? {
+        None => OfferOutcome::Unknown,
+        Some(ReceiptOutcome::Rekeyed) => OfferOutcome::Applied(revision()?),
+        Some(ReceiptOutcome::RekeyRefused) => OfferOutcome::Refused(revision()?),
+        Some(ReceiptOutcome::Fenced) => OfferOutcome::Fenced {
+            never_ran: answer.never_ran,
+        },
+        Some(
+            ReceiptOutcome::Written
+            | ReceiptOutcome::Removed
+            | ReceiptOutcome::Conflict
+            | ReceiptOutcome::Retired,
+        ) => {
+            return Err(contrary(
+                "an answer about a write for the identity of a key record offer",
+            ));
+        }
+    })
+}
+
+/// The receipt's outcome, which must be the one the state it is answered as comes from.
+fn consistent_outcome(answer: &StatusAnswer) -> Result<Option<ReceiptOutcome>> {
+    match (answer.outcome.0, answer.state) {
+        (None, StatusState::Unknown) => Ok(None),
+        (Some(outcome), state) if outcome.state() == state => Ok(Some(outcome)),
+        _ => Err(contrary(
+            "a request's state that is not the one its recorded outcome is answered as",
+        )),
+    }
+}
+
 /// Reads the bytes a caller asked to publish as the sealed object they are, and holds that object
 /// to every rule the service checks without a key.
 ///
@@ -896,8 +2012,7 @@ fn copy_position(current_revision: &str, write_sequence: U64) -> Result<Option<S
 
 /// Reads what a status query or a fence answered, and holds it to the identity asked about.
 fn status_answer(data: serde_json::Value, request_id: Uuid, what: &str) -> Result<StatusAnswer> {
-    let answer: StatusAnswer =
-        serde_json::from_value(data).map_err(|error| unreadable_answer(what, &error))?;
+    let answer: StatusAnswer = read(data, what)?;
     if answer.request_id != request_id {
         return Err(contrary("an answer about another request identity"));
     }
@@ -924,6 +2039,21 @@ fn a_counter(what: &str, value: u64) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// A fence either finds an outcome or makes one, so it is never answered `unknown`.
+fn fence_answered_unknown() -> ClientError {
+    contrary("a fence with \"unknown\", which a fence never answers")
+}
+
+/// A retired epoch is an answer only to a write that named one.
+fn retired_where_no_write_was() -> ClientError {
+    contrary("a retired epoch to a request that wrote nothing")
+}
+
+/// A write to a collection only its home writes names no epoch, so none of it can be retired.
+fn retired_where_no_epoch_was() -> ClientError {
+    contrary("a retired epoch about a write that named none")
 }
 
 /// An answer that was read and says something the service's contract does not allow.

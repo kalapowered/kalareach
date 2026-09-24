@@ -289,9 +289,12 @@ fn the_largest_exchange_fits_the_request_the_service_admits() {
         largest.size_bucket_bytes.get(),
         MAX_SYNC_OBJECT_PLAINTEXT_BYTES
     );
+    // The largest exchange is one into a shared collection: it names the home and the epoch too.
     let body = serde_json::to_vec(&SyncRequest::Exchange(ExchangeBody {
         request_id: identity(1),
         collection_id: SyncCollectionId::new(identity(2)),
+        home: Some(InstallationId::new(identity(5))),
+        key_epoch: Some(U64::new(MAX_SYNC_COUNTER)),
         kind: SyncObjectKind::Settings,
         object_id: SyncObjectId::new(identity(2)),
         expected_revision: Some(revision(3)),
@@ -1242,12 +1245,14 @@ fn a_rendering_of_a_request_an_object_or_a_copy_carries_nothing_sealed() {
         &ExchangeBody {
             request_id: identity(1),
             collection_id: SyncCollectionId::new(identity(2)),
+            home: Some(InstallationId::new(identity(5))),
+            key_epoch: Some(U64::new(3)),
             kind: SyncObjectKind::Settings,
             object_id: SyncObjectId::new(identity(2)),
             expected_revision: Some(revision(3)),
             object: &object,
         },
-        "ExchangeBody{kind:Settings,size_bucket_bytes:U64(1024),expects_an_object:true,..}",
+        "ExchangeBody{kind:Settings,size_bucket_bytes:U64(1024),expects_an_object:true,key_epoch:Some(U64(3)),..}",
     );
 
     let ciphertext = published(&object);
@@ -1255,12 +1260,13 @@ fn a_rendering_of_a_request_an_object_or_a_copy_carries_nothing_sealed() {
         object_id: SyncObjectId::new(identity(2)),
         kind: SyncObjectKind::Settings,
         position: SyncPosition::at(4, revision(9)),
+        epoch: Some(2),
         ciphertext: ciphertext.clone(),
     };
     renders_only(
         &held,
         &format!(
-            "SyncHeldObject{{object_id:{:?},kind:Settings,position:{:?},..}}",
+            "SyncHeldObject{{object_id:{:?},kind:Settings,position:{:?},epoch:Some(2),..}}",
             held.object_id, held.position
         )
         .replace(' ', ""),
@@ -1273,12 +1279,13 @@ fn a_rendering_of_a_request_an_object_or_a_copy_carries_nothing_sealed() {
         kind: SyncObjectKind::Settings,
         expected_revision: Nullable::null(),
         current: Some(SyncPosition::at(4, revision(9))),
+        epoch: Some(2),
         ciphertext,
     };
     renders_only(
         &copy,
         &format!(
-            "SyncHeldCopy{{sequence:3,conflict_id:{:?},object_id:{:?},kind:Settings,current:{:?},..}}",
+            "SyncHeldCopy{{sequence:3,conflict_id:{:?},object_id:{:?},kind:Settings,current:{:?},epoch:Some(2),..}}",
             copy.conflict_id, copy.object_id, copy.current
         )
         .replace(' ', ""),
@@ -1291,3 +1298,6 @@ fn a_rendering_of_a_request_an_object_or_a_copy_carries_nothing_sealed() {
         assert!(!rendering.contains("7e"), "{rendering}");
     }
 }
+
+/// The calls about collections two or more devices share.
+mod shared;

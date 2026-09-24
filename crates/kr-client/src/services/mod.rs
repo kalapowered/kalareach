@@ -52,8 +52,8 @@
 //! | [`mailbox::MailboxClaimAnswer`] | The proof that a mailbox is this device's own | The challenge it answers |
 //! | [`mailbox::MailboxItem`] | A sealed item a mailbox served back | Its position, what the item is, its declared size |
 //! | [`mailbox::MailboxPage`] | Those items | How many came back, the cursor, what the mailbox holds |
-//! | [`sync::SyncHeldObject`] | A sealed object a collection holds | The object, its kind, where it stands |
-//! | [`sync::SyncHeldCopy`] | A sealed copy of a refused write | The copy, its object and kind, where the object stood |
+//! | [`sync::SyncHeldObject`] | A sealed object a collection holds | The object, its kind, where it stands, its key epoch |
+//! | [`sync::SyncHeldCopy`] | A sealed copy of a refused write | The copy, its object and kind, where the object stood, its key epoch |
 //!
 //! A type that holds one of these only through one of these, as [`AccountSession`] holds a token
 //! and [`relay::RelayLeaseAnswer`] holds a grant, is safe to derive, because the rendering it
@@ -117,7 +117,10 @@ pub use relay::{
     RelayLeaseEnding, RelayLeaseGrant, RelayLeaseRefusal, RelayWarning, ServiceHttp,
     ServiceHttpAnswer, ServiceSigner,
 };
-pub use sync::{ManagedSyncService, SyncComparison, SyncHeldCopy, SyncHeldObject, SyncUsage};
+pub use sync::{
+    Inventory, InventoryCopy, InventoryObject, ManagedSyncService, MembershipListing,
+    SyncComparison, SyncHeldCopy, SyncHeldObject, SyncUsage,
+};
 pub use voice::{
     AccountToken, AccountTokenSource, ManagedVoiceBroker, ManagedVoiceService, VoiceClosure,
     VoiceCommand, VoiceContextFrame, VoiceControlEvent, VoiceRefusal, VoiceRefusalReason,
@@ -583,6 +586,47 @@ pub enum SyncRequestFence {
         /// a caller keeps whatever account it owes for content that left the device.
         never_ran: bool,
     },
+}
+
+/// Where a shared collection's key records stood when a service answered: the newest record's key
+/// epoch and its revision.
+///
+/// A device that holds an older revision fetches the records after it before it trusts anything
+/// sealed under a newer epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct KeyHead {
+    /// The epoch of the key the newest record carries.
+    pub epoch: u64,
+    /// The newest record's revision.
+    pub revision: u64,
+}
+
+/// What a service answered about one request in a collection two or more devices share.
+///
+/// Two answers beyond those a collection only its home writes can give. A write sealed under an
+/// epoch the collection has retired is refused, stores nothing and holds nothing, and the refusal
+/// is that request's receipt. And a collection that does not exist is answered exactly as one whose
+/// newest key record does not list the caller, so the two cannot be told apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Keyed<T> {
+    /// The service answered.
+    Answered {
+        /// What it answered.
+        answer: T,
+        /// Where the collection's key records stood, as the answer named it. An answer that names
+        /// no receipt names no key records either.
+        head: Option<KeyHead>,
+    },
+    /// The request named a key epoch the collection has retired.
+    ///
+    /// It ends the attempt that met it and says nothing of an earlier attempt under the same
+    /// identity: one whose receipt the service no longer holds may have run.
+    Retired {
+        /// The collection's epoch and revision, as the refusal named them.
+        head: KeyHead,
+    },
+    /// The collection does not exist, or its newest key record does not list this device.
+    Absent,
 }
 
 /// Where encrypted settings and backups are exchanged.
