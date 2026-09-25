@@ -1162,8 +1162,20 @@ pub mod testing {
     ///
     /// Returns what to build when the binary is not there.
     pub fn built_binary(name: &str) -> Result<PathBuf, String> {
-        let _ = name;
-        Err("not built yet".to_owned())
+        let this = std::env::current_exe().map_err(|error| format!("this test: {error}"))?;
+        let profile = this
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| format!("{} is not inside a build directory", this.display()))?;
+        let binary = profile.join(format!("{name}.exe"));
+        if binary.is_file() {
+            Ok(binary)
+        } else {
+            Err(format!(
+                "{} is not built: build it before this suite (cargo build -p {name})",
+                binary.display()
+            ))
+        }
     }
 
     /// The environment's task, registered for a test and removed when this is dropped, and only
@@ -1183,8 +1195,13 @@ pub mod testing {
         ///
         /// Returns what went wrong when the account, the session or the registration failed.
         pub fn register(environment: &EnvironmentPaths, starter: &Path) -> Result<Self, String> {
-            let _ = (environment, starter);
-            Err("not built yet".to_owned())
+            let user = kr_ipc::starter::current_user_sid()
+                .map_err(|error| format!("this account: {error}"))?;
+            let logon =
+                logon_for_this_session().map_err(|error| format!("this session: {error}"))?;
+            let definition = TaskDefinition::new(user, environment, starter, logon);
+            register(&definition)?;
+            Ok(Self { definition })
         }
 
         /// The definition registered.
@@ -1209,8 +1226,11 @@ pub mod testing {
     pub fn supervisor(
         environment: &EnvironmentPaths,
     ) -> Result<(TestTask, TaskSupervisor), String> {
-        let _ = environment;
-        Err("not built yet".to_owned())
+        let starter = built_binary("kr-controller")?;
+        let task = TestTask::register(environment, &starter)?;
+        let supervisor = TaskSupervisor::new(environment.clone(), &starter)
+            .map_err(|error| format!("the supervisor: {error}"))?;
+        Ok((task, supervisor))
     }
 }
 
