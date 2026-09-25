@@ -1722,8 +1722,10 @@ impl StagedPackage {
             }
         };
         // Every directory from a replaced file up to the package's own holds a new entry, a
-        // replaced file or a directory created for one, so each of them is flushed.
-        let mut touched: BTreeMap<PathBuf, Area> = BTreeMap::new();
+        // replaced file or a directory created for one, so each of them is flushed, for the kind
+        // of name it holds: a file's for the directory a file was renamed into, whatever else it
+        // holds, and a directory's for each one above it.
+        let mut touched: BTreeMap<PathBuf, (Area, NameKind)> = BTreeMap::new();
         for relative in self.written.keys() {
             let relative = Path::new(relative);
             let staged = self.dir.path.join(relative);
@@ -1761,13 +1763,15 @@ impl StagedPackage {
                     false,
                 )
                 .map_err(|error| stopped(&replaced, error))?;
-                touched.insert(directory.path.clone(), directory);
+                touched
+                    .entry(directory.path.clone())
+                    .or_insert((directory, NameKind::Directory));
                 directory = next;
             }
-            touched.insert(directory.path.clone(), directory);
+            touched.insert(directory.path.clone(), (directory, NameKind::File));
         }
-        for directory in touched.values() {
-            flushed_after_publication(directory, &package.path, NameKind::File)?;
+        for (directory, kind) in touched.values() {
+            flushed_after_publication(directory, &package.path, *kind)?;
         }
         Ok(())
     }
@@ -3225,6 +3229,136 @@ mod tests {
         let staged = stage();
         flush_tree(&staged.dir).expect("with nothing holding it, the staged tree is flushed");
         staged.abandon();
+    }
+
+    /// Runs a program and returns what it printed, failing the test when it fails.
+    #[cfg(windows)]
+    fn run_program(program: &str, arguments: &[&std::ffi::OsStr]) -> String {
+        let output = std::process::Command::new(program)
+            .args(arguments)
+            .output()
+            .unwrap_or_else(|error| panic!("{program} starts: {error}"));
+        let printed = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "{program} failed: {printed}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        printed
+    }
+
+    /// Refuses this account the right to add a file to one directory, and nothing else, until it
+    /// is dropped.
+    #[cfg(windows)]
+    struct AddingFilesRefused {
+        directory: PathBuf,
+        account: String,
+    }
+
+    #[cfg(windows)]
+    impl AddingFilesRefused {
+        fn on(directory: &Path) -> Self {
+            use std::os::windows::fs::OpenOptionsExt as _;
+
+            /// The right to add a file to a directory.
+            const FILE_ADD_FILE: u32 = 0x0002;
+            /// The right to add a directory to one.
+            const FILE_ADD_SUBDIRECTORY: u32 = 0x0004;
+            /// What lets a program open a directory at all.
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+            let printed = run_program(
+                "whoami.exe",
+                &[
+                    "/user".as_ref(),
+                    "/fo".as_ref(),
+                    "csv".as_ref(),
+                    "/nh".as_ref(),
+                ],
+            );
+            let account = printed
+                .trim()
+                .rsplit(',')
+                .next()
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_owned();
+            assert!(
+                account.starts_with("S-1-"),
+                "this account's identifier: {printed}"
+            );
+            // An entry for this directory alone, which nothing created inside it inherits.
+            run_program(
+                "icacls.exe",
+                &[
+                    directory.as_os_str(),
+                    "/deny".as_ref(),
+                    format!("*{account}:(WD)").as_ref(),
+                ],
+            );
+            let refused = Self {
+                directory: directory.to_path_buf(),
+                account,
+            };
+            let open = |right: u32| {
+                std::fs::OpenOptions::new()
+                    .access_mode(right)
+                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                    .open(directory)
+            };
+            // The list is what refuses it: an account holding a privilege that overrides lists
+            // would be let through, and for it this arrangement cannot be made.
+            assert_eq!(
+                open(FILE_ADD_FILE)
+                    .expect_err("adding a file is refused")
+                    .kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            open(FILE_ADD_SUBDIRECTORY).expect("adding a directory is not");
+            refused
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for AddingFilesRefused {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("icacls.exe")
+                .arg(&self.directory)
+                .arg("/remove:d")
+                .arg(format!("*{}", self.account))
+                .output();
+        }
+    }
+
+    /// KR-REQ-11.06: a package repaired in place has each directory it changed flushed for the
+    /// kind of name that directory gained. Here the package's own directory may gain a directory
+    /// and not a file: the repair makes `assets` in it and renames the missing file into `assets`,
+    /// so the package's directory is flushed with the right to add a directory and `assets` with
+    /// the right to add a file, and the repair reports success.
+    #[cfg(windows)]
+    #[test]
+    fn a_repair_flushes_each_directory_for_the_kind_of_name_it_gained() {
+        let (_directory, store) = store();
+        let digest = PayloadDigest::of(b"manifest");
+        let package = store.package_dir(digest);
+        std::fs::create_dir_all(&package).expect("a package directory already in place");
+        std::fs::write(package.join("plugin.json"), b"manifest").expect("its manifest, intact");
+        let mut staged = store.stage_package(digest).expect("a staging directory");
+        staged
+            .write(&path("plugin.json"), b"manifest")
+            .expect("written");
+        staged
+            .write(&path("assets/icon.txt"), b"icon")
+            .expect("written");
+
+        let refused = AddingFilesRefused::on(&package);
+        let repaired = owned(|permit| staged.activate(permit));
+        drop(refused);
+        assert_eq!(repaired.expect("the repair is made and flushed"), package);
+        assert_eq!(
+            std::fs::read(package.join("assets").join("icon.txt")).expect("the repaired file"),
+            b"icon"
+        );
     }
 
     /// A directory the store holds is flushed through a second handle opened from the one held,
