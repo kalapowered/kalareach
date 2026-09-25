@@ -15,9 +15,13 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use kr_conformance::id::{Identifier, Refusal};
+use kr_conformance::libtest::{Binary, Outcome as LibtestOutcome};
+use kr_conformance::map::Key;
 use kr_conformance::map::{self, Binding, Declarations, Map, Place};
 use kr_conformance::plan::{self, Group, Platform, Step};
-use kr_conformance::report::{self, Document, Options, Outcome, Stopped, Verdict};
+use kr_conformance::report::{self, Document, Gathered, Options, Outcome, Stopped, Verdict};
+use kr_conformance::run::Executed;
+use kr_conformance::workspace::{TargetId, TargetKind};
 
 fn tree(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -557,6 +561,97 @@ fn a_source_outside_the_conventions_is_a_problem_and_keys_no_helper() {
             map.references.get(&row)
         );
     }
+}
+
+#[test]
+fn a_test_record_takes_its_command_and_what_it_needs_from_the_same_run() {
+    // On Windows the client's whole library lists the credential store's case as ignored, and
+    // the step that runs it with `--ignored` reads the switch that lets it write the store: the
+    // record's command is that step's, so what the command needs is that step's as well.
+    let name = "sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again";
+    let target = TargetId {
+        package: "kr-client".to_owned(),
+        kind: TargetKind::Lib,
+        name: "kr_client".to_owned(),
+    };
+    let row = identifier("KR-REQ-29.01");
+    let mut map = Map::default();
+    map.keys.entry(row).or_default().insert(
+        Place::Rust {
+            target: target.clone(),
+            name: name.to_owned(),
+        },
+        Key {
+            binding: Binding::AttachedComment,
+            source: "crates/kr-client/src/sync/keys.rs:698".to_owned(),
+        },
+    );
+    let steps = plan::steps(Platform::Windows, &[Group::Rust], "/tmp/e", None);
+    let whole = steps
+        .iter()
+        .find(|step| step.what == "the client's stores and their directory flush")
+        .expect("the client's library")
+        .clone();
+    let switched = steps
+        .iter()
+        .find(|step| step.command.iter().any(|word| word == name))
+        .expect("the credential store's case")
+        .clone();
+    assert_eq!(switched.needs, [plan::SECRET_STORE_VARIABLE]);
+    let executed = |step: Step, outcome: LibtestOutcome| Executed {
+        step,
+        exit: Some(0),
+        seconds: 0,
+        log: "conformance/logs/x.log".to_owned(),
+        binaries: vec![(
+            Some(target.clone()),
+            Binary {
+                executable: "kr_client-0.exe".to_owned(),
+                source: "src/lib.rs".to_owned(),
+                tests: [(name.to_owned(), outcome)].into(),
+                summary: None,
+                readable: true,
+            },
+        )],
+        built: vec![target.clone()],
+        listed: [(target.clone(), [name.to_owned()].into())].into(),
+        vitest: None,
+        error: None,
+    };
+    let options = Options {
+        root: PathBuf::from("/tmp/r"),
+        evidence: PathBuf::from("/tmp/e"),
+        selection: Some(vec![Group::Rust]),
+        all_terminals: false,
+        platform: Platform::Windows,
+        case_tables: &[],
+        lanes: &[],
+        applications: None,
+        steps: None,
+        lister: PathBuf::from("/tmp/l"),
+        environment: Vec::new(),
+    };
+    let document = report::assemble(
+        &options,
+        &[Group::Rust],
+        &map,
+        &[
+            executed(whole, LibtestOutcome::Ignored(None)),
+            executed(switched, LibtestOutcome::Passed),
+        ],
+        Gathered::default(),
+        "2026-09-26T00:00:00Z".to_owned(),
+    );
+    let record = &document.identifiers["KR-REQ-29.01"].tests[0];
+    assert_eq!(record.outcome, Outcome::Passed);
+    assert!(
+        record
+            .command
+            .as_deref()
+            .is_some_and(|command| command.contains("--ignored")),
+        "{record:?}"
+    );
+    assert_eq!(record.needs, [plan::SECRET_STORE_VARIABLE], "{record:?}");
 }
 
 #[test]

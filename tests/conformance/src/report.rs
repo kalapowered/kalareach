@@ -942,9 +942,9 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    /// The variables the step that listed a test reads.
+    /// The variables the step its command is taken from reads (see [`reproducing`]).
     fn needs(&self, runs: &[RunRecord]) -> Vec<String> {
-        runs.first()
+        reproducing(runs)
             .map(|run| {
                 self.executed[run.step - 1]
                     .step
@@ -1005,11 +1005,7 @@ impl<'a> Resolver<'a> {
     /// The command that reproduces a Rust test: the step that ran it, narrowed to its package,
     /// its target and the test, or the ordinary `cargo test` of it where no step did.
     fn rust_command(&self, target: &TargetId, name: &str, runs: &[RunRecord]) -> String {
-        let step = runs
-            .iter()
-            .find(|run| matches!(run.outcome, Outcome::Passed | Outcome::Failed))
-            .or_else(|| runs.first())
-            .map(|run| &self.executed[run.step - 1].step);
+        let step = reproducing(runs).map(|run| &self.executed[run.step - 1].step);
         let mut words = vec!["cargo".to_owned(), "test".to_owned(), "--locked".to_owned()];
         let mut test_arguments: Vec<String> = Vec::new();
         if let Some(step) = step {
@@ -1446,6 +1442,15 @@ pub fn lock_applications(root: &Path, family: &str) -> Result<Vec<ApplicationRec
 #[must_use]
 pub fn result_path(evidence: &Path) -> PathBuf {
     evidence.join("conformance").join("result.json")
+}
+
+/// The run a test's record reproduces: the first that ran it, passed or failed, or else the first
+/// that listed it. Its command and the variables that command needs both come from that run's
+/// step, so a record never names a command without what the command reads.
+fn reproducing(runs: &[RunRecord]) -> Option<&RunRecord> {
+    runs.iter()
+        .find(|run| matches!(run.outcome, Outcome::Passed | Outcome::Failed))
+        .or_else(|| runs.first())
 }
 
 #[cfg(test)]
