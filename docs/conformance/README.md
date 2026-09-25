@@ -68,10 +68,10 @@ runner to rustdoc, and the programs rustdoc builds of a crate's documentation te
 build's and are keyed nowhere, so the listing passes over them; a test binary whose list overlaps
 another program's cannot be read and is the step's error. Every test binary the build made then has
 to be run and read: a listing that fails, a binary the log never ran, and a log that cannot be read
-are each the step's error, and the tests of a target the step built and did not run are not run,
-with that error as the reason. A target whose manifest gives it a harness of its own
-(`harness = false`) is a program that prints neither a list nor verdicts: the runner does not run
-it while the tests are listed, it is run with the step, its exit status is the step's, and a
+are each the step's error, and the tests of a target the step built with no run of it that can be
+read are not run, with that error as the reason. A target whose manifest gives it a harness of its
+own (`harness = false`) is a program that prints neither a list nor verdicts: the runner does not
+run it while the tests are listed, it is run with the step, its exit status is the step's, and a
 comment on it is a reference.
 
 A test that no selected group runs on this platform is reported as not run, with the reason. It is
@@ -115,7 +115,7 @@ row that does not exist.
 | A test function whose name spells an identifier in snake case: `kr_req_11_07_...`, `kr_acc_004_...` | That test. A name that spells no accepted form is only a name |
 | A module comment (`//!`) of test code | Every test in that module and the modules inside it |
 | In test code, a comment block with a blank line after it | Every test from there to the next such block, or the end of the module |
-| In test code, a comment on a function | Every test of the same target whose body calls that function, where the report proves from the target's own source that the compiler resolves the call to it: through module definitions, `crate`, `self` and `super`, a `use` that keeps the item's own name, and globs, each judged by who may name what it brings in. A renaming `use`, a name or glob the calling body brings in for itself, a module whose macros make items, a glob it cannot follow and a visibility it cannot work out all stop it, and a call it cannot prove keys nothing, so the function's identifiers stay references rather than become a key the compiler would not make |
+| In test code, a comment on a function | Every test of the same target whose body calls that function, where the report proves from the target's own source that the compiler resolves the call to it: through module definitions, `crate`, `self` and `super`, a `use` that keeps the item's own name, and globs, each judged by who may name what it brings in. A renaming `use`, a name or glob the calling body brings in for itself, a first name the calling body may bind for itself (a local, a nested item, or a macro or attribute whose expansion the report cannot see), a module whose macros make items, a glob it cannot follow and a visibility it cannot work out all stop it, and a call it cannot prove keys nothing, so the function's identifiers stay references rather than become a key the compiler would not make |
 | A `covers` field of a `const` or `static` case table | Every test of the same package whose body names the table |
 
 Test code is a test or bench target, or a module compiled under `cfg(test)`. A comment on product
@@ -174,7 +174,7 @@ Each keyed test has one outcome on this platform:
 | `passed` | A step ran it and it passed |
 | `failed` | A step ran it and it failed, or its binary's output could not be read against the summary the harness printed |
 | `ignored` | Every step that listed it left it out, with the reason its `#[ignore]` gives |
-| `not_run` | No step of this run ran it here: a step's own flags left it out, no selected group runs its target on this platform, another toolchain builds it, a step that would run it failed before it did, or it returned early and said why. The reason says which |
+| `not_run` | No step of this run ran it here: a step's own flags left it out, no selected group runs its target on this platform, another toolchain builds it, the step that built it failed before a run of it could be read, or it returned early and said why. The reason says which |
 | `not_built` | A step ran its target and this platform's build of it has no such test |
 | `known_difference` | It ran and held what the profile defines, and it recorded that the application it is about reads the same thing differently |
 
