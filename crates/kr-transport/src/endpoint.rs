@@ -11,13 +11,16 @@
 //! none, the relay connection and the Pkarr requests go directly. The two relay probes are the
 //! exception: iroh builds their client with the environment's proxy settings when it is given no
 //! proxy, and offers no way to turn that off, so they follow `HTTP_PROXY`, `HTTPS_PROXY` and
-//! `ALL_PROXY` when those are set.
+//! `ALL_PROXY` when those are set. Name lookups go directly either way, over plain DNS or DNS over
+//! TLS: the resolver is this module's, and it has no DNS-over-HTTPS client, which would follow
+//! those variables too.
 //!
 //! [`connect`] is the dialling half: it opens a connection and, when a relay the connection needed
 //! turned this endpoint away, or the network refused the relay's WebSocket upgrade, says so rather
 //! than reporting a peer that did not answer.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -111,13 +114,15 @@ async fn bind(
             reason: "an endpoint with no relay and no direct path can reach nothing".to_owned(),
         });
     }
-    if !config.relay_ca_roots.is_empty() {
-        let roots = config
+    let ca_tls = CaTlsConfig::default().with_extra_roots(
+        config
             .relay_ca_roots
             .iter()
-            .map(|der| CertificateDer::from(der.clone()));
-        builder = builder.ca_tls_config(CaTlsConfig::default().with_extra_roots(roots));
-    }
+            .map(|der| CertificateDer::from(der.clone())),
+    );
+    builder = builder
+        .dns_resolver(dns_resolver(&ca_tls)?)
+        .ca_tls_config(ca_tls);
     // The relay client tunnels through the proxy with CONNECT, and the net report sends its relay
     // latency probe and captive-portal check through it. Nothing falls back to a direct connection
     // when the proxy cannot be reached: the owner chose to go through it. `proxy_from_env` is never
@@ -628,6 +633,80 @@ fn apply_discovery(mut builder: Builder, config: &EndpointConfig) -> Result<Buil
     Ok(builder)
 }
 
+/// The public resolvers this endpoint's lookups fall back to, each as its IPv4 and IPv6 primary
+/// addresses and then its secondary ones.
+///
+/// They are the three iroh falls back to (n0-dns-resolver 0.1.0's `public_resolvers`: Cloudflare,
+/// Google and Quad9), whose certificates name these addresses, so DNS over TLS verifies without a
+/// server name.
+const PUBLIC_RESOLVERS: [[IpAddr; 4]; 3] = [
+    [
+        IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+        IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+        IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
+        IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1001)),
+    ],
+    [
+        IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)),
+        IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)),
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8844)),
+    ],
+    [
+        IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
+        IpAddr::V6(Ipv6Addr::new(0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x00fe)),
+        IpAddr::V4(Ipv4Addr::new(149, 112, 112, 112)),
+        IpAddr::V6(Ipv6Addr::new(0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x0009)),
+    ],
+];
+
+/// Returns the resolver this endpoint looks names up with: the system's configuration, and behind
+/// it the public resolvers over plain DNS and DNS over TLS.
+///
+/// iroh's own resolver has the same two tiers, but its fallback also asks over DNS over HTTPS, and
+/// that client follows `HTTPS_PROXY` and `ALL_PROXY` whether or not a proxy is selected. This one
+/// speaks no HTTP, so nothing the environment names moves a lookup. DNS over TLS verifies against
+/// the same anchors as the relay, and like the rest of the lookup it goes directly.
+fn dns_resolver(ca_tls: &CaTlsConfig) -> Result<iroh::dns::DnsResolver> {
+    let tls = ca_tls
+        .client_config(iroh_relay::tls::default_provider())
+        .map_err(|error| TransportError::Configuration {
+            what: "dns".to_owned(),
+            kind: "DNS resolver",
+            reason: error.to_string(),
+        })?;
+    Ok(iroh::dns::DnsResolver::builder()
+        .with_system_defaults()
+        .fallback_nameserver_configs(fallback_nameservers())
+        .tls_client_config(tls)
+        .build())
+}
+
+/// Returns the fallback tier in iroh's own order, with DNS over TLS where iroh has DNS over HTTPS.
+///
+/// Plain entries go round the providers, primary addresses first, and one encrypted entry per
+/// provider sits after the first two, inside the first wave of queries, so on a network that
+/// filters port 53 the encrypted ones are already racing. A plain entry asks over UDP and asks
+/// again over TCP when an answer is truncated or does not come.
+fn fallback_nameservers() -> Vec<iroh::dns::NameserverConfig> {
+    use iroh::dns::NameserverConfig;
+
+    let mut servers: Vec<NameserverConfig> = (0..4)
+        .flat_map(|index| {
+            PUBLIC_RESOLVERS
+                .iter()
+                .map(move |provider| NameserverConfig::udp(provider[index]))
+        })
+        .collect();
+    servers.splice(
+        2..2,
+        PUBLIC_RESOLVERS
+            .iter()
+            .map(|provider| NameserverConfig::tls(provider[0])),
+    );
+    servers
+}
+
 /// Returns the transport configuration every KalaReach connection uses.
 ///
 /// The keepalive and the idle timeout are the section 23 values. Setting them here rather than per
@@ -649,6 +728,57 @@ fn transport_config() -> QuicTransportConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KR-REQ-26.14: the endpoint's lookups fall back to the public resolvers over plain DNS and DNS
+    /// over TLS, in iroh's order, and to nothing that speaks HTTP.
+    #[test]
+    fn the_dns_fallback_is_the_public_resolvers_without_http() {
+        use iroh::dns::NameserverConfig;
+
+        let servers = fallback_nameservers();
+        assert_eq!(
+            servers.len(),
+            15,
+            "twelve plain entries and three encrypted"
+        );
+        for server in &servers {
+            let described = format!("{server:?}");
+            assert!(!described.contains("Https"), "{described}");
+        }
+        let v4 = |a, b, c, d| IpAddr::V4(Ipv4Addr::new(a, b, c, d));
+        assert_eq!(
+            servers[..6],
+            [
+                NameserverConfig::udp(v4(1, 1, 1, 1)),
+                NameserverConfig::udp(v4(8, 8, 8, 8)),
+                NameserverConfig::tls(v4(1, 1, 1, 1)),
+                NameserverConfig::tls(v4(8, 8, 8, 8)),
+                NameserverConfig::tls(v4(9, 9, 9, 9)),
+                NameserverConfig::udp(v4(9, 9, 9, 9)),
+            ]
+        );
+    }
+
+    /// KR-REQ-26.14: an endpoint looks names up with that resolver. Its fallback asks the public
+    /// resolvers over DNS over TLS, and never over HTTPS, whose client would follow the
+    /// environment's proxy variables.
+    #[tokio::test]
+    async fn an_endpoint_looks_names_up_with_no_http_client() {
+        let identity = TransportIdentityKeyPair::generate().expect("a transport identity");
+        let endpoint = bind_listener(&EndpointConfig::default(), &identity)
+            .await
+            .expect("an endpoint");
+        let described = format!("{:?}", endpoint.dns_resolver().expect("a resolver"));
+        endpoint.close().await;
+        assert!(
+            described.contains("protocol: Tls"),
+            "the fallback asks the public resolvers over DNS over TLS"
+        );
+        assert!(
+            !described.contains("protocol: Https"),
+            "the fallback asks a resolver over HTTPS"
+        );
+    }
 
     /// KR-REQ-23.09: the transport ALPN is the stable `kalareach`.
     #[test]
