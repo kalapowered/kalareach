@@ -332,6 +332,7 @@ describe('what setup costs a person', () => {
       (name) =>
         ![
           'connectionState',
+          'onConnection',
           'subscribe',
           'accountStatus',
           'onAccount',
