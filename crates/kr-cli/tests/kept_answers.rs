@@ -55,6 +55,8 @@ enum Behaviour {
     TakesAnswersAndDropsTheReply,
     /// Refuses every read with `PERMISSION_DENIED`.
     RefusesReads,
+    /// Refuses every read with `UNKNOWN_SESSION`, as though its session were not its own.
+    DisownsItsSession,
     /// Replies to an answer with a frame that is not a message, and takes nothing.
     RepliesWithGarbage,
     /// Refuses an answer with `OUTCOME_UNKNOWN`: it cannot say what became of it.
@@ -519,6 +521,12 @@ async fn serve_one(
                         Err(ProtocolError::new(
                             ErrorCode::PermissionDenied,
                             "this worker will not show its questions",
+                        ))
+                    }
+                    "question.read" if behaviour == Behaviour::DisownsItsSession => {
+                        Err(ProtocolError::new(
+                            ErrorCode::UnknownSession,
+                            "this worker has no such session",
                         ))
                     }
                     "question.read" => read(&state, &request.params),
@@ -1024,6 +1032,30 @@ async fn an_unreachable_worker_retires_a_kept_answer_only_on_a_recorded_closure(
             daemon.abort();
         }
     }
+}
+
+/// KR-REQ-11.63: only a session's daemon says whether the session ended, so a worker that refuses
+/// to read its questions with `UNKNOWN_SESSION` retires nothing. The control is the same worker
+/// serving again, whose kept answer is offered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_that_disowns_its_session_retires_nothing() {
+    let host = kept_answer().await;
+    host.behave(Behaviour::DisownsItsSession);
+    let (status, document) = host.json(&["question", "drafts"]);
+    assert_ne!(status, Some(0), "{document}");
+    assert_eq!(document["code"], "RESOURCE_UNAVAILABLE", "{document}");
+    let message = document["message"].as_str().expect("a message");
+    assert!(
+        message.contains("does not know its own session"),
+        "{message}"
+    );
+    assert!(host.kept().is_file(), "nothing is retired");
+
+    host.behave(Behaviour::Serves);
+    let (status, document) = host.json(&["question", "drafts"]);
+    assert_eq!(status, Some(0), "{document}");
+    assert_eq!(document["drafts"][0]["state"], "offered", "{document}");
+    assert_eq!(host.answers_received(), 0, "nothing was sent");
 }
 
 /// KR-REQ-11.63: a descriptor directory that cannot be trusted says nothing about whether a

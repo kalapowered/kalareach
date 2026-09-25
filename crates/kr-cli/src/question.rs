@@ -755,6 +755,18 @@ impl QuestionHost for Workers {
             .await;
         let value = match outcome {
             Ok(Ok(value)) => value,
+            // The host's `UNKNOWN_SESSION` retires a kept answer, and only a session's daemon says
+            // a session ended. A worker refusing with that code about its own session is passed on
+            // as the refusal it is, one that retires nothing.
+            Ok(Err(refusal)) if refusal.code == ErrorCode::UnknownSession => {
+                return Err(ClientError::Host(ProtocolError::new(
+                    ErrorCode::ResourceUnavailable,
+                    format!(
+                        "session {session_id}'s worker answered that it does not know its own \
+                         session ({refusal}), and only its daemon says whether a session ended"
+                    ),
+                )));
+            }
             Ok(Err(refusal)) => return Err(ClientError::from(refusal)),
             Err(error) => {
                 connections.remove(&session_id);
