@@ -471,6 +471,39 @@ pub fn worker_decision(
     resolution.to_answer(None)
 }
 
+/// The text a shell is told for `path`, such as the endpoint it connects to.
+///
+/// The endpoint travels as text, in the shell's environment and in the contract, so a path that
+/// is not text cannot be told to a shell: a lossy copy names another path, and the shell would
+/// connect to one nothing is bound at. Such a path is refused with the reason instead.
+///
+/// # Panics
+///
+/// Panics when `path` is not UTF-8.
+#[must_use]
+pub fn told(path: &Path) -> String {
+    path.to_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "{} is not UTF-8, so no shell can be told it",
+                path.display()
+            )
+        })
+        .to_owned()
+}
+
+/// The module search path a PowerShell package's host starts with: the package's own modules
+/// first, then whatever this process was given, each exactly as the system spells it.
+#[must_use]
+pub fn module_search_path(package: &Package) -> std::ffi::OsString {
+    let mut path = package.module_directory.clone().into_os_string();
+    if let Some(existing) = std::env::var_os("PSModulePath") {
+        path.push(":");
+        path.push(existing);
+    }
+    path
+}
+
 /// One live session: the worker's endpoint, the shell under a pseudo-terminal, and the frames
 /// between them.
 pub struct Session {
@@ -566,7 +599,7 @@ impl Session {
             .expect("an owner-only runtime directory");
 
         let endpoint_path = runtime.join("shell-bridge");
-        let endpoint = BridgeEndpoint::unix(endpoint_path.to_string_lossy().into_owned());
+        let endpoint = BridgeEndpoint::unix(told(&endpoint_path));
         endpoint
             .validate()
             .expect("the endpoint path fits a socket address");
@@ -594,7 +627,7 @@ impl Session {
             })
             .expect("a pseudo-terminal");
 
-        let mut command = CommandBuilder::new(package.executable.to_string_lossy().into_owned());
+        let mut command = CommandBuilder::new(&package.executable);
         match package.kind {
             ShellKind::PowerShell => {
                 // The host reads its profile and drops into its own read loop; nothing else about
@@ -602,12 +635,7 @@ impl Session {
                 command.arg("-NoLogo");
                 // The qualified editor and this module are selected before the profile runs, which
                 // is what the marked block then imports by name.
-                let mut module_path = package.module_directory.to_string_lossy().into_owned();
-                if let Some(existing) = std::env::var_os("PSModulePath") {
-                    module_path.push(':');
-                    module_path.push_str(&existing.to_string_lossy());
-                }
-                command.env("PSModulePath", module_path);
+                command.env("PSModulePath", module_search_path(package));
                 // The host's own image needs its runtime's location, which the qualification
                 // recorded from the launcher that started the host it qualified.
                 if let Some(environment) = package.record["launch"]["environment"].as_object() {
@@ -2114,6 +2142,19 @@ fn a_terminal_that_stopped_reading_ends_a_write_at_its_deadline() {
     // The terminal takes input again, and the writer's thread ends with the session that started
     // it rather than outliving this test.
     drop(taking);
+}
+
+/// An endpoint whose path is not text is refused by name, rather than told to the shell as a
+/// lossy copy that names another path.
+#[test]
+#[should_panic(expected = "is not UTF-8, so no shell can be told it")]
+fn a_path_that_is_not_text_is_refused_rather_than_told_as_another() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let path = PathBuf::from(std::ffi::OsString::from_vec(
+        b"/tmp/kr-shell-\xff/rt/shell-bridge".to_vec(),
+    ));
+    let _ = told(&path);
 }
 
 mod cases;
