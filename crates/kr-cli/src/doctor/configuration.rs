@@ -44,9 +44,13 @@ pub fn load(paths: &EnvironmentPaths) -> configuration::Loaded {
 ///
 /// # Errors
 ///
-/// Returns [`CliError::Usage`] when the edit is refused, and [`CliError::Ipc`] when the document
-/// cannot be written.
+/// Returns [`CliError::Usage`] when the edit is refused, and [`CliError::Ipc`] when the
+/// environment's directories cannot be made or checked, or the document cannot be written.
 pub fn apply(paths: &EnvironmentPaths, change: &Change) -> Result<u64> {
+    // An edit is a first use of the environment as much as a daemon's start is: on a host where no
+    // daemon has run yet, the state directory the lock lives in does not exist. It is made here,
+    // owner-only and checked, exactly as a daemon makes it.
+    paths.create()?;
     // The same lock the host takes, so a setting written here and one written by the daemon are
     // one edit at a time rather than two writers racing for the same revision.
     let held = configuration::lock(paths.state_dir()).map_err(CliError::Usage)?;
