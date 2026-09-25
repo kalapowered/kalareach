@@ -44,6 +44,36 @@ pub enum Entry {
     Section(Vec<Comment>),
 }
 
+/// Who may name an item, as its `pub` says.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Visibility {
+    /// No `pub`, or `pub(self)`: its own module and the modules inside it.
+    #[default]
+    Private,
+    /// `pub(super)`: its module's parent and everything inside that.
+    Parent,
+    /// `pub` or `pub(crate)`: the whole crate.
+    Crate,
+    /// `pub(in <path>)`, which this reading does not work out.
+    Restricted,
+}
+
+/// The visibility the tokens before an item's keyword give it.
+fn visibility(tokens: &[Token]) -> Visibility {
+    let Some(at) = tokens.iter().position(|token| token.ident() == Some("pub")) else {
+        return Visibility::Private;
+    };
+    if !tokens.get(at + 1).is_some_and(|token| token.is_punct('(')) {
+        return Visibility::Crate;
+    }
+    match tokens.get(at + 2).and_then(Token::ident) {
+        Some("crate") => Visibility::Crate,
+        Some("super") => Visibility::Parent,
+        Some("self") => Visibility::Private,
+        _ => Visibility::Restricted,
+    }
+}
+
 /// A test function.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Test {
@@ -63,6 +93,8 @@ pub struct Test {
     pub calls: BTreeSet<Vec<String>>,
     /// The names its body's own `use` declarations bring in.
     pub imports: Vec<Import>,
+    /// Who may name it.
+    pub visibility: Visibility,
 }
 
 /// One name, or every name of a module, that a `use` declaration brings into scope.
@@ -100,6 +132,8 @@ pub struct Item {
     pub covers: Vec<Covers>,
     /// What a `use` declaration brings into its module.
     pub imports: Vec<Import>,
+    /// Who may name it.
+    pub visibility: Visibility,
 }
 
 /// One module: a file, or an inline `mod` block.
@@ -669,6 +703,7 @@ fn classify(
                 uses,
                 calls,
                 imports,
+                visibility: visibility(&tokens[..at]),
             })
         }
         "mod" => {
@@ -694,6 +729,7 @@ fn classify(
                 inside: comments_in(range),
                 covers: range.map_or_else(Vec::new, |(from, to)| covers(&tokens[from..to])),
                 imports: Vec::new(),
+                visibility: visibility(&tokens[..at]),
             })
         }
         _ => {
@@ -720,6 +756,7 @@ fn classify(
                 } else {
                     Vec::new()
                 },
+                visibility: visibility(&tokens[..at]),
             })
         }
     }
@@ -989,6 +1026,17 @@ mod tests {
         assert_eq!(item.covers.len(), 2);
         assert_eq!(item.covers[1].text, "KR-ACC-001 KR-REQ-08.21");
         assert_eq!(item.inside[0].text, " KR-REQ-08.21: queries.");
+    }
+
+    #[test]
+    fn an_items_visibility_is_read_from_its_pub() {
+        let read = |text: &str| visibility(&lex(text).expect("lexes"));
+        assert_eq!(read(""), Visibility::Private);
+        assert_eq!(read("pub"), Visibility::Crate);
+        assert_eq!(read("pub(crate)"), Visibility::Crate);
+        assert_eq!(read("pub(super)"), Visibility::Parent);
+        assert_eq!(read("pub(self)"), Visibility::Private);
+        assert_eq!(read("pub(in crate::a)"), Visibility::Restricted);
     }
 
     #[test]
