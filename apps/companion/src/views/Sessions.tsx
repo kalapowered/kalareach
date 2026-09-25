@@ -13,6 +13,7 @@ import type { EnvironmentListResult, HostInfoResult, SessionListResult } from '@
 import { Badge, Banner, Button, Card } from '../components/ui'
 import { useApp } from '../app/state'
 import { failureMessage } from '../host/port'
+import { accountName } from './account-name'
 
 type Session = SessionListResult['sessions'][number]
 
@@ -223,7 +224,7 @@ export function Hosts(): ReactNode {
               <div className="spacer">
                 <strong>{environment.label}</strong>
                 <p className="muted small mono">
-                  {environment.os} · {environment.arch} · {environment.os_user}
+                  {environment.os} · {environment.arch} · {accountName(environment.os_user)}
                 </p>
               </div>
               <span className="row">
