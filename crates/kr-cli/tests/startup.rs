@@ -1914,22 +1914,25 @@ fn parent_of(pid: u32) -> (u32, String) {
 /// Its home is the test's own, so it reads unit files from there, and its runtime directory is its
 /// own, so `systemctl --user` reaches it through `XDG_RUNTIME_DIR` and nothing else. It starts
 /// nothing by itself: its default target has no dependencies. Ending the scope ends every process
-/// in it, the manager and whatever the manager started, which is how a test's teardown ends it.
+/// in it, the manager and whatever the manager started, workers included, which is how a test's
+/// teardown ends it. Where that cannot be established, the test's tree and the manager's runtime
+/// directory are both kept.
 #[cfg(target_os = "linux")]
 struct UserManager {
     /// The scope it runs in.
     scope: String,
     /// The manager, which `systemd-run` became: this test process's own child.
     process: Option<Child>,
-    /// Its runtime directory, outside the test's tree so that it outlives the tree's removal
-    /// until the manager has ended.
+    /// Its runtime directory, outside the test's tree.
     runtime: PathBuf,
+    /// What keeps the test's tree when this manager's scope cannot be established as ended.
+    holder: teardown::Holder,
 }
 
 #[cfg(target_os = "linux")]
 impl UserManager {
     /// Starts a manager whose home is `home`, or says why none can be started here.
-    fn start(home: &Path) -> Result<Self, String> {
+    fn start(home: &Path, holder: teardown::Holder) -> Result<Self, String> {
         use std::os::unix::fs::PermissionsExt as _;
 
         let program = ["/usr/lib/systemd/systemd", "/lib/systemd/systemd"]
@@ -1987,6 +1990,7 @@ impl UserManager {
             scope,
             process: Some(process),
             runtime,
+            holder,
         };
         let begun = Instant::now();
         loop {
@@ -2041,7 +2045,8 @@ impl Drop for UserManager {
             eprintln!("stopping {}: {stopped:?}", self.scope);
             let mut kill = Command::new("systemctl");
             kill.args(["--user", "kill", "--signal=SIGKILL", &self.scope]);
-            let _ = bounded(kill, TEARDOWN_BOUND);
+            let killed = bounded(kill, TEARDOWN_BOUND);
+            eprintln!("killing what is in {}: {killed:?}", self.scope);
         }
         if let Some(mut process) = self.process.take() {
             let begun = Instant::now();
@@ -2051,6 +2056,28 @@ impl Drop for UserManager {
             // This test's own child, not collected yet, so the number is still its.
             let _ = process.kill();
             let _ = process.wait();
+        }
+        // Whether the scope is gone is asked of the manager that held it: a scope with nothing
+        // left in it goes by itself.
+        let mut shown = Command::new("systemctl");
+        shown.args([
+            "--user",
+            "show",
+            "--property=ActiveState",
+            "--value",
+            &self.scope,
+        ]);
+        let state = bounded(shown, STREAMS_DEADLINE)
+            .map(|answer| String::from_utf8_lossy(&answer.stdout).trim().to_owned());
+        if !matches!(state.as_deref(), Ok("inactive" | "failed" | "")) {
+            // Both are kept: something may still be running in them.
+            self.holder.hold(format!(
+                "the scope {} of the test's user manager could not be established as ended ({state:?}); \
+                 its runtime directory is kept at {}",
+                self.scope,
+                self.runtime.display()
+            ));
+            return;
         }
         // The manager makes directories nobody may write in its runtime directory, which could not
         // be removed otherwise.
@@ -2083,13 +2110,16 @@ impl Drop for UserManager {
 /// a label that names the tree's own environment, so no other test has it. On Linux it is a
 /// [`UserManager`] of the test's own.
 ///
-/// However a test ends, the daemon the manager started is ended through the manager first; then the
-/// tree ends every worker the daemon recorded; then, on Linux, the test's own manager ends.
+/// However a test ends, the daemon the manager started is ended through the manager first. On
+/// Linux the test's own manager ends next, and with its scope everything it started, workers
+/// included; on macOS the tree then ends every worker the daemon recorded. A tree in which that
+/// cannot be established is kept.
 struct ServiceHost {
-    tree: teardown::Tree,
-    home: PathBuf,
+    // Dropped first, while the tree is still there to be kept.
     #[cfg(target_os = "linux")]
     manager: UserManager,
+    tree: teardown::Tree,
+    home: PathBuf,
 }
 
 impl Drop for ServiceHost {
@@ -2122,11 +2152,11 @@ impl ServiceHost {
         }
         #[cfg(target_os = "linux")]
         {
-            match UserManager::start(&home) {
+            match UserManager::start(&home, tree.holder()) {
                 Ok(manager) => Some(Self {
+                    manager,
                     tree,
                     home,
-                    manager,
                 }),
                 Err(why) => Self::not_here(&why),
             }
@@ -2377,10 +2407,22 @@ impl ServiceHost {
         }
         #[cfg(target_os = "linux")]
         {
-            // Ending the manager's scope ends the daemon too; stopping it here first means no worker
-            // is started while the tree ends the ones that are running.
+            // Ending the manager's scope ends the daemon too; stopping it here first means nothing
+            // is started while the rest ends.
             let unit = format!("{}.service", self.label());
-            bounded(self.manager.systemctl(&["stop", &unit]), TEARDOWN_BOUND).map(|_| ())
+            let stopped = bounded(self.manager.systemctl(&["stop", &unit]), TEARDOWN_BOUND)?;
+            let shown = bounded(
+                self.manager
+                    .systemctl(&["show", "--property=ActiveState", "--value", &unit]),
+                STREAMS_DEADLINE,
+            )?;
+            match String::from_utf8_lossy(&shown.stdout).trim() {
+                "inactive" | "failed" => Ok(()),
+                state => Err(format!(
+                    "{unit} is {state} after it was stopped: {}",
+                    String::from_utf8_lossy(&stopped.stderr).trim()
+                )),
+            }
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
@@ -2660,4 +2702,192 @@ fn a_definition_that_was_changed_or_has_gone_is_named_and_never_replaced() {
     );
     assert_eq!(host.daemon(), None, "nothing was started");
     assert!(!host.answers());
+}
+
+/// KR-REQ-07.12: the service start is chosen and used on a host where no daemon has ever run.
+///
+/// Such a host has the environment's identity and none of the environment's directories.
+/// `kr host startup --set service` makes the directories the record lives in, writes and records the
+/// definition, and `kr new` then has the manager start the daemon and creates its session.
+#[test]
+fn the_service_start_is_chosen_and_used_where_no_daemon_has_ever_run() {
+    let Some(host) = ServiceHost::create() else {
+        return;
+    };
+    std::fs::remove_dir_all(host.tree.paths().runtime_root()).expect("no runtime tree");
+    std::fs::remove_dir_all(host.tree.paths().state_root().join("environments"))
+        .expect("no environment directories");
+
+    host.select_service();
+    assert!(host.record().is_file(), "the record was written");
+    let output = start(host.new_session()).finish("kr new");
+    let created = document(&output, "kr new");
+    assert!(
+        output.status.success(),
+        "{created}; it said {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(created["state"], "live", "{created}");
+    host.assert_started_by_the_manager(
+        host.daemon()
+            .expect("the service manager reports the daemon it started"),
+    );
+    host.close(&created);
+}
+
+/// KR-REQ-07.12: a service manager holding anything but the definition kr wrote is not asked to
+/// start it.
+///
+/// The file is exactly what kr wrote, and the manager holds something else under its label: on
+/// macOS launchd holds the job with an argument added, and on Linux the user manager reads a
+/// drop-in of the unit's own that runs another command. `kr new` names what the manager holds and
+/// the setup action, and nothing is started. The setup then has the manager take the definition
+/// again, and `kr new` goes on.
+#[test]
+fn a_manager_holding_anything_but_the_definition_kr_wrote_is_not_asked_to_start_it() {
+    let Some(host) = ServiceHost::create() else {
+        return;
+    };
+    let chosen = host.select_service();
+    let written = std::fs::read(host.definition()).expect("the definition");
+    #[cfg(target_os = "macos")]
+    {
+        let domain = chosen["startup"]["definition"]["domain"]
+            .as_str()
+            .expect("a domain")
+            .to_owned();
+        let target = format!("{domain}/{}", host.label());
+        let launchctl = |arguments: &[&str]| {
+            let mut command = Command::new("/bin/launchctl");
+            command.args(arguments);
+            let answer = bounded(command, STREAMS_DEADLINE).expect("launchctl answers");
+            assert!(
+                answer.status.success(),
+                "launchctl {arguments:?}: {}",
+                String::from_utf8_lossy(&answer.stderr)
+            );
+        };
+        let other = String::from_utf8(written.clone())
+            .expect("text")
+            .replacen(
+                "\t\t<string>--runtime-dir</string>",
+                "\t\t<string>--worker</string>\n\t\t<string>/usr/bin/false</string>\n\t\t<string>--runtime-dir</string>",
+                1,
+            );
+        launchctl(&["bootout", &target]);
+        std::fs::write(host.definition(), other).expect("another form");
+        let path = host.definition().display().to_string();
+        launchctl(&["bootstrap", &domain, &path]);
+        // The file is kr's again, and launchd still holds the other form.
+        std::fs::write(host.definition(), &written).expect("the definition kr wrote");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = &chosen;
+        let drop_ins = host
+            .definition()
+            .with_file_name(format!("{}.service.d", host.label()));
+        std::fs::create_dir_all(&drop_ins).expect("a drop-in directory");
+        std::fs::write(
+            drop_ins.join("override.conf"),
+            "[Service]\nExecStart=\nExecStart=/bin/true\n",
+        )
+        .expect("a drop-in");
+        let reloaded = bounded(host.manager.systemctl(&["daemon-reload"]), STREAMS_DEADLINE)
+            .expect("the manager reloads");
+        assert!(reloaded.status.success());
+    }
+
+    let output = start(host.new_session()).finish("kr new");
+    let failure = document(&output, "kr new");
+    assert_eq!(failure["code"], "HOST_NOT_CONFIGURED", "{failure}");
+    let message = failure["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("kr host startup --set service"),
+        "the failure names what the manager holds and the setup action: {message}"
+    );
+    assert_eq!(host.daemon(), None, "nothing was started");
+    assert!(!host.answers());
+    assert_eq!(
+        std::fs::read(host.definition()).expect("the definition"),
+        written,
+        "and the definition kr wrote was not touched"
+    );
+
+    #[cfg(target_os = "linux")]
+    std::fs::remove_dir_all(
+        host.definition()
+            .with_file_name(format!("{}.service.d", host.label())),
+    )
+    .expect("removes the drop-in");
+    host.select_service();
+    let output = start(host.new_session()).finish("kr new once the setup ran again");
+    let created = document(&output, "kr new");
+    assert!(
+        output.status.success(),
+        "{created}; it said {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    host.close(&created);
+}
+
+/// KR-REQ-26.04: `--clear` leaves a definition that was changed after kr wrote it, says so, and
+/// removes the record, so the file is no longer taken for kr's: the next `--set service` refuses it
+/// and leaves it as it is.
+#[test]
+fn clearing_leaves_a_definition_changed_since_kr_wrote_it() {
+    let Some(host) = ServiceHost::create() else {
+        return;
+    };
+    host.select_service();
+    let mut changed = std::fs::read(host.definition()).expect("the definition");
+    changed.extend_from_slice(b"\n");
+    std::fs::write(host.definition(), &changed).expect("changes the definition");
+
+    let cleared =
+        start(host.kr(&["--json", "host", "startup", "--clear"])).finish("kr host startup");
+    let none = document(&cleared, "kr host startup");
+    assert!(cleared.status.success(), "{none}");
+    let left = none["left"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the clear says what it left: {none}"));
+    assert!(
+        left.iter()
+            .any(|entry| entry["path"] == host.definition().display().to_string()),
+        "the changed definition is among what the clear left: {none}"
+    );
+    let removed: Vec<&str> = none["removed"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the clear says what it removed: {none}"))
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(
+        removed,
+        [host.record().display().to_string().as_str()],
+        "only the record: {none}"
+    );
+    assert_eq!(
+        std::fs::read(host.definition()).expect("the definition"),
+        changed,
+        "left exactly as it was"
+    );
+    assert!(!host.record().exists());
+
+    let refused = start(host.kr(&["--json", "host", "startup", "--set", "service"]))
+        .finish("kr host startup");
+    let refusal = document(&refused, "kr host startup");
+    assert_eq!(refused.status.code(), Some(2), "{refusal}");
+    assert!(
+        refusal["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("did not write"),
+        "{refusal}"
+    );
+    assert_eq!(
+        std::fs::read(host.definition()).expect("the definition"),
+        changed,
+        "and it is still as it was"
+    );
 }
