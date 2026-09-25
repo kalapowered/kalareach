@@ -782,10 +782,24 @@ mod tests {
                 inode: std::os::unix::fs::MetadataExt::ino(&metadata),
             }
         }
+
+        /// What the metadata of a file held open with no sharing says. On Windows the singleton
+        /// lock is such a handle, and nothing else can read the file while it is held.
+        #[cfg(windows)]
+        fn held(path: &Path) -> Self {
+            let metadata = std::fs::symlink_metadata(path).expect("inspects a file");
+            Self {
+                bytes: Vec::new(),
+                modified: metadata.modified().expect("a modification time"),
+            }
+        }
     }
 
     /// Every file under `root` but the machine group record, with what it holds and its metadata.
-    fn everything_but_the_record(root: &Path) -> BTreeMap<PathBuf, Facts> {
+    ///
+    /// `lock` is the environment's singleton lock, whose bytes cannot be read on Windows while the
+    /// environment holds it, so there its metadata alone is compared.
+    fn everything_but_the_record(root: &Path, lock: &Path) -> BTreeMap<PathBuf, Facts> {
         let mut files = BTreeMap::new();
         let mut pending = vec![root.to_path_buf()];
         while let Some(directory) = pending.pop() {
@@ -797,6 +811,13 @@ mod tests {
                 {
                     pending.push(path);
                 } else if path.file_name() != Some(std::ffi::OsStr::new(RECORD_FILE)) {
+                    #[cfg(windows)]
+                    if path == lock {
+                        files.insert(path.clone(), Facts::held(&path));
+                        continue;
+                    }
+                    #[cfg(not(windows))]
+                    let _ = lock;
                     files.insert(path.clone(), Facts::of(&path));
                 }
             }
@@ -957,7 +978,7 @@ mod tests {
     fn join_merge_and_split_leave_the_environment_identity_untouched() {
         let environment = Environment::create();
         let store = environment.open();
-        let before = everything_but_the_record(environment.host.root());
+        let before = everything_but_the_record(environment.host.root(), environment.lock.path());
         for identity in [
             environment.host.paths().environment_id_file(),
             environment
@@ -987,7 +1008,7 @@ mod tests {
             )
             .expect("joins");
         assert_eq!(
-            everything_but_the_record(environment.host.root()),
+            everything_but_the_record(environment.host.root(), environment.lock.path()),
             before,
             "a join touched another file"
         );
@@ -1001,7 +1022,7 @@ mod tests {
             )
             .expect("merges");
         assert_eq!(
-            everything_but_the_record(environment.host.root()),
+            everything_but_the_record(environment.host.root(), environment.lock.path()),
             before,
             "a merge touched another file"
         );
@@ -1009,7 +1030,7 @@ mod tests {
             .split(&environment.lock, merged.expected(), &approval(), 4_000)
             .expect("splits");
         assert_eq!(
-            everything_but_the_record(environment.host.root()),
+            everything_but_the_record(environment.host.root(), environment.lock.path()),
             before,
             "a split touched another file"
         );
