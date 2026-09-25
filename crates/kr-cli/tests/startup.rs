@@ -2058,7 +2058,8 @@ impl Drop for UserManager {
             let _ = process.wait();
         }
         // Whether the scope is gone is asked of the manager that held it: a scope with nothing
-        // left in it goes by itself.
+        // left in it goes by itself, and the manager then describes it as inactive. Only an answer
+        // that says so counts; a question that failed establishes nothing.
         let mut shown = Command::new("systemctl");
         shown.args([
             "--user",
@@ -2067,9 +2068,18 @@ impl Drop for UserManager {
             "--value",
             &self.scope,
         ]);
-        let state = bounded(shown, STREAMS_DEADLINE)
-            .map(|answer| String::from_utf8_lossy(&answer.stdout).trim().to_owned());
-        if !matches!(state.as_deref(), Ok("inactive" | "failed" | "")) {
+        let state = bounded(shown, STREAMS_DEADLINE).and_then(|answer| {
+            if answer.status.success() {
+                Ok(String::from_utf8_lossy(&answer.stdout).trim().to_owned())
+            } else {
+                Err(format!(
+                    "systemctl --user show answered {:?}: {}",
+                    answer.status.code(),
+                    String::from_utf8_lossy(&answer.stderr).trim()
+                ))
+            }
+        });
+        if !matches!(state.as_deref(), Ok("inactive" | "failed")) {
             // Both are kept: something may still be running in them.
             self.holder.hold(format!(
                 "the scope {} of the test's user manager could not be established as ended ({state:?}); \
@@ -2736,13 +2746,14 @@ fn the_service_start_is_chosen_and_used_where_no_daemon_has_ever_run() {
 }
 
 /// KR-REQ-07.12: a service manager holding anything but the definition kr wrote is not asked to
-/// start it.
+/// start it, and kr does not change what it holds either.
 ///
 /// The file is exactly what kr wrote, and the manager holds something else under its label: on
 /// macOS launchd holds the job with an argument added, and on Linux the user manager reads a
 /// drop-in of the unit's own that runs another command. `kr new` names what the manager holds and
-/// the setup action, and nothing is started. The setup then has the manager take the definition
-/// again, and `kr new` goes on.
+/// the setup action, and nothing is started. The setup names the same thing and its remedy, which
+/// is the person's to apply, and changes nothing in the manager. Once the person has applied it,
+/// the setup has the manager take the definition, and `kr new` goes on.
 #[test]
 fn a_manager_holding_anything_but_the_definition_kr_wrote_is_not_asked_to_start_it() {
     let Some(host) = ServiceHost::create() else {
@@ -2814,12 +2825,45 @@ fn a_manager_holding_anything_but_the_definition_kr_wrote_is_not_asked_to_start_
         "and the definition kr wrote was not touched"
     );
 
+    let refused = start(host.kr(&["--json", "host", "startup", "--set", "service"]))
+        .finish("kr host startup while the manager holds another form");
+    let refusal = document(&refused, "kr host startup");
+    assert_ne!(refused.status.code(), Some(0), "{refusal}");
+    let message = refusal["message"].as_str().unwrap_or_default();
+    #[cfg(target_os = "macos")]
+    {
+        let domain = chosen["startup"]["definition"]["domain"]
+            .as_str()
+            .expect("a domain");
+        let target = format!("{domain}/{}", host.label());
+        assert!(
+            message.contains(&format!("launchctl bootout {target}")),
+            "the setup names the remedy and leaves it to the person: {message}"
+        );
+        // Still the other form: the setup did not replace it.
+        let mut print = Command::new("/bin/launchctl");
+        print.args(["print", &target]);
+        let printed = bounded(print, STREAMS_DEADLINE).expect("launchctl answers");
+        assert!(
+            String::from_utf8_lossy(&printed.stdout).contains("/usr/bin/false"),
+            "launchd still holds the other form"
+        );
+        let mut bootout = Command::new("/bin/launchctl");
+        bootout.args(["bootout", &target]);
+        let removed = bounded(bootout, STREAMS_DEADLINE).expect("launchctl answers");
+        assert!(removed.status.success(), "the person removes it");
+    }
     #[cfg(target_os = "linux")]
-    std::fs::remove_dir_all(
-        host.definition()
-            .with_file_name(format!("{}.service.d", host.label())),
-    )
-    .expect("removes the drop-in");
+    {
+        let drop_ins = host
+            .definition()
+            .with_file_name(format!("{}.service.d", host.label()));
+        assert!(
+            message.contains(&drop_ins.join("override.conf").display().to_string()),
+            "the setup names the drop-in and leaves it to the person: {message}"
+        );
+        std::fs::remove_dir_all(drop_ins).expect("the person removes the drop-in");
+    }
     host.select_service();
     let output = start(host.new_session()).finish("kr new once the setup ran again");
     let created = document(&output, "kr new");
