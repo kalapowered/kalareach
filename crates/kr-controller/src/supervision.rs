@@ -53,6 +53,8 @@ use kr_shell_integration::host::terminal::{self, Selection, TerminalUnavailable}
 
 use crate::error::{ControllerError, Result};
 
+pub mod windows;
+
 /// What a worker needs to be told through its job definition.
 ///
 /// Every field here is non-secret. The shell, the creator's environment and the controller's
@@ -700,11 +702,11 @@ enum JobState {
 
 /// How long one command put to a service manager is given to answer: a question, a removal, a
 /// load or a start.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 const SERVICE_MANAGER_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long a command that did not answer is given to be collected once it has been ended.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 const COLLECT_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Runs `launchctl` within [`SERVICE_MANAGER_BOUND`], and returns its answer or why there was none.
@@ -726,7 +728,7 @@ fn launchctl_within(arguments: &[&str]) -> std::result::Result<std::process::Out
 ///
 /// A command that could not be started at all is [`RunFailure::NotRun`]; every failure after it
 /// started is [`RunFailure::Failed`], because it may have reached the service manager first.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn command_within(
     program: &str,
     arguments: &[&str],
@@ -794,7 +796,7 @@ fn command_within(
 /// Ends a command this process started and has not collected, and collects it within
 /// [`COLLECT_BOUND`]. Returns `detail` with whatever of that failed added to it, and whether the
 /// command was collected.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn end_and_collect(child: &mut std::process::Child, mut detail: String) -> (String, bool) {
     if let Err(error) = child.kill() {
         detail.push_str(&format!("; ending it failed: {error}"));
@@ -821,7 +823,7 @@ fn end_and_collect(child: &mut std::process::Child, mut detail: String) -> (Stri
 }
 
 /// Reads a pipe to its end on a thread of its own, or says why no thread could be made for it.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn read_to_the_end_aside(
     mut pipe: impl std::io::Read + Send + 'static,
 ) -> std::io::Result<std::thread::JoinHandle<Vec<u8>>> {
@@ -1238,23 +1240,25 @@ pub fn identity_when_available(pid: u32) -> Result<ProcessStartIdentity> {
 
 /// Why a launcher command did not produce an answer.
 ///
-/// Only the service managers use this, and only two platforms have one.
+/// Only the service managers use this: launchd, systemd and the Task Scheduler.
 ///
 /// The two are not the same. A command that never ran started nothing. A command that ran and
 /// failed part way through may have reached the service manager first, and treating that as
 /// "nothing started" would free a slot something may still be occupying.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[derive(Clone, Debug)]
-enum RunFailure {
+pub enum RunFailure {
     /// The command could not be started at all.
     NotRun(String),
     /// The command ran and reported a failure.
     Failed(String),
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 impl RunFailure {
-    fn detail(&self) -> String {
+    /// What went wrong, in words.
+    #[must_use]
+    pub fn detail(&self) -> String {
         match self {
             Self::NotRun(detail) | Self::Failed(detail) => detail.clone(),
         }

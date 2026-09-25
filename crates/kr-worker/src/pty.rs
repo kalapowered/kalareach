@@ -969,9 +969,11 @@ pub use crate::windows::conpty::OutputWaiter;
 /// backslashes, so a version of this that dropped them would start the wrong program or none.
 ///
 /// It lives here rather than beside the console it is for, so that it can be tested on a machine
-/// that cannot run Windows: the rule is a string rule and has nothing of the platform in it.
-#[cfg(any(windows, test))]
-pub(crate) fn command_line(argv: &[std::ffi::OsString]) -> String {
+/// that cannot run Windows: the rule is a string rule and has nothing of the platform in it. The
+/// control daemon's Windows supervisor quotes the command its scheduled task runs with it too, so
+/// there is one rule for every command line this host writes.
+#[must_use]
+pub fn command_line(argv: &[std::ffi::OsString]) -> String {
     let mut line = String::new();
     for argument in argv {
         if !line.is_empty() {
