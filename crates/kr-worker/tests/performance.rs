@@ -382,8 +382,42 @@ fn resident_kib(pid: u32) -> Result<u64, String> {
 /// Returns the processor time a process has used, in seconds.
 ///
 /// A reading this host could not take is not zero here either. A process the kernel will not name,
+/// or a field it does not write the way this reads it, would otherwise be counted as having used
+/// nothing, which is the one direction a resource measurement must never be wrong in.
+///
+/// Linux keeps the count in clock ticks, the process's `utime` and `stime` in `/proc/<pid>/stat`,
+/// and that is what is read there. Its `ps` prints processor time in whole seconds, and every
+/// process the idle measurement reads spends well under a second in its window, so two `ps`
+/// readings of any of them are the same and their difference is zero whatever the process did.
+#[cfg(target_os = "linux")]
+fn processor_seconds(pid: u32) -> Result<f64, String> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map_err(|error| format!("read process {pid}'s status: {error}"))?;
+    // The second field is the command name in parentheses, and a name can hold spaces and
+    // parentheses of its own, so the fields are counted from after the last parenthesis. The
+    // first of them is the line's third field.
+    let fields: Vec<&str> = status
+        .rsplit_once(')')
+        .map(|(_, rest)| rest.split_whitespace().collect())
+        .ok_or_else(|| format!("process {pid}'s status names no command: `{status}`"))?;
+    let ticks = |field: usize, name: &str| -> Result<u64, String> {
+        fields
+            .get(field - 3)
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| format!("process {pid}'s status has no {name}: `{status}`"))
+    };
+    let used = ticks(14, "user time")? + ticks(15, "system time")?;
+    Ok(used as f64 / rustix::param::clock_ticks_per_second() as f64)
+}
+
+/// Returns the processor time a process has used, in seconds.
+///
+/// A reading this host could not take is not zero here either. A process the kernel will not name,
 /// or a column it does not print the way this reads it, would otherwise be counted as having used
 /// nothing, which is the one direction a resource measurement must never be wrong in.
+///
+/// Outside Linux `ps` prints processor time to a hundredth of a second, and that is what is read.
+#[cfg(not(target_os = "linux"))]
 fn processor_seconds(pid: u32) -> Result<f64, String> {
     let output = std::process::Command::new("ps")
         .args(["-o", "time=", "-p", &pid.to_string()])
@@ -412,6 +446,105 @@ fn processor_seconds(pid: u32) -> Result<f64, String> {
         seconds = seconds * 60.0 + part;
     }
     Ok(seconds)
+}
+
+/// Set in the environment of the process the processor-time regression starts, which makes that
+/// process the one that spends the time.
+#[cfg(unix)]
+const SPENDER: &str = "KR_PERF_SPENDER";
+
+/// How much processor time that process spends before it is read.
+///
+/// Less than a second on purpose: it is the size of what each process the idle measurement reads
+/// spends in its window, and a reading in whole seconds reads it as none.
+#[cfg(unix)]
+const SPENT: Duration = Duration::from_millis(400);
+
+/// How far a reading may be from what the process spent: the coarsest unit a platform counts
+/// processor time in is a clock tick, a hundredth of a second, and this allows several.
+#[cfg(unix)]
+const READING_TOLERANCE: f64 = 0.05;
+
+/// A process that spent a fraction of a second of processor time is read as having spent it.
+///
+/// The idle measurement is the difference of two readings of each process five minutes apart, and
+/// each of them spends well under a second in that time. A reading that rounds that away turns
+/// every difference into zero, which meets the bound without measuring anything. So this test
+/// starts a copy of its own binary that spends [`SPENT`] by its own processor clock, says how much
+/// it spent and waits, and reads it the way the measurement does.
+#[cfg(unix)]
+#[test]
+fn a_process_that_spends_processor_time_is_read_as_spending_it() {
+    use std::io::BufRead as _;
+
+    if std::env::var_os(SPENDER).is_some() {
+        spend_and_wait();
+        return;
+    }
+    let this = std::env::current_exe().expect("this test's own binary");
+    let mut spender = std::process::Command::new(this)
+        .args([
+            "--exact",
+            "a_process_that_spends_processor_time_is_read_as_spending_it",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
+        .env(SPENDER, "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("the spending process starts");
+    let mut output = std::io::BufReader::new(spender.stdout.take().expect("its output"));
+    let mut said = None;
+    let mut line = String::new();
+    while said.is_none() && output.read_line(&mut line).unwrap_or(0) > 0 {
+        said = line
+            .trim()
+            .strip_prefix("spent ")
+            .and_then(|nanoseconds| nanoseconds.parse::<u64>().ok());
+        line.clear();
+    }
+    let read = processor_seconds(spender.id());
+    // Its input closing is what lets it end, and what it writes on the way out is read to the end
+    // so that nothing it writes fails.
+    drop(spender.stdin.take());
+    let _ = std::io::copy(&mut output, &mut std::io::sink());
+    let _ = spender.wait();
+
+    let said = said.expect("the spending process says what it spent");
+    let spent = Duration::from_nanos(said).as_secs_f64();
+    let read = read.expect("the spending process's processor time is read");
+    assert!(
+        (read - spent).abs() <= READING_TOLERANCE,
+        "a process that spent {spent:.3} s of processor time is read as having spent {read:.3} s"
+    );
+}
+
+/// The spending process's part: spends [`SPENT`] of processor time, says how much it has spent in
+/// all, and waits until its input closes, so that it is read while it is still running.
+#[cfg(unix)]
+fn spend_and_wait() {
+    use std::io::{BufRead as _, Write as _};
+
+    let spent = || {
+        let clock = rustix::time::clock_gettime(rustix::time::ClockId::ProcessCPUTime);
+        Duration::new(
+            u64::try_from(clock.tv_sec).expect("a processor time"),
+            u32::try_from(clock.tv_nsec).expect("a fraction of a second"),
+        )
+    };
+    let mut spinning = 0_u64;
+    while spent() < SPENT {
+        spinning = std::hint::black_box(spinning.wrapping_add(1));
+    }
+    // On a line of its own: the harness has already begun a line for this test.
+    let mut out = std::io::stdout().lock();
+    let _ = write!(out, "\nspent {}\n", spent().as_nanos());
+    let _ = out.flush();
+    drop(out);
+    let _ = std::io::stdin().lock().read_line(&mut String::new());
 }
 
 /// Takes one reading for every process, keeping which process it came from.
