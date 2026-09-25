@@ -804,6 +804,54 @@ mod windows {
         Err(std::io::Error::from_raw_os_error(code.cast_signed()))
     }
 
+    /// The limit flags of the job this process runs in, or `None` when it runs in no job.
+    ///
+    /// A daemon reads this to decide whether a worker it starts must break away from its job: a
+    /// worker outlives the daemon, so it must not be inside a job that kills its members when the
+    /// daemon closes. Where the job does not kill on close, or there is no job, the worker already
+    /// outlives the daemon and no breakaway is needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's error when the job cannot be queried.
+    pub fn current_job_limit_flags() -> std::io::Result<Option<u32>> {
+        use windows_sys::Win32::System::JobObjects::{
+            IsProcessInJob, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectExtendedLimitInformation, QueryInformationJobObject,
+        };
+
+        let mut in_job: windows_sys::core::BOOL = 0;
+        // SAFETY: the process handle is a pseudo-handle that needs no release, the second argument
+        // is null to ask about any job, and `in_job` is a live out parameter.
+        let asked =
+            unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &raw mut in_job) };
+        if asked == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if in_job == 0 {
+            return Ok(None);
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        let size =
+            u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()).unwrap_or(0);
+        // SAFETY: a null job handle queries the job this process is in, which the call above
+        // confirmed it has; `info` is a live buffer of the size passed, and the return length is
+        // not wanted.
+        let read = unsafe {
+            QueryInformationJobObject(
+                std::ptr::null_mut(),
+                JobObjectExtendedLimitInformation,
+                (&raw mut info).cast(),
+                size,
+                std::ptr::null_mut(),
+            )
+        };
+        if read == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Some(info.BasicLimitInformation.LimitFlags))
+    }
+
     /// The object's owner only, with inheritance blocked and children covered.
     ///
     /// `D:P` makes the list protected, so no inherited entry from the user profile widens it.
@@ -1239,7 +1287,9 @@ mod windows {
 }
 
 #[cfg(windows)]
-pub use self::windows::{AccessListRefusal, check_access_list, open_child};
+pub use self::windows::{
+    AccessListRefusal, check_access_list, current_job_limit_flags, open_child,
+};
 
 /// Returns the current user's identifier.
 #[cfg(unix)]
