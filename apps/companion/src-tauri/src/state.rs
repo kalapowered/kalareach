@@ -14,6 +14,7 @@ use crate::connection::{Connection, ConnectionState};
 use crate::device::Device;
 use crate::error::{CommandError, Result};
 use crate::owner::Owner;
+use crate::pairing::PastePlatform;
 
 /// The backend's long-lived state.
 #[derive(Debug)]
@@ -22,6 +23,7 @@ pub struct AppState {
     reason: RwLock<Option<String>>,
     device: OnceLock<Arc<Device>>,
     owner: OnceLock<Arc<Owner>>,
+    paste: OnceLock<Arc<dyn PastePlatform>>,
     drafts: Mutex<Option<Arc<kr_client::drafts::DraftStore>>>,
     export_destinations: Mutex<Vec<std::path::PathBuf>>,
     dropped_files: Mutex<Vec<std::path::PathBuf>>,
@@ -38,6 +40,7 @@ impl AppState {
             )),
             device: OnceLock::new(),
             owner: OnceLock::new(),
+            paste: OnceLock::new(),
             drafts: Mutex::new(None),
             export_destinations: Mutex::new(Vec::new()),
             dropped_files: Mutex::new(Vec::new()),
@@ -116,10 +119,12 @@ impl AppState {
         }
     }
 
-    /// Records this computer as a device that pairs, once it has been opened.
-    pub fn opened(&self, device: Arc<Device>, owner: Arc<Owner>) {
+    /// Records this computer as a device that pairs, once it has been opened, and where it pastes
+    /// invitations from.
+    pub fn opened(&self, device: Arc<Device>, owner: Arc<Owner>, paste: Arc<dyn PastePlatform>) {
         let _ = self.device.set(device);
         let _ = self.owner.set(owner);
+        let _ = self.paste.set(paste);
     }
 
     /// This computer as a device that pairs.
@@ -140,6 +145,17 @@ impl AppState {
     /// Returns a local failure when its keys or records could not be opened.
     pub fn owner(&self) -> Result<Arc<Owner>> {
         self.owner.get().cloned().ok_or_else(|| {
+            CommandError::local_failure("this computer's pairing records could not be opened")
+        })
+    }
+
+    /// Where this computer pastes invitations from.
+    ///
+    /// # Errors
+    ///
+    /// Returns a local failure when its keys or records could not be opened.
+    pub fn paste(&self) -> Result<Arc<dyn PastePlatform>> {
+        self.paste.get().cloned().ok_or_else(|| {
             CommandError::local_failure("this computer's pairing records could not be opened")
         })
     }

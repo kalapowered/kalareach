@@ -238,33 +238,59 @@ fn watch_drops(app: &tauri::AppHandle) {
     }
 }
 
-/// Opens this computer as a device that pairs, and as an owner device of the hosts it owns, and
-/// starts telling the page about both.
+/// Opens this computer as a device that pairs, and as an owner device of the hosts it owns, on
+/// this computer's own parts, ceremony and pasteboard, and starts telling the page about both.
 ///
 /// A computer whose keys or records cannot be opened still runs: the pairing commands say so, and
 /// everything else works as it did.
 fn open_pairing(app: &tauri::AppHandle) {
     use std::sync::Arc;
 
-    use tauri::{Emitter as _, Manager as _};
+    use tauri::Manager as _;
 
     let Ok(data) = app.path().app_data_dir() else {
         tracing::warn!("no application data directory, so this computer cannot pair");
         return;
     };
+    let opened = device::Parts::platform(&data).and_then(|parts| {
+        start_pairing(
+            app,
+            &data,
+            parts,
+            verify::platform_ceremony(app.get_webview_window("main")),
+            Arc::new(pairing::NativePaste::new(app.clone())),
+        )
+    });
+    if let Err(error) = opened {
+        tracing::warn!(%error, "this computer's pairing records could not be opened");
+    }
+}
+
+/// Opens this computer as a device that pairs, made of `parts` with its records under `data`, and
+/// as an owner device whose confirmations `ceremony` answers, pasting invitations through `paste`;
+/// tells the page about both on [`pairing::PAIRING_EVENT`] and [`pairing::CONFIRMATIONS_EVENT`];
+/// and starts both.
+///
+/// # Errors
+///
+/// Returns a local failure when this computer's keys or records cannot be opened.
+pub fn start_pairing<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    data: &std::path::Path,
+    parts: device::Parts,
+    ceremony: std::sync::Arc<dyn kr_client::pairing::owner::Ceremony>,
+    paste: std::sync::Arc<dyn pairing::PastePlatform>,
+) -> Result<()> {
+    use std::sync::Arc;
+
+    use tauri::{Emitter as _, Manager as _};
+
     let emitter = app.clone();
-    let device = match device::Device::open(&data, move || {
+    let device = device::Device::with(data, parts, move || {
         if let Ok(device) = emitter.state::<AppState>().device() {
             let _ = emitter.emit(pairing::PAIRING_EVENT, device.view());
         }
-    }) {
-        Ok(device) => device,
-        Err(error) => {
-            tracing::warn!(%error, "this computer's pairing records could not be opened");
-            return;
-        }
-    };
-    let ceremony = verify::platform_ceremony(app.get_webview_window("main"));
+    })?;
     let emitter = app.clone();
     let owner = owner::Owner::new(Arc::clone(&device), ceremony, move || {
         if let Ok(owner) = emitter.state::<AppState>().owner() {
@@ -272,9 +298,10 @@ fn open_pairing(app: &tauri::AppHandle) {
         }
     });
     app.state::<AppState>()
-        .opened(Arc::clone(&device), Arc::clone(&owner));
+        .opened(Arc::clone(&device), Arc::clone(&owner), paste);
     device.start();
     owner.start();
+    Ok(())
 }
 
 /// The event the backend publishes the paths of dropped files on.

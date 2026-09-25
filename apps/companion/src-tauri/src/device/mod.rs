@@ -136,7 +136,7 @@ fn failed(failure: &PairingFailure) -> CommandError {
 
 /// What a device is made of besides its records: where its secrets live, how it opens a room,
 /// where its endpoints bind and the clock it counts on. The product's come from the platform
-/// ([`Device::open`]); a test gives its own.
+/// ([`Parts::platform`]); a test gives its own.
 pub struct Parts {
     /// The store this computer's keys and its budget's key live in.
     pub secrets: Arc<dyn SecretStore>,
@@ -148,14 +148,15 @@ pub struct Parts {
     pub clock: Arc<dyn PairingClock + Send + Sync>,
 }
 
-impl Device {
-    /// This computer as a device, from its records under `data`. `changed` is called whenever
-    /// anything the pairing screen shows changes.
+impl Parts {
+    /// This computer's own parts: the platform's secret store, or the documented directory under
+    /// `data` where it has none; the pairing service over the platform's TLS verifier; endpoints on
+    /// every interface; and this boot's clock.
     ///
     /// # Errors
     ///
-    /// Returns a local failure when the secret store, the budget or the records cannot be opened.
-    pub fn open(data: &Path, changed: impl Fn() + Send + Sync + 'static) -> Result<Arc<Self>> {
+    /// Returns a local failure when the secret store, the TLS verifier or the clock cannot be set.
+    pub fn platform(data: &Path) -> Result<Self> {
         let opened =
             open_store(identity::SECRET_SERVICE, &data.join("secrets")).map_err(|error| {
                 CommandError::local_failure(format!(
@@ -168,18 +169,16 @@ impl Device {
                 "the pairing service's TLS could not be set: {error}"
             ))
         })?;
-        Self::with(
-            data,
-            Parts {
-                secrets: Arc::from(opened.store),
-                room: Arc::new(room),
-                bind: None,
-                clock: Arc::new(clock),
-            },
-            changed,
-        )
+        Ok(Self {
+            secrets: Arc::from(opened.store),
+            room: Arc::new(room),
+            bind: None,
+            clock: Arc::new(clock),
+        })
     }
+}
 
+impl Device {
     /// This computer as a device made of `parts`, with its records under `data`.
     ///
     /// # Errors
