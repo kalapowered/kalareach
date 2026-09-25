@@ -9,7 +9,8 @@
 //!
 //! This module is the client's half of that, with no platform code in it:
 //!
-//! * [`AuthorisationRequest`] builds the one address the browser is handed.
+//! * [`AuthorisationRequest`] builds the one address the browser is handed, asking for the scopes
+//!   its caller names.
 //! * [`PendingAuthorisation`] checks what comes back, in a fixed order, and consumes the request so
 //!   that no second answer can use it.
 //! * [`AccountService`] is the service's token, revocation, identity and usage endpoints, and
@@ -96,11 +97,24 @@ pub const LEASE_SCOPE: &str = "organisation.lease";
 /// The scope reading usage needs.
 pub const USAGE_SCOPE: &str = "billing.read";
 
+/// The scope an account token needs to write what the account keeps as backup: its archives, and
+/// the recovery bundle at its locator.
+pub const BACKUP_WRITE_SCOPE: &str = "backup.write";
+
+/// The scope an account token needs to read the recovery bundle and nothing else, which is what a
+/// device restoring from a recovery kit asks for.
+pub const BACKUP_RESTORE_SCOPE: &str = "backup.restore";
+
+/// The scopes every authorisation asks for, whatever resources it asks for beside them.
+///
+/// The identity claims, which the ID token an exchange is checked by carries and the identity read
+/// returns, and a refresh token that survives a restart, which the kept grant is renewed with.
+pub const IDENTITY_SCOPES: [&str; 4] = ["openid", "profile", "email", "offline_access"];
+
 /// Every scope an application sign-in asks for, in the order the request states them.
 ///
-/// The identity claims, a refresh token that survives a restart, the member's lease fetch, the
-/// call this device holds and the answers it asks for, and usage. Not `backup.write`: the
-/// application writes no archives.
+/// The [`IDENTITY_SCOPES`], then the member's lease fetch, the call this device holds and the
+/// answers it asks for, and usage. Not [`BACKUP_WRITE_SCOPE`]: the application writes no archives.
 pub const REQUESTED_SCOPES: [&str; 8] = [
     "openid",
     "profile",
@@ -390,10 +404,16 @@ impl fmt::Debug for AttemptId {
 /// Its state, verifier and nonce are fresh for every attempt, live in this process for as long as
 /// the attempt does, and are never stored; the nonce is kept with the grant once the sign-in
 /// succeeds, because a refresh's ID token is checked against it.
+///
+/// It asks for the scopes its caller names and no others. The application's own sign-in asks for
+/// [`REQUESTED_SCOPES`]; an authorisation made for one purpose asks for the [`IDENTITY_SCOPES`] and
+/// that purpose's resources, so the token that comes of it reaches what it was asked for and
+/// nothing else.
 pub struct AuthorisationRequest {
     client: Client,
     redirect: Redirect,
     attempt: AttemptId,
+    scopes: Vec<String>,
     state: String,
     verifier: String,
     nonce: String,
@@ -411,13 +431,31 @@ impl fmt::Debug for AuthorisationRequest {
 }
 
 impl AuthorisationRequest {
-    /// A request for `client`, answered on `redirect`.
+    /// The application's sign-in for `client`, answered on `redirect`, asking for
+    /// [`REQUESTED_SCOPES`].
     ///
     /// # Errors
     ///
     /// Returns an error when `redirect` is not registered for `client`, or when this device could
     /// not produce random bytes.
     pub fn new(client: Client, redirect: Redirect) -> Result<Self> {
+        Self::asking(client, redirect, &REQUESTED_SCOPES[IDENTITY_SCOPES.len()..])
+    }
+
+    /// A request for `client`, answered on `redirect`, asking for the [`IDENTITY_SCOPES`] and the
+    /// resources `resources` names, and for nothing else.
+    ///
+    /// A caller names what its one purpose reads: a device restoring from a recovery kit asks for
+    /// [`BACKUP_RESTORE_SCOPE`] alone. The identity scopes are asked for whatever the resources are,
+    /// because an exchange is checked by its ID token and a kept grant is renewed with its refresh
+    /// token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `redirect` is not registered for `client`, when a resource is not a
+    /// scope a request can carry or names a scope already asked for, or when this device could not
+    /// produce random bytes.
+    pub fn asking(client: Client, redirect: Redirect, resources: &[&str]) -> Result<Self> {
         if !client.owns(redirect) {
             return Err(local(&format!(
                 "{} is not a redirect registered for {}",
@@ -425,10 +463,32 @@ impl AuthorisationRequest {
                 client.id()
             )));
         }
+        let mut scopes: Vec<String> = IDENTITY_SCOPES
+            .iter()
+            .map(|scope| (*scope).to_owned())
+            .collect();
+        for resource in resources {
+            // RFC 6749 section 3.3: a scope is printable ASCII other than a space, a quotation
+            // mark and a backslash, because the request carries the list separated by spaces.
+            let carried = !resource.is_empty()
+                && resource
+                    .bytes()
+                    .all(|byte| matches!(byte, 0x21 | 0x23..=0x5b | 0x5d..=0x7e));
+            if !carried {
+                return Err(local(
+                    "a scope is printable ASCII with no space, quotation mark or backslash",
+                ));
+            }
+            if scopes.iter().any(|asked| asked == resource) {
+                return Err(local("an authorisation asks for each scope once"));
+            }
+            scopes.push((*resource).to_owned());
+        }
         Ok(Self {
             client,
             redirect,
             attempt: AttemptId::fresh()?,
+            scopes,
             state: fresh_secret()?,
             verifier: fresh_secret()?,
             nonce: fresh_secret()?,
@@ -450,7 +510,7 @@ impl AuthorisationRequest {
             .append_pair("response_type", "code")
             .append_pair("client_id", self.client.id())
             .append_pair("redirect_uri", self.redirect.uri())
-            .append_pair("scope", &REQUESTED_SCOPES.join(" "))
+            .append_pair("scope", &self.scopes.join(" "))
             .append_pair("state", &self.state)
             .append_pair("code_challenge", &code_challenge(&self.verifier))
             .append_pair("code_challenge_method", "S256")
@@ -475,6 +535,12 @@ impl AuthorisationRequest {
     #[must_use]
     pub const fn attempt(&self) -> AttemptId {
         self.attempt
+    }
+
+    /// The scopes this request asks for, in the order it states them.
+    #[must_use]
+    pub fn scopes(&self) -> &[String] {
+        &self.scopes
     }
 }
 
@@ -2259,5 +2325,195 @@ mod tests {
         let error = StoredGrant::read(&serde_json::to_vec(&document).expect("bytes"))
             .expect_err("another issuer");
         assert_eq!(error.code(), ErrorCode::StorageUnavailable);
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* What an authorisation asks for                                          */
+    /* ---------------------------------------------------------------------- */
+
+    /// The one `scope` parameter an authorisation's address carries.
+    fn asked(request: &AuthorisationRequest) -> Vec<String> {
+        Url::parse(&request.url())
+            .expect("an address")
+            .query_pairs()
+            .filter(|(name, _)| name == "scope")
+            .map(|(_, value)| value.into_owned())
+            .collect()
+    }
+
+    /// An authorisation asks for the identity scopes and exactly the resources its caller names,
+    /// and the application's own sign-in asks for what it always has: the identity scopes first,
+    /// then its resources, and not `backup.write`.
+    #[test]
+    fn an_authorisation_asks_for_the_identity_scopes_and_the_resources_its_caller_names() {
+        let restore = AuthorisationRequest::asking(
+            Client::Desktop,
+            Redirect::Loopback,
+            &[BACKUP_RESTORE_SCOPE],
+        )
+        .expect("a request");
+        assert_eq!(
+            asked(&restore),
+            ["openid profile email offline_access backup.restore"]
+        );
+        assert_eq!(
+            restore.scopes(),
+            [
+                "openid",
+                "profile",
+                "email",
+                "offline_access",
+                BACKUP_RESTORE_SCOPE
+            ]
+        );
+
+        let identity = AuthorisationRequest::asking(Client::Mobile, Redirect::AppLink, &[])
+            .expect("a request");
+        assert_eq!(identity.scopes(), IDENTITY_SCOPES);
+
+        let application =
+            AuthorisationRequest::new(Client::Desktop, Redirect::Loopback).expect("a request");
+        assert_eq!(asked(&application), [REQUESTED_SCOPES.join(" ")]);
+        assert_eq!(application.scopes(), REQUESTED_SCOPES);
+        assert_eq!(REQUESTED_SCOPES[..IDENTITY_SCOPES.len()], IDENTITY_SCOPES);
+        assert!(!REQUESTED_SCOPES.contains(&BACKUP_WRITE_SCOPE));
+        assert!(!REQUESTED_SCOPES.contains(&BACKUP_RESTORE_SCOPE));
+    }
+
+    /// A scope a request cannot carry, and a scope asked for twice, are refused before an
+    /// address is built; so is a redirect the client did not register, as it always was.
+    #[test]
+    fn a_scope_an_authorisation_cannot_ask_for_is_refused() {
+        for resources in [
+            &[""][..],
+            &["backup restore"],
+            &["backup\"restore"],
+            &["backup\\restore"],
+            &["backup.réstore"],
+            &["openid"],
+            &[BACKUP_RESTORE_SCOPE, BACKUP_RESTORE_SCOPE],
+        ] {
+            let error =
+                AuthorisationRequest::asking(Client::Desktop, Redirect::Loopback, resources)
+                    .expect_err("a scope no request asks for");
+            assert_eq!(error.code(), ErrorCode::InvalidArgument, "{resources:?}");
+        }
+        assert!(
+            AuthorisationRequest::asking(
+                Client::Desktop,
+                Redirect::AppLink,
+                &[BACKUP_RESTORE_SCOPE]
+            )
+            .is_err()
+        );
+    }
+
+    /// The token endpoint, answering every exchange with one answer.
+    #[derive(Debug)]
+    struct TokenEndpoint(serde_json::Value);
+
+    impl AccountHttp for TokenEndpoint {
+        fn post_form<'a>(
+            &'a self,
+            _url: &'a str,
+            _body: &'a [u8],
+        ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+            let body = serde_json::to_vec(&self.0).expect("an answer");
+            Box::pin(async move { Ok(ServiceHttpAnswer { status: 200, body }) })
+        }
+
+        fn get<'a>(
+            &'a self,
+            _url: &'a str,
+            _headers: &'a [(&'a str, &'a str)],
+        ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+            Box::pin(async move { panic!("nothing here reads with a token") })
+        }
+    }
+
+    /// An unsigned compact token with these claims; its signature is not what is checked.
+    fn id_token(claims: &serde_json::Value) -> String {
+        let encode = |value: &serde_json::Value| {
+            base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                serde_json::to_vec(value).expect("json"),
+            )
+        };
+        format!(
+            "{}.{}.signature",
+            encode(&serde_json::json!({ "alg": "RS256", "typ": "JWT" })),
+            encode(claims)
+        )
+    }
+
+    /// A device restoring from a recovery kit authorises for the restore alone: the browser's
+    /// answer, the exchange and the kept grant are the ones every sign-in goes through, and the
+    /// token that comes of it is handed out for `backup.restore` and refused for every scope the
+    /// application's own sign-in would have carried and for writing a bundle.
+    #[tokio::test]
+    async fn a_restore_authorisation_holds_a_token_for_its_scope_and_for_no_other() {
+        let request = AuthorisationRequest::asking(
+            Client::Desktop,
+            Redirect::Loopback,
+            &[BACKUP_RESTORE_SCOPE],
+        )
+        .expect("a request");
+        let state = request.state.clone();
+        let mut pending = PendingAuthorisation::new(request);
+        let mut answer = Url::parse(Redirect::Loopback.uri()).expect("the redirect");
+        answer
+            .query_pairs_mut()
+            .append_pair("code", "a-code")
+            .append_pair("state", &state)
+            .append_pair("iss", ISSUER);
+        let Answer::Granted(grant) = pending.answer(answer.as_str(), Carrier::Terminal) else {
+            panic!("the answer grants a code");
+        };
+
+        let now = system_seconds();
+        let endpoint = Arc::new(TokenEndpoint(serde_json::json!({
+            "access_token": "a-restore-token",
+            "token_type": "Bearer",
+            "expires_in": 600,
+            "refresh_token": "a-refresh-token",
+            "scope": "openid profile email offline_access backup.restore",
+            "id_token": id_token(&serde_json::json!({
+                "iss": ISSUER,
+                "sub": "an-account",
+                "aud": Client::Desktop.id(),
+                "nonce": grant.nonce(),
+                "iat": now - 5,
+                "exp": now + 3600,
+            })),
+        })));
+        let service = Arc::new(ManagedAccountService::new(
+            endpoint as Arc<dyn AccountHttp>,
+            Client::Desktop,
+        ));
+        let Exchanged::Issued(issued) = service.exchange(&grant).await.expect("an answer") else {
+            panic!("the exchange is issued");
+        };
+        let account = SignedInAccount::new(
+            service,
+            Arc::new(kr_crypto::store::MemoryStore::new()),
+            Client::Desktop,
+        );
+        account
+            .commit(issued, grant.nonce())
+            .await
+            .expect("the grant is kept");
+
+        assert_eq!(
+            account
+                .token(BACKUP_RESTORE_SCOPE)
+                .await
+                .expect("a token for the restore")
+                .expose(),
+            "a-restore-token"
+        );
+        for other in [BACKUP_WRITE_SCOPE, LEASE_SCOPE, USAGE_SCOPE, "reasoning"] {
+            let refused = account.token(other).await.expect_err("not this grant's");
+            assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{other}");
+        }
     }
 }
