@@ -23,7 +23,9 @@
 # toolchains are used as they are installed: rustup's own directory is kept, and
 # rust-toolchain.toml picks the toolchain from it. On macOS the fresh home directory gets a keychain
 # of its own as its default, removed with it, so nothing a step runs finds no keychain and asks the
-# person at the machine for one; the run fails if SecurityAgent opened a dialog while it ran.
+# person at the machine for one. The account's own keychain settings are read before and after that
+# is set up, and a run that changed them puts them back and stops. The system log is read after
+# every step, and a run stops when SecurityAgent opened a dialog, or when the log cannot be read.
 #
 # Before any step runs, the clone is refused when:
 #
@@ -34,22 +36,26 @@
 #     uses in its own sense is not a record, so each pattern matches a record's own form and
 #     nothing wider;
 #   - a commit in the range, which is the commit's whole history unless --commits names one, has a
-#     message of more than one line: a body or a trailer, whether or not a blank line precedes it;
-#   - a relative link in a tracked Markdown file names a path the tree does not have. The rule is
-#     read from the text, not from rendered Markdown: every `](` followed by a destination, and
-#     every `[label]: destination` definition, is a link, in a code example as much as anywhere,
-#     so an example names a path that exists or uses an absolute URL.
+#     message of more than one line. Only the newline that ends the subject is allowed after it: a
+#     second line, blank or not and with or without a blank line before it, is refused;
+#   - a tracked Markdown file has a relative link to a path the tree does not have, or a link this
+#     check cannot read. The rule reads text, not rendered Markdown, and it reads every link-shaped
+#     construct, in a code example as much as anywhere. Every `](` starts a destination, read after
+#     any whitespace up to the next whitespace or unbalanced `)`; every line that starts with a
+#     bracketed label and `]:` is a definition, whose destination is the first word after the first
+#     `]:` or, when nothing follows it, the first word of the next line. A destination that starts
+#     with `<` or holds a backslash or `&` is refused as unreadable: write the path plainly.
 #
 # Each pattern in `record_patterns` is written so that its own text does not match it, which is
 # what lets this file pass its own check.
 #
 # Then the steps run. README.md gives them as fenced blocks, each after a line
-# `<!-- clean-checkout: <group> -->`; every line of a block is one step, a line ending in a
-# backslash continues on the next, and a line that starts with `#` is a comment. A block that is
-# never closed, or that ends inside a continued line, is refused. A step runs with bash in the
-# clone's root, with nothing on its standard input, groups and steps in README.md's order, and the
-# run stops at the first step that fails unless --keep-going is given. KR_CLEAN_CHECKOUT_ROOT names
-# the run's directory to every step.
+# `<!-- clean-checkout: <group> -->`. Every non-blank line of a block is one step, and a line that
+# starts with `#` is a comment. A step is one line: a line that ends with a backslash is refused,
+# and so is a block that is never closed. A step runs with bash in the clone's root, with nothing on
+# its standard input, groups and steps in README.md's order, and the run stops at the first step
+# that fails unless --keep-going is given. KR_CLEAN_CHECKOUT_ROOT names the run's directory to every
+# step.
 #
 # The clone and everything the run wrote are removed at the end, unless --keep is given.
 set -euo pipefail
@@ -195,12 +201,13 @@ refuse_messages() {
       sub(/^\n+/, "", $1)
       if ($1 == "") next
       message = $2
-      sub(/[ \t\n]+$/, "", message)
+      sub(/\n$/, "", message)
       count = split(message, lines, "\n")
       if (count <= 1) next
-      kind = "a trailer"
+      kind = "a blank line"
       for (i = 2; i <= count; i++) {
-        if (lines[i] != "" && lines[i] !~ /^[A-Za-z0-9-]+: /) kind = "a body"
+        if (lines[i] ~ /^[A-Za-z0-9-]+: / && kind != "a body") kind = "a trailer"
+        else if (lines[i] ~ /[^ \t]/) kind = "a body"
       }
       printf "  %s %s: %s\n", substr($1, 1, 12), kind, lines[1]
       bad = 1
@@ -214,8 +221,8 @@ refuse_messages() {
   say "every commit in $range is one subject line"
 }
 
-# Prints each relative link in a tracked Markdown file whose path the tree does not have, and
-# fails when there is one.
+# Prints each link in a tracked Markdown file that names a relative path the tree does not have,
+# or that this check cannot read, and fails when there is one.
 broken_links() {
   clean python3 - "$1" <<'PYTHON'
 import os
@@ -237,29 +244,18 @@ for path in tracked:
         parent = os.path.dirname(parent)
 
 scheme = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
-definition = re.compile(r"(?m)^ {0,3}\[[^\]\n]+\]:[ \t]*\n?[ \t]*(<[^>\n]*>|\S+)")
+definition = re.compile(r"^ {0,3}\[")
 
 
-def destination(text, index):
-    """Reads the destination that starts at index, delimited the way CommonMark delimits one."""
-    while index < len(text) and text[index] in " \t\n":
+def inline_destination(text, index):
+    """Reads the destination after a `](`, to the next whitespace or unbalanced `)`."""
+    while index < len(text) and text[index].isspace():
         index += 1
-    if text.startswith("<", index):
-        end = text.find(">", index)
-        if end < 0 or "\n" in text[index:end]:
-            return None
-        return text[index + 1 : end]
     start, depth = index, 0
-    while index < len(text):
-        character = text[index]
-        if character == "\\" and index + 1 < len(text):
-            index += 2
-            continue
-        if character.isspace() or ord(character) < 0x20:
-            break
-        if character == "(":
+    while index < len(text) and not text[index].isspace():
+        if text[index] == "(":
             depth += 1
-        elif character == ")":
+        elif text[index] == ")":
             if depth == 0:
                 break
             depth -= 1
@@ -273,16 +269,25 @@ for path in sorted(p for p in tracked if p.endswith(".md")):
         text = handle.read()
     found = []
     for match in re.finditer(r"\]\(", text):
-        target = destination(text, match.end())
-        if target is not None:
-            found.append((match.start(), target))
-    for match in definition.finditer(text):
-        found.append((match.start(), match.group(1).strip("<>")))
-    for offset, target in found:
+        found.append((match.start(), inline_destination(text, match.end())))
+    lines = text.split("\n")
+    offset = 0
+    for number, line in enumerate(lines):
+        if definition.match(line) and "]:" in line:
+            words = line.split("]:", 1)[1].split()
+            if not words and number + 1 < len(lines):
+                words = lines[number + 1].split()
+            found.append((offset, words[0] if words else ""))
+        offset += len(line) + 1
+    for position, target in found:
+        where = f"{path}:{text.count(chr(10), 0, position) + 1}"
+        if target.startswith("<") or "\\" in target or "&" in target:
+            print(f"  {where}: {target} is written in a form this check cannot read")
+            broken += 1
+            continue
         if not target or target.startswith(("#", "//")) or scheme.match(target):
             continue
-        named = target.split("#", 1)[0].split("?", 1)[0]
-        named = urllib.parse.unquote(re.sub(r"\\(.)", r"\1", named))
+        named = urllib.parse.unquote(target.split("#", 1)[0].split("?", 1)[0])
         if not named:
             continue
         if named.startswith("/"):
@@ -291,7 +296,7 @@ for path in sorted(p for p in tracked if p.endswith(".md")):
             resolved = os.path.normpath(os.path.join(os.path.dirname(path), named))
         if resolved in tracked or resolved in directories or resolved == ".":
             continue
-        print(f"  {path}:{text.count(chr(10), 0, offset) + 1}: {target}")
+        print(f"  {where}: {target}")
         broken += 1
 sys.exit(1 if broken else 0)
 PYTHON
@@ -300,7 +305,7 @@ PYTHON
 refuse_links() {
   local clone="$1" broken
   if ! broken="$(broken_links "$clone")"; then
-    say "refused: relative Markdown links name paths the tree does not have:"
+    say "refused: Markdown links name paths the tree does not have, or cannot be read:"
     printf '%s\n' "$broken"
     return 1
   fi
@@ -330,7 +335,6 @@ while index < len(lines):
         sys.exit(f"README.md: the group {group} is not followed by a fenced block")
     character, length = opened.group(1)[0], len(opened.group(1))
     index += 1
-    pending = ""
     closed = False
     while index < len(lines):
         line = lines[index].rstrip()
@@ -339,19 +343,12 @@ while index < len(lines):
         if len(stripped) >= length and set(stripped) == {character}:
             closed = True
             break
-        if not pending and stripped.startswith("#"):
-            continue
         if line.endswith("\\"):
-            pending += line[:-1].rstrip() + " "
-            continue
-        command = (pending + line).strip()
-        pending = ""
-        if command:
-            print(f"{group}\t{command}")
+            sys.exit(f"README.md: line {index} of the group {group} ends with a backslash")
+        if stripped and not stripped.startswith("#"):
+            print(f"{group}\t{stripped}")
     if not closed:
         sys.exit(f"README.md: the group {group}'s block is not closed")
-    if pending:
-        sys.exit(f"README.md: the group {group}'s block ends inside a continued line")
 PYTHON
 }
 
@@ -403,9 +400,8 @@ case "$TMPDIR" in /tmp/kr-clean.*) test -d "$TMPDIR" ;; *) false ;; esac
 test -z "${CARGO_TARGET_DIR:-}" && test -z "${RUSTUP_TOOLCHAIN:-}"
 test -z "${KR_CLEAN_SELF_TEST_LEAK:-}"
 test "$(pwd -P)" = "$(cd "$KR_CLEAN_CHECKOUT_ROOT/clone" && pwd -P)" && test -z "$(git status --porcelain)"
-# a note that ends with a backslash, which is still a note \
-test \
-  -f README.md
+# a note between two steps
+test -f README.md
 ```
 EOF
   cat > "$directory/docs/guide.md" <<'EOF'
@@ -415,8 +411,7 @@ Back to [the README](../README.md), a [reference] link, and a destination on the
 README again](
 ../README.md).
 
-A destination with parentheses: [a page](a(b).md). One in angle brackets: [a page](<with space.md>).
-One encoded: [a page](with%20space.md).
+A destination with parentheses: [a page](a(b).md). One encoded: [a page](with%20space.md).
 
 ```text
 An example that links: [the guide](guide.md)
@@ -473,6 +468,10 @@ self_test() {
   make_fixture "$directory"
   expect "a clean fixture passes" pass "== step check.4 exit 0"
   expect "the run records each program it found" pass "tool git: /"
+  if [ "$(uname -s)" = Darwin ]; then
+    expect "on macOS the fresh home directory has a keychain of its own" pass \
+      "the fresh home directory has a keychain of its own"
+  fi
   expect "an unknown group is refused" refuse "names no group README.md lists" --only nosuch
   expect "a group name is not a pattern" refuse "names no group README.md lists" --only 'check.*'
   expect "a selection of nothing is refused" refuse "select no step" --skip setup,check
@@ -567,22 +566,36 @@ and say why on the next line"
   expect "a second line with no blank line before it is refused" refuse \
     "a body: Extend the guide again" --no-steps
 
-  directory="$work/broken-link"
+  directory="$work/commit-blank-line"
   make_fixture "$directory"
-  printf 'See [the missing page](\n  missing.md).\n' >> "$directory/docs/guide.md"
-  commit_fixture "$directory" "Link a page that is not there"
-  expect "a relative link to a missing path is refused, across a line" refuse \
-    "docs/guide.md:16: missing.md"
+  echo "more" >> "$directory/docs/guide.md"
+  commit_fixture "$directory" "Extend the guide
 
-  directory="$work/example-link"
-  make_fixture "$directory"
-  printf '```text\n[an example](missing-example.md)\n```\n' >> "$directory/docs/guide.md"
-  commit_fixture "$directory" "Add an example that links nowhere"
-  expect "a link in a code example counts" refuse "missing-example.md"
+"
+  expect "a blank line after the subject is refused" refuse "a blank line: Extend the guide" \
+    --no-steps
+
+  local defect
+  for planted in \
+    "missing-across-lines=See [the missing page](\n  missing.md).|docs/guide.md:15: missing.md" \
+    "missing-in-an-example=\`\`\`text\n[an example](missing-example.md)\n\`\`\`|missing-example.md" \
+    "missing-definition=[a\\\\]b]: missing-definition.md|docs/guide.md:15: missing-definition.md" \
+    "angle-brackets=[a page](<with space.md>)|cannot read" \
+    "backslash=[a page](a\\\\(b\\\\).md)|cannot read" \
+    "entity=[a page](a&amp;b.md)|cannot read"; do
+    name="${planted%%=*}"
+    defect="${planted#*=}"
+    directory="$work/link-$name"
+    make_fixture "$directory"
+    # shellcheck disable=SC2059
+    printf "${defect%|*}\n" >> "$directory/docs/guide.md"
+    commit_fixture "$directory" "Add a link"
+    expect "a link that is broken or unreadable ($name) is refused" refuse "${defect##*|}"
+  done
 
   directory="$work/failing-step"
   make_fixture "$directory"
-  sed 's/^test \\$/false \\/' "$directory/README.md" > "$directory/README.new"
+  sed 's/^test -f README.md$/false/' "$directory/README.md" > "$directory/README.new"
   mv "$directory/README.new" "$directory/README.md"
   commit_fixture "$directory" "Make the last step fail"
   expect "a step that fails fails the run" refuse "== step check.4 exit 1"
@@ -591,16 +604,17 @@ and say why on the next line"
   expect "--only runs the named group alone" pass "== step setup.4 exit 0" --only setup
   expect "--list prints the steps and runs none" pass "check.4: false" --list
 
-  directory="$work/comment-backslash"
-  make_fixture "$directory"
-  replace_readme "$directory" '<!-- clean-checkout: check -->
-
-```bash
-# a note that ends with a backslash \
-false
-true
-```'
-  expect "a note ending in a backslash does not hide the next step" refuse "== step check.1 exit 1"
+  for planted in \
+    "comment=# a note that ends with a backslash \\\\\nfalse\ntrue" \
+    "continued=true \\\\\n# a note \\\\\nfalse"; do
+    name="${planted%%=*}"
+    directory="$work/backslash-$name"
+    make_fixture "$directory"
+    # shellcheck disable=SC2059
+    replace_readme "$directory" "$(printf '<!-- clean-checkout: check -->\n\n```bash\n'"${planted#*=}"'\n```')"
+    expect "a step line that ends with a backslash is refused ($name)" refuse \
+      "ends with a backslash"
+  done
 
   directory="$work/unclosed"
   make_fixture "$directory"
@@ -609,15 +623,6 @@ true
 ```bash
 true'
   expect "a block that is never closed is refused" refuse "block is not closed"
-
-  directory="$work/dangling"
-  make_fixture "$directory"
-  replace_readme "$directory" '<!-- clean-checkout: check -->
-
-```bash
-true \
-```'
-  expect "a block that ends inside a continued line is refused" refuse "inside a continued line"
 
   directory="$work/no-steps"
   make_fixture "$directory"
@@ -708,7 +713,7 @@ cleanup() {
     return
   fi
   if [ -n "$keychain" ]; then
-    clean security delete-keychain "$keychain" 2>/dev/null || true
+    clean /usr/bin/security delete-keychain "$keychain" 2>/dev/null || true
   fi
   chmod -R u+w "${root:?}" 2>/dev/null || true
   rm -rf "${root:?}" "${step_tmp:?}"
@@ -724,39 +729,75 @@ for tool in "${tools[@]}"; do
   fi
 done
 
-# The account's own keychain settings are read before and after, and a change to them stops the
-# run once they are put back: the fresh home directory's keychain is its own or it is nothing.
-if [ "$(uname -s)" = Darwin ]; then
-  own_default="$(security default-keychain -d user 2>/dev/null | tr -d ' "' || true)"
-  own_list="$(security list-keychains -d user 2>/dev/null | tr -d ' "' || true)"
+# Prints the keychain paths a `security` listing names, one per line, spaces kept.
+keychain_paths() {
+  "$@" 2>/dev/null | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//' || true
+}
+
+# Gives the fresh home directory a keychain of its own as its default and its whole search list.
+make_keychain() {
   keychain="$root/home/Library/Keychains/login.keychain-db"
-  mkdir -p "$root/home/Library/Keychains"
-  clean security create-keychain -p "" "$keychain"
-  clean security set-keychain-settings "$keychain"
-  clean security default-keychain -d user -s "$keychain"
-  clean security list-keychains -d user -s "$keychain"
-  if [ "$(security default-keychain -d user 2>/dev/null | tr -d ' "' || true)" != "$own_default" ] \
-    || [ "$(security list-keychains -d user 2>/dev/null | tr -d ' "' || true)" != "$own_list" ]; then
-    if [ -n "$own_default" ]; then
-      security default-keychain -d user -s "$own_default"
+  mkdir -p "$root/home/Library/Keychains" \
+    && clean /usr/bin/security create-keychain -p "" "$keychain" \
+    && clean /usr/bin/security set-keychain-settings "$keychain" \
+    && clean /usr/bin/security default-keychain -d user -s "$keychain" \
+    && clean /usr/bin/security list-keychains -d user -s "$keychain"
+}
+
+if [ "$(uname -s)" = Darwin ]; then
+  own_default="$(keychain_paths /usr/bin/security default-keychain -d user)"
+  own_list="$(keychain_paths /usr/bin/security list-keychains -d user)"
+  own_paths=()
+  while IFS= read -r line; do
+    if [ -n "$line" ]; then
+      own_paths+=("$line")
     fi
-    # shellcheck disable=SC2086
-    security list-keychains -d user -s $own_list
-    say "refused: this account's own keychain settings changed when the fresh home directory's"
-    say "keychain was made its default; they have been put back"
+  done <<EOF
+$own_list
+EOF
+  made=0
+  if make_keychain; then
+    made=1
+  fi
+  if [ "$(keychain_paths /usr/bin/security default-keychain -d user)" != "$own_default" ] \
+    || [ "$(keychain_paths /usr/bin/security list-keychains -d user)" != "$own_list" ]; then
+    if [ -n "$own_default" ]; then
+      /usr/bin/security default-keychain -d user -s "$own_default" || true
+    fi
+    /usr/bin/security list-keychains -d user -s ${own_paths[@]+"${own_paths[@]}"} || true
+    if [ "$(keychain_paths /usr/bin/security default-keychain -d user)" = "$own_default" ] \
+      && [ "$(keychain_paths /usr/bin/security list-keychains -d user)" = "$own_list" ]; then
+      say "refused: this account's own keychain settings changed when the fresh home directory's"
+      say "keychain was set up; they have been put back"
+    else
+      say "refused: this account's own keychain settings changed when the fresh home directory's"
+      say "keychain was set up, and could not be put back. They were: default $own_default;"
+      say "search list:"
+      printf '%s\n' "$own_list" | sed 's/^/  /'
+    fi
+    exit 1
+  fi
+  if [ "$made" -eq 0 ]; then
+    say "refused: the fresh home directory's keychain could not be set up"
     exit 1
   fi
   say "the fresh home directory has a keychain of its own as its default"
 fi
 
-# macOS names every SecurityAgent dialog in its log, and a run that opened one fails.
+# Returns success when the run must stop over a dialog: SecurityAgent opened one since the run
+# started, or the system log that would say so cannot be read. Always failure off macOS.
 security_agent_opened() {
-  local entries
+  local entries rc=0
   if [ "$(uname -s)" != Darwin ]; then
     return 1
   fi
-  entries="$(log show --start "$started_at" --predicate 'process == "SecurityAgent"' \
-    --style compact 2>/dev/null | grep -F SecurityAgent || true)"
+  entries="$(/usr/bin/log show --start "$started_at" --predicate 'process == "SecurityAgent"' \
+    --style compact 2>/dev/null)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    say "refused: the system log could not be read to look for a SecurityAgent dialog"
+    return 0
+  fi
+  entries="$(printf '%s\n' "$entries" | grep -F SecurityAgent || true)"
   if [ -n "$entries" ]; then
     say "refused: SecurityAgent opened a dialog while this run ran:"
     printf '%s\n' "$entries" | head -20 | sed 's/^/  /'
@@ -788,16 +829,15 @@ refused=0
 refuse_records "$clone" || refused=1
 refuse_messages "$clone" "${commits:-$commit}" || refused=1
 refuse_links "$clone" || refused=1
+if security_agent_opened; then
+  refused=1
+fi
 if [ "$refused" -ne 0 ]; then
-  security_agent_opened || true
   say "refused $commit"
   exit 1
 fi
 
 if [ "$run_steps" -eq 0 ]; then
-  if security_agent_opened; then
-    exit 1
-  fi
   say "no step was asked for"
   exit 0
 fi
@@ -857,6 +897,10 @@ while IFS="$(printf '\t')" read -r group command; do
   # A step reads nothing from this script's input, which holds the steps still to come.
   (cd "$clone" && clean bash -c "$command" < /dev/null) || rc=$?
   echo "== step $group.$index exit $rc ($((SECONDS - started)) s)"
+  if security_agent_opened; then
+    failed=1
+    break
+  fi
   if [ "$rc" -ne 0 ]; then
     failed=1
     if [ "$keep_going" -eq 0 ]; then
@@ -867,9 +911,6 @@ done <<EOF
 $steps
 EOF
 
-if security_agent_opened; then
-  failed=1
-fi
 if [ "$list_steps" -eq 1 ] && [ "$failed" -eq 0 ]; then
   exit 0
 fi

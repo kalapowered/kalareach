@@ -83,9 +83,10 @@ one commit, with a home directory, a Cargo home, a pnpm store and a temporary di
 and with a PATH reduced to the system directories and those of the programs the list uses, whose
 paths and digests it prints first; on macOS the fresh home directory has a keychain of its own.
 `--help` says how to choose groups. Before it runs a step it refuses a tree that names a working
-record kept outside the repository, a commit message longer than one line, and a relative link in
-a Markdown file, read as text, to a path the tree does not have; `--self-test` shows each refusal
-on a fixture with its defect planted.
+record kept outside the repository, a commit message longer than one line, and a link in a
+Markdown file, read as text, that names a relative path the tree does not have or that it cannot
+read; `--self-test` shows each refusal on a fixture with its defect planted. Each step is one line
+of the lists below.
 
 Setup: the target, the JavaScript dependencies, the test components the plugin runtime's tests
 load, and the managed shell packages with the PSReadLine qualification. `--no-upstream-tests`
