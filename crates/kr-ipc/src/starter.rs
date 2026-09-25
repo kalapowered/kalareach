@@ -189,8 +189,8 @@ pub fn leave_claim(environment: &EnvironmentPaths, claim: &StartClaim) -> Result
 
 /// Takes one claim this starter may act on, if there is one.
 ///
-/// Taking is one rename of the claim's file, so of any number of starters looking at once, one
-/// takes each claim and every other finds it gone. A claim that has lapsed, or that names another
+/// Taking is one exclusive link of the claim's file to a taken name, so of any number of starters
+/// looking at once, one takes each claim and every other finds it taken or gone. A claim that has lapsed, or that names another
 /// boot, is taken and removed rather than returned, so nothing acts on it and it does not wait
 /// forever. A name in the directory that is not a waiting claim is left alone.
 ///
@@ -225,11 +225,27 @@ pub fn take_claim(
     for request in waiting {
         let from = directory.join(format!("{request}.{WAITING}"));
         let to = directory.join(format!("{request}.{TAKEN}"));
-        match std::fs::rename(&from, &to) {
+        // A link refuses a name that exists, so exactly one of the starters that link at once
+        // succeeds. A rename would not do: on Windows it works through a handle opened first, and
+        // two starters that had both opened the waiting claim would both succeed.
+        match std::fs::hard_link(&from, &to) {
             Ok(()) => {}
             // Another starter took it first.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                continue;
+            }
             Err(error) => return Err(IpcError::io("take", &from, error)),
+        }
+        // Taken: the waiting name goes, so no later starter looks at it again.
+        match std::fs::remove_file(&from) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(IpcError::io("remove", &from, error)),
         }
         let taken = TakenClaim {
             claim: read_claim(&to)?,
@@ -1897,11 +1913,12 @@ mod tests {
             writeln!(helper.stdin.take().expect("the helper's input"), "go")
                 .expect("the word is given");
             let output = std::io::BufReader::new(helper.stdout.take().expect("its output"));
-            // The test harness prints a test's name before running it, so the helper's line may
-            // follow the name on the same line of output.
-            let reported = output
-                .lines()
-                .map_while(std::result::Result::ok)
+            // Read to the end: the helper's test harness writes after the result line, and a pipe
+            // closed under it fails the helper. The harness prints a test's name before running
+            // it, so the result may follow the name on the same line.
+            let lines: Vec<String> = output.lines().map_while(std::result::Result::ok).collect();
+            let reported = lines
+                .iter()
                 .find_map(|line| line.find("result ").map(|at| line[at..].to_owned()))
                 .unwrap_or_default();
             let status = helper.wait().expect("the helper ends");
