@@ -1304,12 +1304,18 @@ async fn admit_claimed<'a>(
         .map_err(|refused| refused.error)?;
     // The directory the invocation was resolved in, for reading only and confined to its own
     // mount. The grant is the instance's, so it goes with the instance: a launch given back takes
-    // it along, and so does the program's end. A directory no grant can be made from (its handle
-    // cannot be taken again, or its mount cannot be told) is granted nothing, like one that could
-    // not be opened.
+    // it along, and so does the program's end. It is granted only when it is the directory the
+    // launched process works in, as the kernel keeps it: the path was opened after the shell
+    // reported it, and a directory moved away and replaced at that path meanwhile is another
+    // directory. A directory no grant can be made from (its handle cannot be taken again, or its
+    // mount cannot be told) is granted nothing, like one that could not be opened.
+    let working = working_directory_of(process.pid.get());
     if let Some(files) = backend
         .host_directory
         .get()
+        .filter(|directory| {
+            working.is_some_and(|working| directory.check_identity(working).is_ok())
+        })
         .and_then(|directory| directory.try_clone().ok())
         .and_then(|root| {
             crate::broker::host::HostFiles::new(root, crate::broker::host::FileAccess::Read).ok()
@@ -1350,6 +1356,70 @@ fn confirmation() -> Vec<u8> {
     serde_json::json!({ "kr_launch": { "committed": true } })
         .to_string()
         .into_bytes()
+}
+
+/// Returns the identity of the directory a process works in, as the kernel keeps it: the directory
+/// object itself, whatever path names it now.
+#[cfg(target_os = "linux")]
+fn working_directory_of(pid: u64) -> Option<kr_transfer::authority::ObjectIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = std::fs::metadata(format!("/proc/{pid}/cwd")).ok()?;
+    Some(kr_transfer::authority::ObjectIdentity {
+        device: metadata.dev(),
+        file_id: metadata.ino(),
+    })
+}
+
+/// Returns the identity of the directory a process works in, as the kernel keeps it: the directory
+/// object itself, whatever path names it now.
+#[cfg(target_os = "macos")]
+fn working_directory_of(pid: u64) -> Option<kr_transfer::authority::ObjectIdentity> {
+    let pid = i32::try_from(pid).ok()?;
+    let info: WorkingDirectories = libproc::proc_pid::pidinfo(pid, 0).ok()?;
+    let stat = &info.current.vnode.stat;
+    Some(kr_transfer::authority::ObjectIdentity {
+        device: u64::from(stat.vst_dev),
+        file_id: stat.vst_ino,
+    })
+}
+
+/// No platform record of a process's working directory is read here, so none is granted.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const fn working_directory_of(_pid: u64) -> Option<kr_transfer::authority::ObjectIdentity> {
+    None
+}
+
+/// The kernel's `struct proc_vnodepathinfo`: the current and the root directory of a process.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct WorkingDirectories {
+    current: VnodeWithPath,
+    root: VnodeWithPath,
+}
+
+/// The kernel's `struct vnode_info_path`.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct VnodeWithPath {
+    vnode: Vnode,
+    path: [u8; 1024],
+}
+
+/// The kernel's `struct vnode_info`.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct Vnode {
+    stat: libproc::net_info::VInfoStat,
+    kind: i32,
+    pad: i32,
+    fsid: [i32; 2],
+}
+
+#[cfg(target_os = "macos")]
+impl libproc::proc_pid::PIDInfo for WorkingDirectories {
+    fn flavor() -> libproc::proc_pid::PidInfoFlavor {
+        libproc::proc_pid::PidInfoFlavor::VNodePathInfo
+    }
 }
 
 /// The most bytes of a refusal's reason an announcement carries.

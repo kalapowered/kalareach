@@ -358,6 +358,20 @@ impl Shell {
         command.spawn().expect("the launcher starts")
     }
 
+    /// Starts the launcher in `cwd`, as the shell's child runs in the directory the shell reported.
+    fn launch_from(
+        &self,
+        answer: &CommandBackend,
+        name: &str,
+        env: &[(&str, &str)],
+        cwd: &Path,
+    ) -> std::process::Child {
+        let mut command = self.launcher(&self.executable, &Self::answered(), None);
+        self.prepare(&mut command, Some(answer), name, env);
+        command.current_dir(cwd);
+        command.spawn().expect("the launcher starts")
+    }
+
     fn prepare(
         &self,
         command: &mut std::process::Command,
@@ -1618,7 +1632,7 @@ fn kr_req_12_16_a_launch_is_granted_the_directory_it_was_resolved_in_for_reading
     std::fs::create_dir_all(&project).expect("a project directory");
     std::fs::write(project.join("notes.txt"), "first\nsecond\n").expect("a file in it");
     let answer = shell.establish_in(&project);
-    let child = shell.launch(&answer, "reading", &[("LINGER", "2")]);
+    let child = shell.launch_from(&answer, "reading", &[("LINGER", "2")], &project);
     let instance = instance_of(&shell.report("reading"));
     let files = shell
         .broker
@@ -1641,7 +1655,7 @@ fn kr_req_12_16_a_launch_is_granted_the_directory_it_was_resolved_in_for_reading
     // refused, where this host has such a file.
     if let Some(across) = across_a_mount() {
         let answer = shell.establish_in(Path::new("/"));
-        let child = shell.launch(&answer, "root", &[("LINGER", "2")]);
+        let child = shell.launch_from(&answer, "root", &[("LINGER", "2")], Path::new("/"));
         let instance = instance_of(&shell.report("root"));
         let files = shell
             .broker
@@ -1689,7 +1703,7 @@ fn kr_req_12_16_a_directory_slow_to_open_does_not_hold_the_establish() {
         "the establish waited {took:?} for the directory's open"
     );
     release.send(()).expect("the open is let go");
-    let child = shell.launch(&answer, "slow", &[("LINGER", "2")]);
+    let child = shell.launch_from(&answer, "slow", &[("LINGER", "2")], &project);
     let instance = instance_of(&shell.report("slow"));
     assert!(
         shell.broker.host_files(instance).is_some(),
@@ -1960,4 +1974,36 @@ fn kr_req_12_07_a_refused_bridge_is_announced_with_its_reason() {
         Some(&why),
         "the refusal stands to the end"
     );
+}
+
+/// KR-REQ-12.16: the directory a launch is granted is the one its program runs in. A directory
+/// moved away and replaced at its path before the grant's directory is opened is not granted:
+/// what was opened is not where the launched process works.
+#[test]
+fn kr_req_12_16_a_directory_replaced_before_it_is_opened_is_not_granted() {
+    let shell = Shell::reading();
+    let project = shell.placed.host.root().join("replaced");
+    std::fs::create_dir_all(&project).expect("a project directory");
+    let (arrived, release) = shell.backends.pause_before_opening_the_directory();
+    let answer = shell.establish_in(&project);
+    arrived
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the directory's open is reached");
+    // The launcher starts in the directory, as the shell's child would, and the directory is then
+    // moved away and another made at its path, before the open.
+    let child = shell.launch_from(&answer, "replaced", &[("LINGER", "2")], &project);
+    std::fs::rename(&project, shell.placed.host.root().join("moved"))
+        .expect("the directory is moved away");
+    std::fs::create_dir(&project).expect("another directory at its path");
+    release.send(()).expect("the open is let go");
+    let instance = instance_of(&shell.report("replaced"));
+    assert!(
+        shell.broker.binding_state(instance).is_ok(),
+        "the launch went ahead"
+    );
+    assert!(
+        shell.broker.host_files(instance).is_none(),
+        "the directory opened is not the one the program runs in, so none is granted"
+    );
+    let _ = finish(child);
 }
