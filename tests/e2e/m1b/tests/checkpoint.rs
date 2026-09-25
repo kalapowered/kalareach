@@ -23,8 +23,9 @@ const PROBE: Duration = Duration::from_secs(5);
 ///
 /// The host releases the locator before it answers the call that ended the invitation, so a room
 /// that still serves the record this long afterwards is one the release did not reach; the record
-/// then lasts until the invitation's own expiry.
-const RELEASE_WAIT: Duration = Duration::from_secs(30);
+/// then lasts until the invitation's own expiry. Only a question that can conclude inside this is
+/// asked.
+const RELEASE_WAIT: Duration = Duration::from_secs(40);
 
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
@@ -60,7 +61,10 @@ fn room_after(
         .block_on(room::stops_serving(origin, locator, PROBE, RELEASE_WAIT))
         .unwrap_or_else(|why| panic!("the room could not be asked: {why}"));
     if let Some(after) = stopped {
-        println!("a new candidate was served no record {after:?} after {ended}");
+        println!(
+            "a new candidate was served no record: the question that found so concluded \
+             {after:?} after {ended}"
+        );
         return format!(
             "nothing that a new candidate is served: once {ended}, the room of locator {} served \
              no record",
@@ -73,8 +77,9 @@ fn room_after(
             u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
         });
     format!(
-        "the room of locator {} still served its record {RELEASE_WAIT:?} after {ended}: the \
-         host's release did not reach it, and the record ends with the invitation in about {} s",
+        "the room of locator {} still served its record to every question asked within \
+         {RELEASE_WAIT:?} after {ended}; the host's release is a best effort, and the record \
+         is due to end with the invitation in about {} s",
         locator.as_str(),
         expires_at_ms.saturating_sub(now_ms) / 1000
     )
