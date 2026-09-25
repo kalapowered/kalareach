@@ -800,10 +800,11 @@ names, so a device restoring from a recovery kit asks for `backup.restore` and n
 A relay lease request whose answer went missing is `OUTCOME_UNKNOWN`: a success `services::relay`
 cannot read, and a 502 or 504 with no envelope of the service's, because the service may have
 issued and installed the lease before a gateway in front of it lost the answer. Nothing asks again
-by itself. A caller finds out before it asks for anything else, by asking again for the same pair
-with the same cumulative ceiling: the service answers a pair that already holds a lease with that
-lease rather than a second one, and the caller then uses it or ends it. A revocation whose answer
-went missing is asked again as it was.
+by itself. A caller finds out before it asks for anything else, by sending the same request again,
+with the same signer, payer, pair, direction and cumulative ceiling: a pair that already holds a
+lease on a live reservation is answered with that lease and no more bytes held, a first request
+that issued nothing is answered with a new lease, and either can be refused. The caller then uses
+the lease it is given or ends it. A revocation whose answer went missing is asked again as it was.
 
 A mailbox is addressed by the identifier of the recipient's stored-envelope public key, and every
 paired peer of that recipient knows that key, because it is what they seal to. So possession of the

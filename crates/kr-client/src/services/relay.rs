@@ -23,13 +23,14 @@
 //! it on a relay, whatever came back. When this client cannot tell, it reports `OUTCOME_UNKNOWN`:
 //! for a success status whose body it cannot read, and for a 502 or 504 with no envelope of the
 //! service's, which is a gateway in front of it saying the service's answer never reached it.
-//! Nothing asks again by itself. A caller finds out before it asks for anything else, by asking
-//! again for the same pair with the same cumulative ceiling. The service answers a pair that
-//! already holds a lease with that lease rather than a second one, and holds no more bytes than the
-//! ceiling names, so the answer is the lease the first request issued, or a new one when it issued
-//! none. The caller then uses that lease or ends it with a revocation. A revocation whose answer
-//! went missing is simply asked again, because a repeated revocation finishes whatever the first
-//! did not and answers with the settlement as it stands.
+//! Nothing asks again by itself. A caller finds out before it asks for anything else, by sending
+//! the same request again: the same signer, payer, pair, direction and cumulative ceiling. A pair
+//! that already holds a lease on a live reservation is answered with that lease, holding no more
+//! bytes than the ceiling names, although its deadline can move later. When the first request
+//! issued nothing, or the reservation it issued from has since ended, the answer is a new lease;
+//! and either answer can be a refusal. The caller then uses the lease it is given or ends it with a
+//! revocation. A revocation whose answer went missing is simply asked again, because a repeated
+//! revocation finishes whatever the first did not and answers with the settlement as it stands.
 //!
 //! # One body, two representations
 //!
