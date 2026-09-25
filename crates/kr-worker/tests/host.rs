@@ -580,7 +580,7 @@ fn workspace_root() -> PathBuf {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
     windows,
-    ignore = "cargo's own job kills on close and forbids breakaway, so a worker cannot be started under `cargo test`; run this from the built test executable directly, outside cargo"
+    ignore = "cargo's own job kills on close and forbids breakaway, so a worker cannot be started under `cargo test`; run this from the built test executable directly, outside cargo (held back there too: on Windows the worker's rendezvous does not complete across a daemon restart yet, so the worker does not report itself in time)"
 )]
 async fn a_daemon_restart_keeps_the_session_and_its_shell() {
     let host = Host::create();
@@ -930,7 +930,7 @@ async fn a_daemon_restart_during_output_keeps_the_local_terminals_and_the_screen
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
     windows,
-    ignore = "cargo's own job kills on close and forbids breakaway, so a worker cannot be started under `cargo test`; run this from the built test executable directly, outside cargo"
+    ignore = "cargo's own job kills on close and forbids breakaway, so a worker cannot be started under `cargo test`; run this from the built test executable directly, outside cargo (held back there too: on Windows the worker's rendezvous times out before the descriptor is published, so the worker does not report itself in time)"
 )]
 async fn the_descriptor_is_published_whole_and_owner_only_and_names_the_worker() {
     let host = Host::create();
@@ -1140,10 +1140,6 @@ async fn the_creating_terminals_size_is_the_shells_from_the_start() {
 /// access control: a socket only its owner may open, in a directory only its owner may enter.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg_attr(
-    windows,
-    ignore = "cargo's own job kills on close and forbids breakaway, so a worker cannot be started under `cargo test`; run this from the built test executable directly, outside cargo"
-)]
 async fn a_workers_endpoint_is_open_to_its_owner_alone() {
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 
@@ -1186,10 +1182,6 @@ async fn a_workers_endpoint_is_open_to_its_owner_alone() {
 /// starts beside the shell stays running.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg_attr(
-    windows,
-    ignore = "cargo's own job kills on close and forbids breakaway, so a worker cannot be started under `cargo test`; run this from the built test executable directly, outside cargo"
-)]
 async fn an_idle_session_runs_nothing_beside_its_shell() {
     let host = Host::create().recording_launches();
     let _controller = host.start().await;
@@ -1272,7 +1264,7 @@ fn processes() -> Vec<(u32, u32)> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
     windows,
-    ignore = "cargo's own job kills on close and forbids breakaway, so a worker cannot be started under `cargo test`; run this from the built test executable directly, outside cargo"
+    ignore = "cargo's own job kills on close and forbids breakaway, so a worker cannot be started under `cargo test`; run this from the built test executable directly, outside cargo (held back there too: it places a POSIX /bin/cat as a stand-in shell binary, which this platform has not got)"
 )]
 async fn a_worker_that_reports_it_could_not_start_leaves_no_directory() {
     let host = Host::create().with_shell_package();
