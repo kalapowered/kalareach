@@ -306,8 +306,8 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
                     continue;
                 }
             };
-        for warning in warnings {
-            let text = format!("{}: {}", warning.file, warning.what);
+        for warning in &warnings {
+            let text = format!("{}:{}: {}", warning.file, warning.line, warning.what);
             if !map.warnings.contains(&text) {
                 map.warnings.push(text);
             }
@@ -409,6 +409,13 @@ fn rust_package(map: &mut Map, sources: &mut Sources, root: &Path, package: &Pac
             found.extend(breaches(
                 sources, root, package, target, &modules, &scope, &helpers,
             ));
+            // A module the scan could not read as the compiler would may hold what the
+            // conventions forbid.
+            found.extend(warnings.into_iter().map(|warning| Breach {
+                file: warning.file,
+                line: warning.line,
+                what: warning.what,
+            }));
         }
         for breach in &found {
             let text = breach.to_string();
