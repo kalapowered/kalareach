@@ -143,12 +143,16 @@ cleanup() {
     stopped=0
   fi
   if [ -n "$run" ] && [ -d "$run" ]; then
-    if [ "$stopped" -eq 1 ] && [ "$failed" -eq 0 ] && [ "$missed" -eq 0 ] && [ "$status" -eq 0 ] &&
-      node "$driver" stop --state "$state" --remove >>"$evidence/driver.log" 2>&1; then
-      rm -rf "${run:?}"
-    elif [ "$stopped" -eq 1 ]; then
+    if [ "$stopped" -eq 1 ] && [ "$failed" -eq 0 ] && [ "$missed" -eq 0 ] && [ "$status" -eq 0 ]; then
+      if node "$driver" stop --state "$state" --remove >>"$evidence/driver.log" 2>&1; then
+        rm -rf "${run:?}"
+      else
+        stopped=0
+      fi
+    fi
+    if [ -d "$run" ] && [ "$stopped" -eq 1 ]; then
       echo "the local run directory was kept for its evidence: $run"
-    else
+    elif [ -d "$run" ]; then
       echo "a local deployment did not stop: its record and the run directory were kept: $run"
       exit 1
     fi
