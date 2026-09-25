@@ -178,8 +178,9 @@ against that class, so an action cannot acquire rights by calling itself somethi
 | `approval.respond` | yes | `agent.approval.respond` | `approval.respond` |
 | `terminal.input` | yes | `terminal.input` | `terminal.input` |
 
-`approval.decode` needs no action right because decoding proposes a resource rather than answering
-one. The trust to decode is recorded against the publisher and its methods, separately from the
+A caller acting under a grant needs every right in that column for the action it invokes, whatever
+the action is called. `approval.decode` needs no action right because decoding proposes a resource
+rather than answering one. The trust to decode is recorded against the publisher and its methods, separately from the
 action vocabulary, and answering still needs `agent.approval.respond`.
 
 A control may name only an action the manifest registers, so the class the broker enforces is

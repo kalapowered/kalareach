@@ -4370,9 +4370,21 @@ caller past them. At that bound an answer's resource is settled as uncertain fir
 records an outcome nobody can establish, and only then is the caller told `UPSTREAM_UNAVAILABLE`.
 What the transport does afterwards settles nothing.
 
+A binding's actions are registered from its package's declarations and from nothing else. The
+grant, the effect, the capability, the operation and the rights of each follow from its declared
+effect class and implementation, and what an action is called, or labelled, changes none of them.
+A declaration this host does not register as an action (decoding, terminal input, an answer a
+component would prepare) is left out, with its reason.
+
 `plugin.action.invoke` validates the registered action, the grant that action declares, its effect
 class and whether a draft the action needs was named, and then issues the action token that
-authorises the one invocation that follows. The declaration is read inside the admission and kept
+authorises the one invocation that follows. A caller acting under a grant must hold the rights the
+action's class needs (an answer `agent.approval.respond`, a prompt `agent.prompt`, an attachment
+`agent.prompt` and `files.upload`), or the call is refused before the dispatch marker; the local
+owner on this worker's own socket, naming no grant, is its own authority. An action goes to the
+upstream as the rich method its name selects only when the right that method needs is one the class
+of the operation it prepares carries, and the transport is asked about that operation as soon as a
+plan names it. The declaration is read inside the admission and kept
 with it, and the plan the component returns is refused unless the declaration in force is still the
 one the invocation was admitted under: a package that re-registered the action while its component
 was working has withdrawn the invitation. The draft is resolved before the admission takes its lock
