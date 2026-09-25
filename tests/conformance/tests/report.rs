@@ -147,7 +147,17 @@ fn every_comment_form_and_a_case_table_key_their_tests() {
     );
     expect(
         "KR-REQ-03.08",
-        &[("flow calls_the_shared_case", Binding::CalledFunction)],
+        &[
+            (
+                "flow calls_a_case_its_module_brings_up",
+                Binding::CalledFunction,
+            ),
+            ("flow calls_the_shared_case", Binding::CalledFunction),
+            (
+                "flow other::calls_the_shared_case_by_its_path",
+                Binding::CalledFunction,
+            ),
+        ],
     );
     assert_eq!(keyed.len(), 10, "and nothing else: {keyed:?}");
 }
@@ -168,7 +178,7 @@ fn a_tree_with_nothing_ignored_reports_every_identifier_as_run() {
         );
     }
     // The module comment of the test file keys every test in it, each by its own name.
-    assert_eq!(document.identifiers["KR-REQ-03.01"].tests.len(), 8);
+    assert_eq!(document.identifiers["KR-REQ-03.01"].tests.len(), 12);
     assert!(document.passed());
 }
 
