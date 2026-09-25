@@ -6,11 +6,12 @@
 //! which is how the report learns which package and target each test binary is: two packages can
 //! both have a test target called `fixtures`, and only the executable tells them apart.
 //!
-//! What the build names is what the run is held to. Every test binary it built is listed, and has
-//! to be run and read; a listing that fails, a binary the log never ran, and a log that cannot be
-//! read are each the step's error, so a step can never pass on less output than it was built for.
-//! A target with a harness of its own (`harness = false`) is a program that prints neither a list
-//! nor verdicts: it is run, and only its exit status, which is the step's, counts.
+//! What the build names is what the run is held to. Every test binary it built is asked for its
+//! list, and has to be run and read; a binary that does not list, one the log never ran, and a log
+//! that cannot be read are each the step's error, so a step can never pass on less output than it
+//! was built for. A target with a harness of its own (`harness = false`) is a program that prints
+//! neither a list nor verdicts: it is not asked for a list, it is run with the step, and only its
+//! exit status, which is the step's, counts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -125,13 +126,12 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
     if tests {
         let listed = build_first(step, place, &log_path, packages).and_then(|(built, map)| {
             executed.built = built;
-            executables = map;
-            let own_harness: BTreeSet<&str> = executables
-                .iter()
-                .filter(|(_, target)| !has_harness(packages, target))
-                .map(|(executable, _)| executable.as_str())
+            let listed = list(&map, packages);
+            executables = map
+                .into_iter()
+                .map(|(executable, (target, _))| (executable, target))
                 .collect();
-            list(step, place, &executables, &own_harness)
+            listed
         });
         match listed {
             Ok(listed) => executed.listed = listed,
@@ -241,103 +241,82 @@ pub fn has_harness(packages: &[Package], target: &TargetId) -> bool {
         .is_none_or(|found| found.harness)
 }
 
-/// Every test each binary of a step holds, as the binaries list them through Cargo, whatever the
-/// step's own filters are. A binary with a harness of its own lists nothing, and is left out.
+/// Every test each binary of a step holds, whatever the step's own filters are, as each binary
+/// lists them when it is asked directly. A binary with a harness of its own is a program that
+/// would run rather than list, so it is not asked.
 ///
 /// # Errors
 ///
-/// Returns why the listing failed or could not be paired with the binaries the build made: a
-/// binary the listing leaves out would have its tests judged from the run alone.
+/// Returns the binary that could not be started, did not exit 0, or listed nothing it ended with
+/// a count of: a binary that lists nothing would have its tests judged from the run alone.
 fn list(
-    step: &Step,
-    place: &Place<'_>,
-    executables: &BTreeMap<String, TargetId>,
-    own_harness: &BTreeSet<&str>,
+    executables: &BTreeMap<String, (TargetId, PathBuf)>,
+    packages: &[Package],
 ) -> Result<BTreeMap<TargetId, BTreeSet<String>>, String> {
-    let mut command: Vec<String> = step
-        .command
-        .iter()
-        .take_while(|word| *word != "--")
-        .cloned()
-        .collect();
-    command.extend(["--".to_owned(), "--list".to_owned()]);
-    let output = place
-        .command(&command)
-        .stdin(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| format!("the step's tests could not be listed: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "`{}` did not list the step's tests (exit {})",
-            command.join(" "),
-            output
-                .status
-                .code()
-                .map_or_else(|| "by a signal".to_owned(), |code| code.to_string())
-        ));
-    }
-    // Cargo's lines are on standard error and the binaries' on standard output, so the two are
-    // read apart and paired in order: each section Cargo announces, a binary or a crate's
-    // documentation tests, prints one list, which ends with its count line.
-    let sections: Vec<Option<String>> = libtest::plain(&String::from_utf8_lossy(&output.stderr))
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim_start();
-            if line.starts_with("Doc-tests ") {
-                return Some(None);
-            }
-            let rest = line.strip_prefix("Running ")?;
-            let (_, executable) = rest.rsplit_once(" (")?;
-            Some(Some(file_name(executable.strip_suffix(')')?)))
-        })
-        .filter(|section| {
-            section
-                .as_deref()
-                .is_none_or(|executable| !own_harness.contains(executable))
-        })
-        .collect();
-    let mut lists: Vec<BTreeSet<String>> = Vec::new();
-    let mut current = BTreeSet::new();
-    for line in libtest::plain(&String::from_utf8_lossy(&output.stdout)).lines() {
-        if let Some(name) = line
-            .strip_suffix(": test")
-            .or_else(|| line.strip_suffix(": bench"))
-        {
-            current.insert(name.to_owned());
-        } else if is_count(line) {
-            lists.push(std::mem::take(&mut current));
-        }
-    }
-    if lists.len() != sections.len() {
-        return Err(format!(
-            "the listing printed {} lists for the {} binaries Cargo announced",
-            lists.len(),
-            sections.len()
-        ));
-    }
     let mut listed = BTreeMap::new();
-    for (section, names) in sections.into_iter().zip(lists) {
-        let Some(executable) = section else {
+    for (target, path) in executables.values() {
+        if !has_harness(packages, target) {
             continue;
-        };
-        let target = executables.get(&executable).ok_or_else(|| {
-            format!("the listing names {executable}, which the step's build did not make")
-        })?;
+        }
+        let mut command = Command::new(path);
+        command.arg("--list").stdin(Stdio::null());
+        // The package's directory, as Cargo gives it; and the build's own libraries beside the
+        // binary, where a platform looks for the ones it links.
+        if let Some(manifest) = packages
+            .iter()
+            .find(|package| package.name == target.package)
+            .and_then(|package| package.manifest.parent())
+        {
+            command.current_dir(manifest);
+        }
+        if let Some(directory) = path.parent() {
+            let variable = if cfg!(windows) {
+                "PATH"
+            } else if cfg!(target_os = "macos") {
+                "DYLD_FALLBACK_LIBRARY_PATH"
+            } else {
+                "LD_LIBRARY_PATH"
+            };
+            let mut paths = vec![directory.to_owned()];
+            paths.extend(
+                std::env::var_os(variable)
+                    .iter()
+                    .flat_map(std::env::split_paths),
+            );
+            if let Ok(joined) = std::env::join_paths(paths) {
+                command.env(variable, joined);
+            }
+        }
+        let output = command
+            .output()
+            .map_err(|error| format!("{target} could not be asked for its tests: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "{target} did not list its tests (exit {})",
+                output
+                    .status
+                    .code()
+                    .map_or_else(|| "by a signal".to_owned(), |code| code.to_string())
+            ));
+        }
+        let mut names = BTreeSet::new();
+        let mut counted = false;
+        for line in libtest::plain(&String::from_utf8_lossy(&output.stdout)).lines() {
+            if let Some(name) = line
+                .strip_suffix(": test")
+                .or_else(|| line.strip_suffix(": bench"))
+            {
+                names.insert(name.to_owned());
+            } else if is_count(line) {
+                counted = true;
+            }
+        }
+        if !counted {
+            return Err(format!(
+                "{target} listed its tests without the count that ends a list"
+            ));
+        }
         listed.insert(target.clone(), names);
-    }
-    let unlisted: Vec<String> = executables
-        .iter()
-        .filter(|(executable, target)| {
-            !own_harness.contains(executable.as_str()) && !listed.contains_key(*target)
-        })
-        .map(|(_, target)| target.to_string())
-        .collect();
-    if !unlisted.is_empty() {
-        return Err(format!(
-            "the listing leaves out {}, which the step's build made",
-            unlisted.join(", ")
-        ));
     }
     Ok(listed)
 }
@@ -352,8 +331,9 @@ fn is_count(line: &str) -> bool {
     )
 }
 
-/// A step's build: the targets it built, and which target each executable is.
-type Built = (Vec<TargetId>, BTreeMap<String, TargetId>);
+/// A step's build: the targets it built, and which target each executable is, by its file name,
+/// with its path.
+type Built = (Vec<TargetId>, BTreeMap<String, (TargetId, PathBuf)>);
 
 /// Builds a `cargo test` step's binaries without running them, and returns the targets it built
 /// and which target each executable is.
@@ -418,7 +398,10 @@ fn build_first(
             .find(|target| target.src_path == Path::new(source) && target.id.name == name)
             .map(|target| target.id.clone());
         if let Some(target) = target {
-            executables.insert(file_name(executable), target.clone());
+            executables.insert(
+                file_name(executable),
+                (target.clone(), PathBuf::from(executable)),
+            );
             if !built.contains(&target) {
                 built.push(target);
             }
