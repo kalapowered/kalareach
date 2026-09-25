@@ -16,10 +16,29 @@
 //! Questions belong to the session, so this reaches the session's worker directly, the way
 //! attaching does. It therefore keeps working while the control daemon is restarting, and the
 //! authority behind it is the operating-system owner the worker's socket authenticates.
+//!
+//! An answer the worker could not take is kept rather than lost, because section 11 keeps an
+//! offline answer as a draft. When the connection ends before the answer is sent, or after it is
+//! sent and before the worker says what became of it, the answer is written to this user's state
+//! directory with the question and the revision the person was shown, and the person is told.
+//! `kr question drafts` reads the questions again and says of each kept answer whether it can
+//! still be sent, or was retired unsent because its question ended or moved; it sends nothing.
+//! `kr question send` sends one kept answer, after reading its question once more, and nothing else
+//! sends a kept answer. The rules are the client library's own ([`kr_client::answers`]); what this
+//! adds is the connection they are sent over: each session's worker, found by its descriptor and
+//! proved against it before anything is sent.
 
+use std::collections::BTreeMap;
+
+use kr_client::answers::{
+    self, AnswerDraft, AnswerDrafts, AnswerError, Answered, QuestionHost, Reconciled, Retired,
+};
+use kr_client::error::ClientError;
 use kr_ipc::client::LocalClient;
 use kr_ipc::paths::HostPaths;
-use kr_protocol::ids::{BuildId, QuestionId};
+use kr_protocol::envelope::ActionTarget;
+use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::ids::{ActionId, BuildId, QuestionId, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::question::{
     Question, QuestionAnswer, QuestionAnswerParams, QuestionCancelParams, QuestionReadParams,
@@ -31,6 +50,9 @@ use serde_json::{Value, json};
 
 use crate::error::{CliError, Result};
 use crate::resolve::{KnownEnvironment, SessionSelector, environments, find, open_worker};
+
+/// The directory, in this user's state directory, the answers kept on this device are in.
+pub const KEPT_ANSWERS: &str = "kept-answers";
 
 /// Which sessions a listing covers.
 #[derive(Clone, Debug)]
@@ -92,34 +114,402 @@ pub async fn show(
         .map(|(descriptor, question, _)| (descriptor, question))
 }
 
-/// Answers one question.
+/// Answers one question, or keeps the answer on this device when its worker cannot take it.
+///
+/// The revision this command read is the revision the answer names, so a question that moved while
+/// the person was reading it is refused rather than answered as though it had not.
 ///
 /// # Errors
 ///
-/// Returns [`CliError::Refused`] when the question has already been resolved, has expired, or has
-/// moved to a revision this command did not read.
+/// Returns [`CliError::AnswerKept`] when the answer was kept rather than sent, [`CliError::Usage`]
+/// for an answer that does not fit the question's form, and [`CliError::Refused`] when the question
+/// has already been resolved, has expired, or has moved to a revision this command did not read.
 pub async fn answer(
     paths: &HostPaths,
     question_id: QuestionId,
     answer: QuestionAnswer,
     build_id: BuildId,
 ) -> Result<Question> {
-    let (descriptor, question, mut client) = locate(paths, question_id, build_id).await?;
-    let result: QuestionResolveResult = mutate(
-        &mut client,
-        &descriptor,
-        Method::QuestionAnswer,
-        &QuestionAnswerParams {
-            session_id: descriptor.session_id,
-            question_id,
-            // The revision this command read is the revision it answers. A question that moved
-            // while the person was reading it is refused rather than answered as though it had not.
-            expected_revision: question.revision,
-            answer,
-        },
+    let (descriptor, question, client) = locate(paths, question_id, build_id.clone()).await?;
+    let drafts = kept_answers(paths)?;
+    let workers = Workers::new(paths, build_id).holding(descriptor.session_id, client);
+    let answered = answers::answer(
+        Some(&workers),
+        &drafts,
+        crate::attach::target(&descriptor),
+        &question,
+        answer,
+        kr_ipc::now_ms(),
     )
-    .await?;
-    Ok(result.question)
+    .await;
+    match answered {
+        Ok(Answered::Sent(question)) => Ok(*question),
+        Ok(Answered::Kept(draft)) => Err(kept(&workers, draft.question_id, "was kept")),
+        Err(error) => Err(answer_failure(error)),
+    }
+}
+
+/// Reads the questions of every kept answer again, and says of each whether it can still be sent.
+///
+/// A kept answer whose question is still pending at the revision it answers is offered and stays
+/// kept. Any other is retired: it is not sent and no longer kept. Nothing is sent, however often
+/// this runs.
+///
+/// # Errors
+///
+/// Returns a failure when the store cannot be read, and when a session holding a kept answer's
+/// question cannot be read, in which case nothing is retired.
+pub async fn drafts(paths: &HostPaths, build_id: BuildId) -> Result<Vec<Reconciled>> {
+    let drafts = kept_answers(paths)?;
+    let workers = Workers::new(paths, build_id);
+    answers::reconcile(&workers, &drafts)
+        .await
+        .map_err(answer_failure)
+}
+
+/// Sends one kept answer, which is the one way a kept answer is ever sent.
+///
+/// The question is read again first, and an answer whose question ended or moved is retired rather
+/// than sent.
+///
+/// # Errors
+///
+/// Returns [`CliError::Usage`] when no answer to the question is kept, [`CliError::AnswerKept`]
+/// when the worker could not take it and it stays kept, and [`CliError::Refused`] when the question
+/// ended or moved.
+pub async fn send(
+    paths: &HostPaths,
+    question_id: QuestionId,
+    build_id: BuildId,
+) -> Result<Question> {
+    let drafts = kept_answers(paths)?;
+    let draft = kept_draft(&drafts, question_id)?.ok_or_else(|| {
+        CliError::Usage(format!(
+            "no answer to question {question_id} is kept on this device"
+        ))
+    })?;
+    let workers = Workers::new(paths, build_id);
+    match answers::send(&workers, &drafts, &draft).await {
+        Ok(question) => Ok(question),
+        // The library keeps a draft it could not send for any reason but its question's end, so
+        // what is still in the store says which this was.
+        Err(error) => match kept_draft(&drafts, question_id) {
+            Ok(Some(_)) if !matches!(error, AnswerError::Retired(_)) => {
+                Err(kept(&workers, question_id, "is still kept"))
+            }
+            _ => Err(answer_failure(error)),
+        },
+    }
+}
+
+/// Opens the answers kept on this device, in this user's state directory, readable only by its
+/// owner.
+///
+/// # Errors
+///
+/// Returns [`CliError::Other`] when the directory cannot be created or narrowed to its owner.
+pub fn kept_answers(paths: &HostPaths) -> Result<AnswerDrafts> {
+    AnswerDrafts::open(paths.state_root().join(KEPT_ANSWERS)).map_err(answer_failure)
+}
+
+/// The answer kept for one question, when there is one.
+fn kept_draft(drafts: &AnswerDrafts, question_id: QuestionId) -> Result<Option<AnswerDraft>> {
+    Ok(drafts
+        .drafts()
+        .map_err(answer_failure)?
+        .into_iter()
+        .find(|draft| draft.question_id == question_id))
+}
+
+/// The failure an answer that was not sent is reported as, with why and what to do about it.
+fn kept(workers: &Workers, question_id: QuestionId, which: &str) -> CliError {
+    let (code, why) = workers.failure().unwrap_or((
+        ErrorCode::ResourceUnavailable,
+        "its session's worker could not take it".to_owned(),
+    ));
+    CliError::AnswerKept {
+        code,
+        message: format!(
+            "the answer to question {question_id} {which} on this device and not sent: {why}. \
+             `kr question drafts` says whether it can still be sent, and \
+             `kr question send {question_id}` sends it"
+        ),
+    }
+}
+
+/// Turns a failure of the kept-answer rules into this command's own.
+fn answer_failure(error: AnswerError) -> CliError {
+    let code = error.code();
+    match error {
+        AnswerError::Form(message) => CliError::Usage(message),
+        AnswerError::Retired(reason) => CliError::Refused(ProtocolError::new(
+            code,
+            format!(
+                "{}, so the kept answer was not sent",
+                retired_because(reason)
+            ),
+        )),
+        AnswerError::Host(
+            ClientError::Host(refusal) | ClientError::Refused { error: refusal, .. },
+        ) => CliError::Refused(refusal),
+        AnswerError::Host(other) => CliError::HostUnavailable(other.to_string()),
+        AnswerError::Store { .. } | AnswerError::Unreadable { .. } => {
+            CliError::Other(error.to_string())
+        }
+    }
+}
+
+/// Why a kept answer will not be sent, in the words a person is shown.
+fn retired_because(reason: Retired) -> String {
+    match reason {
+        Retired::Ended(state) => format!("the question was {state} while the answer was kept"),
+        Retired::Moved { revision } => {
+            format!("the question moved to revision {revision} while the answer was kept")
+        }
+        Retired::Gone => "its session is not on this host any more".to_owned(),
+    }
+}
+
+/// Renders one kept answer, as `kr question drafts` found it, for a script.
+#[must_use]
+pub fn kept_rendered(reconciled: &Reconciled) -> Value {
+    let (draft, state, reason) = match reconciled {
+        Reconciled::Offered(draft) => (draft, "offered", None),
+        Reconciled::Retired { draft, reason } => (draft, "retired", Some(*reason)),
+    };
+    json!({
+        "question_id": draft.question_id.to_string(),
+        "session_id": draft.session_id.to_string(),
+        "state": state,
+        "reason": reason.map(retired_because),
+        "reason_code": reason.map(|reason| AnswerError::Retired(reason).code().as_str()),
+        "question_revision": draft.question_revision.get(),
+        "answer": answer_document(&draft.answer),
+        "drafted_at_ms": draft.drafted_at_ms.get(),
+    })
+}
+
+/// Renders one kept answer, as `kr question drafts` found it, as a line for a person.
+#[must_use]
+pub fn kept_line(reconciled: &Reconciled) -> String {
+    match reconciled {
+        Reconciled::Offered(draft) => format!(
+            "{}  offered  {} at revision {}; send it with kr question send {}",
+            draft.question_id,
+            answer_words(&draft.answer),
+            draft.question_revision.get(),
+            draft.question_id
+        ),
+        Reconciled::Retired { draft, reason } => format!(
+            "{}  retired  {}; it was not sent and is no longer kept",
+            draft.question_id,
+            retired_because(*reason)
+        ),
+    }
+}
+
+/// An answer, for a script.
+fn answer_document(answer: &QuestionAnswer) -> Value {
+    json!({
+        "kind": answer.kind(),
+        "text": answer.text(),
+        "choice_id": match answer {
+            QuestionAnswer::Choice { choice_id } => Some(choice_id.clone()),
+            _ => None,
+        },
+        "decided": match answer {
+            QuestionAnswer::Decision { decided } => Some(*decided),
+            _ => None,
+        },
+    })
+}
+
+/// An answer, in the words a person is shown.
+fn answer_words(answer: &QuestionAnswer) -> String {
+    match answer {
+        QuestionAnswer::Input { text } | QuestionAnswer::Other { text } => format!("{text:?}"),
+        QuestionAnswer::Choice { choice_id } => format!("choice {choice_id}"),
+        QuestionAnswer::Decision { decided } => if *decided { "yes" } else { "no" }.to_owned(),
+    }
+}
+
+/// This host's session workers, as the answering rules reach them.
+///
+/// A session's worker is found by its descriptor and proved against it before anything is sent to
+/// it, as every command that reaches a worker proves it, and one connection to it is kept for the
+/// length of the command. What became of the last answer that was not taken is remembered, so the
+/// person can be told why it was kept.
+pub struct Workers {
+    paths: HostPaths,
+    build_id: BuildId,
+    connections: tokio::sync::Mutex<BTreeMap<SessionId, LocalClient>>,
+    failure: std::sync::Mutex<Option<(ErrorCode, String)>>,
+}
+
+impl Workers {
+    /// Reaches this host's workers with `build_id`.
+    #[must_use]
+    pub fn new(paths: &HostPaths, build_id: BuildId) -> Self {
+        Self {
+            paths: paths.clone(),
+            build_id,
+            connections: tokio::sync::Mutex::new(BTreeMap::new()),
+            failure: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Starts from a connection already open to one session's worker, and proved.
+    #[must_use]
+    pub fn holding(mut self, session_id: SessionId, client: LocalClient) -> Self {
+        self.connections.get_mut().insert(session_id, client);
+        self
+    }
+
+    /// Why the last answer was not taken, with the code that says which kind of reason it is.
+    fn failure(&self) -> Option<(ErrorCode, String)> {
+        self.failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn failed(&self, code: ErrorCode, why: String) {
+        *self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((code, why));
+    }
+
+    /// The connection to the worker of `session_id`, opened and proved when there is none yet.
+    async fn connection<'a>(
+        &self,
+        connections: &'a mut BTreeMap<SessionId, LocalClient>,
+        session_id: SessionId,
+    ) -> std::result::Result<&'a mut LocalClient, ClientError> {
+        Ok(match connections.entry(session_id) {
+            std::collections::btree_map::Entry::Occupied(held) => held.into_mut(),
+            std::collections::btree_map::Entry::Vacant(missing) => {
+                missing.insert(self.open(session_id).await?)
+            }
+        })
+    }
+
+    /// Opens and proves a connection to the worker of `session_id`.
+    ///
+    /// A session no descriptor names is gone as far as this host is concerned, which is the
+    /// host's own `UNKNOWN_SESSION`. A worker that cannot be reached has not answered, and that is
+    /// a connection that ended.
+    async fn open(&self, session_id: SessionId) -> std::result::Result<LocalClient, ClientError> {
+        let descriptor = match find(&self.paths, &SessionSelector::Identifier(session_id), None) {
+            Ok((_, descriptor)) => descriptor,
+            Err(CliError::UnknownSession(_)) => {
+                return Err(ClientError::Host(ProtocolError::new(
+                    ErrorCode::UnknownSession,
+                    format!("no session {session_id} is on this host"),
+                )));
+            }
+            Err(error) => {
+                return Err(ClientError::Host(ProtocolError::new(
+                    ErrorCode::ResourceUnavailable,
+                    error.to_string(),
+                )));
+            }
+        };
+        open_worker(&descriptor, self.build_id.clone())
+            .await
+            .map_err(|error| {
+                self.failed(
+                    ErrorCode::ResourceUnavailable,
+                    format!("session {session_id}'s worker could not be reached ({error})"),
+                );
+                ClientError::ConnectionEnded
+            })
+    }
+}
+
+impl QuestionHost for Workers {
+    async fn questions(
+        &self,
+        session_id: SessionId,
+    ) -> std::result::Result<Vec<Question>, ClientError> {
+        let mut connections = self.connections.lock().await;
+        let client = self.connection(&mut connections, session_id).await?;
+        let outcome = client
+            .request(
+                Method::QuestionRead,
+                &QuestionReadParams {
+                    session_id,
+                    question_id: Nullable::null(),
+                    include_resolved: true,
+                },
+            )
+            .await;
+        let value = match outcome {
+            Ok(Ok(value)) => value,
+            Ok(Err(refusal)) => return Err(ClientError::from(refusal)),
+            Err(error) => {
+                connections.remove(&session_id);
+                return Err(ClientError::Ipc(error));
+            }
+        };
+        let read: QuestionReadResult = value.to_typed()?;
+        Ok(read.questions)
+    }
+
+    async fn answer(
+        &self,
+        target: ActionTarget,
+        params: QuestionAnswerParams,
+    ) -> std::result::Result<Question, ClientError> {
+        let session_id = params.session_id;
+        let mut connections = self.connections.lock().await;
+        let client = self.connection(&mut connections, session_id).await?;
+        let action_id = ActionId::new(kr_ipc::new_uuid());
+        // Composing reads whatever the worker already sent, before anything is written. A
+        // connection that fails here has sent nothing.
+        let mutation = match client
+            .compose(Method::QuestionAnswer, action_id, target, &params)
+            .await
+        {
+            Ok(mutation) => mutation,
+            Err(error) => {
+                connections.remove(&session_id);
+                self.failed(
+                    ErrorCode::ResourceUnavailable,
+                    format!(
+                        "the connection to session {session_id}'s worker ended before the answer \
+                         was sent ({error})"
+                    ),
+                );
+                return Err(ClientError::ConnectionEnded);
+            }
+        };
+        match client.repeat(&mutation).await {
+            Ok(Ok(value)) => {
+                let resolved: QuestionResolveResult = value.to_typed()?;
+                Ok(resolved.question)
+            }
+            Ok(Err(refusal)) => {
+                self.failed(
+                    refusal.code,
+                    format!("session {session_id}'s worker did not take it ({refusal})"),
+                );
+                Err(ClientError::from(refusal))
+            }
+            // Once the answer is written, a connection that ends leaves what became of it unknown.
+            Err(error) => {
+                connections.remove(&session_id);
+                self.failed(
+                    ErrorCode::OutcomeUnknown,
+                    format!(
+                        "the connection to session {session_id}'s worker ended after the answer \
+                         was sent, so whether it arrived is not known ({error})"
+                    ),
+                );
+                Err(ClientError::SubmissionUncertain { action_id })
+            }
+        }
+    }
 }
 
 /// Cancels one question.
@@ -389,9 +779,7 @@ pub const fn is_pending(question: &Question) -> bool {
 #[cfg(test)]
 mod tests {
     use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
-    use kr_protocol::ids::{
-        ApplicationInstanceId, ConnectionId, QuestionRevision, SessionEpoch, SessionId,
-    };
+    use kr_protocol::ids::{ApplicationInstanceId, ConnectionId, QuestionRevision, SessionEpoch};
     use kr_protocol::question::{QuestionKind, QuestionSource};
     use kr_protocol::scalars::{TimestampMs, Uuid};
 
@@ -474,6 +862,67 @@ mod tests {
         let text = detail(&descriptor(), &question(QuestionState::Pending));
         assert!(text.contains("something_else"));
         assert!(text.contains("--other"));
+    }
+
+    fn kept_draft_for(question: &Question) -> AnswerDraft {
+        AnswerDraft {
+            target: crate::attach::target(&descriptor()),
+            session_id: question.session_id,
+            question_id: question.question_id,
+            question_revision: question.revision,
+            answer: QuestionAnswer::Choice {
+                choice_id: "left".to_owned(),
+            },
+            drafted_at_ms: TimestampMs::new(30),
+        }
+    }
+
+    #[test]
+    fn a_kept_answer_says_whether_it_can_be_sent_and_why_not() {
+        let draft = kept_draft_for(&question(QuestionState::Pending));
+        let offered = Reconciled::Offered(draft.clone());
+        assert!(kept_line(&offered).contains("offered  choice left at revision 1"));
+        assert_eq!(kept_rendered(&offered)["state"], "offered");
+        assert!(kept_rendered(&offered)["reason"].is_null());
+        for (reason, words, code) in [
+            (
+                Retired::Ended(QuestionState::Expired),
+                "the question was expired while the answer was kept",
+                "QUESTION_EXPIRED",
+            ),
+            (
+                Retired::Ended(QuestionState::Answered),
+                "the question was answered while the answer was kept",
+                "QUESTION_RESOLVED",
+            ),
+            (
+                Retired::Moved {
+                    revision: QuestionRevision::new(3),
+                },
+                "the question moved to revision 3 while the answer was kept",
+                "STALE_SESSION",
+            ),
+            (
+                Retired::Gone,
+                "its session is not on this host any more",
+                "UNKNOWN_SESSION",
+            ),
+        ] {
+            let retired = Reconciled::Retired {
+                draft: draft.clone(),
+                reason,
+            };
+            let line = kept_line(&retired);
+            assert!(line.contains("retired"), "{line}");
+            assert!(line.contains(words), "{line}");
+            assert!(line.contains("not sent"), "{line}");
+            let document = kept_rendered(&retired);
+            assert_eq!(document["state"], "retired");
+            assert_eq!(document["reason_code"], code, "{document}");
+            let refused = answer_failure(AnswerError::Retired(reason));
+            assert_eq!(refused.code(), code);
+            assert!(refused.to_string().contains("was not sent"), "{refused}");
+        }
     }
 
     #[test]

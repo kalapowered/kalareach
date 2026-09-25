@@ -1286,18 +1286,32 @@ async fn question(
         QuestionCommand::Answer(arguments) => {
             let question_id = parse_question(&arguments.question)?;
             let answer = answer_form(&arguments.form)?;
-            let item = question::answer(paths, question_id, answer, build_id()).await?;
+            let answered = question::answer(paths, question_id, answer, build_id()).await;
+            report_answered(question_id, answered, json)
+        }
+        QuestionCommand::Drafts => {
+            let reconciled = question::drafts(paths, build_id()).await?;
             if json {
                 print_json(&serde_json::json!({
                     "ok": true,
-                    "state": item.state.as_str(),
-                    "revision": item.revision.get(),
-                    "question_id": item.question_id.to_string(),
+                    "drafts": reconciled
+                        .iter()
+                        .map(question::kept_rendered)
+                        .collect::<Vec<_>>(),
                 }));
+            } else if reconciled.is_empty() {
+                println!("no answers are kept on this device");
             } else {
-                println!("{} is {}", item.question_id, item.state.as_str());
+                for item in &reconciled {
+                    println!("{}", question::kept_line(item));
+                }
             }
             Ok(Completion::Done)
+        }
+        QuestionCommand::Send(arguments) => {
+            let question_id = parse_question(&arguments.question)?;
+            let sent = question::send(paths, question_id, build_id()).await;
+            report_answered(question_id, sent, json)
         }
         QuestionCommand::Cancel(arguments) => {
             let question_id = parse_question(&arguments.question)?;
@@ -1313,6 +1327,44 @@ async fn question(
             }
             Ok(Completion::Done)
         }
+    }
+}
+
+/// Reports an answer that was sent, or one that was kept on this device instead.
+///
+/// A kept answer is a failure, because it did not reach its session, and its document says it was
+/// kept, so a script can tell it from an answer that was refused.
+fn report_answered(
+    question_id: kr_protocol::ids::QuestionId,
+    answered: Result<kr_protocol::question::Question>,
+    json: bool,
+) -> Result<Completion> {
+    match answered {
+        Ok(item) => {
+            if json {
+                print_json(&serde_json::json!({
+                    "ok": true,
+                    "state": item.state.as_str(),
+                    "revision": item.revision.get(),
+                    "question_id": item.question_id.to_string(),
+                }));
+            } else {
+                println!("{} is {}", item.question_id, item.state.as_str());
+            }
+            Ok(Completion::Done)
+        }
+        Err(error @ CliError::AnswerKept { .. }) => {
+            if json {
+                let mut document = report::failure(&error);
+                document["kept"] = serde_json::Value::Bool(true);
+                document["question_id"] = serde_json::json!(question_id.to_string());
+                print_json(&document);
+            } else {
+                eprintln!("kr: {error}");
+            }
+            Ok(Completion::Reported(error))
+        }
+        Err(error) => Err(error),
     }
 }
 

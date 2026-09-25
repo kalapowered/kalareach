@@ -56,6 +56,16 @@ pub enum CliError {
         /// What did not finish, for a person.
         message: String,
     },
+    /// A person's answer did not reach its session's worker, or whether it did is not known, so it
+    /// is kept on this device rather than sent. `kr question drafts` shows it and `kr question send`
+    /// sends it; nothing else does.
+    #[error("{message}")]
+    AnswerKept {
+        /// The stable code the failure carries.
+        code: kr_protocol::error::ErrorCode,
+        /// What happened to the answer, for a person.
+        message: String,
+    },
     /// Local IPC failed.
     #[error("{0}")]
     Ipc(#[from] kr_ipc::IpcError),
@@ -77,7 +87,7 @@ impl CliError {
             Self::NotATerminal | Self::Terminal(_) | Self::TerminalProbeFailed(_) => 6,
             Self::TerminalUnavailable(_) => 7,
             Self::Refused(_) => 8,
-            Self::Ipc(_) => 3,
+            Self::Ipc(_) | Self::AnswerKept { .. } => 3,
             Self::SessionClosed(_) | Self::Unfinished { .. } | Self::Other(_) => 1,
         }
     }
@@ -120,7 +130,9 @@ impl CliError {
             Self::SessionClosed(_) => kr_protocol::error::ErrorCode::SessionClosed
                 .as_str()
                 .to_owned(),
-            Self::Unfinished { code, .. } => code.as_str().to_owned(),
+            Self::Unfinished { code, .. } | Self::AnswerKept { code, .. } => {
+                code.as_str().to_owned()
+            }
             Self::Other(_) => kr_protocol::error::ErrorCode::ResourceUnavailable
                 .as_str()
                 .to_owned(),

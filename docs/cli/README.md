@@ -517,6 +517,8 @@ surface on the machine the session is on.
 | `kr question show <question_id>` | One question in full |
 | `kr question answer <question_id> (--text \| --choice <id> \| --yes \| --no \| --other <text>)` | Answers it |
 | `kr question cancel <question_id>` | Withdraws it without answering |
+| `kr question drafts` | Lists the answers kept on this device, and says of each whether it can still be sent |
+| `kr question send <question_id>` | Sends one kept answer |
 
 Exactly one answer flag is required. `--other` is the free-text option every `select` and `confirm`
 carries; it stays free text and is never read as a listed choice or as yes.
@@ -531,6 +533,21 @@ rather than answered as though it had not moved.
 
 Questions belong to the session, so these reach the session's worker directly, the way attaching
 does; they keep working while the control daemon is restarting.
+
+An answer the worker could not take is kept rather than lost. When the connection to the worker
+ends before the answer is sent, or after it is sent and before the worker says what became of it,
+`kr question answer` keeps the answer in this user's state directory, readable only by its owner,
+with the question and the revision it answered. It says so and exits with 3, and its `--json`
+document carries `"kept": true` beside the failure: `RESOURCE_UNAVAILABLE` when the answer did not
+go, `OUTCOME_UNKNOWN` when it went and its fate is not known.
+
+`kr question drafts` reads each kept answer's question again. An answer whose question is still
+pending at the revision it answered is offered, and stays kept. Any other is retired: its question
+was answered, cancelled or expired, moved to another revision, or its session is gone, and the
+answer is not sent and no longer kept. The command sends nothing, however often it runs. `kr
+question send` is the one way a kept answer is sent: it reads the question once more and sends the
+answer only while that question is still what the person answered. An answer whose outcome was not
+known is retired by the next `kr question drafts` if it did arrive, so it is never sent twice.
 
 ## `kr skill`
 
