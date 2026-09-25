@@ -371,6 +371,22 @@ mod platform {
             rustix::fs::fsync(self.handle.as_fd()).map_err(Into::into)
         }
 
+        /// Makes the bytes of the regular file at `name` durable, where there is one.
+        pub(in crate::catalogue::native_bridge) fn sync_file(
+            &self,
+            name: &str,
+        ) -> std::io::Result<()> {
+            match self.open_regular(name) {
+                Ok(Some(file)) => file.sync_all(),
+                Ok(None) => Err(std::io::Error::other(format!(
+                    "{} is not a regular file",
+                    self.join(name).display()
+                ))),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+
         /// Opens a regular file to read, without following a link and without waiting; `None` when
         /// what is there is not a regular file.
         fn open_regular(&self, name: &str) -> std::io::Result<Option<std::fs::File>> {
@@ -568,6 +584,13 @@ mod platform {
         }
 
         pub(in crate::catalogue::native_bridge) fn flush(&self) -> std::io::Result<()> {
+            Err(unsupported())
+        }
+
+        pub(in crate::catalogue::native_bridge) fn sync_file(
+            &self,
+            _name: &str,
+        ) -> std::io::Result<()> {
             Err(unsupported())
         }
     }

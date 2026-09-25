@@ -38,8 +38,10 @@
 //! intended. Something the host cannot show it made is neither taken nor claimed: it is left in
 //! place and named, and while it is there the bridge is not reported as applied. A publication is
 //! recorded only once its directory is flushed, by the run that made it or by the one that settles
-//! it. The application's directory is known by its identity as well as its path, so a directory
-//! put in its place is never taken for it.
+//! it, and a record goes only once what it names is gone and that absence is flushed. The
+//! application's directory is known by its identity as well as its path, so a directory put in its
+//! place is never taken for it, and nothing at its path is not taken as its deletion: what was
+//! placed stays recorded until the directory is back.
 
 mod journal;
 mod json;
@@ -58,7 +60,8 @@ pub use kr_worker::broker::bridge::BridgeSurface;
 pub use kr_worker::broker::connectors::{BridgeFacts, QualifiedExecutable};
 
 use self::journal::{
-    Change, Journal, Journals, Kept, Publication, RecordedFacts, Release, Removal, Staging, State,
+    Change, Journal, Journals, Kept, Publication, RecordedFacts, Refusal, Release, Removal,
+    Staging, State,
 };
 use self::tree::{Child, Dir, Entry, Fetched, Identity, Unstaged, Walk};
 use crate::catalogue::files;
@@ -252,10 +255,10 @@ type Run<T> = std::result::Result<T, Fault>;
 enum Root {
     /// The directory the release was applied in.
     Open(Dir),
-    /// Nothing is at its path.
-    Gone,
-    /// Another directory is at its path, and why that means nothing in it is taken as the host's.
-    Substituted(String),
+    /// Nothing is at its path, or another directory is, and why. What the release placed is in
+    /// the directory it was applied in, which is not reached, so nothing is taken out and nothing
+    /// is forgotten.
+    Unavailable(String),
 }
 
 /// What settling one change found: the change as it stays in the journal, where it stays, and
@@ -508,15 +511,39 @@ impl NativeBridges {
                     .iter()
                     .map(|kept| format!("not settled: {}", kept.describe())),
             );
-            if let Some(reason) = &journal.refusal {
-                notes.push(format!("refused: {reason}"));
+            if let Some(release) = journal.release.as_ref()
+                && journal.changes.iter().any(in_flight)
+            {
+                let why = match Dir::open(&release.directory) {
+                    Ok(root) if root.identity().same_object(&release.directory_identity) => {
+                        "a run stopped while it was being made or taken out".to_owned()
+                    }
+                    Ok(_) => "a run stopped while it was being made or taken out, and another \
+                              directory is at its directory's path now"
+                        .to_owned(),
+                    Err(error) => format!(
+                        "a run stopped while it was being made or taken out, and its directory \
+                         cannot be opened: {error}"
+                    ),
+                };
+                for change in journal.changes.iter().filter(|change| in_flight(change)) {
+                    let named =
+                        kept_in(&release.directory, release.directory_identity, change, &why);
+                    notes.push(format!("not settled: {}", named.describe()));
+                }
             }
+            if let Some(refusal) = &journal.refusal {
+                notes.push(format!("refused: {}", refusal.reason));
+            }
+            let unsettled = !journal.unresolved.is_empty()
+                || journal.changes.iter().any(in_flight)
+                || (journal.state == State::Refused && !journal.is_clean_refusal());
             reports.push(BridgeReport {
                 plugin_id: journal.plugin_id.clone(),
-                state: if journal.unresolved.is_empty() {
-                    journal.state.as_str().to_owned()
-                } else {
+                state: if unsettled {
                     "unsettled".to_owned()
+                } else {
+                    journal.state.as_str().to_owned()
                 },
                 package_digest: journal.digest().map(str::to_owned),
                 notes,
@@ -585,7 +612,7 @@ impl NativeBridges {
         };
         self.settle(&mut journal)?;
         // What an earlier run left and named, and has gone since, no longer holds anything up.
-        let rechecked = recheck(&mut journal);
+        let rechecked = self.recheck(&mut journal);
         let same = wanted.is_some_and(|target| {
             journal.digest() == Some(target.package_digest.to_string().as_str())
         });
@@ -629,7 +656,6 @@ impl NativeBridges {
         };
         journal.release = Some(plan.release.clone());
         journal.state = State::Applying;
-        journal.refusal = None;
         journal.blocked.clear();
         self.save(journal)?;
         match self.carry_out(journal, &plan) {
@@ -638,7 +664,8 @@ impl NativeBridges {
             Err(halted) => return Err(halted),
         }
         journal.state = State::Applied;
-        recheck(journal);
+        journal.refusal = None;
+        self.recheck(journal);
         self.save(journal)?;
         Ok(if journal.is_applied() {
             Settled::Applied
@@ -655,38 +682,40 @@ impl NativeBridges {
         if !journal.changes.is_empty() {
             self.undo(journal)?;
         }
-        // What this refusal had to leave in place because it changed since it was placed. It is
-        // taken before the recheck below, which may drop what an earlier removal left.
-        let added: Vec<Kept> = journal
-            .leftovers
-            .get(earlier..)
-            .unwrap_or_default()
-            .to_vec();
-        journal.refusal = Some(reason.clone());
+        // What this refusal's undo had to leave in place because it changed since it was placed,
+        // with what an earlier refusal had to leave. Both are kept with the refusal, so it is not
+        // reported as clean, by this run or any later one, while any of it is there.
+        let mut left = journal
+            .refusal
+            .take()
+            .map(|refusal| refusal.left)
+            .unwrap_or_default();
+        left.extend(
+            journal
+                .leftovers
+                .get(earlier..)
+                .unwrap_or_default()
+                .iter()
+                .cloned(),
+        );
+        journal.refusal = Some(Refusal {
+            reason: reason.clone(),
+            left,
+        });
         journal.state = if journal.changes.is_empty() {
             State::Refused
         } else {
             State::Removing
         };
-        recheck(journal);
+        self.recheck(journal);
         self.save(journal)?;
-        // What it left, and is still there, is named, and the refusal is not reported as clean.
-        let left: Vec<String> = added
-            .iter()
-            .filter(|kept| journal.leftovers.contains(kept))
-            .map(Kept::describe)
-            .collect();
-        if !journal.changes.is_empty() || !journal.unresolved.is_empty() || !left.is_empty() {
-            let mut outstanding = outstanding(journal);
-            if !left.is_empty() {
-                if !outstanding.is_empty() {
-                    outstanding.push_str("; and ");
-                }
-                outstanding.push_str(&format!("left in place: {}", left.join("; ")));
-            }
-            return Ok(Settled::Unsettled(format!("{reason}; and {outstanding}")));
+        if journal.is_clean_refusal() {
+            return Ok(Settled::Refused(reason));
         }
-        Ok(Settled::Refused(reason))
+        Ok(Settled::Unsettled(format!(
+            "{reason}; and {}",
+            outstanding(journal)
+        )))
     }
 
     /// Checks everything a recipe needs before anything is written, and says what is left to do.
@@ -1333,20 +1362,9 @@ impl NativeBridges {
             return self.save(journal);
         };
         match self.open_root(&release)? {
-            // The directory is gone, and with it everything the changes were about.
-            Root::Gone => journal.changes.clear(),
-            Root::Substituted(reason) => {
-                for change in std::mem::take(&mut journal.changes) {
-                    let found = unreachable(
-                        &release.directory,
-                        release.directory_identity,
-                        change,
-                        &reason,
-                    );
-                    journal.changes.extend(found.change);
-                    journal.unresolved.extend(found.unresolved);
-                }
-            }
+            // What was in flight stays recorded as it was, with the identities that settle it once
+            // the directory is back.
+            Root::Unavailable(_) => return Ok(()),
             Root::Open(root) => {
                 let mut settled = Vec::with_capacity(journal.changes.len());
                 for change in journal.changes.clone() {
@@ -1374,14 +1392,9 @@ impl NativeBridges {
                     .map_err(halted)?;
                 return Ok(Found::drop());
             }
-            Walk::Substituted(at) => {
-                return Ok(unreachable(
-                    root.path(),
-                    root.identity(),
-                    change,
-                    &substituted_reason(root, &at),
-                ));
-            }
+            // A directory on the way was replaced. What the change made, if anything, is in the one
+            // it replaced, so the change stays in flight until that is back.
+            Walk::Substituted(_) => return Ok(Found::keep(change)),
         };
         let directory = parent.as_ref().unwrap_or(root);
         let mut found = Found::keep(change.clone());
@@ -1502,9 +1515,9 @@ impl NativeBridges {
     /// Takes out every change of the release, in the order the recipe's removal says, then the
     /// directories this host made, deepest first. What changed since it was placed is left and
     /// named; what could not be taken out this time stays recorded for the next run, and so does
-    /// every directory that still holds it. While another directory is at the application
-    /// directory's path, nothing is taken out and everything stays recorded, to be taken out if
-    /// the directory the release was applied in comes back.
+    /// every directory that still holds it. While another directory, or nothing, is at the
+    /// application directory's path, nothing is taken out and everything stays recorded, to be
+    /// taken out if the directory the release was applied in comes back.
     fn undo(&self, journal: &mut Journal) -> Run<()> {
         journal.state = State::Removing;
         journal.blocked.clear();
@@ -1515,13 +1528,9 @@ impl NativeBridges {
         };
         let root = match self.open_root(&release)? {
             Root::Open(root) => root,
-            Root::Gone => {
-                journal.changes.clear();
-                return self.save(journal);
-            }
-            // What the release placed is in the directory it was applied in, which is not the one
-            // at the path now. Nothing is taken out of this one.
-            Root::Substituted(reason) => {
+            // What the release placed is in the directory it was applied in, which is not reached.
+            // Nothing is taken out, and everything stays recorded for when it is back.
+            Root::Unavailable(reason) => {
                 let blocked: Vec<Kept> = journal
                     .changes
                     .iter()
@@ -1559,6 +1568,7 @@ impl NativeBridges {
             .enumerate()
             .filter(|(_, change)| {
                 !matches!(change, Change::Directory { .. })
+                    && !in_flight(change)
                     && !release
                         .removal
                         .iter()
@@ -1640,7 +1650,9 @@ impl NativeBridges {
                     .map_err(halted)?;
                 return Ok(Outcome::Done);
             }
-            Ok(Walk::Substituted(at)) => return Ok(Outcome::Kept(substituted_reason(root, &at))),
+            Ok(Walk::Substituted(at)) => {
+                return Ok(Outcome::Unfinished(substituted_reason(root, &at)));
+            }
             Ok(Walk::Found { parent, name }) => (parent, name),
         };
         let directory = parent.as_ref().unwrap_or(root);
@@ -1699,7 +1711,7 @@ impl NativeBridges {
                     return Ok(Outcome::Done);
                 }
                 Ok(Walk::Substituted(at)) => {
-                    return Ok(Outcome::Kept(substituted_reason(root, &at)));
+                    return Ok(Outcome::Unfinished(substituted_reason(root, &at)));
                 }
                 Ok(Walk::Found { parent, name }) => (parent, name),
             };
@@ -1858,7 +1870,9 @@ impl NativeBridges {
                     .map_err(halted)?;
                 return Ok(Outcome::Done);
             }
-            Ok(Walk::Substituted(at)) => return Ok(Outcome::Kept(substituted_reason(root, &at))),
+            Ok(Walk::Substituted(at)) => {
+                return Ok(Outcome::Unfinished(substituted_reason(root, &at)));
+            }
             Ok(Walk::Found { parent, name }) => (parent, name),
         };
         let directory = parent.as_ref().unwrap_or(root);
@@ -1903,7 +1917,7 @@ impl NativeBridges {
 
     /// Ends a removal: the journal goes when nothing is left to say, and otherwise stays to say it.
     fn finish_removal(&self, mut journal: Journal) -> Run<Settled> {
-        recheck(&mut journal);
+        self.recheck(&mut journal);
         if !journal.changes.is_empty() {
             journal.state = State::Removing;
             self.save(&journal)?;
@@ -1925,16 +1939,65 @@ impl NativeBridges {
         })
     }
 
+    /// Drops what removals and refusals left, and what could not be settled, once it is shown to be
+    /// gone and that is durable; returns whether anything was dropped.
+    fn recheck(&self, journal: &mut Journal) -> bool {
+        let before = journal.leftovers.len() + journal.unresolved.len();
+        journal.leftovers.retain(|kept| !self.confirmed_gone(kept));
+        journal.unresolved.retain(|kept| !self.confirmed_gone(kept));
+        if let Some(refusal) = journal.refusal.as_mut() {
+            refusal.left.retain(|kept| journal.leftovers.contains(kept));
+        }
+        journal.leftovers.len() + journal.unresolved.len() != before
+    }
+
+    /// True only when what `kept` names is shown to be gone from the directory it is recorded in,
+    /// and that absence is flushed. An error, another directory at the path, nothing at the path,
+    /// or a document that cannot be read says nothing about it, and neither does a flush that
+    /// fails.
+    fn confirmed_gone(&self, kept: &Kept) -> bool {
+        let Ok(root) = Dir::open(&kept.directory) else {
+            return false;
+        };
+        if !root.identity().same_object(&kept.directory_identity) {
+            return false;
+        }
+        match tree::parent_of(&root, &kept.path) {
+            Ok(Walk::Missing { reached }) => self.flush(reached.as_ref().unwrap_or(&root)).is_ok(),
+            Ok(Walk::Found { parent, name }) => {
+                let directory = parent.as_ref().unwrap_or(&root);
+                let gone = match &kept.key {
+                    None => matches!(directory.entry(name), Ok(Entry::Absent)),
+                    // The document without the key is made durable too, as it is now.
+                    Some(key) => {
+                        key_holds_anything(directory, name, key) == Some(false)
+                            && directory.sync_file(name).is_ok()
+                    }
+                };
+                gone && self.flush(directory).is_ok()
+            }
+            _ => false,
+        }
+    }
+
     /// Opens a release's application directory, and says whether it is still the one the release
     /// was applied in.
     fn open_root(&self, release: &Release) -> Run<Root> {
         let root = match Dir::open(&release.directory) {
             Ok(root) => root,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Root::Gone),
+            // Absence at a path cannot tell a deleted directory from one moved away, or a link
+            // that leads nowhere now.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Root::Unavailable(format!(
+                    "{} is not there, so what this host placed in the directory it applied the \
+                     bridge in is not reached",
+                    release.directory.display()
+                )));
+            }
             Err(error) => return Err(halted(error)),
         };
         if !root.identity().same_object(&release.directory_identity) {
-            return Ok(Root::Substituted(format!(
+            return Ok(Root::Unavailable(format!(
                 "{} is now another directory than the one this host applied the bridge in, so \
                  nothing in it is taken as this host's",
                 release.directory.display()
@@ -2600,39 +2663,6 @@ fn drift(journal: &Journal) -> Vec<String> {
     notes
 }
 
-/// Drops what removals left, and what could not be settled, once it is confirmed to be gone;
-/// returns whether anything was dropped.
-fn recheck(journal: &mut Journal) -> bool {
-    let before = journal.leftovers.len() + journal.unresolved.len();
-    journal.leftovers.retain(|kept| !confirmed_gone(kept));
-    journal.unresolved.retain(|kept| !confirmed_gone(kept));
-    journal.leftovers.len() + journal.unresolved.len() != before
-}
-
-/// True only when what `kept` names is shown to be gone: an error, a directory that cannot be read
-/// or a document that cannot be read says nothing about it.
-fn confirmed_gone(kept: &Kept) -> bool {
-    let root = match Dir::open(&kept.directory) {
-        Ok(root) => root,
-        Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
-    };
-    // Another directory at the path says nothing about what is in the one the record is about.
-    if !root.identity().same_object(&kept.directory_identity) {
-        return false;
-    }
-    match tree::parent_of(&root, &kept.path) {
-        Ok(Walk::Missing { .. }) => true,
-        Ok(Walk::Found { parent, name }) => {
-            let directory = parent.as_ref().unwrap_or(&root);
-            match &kept.key {
-                None => matches!(directory.entry(name), Ok(Entry::Absent)),
-                Some(key) => key_holds_anything(directory, name, key) == Some(false),
-            }
-        }
-        _ => false,
-    }
-}
-
 /// `Some(true)` when the document holds anything at `key`, `Some(false)` when it or the key is
 /// not there, and `None` when that cannot be read.
 fn key_holds_anything(directory: &Dir, name: &str, key: &str) -> Option<bool> {
@@ -2645,71 +2675,6 @@ fn key_holds_anything(directory: &Dir, name: &str, key: &str) -> Option<bool> {
     let document = json::Document::read(text).ok()?;
     let members: Vec<&str> = key.split('.').collect();
     Some(document.value_at(text, &members).ok()?.is_some())
-}
-
-/// What a change becomes when what it may have left cannot be reached: every name it may have left
-/// something at is recorded as not settled, and a change already published stays, for its removal
-/// to decide.
-fn unreachable(directory: &Path, identity: Identity, change: Change, reason: &str) -> Found {
-    if !in_flight(&change) {
-        return Found::keep(change);
-    }
-    let (path, key) = placed_path(&change);
-    let mut names = Vec::new();
-    match &change {
-        Change::Directory {
-            temporary,
-            publication,
-            ..
-        }
-        | Change::File {
-            temporary,
-            publication,
-            ..
-        }
-        | Change::Key {
-            temporary,
-            publication,
-            ..
-        } => match publication {
-            Publication::Noted => names.push((sibling(path, temporary), None)),
-            Publication::Staged { .. } => {
-                names.push((sibling(path, temporary), None));
-                names.push((path.to_owned(), key.map(str::to_owned)));
-            }
-            Publication::Published { .. } => {}
-        },
-    }
-    if let Change::Key {
-        removing: Some(staging),
-        ..
-    } = &change
-    {
-        names.push((sibling(path, &staging.temporary), None));
-    }
-    let unresolved = names
-        .into_iter()
-        .map(|(path, key)| Kept {
-            directory: directory.to_path_buf(),
-            directory_identity: identity,
-            path,
-            key,
-            reason: reason.to_owned(),
-        })
-        .collect();
-    let published = match &change {
-        Change::Directory { publication, .. }
-        | Change::File { publication, .. }
-        | Change::Key { publication, .. } => {
-            matches!(publication, Publication::Published { .. })
-        }
-    };
-    let change = published.then(|| {
-        let mut placed = change;
-        set_removing(&mut placed, None);
-        placed
-    });
-    Found { change, unresolved }
 }
 
 fn in_flight(change: &Change) -> bool {
@@ -2878,6 +2843,12 @@ fn outstanding(journal: &Journal) -> String {
     if !journal.unresolved.is_empty() {
         let unresolved: Vec<String> = journal.unresolved.iter().map(Kept::describe).collect();
         parts.push(format!("not settled: {}", unresolved.join("; ")));
+    }
+    if let Some(refusal) = journal.refusal.as_ref()
+        && !refusal.left.is_empty()
+    {
+        let left: Vec<String> = refusal.left.iter().map(Kept::describe).collect();
+        parts.push(format!("left in place: {}", left.join("; ")));
     }
     parts.join("; and ")
 }

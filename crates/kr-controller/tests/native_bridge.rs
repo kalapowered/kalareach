@@ -965,6 +965,40 @@ fn a_refusal_that_has_to_leave_a_changed_file_is_not_reported_as_clean() {
         !site.application().join(SERVERS_PATH).exists(),
         "the rest is taken out"
     );
+    // The record says so too, and so does a host started again, until the file is gone.
+    let unclean = |bridges: &NativeBridges| {
+        let reports = bridges.reports().expect("reads");
+        assert_eq!(reports[0].state, "unsettled", "{reports:?}");
+        assert!(
+            reports[0]
+                .notes
+                .iter()
+                .any(|note| note.starts_with("left in place") && note.contains(HOOKS_PATH)),
+            "{reports:?}"
+        );
+    };
+    unclean(&bridges);
+    let restarted = site.bridges();
+    let settled = restarted
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+    assert!(
+        matches!(&settled, Settled::Unsettled(reason) if reason.contains(HOOKS_PATH)),
+        "{settled:?}"
+    );
+    unclean(&restarted);
+    std::fs::remove_file(&hooks).expect("its owner removes it");
+    assert_eq!(
+        restarted
+            .reconcile(&plugin(), Some(&site.release()))
+            .expect("reconciles"),
+        Settled::Applied
+    );
+    assert_eq!(
+        restarted.reports().expect("reads")[0].state,
+        "applied",
+        "once it is gone"
+    );
 }
 
 /// A refusal names the file its undo had to leave even when, in the same run, something an earlier
@@ -2502,6 +2536,146 @@ fn an_unreadable_directory_does_not_erase_what_is_not_settled() {
             .iter()
             .any(|note| note.starts_with("not settled") && note.contains(&left[0])),
         "{reports:?}"
+    );
+}
+
+/// A record of something left or not settled goes only once its absence is shown in its own
+/// directory and flushed.
+#[test]
+fn a_record_goes_only_once_its_absence_is_flushed() {
+    let apply =
+        |site: &Site, bridges: &NativeBridges| bridges.reconcile(&plugin(), Some(&site.release()));
+    let stopped = (1..)
+        .map_while(|step| stopped_at(step, &|_| {}, &apply))
+        .find(Stopped::left_unrecorded)
+        .expect("a run stopped between making something and recording it");
+    let site = &stopped.site;
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+    assert!(matches!(settled, Settled::Unsettled(_)), "{settled:?}");
+    let left = temporaries(site);
+    assert_eq!(left.len(), 1, "{left:?}");
+    let path = site.application().join(&left[0]);
+    if path.is_dir() {
+        std::fs::remove_dir(&path).expect("its owner removes it");
+    } else {
+        std::fs::remove_file(&path).expect("its owner removes it");
+    }
+
+    let next = site.bridges();
+    assert_eq!(
+        next.reconcile(&plugin(), Some(&site.release()))
+            .expect("reconciles"),
+        Settled::Unchanged
+    );
+
+    let steps = next.steps();
+    let directory = format!("flush {}", path.parent().expect("a directory").display());
+    let flushed = steps
+        .iter()
+        .position(|step| *step == directory)
+        .expect("its directory is flushed");
+    let recorded = steps
+        .iter()
+        .position(|step| step.starts_with("save "))
+        .expect("the record goes");
+    assert!(flushed < recorded, "{steps:?}");
+}
+
+/// An application directory with nothing at its path, whether moved away or behind a link that
+/// leads nowhere now, is not taken as deleted: what was placed stays recorded, and is taken out
+/// once the directory is back. A change a stopped run left in flight is settled then from the
+/// identities it recorded, so nothing is left behind.
+#[cfg(unix)]
+#[test]
+fn a_missing_application_directory_keeps_what_was_placed_recorded() {
+    for dangling in [false, true] {
+        let site = Site::new();
+        let before = site.tree();
+        let bridges = site.bridges();
+        bridges
+            .reconcile(&plugin(), Some(&site.release()))
+            .expect("applies");
+        let original = site.root.join("home/.claude-original");
+        std::fs::rename(site.application(), &original).expect("somebody moves it away");
+        if dangling {
+            std::os::unix::fs::symlink(site.root.join("nowhere"), site.application())
+                .expect("and leaves a link that leads nowhere");
+        }
+
+        let settled = bridges.reconcile(&plugin(), None).expect("reconciles");
+
+        assert!(
+            matches!(settled, Settled::Unsettled(_)),
+            "dangling {dangling}: {settled:?}"
+        );
+        let reports = bridges.reports().expect("reads");
+        assert_eq!(
+            reports[0].state, "removing",
+            "dangling {dangling}: {reports:?}"
+        );
+        assert!(
+            reports[0].notes.iter().any(|note| {
+                note.starts_with("could not be taken out") && note.contains("is not there")
+            }),
+            "dangling {dangling}: {reports:?}"
+        );
+        if dangling {
+            std::fs::remove_file(site.application()).expect("the link goes");
+        }
+        std::fs::rename(&original, site.application()).expect("the directory comes back");
+        assert_eq!(
+            bridges.reconcile(&plugin(), None).expect("reconciles"),
+            Settled::Removed,
+            "dangling {dangling}"
+        );
+        assert_eq!(site.tree(), before, "dangling {dangling}: removed exactly");
+    }
+
+    // A staged copy recorded and not yet renamed, while the directory is away.
+    let apply =
+        |site: &Site, bridges: &NativeBridges| bridges.reconcile(&plugin(), Some(&site.release()));
+    let stopped = (1..)
+        .map_while(|step| stopped_at(step, &|_| {}, &apply))
+        .find(|stopped| {
+            let [.., staged, last] = stopped.steps.as_slice() else {
+                return false;
+            };
+            staged.starts_with("stage ") && last.starts_with("save ")
+        })
+        .expect("a run stopped with a staged copy recorded");
+    let site = &stopped.site;
+    let before = Site::new().tree();
+    let original = site.root.join("home/.claude-original");
+    std::fs::rename(site.application(), &original).expect("somebody moves it away");
+
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), None)
+        .expect("reconciles");
+
+    assert!(matches!(settled, Settled::Unsettled(_)), "{settled:?}");
+    let reports = site.bridges().reports().expect("reads");
+    assert!(
+        reports[0]
+            .notes
+            .iter()
+            .any(|note| note.starts_with("not settled") && note.contains("cannot be opened")),
+        "{reports:?}"
+    );
+    std::fs::rename(&original, site.application()).expect("the directory comes back");
+    assert_eq!(
+        site.bridges()
+            .reconcile(&plugin(), None)
+            .expect("reconciles"),
+        Settled::Removed
+    );
+    assert_eq!(
+        site.tree(),
+        before,
+        "the staged copy went by its recorded identity"
     );
 }
 

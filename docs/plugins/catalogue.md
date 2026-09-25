@@ -370,8 +370,10 @@ its place. A document whose bytes, permission bits or owners change between the 
 its replacement is read again, so what somebody changed meanwhile is kept, and one that gains an
 access-control list meanwhile is not replaced. Access-control lists are read through paths, so they
 are read only while the paths still lead to the directory the host holds and the document it read,
-and the replacement is refused otherwise. Each file is written under a temporary name, flushed and
-renamed into place only where nothing is; directories are made the same way.
+checked before and after, and the replacement is refused otherwise. A program running as the same
+user that swaps a path and puts it back between those checks, or changes the document after the last
+of them and before the rename, is not caught. Each file is written under a temporary name, flushed
+and renamed into place only where nothing is; directories are made the same way.
 
 Each change is noted in the package's journal before it is made: a file or a directory with the
 temporary name it is about to be made under, then with the identity of what was made there, then as
@@ -380,7 +382,8 @@ settles from what is on disk. What is still at its temporary name with the recor
 never put in place, and is removed. A destination holding that identity is the host's, whatever is
 at the temporary name now, and is recorded as in place only after its directory is flushed. An
 absence is flushed before its record goes too, so a removal a stopped run made is durable before it
-is forgotten. Anything else is left alone.
+is forgotten, and a record of something left or not settled goes only once what it names is gone
+from its own directory and that is flushed. Anything else is left alone.
 
 Two things can be the host's without the host being able to show it: something at a temporary name
 when the run stopped before recording what it made there, and a key whose document was replaced
@@ -390,22 +393,24 @@ gone.
 
 The application's directory is recorded by its identity as well as its path. A directory put in its
 place is never changed, and nothing it holds or lacks is taken as saying anything about the
-original: what the release placed stays recorded, the removal is reported as unfinished, and it is
-taken out if the original comes back to its path. When nothing at all is at the path, the directory
-is taken as deleted, with everything in it.
+original. Nothing at the path, or a link that leads nowhere, is not taken as the original deleted
+either: absence at a path cannot tell a deleted directory from one moved away. Either way what the
+release placed stays recorded, with the identities that settle what a stopped run left in flight,
+the removal is reported as unfinished, and it is taken out once the original comes back to its path.
 
 An application either finishes, or is taken out and recorded as refused with its reason. When
 something cannot be taken out, such as a file in a directory that is no longer writable, the bridge
 stays recorded as being removed, names what is left, and the next reconciliation tries again. A
-refusal is reported as clean only when nothing of it is left: what it had to leave because somebody
-changed it is named. A release is reported as applied only once every change is in place and
-nothing is unsettled.
+refusal is reported as clean only when nothing of it is left: what its undo had to leave because
+somebody changed it is recorded with the refusal and named, and the refusal stays unsettled, in the
+journal and in every later report, until that is gone. A release is reported as applied only once
+every change is in place and nothing is unsettled.
 
-A removal takes out each file only while it is the file the host installed and still holds the
-bytes installed: a copy with the same bytes put in its place is somebody's own, and is left. The key
-goes only while it holds the value written, then the directories the host made once they hold
-nothing else. Whatever changed since is left in place and named in the journal. A release applied
-in a directory the host no longer keeps the application's plugins in is taken out of it before the
+A removal takes out each file only while it is the file the host installed and still holds the bytes
+installed: a copy with the same bytes put in its place is somebody's own, and is left. The key goes
+only while it holds the value written, then the directories the host made once they hold nothing
+else. Whatever changed since is left in place and named in the journal. A release applied in a
+directory the host no longer keeps the application's plugins in is taken out of it before the
 release is applied in the new one. The journal also says what an applied release yields for the
 sessions that launch its application: the application name its registration invokes the forwarder
 for, the registrations it makes and the forwarder it is expected to start.
