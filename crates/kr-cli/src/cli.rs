@@ -68,7 +68,7 @@ pub enum Command {
     Bridge(BridgeArguments),
     /// Pair a device with this host: issue an invitation, approve the device that answers it,
     /// withdraw one, or show where one has reached.
-    #[command(subcommand)]
+    #[command(subcommand, visible_alias = "p")]
     Pair(PairCommand),
 }
 
