@@ -2094,6 +2094,37 @@ async fn a_ceiling_removed_while_the_document_was_unreadable_is_still_fenced() {
     drop(controller);
 }
 
+/// A restart while something still holds the daemon a test let go, as that daemon's own tasks can
+/// for a moment, meets the environment held and takes it over once the holder lets go.
+///
+/// The holder is the test's own, and it lets go the first time the restart waits. A start takes the
+/// environment's lock before it waits for anything, so that is after the restart's first attempt
+/// met the environment held, and nothing here depends on timing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_takes_the_environment_over_once_the_daemon_before_it_is_let_go() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let controller = start_controller(&environment, environment_id).await;
+    let mut holder = Some(std::sync::Arc::clone(&controller));
+    drop(controller);
+
+    let mut restart = std::pin::pin!(start_controller(&environment, environment_id));
+    let controller = std::future::poll_fn(|context| {
+        let polled = restart.as_mut().poll(context);
+        if polled.is_pending() {
+            holder = None;
+        }
+        polled
+    })
+    .await;
+    assert!(
+        holder.is_none(),
+        "the restart waited while the daemon before it was held"
+    );
+    drop(controller);
+}
+
 /// The authority revision this environment's registry currently holds.
 fn authority_revision(
     environment: &kr_ipc::paths::EnvironmentPaths,
