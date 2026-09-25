@@ -289,9 +289,15 @@ fn a_source_outside_the_conventions_is_a_problem_and_keys_no_helper() {
     expect_problems(
         &map,
         &[
+            ("tests/absent.rs:3", "module missing has no file"),
             (
                 "tests/aliased.rs:3",
                 "`println` is declared here as the name `as` gives",
+            ),
+            ("tests/chosen.rs:4", "a `cfg_attr` chooses"),
+            (
+                "tests/elsewhere/deep.rs:2",
+                "`assert_eq` is declared here as a macro",
             ),
             (
                 "tests/emitcore.rs:13",
@@ -356,6 +362,14 @@ fn a_source_outside_the_conventions_is_a_problem_and_keys_no_helper() {
                 "a `use` of `shared`, a keyed helper's name, that the reading does not follow",
             ),
             ("tests/inner.rs:9", "a function inside a function"),
+            (
+                "tests/inline/declared.rs:2",
+                "`assert_eq` is declared here as a macro",
+            ),
+            (
+                "tests/loaded/neighbour.rs:2",
+                "`assert_eq` is declared here as a macro",
+            ),
             (
                 "tests/localcore.rs:3",
                 "`core` is declared here as a module",
@@ -442,6 +456,11 @@ fn a_source_outside_the_conventions_is_a_problem_and_keys_no_helper() {
         "KR-REQ-03.52",
         "KR-REQ-03.53",
         "KR-REQ-03.54",
+        "KR-REQ-03.59",
+        "KR-REQ-03.60",
+        "KR-REQ-03.61",
+        "KR-REQ-03.62",
+        "KR-REQ-03.63",
     ] {
         let row = identifier(row);
         assert!(
