@@ -222,7 +222,7 @@ impl RecordFile {
             let _ = std::fs::remove_file(&self.partial);
             return Err(storage(&self.path, source));
         }
-        kr_ipc::paths::flush_directory(&self.directory, kr_ipc::paths::NameKind::File)
+        kr_flush::flush_directory(&self.directory, kr_flush::NameKind::File)
             .map_err(|source| storage(&self.directory, source))
     }
 
@@ -245,7 +245,7 @@ impl RecordFile {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(source) => return Err(storage(&self.path, source)),
         }
-        kr_ipc::paths::flush_directory(&self.directory, kr_ipc::paths::NameKind::File)
+        kr_flush::flush_directory(&self.directory, kr_flush::NameKind::File)
             .map_err(|source| storage(&self.directory, source))
     }
 }

@@ -24,6 +24,7 @@ kr-changeset.workspace = true
 kr-client = { workspace = true, default-features = false }
 kr-crypto.workspace = true
 kr-delivery.workspace = true
+kr-flush.workspace = true
 kr-ipc.workspace = true
 kr-pairing.workspace = true
 # The catalogue client: verification, storage and network, and no component engine, so this

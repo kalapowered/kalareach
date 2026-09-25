@@ -81,7 +81,7 @@ use std::path::{Path, PathBuf};
 
 use cap_fs_ext::{DirExt as _, FollowSymlinks, MetadataExt as _, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir, File, OpenOptions};
-use kr_ipc::paths::{NameKind, flush_held_directory};
+use kr_flush::{NameKind, flush_held_directory};
 use kr_protocol::ids::EnvironmentId;
 
 /// Longest accepted relative name, in bytes.

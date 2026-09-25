@@ -22,7 +22,7 @@
 
 use std::path::{Path, PathBuf};
 
-use kr_ipc::paths::{NameKind, flush_directory};
+use kr_flush::{NameKind, flush_directory};
 use kr_protocol::scalars::{Digest256, Nullable};
 use kr_protocol::skill::{
     AgentTarget, AgentToolsInstallResult, AgentToolsParams, AgentToolsRemoveResult,

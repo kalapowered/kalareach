@@ -13,6 +13,7 @@ cap-fs-ext.workspace = true
 cap-std.workspace = true
 image.workspace = true
 kr-cbor.workspace = true
+kr-flush.workspace = true
 kr-ipc.workspace = true
 kr-protocol.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }

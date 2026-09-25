@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 kr-cbor.workspace = true
 kr-crypto.workspace = true
+kr-flush.workspace = true
 kr-protocol.workspace = true
 rustix = { workspace = true, features = ["fs", "mm", "net", "process", "time"] }
 serde.workspace = true

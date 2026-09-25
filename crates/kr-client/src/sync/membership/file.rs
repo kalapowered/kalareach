@@ -15,7 +15,8 @@
 
 use std::path::{Path, PathBuf};
 
-use kr_ipc::paths::{NameKind, flush_directory, flush_path_names};
+use kr_flush::{NameKind, flush_directory};
+use kr_ipc::paths::flush_path_names;
 
 use super::MembershipError;
 use super::facts::{Facts, Kinds};
