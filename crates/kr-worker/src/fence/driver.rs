@@ -49,8 +49,8 @@ pub const FENCE_WRITE_LIMIT: Duration = Duration::from_secs(5);
 /// One published fence, numbered in the order the connection's writer was handed them.
 ///
 /// The session puts it in its queue for the terminal where the fence was published, and nothing
-/// queued behind it goes to the terminal until the writer has written the fence or the connection
-/// has ended.
+/// queued behind it goes to the terminal until the writer has written the fence, the connection has
+/// ended, or the machine has dropped the fence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FenceFrame(u64);
 
@@ -59,7 +59,7 @@ pub struct FenceFrame(u64);
 /// The frames themselves are written by the connection's own task. Queueing them here keeps the
 /// session boundary free of socket writes: a reader that has stopped reading its own socket must
 /// not be able to hold the worker's input path. The one thing that waits for the writer is input
-/// behind a published fence, and for no longer than [`FENCE_WRITE_LIMIT`].
+/// behind a published fence the machine still holds, and for no longer than [`FENCE_WRITE_LIMIT`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outbound {
     /// Something the reader thread must decide.
@@ -181,9 +181,10 @@ pub enum Step {
     /// Publish a fence to the bridge.
     ///
     /// Everything the session queues for the terminal after it waits until the connection's writer
-    /// has written it. A reader takes what is on its endpoint before it acts on a key, and only
-    /// what is there: a key that reached the shell ahead of its fence would be accepted without
-    /// it, and the line it made would run without the capability the fence exists to mint.
+    /// has written it, for as long as the machine holds the fence. A reader takes what is on its
+    /// endpoint before it acts on a key, and only what is there: a key that reached the shell ahead
+    /// of its fence would be accepted without it, and the line it made would run without the
+    /// capability the fence exists to mint.
     Publish(Box<EditorFence>),
     /// Deliver an `editor_busy` event to the attachment it names.
     EditorBusy(Box<EditorBusyEvent>),
@@ -326,11 +327,13 @@ pub struct FenceDriver {
     /// must not be able to hold the worker's input path or its one timer.
     outbound: Option<tokio::sync::mpsc::UnboundedSender<Outbound>>,
     /// The published fences the connection's writer has been handed and has not written, oldest
-    /// first, each with the reading it was handed over at.
+    /// first, each with the fence it carries and the reading it was handed over at.
     ///
-    /// The writer takes its frames in order, so these are always the newest frames handed over:
-    /// one written is every one before it written too.
-    unwritten: VecDeque<(FenceFrame, ContinuousMs)>,
+    /// Only a fence the machine still holds is kept here. Input waits for one because a reader
+    /// that met a key before the fence would accept the line without it; once the machine has
+    /// dropped the fence, no line can be attributed through it however the reader meets it, so
+    /// nothing waits for its frame. In practice that leaves at most the one current fence.
+    unwritten: VecDeque<(FenceFrame, FenceId, ContinuousMs)>,
     /// How many published fences have been handed to a writer, on any connection.
     handed: u64,
     /// The fence the bridge currently holds, so an invalidation can name it.
@@ -557,11 +560,12 @@ impl FenceDriver {
         let outbound = self.outbound.as_ref()?;
         self.handed += 1;
         let frame = FenceFrame(self.handed);
+        let fence_id = fence.fence_id;
         let _ = outbound.send(Outbound::Published {
             fence: Box::new(fence),
             frame,
         });
-        self.unwritten.push_back((frame, self.reading()));
+        self.unwritten.push_back((frame, fence_id, self.reading()));
         // The connection's task times the write as well as the machine, so it looks again.
         self.waker.notify_one();
         Some(frame)
@@ -572,33 +576,40 @@ impl FenceDriver {
     /// It returns no effects of its own. What it changes is what the session's queue for the
     /// terminal may let go of, and the flush that ends every stimulus lets it go.
     pub fn fence_written(&mut self, frame: FenceFrame) -> Effects {
-        while self
-            .unwritten
-            .front()
-            .is_some_and(|(unwritten, _)| *unwritten <= frame)
-        {
-            self.unwritten.pop_front();
-        }
+        self.unwritten
+            .retain(|(unwritten, _, _)| *unwritten > frame);
         self.waker.notify_one();
         Effects::default()
     }
 
-    /// Returns the oldest published fence the connection's writer has not written, if any.
+    /// Returns whether what the session queued behind `frame` still waits for it.
     ///
-    /// It and every fence handed over after it are unwritten, and every fence before it has been
-    /// written or has gone with its connection.
+    /// It does while the frame is unwritten and its fence is still the machine's; once the writer
+    /// has written it, the connection has ended, or the machine has dropped the fence, it does not.
     #[must_use]
-    pub fn unwritten_fence(&self) -> Option<FenceFrame> {
-        self.unwritten.front().map(|(frame, _)| *frame)
+    pub fn holds_back(&self, frame: FenceFrame) -> bool {
+        self.unwritten
+            .iter()
+            .any(|(unwritten, _, _)| *unwritten == frame)
     }
 
-    /// Returns how long the oldest unwritten fence may still wait for the writer, when there is one.
+    /// Returns the oldest published fence input still waits for, if any.
+    #[must_use]
+    pub fn unwritten_fence(&self) -> Option<FenceFrame> {
+        self.unwritten.front().map(|(frame, _, _)| *frame)
+    }
+
+    /// Returns how long the oldest fence input waits for may still wait for the writer, when there
+    /// is one.
     ///
     /// Zero once [`FENCE_WRITE_LIMIT`] has passed, and the connection's task then ends the
-    /// connection. It is read on the same clock as the machine's own deadline.
+    /// connection. It is read on the same clock as the machine's own deadline, and like that
+    /// deadline it is woken by the runtime's timer, which does not count a suspended machine's
+    /// sleep: across a suspend the connection ends at the first wake after the limit has passed,
+    /// and until then the input still waits.
     #[must_use]
     pub fn fence_write_deadline(&self) -> Option<Duration> {
-        let (_, handed) = self.unwritten.front()?;
+        let (_, _, handed) = self.unwritten.front()?;
         let limit = u64::try_from(FENCE_WRITE_LIMIT.as_millis()).unwrap_or(u64::MAX);
         Some(Duration::from_millis(
             handed
@@ -1093,6 +1104,13 @@ impl FenceDriver {
             }
             Action::InvalidateFence(reason) => {
                 if let Some(fence_id) = self.published.take() {
+                    // Input waits for a published fence only while it is the machine's. From here
+                    // an acceptance or a detach the reader makes through it is refused as not the
+                    // fence this session holds, however late its frame reaches the reader, so what
+                    // was waiting goes on: a takeover whose exchange times out, and a reader that
+                    // has left for an application, release input the moment the rules say.
+                    self.unwritten
+                        .retain(|(_, unwritten, _)| *unwritten != fence_id);
                     effects.steps.push(Step::Send(Outbound::Invalidated {
                         fence_id,
                         reason: withheld_for(*reason),
@@ -1562,10 +1580,12 @@ mod tests {
             }
         );
         assert_eq!(driver.unwritten_fence(), Some(frame));
+        assert!(driver.holds_back(frame));
         assert_eq!(driver.fence_write_deadline(), Some(FENCE_WRITE_LIMIT));
         clock.advance(FENCE_WRITE_LIMIT);
         assert_eq!(driver.fence_write_deadline(), Some(Duration::ZERO));
         let _ = driver.fence_written(frame);
+        assert!(!driver.holds_back(frame));
         assert_eq!(driver.unwritten_fence(), None);
         assert_eq!(driver.fence_write_deadline(), None);
 
@@ -1575,11 +1595,20 @@ mod tests {
         assert!(first < second);
         assert_eq!(driver.unwritten_fence(), Some(first));
         let _ = driver.fence_written(second);
-        assert_eq!(driver.unwritten_fence(), None);
+        assert!(!driver.holds_back(first) && !driver.holds_back(second));
+
+        // A fence the machine drops holds nothing back, written or not: the reader leaves.
+        let third = driver.publish(fence.clone()).expect("taken");
+        assert!(driver.holds_back(third));
+        let _ = driver.bridge_event(RequestId::new(3), &left(1, 1));
+        assert!(driver.fence().is_none(), "the leave dropped the fence");
+        assert!(!driver.holds_back(third));
+        assert_eq!(driver.fence_write_deadline(), None);
 
         // One the connection never writes stops being waited for when the connection ends.
-        let _ = driver.publish(fence.clone()).expect("taken");
+        let fourth = driver.publish(fence.clone()).expect("taken");
         driver.stop_sending();
+        assert!(!driver.holds_back(fourth));
         assert_eq!(driver.unwritten_fence(), None);
         // With no connection there is no reader for a fence to reach ahead of anything.
         assert_eq!(driver.publish(fence), None);

@@ -2408,33 +2408,59 @@ impl Session {
     /// Takes the batches that may be written to the pseudo-terminal now, in the order they were
     /// queued.
     ///
-    /// It stops at a published fence the bridge's writer has not written yet, and leaves it and
-    /// everything behind it queued. A reader takes what is on its endpoint before it acts on a key,
-    /// and only what is already there, so a key that reached the shell ahead of the fence it was
-    /// released under would be accepted without it: the line it made would run without the
-    /// capability the fence exists to mint. This is the only way out of the queue, and every byte
-    /// for the terminal goes through the queue, so nothing reaches the terminal around a fence.
+    /// It stops at a published fence the bridge's writer has not written yet, while the machine
+    /// still holds that fence, and leaves it and everything behind it queued. A reader takes what is
+    /// on its endpoint before it acts on a key, and only what is already there, so a key that
+    /// reached the shell ahead of the fence it was released under would be accepted without it: the
+    /// line it made would run without the capability the fence exists to mint. This is the only way
+    /// out of the queue, and every batch for the terminal, the host's own replies included, goes
+    /// through the queue, so no batch reaches the terminal around a fence. The one thing the
+    /// terminal's writer writes of its own accord is the terminator that closes a paste a lease
+    /// that has ended left open; it belongs to input queued before that lease ended, and it goes
+    /// ahead of the batch whose taking showed the writer the change.
     ///
-    /// When the writer reports the fence written, or its connection ends and the loss has been
-    /// recorded, the next flush takes what was waiting.
+    /// When the writer reports the fence written, its connection ends and the loss has been
+    /// recorded, or the machine drops the fence, the next flush takes what was waiting.
     pub fn take_pending_input(&mut self) -> Vec<InputBatch> {
-        let unwritten = self
-            .fence
-            .as_ref()
-            .and_then(crate::fence::FenceDriver::unwritten_fence);
         let mut taken = Vec::new();
         while let Some(queued) = self.pending_input.pop_front() {
             match queued {
                 Queued::Batch(batch) => taken.push(batch),
-                Queued::Fence(frame) if unwritten.is_some_and(|oldest| frame >= oldest) => {
+                Queued::Fence(frame)
+                    if self
+                        .fence
+                        .as_ref()
+                        .is_some_and(|driver| driver.holds_back(frame)) =>
+                {
                     self.pending_input.push_front(Queued::Fence(frame));
                     break;
                 }
-                // Written, or gone with the connection it was handed to.
+                // Written, gone with the connection it was handed to, or no longer the machine's.
                 Queued::Fence(_) => {}
             }
         }
         taken
+    }
+
+    /// Returns how many batches wait in the queue for the terminal behind a published fence that
+    /// still holds them back, for this host's own tests.
+    ///
+    /// It is what a test reads to know, on the step itself rather than by watching the terminal,
+    /// whether keys have gone to the writer.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn waiting_for_fence(&self) -> usize {
+        self.pending_input
+            .iter()
+            .skip_while(|queued| match queued {
+                Queued::Batch(_) => true,
+                Queued::Fence(frame) => !self
+                    .fence
+                    .as_ref()
+                    .is_some_and(|driver| driver.holds_back(*frame)),
+            })
+            .filter(|queued| matches!(queued, Queued::Batch(_)))
+            .count()
     }
 
     /// Returns the epoch a batch must carry to still be written.

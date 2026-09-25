@@ -50,6 +50,7 @@ use kr_shell_integration::host::scripted::{
     ReferenceShell, ScriptedBridge, ToBridge, qualified_hello,
 };
 use kr_transport::clock::SystemContinuousClock;
+use kr_worker::fence::bridge::{FenceGate, FenceHold};
 use kr_worker::fence::{FenceDriver, ReaderDiscards};
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
@@ -449,21 +450,20 @@ async fn wired_profiled(
 }
 
 /// Starts a managed session with its bridge registered, on a clock this test moves, with the bridge
-/// server keeping each published fence from its writer for `hold`.
+/// server keeping each published fence from its writer while `gate` is closed.
 ///
-/// The machine's own deadlines pass only when the test moves `clock`, so an exchange waits for the
-/// test however long the test takes; the hold is on the ordinary clock, because it stands for a
-/// writer that is slow in real time.
+/// The machine's own deadlines pass only when the test moves `clock`, and a fence is written only
+/// once the test opens the gate, so neither depends on how quickly anything here is scheduled.
 async fn wired_holding_fences(
     clock: &Arc<kr_transport::clock::ManualClock>,
-    hold: Duration,
+    gate: Option<&FenceGate>,
 ) -> Wired {
     wired_built(
         ShellMode::Managed,
         true,
         Bridging {
             clock: Arc::clone(clock) as Arc<_>,
-            fence_hold: hold,
+            fence_hold: gate.map(|gate| FenceHold::Gate(gate.clone())),
         },
         |_| {},
     )
@@ -474,8 +474,8 @@ async fn wired_holding_fences(
 struct Bridging {
     /// The clock the session's fence machine reads.
     clock: Arc<dyn kr_transport::clock::ContinuousClock>,
-    /// How long the server keeps each published fence from its connection's writer.
-    fence_hold: Duration,
+    /// What the server keeps each published fence from its connection's writer for, if anything.
+    fence_hold: Option<FenceHold>,
 }
 
 impl Bridging {
@@ -483,7 +483,7 @@ impl Bridging {
     fn ordinary() -> Self {
         Self {
             clock: Arc::new(SystemContinuousClock::new()),
-            fence_hold: Duration::ZERO,
+            fence_hold: None,
         }
     }
 }
@@ -558,15 +558,15 @@ async fn wired_built(
         already_registered: false,
         gesture: EofGesture::default(),
     };
-    let bridge_task = tokio::spawn(
-        kr_worker::fence::bridge::BridgeServer::new(
-            Arc::clone(&runtime),
-            host_endpoint,
-            expectation,
-        )
-        .holding_fences(bridging.fence_hold)
-        .serve(),
+    let mut server = kr_worker::fence::bridge::BridgeServer::new(
+        Arc::clone(&runtime),
+        host_endpoint,
+        expectation,
     );
+    if let Some(hold) = bridging.fence_hold {
+        server = server.holding_fences(hold);
+    }
+    let bridge_task = tokio::spawn(server.serve());
 
     let hello =
         qualified_hello(&reference(), session_id, &address, process, &secret).expect("a hello");
@@ -886,14 +886,13 @@ async fn an_unanswered_exchange_releases_the_held_input_and_says_the_editor_was_
 // KR-REQ-07.79, KR-REQ-07.84: what a fence lets go of reaches the shell after the fence does.
 // --------------------------------------------------------------------------------------------
 
-/// How long the bridge server keeps each published fence from its writer, in the cases that need
-/// one written late.
+/// How long the cases that keep a fence from the writer watch the shell for keys that should be
+/// waiting.
 ///
-/// Long beside the moment a key takes to reach the shell and come back as output, so a key that
-/// did not wait for its fence is in the output long before the fence is written.
-const FENCE_HOLD: Duration = Duration::from_secs(2);
-
-/// How long those cases look for keys that should still be waiting.
+/// A fence is written only when the case opens its gate, and the case reads the session's queue on
+/// the step that decides, so this decides nothing by itself. It is many times what a key that did
+/// not wait takes to reach the shell and come back as output, which is what the check beside that
+/// read looks for.
 const WHILE_HELD: Duration = Duration::from_millis(300);
 
 /// Types `bytes` through the lease `holder` holds, as its client's `input.write` does, and hands
@@ -949,55 +948,80 @@ async fn until_fenced(runtime: &SessionRuntime) {
     .expect("the acknowledged fence was published");
 }
 
+/// Returns how many batches the session keeps behind a fence its writer has not written.
+fn waiting(runtime: &SessionRuntime) -> usize {
+    runtime.session().waiting_for_fence()
+}
+
+/// Takes the session through entry to a published fence, typing `held` while the reader is asked
+/// when there is anything to type, and returns once the machine has published the fence.
+async fn fenced_with(
+    wired: &mut Wired,
+    holder: AttachmentId,
+    held: Option<&[u8]>,
+) -> kr_protocol::root::FenceId {
+    wired
+        .bridge
+        .send_event(enter(wired.session_id, 1, 1))
+        .await
+        .expect("enters");
+    let fence_id = asked_for_a_fence(wired).await;
+    if let Some(keys) = held {
+        type_keys(wired, holder, 0, keys);
+        assert_eq!(
+            wired
+                .runtime
+                .session()
+                .fence()
+                .expect("a driver")
+                .held()
+                .len(),
+            1,
+            "the machine holds what arrives while the reader is asked"
+        );
+    }
+    wired
+        .bridge
+        .answer(kr_protocol::ids::RequestId::new(0), drained(1, 1, fence_id))
+        .await
+        .expect("acknowledges");
+    until_fenced(&wired.runtime).await;
+    fence_id
+}
+
 /// KR-REQ-07.79, KR-REQ-07.84: keys held while the reader is asked reach the shell only once the
 /// fence they were held for has been written to the reader.
 ///
 /// A reader takes what is on its endpoint before it acts on a key, and only what is already there.
 /// A key that reaches the shell ahead of the fence it was released under is accepted without it:
 /// the line it makes is one the worker cannot attribute, and it runs without the capability the
-/// fence exists to mint. The connection's writer here keeps each published fence back, as a writer
-/// on a loaded machine sometimes does, and the keys have to wait for it.
+/// fence exists to mint. The connection's writer here keeps the published fence back, as a writer
+/// on a loaded machine sometimes does, until the case lets it go.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn held_keys_reach_the_shell_only_once_their_fence_is_written() {
     let clock = Arc::new(kr_transport::clock::ManualClock::new());
-    let mut wired = wired_holding_fences(&clock, FENCE_HOLD).await;
+    let gate = FenceGate::closed();
+    let mut wired = wired_holding_fences(&clock, Some(&gate)).await;
     let holder = wired.holder();
-    wired
-        .bridge
-        .send_event(enter(wired.session_id, 1, 1))
-        .await
-        .expect("enters");
-    let fence_id = asked_for_a_fence(&mut wired).await;
-    type_keys(&wired, holder, 0, b"held-keys\n");
+    let fence_id = fenced_with(&mut wired, holder, Some(b"held-keys\n")).await;
+    // The machine published the fence and let the keys go on one step. The writer is keeping the
+    // fence, so the session keeps the keys.
     assert_eq!(
-        wired
-            .runtime
-            .session()
-            .fence()
-            .expect("a driver")
-            .held()
-            .len(),
+        waiting(&wired.runtime),
         1,
-        "the machine holds what arrives while the reader is asked"
+        "the keys went to the terminal's writer before the fence they were held for was written"
     );
-
-    wired
-        .bridge
-        .answer(kr_protocol::ids::RequestId::new(0), drained(1, 1, fence_id))
-        .await
-        .expect("acknowledges");
-    // The machine publishes the fence and lets the keys go on the same step. The writer has the
-    // fence and is keeping it, so the keys are still waiting.
-    until_fenced(&wired.runtime).await;
     tokio::time::sleep(WHILE_HELD).await;
     assert!(
         !echoed_now(&wired.runtime, b"held-keys"),
         "the keys reached the shell before the fence they were held for reached the reader"
     );
 
+    gate.open();
     let fence = published(&mut wired).await;
     assert_eq!(fence.fence_id, fence_id);
     echoed(&wired.runtime, b"held-keys").await;
+    assert_eq!(waiting(&wired.runtime), 0);
     wired.close().await;
 }
 
@@ -1009,20 +1033,10 @@ async fn held_keys_reach_the_shell_only_once_their_fence_is_written() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keys_typed_while_their_fence_is_on_its_way_wait_for_it() {
     let clock = Arc::new(kr_transport::clock::ManualClock::new());
-    let mut wired = wired_holding_fences(&clock, FENCE_HOLD).await;
+    let gate = FenceGate::closed();
+    let mut wired = wired_holding_fences(&clock, Some(&gate)).await;
     let holder = wired.holder();
-    wired
-        .bridge
-        .send_event(enter(wired.session_id, 1, 1))
-        .await
-        .expect("enters");
-    let fence_id = asked_for_a_fence(&mut wired).await;
-    wired
-        .bridge
-        .answer(kr_protocol::ids::RequestId::new(0), drained(1, 1, fence_id))
-        .await
-        .expect("acknowledges");
-    until_fenced(&wired.runtime).await;
+    let _ = fenced_with(&mut wired, holder, None).await;
 
     type_keys(&wired, holder, 0, b"typed-keys\n");
     assert!(
@@ -1035,12 +1049,18 @@ async fn keys_typed_while_their_fence_is_on_its_way_wait_for_it() {
             .is_empty(),
         "a fenced machine forwards what arrives rather than holding it"
     );
+    assert_eq!(
+        waiting(&wired.runtime),
+        1,
+        "the keys went to the terminal's writer before the fence published for them was written"
+    );
     tokio::time::sleep(WHILE_HELD).await;
     assert!(
         !echoed_now(&wired.runtime, b"typed-keys"),
         "the keys reached the shell before the fence published for them reached the reader"
     );
 
+    gate.open();
     published(&mut wired).await;
     echoed(&wired.runtime, b"typed-keys").await;
     wired.close().await;
@@ -1056,22 +1076,12 @@ async fn keys_typed_while_their_fence_is_on_its_way_wait_for_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keys_behind_a_fence_never_written_go_once_the_loss_is_recorded() {
     let clock = Arc::new(kr_transport::clock::ManualClock::new());
-    // Held for longer than this test runs, so the fence is never written.
-    let mut wired = wired_holding_fences(&clock, Duration::from_secs(3600)).await;
+    // Never opened, so the fence is never written.
+    let gate = FenceGate::closed();
+    let mut wired = wired_holding_fences(&clock, Some(&gate)).await;
     let holder = wired.holder();
-    wired
-        .bridge
-        .send_event(enter(wired.session_id, 1, 1))
-        .await
-        .expect("enters");
-    let fence_id = asked_for_a_fence(&mut wired).await;
-    type_keys(&wired, holder, 0, b"stranded-keys\n");
-    wired
-        .bridge
-        .answer(kr_protocol::ids::RequestId::new(0), drained(1, 1, fence_id))
-        .await
-        .expect("acknowledges");
-    until_fenced(&wired.runtime).await;
+    let _ = fenced_with(&mut wired, holder, Some(b"stranded-keys\n")).await;
+    assert_eq!(waiting(&wired.runtime), 1, "the keys wait for their fence");
     tokio::time::sleep(WHILE_HELD).await;
     assert!(
         !echoed_now(&wired.runtime, b"stranded-keys"),
@@ -1103,6 +1113,7 @@ async fn keys_behind_a_fence_never_written_go_once_the_loss_is_recorded() {
             kr_shell_integration::contract::qualification::IntegrationPhase::Degraded,
             "the loss was recorded before the keys went"
         );
+        assert_eq!(session.waiting_for_fence(), 0);
     }
 
     runtime.close(ClosureReason::CloseRequested).1.release();
@@ -1120,26 +1131,11 @@ async fn keys_behind_a_fence_never_written_go_once_the_loss_is_recorded() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fence_not_written_within_its_limit_ends_the_connection_and_lets_the_keys_go() {
     let clock = Arc::new(kr_transport::clock::ManualClock::new());
-    let mut wired = wired_holding_fences(&clock, Duration::from_secs(3600)).await;
+    let gate = FenceGate::closed();
+    let mut wired = wired_holding_fences(&clock, Some(&gate)).await;
     let holder = wired.holder();
-    wired
-        .bridge
-        .send_event(enter(wired.session_id, 1, 1))
-        .await
-        .expect("enters");
-    let fence_id = asked_for_a_fence(&mut wired).await;
-    type_keys(&wired, holder, 0, b"waiting-keys\n");
-    wired
-        .bridge
-        .answer(kr_protocol::ids::RequestId::new(0), drained(1, 1, fence_id))
-        .await
-        .expect("acknowledges");
-    until_fenced(&wired.runtime).await;
-    tokio::time::sleep(WHILE_HELD).await;
-    assert!(
-        !echoed_now(&wired.runtime, b"waiting-keys"),
-        "the keys wait while the fence is within its limit"
-    );
+    let _ = fenced_with(&mut wired, holder, Some(b"waiting-keys\n")).await;
+    assert_eq!(waiting(&wired.runtime), 1, "the keys wait for their fence");
 
     clock.advance(kr_worker::fence::FENCE_WRITE_LIMIT);
     wired
@@ -1162,11 +1158,109 @@ async fn a_fence_not_written_within_its_limit_ends_the_connection_and_lets_the_k
             kr_shell_integration::contract::qualification::IntegrationPhase::Degraded,
             "the loss was recorded before the keys went"
         );
+        assert_eq!(session.waiting_for_fence(), 0);
     }
     // The bridge finds its connection over.
     tokio::time::timeout(SOON, async { while wired.bridge.recv().await.is_ok() {} })
         .await
         .expect("the connection ended");
+    wired.close().await;
+}
+
+/// KR-REQ-07.79, KR-REQ-07.82: a takeover whose exchange times out lets the new holder's keys go at
+/// the timeout, while the fence the previous holder had is still unwritten.
+///
+/// Input waits for a published fence only while it is the machine's. The takeover drops the first
+/// fence, so nothing waits for its frame any more: an acceptance or a detach made through it is
+/// refused as not the fence this session holds, however late it reaches the reader. The new
+/// exchange's request waits on the writer behind the frame it is keeping, so the reader never
+/// answers, and the 250 ms rule has the held keys released in order, unfenced, with the connection
+/// still up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_takeover_that_times_out_lets_its_keys_go_while_an_earlier_fence_is_unwritten() {
+    let clock = Arc::new(kr_transport::clock::ManualClock::new());
+    let gate = FenceGate::closed();
+    let mut wired = wired_holding_fences(&clock, Some(&gate)).await;
+    let first = wired.holder();
+    let _ = fenced_with(&mut wired, first, None).await;
+
+    let second = wired.holder();
+    type_keys(&wired, second, 0, b"second-keys\n");
+    assert_eq!(
+        wired
+            .runtime
+            .session()
+            .fence()
+            .expect("a driver")
+            .held()
+            .len(),
+        1,
+        "the machine holds the new holder's keys while it asks for a new fence"
+    );
+    // The exchange's deadline passes on the machine's own clock.
+    clock.advance(Duration::from_millis(250));
+    wired
+        .runtime
+        .session()
+        .fence()
+        .expect("a driver")
+        .waker()
+        .notify_one();
+    echoed(&wired.runtime, b"second-keys").await;
+    {
+        let session = wired.runtime.session();
+        let driver = session.fence().expect("a driver");
+        assert_eq!(
+            driver.state(),
+            FenceState::Unfenced,
+            "the editor stays unfenced"
+        );
+        assert_eq!(
+            driver.phase().phase(),
+            kr_shell_integration::contract::qualification::IntegrationPhase::Qualified,
+            "nothing ended the connection"
+        );
+        assert_eq!(session.waiting_for_fence(), 0);
+    }
+    gate.open();
+    wired.close().await;
+}
+
+/// KR-REQ-07.77, KR-REQ-07.79: keys waiting for a fence go to the terminal the moment the reader
+/// leaves the prompt, while that fence is still unwritten.
+///
+/// Outside a registered root editor input does not wait for a reader. The leave drops the fence,
+/// so nothing waits for its frame, and the keys go to whatever reads the terminal now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keys_waiting_for_a_fence_go_when_the_reader_leaves_the_prompt() {
+    let clock = Arc::new(kr_transport::clock::ManualClock::new());
+    let gate = FenceGate::closed();
+    let mut wired = wired_holding_fences(&clock, Some(&gate)).await;
+    let holder = wired.holder();
+    let _ = fenced_with(&mut wired, holder, None).await;
+    type_keys(&wired, holder, 0, b"leaving-keys\n");
+    assert_eq!(waiting(&wired.runtime), 1, "the keys wait for their fence");
+
+    // Another reader takes over from the prompt, a pager inside the shell, say.
+    wired
+        .bridge
+        .send_event(BridgeEvent::EditorLeave(RootEditorLeaveParams {
+            session_id: wired.session_id,
+            prompt_generation: PromptGeneration::new(1),
+            reader_revision: ReaderRevision::new(1),
+            reason: kr_protocol::root::EditorLeaveReason::ReaderTakeover,
+        }))
+        .await
+        .expect("leaves");
+    echoed(&wired.runtime, b"leaving-keys").await;
+    {
+        let session = wired.runtime.session();
+        let driver = session.fence().expect("a driver");
+        assert_eq!(driver.state(), FenceState::Outside);
+        assert!(driver.fence().is_none(), "the leave dropped the fence");
+        assert_eq!(session.waiting_for_fence(), 0);
+    }
+    gate.open();
     wired.close().await;
 }
 
@@ -1178,7 +1272,7 @@ async fn a_fence_not_written_within_its_limit_ends_the_connection_and_lets_the_k
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keys_typed_behind_a_written_fence_are_not_held() {
     let clock = Arc::new(kr_transport::clock::ManualClock::new());
-    let mut wired = wired_holding_fences(&clock, Duration::ZERO).await;
+    let mut wired = wired_holding_fences(&clock, None).await;
     let holder = wired.holder();
     let _fence = fenced(&mut wired, 1, 1).await;
     // The reader has the fence; the writer says so on its own task, just after.
@@ -1801,7 +1895,7 @@ async fn a_real_qualified_package_registers_and_qualifies_on_this_hosts_endpoint
         &package,
         kr_protocol::session::LaunchProfile::default(),
         Vec::new(),
-        Duration::ZERO,
+        None,
     )
     .await;
     assert_eq!(
@@ -1833,12 +1927,13 @@ impl RealShell {
     /// have, and waits until the entry has reported the hooks live after the startup files, which
     /// is what qualifies the session.
     ///
-    /// The bridge server keeps each published fence from its writer for `fence_hold`.
+    /// The bridge server keeps each published fence from its writer as `fence_hold` says, when
+    /// there is one.
     async fn start(
         package: &kr_shell_integration::host::package::ShellPackage,
         launch_profile: kr_protocol::session::LaunchProfile,
         extra: Vec<(String, String)>,
-        fence_hold: Duration,
+        fence_hold: Option<FenceHold>,
     ) -> Self {
         let temp = kr_ipc::testing::TempHost::create();
         let environment = temp.environment();
@@ -1927,15 +2022,15 @@ impl RealShell {
             already_registered: false,
             gesture: EofGesture::default(),
         };
-        let bridge_task = tokio::spawn(
-            kr_worker::fence::bridge::BridgeServer::new(
-                Arc::clone(&runtime),
-                host_endpoint,
-                expectation,
-            )
-            .holding_fences(fence_hold)
-            .serve(),
+        let mut server = kr_worker::fence::bridge::BridgeServer::new(
+            Arc::clone(&runtime),
+            host_endpoint,
+            expectation,
         );
+        if let Some(hold) = fence_hold {
+            server = server.holding_fences(hold);
+        }
+        let bridge_task = tokio::spawn(server.serve());
 
         // The package connects to the endpoint it was given, proves itself over the bootstrap
         // secret and is registered; then its own entry reports that the hooks are live after the
@@ -2324,13 +2419,13 @@ async fn a_real_package_asks_the_real_worker_before_each_command_and_runs_a_bypa
     let set =
         kr_shell_integration::host::package::PackageSet::discover(std::path::Path::new(&root))
             .unwrap_or_else(|fault| panic!("{PACKAGE_ROOT_VARIABLE} names {root:?}: {fault}"));
-    for fence_hold in [Duration::ZERO, PACKAGE_FENCE_HOLD] {
+    for fence_hold in [None, Some(FenceHold::For(PACKAGE_FENCE_HOLD))] {
         for kind in [ShellKind::Zsh, ShellKind::Bash] {
             let package = set
                 .select(Some(kind.as_str()))
                 .unwrap_or_else(|fault| panic!("{PACKAGE_ROOT_VARIABLE} has no {kind:?}: {fault}"))
                 .clone();
-            asks_the_real_worker_before_each_command(&package, fence_hold).await;
+            asks_the_real_worker_before_each_command(&package, fence_hold.clone()).await;
         }
     }
 }
@@ -2340,11 +2435,11 @@ async fn a_real_package_asks_the_real_worker_before_each_command_and_runs_a_bypa
 const PACKAGE_FENCE_HOLD: Duration = Duration::from_millis(100);
 
 /// What [`a_real_package_asks_the_real_worker_before_each_command_and_runs_a_bypass_as_typed`]
-/// asks of one package, with each published fence kept from the writer for `fence_hold`.
+/// asks of one package, with each published fence kept from the writer as `fence_hold` says.
 #[cfg(unix)]
 async fn asks_the_real_worker_before_each_command(
     package: &kr_shell_integration::host::package::ShellPackage,
-    fence_hold: Duration,
+    fence_hold: Option<FenceHold>,
 ) {
     for (integrations, bypass) in [
         (Vec::new(), "bypass not_integrated"),
@@ -2365,7 +2460,7 @@ async fn asks_the_real_worker_before_each_command(
                 ..kr_protocol::session::LaunchProfile::default()
             },
             probes.variables(),
-            fence_hold,
+            fence_hold.clone(),
         )
         .await;
         let mut keys = shell.keys();
@@ -2486,7 +2581,7 @@ async fn asks_the_real_worker_before_each_command(
             .unwrap_or_else(|_| {
                 panic!(
                     "the held command started and the worker has its block ({:?}, {bypass}, \
-                     each published fence kept from the writer for {fence_hold:?}, attempt \
+                     each published fence kept from the writer: {fence_hold:?}, attempt \
                      {attempt}): {}",
                     package.kind(),
                     probes.trace()
@@ -2504,7 +2599,7 @@ async fn asks_the_real_worker_before_each_command(
                 None if fenced && !answered && attempt < ATTEMPTS => {
                     eprintln!(
                         "the {:?} package's held line was answered after the shell's deadline on \
-                         attempt {attempt} (each published fence kept from the writer for \
+                         attempt {attempt} (each published fence kept from the writer: \
                          {fence_hold:?}), so it is typed again at the next prompt",
                         package.kind()
                     );
@@ -2515,7 +2610,7 @@ async fn asks_the_real_worker_before_each_command(
                 }
                 None => panic!(
                     "the {:?} package started the held command without its line's capability \
-                     ({bypass}, each published fence kept from the writer for {fence_hold:?}, \
+                     ({bypass}, each published fence kept from the writer: {fence_hold:?}, \
                      attempt {attempt}, the line {} through the fence and the shell {} its \
                      answer): {}",
                     package.kind(),

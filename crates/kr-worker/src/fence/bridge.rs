@@ -49,16 +49,14 @@ impl BridgeServer {
         }
     }
 
-    /// Keeps each published fence from its connection's writer for `hold`, for this host's own
+    /// Keeps each published fence from its connection's writer as `hold` says, for this host's own
     /// tests.
     ///
-    /// A writer that is slow to put a fence on the socket is what a loaded machine produces now and
-    /// then, and this is how a test produces it every time. A build without the `testing` feature
-    /// has neither this method nor the wait it asks for.
+    /// A build without the `testing` feature has neither this method nor the wait it asks for.
     #[cfg(feature = "testing")]
     #[must_use]
-    pub const fn holding_fences(mut self, hold: std::time::Duration) -> Self {
-        self.holds.fence = hold;
+    pub fn holding_fences(mut self, hold: FenceHold) -> Self {
+        self.holds.fence = Some(hold);
         self
     }
 
@@ -139,7 +137,7 @@ impl BridgeServer {
                 writer,
                 receiving,
                 Arc::clone(&self.runtime),
-                self.holds,
+                self.holds.clone(),
             ));
             self.pump(&mut reader, &mut writing).await;
             // The connection has ended. The driver stops queueing for it and the session hears that
@@ -244,26 +242,68 @@ impl BridgeServer {
 ///
 /// Empty in a build without the `testing` feature: there is nothing in it to set and nothing that
 /// waits on it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Holds {
-    /// How long each published fence waits before it is written.
+    /// What each published fence waits for before it is written.
     #[cfg(feature = "testing")]
-    fence: std::time::Duration,
+    fence: Option<FenceHold>,
 }
 
 impl Holds {
     /// Nothing kept.
     const NONE: Self = Self {
         #[cfg(feature = "testing")]
-        fence: std::time::Duration::ZERO,
+        fence: None,
     };
 
-    /// Waits for as long as a test asked before a published fence is written.
+    /// Waits for what a test asked before a published fence is written.
     #[cfg(feature = "testing")]
-    async fn before_fence(self) {
-        if !self.fence.is_zero() {
-            tokio::time::sleep(self.fence).await;
+    async fn before_fence(&self) {
+        match &self.fence {
+            None => {}
+            Some(FenceHold::For(hold)) => tokio::time::sleep(*hold).await,
+            Some(FenceHold::Gate(gate)) => {
+                let _ = gate.0.subscribe().wait_for(|closed| !*closed).await;
+            }
         }
+    }
+}
+
+/// What a bridge server keeps each published fence waiting for before its writer writes it, for
+/// this host's own tests.
+///
+/// A writer that is slow to put a fence on the socket is what a loaded machine produces now and
+/// then, and this is how a test produces it every time.
+#[cfg(feature = "testing")]
+#[derive(Clone, Debug)]
+pub enum FenceHold {
+    /// Each fence waits this long.
+    For(std::time::Duration),
+    /// Each fence waits while the gate is closed, so the test decides when it is written.
+    Gate(FenceGate),
+}
+
+/// A gate a test opens and closes on published fences, for this host's own tests.
+#[cfg(feature = "testing")]
+#[derive(Clone, Debug)]
+pub struct FenceGate(Arc<tokio::sync::watch::Sender<bool>>);
+
+#[cfg(feature = "testing")]
+impl FenceGate {
+    /// Returns a gate that starts closed.
+    #[must_use]
+    pub fn closed() -> Self {
+        Self(Arc::new(tokio::sync::watch::Sender::new(true)))
+    }
+
+    /// Lets every fence that is waiting, and every later one, be written.
+    pub fn open(&self) {
+        self.0.send_replace(false);
+    }
+
+    /// Keeps the next fence the writer comes to waiting.
+    pub fn close(&self) {
+        self.0.send_replace(true);
     }
 }
 
