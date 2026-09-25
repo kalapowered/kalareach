@@ -333,8 +333,8 @@ pub fn clear_recorded_session(environment: &EnvironmentPaths) -> Result<()> {
 #[cfg(windows)]
 pub use self::windows::{
     ChildCommand, ChildRefusal, LaunchListener, LaunchStream, MAX_LAUNCH_FRAME, PeerProcess,
-    Reached, StartedChild, account_sid, connect, current_session, current_user_sid, process_facts,
-    start_child,
+    Reached, StartedChild, account_sid, connect, current_session, current_user_sid, in_any_job,
+    process_facts, start_child,
 };
 
 #[cfg(all(windows, any(test, feature = "testing")))]
@@ -770,6 +770,29 @@ mod windows {
             session: token.session()?,
             same_user: token.same_user_as(&own)?,
         })
+    }
+
+    /// Whether process `pid` runs inside any job.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's error when the process cannot be opened or asked.
+    pub fn in_any_job(pid: u32) -> io::Result<bool> {
+        let process = open_process(pid)?;
+        let mut in_job: windows_sys::core::BOOL = 0;
+        // SAFETY: the process is open with a right this call accepts, a null job asks about any
+        // job, and `in_job` is a live out parameter.
+        let asked = unsafe {
+            IsProcessInJob(
+                process.as_raw_handle(),
+                std::ptr::null_mut(),
+                &raw mut in_job,
+            )
+        };
+        if asked == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(in_job != 0)
     }
 
     /// Returns the login session this process runs in.

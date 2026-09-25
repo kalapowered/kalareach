@@ -155,6 +155,19 @@ impl HostPaths {
         })
     }
 
+    /// Reads this installation's environment identity, when it has one, without allocating one.
+    ///
+    /// For a process that serves an environment it did not create, such as the starter the
+    /// environment's scheduled task runs: an installation with no identity has nothing for it to
+    /// serve, and making one would be making an installation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file exists and cannot be read, or does not hold an identity.
+    pub fn recorded_environment_id(&self) -> Result<Option<EnvironmentId>> {
+        read_environment_id(&self.environment_id_file())
+    }
+
     /// Returns the directories one environment uses.
     #[must_use]
     pub fn environment(&self, environment_id: EnvironmentId) -> EnvironmentPaths {
