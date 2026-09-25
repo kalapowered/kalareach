@@ -2030,6 +2030,11 @@ mod windows {
                 assert!(!access.records_nothing_set_here(), "{what}");
                 assert_ne!(access, control, "{what}");
             }
+            assert_ne!(
+                changed(&|access| access.discretionary = None),
+                changed(&|access| list(access).entries.clear()),
+                "no list is not an empty one"
+            );
 
             // Written the older way, neither list says which of its entries it inherited.
             let older = changed(&|access| {
@@ -3122,7 +3127,8 @@ mod tests {
     }
 
     /// Entries are read in their order and with their rights, a generic right as the file rights
-    /// it stands for, and a file with no list apart from one with an empty list.
+    /// it stands for; a file with no list reads as one, and one whose list is empty cannot be
+    /// read at all.
     #[cfg(windows)]
     #[test]
     fn order_rights_and_an_absent_list_are_read_as_they_are() {
@@ -3153,9 +3159,20 @@ mod tests {
             "a generic right reads as the rights it stands for"
         );
         let absent = access(&directory.described("no-list", "D:NO_ACCESS_CONTROL"));
-        let empty = access(&directory.described("empty-list", "D:P"));
-        assert_ne!(absent, empty, "no list is not an empty one");
-        assert!(!absent.records_nothing_set_here() && !empty.records_nothing_set_here());
+        assert_ne!(
+            absent, all,
+            "no list is not read as one that grants everything"
+        );
+        assert!(!absent.records_nothing_set_here());
+        // An empty list grants nothing, not even the synchronisation every open of a file asks
+        // for, so its owner cannot open it to read its descriptor: a read that failed, never a
+        // file read as having no list.
+        let empty = FileAccess::of(&directory.described("empty-list", "D:P"))
+            .expect_err("a file whose list grants nothing cannot be opened");
+        assert!(
+            matches!(empty, AccessListRefusal::Unreadable(_)),
+            "{empty:?}"
+        );
     }
 
     /// A mandatory label is read with its policy: one that forbids reading up is another access
