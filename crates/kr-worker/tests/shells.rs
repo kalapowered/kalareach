@@ -7,10 +7,13 @@
 //! the session, and the shell's own `exit` ends the session with the shell's own status.
 //!
 //! A shell is the first of its name on this test's own `PATH`, and otherwise in the standard
-//! install directories, and the test prints which one it ran. A shell this machine does not have
-//! is reported in the test's output rather than tested. A machine that must have a shell says so
-//! in `KR_REQUIRE_SHELLS` (for example `bash,zsh,fish`), and a missing shell it names is a
-//! failure.
+//! install directories, and the test prints which one it ran. Every Linux and macOS host has Bash,
+//! so its case runs everywhere. macOS ships Zsh and the macOS workstation and continuous
+//! integration's macOS job have Fish, so both of those cases run on macOS too. A Linux host has
+//! either one only where it was installed, so on Linux an ordinary run leaves those two cases out,
+//! and a run that has the shell on this test's `PATH` runs them with `--ignored`: the build box
+//! does, with the bin directories of the Zsh and Fish packages it built put first. A case that
+//! runs on a host without its shell fails and says so.
 //!
 //! Everything the shells touch is on the internal disk: each one's home directory is inside the
 //! test's own temporary host, which is where any history a shell writes goes.
@@ -46,27 +49,19 @@ fn installed(name: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-/// Returns true when this machine must have the named shell.
-fn required(name: &str) -> bool {
-    std::env::var("KR_REQUIRE_SHELLS")
-        .is_ok_and(|names| names.split(',').any(|required| required.trim() == name))
-}
-
 /// Runs one shell as a session's root and drives it.
 ///
 /// `arguments` start it interactively with none of the user's startup files. `probe` is a command
 /// in that shell's own syntax which prints `kr-interactive` when the shell knows it is interactive
 /// and `kr-terminal` when its standard input is a terminal.
 async fn drive(name: &str, arguments: &[&str], probe: &str) {
-    let Some(program) = installed(name) else {
-        assert!(
-            !required(name),
-            "{name} is required on this machine and is on neither this test's PATH nor any of \
-             {LOCATIONS:?}"
-        );
-        eprintln!("skipped: {name} is on neither this test's PATH nor any of {LOCATIONS:?}");
-        return;
-    };
+    let program = installed(name).unwrap_or_else(|| {
+        panic!(
+            "{name} is on neither this test's PATH nor any of {LOCATIONS:?}, so this check cannot \
+             run here; install it, or put the bin directory of a built {name} package first on \
+             PATH"
+        )
+    });
     eprintln!("{name}: {}", program.display());
     let host = kr_ipc::testing::TempHost::create();
     let home = host.root().join("home");
@@ -208,6 +203,10 @@ async fn bash_runs_interactively_on_the_unix_pseudo_terminal() {
 /// `portable-pty` Unix pseudo-terminal, runs what is typed at it, and ends the session with its
 /// own exit status.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "needs Zsh, which a Linux host has only where it was installed; it runs on macOS, which ships it, and with --ignored where Zsh is on this test's PATH, as on the build box with its built Zsh package"
+)]
 async fn zsh_runs_interactively_on_the_unix_pseudo_terminal() {
     drive(
         "zsh",
@@ -221,6 +220,10 @@ async fn zsh_runs_interactively_on_the_unix_pseudo_terminal() {
 /// `portable-pty` Unix pseudo-terminal, runs what is typed at it, and ends the session with its
 /// own exit status.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "needs Fish, which a Linux host has only where it was installed; it runs on macOS, where the workstation and continuous integration's macOS job install it, and with --ignored where Fish is on this test's PATH, as on the build box"
+)]
 async fn fish_runs_interactively_on_the_unix_pseudo_terminal() {
     drive(
         "fish",
