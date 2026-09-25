@@ -132,7 +132,9 @@ def check_macho(data, architecture):
     found = []
     for offset, length in slices:
         found.append(read_macho_slice(data[offset : offset + length]))
-    wrong = [minimum for arch, minimum in found if arch == architecture and minimum != MACOS_MINIMUM]
+    # Every image is held to the baseline, not only the one for this target: a universal file is
+    # one download, and each of its images has to start on the baseline.
+    wrong = [minimum for _, minimum in found if minimum != MACOS_MINIMUM]
     carried = [arch for arch, _ in found]
     described = ", ".join("{} for macOS {}".format(arch, dotted(minimum)) for arch, minimum in found)
     if architecture not in carried:
