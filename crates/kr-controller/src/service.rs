@@ -54,7 +54,7 @@ use kr_transport::window::{AcceptedDeadline, ActionWindowIssuer, MAX_WINDOW_VALI
 use tokio::sync::{Mutex, oneshot};
 
 use crate::desktop::power::{self, Demand, Inhibitor};
-use crate::directory::{Directory, Ending, KnownWorker, Reconnect};
+use crate::directory::{Directory, KnownWorker, Reconnect};
 use crate::error::{ControllerError, Result};
 use crate::registry::{LaunchPhase, Registry, WorkerRecord};
 use crate::singleton::SingletonLock;
@@ -1269,14 +1269,20 @@ impl Controller {
     async fn recover_claim(&self, reservation: &crate::registry::Reservation) -> Result<()> {
         let endpoint = self.paths.worker_endpoint(reservation.display_number)?;
         if let Some(key) = reservation.claimed_key
-            && let Ok(proof) = self
+            && let Ok((proof, described)) = self
                 .challenge(&endpoint, &key, reservation.session_id)
                 .await
         {
             // The worker is alive and is the one this reservation admitted. Its descriptor and its
             // registry row are rebuilt from its own signed answer.
-            self.adopt(reservation.display_number, &key, &proof, &endpoint)
-                .await?;
+            self.adopt(
+                reservation.display_number,
+                &key,
+                &proof,
+                &endpoint,
+                described,
+            )
+            .await?;
             let mut registry = self.registry.lock().await;
             registry.resolve_claim(reservation.reservation_id, LaunchPhase::Live)?;
             return Ok(());
@@ -1452,9 +1458,15 @@ impl Controller {
                 .challenge(&endpoint, &row.public_key, row.session_id)
                 .await
             {
-                Ok(proof) => {
-                    self.adopt(row.display_number, &row.public_key, &proof, &endpoint)
-                        .await?;
+                Ok((proof, described)) => {
+                    self.adopt(
+                        row.display_number,
+                        &row.public_key,
+                        &proof,
+                        &endpoint,
+                        described,
+                    )
+                    .await?;
                 }
                 // A worker that does not answer is not necessarily gone. Reconciliation asks the
                 // kernel; only a confirmed death produces a closure record.
@@ -1466,13 +1478,14 @@ impl Controller {
         Ok(())
     }
 
-    /// Challenges a worker against a key this daemon already holds, and presents its generation.
+    /// Challenges a worker against a key this daemon already holds, presents its generation, and
+    /// asks the worker to describe its session ([`crate::directory::describe`]).
     async fn challenge(
         &self,
         endpoint: &Endpoint,
         worker_public_key: &kr_protocol::scalars::AuthorisationKey,
         session_id: SessionId,
-    ) -> Result<kr_protocol::worker::WorkerVerifyProof> {
+    ) -> Result<(kr_protocol::worker::WorkerVerifyProof, SessionSummary)> {
         let identity = &self.identity;
         let generation = self.generation;
         let boot = self.boot_identity.clone();
@@ -1496,21 +1509,28 @@ impl Controller {
                         .map_err(kr_ipc::IpcError::from)
                 })
                 .await?;
-            Ok::<_, ControllerError>(proof)
+            let described = crate::directory::describe(&mut client, session_id)
+                .await
+                .map_err(ControllerError::supervision)?;
+            Ok::<_, ControllerError>((proof, described))
         })
         .await
         .map_err(|_| {
-            ControllerError::supervision("the worker did not answer its challenge in time")
+            ControllerError::supervision(
+                "the worker did not prove itself and describe its session in time",
+            )
         })?
     }
 
-    /// Records a recovered worker and republishes its descriptor.
+    /// Records a recovered worker and republishes its descriptor, and admits the worker with the
+    /// description of its session it gave when it was challenged.
     async fn adopt(
         &self,
         display_number: kr_protocol::session::DisplayNumber,
         worker_public_key: &kr_protocol::scalars::AuthorisationKey,
         proof: &kr_protocol::worker::WorkerVerifyProof,
         endpoint: &Endpoint,
+        described: SessionSummary,
     ) -> Result<()> {
         let record = WorkerRecord {
             session_id: proof.session_id,
@@ -1542,10 +1562,13 @@ impl Controller {
             published_at_ms: kr_ipc::now_ms(),
         };
         kr_ipc::descriptor::publish(&self.paths, &descriptor)?;
-        self.add_worker(KnownWorker {
-            descriptor,
-            endpoint: endpoint.clone(),
-        })
+        self.add_worker(
+            KnownWorker {
+                descriptor,
+                endpoint: endpoint.clone(),
+            },
+            Some(described),
+        )
         .await;
         Ok(())
     }
@@ -3596,9 +3619,13 @@ impl Controller {
         Arc::new(AttentionReach(self.me.clone()))
     }
 
-    /// Adds a verified worker to the directory and starts reading its attention sources.
-    async fn add_worker(&self, worker: KnownWorker) {
-        self.directory.lock().await.insert(worker.clone());
+    /// Adds a verified worker to the directory, with its own description of its session where
+    /// this daemon has one (`Directory::insert`), and starts reading its attention sources.
+    async fn add_worker(&self, worker: KnownWorker, described: Option<SessionSummary>) {
+        self.directory
+            .lock()
+            .await
+            .insert(worker.clone(), described);
         self.attention.watch(self.attention_reach(), worker);
     }
 
@@ -3944,10 +3971,14 @@ impl Controller {
         };
         kr_ipc::descriptor::publish(&self.paths, &descriptor)?;
         let endpoint = Endpoint::from_path(&ready.endpoint)?;
-        self.add_worker(KnownWorker {
-            descriptor,
-            endpoint,
-        })
+        // No description yet: the create waiting on this report asks the worker for one at once.
+        self.add_worker(
+            KnownWorker {
+                descriptor,
+                endpoint,
+            },
+            None,
+        )
         .await;
         Ok(())
     }
@@ -7921,9 +7952,7 @@ impl Controller {
                         let ending = self.directory.lock().await.ending(session_id);
                         let recorded = self.registry.lock().await.closure(session_id);
                         match (recorded, ending) {
-                            (Ok(None), Some(ending)) => {
-                                self.ending_read(ending).await.ok().map(|read| read.session)
-                            }
+                            (Ok(None), Some(read)) => Some(read.session),
                             _ => None,
                         }
                     } else {
@@ -8001,7 +8030,7 @@ impl Controller {
                         let recorded = self.registry.lock().await.closure(params.session_id)?;
                         if recorded.is_none() {
                             return match ending {
-                                Some(ending) => encode(&self.ending_read(ending).await?),
+                                Some(read) => encode(&read),
                                 None => Err(error),
                             };
                         }
@@ -9232,36 +9261,6 @@ impl Controller {
         )
     }
 
-    /// Answers a read of a session whose worker has stopped answering while its end is under way
-    /// (`Directory::ending`).
-    ///
-    /// A session its worker described is answered as described. One whose worker accepted a close
-    /// before describing the session to this daemon is described from what this daemon holds of
-    /// it ([`accepted_summary`]).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the registry cannot be read.
-    async fn ending_read(&self, ending: Ending) -> Result<SessionReadResult> {
-        match ending {
-            Ending::Described(read) => Ok(*read),
-            Ending::Accepted(worker) => {
-                let reservation = self
-                    .registry
-                    .lock()
-                    .await
-                    .reservation_for_session(worker.descriptor.session_id)?;
-                Ok(SessionReadResult {
-                    session: accepted_summary(&worker.descriptor, reservation.as_ref()),
-                    endpoint: Nullable::null(),
-                    launch_profile: Nullable::null(),
-                    last_command_block: Nullable::null(),
-                    outstanding_launches: Nullable::null(),
-                })
-            }
-        }
-    }
-
     /// Records a closure from outside this daemon's own bookkeeping, unless one is already
     /// recorded, and looks at the sleep setting afterwards.
     ///
@@ -9507,7 +9506,7 @@ impl Controller {
         self.directory
             .lock()
             .await
-            .heard(worker.descriptor.session_id, &read);
+            .heard(worker.descriptor.session_id, &read.session);
         drop(held);
         Ok(read)
     }
@@ -9766,7 +9765,7 @@ fn qualified_package(root: Option<&Path>, requested: Option<&str>) -> Result<Pat
 /// # Errors
 ///
 /// Returns the decoding failure when the answer is neither shape.
-fn reported_read(value: &ParamsValue) -> std::result::Result<SessionReadResult, String> {
+pub(crate) fn reported_read(value: &ParamsValue) -> std::result::Result<SessionReadResult, String> {
     match value.to_typed::<SessionReadResult>() {
         Ok(read) => Ok(read),
         // The older shape is checked against its own schema before it is decoded, like any
@@ -9910,54 +9909,6 @@ fn closed_summary(
         application_state: Nullable::null(),
         root_process: Nullable::null(),
         closure: Nullable::some(closure.clone()),
-    }
-}
-
-/// Describes a closing session from what this daemon holds of it, for a worker that accepted a
-/// close before it described the session to this daemon.
-///
-/// The descriptor this daemon verified says which session it is, and the create this daemon
-/// recorded says what was asked for: the shell mode, the execution context, the directory and the
-/// size it was to start in, and when it was asked for. What neither says is left as a closure with
-/// nothing surviving leaves it ([`closed_summary`]) rather than guessed: no executable, no desktop,
-/// no attachment, no application state and no root process.
-fn accepted_summary(
-    descriptor: &kr_protocol::worker::WorkerDescriptor,
-    reservation: Option<&crate::registry::Reservation>,
-) -> SessionSummary {
-    let requested = reservation
-        .and_then(|reservation| reservation.create_intent.as_deref())
-        .and_then(|recorded| recorded_create(recorded).ok());
-    SessionSummary {
-        session_id: descriptor.session_id,
-        session_epoch: descriptor.session_epoch,
-        environment_id: descriptor.environment_id,
-        display_number: descriptor.display_number,
-        state: SessionState::Closing,
-        shell_mode: requested
-            .as_ref()
-            .map_or(kr_protocol::session::ShellMode::NativeCompat, |create| {
-                create.shell_mode
-            }),
-        shell_path: String::new(),
-        cwd: requested
-            .as_ref()
-            .and_then(|create| create.cwd.0.clone())
-            .unwrap_or_default(),
-        worker_profile: requested
-            .as_ref()
-            .map_or(descriptor.worker_profile, |create| create.worker_profile),
-        desktop: kr_protocol::identity::DesktopBinding::none(),
-        created_at_ms: reservation.map_or(descriptor.published_at_ms, |reservation| {
-            reservation.created_at_ms
-        }),
-        dimensions: requested
-            .and_then(|create| create.dimensions.0)
-            .unwrap_or(kr_protocol::session::INVISIBLE_DEFAULT_DIMENSIONS),
-        attachment_count: U64::ZERO,
-        application_state: Nullable::null(),
-        root_process: Nullable::null(),
-        closure: Nullable::null(),
     }
 }
 
@@ -12557,7 +12508,6 @@ mod a_close_a_worker_never_answers {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use kr_crypto::store::MemoryStore;
     use kr_ipc::endpoint::Listener;
     use kr_ipc::framed::split;
     use kr_ipc::verify::WorkerIdentity;
@@ -12860,20 +12810,21 @@ mod a_close_a_worker_never_answers {
         .await
     }
 
-    /// A daemon with one fake worker in its directory, served by `serve` on the worker's own
-    /// endpoint, and everything a close needs.
-    pub(super) async fn fake_world(
-        serve: impl FnOnce(Listener, Arc<WorkerIdentity>, String) -> tokio::task::JoinHandle<()>,
-    ) -> Silent {
-        let temp = kr_ipc::testing::TempHost::create();
+    /// What a fake world's daemon is started with. The daemon's identity is kept in the
+    /// environment's own secret store, so a daemon started again on the same environment is the
+    /// same controller.
+    pub(super) fn setup(temp: &kr_ipc::testing::TempHost) -> ControllerSetup {
         let environment = temp.environment();
         let environment_id = temp.environment_id();
-        let controller = Controller::start(ControllerSetup {
-            paths: environment.clone(),
+        let secrets = environment.secrets_dir();
+        ControllerSetup {
+            paths: environment,
             environment_id,
             identity: Box::new(move || {
+                let store = kr_crypto::store::open_store_in(&secrets)
+                    .expect("a secret store for the test environment");
                 Ok(kr_ipc::verify::ControllerIdentity::open(
-                    &MemoryStore::new(),
+                    store.store.as_ref(),
                     environment_id,
                     false,
                 )
@@ -12887,9 +12838,21 @@ mod a_close_a_worker_never_answers {
             release: "0".to_owned(),
             shell_packages: None,
             terminal: Box::new(crate::supervision::NoTerminal),
-        })
-        .await
-        .expect("the daemon starts");
+        }
+    }
+
+    /// A daemon with one fake worker in its directory, served by `serve` on the worker's own
+    /// endpoint, and everything a close needs. The worker is admitted as a worker that has just
+    /// reported itself is, with no description of its session yet.
+    pub(super) async fn fake_world(
+        serve: impl FnOnce(Listener, Arc<WorkerIdentity>, String) -> tokio::task::JoinHandle<()>,
+    ) -> Silent {
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = temp.environment();
+        let environment_id = temp.environment_id();
+        let controller = Controller::start(setup(&temp))
+            .await
+            .expect("the daemon starts");
 
         let session_id = SessionId::new(kr_ipc::new_uuid());
         let worker_endpoint = environment
@@ -12929,8 +12892,7 @@ mod a_close_a_worker_never_answers {
             .directory
             .lock()
             .await
-            .verified
-            .insert(session_id, worker.clone());
+            .insert(worker.clone(), None);
 
         let actor = crate::service::local_actor(
             kr_protocol::ids::ActorId::new("local:test").expect("a principal"),
@@ -13203,6 +13165,7 @@ mod a_read_that_meets_a_worker_on_its_way_out {
 
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use kr_ipc::endpoint::Listener;
     use kr_ipc::framed::split;
@@ -13210,22 +13173,21 @@ mod a_read_that_meets_a_worker_on_its_way_out {
     use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Response};
     use kr_protocol::error::ErrorCode;
     use kr_protocol::frame::StreamKind;
-    use kr_protocol::identity::DesktopBinding;
     use kr_protocol::identity::WorkerProfile;
     use kr_protocol::ids::{AuthorityRevision, ConnectionId, RequestId, SessionEpoch, SessionId};
     use kr_protocol::method::Method;
     use kr_protocol::root::{CwdRevision, PromptGeneration, RootCommandBlockParams};
-    use kr_protocol::scalars::{Nullable, TimestampMs, U64};
+    use kr_protocol::scalars::{Nullable, U64};
     use kr_protocol::session::{
-        ClosureReason, ClosureRecord, Dimensions, DisplayNumber, Durability,
-        INVISIBLE_DEFAULT_DIMENSIONS, OwnershipCoverage, Presentation, SessionCloseResult,
-        SessionCreateParams, SessionListParams, SessionListResult, SessionReadParams,
-        SessionReadResult, SessionState, SessionSummary, ShellMode,
+        ClosureReason, ClosureRecord, Dimensions, Durability, INVISIBLE_DEFAULT_DIMENSIONS,
+        OwnershipCoverage, SessionCloseResult, SessionListParams, SessionListResult,
+        SessionReadParams, SessionReadResult, SessionState, SessionSummary,
     };
     use tokio::sync::{Notify, oneshot};
 
     use super::a_close_a_worker_never_answers::{self as fake, Silent};
     use crate::registry::WorkerRecord;
+    use crate::service::Controller;
 
     /// A worker whose session a test moves along, and which goes when the test says so.
     ///
@@ -13237,6 +13199,8 @@ mod a_read_that_meets_a_worker_on_its_way_out {
     struct Scripted {
         /// The state its session is in.
         state: std::sync::Mutex<SessionState>,
+        /// Its session's size.
+        dimensions: std::sync::Mutex<Dimensions>,
         /// How many reads have reached it.
         reads: AtomicUsize,
         /// The read it goes at, once a test has set one.
@@ -13260,6 +13224,7 @@ mod a_read_that_meets_a_worker_on_its_way_out {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 state: std::sync::Mutex::new(SessionState::Live),
+                dimensions: std::sync::Mutex::new(INVISIBLE_DEFAULT_DIMENSIONS),
                 reads: AtomicUsize::new(0),
                 end: std::sync::Mutex::new(None),
                 going: Notify::new(),
@@ -13273,6 +13238,19 @@ mod a_read_that_meets_a_worker_on_its_way_out {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = state;
+        }
+
+        /// Resizes the session, as an attachment's window does.
+        fn resize(&self, dimensions: Dimensions) {
+            *self
+                .dimensions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = dimensions;
+        }
+
+        /// How many reads have reached this worker.
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::Acquire)
         }
 
         /// The state the session is in.
@@ -13302,6 +13280,10 @@ mod a_read_that_meets_a_worker_on_its_way_out {
         fn answer(&self, session_id: SessionId) -> SessionReadResult {
             let mut read = fake::read_result(session_id);
             read.session.state = self.state();
+            read.session.dimensions = *self
+                .dimensions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if read.session.state == SessionState::Closed {
                 read.session.closure = Nullable::some(closure_of(session_id));
             }
@@ -13457,6 +13439,61 @@ mod a_read_that_meets_a_worker_on_its_way_out {
         world
     }
 
+    /// The same world after its daemon was replaced: the one before it has let go of the
+    /// environment, and another has started on it and found the scripted worker still running, the
+    /// way a daemon that starts finds its workers, by the descriptor, the registry's row and a
+    /// challenge.
+    async fn restarted(world: Silent) -> Silent {
+        let Silent {
+            _temp,
+            controller,
+            environment_id,
+            session_id,
+            worker,
+            serving,
+            ..
+        } = world;
+        kr_ipc::descriptor::publish(&_temp.environment(), &worker.descriptor)
+            .expect("publishes the worker's descriptor");
+        drop(controller);
+        let started = std::time::Instant::now();
+        let controller = loop {
+            match Controller::start(fake::setup(&_temp)).await {
+                Ok(controller) => break controller,
+                Err(crate::error::ControllerError::AlreadyRunning { .. })
+                    if started.elapsed() < Duration::from_secs(60) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("the daemon does not start again: {error}"),
+            }
+        };
+        fake::acknowledged(&controller, session_id);
+        let actor = crate::service::local_actor(
+            kr_protocol::ids::ActorId::new("local:test").expect("a principal"),
+            ConnectionId::new(kr_ipc::new_uuid()),
+            controller.generation,
+        );
+        let accepted = kr_transport::window::AcceptedDeadline {
+            deadline: controller
+                .clock
+                .now()
+                .checked_add(Duration::from_secs(300))
+                .expect("a deadline five minutes out"),
+            bound: kr_transport::window::DeadlineBound::RequestedTtl,
+        };
+        Silent {
+            _temp,
+            controller,
+            environment_id,
+            session_id,
+            worker,
+            actor,
+            accepted,
+            serving,
+        }
+    }
+
     /// Reads the session through the daemon, as a client's `session.read` does.
     async fn read(world: &Silent) -> crate::error::Result<SessionReadResult> {
         world
@@ -13580,117 +13617,72 @@ mod a_read_that_meets_a_worker_on_its_way_out {
         world.serving.abort();
     }
 
-    /// A worker that accepts a close before it has described its session to this daemon, as after
-    /// a start that found it running, leaves the session closing all the same: a read that meets
-    /// its end is answered from what this daemon holds of the session, and nothing is asked of the
-    /// worker at the close, whose link the worker is holding the close on.
-    ///
-    /// The worker here goes at the first read it is sent after the close, whoever sends it.
+    /// A worker a daemon finds when it starts is admitted with its own description of its session,
+    /// asked for over the connection it proved itself on. A close accepted before anything else
+    /// has read the worker therefore still leaves the session described: a read that meets the
+    /// worker's end answers it closing, as the worker described it at the start, including a size
+    /// the session was given while the daemon before this one ran. Nothing is asked of the worker
+    /// at the close, whose link the worker is holding the close on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_read_that_meets_the_end_of_a_worker_never_read_before_its_close_answers_closing() {
+    async fn a_worker_found_at_a_start_is_admitted_with_its_own_description() {
         let script = Scripted::new();
         let world = scripted(&script).await;
+        script.resize(Dimensions::new(100, 30));
+        let world = restarted(world).await;
+        assert_eq!(
+            script.reads(),
+            1,
+            "the start asks the worker to describe its session"
+        );
+
+        // The worker goes at the first read it is sent after the close, whoever sends it.
         let (_arrived, go) = script.end_at_next_read();
         drop(go);
         assert_eq!(close(&world).await.state, SessionState::Closing);
-        assert_eq!(
-            script.reads.load(Ordering::Acquire),
-            0,
-            "the close asks the worker nothing"
-        );
-
+        assert_eq!(script.reads(), 1, "the close asks the worker nothing");
         let answer = read(&world)
             .await
             .expect("a closing session is answered for from this daemon's own record");
-        let descriptor = &world.worker.descriptor;
         assert_eq!(
             answer.session,
             SessionSummary {
-                session_id: descriptor.session_id,
-                session_epoch: descriptor.session_epoch,
-                environment_id: descriptor.environment_id,
-                display_number: descriptor.display_number,
                 state: SessionState::Closing,
-                shell_mode: ShellMode::NativeCompat,
-                shell_path: String::new(),
-                cwd: String::new(),
-                worker_profile: descriptor.worker_profile,
-                desktop: DesktopBinding::none(),
-                created_at_ms: descriptor.published_at_ms,
-                dimensions: INVISIBLE_DEFAULT_DIMENSIONS,
-                attachment_count: U64::ZERO,
-                application_state: Nullable::null(),
-                root_process: Nullable::null(),
-                closure: Nullable::null(),
+                dimensions: Dimensions::new(100, 30),
+                created_at_ms: answer.session.created_at_ms,
+                ..fake::read_result(world.session_id).session
             },
-            "the session this daemon verified, closing, with no create recorded to say more"
+            "the session as its worker described it when this daemon started"
         );
         assert!(answer.endpoint.0.is_none());
         assert!(!recorded(&world).await);
         world.serving.abort();
     }
 
-    /// What this daemon holds of a session whose worker accepted a close before describing it is
-    /// the descriptor it verified and the create it recorded, and the create says what was asked
-    /// for; nothing the create does not say is made up.
-    #[test]
-    fn a_session_described_from_this_daemons_records_says_what_its_create_asked_for() {
-        let session_id = SessionId::new(kr_ipc::new_uuid());
-        let descriptor = kr_protocol::worker::WorkerDescriptor {
-            session_id,
-            session_epoch: SessionEpoch::V1,
-            environment_id: kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()),
-            display_number: DisplayNumber::new(7),
-            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-            process_start_identity: kr_ipc::identity::process_start_identity(std::process::id())
-                .expect("this process's start identity"),
-            protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
-            endpoint: "/tmp/kr-worker-7".to_owned(),
-            worker_public_key: kr_protocol::scalars::AuthorisationKey::from_bytes([7; 32]),
-            worker_profile: WorkerProfile::HeadlessUser,
-            published_at_ms: TimestampMs::new(2_000),
-        };
-        let create = SessionCreateParams {
-            environment_id: descriptor.environment_id,
-            presentation: Presentation::Invisible,
-            shell: Nullable::some("/bin/zsh".to_owned()),
-            shell_mode: ShellMode::Managed,
-            cwd: Nullable::some("/work".to_owned()),
-            dimensions: Nullable::some(Dimensions::new(132, 40)),
-            worker_profile: WorkerProfile::DesktopBound,
-            palette: Nullable::null(),
-            environment_snapshot: Vec::new(),
-            launch_profile: kr_protocol::session::LaunchProfile::default(),
-            terminal: Nullable::null(),
-        };
-        let reservation = crate::registry::Reservation {
-            reservation_id: kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid()),
-            actor_id: kr_protocol::ids::ActorId::new("local:test").expect("a principal"),
-            create_token: kr_ipc::new_uuid(),
-            payload_digest: kr_protocol::scalars::Digest256::from_bytes([1; 32]),
-            create_intent: Some(kr_cbor::to_canonical_vec(&create).expect("encodes")),
-            session_id,
-            display_number: descriptor.display_number,
-            phase: crate::registry::LaunchPhase::Live,
-            launcher_identity: None,
-            claimed_key: None,
-            created_at_ms: TimestampMs::new(1_000),
-        };
-
-        let described = super::accepted_summary(&descriptor, Some(&reservation));
-        assert_eq!(described.state, SessionState::Closing);
-        assert_eq!(described.shell_mode, ShellMode::Managed);
-        assert_eq!(described.worker_profile, WorkerProfile::DesktopBound);
-        assert_eq!(described.cwd, "/work");
-        assert_eq!(described.dimensions, Dimensions::new(132, 40));
-        assert_eq!(described.created_at_ms, TimestampMs::new(1_000));
-        assert_eq!(
-            described.shell_path, "",
-            "the executable a managed create launched is the worker's to say"
+    /// A worker that proves itself when a daemon starts but does not describe its session is not
+    /// admitted: it is left for the next look, as a worker that fails its challenge is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_worker_that_does_not_describe_its_session_at_a_start_is_not_admitted() {
+        let script = Scripted::new();
+        let world = scripted(&script).await;
+        // The worker goes at the read the start sends it, once it has proved itself.
+        let (_arrived, go) = script.end_at_next_read();
+        drop(go);
+        let world = restarted(world).await;
+        assert_eq!(script.reads(), 1);
+        let directory = world.controller.directory.lock().await;
+        assert!(
+            directory.get(world.session_id).is_none(),
+            "a worker this daemon has no description from is not in its directory"
         );
-        assert_eq!(described.desktop, DesktopBinding::none());
-        assert_eq!(described.attachment_count, U64::ZERO);
-        assert!(described.root_process.0.is_none() && described.closure.0.is_none());
+        assert!(
+            directory
+                .quarantined
+                .iter()
+                .any(|quarantined| quarantined.session_id == world.session_id),
+            "it is left out as a worker that did not answer is"
+        );
+        drop(directory);
+        world.serving.abort();
     }
 
     /// A session that began closing on its own is answered for the same way: its worker said it
@@ -13830,6 +13822,14 @@ mod a_read_that_meets_a_worker_on_its_way_out {
     async fn a_list_that_meets_the_end_of_a_worker_whose_close_was_accepted_lists_it_closing() {
         let script = Scripted::new();
         let world = scripted(&script).await;
+        assert_eq!(
+            read(&world)
+                .await
+                .expect("the worker answers")
+                .session
+                .state,
+            SessionState::Live
+        );
         assert_eq!(close(&world).await.state, SessionState::Closing);
 
         let (_arrived, go) = script.end_at_next_read();
