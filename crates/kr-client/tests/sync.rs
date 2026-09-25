@@ -6468,16 +6468,34 @@ async fn an_empty_collection_read_after_privacy_mode_moved_on_writes_nothing() {
     // privacy mode fenced that generation.
     client.resume(4).expect("resumed");
     service.hold_the_next_fetch().await;
-    let (published, ()) = tokio::join!(
+    let where_it_stands = || {
+        (
+            client
+                .store()
+                .basis(object_id)
+                .expect("a history")
+                .recovery(),
+            client.store().checkpoint(object_id).expect("a note"),
+        )
+    };
+    let (published, settled) = tokio::join!(
         client.publish(object_id, TimestampMs::new(NOW + 3)),
         async {
-            // The exchange first, then the fetch that follows its refusal.
+            // The exchange first, then the fetch that follows its refusal. By the time the fetch is
+            // out, the refusal has settled under the generation in force.
             service.wait_for_a_publication().await;
             service.let_it_go();
             service.wait_for_a_publication().await;
+            let settled = where_it_stands();
             client.fence(5).expect("privacy mode is on");
             service.let_it_go();
+            settled
         }
+    );
+    assert_eq!(
+        settled,
+        (Some(restored), None),
+        "the refusal was followed into the history it was answered in, and the note went"
     );
     assert_eq!(
         published.expect("an answer"),
@@ -6485,6 +6503,11 @@ async fn an_empty_collection_read_after_privacy_mode_moved_on_writes_nothing() {
             produced_under: 4,
             current: 5
         }
+    );
+    assert_eq!(
+        where_it_stands(),
+        settled,
+        "the absence that arrived after the fence wrote nothing"
     );
     assert!(
         client
