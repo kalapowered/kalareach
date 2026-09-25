@@ -271,9 +271,9 @@ pub struct Session {
     /// The runtime marks it for the input this session accepts and the output it produces, and the
     /// session itself for a command the shell's integration reports starting.
     activity: Arc<crate::lifecycle::Activity>,
-    /// How many times the terminal's foreground has been read, for this host's own tests.
+    /// When the terminal's foreground has been read, for this host's own tests.
     #[cfg(feature = "testing")]
-    foreground_reads: std::sync::atomic::AtomicUsize,
+    foreground_reads: std::sync::Mutex<Vec<std::time::Instant>>,
     /// The session's live agent instances, and how many announcements it has made about them.
     agent_instances: AgentInstances,
     /// Why the last interrupt this session tried did not reach the foreground group.
@@ -561,7 +561,7 @@ impl Session {
             answered: Answered::default(),
             activity: crate::lifecycle::Activity::new(),
             #[cfg(feature = "testing")]
-            foreground_reads: std::sync::atomic::AtomicUsize::new(0),
+            foreground_reads: std::sync::Mutex::new(Vec::new()),
             agent_instances: AgentInstances::default(),
             interrupt_failed: None,
             held_input_bytes: 0,
@@ -3164,8 +3164,7 @@ impl Session {
     #[must_use]
     pub fn foreground_group(&self) -> Option<i32> {
         #[cfg(feature = "testing")]
-        self.foreground_reads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.note_foreground_read();
         if !self.state.accepts_input() || self.shell.is_none() {
             return None;
         }
@@ -3181,8 +3180,7 @@ impl Session {
     #[must_use]
     pub fn foreground(&self) -> Option<crate::broker::adoption::Foreground> {
         #[cfg(feature = "testing")]
-        self.foreground_reads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.note_foreground_read();
         if !self.state.accepts_input() {
             return None;
         }
@@ -3200,13 +3198,25 @@ impl Session {
         })
     }
 
-    /// Returns how many times the terminal's foreground has been read, for this host's own tests:
-    /// what a test counts to know whether a session nothing is happening in is being looked at.
+    /// Returns when the terminal's foreground has been read, oldest first, for this host's own
+    /// tests: what a test counts, over a window of its own, to know whether a session nothing is
+    /// happening in is being looked at.
     #[cfg(feature = "testing")]
     #[must_use]
-    pub fn foreground_reads(&self) -> usize {
+    pub fn foreground_reads(&self) -> Vec<std::time::Instant> {
         self.foreground_reads
-            .load(std::sync::atomic::Ordering::Relaxed)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Records a read of the terminal's foreground, for this host's own tests.
+    #[cfg(feature = "testing")]
+    fn note_foreground_read(&self) {
+        self.foreground_reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(std::time::Instant::now());
     }
 
     /// Returns the oldest output cursor this session can still replay.

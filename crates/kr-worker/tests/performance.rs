@@ -465,7 +465,8 @@ const SPENT: Duration = Duration::from_millis(400);
 #[cfg(unix)]
 const READING_TOLERANCE: f64 = 0.05;
 
-/// How long the spending process has to say what it spent before it is stopped and the test fails.
+/// How long the spending process has from its start to its exit: every wait on it ends by then,
+/// and one still running is stopped and the test fails.
 #[cfg(unix)]
 const SPENDER_LIMIT: Duration = Duration::from_secs(60);
 
@@ -486,6 +487,7 @@ fn a_process_that_spends_processor_time_is_read_as_spending_it() {
         return;
     }
     let this = std::env::current_exe().expect("this test's own binary");
+    let deadline = std::time::Instant::now() + SPENDER_LIMIT;
     let mut spender = std::process::Command::new(this)
         .args([
             "--exact",
@@ -501,8 +503,8 @@ fn a_process_that_spends_processor_time_is_read_as_spending_it() {
         .spawn()
         .expect("the spending process starts");
     // Its output is read on a thread of its own, to the end, so that nothing it writes on its way
-    // out fails; what it says is waited for with a limit, so a process that never says it cannot
-    // hold this test up.
+    // out fails. Every wait on it ends at the one deadline: what it says, its exit, and so the
+    // reader, which ends with its output.
     let output = spender.stdout.take().expect("its output");
     let (saying, said) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
@@ -519,14 +521,23 @@ fn a_process_that_spends_processor_time_is_read_as_spending_it() {
             line.clear();
         }
     });
-    let said = said.recv_timeout(SPENDER_LIMIT);
+    let said = said.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
     let read = said.is_ok().then(|| processor_seconds(spender.id()));
-    // Its input closing is what lets it end; one that never said what it spent is stopped.
+    // Its input closing is what lets it end; one that has not ended by the deadline is stopped.
     drop(spender.stdin.take());
-    if said.is_err() {
+    let ended = loop {
+        match spender.try_wait() {
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => break false,
+            Ok(Some(_)) => break true,
+        }
+    };
+    if !ended {
         let _ = spender.kill();
+        let _ = spender.wait();
     }
-    let _ = spender.wait();
     let _ = reader.join();
 
     let said = said.expect("the spending process says what it spent");
