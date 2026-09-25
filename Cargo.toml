@@ -20,6 +20,7 @@ members = [
     "crates/kr-plugin-host",
     "crates/kr-plugin-runtime",
     "crates/kr-plugin-sdk",
+    "crates/kr-plugin-service",
     "crates/kr-project",
     "crates/kr-protocol",
     "crates/kr-shell-integration",
@@ -98,6 +99,7 @@ kr-plugin-catalogue = { path = "crates/kr-plugin-catalogue", version = "=0.1.0" 
 kr-plugin-host = { path = "crates/kr-plugin-host", version = "=0.1.0" }
 kr-plugin-runtime = { path = "crates/kr-plugin-runtime", version = "=0.1.0" }
 kr-plugin-sdk = { path = "crates/kr-plugin-sdk", version = "=0.1.0" }
+kr-plugin-service = { path = "crates/kr-plugin-service", version = "=0.1.0" }
 kr-project = { path = "crates/kr-project", version = "=0.1.0" }
 kr-protocol = { path = "crates/kr-protocol", version = "=0.1.0" }
 kr-shell-integration = { path = "crates/kr-shell-integration", version = "=0.1.0" }

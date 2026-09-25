@@ -4508,6 +4508,7 @@ dependencies = [
  "kr-ipc",
  "kr-plugin-runtime",
  "kr-plugin-sdk",
+ "kr-plugin-service",
  "kr-protocol",
  "kr-worker",
  "serde",
@@ -4526,6 +4527,7 @@ dependencies = [
  "kr-crypto",
  "kr-ipc",
  "kr-plugin-sdk",
+ "kr-plugin-service",
  "kr-protocol",
  "libc",
  "schemars 1.2.2",
@@ -4556,6 +4558,21 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "wit-parser 0.259.0",
+]
+
+[[package]]
+name = "kr-plugin-service"
+version = "0.1.0"
+dependencies = [
+ "kr-cbor",
+ "kr-crypto",
+ "kr-ipc",
+ "kr-plugin-sdk",
+ "kr-protocol",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
