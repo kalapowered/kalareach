@@ -17,7 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use kr_controller::supervision::windows::testing::{TestTask, built_binary};
+use kr_controller::supervision::windows::testing::{TestTask, built_binary, definition};
 use kr_controller::supervision::windows::{TaskSupervisor, run};
 use kr_controller::supervision::{LaunchOutcome, ServiceLaunch, WorkerSupervisor};
 use kr_ipc::starter::{Reached, StartClaim, connect, current_session, in_any_job};
@@ -82,8 +82,8 @@ fn a_suite_finds_the_built_daemon_beside_itself() {
 #[test]
 fn a_service_is_started_by_the_environments_task_and_not_by_this_process() {
     let host = TempHost::create();
-    let _task = registered(&host, &starter());
-    let supervisor = TaskSupervisor::new(host.environment(), &starter()).expect("the supervisor");
+    let task = registered(&host, &starter());
+    let supervisor = task.supervisor(&host.environment());
     let outcome = supervisor.start_service(&waiting_service(&host));
     let LaunchOutcome::Started(identity) = outcome else {
         panic!("the service was started: {outcome:?}");
@@ -150,7 +150,8 @@ fn with_no_task_a_start_names_the_setup_step_and_leaves_nothing_waiting() {
 fn a_task_that_runs_another_program_is_refused_before_it_is_run() {
     let host = TempHost::create();
     let _task = registered(&host, &system("whoami.exe"));
-    let supervisor = TaskSupervisor::new(host.environment(), &starter()).expect("the supervisor");
+    let expected = definition(&host.environment(), &starter()).expect("the expected task");
+    let supervisor = TaskSupervisor::for_definition(host.environment(), expected);
     let outcome = supervisor.start_service(&waiting_service(&host));
     let LaunchOutcome::NotStarted { detail } = outcome else {
         panic!("nothing was started: {outcome:?}");
@@ -166,8 +167,8 @@ fn a_task_that_runs_another_program_is_refused_before_it_is_run() {
 #[test]
 fn a_launch_the_starter_cannot_create_is_nothing_started() {
     let host = TempHost::create();
-    let _task = registered(&host, &starter());
-    let supervisor = TaskSupervisor::new(host.environment(), &starter()).expect("the supervisor");
+    let task = registered(&host, &starter());
+    let supervisor = task.supervisor(&host.environment());
     let mut launch = waiting_service(&host);
     launch.program = host.root().join("no-such-program.exe");
     let outcome = supervisor.start_service(&launch);
@@ -177,6 +178,27 @@ fn a_launch_the_starter_cannot_create_is_nothing_started() {
     assert!(
         detail.contains("no-such-program.exe"),
         "the starter's refusal names the program: {detail}"
+    );
+}
+
+/// A launch larger than the launch pipe carries is refused before it is handed over, so it is
+/// nothing started rather than a launch whose answer was lost.
+#[test]
+fn a_launch_too_large_for_the_pipe_is_nothing_started() {
+    let host = TempHost::create();
+    let task = registered(&host, &starter());
+    let supervisor = task.supervisor(&host.environment());
+    let mut launch = waiting_service(&host);
+    launch
+        .arguments
+        .push("x".repeat(kr_ipc::starter::MAX_LAUNCH_FRAME));
+    let outcome = supervisor.start_service(&launch);
+    let LaunchOutcome::NotStarted { detail } = outcome else {
+        panic!("nothing was started: {outcome:?}");
+    };
+    assert!(
+        detail.contains("more than the"),
+        "the refusal names the bound: {detail}"
     );
 }
 
