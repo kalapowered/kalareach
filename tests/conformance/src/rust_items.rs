@@ -1578,7 +1578,11 @@ impl std::fmt::Display for Breach {
 ///   something else by that name;
 /// * a module file declared anywhere but among a module's items, which the reading does not read;
 /// * a character outside ASCII anywhere but in a comment or a literal: the compiler compares
-///   identifiers once it has normalised them, and the reading compares them as written.
+///   identifiers once it has normalised them, and the reading compares them as written;
+/// * in a macro whose tokens hold a metavariable or a repetition (see [`macro_text`]), a keyed
+///   helper's name however it is written, and a trusted name anywhere but where no expansion can
+///   make it a declaration;
+/// * a macro's repetition that opens or ends inside an item's header (see [`split_headers`]).
 ///
 /// # Errors
 ///
@@ -1623,6 +1627,9 @@ fn conventions(tokens: &[Token], helpers: &BTreeSet<String>) -> Vec<(usize, Stri
     let levels = levels(&tokens);
     let uses = use_declarations(&tokens, &levels.module);
     let parameters = generic_parameters(&tokens);
+    let rewritten = macro_text(&tokens);
+    let attributes = inside_attributes(&tokens);
+    let split = split_headers(&tokens);
     let mut found = Vec::new();
     for (index, token) in tokens.iter().enumerate() {
         let name = match &token.tok {
@@ -1669,21 +1676,179 @@ fn conventions(tokens: &[Token], helpers: &BTreeSet<String>) -> Vec<(usize, Stri
                 "a module file declared inside a function, a block, an implementation or a macro, which the reading does not read".to_owned(),
             ));
         }
+        if split.contains(&index) {
+            found.push((
+                token.line,
+                format!("the header of this `{name}`, from its keyword to its body or `;`, holds where a macro's repetition opens or ends, so the reading cannot tell where the item's name, generic parameters or body are"),
+            ));
+        }
+        // In a macro that holds a metavariable or a repetition, what the tokens around a name show
+        // is no guide to what it is where the macro is invoked: a keyed helper's name is a breach
+        // however it is written, and a trusted name wherever an expansion may make it a declaration.
         if helpers.contains(name)
             && let Some(what) = helper_occurrence(&around, &levels, declaration)
+                .or(rewritten[index].then_some(
+                "part of a macro whose metavariables or repetitions may write any code around it",
+            ))
         {
             found.push((
                 token.line,
                 format!("`{name}`, a keyed helper's name, is written here as {what}, where a helper key allows only its definition, a call or a plain `use` of it"),
             ));
         }
-        if let Some(meaning) = trusted_meaning(name)
-            && let Some(how) = trusted_declaration(&around, name, declaration, &parameters)
+        if let Some(meaning) = trusted_meaning(name) {
+            if let Some(how) = trusted_declaration(&around, name, declaration, &parameters) {
+                found.push((
+                    token.line,
+                    format!("`{name}` is declared here as {how}, where the reading trusts it to mean {meaning}"),
+                ));
+            } else if rewritten[index]
+                && !around.punct_before(1, '$')
+                && !around.declares_nothing_however_expanded(attributes[index])
+            {
+                found.push((
+                    token.line,
+                    format!("`{name}` is written here in a macro whose metavariables or repetitions may make it a declaration, where the reading trusts it to mean {meaning}; in such a macro it may stand only invoked (`{name}!`), before `::` and a name, after `.` or inside an attribute"),
+                ));
+            }
+        }
+    }
+    found
+}
+
+/// Which tokens a macro rewrites before the compiler reads them: the body of a macro's definition
+/// (`macro_rules! name { ... }`, `macro name(...) { ... }`) and a macro's arguments (`name!(...)`),
+/// wherever they hold a `$`. What a metavariable (`$name`) or a repetition (`$( ... )*`) stands for
+/// is known only where the macro is invoked, so these tokens do not show the code they write.
+fn macro_text(tokens: &[Token]) -> Vec<bool> {
+    let mut groups = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let word = token.ident();
+        if word.is_some() && tokens.get(index + 1).is_some_and(|next| next.is_punct('!')) {
+            let named = word == Some("macro_rules")
+                && tokens.get(index + 2).and_then(Token::ident).is_some();
+            groups.push(index + if named { 3 } else { 2 });
+        } else if word == Some("macro") && tokens.get(index + 1).and_then(Token::ident).is_some() {
+            // `macro name(...) { ... }` takes its arguments and its body in two groups.
+            groups.push(index + 2);
+            if tokens.get(index + 2).is_some_and(|open| open.is_punct('('))
+                && let Some(close) = matching(tokens, index + 2)
+            {
+                groups.push(close + 1);
+            }
+        }
+    }
+    let mut text = vec![false; tokens.len()];
+    for open in groups {
+        if !tokens
+            .get(open)
+            .is_some_and(|token| ['(', '[', '{'].iter().any(|c| token.is_punct(*c)))
         {
-            found.push((
-                token.line,
-                format!("`{name}` is declared here as {how}, where the reading trusts it to mean {meaning}"),
-            ));
+            continue;
+        }
+        let close = matching(tokens, open).unwrap_or(tokens.len() - 1);
+        if tokens[open..=close].iter().any(|token| token.is_punct('$')) {
+            text[open..=close].fill(true);
+        }
+    }
+    text
+}
+
+/// Which tokens are inside an attribute (`#[...]` or `#![...]`), whose contents declare no name.
+fn inside_attributes(tokens: &[Token]) -> Vec<bool> {
+    let mut inside = vec![false; tokens.len()];
+    for (index, token) in tokens.iter().enumerate() {
+        if !token.is_punct('#') {
+            continue;
+        }
+        let open = if tokens.get(index + 1).is_some_and(|next| next.is_punct('!')) {
+            index + 2
+        } else {
+            index + 1
+        };
+        if tokens.get(open).is_some_and(|token| token.is_punct('[')) {
+            let close = matching(tokens, open).unwrap_or(tokens.len() - 1);
+            inside[open..=close].fill(true);
+        }
+    }
+    inside
+}
+
+/// The keywords of the items whose header the reading reads in order: the item's name, its generic
+/// parameters and where its body starts.
+const ITEM_KEYWORDS: &[&str] = &[
+    "enum", "fn", "impl", "mod", "struct", "trait", "type", "union",
+];
+
+/// The index of each item keyword whose header, from the keyword to the item's body or `;`, holds
+/// where a macro's repetition opens or ends outside the groups the header holds (angle brackets are
+/// no group): there the reading cannot tell where the item's name, generic parameters or body are.
+/// A repetition that holds whole items, or one inside a group of the header (a function's
+/// parameters), splits no header.
+fn split_headers(tokens: &[Token]) -> BTreeSet<usize> {
+    // Where each repetition's group ends: the `)` of a `$(`.
+    let mut ends = BTreeSet::new();
+    let mut open = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        match token.tok {
+            Tok::Punct('(' | '[' | '{') => open.push(index),
+            Tok::Punct(')' | ']' | '}') => {
+                if let Some(start) = open.pop()
+                    && token.is_punct(')')
+                    && start >= 1
+                    && tokens[start - 1].is_punct('$')
+                {
+                    ends.insert(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut found = BTreeSet::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let Some(word) = token.ident() else {
+            continue;
+        };
+        // A metavariable's own name is none of these keywords; `fn(u8)` is a type, and `union` is a
+        // keyword only before an item's name.
+        if !ITEM_KEYWORDS.contains(&word)
+            || (index >= 1 && tokens[index - 1].is_punct('$'))
+            || (matches!(word, "fn" | "union")
+                && !tokens
+                    .get(index + 1)
+                    .is_some_and(|next| next.ident().is_some() || next.is_punct('$')))
+        {
+            continue;
+        }
+        let mut groups = 0_usize;
+        let mut angles = 0_usize;
+        for at in index + 1..tokens.len() {
+            if groups == 0
+                && tokens[at].is_punct('$')
+                && tokens.get(at + 1).is_some_and(|next| next.is_punct('('))
+            {
+                found.insert(index);
+                break;
+            }
+            match tokens[at].tok {
+                Tok::Punct('{' | ';') if groups == 0 && angles == 0 => break,
+                Tok::Punct('(' | '[' | '{') => groups += 1,
+                Tok::Punct(')' | ']' | '}') => {
+                    if groups == 0 {
+                        // The group around the keyword ends before the header does.
+                        if ends.contains(&at) {
+                            found.insert(index);
+                        }
+                        break;
+                    }
+                    groups -= 1;
+                }
+                Tok::Punct('<') if groups == 0 => angles += 1,
+                Tok::Punct('>') if groups == 0 && !tokens[at - 1].is_punct('-') => {
+                    angles = angles.saturating_sub(1);
+                }
+                _ => {}
+            }
         }
     }
     found
@@ -1870,6 +2035,20 @@ impl Around<'_> {
     fn ends_a_use_path(&self) -> bool {
         self.after(1)
             .is_none_or(|token| token.is_punct(';') || token.is_punct(',') || token.is_punct('}'))
+    }
+
+    /// Whether no expansion of a macro around this name can make it a declaration: it is invoked
+    /// (`name!`), a path goes on through it (`name::item`), it follows a `.` (a field, a method or
+    /// the end of a range), or it is inside an attribute.
+    fn declares_nothing_however_expanded(&self, in_attribute: bool) -> bool {
+        in_attribute
+            || self.punct_after(1, '!')
+            || (self.punct_after(1, ':')
+                && self.punct_after(2, ':')
+                && self
+                    .word_after(3)
+                    .is_some_and(|next| !matches!(next, "self" | "super" | "crate" | "Self")))
+            || self.punct_before(1, '.')
     }
 
     /// Whether this `mod` declares a module file (`mod name;`, or `mod $name;` in a macro).
@@ -2548,7 +2727,6 @@ mod tests {
             "fn t() { enum E where ty!{}: Sized { shared() } }",
             "fn t() { enum E<F> where F: Fn() -> fn() -> ! { shared(), Other(F) } }",
             "macro_rules! m { ($name:ident) => { enum $name { shared() } }; }",
-            "macro_rules! m { ($($name:ident)*) => { enum $($name)* { shared() } }; }",
         ] {
             let found = breached(text);
             assert!(!found.is_empty(), "{text}");
@@ -2624,10 +2802,6 @@ mod tests {
                 "macro_rules! m { ($name:ident) => { fn $name<core>() {} }; }",
                 "core",
             ),
-            (
-                "macro_rules! m { ($($name:ident)*) => { struct $($name)*<alloc>(alloc); }; }",
-                "alloc",
-            ),
             // A definition written as text is one all the same: the check reads tokens.
             (
                 "const _: &str = stringify!(macro_rules! line { () => {} });",
@@ -2690,6 +2864,148 @@ mod tests {
         for text in [
             "extern \"C\" { fn other(); static VALUE: u8; }",
             "make!(x);\nfn t() { println!(\"{}\", 1); }",
+        ] {
+            assert_eq!(breached(text), [], "{text}");
+        }
+    }
+
+    #[test]
+    fn a_repetition_that_opens_or_ends_inside_an_items_header_is_a_breach() {
+        // A repetition stands for any number of copies of what it holds, none included, so inside
+        // an item's header it hides where the item's name, generic parameters or body are.
+        let split = "holds where a macro's repetition opens or ends";
+        for (text, others) in [
+            (
+                "macro_rules! m { ($($empty:tt)*) => { fn $($empty)* other<core>() {} }; }",
+                &["`core`"][..],
+            ),
+            (
+                "macro_rules! m { ($($dummy:ident)?) => { $(enum $dummy)? { shared() } }; }",
+                &["`shared`"],
+            ),
+            (
+                "macro_rules! m { ($($name:ident)*) => { enum $($name)* { shared() } }; }",
+                &["`shared`"],
+            ),
+            (
+                "macro_rules! m { ($($name:ident)*) => { struct $($name)*<alloc>(alloc); }; }",
+                &["`alloc` is declared", "`alloc`"],
+            ),
+            (
+                "macro_rules! m { ($($t:ident),*) => { impl<$($t: Tr),*> Tr for S {} }; }",
+                &[],
+            ),
+            (
+                "macro_rules! m { ($($t:ty)?) => { fn other() $(-> $t)? {} }; }",
+                &[],
+            ),
+            (
+                "macro_rules! m { ($($name:ident)?) => { $(fn $name)? () {} }; }",
+                &[],
+            ),
+            (
+                "macro_rules! m { ($($e:tt)*) => { mod $($e)* inner {} }; }",
+                &[],
+            ),
+            (
+                "macro_rules! m { ($($t:ty)*) => { type A = Vec<$($t)*>; }; }",
+                &[],
+            ),
+            (
+                "macro_rules! m { ($($t:ident),*) => { union U<$($t),*> { a: u8 } }; }",
+                &[],
+            ),
+            (
+                "macro_rules! m { ($($e:tt)*) => { trait $($e)* T {} }; }",
+                &[],
+            ),
+        ] {
+            let found = breached(text);
+            assert_eq!(found.len(), 1 + others.len(), "{text}: {found:?}");
+            assert!(
+                found.iter().any(|(_, what)| what.contains(split)),
+                "{text}: {found:?}"
+            );
+            for other in others {
+                assert!(
+                    found.iter().any(|(_, what)| what.contains(other)),
+                    "{text}: {found:?}"
+                );
+            }
+        }
+        for text in [
+            // A repetition of whole items, or one inside a group the header holds.
+            "macro_rules! m { ($($name:ident)*) => { $( #[test] fn $name() { other() } )* }; }",
+            "macro_rules! m { ($name:ident, $($arg:ident),*) => { fn $name($($arg: u8),*) {} }; }",
+            "macro_rules! m { ($($t:ty),*) => { struct S($($t),*); }; }",
+            "macro_rules! m { ($($v:ident),*) => { enum E { $($v),* } }; }",
+            "macro_rules! m { ($($v:vis)?) => { $($v)? fn other() {} }; }",
+            // A function's type, and `union` where it names no item.
+            "macro_rules! m { ($($t:ty),*) => { let f: fn($($t),*) = g; let u = a.union($($t),*); }; }",
+            "fn union() {}\nfn t() { let union = 1; }",
+        ] {
+            assert_eq!(breached(text), [], "{text}");
+        }
+    }
+
+    #[test]
+    fn a_name_in_a_macro_that_holds_a_metavariable_keeps_to_what_no_expansion_changes() {
+        // A metavariable stands for whatever it is handed, a keyword or a `.` included, and a
+        // repetition for any number of copies of what it holds, so the tokens around a name in such
+        // a macro do not show what the name is where the macro is invoked.
+        for (text, name) in [
+            (
+                "macro_rules! m { ($kw:tt) => { $kw E { shared() } }; }",
+                "shared",
+            ),
+            (
+                "macro_rules! m { ($($e:tt)*) => { x.$($e)* shared() }; }",
+                "shared",
+            ),
+            (
+                "macro_rules! m { ($v:expr, $dot:tt) => { $v $dot shared() }; }",
+                "shared",
+            ),
+            ("macro_rules! m { ($x:expr) => { shared($x) }; }", "shared"),
+            ("define!(($x:expr) => { shared($x) });", "shared"),
+            (
+                "macro_rules! m { ($kw:tt) => { $kw other<core>() {} }; }",
+                "core",
+            ),
+            (
+                "macro_rules! m { ($lt:tt) => { fn other $lt T, core>() {} }; }",
+                "core",
+            ),
+            (
+                "macro_rules! m { ($($e:tt)*) => { use crate::a::$($e)* core; }; }",
+                "core",
+            ),
+            (
+                "macro_rules! m { ($($e:tt)*) => { macro_rules! $($e)* assert { () => {} } }; }",
+                "assert",
+            ),
+            ("macro_rules! m { ($kw:tt) => { $kw std {} }; }", "std"),
+            (
+                "macro_rules! m { ($x:expr) => { use a::println; }; }",
+                "println",
+            ),
+        ] {
+            let found = breached(text);
+            assert_eq!(found.len(), 1, "{text}: {found:?}");
+            assert!(
+                found[0].1.contains(&format!("`{name}`")),
+                "{text}: {found:?}"
+            );
+        }
+        for text in [
+            // Invoked, with a path through it, after a `.`, inside an attribute, or a
+            // metavariable's own name.
+            "macro_rules! m { ($x:expr) => { assert!($x); assert_eq!($x, 1); std::mem::drop($x); ::core::mem::forget($x); }; }",
+            "macro_rules! m { ($name:ident) => { #[derive(Debug, Clone)] struct S; #[test] #[cfg(test)] fn $name() { let v = vec![line!()]; println!(\"{}\", file!()); } }; }",
+            "macro_rules! m { ($core:ident, $x:expr) => { let _ = $core; let _ = $x.line(); tokio::spawn($x); }; }",
+            // A macro with neither writes exactly its tokens, and they are read as they are.
+            "macro_rules! m { () => { shared() }; }",
+            "macro_rules! m { () => { let file = line!(); fn t<T: Debug>() {} }; }",
         ] {
             assert_eq!(breached(text), [], "{text}");
         }

@@ -423,6 +423,34 @@ fn a_source_outside_the_conventions_is_a_problem_and_keys_no_helper() {
                 "`shared`, a keyed helper's name, is written here as the name `as` gives",
             ),
             (
+                "tests/repeated.rs:9",
+                "the header of this `fn`, from its keyword to its body or `;`, holds where a macro's repetition opens or ends",
+            ),
+            (
+                "tests/repeated.rs:9",
+                "`core` is written here in a macro whose metavariables or repetitions may make it a declaration",
+            ),
+            (
+                "tests/repeated.rs:15",
+                "the header of this `enum`, from its keyword to its body or `;`, holds where a macro's repetition opens or ends",
+            ),
+            (
+                "tests/repeated.rs:15",
+                "`shared`, a keyed helper's name, is written here as part of a macro whose metavariables or repetitions",
+            ),
+            (
+                "tests/rewritten.rs:11",
+                "`core` is written here in a macro whose metavariables or repetitions may make it a declaration",
+            ),
+            (
+                "tests/rewritten.rs:17",
+                "`len`, a keyed helper's name, is written here as part of a macro whose metavariables or repetitions",
+            ),
+            (
+                "tests/rewritten.rs:23",
+                "`len`, a keyed helper's name, is written here as part of a macro whose metavariables or repetitions",
+            ),
+            (
                 "tests/shadowed.rs:8",
                 "`println` is declared here as a macro",
             ),
@@ -502,6 +530,8 @@ fn a_source_outside_the_conventions_is_a_problem_and_keys_no_helper() {
         "KR-REQ-03.69",
         "KR-REQ-03.70",
         "KR-REQ-03.71",
+        "KR-REQ-03.72",
+        "KR-REQ-03.73",
     ] {
         let row = identifier(row);
         assert!(

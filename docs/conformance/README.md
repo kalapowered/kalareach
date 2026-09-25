@@ -182,12 +182,25 @@ plain `use` of a helper's name is followed further, through the report's reading
 Each problem names the file and the line. A target with one keys no test through a helper, and the
 report stops before it runs anything.
 
-A macro's body is read like any other code, so a name written in it is held to the conventions
-however the macro writes the item around it (`fn $name<core>`, `enum $($name)* { helper() }`). A
-name the macro is handed when it is invoked (`make!(core)`) is only an argument there, and cannot
-earn a key: a macro invoked among a module's items declines every helper key of its target, and one
-invoked in a test's body declines that test's calls; what a macro invoked in a function, an
-implementation or a trait makes stays inside it; a macro invoked in a foreign block
+A macro's body is read like any other code, but where a macro's definition or arguments hold a
+metavariable or a repetition (`$name`, `$( ... )*`), its tokens do not show the code it writes: a
+metavariable stands for whatever the macro is handed, a keyword or a `.` included, and a repetition
+for any number of copies of what it holds, none included. So inside such a macro a keyed helper's
+name is a problem however it is written, and so is a name the report trusts, unless it names a
+metavariable (`$core`) or no expansion can make it a declaration: invoked (`assert!`), before `::`
+and a name (`std::mem`), after a `.`, or inside an attribute (`#[derive(Debug)]`). A repetition
+that opens or ends inside an item's header, from its keyword (`fn`, `struct`, `enum`, `union`,
+`trait`, `type`, `impl` or `mod`) to its body or `;` and outside the groups the header holds, is a
+problem wherever it is, because the report could not tell where the item's name, generic
+parameters or body are; one that holds whole items (`$( #[test] fn $name() { ... } )*`) or stands
+inside a function's parameters is not.
+
+What a macro makes, the macros it invokes included, counts as made where it is invoked, and a name
+the macro is handed there (`make!(core)`) is only an argument, which cannot earn a key: a macro
+invoked among a module's items declines every helper key of its target; one invoked in a test's
+body declines that test's calls, unless it is one of the standard library's macros above, named by
+its bare name (a call inside `assert!(...)` is read as the test's own); what a macro invoked in a
+function, an implementation or a trait makes stays inside it; a macro invoked in a foreign block
 (`extern "C" { ... }`), whose items are its module's own, is a problem; and the compiler reports a
 standard macro's name as ambiguous wherever a macro that another macro makes and exports would
 take it.
