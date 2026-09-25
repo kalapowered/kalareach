@@ -580,7 +580,9 @@ fn a_version_no_signed_record_establishes_is_refused() {
         }],
         ..site.release()
     };
-    let cases: [(&str, &dyn Fn(&Site) -> BridgeTarget, &dyn Fn(&Site)); 4] = [
+    type Target = dyn Fn(&Site) -> BridgeTarget;
+    type Prepare = dyn Fn(&Site);
+    let cases: [(&str, &Target, &Prepare); 4] = [
         ("no signed qualification record", &unsigned, &|_| {}),
         ("not an executable any signed", &another, &|_| {}),
         ("script", &|site: &Site| site.release(), &|site: &Site| {
