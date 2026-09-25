@@ -40,11 +40,12 @@ kr-ipc = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 # The workspace forbids unsafe code, which a crate that asks the kernel directly cannot honour. This
-# crate denies it instead and allows it in exactly four modules, each of which says why:
+# crate denies it instead and allows it in exactly five modules, each of which says why:
 # `clock::windows` (the interrupt-time counter), `paths::windows` (owner-only access-control lists),
-# `identity::process_times` (a process's creation time and whether it has exited) and
+# `identity::process_times` (a process's creation time and whether it has exited),
 # `floor::platform` (the shared mapping of the clock floor's file and the atomics on it, on each
-# platform). Nothing else in this crate may relax the rule.
+# platform) and `starter::windows` (the launch pipe, a process's facts and a child created
+# suspended). Nothing else in this crate may relax the rule.
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "deny"
