@@ -134,17 +134,23 @@ left=()
 # The local deployments and the device's stores, all in one directory this run made.
 run=""
 state=""
+# Whether every local deployment this run started has been seen to stop.
+stopped=1
 cleanup() {
   local status=$?
-  if [ -n "$state" ] && [ -d "$state" ]; then
-    node "$driver" stop --state "$state" >>"$evidence/driver.log" 2>&1 || true
+  if [ -n "$state" ] && [ -d "$state" ] &&
+    ! node "$driver" stop --state "$state" >>"$evidence/driver.log" 2>&1; then
+    stopped=0
   fi
   if [ -n "$run" ] && [ -d "$run" ]; then
-    if [ "$failed" -eq 0 ] && [ "$missed" -eq 0 ] && [ "$status" -eq 0 ]; then
-      node "$driver" stop --state "$state" --remove >>"$evidence/driver.log" 2>&1 || true
+    if [ "$stopped" -eq 1 ] && [ "$failed" -eq 0 ] && [ "$missed" -eq 0 ] && [ "$status" -eq 0 ] &&
+      node "$driver" stop --state "$state" --remove >>"$evidence/driver.log" 2>&1; then
       rm -rf "${run:?}"
-    else
+    elif [ "$stopped" -eq 1 ]; then
       echo "the local run directory was kept for its evidence: $run"
+    else
+      echo "a local deployment did not stop: its record and the run directory were kept: $run"
+      exit 1
     fi
   fi
 }
@@ -224,10 +230,12 @@ bundle_leg() {
     *) report 'NOT RUN' bundle "the leg ran nothing" ;;
   esac
   if [ "$mode" = deployment ]; then
-    if [ "$rc" -eq 0 ] || grep -q 'the request was sent' "$log"; then
-      left+=("bundle: one bundle collection under a locator made for the run, in the namespace of an installation key discarded with the run, with the receipts and spent nonces the service keeps; no client operation removes a bundle")
+    # Nothing only when the leg itself says it sent nothing; anything less certain is reported as
+    # whatever the leg could have left.
+    if [ "$rc" -ne 0 ] && grep -q '(nothing was sent)' "$log"; then
+      left+=("bundle: nothing, because the leg sent nothing")
     else
-      left+=("bundle: nothing, because nothing was sent")
+      left+=("bundle: as far as the leg got, one bundle collection under a locator made for the run in the namespace of a key discarded with the run, the empty collections its readers reached in their own namespaces, and the receipts and spent nonces the service keeps; no client operation removes a bundle")
     fi
   fi
 }
@@ -252,28 +260,38 @@ else
     report FAILED bundle "no local deployment served on $origin; see $evidence/driver.log"
   fi
 
-  # The bundle, at two services.
+  # The bundle at two services, then, once the first is stopped, with only the second left.
   second=""
   if [ -n "$first" ] && answer="$(step start --name second)"; then
     second="$(member "$answer" origin)"
   fi
   if [ -z "$first" ]; then
     report 'NOT RUN' services "the first local deployment did not serve"
-  elif [ -n "$second" ]; then
-    log="$evidence/services.log"
-    rc=0
-    run_test bundle a_kit_naming_two_services_reads_the_bundle_at_either "$log" \
-      KR_DEPLOYED_ORIGIN="$first" KR_BACKUP_SECOND_ORIGIN="$second" || rc=$?
-    case "$rc" in
-      0) report ok services "$(proved "$log" "$first")" ;;
-      1) report FAILED services "$(reason "$log")" ;;
-      *) report 'NOT RUN' services "the leg ran nothing" ;;
-    esac
-  else
+  elif [ -z "$second" ]; then
     report FAILED services "a second local deployment did not serve; see $evidence/driver.log"
+  else
+    rc=0
+    run_test bundle a_kit_naming_two_services_reads_the_bundle_at_either "$evidence/services-1.log" \
+      KR_DEPLOYED_ORIGIN="$first" KR_BACKUP_SECOND_ORIGIN="$second" KR_BACKUP_RUN_DIR="$run/services" || rc=$?
+    if [ "$rc" -eq 1 ]; then
+      report FAILED services "$(reason "$evidence/services-1.log")"
+    elif [ "$rc" -ne 0 ]; then
+      report 'NOT RUN' services "the leg ran nothing"
+    elif ! step stop --name first >/dev/null; then
+      report FAILED services "the first local deployment did not stop, so its loss could not be shown"
+    else
+      rc=0
+      run_test bundle with_one_service_gone_the_same_kit_still_reads_at_the_other "$evidence/services-2.log" \
+        KR_DEPLOYED_ORIGIN="$first" KR_BACKUP_SECOND_ORIGIN="$second" KR_BACKUP_RUN_DIR="$run/services" || rc=$?
+      case "$rc" in
+        0) report ok services "$(proved "$evidence/services-1.log" "$first"); $(proved "$evidence/services-2.log" "$second")" ;;
+        1) report FAILED services "with the first service gone: $(reason "$evidence/services-2.log")" ;;
+        *) report 'NOT RUN' services "the second half of the leg ran nothing" ;;
+      esac
+    fi
   fi
-  step stop --name first >/dev/null || true
-  step stop --name second >/dev/null || true
+  step stop --name first >/dev/null || stopped=0
+  step stop --name second >/dev/null || stopped=0
 
   # The client across a restored deployment: a source, its export, a target restored from it.
   device="$run/device"
@@ -308,8 +326,10 @@ else
   recovery=""
   if [ -z "$restore_failed" ]; then
     # The source goes out of service before its export is restored, as a replaced deployment does.
-    step stop --name source >/dev/null || true
-    if answer="$(step prepare --from source --export "$export_id" --name target)"; then
+    if ! step stop --name source >/dev/null; then
+      stopped=0
+      restore_failed="the source deployment did not stop, so no restore was attempted"
+    elif answer="$(step prepare --from source --export "$export_id" --name target)"; then
       target="$(member "$answer" origin)"
     else
       restore_failed="preparing the target: $(member "$answer" error)"
@@ -332,7 +352,8 @@ else
   else
     report FAILED restore "$restore_failed"
   fi
-  step stop --name target >/dev/null || true
+  step stop --name source >/dev/null || stopped=0
+  step stop --name target >/dev/null || stopped=0
 fi
 
 echo
@@ -347,8 +368,11 @@ if [ "$mode" = deployment ]; then
       echo "  $what"
     done
   fi
-else
+elif [ "$stopped" -eq 1 ]; then
   echo "every deployment this run started was stopped; nothing was sent anywhere but this machine"
+else
+  failed=$((failed + 1))
+  echo "a local deployment this run started did not stop; see $evidence/driver.log"
 fi
 
 if [ "$failed" -eq 0 ] && [ "$missed" -eq 0 ]; then
@@ -360,6 +384,7 @@ if [ "${#unfinished[@]}" -ne 0 ]; then
   for what in "${unfinished[@]}"; do
     case "$what" in
       restore) echo "  restore-1.log, restore-2.log, restore-3.log and driver.log, as far as the leg got" ;;
+      services) echo "  services-1.log and services-2.log, as far as the leg got" ;;
       *) echo "  $what.log" ;;
     esac
   done

@@ -13,18 +13,19 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-ACC-033, KR-REQ-20.15, KR-REQ-20.18 and KR-REQ-20.19 against a service | `a_bundle_is_found_and_authenticated_with_only_the_kit_and_its_origin` |
-//! | KR-REQ-20.18 several services, KR-REQ-20.19 a lost service | `a_kit_naming_two_services_reads_the_bundle_at_either` |
+//! | KR-REQ-20.18 several services, KR-REQ-20.19 a lost service | `a_kit_naming_two_services_reads_the_bundle_at_either`, then, once the first service is gone, `with_one_service_gone_the_same_kit_still_reads_at_the_other` |
 //!
 //! # What they leave
 //!
 //! Against a deployment: the bundle collection under the run's locator, in the writing
-//! installation's namespace, with the receipts and spent nonces the service keeps by its own rules.
-//! No client operation removes a bundle, because a bundle is the only thing a restore takes a writer
-//! key from. The key that wrote it is discarded with the run.
+//! installation's namespace; the empty collections the reading installations' requests reached in
+//! their own namespaces; and the receipts and spent nonces the service keeps by its own rules. No
+//! client operation removes a bundle, because a bundle is the only thing a restore takes a writer key
+//! from. Every key that signed is discarded with the run.
 
 use std::sync::Arc;
 
-use kr_backup_integration::{Watched, skipped, variable};
+use kr_backup_integration::{RunDirectory, Watched, skipped, variable};
 use kr_client::recovery::{
     BundleStore, FreshRestore, RecoveryError, RetrievalPolicy, ServiceAccess, parse_kit, render_kit,
 };
@@ -39,10 +40,14 @@ use kr_protocol::archive::{RecoveryKit, TrustedWriter};
 use kr_protocol::ids::SyncConflictId;
 use kr_protocol::scalars::{TimestampMs, Uuid};
 use kr_protocol::service::GatewayOrigin;
-use kr_sync_integration::{Deployment, RunKey, SilentService, fresh_uuid, now_ms, proved};
+use kr_sync_integration::{Deployment, RunKey, fresh_uuid, now_ms, proved};
 
 /// The variable naming the second local service a kit may name.
 const SECOND_VARIABLE: &str = "KR_BACKUP_SECOND_ORIGIN";
+/// The variable naming the directory the two-service leg keeps its printed kit in between phases.
+const RUN_VARIABLE: &str = "KR_BACKUP_RUN_DIR";
+/// The file that printed kit is kept in.
+const KIT: &str = "kit.json";
 
 fn now() -> TimestampMs {
     TimestampMs::new(now_ms())
@@ -323,32 +328,42 @@ async fn a_bundle_is_found_and_authenticated_with_only_the_kit_and_its_origin() 
     );
 }
 
-/// KR-REQ-20.18 and KR-REQ-20.19 against two services: a kit naming both reads the bundle at
-/// either, and a service that is gone gives nothing back, not even a bundle it once held.
+/// The two services a leg over several services runs against, and the directory it keeps the
+/// printed kit in between its phases.
+fn two_services() -> Option<(Deployment, Deployment, RunDirectory)> {
+    let first = Deployment::from_environment()?;
+    let Some(second) = variable(SECOND_VARIABLE) else {
+        skipped(SECOND_VARIABLE);
+        return None;
+    };
+    let Some(run) = RunDirectory::from_variable(RUN_VARIABLE) else {
+        skipped(RUN_VARIABLE);
+        return None;
+    };
+    let second = Deployment::at(GatewayOrigin::new(second).expect("an origin"));
+    Some((first, second, run))
+}
+
+/// KR-REQ-20.18 against two services, first phase: a kit naming both reads the bundle at either.
+/// The phase keeps the printed kit for the next one, which runs once the first service is gone.
 #[tokio::test]
 async fn a_kit_naming_two_services_reads_the_bundle_at_either() {
-    let Some(first) = Deployment::from_environment() else {
+    let Some((first, second, run)) = two_services() else {
         return;
     };
-    let Some(second_origin) = variable(SECOND_VARIABLE) else {
-        return skipped(SECOND_VARIABLE);
-    };
-    let second = Deployment::at(GatewayOrigin::new(second_origin).expect("an origin"));
     let origins = [
         first.origin().as_str().to_owned(),
         second.origin().as_str().to_owned(),
     ];
-    let directory = tempfile::tempdir().expect("a directory for the stores");
 
     let owner = RunKey::installation();
     let seed = RecoverySeed::generate().expect("a seed");
-    let locator = fresh_locator();
-    let kit = seed.to_kit(origins.to_vec(), locator.clone());
+    let kit = seed.to_kit(origins.to_vec(), fresh_locator());
     let mut transports = Vec::new();
     for (index, deployment) in [&first, &second].into_iter().enumerate() {
         let origin = deployment.origin().as_str().to_owned();
         let (service, transport) = client_at(deployment, &owner);
-        let path = directory.path().join(format!("owner-{index}"));
+        let path = run.path(&format!("owner-{index}"));
         std::fs::create_dir_all(&path).expect("a directory");
         let mut store = BundleStore::open(
             service as Arc<dyn SyncBackupService>,
@@ -381,46 +396,62 @@ async fn a_kit_naming_two_services_reads_the_bundle_at_either() {
         assert_eq!(found.context.service_origin, origin);
         transports.push(transport);
     }
-
-    // A service that is gone. A kit naming it and a live one still reads at the live one; a kit
-    // naming only the one that is gone reads nothing, and says so as a service that did not
-    // answer rather than as a bundle.
-    let gone = SilentService::start().await;
-    let gone_origin = gone.origin().as_str().to_owned();
-    let (gone_service, _) = client_at(&gone.deployment(), &reader);
-    let with_gone = seed.to_kit(
-        vec![gone_origin.clone(), origins[1].clone()],
-        locator.clone(),
-    );
-    assert!(matches!(
-        restore_with(kept(&with_gone), &gone_origin)
-            .open_bundle(
-                Arc::clone(&gone_service) as Arc<dyn SyncBackupService>,
-                &gone_origin
-            )
-            .await,
-        Err(RecoveryError::Service(_))
-    ));
-    let (live, transport) = client_at(&second, &reader);
-    restore_with(kept(&with_gone), &origins[1])
-        .open_bundle(live as Arc<dyn SyncBackupService>, &origins[1])
-        .await
-        .expect("the live service it names");
-    transports.push(transport);
-    let only_gone = seed.to_kit(vec![gone_origin.clone()], locator);
-    assert!(matches!(
-        restore_with(kept(&only_gone), &gone_origin)
-            .open_bundle(gone_service as Arc<dyn SyncBackupService>, &gone_origin)
-            .await,
-        Err(RecoveryError::Service(_))
-    ));
-
     for transport in &transports {
         transport.assert_every_answer_named_its_history();
     }
+    let printed = render_kit(&kit).expect("a printable kit");
+    run.write(KIT, &serde_json::json!({ "kit": printed.as_str() }));
     proved(
         "bundle",
         &first,
-        "a kit naming two services read the bundle at each, and a kit naming a service that is gone read nothing there",
+        "a kit naming two services read the bundle at each",
+    );
+}
+
+/// KR-REQ-20.19 against two services, second phase, once the first service is gone: the same printed
+/// kit still reads the bundle at the service that is left, and a kit naming only the one that is
+/// gone reads nothing, since a seed alone rebuilds no service.
+#[tokio::test]
+async fn with_one_service_gone_the_same_kit_still_reads_at_the_other() {
+    let Some((first, second, run)) = two_services() else {
+        return;
+    };
+    let printed = run.read(KIT);
+    let kit = parse_kit(printed["kit"].as_str().expect("the printed kit")).expect("a kit");
+    let gone = first.origin().as_str().to_owned();
+    let left = second.origin().as_str().to_owned();
+
+    let reader = RunKey::installation();
+    let (gone_service, _) = client_at(&first, &reader);
+    assert!(
+        matches!(
+            restore_with(kit.clone(), &gone)
+                .open_bundle(gone_service as Arc<dyn SyncBackupService>, &gone)
+                .await,
+            Err(RecoveryError::Service(_))
+        ),
+        "the service that is gone gives nothing back"
+    );
+    let (left_service, transport) = client_at(&second, &reader);
+    let found = restore_with(kit.clone(), &left)
+        .open_bundle(left_service as Arc<dyn SyncBackupService>, &left)
+        .await
+        .expect("the service that is left still serves the bundle");
+    assert_eq!(found.bundle_revision, 1);
+    transport.assert_every_answer_named_its_history();
+
+    let seed = RecoverySeed::from_kit(&kit).expect("the kit's seed");
+    let only_gone = seed.to_kit(vec![gone.clone()], kit.bundle_locator.clone());
+    let (gone_service, _) = client_at(&first, &reader);
+    assert!(matches!(
+        restore_with(kept(&only_gone), &gone)
+            .open_bundle(gone_service as Arc<dyn SyncBackupService>, &gone)
+            .await,
+        Err(RecoveryError::Service(_))
+    ));
+    proved(
+        "bundle",
+        &second,
+        "with one service gone, the same printed kit read the bundle at the other, and a kit naming only the one that is gone read nothing",
     );
 }
