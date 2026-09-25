@@ -181,6 +181,9 @@ pub fn run(paths: &HostPaths, arguments: &StartupArguments, json: bool) -> Resul
         // Refused before anything else is touched, so a document this build must not rewrite
         // leaves the service manager's definition as it was too.
         crate::doctor::configuration::validate(&environment.paths, &change)?;
+        // A first use of the environment, on a host where no daemon has run yet, as an edit of
+        // its document is: the record and the lock live in its state directory.
+        environment.paths.create()?;
         if startup == Some(ControllerStartup::Service) {
             notes = service_manager::install(&environment.paths)?.notes;
         } else {
@@ -190,10 +193,15 @@ pub fn run(paths: &HostPaths, arguments: &StartupArguments, json: bool) -> Resul
         crate::doctor::configuration::apply(&environment.paths, &change)?;
     }
     let chosen = Chosen::read(&environment.paths);
-    let inspection = service_manager::inspect(
+    let inspected = service_manager::inspect(
         &environment.paths,
         chosen.controller == Some(ControllerStartup::Service),
-    )?;
+    );
+    let (inspection, unestablished) = match inspected {
+        Some(Ok(inspection)) => (Some(inspection), None),
+        Some(Err(why)) => (None, Some(why)),
+        None => (None, None),
+    };
     if json {
         let mut document = serde_json::json!({
             "ok": true,
@@ -209,6 +217,7 @@ pub fn run(paths: &HostPaths, arguments: &StartupArguments, json: bool) -> Resul
                 "document_state": chosen.state.as_str(),
                 "revision": chosen.revision.to_string(),
                 "definition": inspection.as_ref().map(service_manager::Inspection::json),
+                "definition_unestablished": unestablished,
             },
         });
         if !removal.removed.is_empty() || !removal.left.is_empty() {
@@ -236,6 +245,11 @@ pub fn run(paths: &HostPaths, arguments: &StartupArguments, json: bool) -> Resul
         crate::report::print_json(&document);
     } else {
         println!("{}", describe(&chosen, inspection.as_ref()));
+        if let Some(why) = &unestablished {
+            println!(
+                "what the service start has for this environment cannot be established: {why}"
+            );
+        }
         for path in &removal.removed {
             println!("removed {}", path.display());
         }
@@ -262,13 +276,13 @@ fn describe(chosen: &Chosen, inspection: Option<&service_manager::Inspection>) -
     match chosen.controller {
         Some(ControllerStartup::Service) => format!(
             "startup: service, from {} at revision {}: kr new asks this user's service manager to \
-             start this environment's control daemon when none is running; {}",
+             start this environment's control daemon when none is running{}",
             chosen.document.display(),
             chosen.revision,
-            inspection.map_or_else(
-                || "this platform has no service start".to_owned(),
-                service_manager::Inspection::describe
-            )
+            inspection.map_or_else(String::new, |inspection| format!(
+                "; {}",
+                inspection.describe()
+            ))
         ),
         Some(ControllerStartup::Standalone) => left_over(format!(
             "startup: standalone, from {} at revision {}: kr new starts this environment's control \
@@ -630,32 +644,34 @@ async fn managed(
     error: &kr_ipc::IpcError,
     bounds: Bounds,
 ) -> Result<(LocalClient, Option<Started>)> {
+    let refused = |refusal| match refusal {
+        service_manager::Refusal::NotSetUp(why) => resolve::not_running(error, &why),
+        service_manager::Refusal::Failed(why) => unanswered(&format!(
+            "the service manager did not start the control daemon for environment {}: {why}",
+            environment.environment_id()
+        )),
+    };
+    let blocked = |error: tokio::task::JoinError| {
+        CliError::Other(format!(
+            "asking the service manager to start the control daemon failed: {error}"
+        ))
+    };
+    // The definition first, with the environment's service lock held from here until the manager
+    // has been asked: one that is not exactly what kr wrote refuses the start with nothing
+    // written, the log included. Each command put to the manager is bounded, and they are waited
+    // for off the runtime's own threads.
+    let checking = environment.clone();
+    let verified = tokio::task::spawn_blocking(move || service_manager::verify(&checking))
+        .await
+        .map_err(blocked)?
+        .map_err(refused)?;
     // The log is checked, and emptied when it has grown too large, before the manager opens it,
     // exactly as for the standalone start; the manager appends to it.
-    environment.create()?;
     let log = Log::open(&environment.state_dir().join(LOG_FILE))?;
-    // Each command put to the manager is bounded, and they are waited for off the runtime's own
-    // threads.
-    let asking = environment.clone();
-    let asked = tokio::task::spawn_blocking(move || service_manager::start(&asking))
+    let asked = tokio::task::spawn_blocking(move || verified.start())
         .await
-        .map_err(|error| {
-            CliError::Other(format!(
-                "asking the service manager to start the control daemon failed: {error}"
-            ))
-        })?;
-    let asked = match asked {
-        Ok(asked) => asked,
-        Err(service_manager::Refusal::NotSetUp(why)) => {
-            return Err(resolve::not_running(error, &why));
-        }
-        Err(service_manager::Refusal::Failed(why)) => {
-            return Err(unanswered(&format!(
-                "the service manager did not start the control daemon for environment {}: {why}",
-                environment.environment_id()
-            )));
-        }
-    };
+        .map_err(blocked)?
+        .map_err(refused)?;
     let started = Started {
         pid: asked.pid,
         start: ControllerStartup::Service,

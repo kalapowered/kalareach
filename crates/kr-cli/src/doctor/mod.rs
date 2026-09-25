@@ -62,16 +62,15 @@ fn startup_check(environment: &kr_ipc::paths::EnvironmentPaths) -> Option<Doctor
 
     let chosen = crate::startup::Chosen::read(environment);
     let selected = chosen.controller == Some(ControllerStartup::Service);
-    let inspection = match crate::service_manager::inspect(environment, selected) {
-        Ok(inspection) => inspection?,
+    let inspection = match crate::service_manager::inspect(environment, selected)? {
+        Ok(inspection) => inspection,
         Err(_) => {
             return Some(DoctorCheck::new(
                 STARTUP_CHECK,
                 STARTUP_TITLE,
                 DoctorStatus::Failed,
                 Sentence::new().stated(
-                    "the record of the service definition kr wrote for this environment cannot be \
-                     read",
+                    "what the service start has for this environment cannot be established",
                 ),
                 Some(
                     "run kr host startup to see why, then kr host startup --set service or --clear",
@@ -123,6 +122,11 @@ fn startup_check(environment: &kr_ipc::paths::EnvironmentPaths) -> Option<Doctor
             ", from a definition that names another program, other directories or another domain \
              than this installation's",
             Some("run kr host startup --set service to write this installation's"),
+        ),
+        State::Unrecorded => (
+            DoctorStatus::Failed,
+            ", from a definition that is what kr writes, and kr has no record of writing it",
+            Some("run kr host startup --set service to record it"),
         ),
     };
     Some(DoctorCheck::new(
