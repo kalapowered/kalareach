@@ -63,8 +63,10 @@ with the kernel's record of when it started, the prompt generation, the reader r
 epoch and exactly one originating attachment. See [The root
 integration](README.md#the-root-integration).
 
-**Effect.** Whether a method reads state or changes it: `read` or `write`. A write that is not raw
-input arrives as a mutation and carries an action.
+**Effect.** Whether a method reads state or changes it: `read` or `write`. A write sent to a host
+arrives as a mutation and carries an action, raw input excepted. A method of the `Services` group is
+sent to a service as a signed service request instead; see [The service
+credential](README.md#the-service-credential).
 
 **Endpoint** (`endpoint_id`). An iroh peer, named by its public key. A host and each paired device
 have one.
@@ -128,7 +130,9 @@ a decision taken at one prompt cannot be replayed at the next.
 states](README.md#receipt-states).
 
 **Right.** One permission a grant can carry, from the action-right vocabulary in
-`crates/kr-protocol/src/rights.rs`. A method's required rights are all needed at once.
+`crates/kr-protocol/src/rights.rs`. A request needs every right its method requires, except one
+whose condition does not apply to it: `session.attach` needs `terminal.geometry` only for a
+geometry claim.
 
 **Root editor.** The line editor of a session's root shell, which a managed shell package connects
 to the worker so that Ctrl-D at an empty prompt detaches and a launch installs a command through
