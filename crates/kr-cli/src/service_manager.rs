@@ -43,10 +43,11 @@
 //! working directory, or hold nothing, in which case the start request loads it; the check before a
 //! start request and the request itself each decide from what launchd holds when they ask. The user
 //! manager is asked everything through `systemctl --user`, so every question and request reaches
-//! the one manager; it must load the unit cleanly from kr's file, have nothing to reload, start it
-//! as the file says, and print one command for it, the file's program, words and flags, and no
-//! other command. Whatever else a drop-in sets, such as the daemon's environment or limits, is the
-//! host's and the person's.
+//! the one manager; it must load the unit cleanly from kr's file, have nothing to reload, and read
+//! no drop-in for it with a line that could set a command or the start type, so the command comes
+//! from kr's file alone; and what it prints must agree: one command, the file's program, words and
+//! flags, started as the file says. Whatever else a drop-in sets, such as the daemon's environment
+//! or limits, is the host's and the person's.
 //!
 //! kr never ends a daemon, and never asks a manager to: it loads a definition and asks for a start,
 //! and nothing else. A manager holding another form of the job, or another definition under its
@@ -1344,7 +1345,8 @@ mod platform {
     //! Every question kr puts to it and every request it makes go through `systemctl --user`,
     //! with the runtime directory set for the command, so all of them reach the one manager that
     //! directory belongs to, over the manager's own socket or the user bus as `systemctl` chooses.
-    //! What the manager holds is read from `systemctl show`'s key=value lines.
+    //! What the manager holds is read from `systemctl show`'s key=value lines, and the drop-ins it
+    //! names are read from disk.
 
     use std::path::PathBuf;
 
