@@ -923,7 +923,9 @@ struct Waiter {
 
 impl Waiter {
     async fn wait(mut self) -> Result<Answer> {
-        let receiver = self.receiver.take().expect("a waiter waits once");
+        let Some(receiver) = self.receiver.take() else {
+            unreachable!("a waiter waits once");
+        };
         receiver.await.map_err(|_| ClientError::ConnectionEnded)
     }
 }

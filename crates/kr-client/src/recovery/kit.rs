@@ -210,9 +210,9 @@ pub fn parse(document: &str) -> Result<RecoveryKit, RecoveryError> {
         });
     }
 
-    let bytes: [u8; 32] = payload[..32]
-        .try_into()
-        .expect("the payload is thirty-six bytes");
+    let Ok(bytes) = <[u8; 32]>::try_from(&payload[..32]) else {
+        unreachable!("the payload is thirty-six bytes");
+    };
     let kit = RecoveryKit {
         profile_version: U64::new(RECOVERY_KIT_PROFILE_VERSION),
         seed: SecretBytes32::from_bytes(bytes),
@@ -289,7 +289,9 @@ fn decode_seed(text: &str) -> Result<Zeroizing<Vec<u8>>, RecoveryError> {
         bits += 5;
         if bits >= 8 {
             bits -= 8;
-            let byte = u8::try_from((accumulator >> bits) & 0xff).expect("eight bits");
+            let Ok(byte) = u8::try_from((accumulator >> bits) & 0xff) else {
+                unreachable!("eight bits");
+            };
             if written < PAYLOAD_LEN {
                 payload[written] = byte;
                 written += 1;

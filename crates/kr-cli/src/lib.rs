@@ -77,6 +77,10 @@ pub const RELEASE: &str = env!("CARGO_PKG_VERSION");
 /// rather than a runtime condition.
 #[must_use]
 pub fn build_id() -> kr_protocol::ids::BuildId {
-    kr_protocol::ids::BuildId::new(format!("kr/{RELEASE}"))
-        .expect("the build identifier is well formed")
+    // What the identifier's check refused is not rendered: the panic says which build fault this
+    // is and nothing it read.
+    match kr_protocol::ids::BuildId::new(format!("kr/{RELEASE}")) {
+        Ok(build_id) => build_id,
+        Err(_) => panic!("the build identifier is not well formed"),
+    }
 }

@@ -571,9 +571,10 @@ impl AuthorisationRequest {
     /// Panics only when the pinned origin does not parse, which is a build-time mistake.
     #[must_use]
     pub fn url(&self) -> String {
-        let mut url = Url::parse(ACCOUNT_ORIGIN)
-            .and_then(|origin| origin.join(AUTHORIZE_PATH))
-            .expect("the pinned origin and path parse");
+        let Ok(mut url) = Url::parse(ACCOUNT_ORIGIN).and_then(|origin| origin.join(AUTHORIZE_PATH))
+        else {
+            unreachable!("the pinned origin and path parse");
+        };
         url.query_pairs_mut()
             .append_pair("response_type", "code")
             .append_pair("client_id", self.client.id())
