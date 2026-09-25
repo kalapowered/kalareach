@@ -1720,28 +1720,26 @@ fn levels(tokens: &[Token]) -> Levels {
     Levels { module, enum_body }
 }
 
-/// Where each `enum`'s body opens: after `enum` and its name (or a macro's metavariable for one),
-/// the first `{` outside every group and every angle bracket of its generics and `where` clause (a
-/// `>` after `-` is an arrow's, and a `{` after a name and `!` opens a macro's arguments).
+/// Where each `enum`'s body opens: after `enum` and its name, however a macro writes it, the first
+/// `{` outside every group and every angle bracket of its generics and `where` clause (a `>` after
+/// `-` is an arrow's, and a `{` after a name and `!` opens a macro's arguments).
 fn enum_bodies(tokens: &[Token]) -> BTreeSet<usize> {
     let mut found = BTreeSet::new();
     for (index, token) in tokens.iter().enumerate() {
         if token.ident() != Some("enum") {
             continue;
         }
-        // The enum's name, or a macro's metavariable that stands for one (`enum $name`).
-        let name = match tokens.get(index + 1) {
-            Some(next) if next.ident().is_some() => index + 1,
-            Some(next)
-                if next.is_punct('$') && tokens.get(index + 2).and_then(Token::ident).is_some() =>
-            {
-                index + 2
-            }
-            _ => continue,
-        };
+        // The enum's name, however a macro writes it: a name, a metavariable (`$name`) or a
+        // repetition (`$($name)*`), whose group the scan passes over like any other.
+        if !tokens
+            .get(index + 1)
+            .is_some_and(|next| next.ident().is_some() || next.is_punct('$'))
+        {
+            continue;
+        }
         let mut groups = 0_usize;
         let mut angles = 0_usize;
-        for at in name + 1..tokens.len() {
+        for at in index + 1..tokens.len() {
             match tokens[at].tok {
                 // A macro's braces in the header (`ty!{}`, a name and then `!`) are a group, not
                 // the body; a `!` after anything else is the never type (`-> !`).
@@ -1960,26 +1958,17 @@ fn helper_occurrence(
 }
 
 /// The indices of the names generic parameter lists declare. A list opens at the `<` after `impl` or
-/// `for`, or after an item's name that follows `fn`, `struct`, `enum`, `union`, `trait` or `type`;
-/// each parameter's name is the first name at the list's own depth after its start or a `,`, past
-/// its attributes and a `const`, a lifetime aside.
+/// `for`, or after an item's name, however a macro writes it, that follows `fn`, `struct`, `enum`,
+/// `union`, `trait` or `type`; each parameter's name is the first name at the list's own depth after
+/// its start or a `,`, past its attributes and a `const`, a lifetime aside.
 fn generic_parameters(tokens: &[Token]) -> BTreeSet<usize> {
     let mut found = BTreeSet::new();
     for (index, token) in tokens.iter().enumerate() {
         if !token.is_punct('<') || index == 0 {
             continue;
         }
-        let opens = match tokens[index - 1].ident() {
-            Some("impl" | "for") => true,
-            Some(_) => {
-                index >= 2
-                    && matches!(
-                        tokens[index - 2].ident(),
-                        Some("fn" | "struct" | "enum" | "union" | "trait" | "type")
-                    )
-            }
-            None => false,
-        };
+        let opens = matches!(tokens[index - 1].ident(), Some("impl" | "for"))
+            || item_name_before(tokens, index);
         if !opens {
             continue;
         }
@@ -2014,6 +2003,48 @@ fn generic_parameters(tokens: &[Token]) -> BTreeSet<usize> {
         }
     }
     found
+}
+
+/// Whether the tokens that end just before `end` are an item's name after the keyword of an item that
+/// can have generic parameters, however a macro writes the name: a name, a metavariable (`$name`),
+/// or a repetition (`$( ... )`, perhaps a separator, and `*`, `+` or `?`).
+fn item_name_before(tokens: &[Token], end: usize) -> bool {
+    let keyword = |at: usize| {
+        at.checked_sub(1)
+            .and_then(|before| tokens[before].ident())
+            .is_some_and(|word| {
+                matches!(word, "fn" | "struct" | "enum" | "union" | "trait" | "type")
+            })
+    };
+    let Some(last) = end.checked_sub(1) else {
+        return false;
+    };
+    if tokens[last].ident().is_some() {
+        return keyword(last) || (last >= 1 && tokens[last - 1].is_punct('$') && keyword(last - 1));
+    }
+    if !['*', '+', '?'].iter().any(|op| tokens[last].is_punct(*op)) {
+        return false;
+    }
+    // The repetition's group ends at `)`, before a separator or not.
+    let close = match last.checked_sub(1) {
+        Some(at) if tokens[at].is_punct(')') => at,
+        Some(at) if at >= 1 && tokens[at - 1].is_punct(')') => at - 1,
+        _ => return false,
+    };
+    let mut depth = 0_usize;
+    for open in (0..=close).rev() {
+        match tokens[open].tok {
+            Tok::Punct(')' | ']' | '}') => depth += 1,
+            Tok::Punct('(' | '[' | '{') => {
+                depth -= 1;
+                if depth == 0 {
+                    return open >= 1 && tokens[open - 1].is_punct('$') && keyword(open - 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// What the reading trusts `name` to mean, when it trusts it at all.
@@ -2488,6 +2519,7 @@ mod tests {
             "fn t() { enum E where ty!{}: Sized { shared() } }",
             "fn t() { enum E<F> where F: Fn() -> fn() -> ! { shared(), Other(F) } }",
             "macro_rules! m { ($name:ident) => { enum $name { shared() } }; }",
+            "macro_rules! m { ($($name:ident)*) => { enum $($name)* { shared() } }; }",
         ] {
             let found = breached(text);
             assert!(!found.is_empty(), "{text}");
@@ -2558,6 +2590,15 @@ mod tests {
             ("struct S<'a, tokio = u8>(&'a tokio);", "tokio"),
             ("fn other<T, #[cfg(all())] core>() {}", "core"),
             ("impl<const std: usize> Trait for Type<std> {}", "std"),
+            // However a macro writes the item's name.
+            (
+                "macro_rules! m { ($name:ident) => { fn $name<core>() {} }; }",
+                "core",
+            ),
+            (
+                "macro_rules! m { ($($name:ident)*) => { struct $($name)*<alloc>(alloc); }; }",
+                "alloc",
+            ),
             // A definition written as text is one all the same: the check reads tokens.
             (
                 "const _: &str = stringify!(macro_rules! line { () => {} });",
