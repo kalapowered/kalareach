@@ -64,6 +64,28 @@ mod other {
     }
 }
 
+mod elsewhere {
+    /// A case of this module's own, which names no row.
+    pub fn shared() -> u8 {
+        7
+    }
+}
+
+mod imported {
+    use super::elsewhere::shared;
+
+    #[test]
+    fn calls_the_case_it_imported() {
+        assert_eq!(shared(), 7);
+    }
+}
+
+#[test]
+fn imports_a_case_of_the_same_name_inside_its_body() {
+    use elsewhere::shared;
+    assert_eq!(shared(), 7);
+}
+
 mod cases {
     mod deep {
         /// KR-REQ-03.08: the same case, written in a child module.
