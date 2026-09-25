@@ -486,7 +486,8 @@ async fn create(client: &mut LocalClient, host: &Host) -> SessionCreateResult {
 /// Read from the process table rather than from anything this test arranged: what is being checked
 /// is what the process actually got, and a launch that quietly inherited a directory looks exactly
 /// like one that was given the right one until the kernel is asked. `None` means this platform has
-/// no way to ask; a platform that has one and refuses to answer is a failure, not a skip.
+/// no way to ask, which fails the check that needs the answer; a platform that has one and refuses
+/// to answer fails here.
 fn working_directory_of(pid: u32) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
@@ -550,14 +551,14 @@ fn runs_where_the_host_put_it(host: &Host, session_id: SessionId) {
         "and the binary it started is not inside it either: {}",
         host.worker.display()
     );
-    let Some(actual) = working_directory_of(pid) else {
-        // Nothing to compare against rather than a comparison that failed. Saying so is better
-        // than a pass that checked nothing.
-        eprintln!(
-            "skipped: this platform does not report another process's working directory here"
-        );
-        return;
-    };
+    // A create that could not be checked has not been shown to keep the worker off the workspace,
+    // so a platform with no way to ask fails here rather than passing a check it never made.
+    let actual = working_directory_of(pid).unwrap_or_else(|| {
+        panic!(
+            "this platform does not report another process's working directory, so this check \
+             cannot run here; it runs on Linux and macOS"
+        )
+    });
     assert_eq!(
         std::fs::canonicalize(&actual).unwrap_or(actual),
         expected,
