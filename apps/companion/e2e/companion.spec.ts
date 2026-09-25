@@ -187,6 +187,101 @@ test.describe('the semantic view', () => {
   })
 })
 
+test.describe('reading once it is listening', () => {
+  /** Where a screenshot for this browser goes, so each engine keeps its own. */
+  const shotFor = (name: string): string => shot(`${name}-${test.info().project.name}`)
+
+  // KR-REQ-13.11: the surface is read at one prompt generation and answers after the prompt has
+  // moved on, so the buttons it draws are disabled from the first frame they are shown in.
+  test('draws the launch buttons disabled when the prompt moved before the surface answered', async ({
+    page
+  }) => {
+    await open(page)
+    const held = await page.evaluateHandle(() => {
+      const host = window.krTestHost
+      if (!host) throw new Error('the harness has no scripted host')
+      return host.hold('launchSurface')
+    })
+    await page.getByRole('button', { name: 'Sessions' }).click()
+    await page.getByTestId('session-row-1').click()
+    await page.getByTestId('conversation').waitFor()
+    await expect.poll(() => held.evaluate((reads) => reads.count)).toBe(1)
+
+    await page.evaluate(() => {
+      window.krTestHost?.changePromptGeneration()
+    })
+    await held.evaluate((reads) => {
+      reads.release()
+    })
+
+    const surface = page.getByTestId('launch-surface')
+    await expect(page.getByTestId('launch-stale')).toBeVisible()
+    await expect(surface.getByRole('button', { name: /Codex/ })).toBeDisabled()
+    await page.screenshot({ path: shotFor('launch-13.11-overtaken'), fullPage: true })
+  })
+
+  // KR-REQ-13.02: before its first answer the session view claims nothing: no lost contact and no
+  // launch button.
+  test('the session view claims nothing before its first answer', async ({ page }) => {
+    await open(page)
+    const complete = await page.evaluateHandle(() => {
+      const host = window.krTestHost
+      if (!host) throw new Error('the harness has no scripted host')
+      return host.holdRegistrations()
+    })
+    await page.getByRole('button', { name: 'Sessions' }).click()
+    await page.getByTestId('session-row-1').click()
+    await page.getByTestId('conversation').waitFor()
+
+    await expect(page.getByText('Not in contact with this host')).toHaveCount(0)
+    await expect(page.getByTestId('launch-surface')).toHaveCount(0)
+    await page.screenshot({ path: shotFor('session-13.02-before-answer'), fullPage: true })
+
+    await complete.evaluate((done) => {
+      done()
+    })
+    await expect(page.getByText('Session 1 · Waiting for you')).toBeVisible()
+    await expect(page.getByTestId('launch-surface')).toBeVisible()
+    await expect(page.getByText('Not in contact with this host')).toHaveCount(0)
+  })
+
+  // KR-REQ-13.02: the phone's shell, its inbox and its account, before and after their first
+  // answers. The shell registers as the page loads, so the registrations are held from then.
+  test('the phone claims nothing before its first answers', async ({ page }) => {
+    await page.addInitScript(() => {
+      let host: unknown
+      Object.defineProperty(window, 'krTestHost', {
+        configurable: true,
+        get: () => host,
+        set: (controls: { holdRegistrations: () => () => void }) => {
+          host = controls
+          ;(window as unknown as { krRegistered: () => void }).krRegistered =
+            controls.holdRegistrations()
+        }
+      })
+    })
+    await page.goto('/harness.html?surface=ios')
+    const connection = page.locator('.m-connection')
+
+    await expect(connection).toHaveText('Not in contact')
+    await expect(page.getByText('Reading the inbox…')).toBeVisible()
+    await page.screenshot({ path: shotFor('phone-13.02-before-answer'), fullPage: true })
+    await page.getByRole('button', { name: /^Account/ }).click()
+    await expect(page.getByTestId('account-panel')).toHaveAttribute('aria-busy', 'true')
+    await expect(page.getByRole('button', { name: 'Sign in' })).toHaveCount(0)
+    await page.screenshot({ path: shotFor('phone-account-before-answer'), fullPage: true })
+
+    await page.evaluate(() => {
+      ;(window as unknown as { krRegistered: () => void }).krRegistered()
+    })
+    await expect(connection).toHaveText('In contact with this host')
+    await expect(page.getByRole('button', { name: 'Sign in' })).toBeVisible()
+    await page.getByRole('button', { name: /^Attention/ }).click()
+    await expect(page.locator('[data-attention="a-2"]')).toBeVisible()
+    await page.screenshot({ path: shotFor('phone-13.02-after-answer'), fullPage: true })
+  })
+})
+
 test.describe('closing a session', () => {
   test('says what closing does before it is committed', async ({ page }) => {
     await openSession(page)
