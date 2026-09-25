@@ -1760,6 +1760,11 @@ pub mod configuration {
         /// The public Mainline DHT for discovery. It publishes to a public network and carries no
         /// KalaReach service guarantee, which is why it is never on unless chosen.
         pub mainline_dht: Nullable<bool>,
+        /// The HTTP proxy the endpoint reaches its relays and discovery servers through, as an
+        /// absolute `http` or `https` origin such as `http://proxy.example.com:3128`. It is this
+        /// machine's own choice: no invitation or host bundle carries it. It names no user and no
+        /// password, because a proxy that needs credentials is not supported.
+        pub proxy_url: Nullable<String>,
     }
 
     impl NetworkSelection {
@@ -1821,6 +1826,13 @@ pub mod configuration {
         #[must_use]
         pub fn mainline_dht(&self) -> bool {
             self.mainline_dht.0.unwrap_or(false)
+        }
+
+        /// The HTTP proxy the endpoint reaches its relays and discovery servers through, when one
+        /// is selected.
+        #[must_use]
+        pub fn proxy_url(&self) -> Option<&str> {
+            self.proxy_url.as_ref().map(String::as_str)
         }
     }
 
@@ -2241,6 +2253,15 @@ pub mod configuration {
          canonical address, no port its scheme implies, no user information, a path of letters, \
          digits and - . _ ~ / only, and at most 253 characters as an invitation carries it";
 
+    /// What a proxy that is not named by its origin is refused with.
+    const NOT_A_PROXY_ORIGIN: &str = "is not an https or http origin with a lower-case host or a \
+         canonical address, no port its scheme implies, no path and no trailing slash, in at most \
+         253 characters";
+
+    /// What a proxy URL that names a user or a password is refused with.
+    const PROXY_CREDENTIALS: &str =
+        "names a user or a password, and a proxy that needs credentials is not supported";
+
     /// Returns what is wrong with a network section, value by value.
     ///
     /// Each value is named by its key and its class, never repeated: a relay URL can carry a
@@ -2331,6 +2352,26 @@ pub mod configuration {
                 "network.relay_only removes every direct path, and network.relay_urls selects no \
                  relay to use instead",
             ));
+        }
+        // A credential is refused as what it is, whatever else is wrong with the address, so the
+        // owner learns why rather than meeting a rule about spelling. It is never used with the
+        // credential dropped either: that would send this host's traffic to a proxy that turns
+        // it away.
+        if let Some(proxy) = network.proxy_url() {
+            let refusal = if carries_user_information(proxy) {
+                Some(PROXY_CREDENTIALS)
+            } else {
+                (!is_proxy_origin(proxy)).then_some(NOT_A_PROXY_ORIGIN)
+            };
+            if let Some(refusal) = refusal {
+                problems.push(
+                    Sentence::new()
+                        .stated("network.proxy_url (")
+                        .withheld(Location, proxy)
+                        .stated(") ")
+                        .stated(refusal),
+                );
+            }
         }
         problems
     }
@@ -3007,6 +3048,13 @@ pub mod configuration {
         about: "whether this host uses the public Mainline DHT for discovery",
     };
 
+    /// The HTTP proxy the endpoint reaches its relays and discovery servers through.
+    pub const NETWORK_PROXY_URL: Selection = Selection {
+        key: "network.proxy_url",
+        about: "the HTTP proxy the network endpoint reaches its relays and discovery servers \
+                through",
+    };
+
     /// The managed voice broker this host names to its devices.
     pub const VOICE_BROKER_ORIGIN: Selection = Selection {
         key: "voice.broker_origin",
@@ -3014,7 +3062,7 @@ pub mod configuration {
     };
 
     /// Every selection this host reads when it starts, in the order `kr doctor` prints them.
-    pub const SELECTIONS: [Selection; 11] = [
+    pub const SELECTIONS: [Selection; 12] = [
         NETWORK_ENABLED,
         NETWORK_BIND_ADDRESS,
         NETWORK_RELAY_URLS,
@@ -3025,6 +3073,7 @@ pub mod configuration {
         NETWORK_RELAY_ONLY,
         NETWORK_LOCAL_DISCOVERY,
         NETWORK_MAINLINE_DHT,
+        NETWORK_PROXY_URL,
         VOICE_BROKER_ORIGIN,
     ];
 
@@ -3136,6 +3185,32 @@ pub mod configuration {
                             character.is_ascii_hexdigit() || matches!(character, '.' | 'x')
                         }))
             })
+    }
+
+    /// Whether `value` is a proxy's origin: an `https` or `http` scheme and a canonical authority,
+    /// with no path and no trailing slash, in at most [`MAX_HINT_LEN`] bytes.
+    ///
+    /// The canonical authority is the rule every other address in the section follows, and it
+    /// already refuses user information. [`carries_user_information`] is asked first only so the
+    /// refusal can say why.
+    fn is_proxy_origin(value: &str) -> bool {
+        let Some((authority, path, implied)) = service_address(value) else {
+            return false;
+        };
+        value.len() <= MAX_HINT_LEN && path.is_empty() && is_canonical_authority(authority, implied)
+    }
+
+    /// Whether `value` names a user or a password before its host, which is where a URL carries a
+    /// credential.
+    ///
+    /// The authority is everything between the scheme's `//` and the first `/`, `?`, `#` or `\`
+    /// after it, whatever the scheme, so an `@` in a path or a query is not mistaken for one.
+    fn carries_user_information(value: &str) -> bool {
+        let after_scheme = value.split_once("//").map_or(value, |(_, rest)| rest);
+        after_scheme
+            .split(['/', '?', '#', '\\'])
+            .next()
+            .is_some_and(|authority| authority.contains('@'))
     }
 
     /// Whether `value` is a trust anchor's path: absolute, and bounded.
@@ -3365,6 +3440,11 @@ pub mod configuration {
                 NETWORK_MAINLINE_DHT,
                 network.mainline_dht.is_present(),
                 switch(network.mainline_dht()),
+            ),
+            row(
+                NETWORK_PROXY_URL,
+                network.proxy_url.is_present(),
+                location(network.proxy_url()),
             ),
             row(
                 VOICE_BROKER_ORIGIN,
@@ -6644,6 +6724,7 @@ mod tests {
             relay_only: Nullable::some(true),
             local_discovery: Nullable::some(false),
             mainline_dht: Nullable::some(false),
+            proxy_url: Nullable::some("http://proxy.example.com:3128".to_owned()),
         };
         document.voice.broker_origin = Nullable::some("https://voice.example.com".to_owned());
         configuration::validate(&document).expect("a complete selection");
@@ -6858,6 +6939,133 @@ mod tests {
             configuration::edit(&loaded, &Change::SessionLimit(Some(4))).is_err(),
             "and an edit writes nothing"
         );
+    }
+
+    /// KR-REQ-10.02, KR-REQ-26.14: the endpoint's proxy is the document's to choose, and it is
+    /// absent unless the document names it. It is an origin: an `https` or `http` scheme and a
+    /// canonical authority with nothing after it. A proxy that names a user or a password is
+    /// refused as one that needs credentials, which is not supported, whatever else is wrong with
+    /// it. Every refusal names the key and never repeats the value, and a document that names a
+    /// proxy it refuses is not this host's to rewrite. The value is reported where the document
+    /// wrote it, as a location.
+    #[test]
+    fn a_proxy_is_an_origin_the_document_names_without_a_credential() {
+        assert_eq!(configuration::NetworkSelection::default().proxy_url(), None);
+        let rows = configuration::selection_rows(None, "/config.json");
+        let row = rows
+            .iter()
+            .find(|row| row.key == "network.proxy_url")
+            .expect("the proxy is reported");
+        assert_eq!(
+            (row.value(), row.source, row.effect),
+            (
+                "none",
+                ValueSource::Default,
+                configuration::ValueEffect::NextStart
+            )
+        );
+
+        for accepted in [
+            "http://proxy.example.com:3128",
+            "https://proxy.example.com",
+            "http://127.0.0.1:8080",
+            "http://[::1]:3128",
+        ] {
+            let mut document = ConfigurationDocument::empty();
+            document.network.proxy_url = Nullable::some(accepted.to_owned());
+            configuration::validate(&document)
+                .unwrap_or_else(|problems| panic!("{accepted}: {problems:?}"));
+        }
+
+        let secret = "hunter2";
+        let credentials = [
+            format!("http://user:{secret}@proxy.example.com:3128"),
+            format!("http://{secret}@proxy.example.com:3128"),
+            format!("https://:{secret}@proxy.example.com"),
+            format!("socks5://user:{secret}@proxy.example.com:1080"),
+        ];
+        let not_origins = [
+            format!("socks5://{secret}.example.com:1080"),
+            format!("ftp://{secret}.example.com"),
+            format!("{secret}.example.com:3128"),
+            format!("http://{secret}.example.com:3128/"),
+            format!("http://proxy.example.com:3128/{secret}"),
+            format!("http://proxy.example.com:3128?{secret}"),
+            format!("http://proxy.example.com:3128#{secret}"),
+            format!("http://proxy.example.com/{secret}@x"),
+            format!("http://{secret}.example.com:80"),
+            format!("https://{secret}.example.com:443"),
+            format!("http://{secret}.Example.com:3128"),
+            format!("http://{secret}.example.com:99999"),
+            format!("http://{secret}.example.com:03128"),
+            format!("https://xn--{secret}.example"),
+            format!("http://{}.{secret}.example", "a".repeat(250)),
+            "http://127.1:3128".to_owned(),
+            "http://".to_owned(),
+        ];
+        for (refused, credential) in credentials
+            .iter()
+            .map(|value| (value, true))
+            .chain(not_origins.iter().map(|value| (value, false)))
+        {
+            let mut document = ConfigurationDocument::empty();
+            document.network.proxy_url = Nullable::some(refused.clone());
+            let problems = configuration::validate(&document).expect_err("a proxy it refuses");
+            let said: Vec<&str> = problems.iter().map(export::Sentence::as_str).collect();
+            assert!(
+                said.iter()
+                    .any(|problem| problem.starts_with("network.proxy_url (")),
+                "{refused}: the key is named: {said:?}"
+            );
+            assert!(
+                said.iter().all(|problem| !problem.contains(secret)),
+                "{refused}: and its value is not repeated: {said:?}"
+            );
+            assert_eq!(
+                said.iter()
+                    .any(|problem| problem
+                        .ends_with("a proxy that needs credentials is not supported")),
+                credential,
+                "{refused}: a credential is refused as one: {said:?}"
+            );
+        }
+
+        let written = format!(
+            r#"{{"version": 1, "network": {{"enabled": true, "proxy_url": "http://user:{secret}@proxy.example.com:3128"}}}}"#
+        );
+        let loaded = configuration::load(Some(written.as_bytes()));
+        assert_eq!(loaded.status.state, DocumentState::Invalid);
+        assert!(
+            loaded.status.detail.as_str().contains("network.proxy_url"),
+            "{:?}",
+            loaded.status
+        );
+        assert!(
+            !loaded.status.detail.as_str().contains(secret),
+            "{:?}",
+            loaded.status
+        );
+        assert!(
+            configuration::edit(&loaded, &Change::SessionLimit(Some(4))).is_err(),
+            "and an edit writes nothing"
+        );
+
+        let mut document = ConfigurationDocument::empty();
+        document.network.proxy_url = Nullable::some("http://proxy.example.com:3128".to_owned());
+        let rows = configuration::selection_rows(Some(&document), "/config.json");
+        let row = rows
+            .iter()
+            .find(|row| row.key == "network.proxy_url")
+            .expect("the proxy is reported");
+        assert_eq!(
+            (row.value(), row.source, row.class()),
+            (
+                "http://proxy.example.com:3128",
+                ValueSource::HostConfiguration,
+                export::ContentClass::Location
+            )
+        );
+        assert_eq!(row.origin.0.as_deref(), Some("/config.json"));
     }
 
     /// KR-REQ-26.14: each selection is reported with its value, its source and "at the next

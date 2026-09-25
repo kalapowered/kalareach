@@ -6962,6 +6962,7 @@
             "mainline_dht": null,
             "pkarr_publisher_url": null,
             "pkarr_resolver_url": null,
+            "proxy_url": null,
             "relay_only": null,
             "relay_trust_anchors": null,
             "relay_urls": null
@@ -17681,6 +17682,18 @@
           ],
           "default": null,
           "description": "The Pkarr server this host resolves peers from."
+        },
+        "proxy_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The HTTP proxy the endpoint reaches its relays and discovery servers through, as an\nabsolute `http` or `https` origin such as `http://proxy.example.com:3128`. It is this\nmachine's own choice: no invitation or host bundle carries it. It names no user and no\npassword, because a proxy that needs credentials is not supported."
         },
         "relay_only": {
           "anyOf": [

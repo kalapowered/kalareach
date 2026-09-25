@@ -8969,6 +8969,13 @@ export interface NetworkSelection {
    */
   pkarr_resolver_url?: string | null
   /**
+   * The HTTP proxy the endpoint reaches its relays and discovery servers through, as an
+   * absolute `http` or `https` origin such as `http://proxy.example.com:3128`. It is this
+   * machine's own choice: no invitation or host bundle carries it. It names no user and no
+   * password, because a proxy that needs credentials is not supported.
+   */
+  proxy_url?: string | null
+  /**
    * Every packet goes through the relay, and no direct path is used.
    */
   relay_only?: boolean | null

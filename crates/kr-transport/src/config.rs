@@ -13,7 +13,9 @@
 //! The same selection travels in a pairing invitation and a host bundle as
 //! [`kr_protocol::pairing::NetworkConfig`]. [`EndpointConfig::from_network_config`] and
 //! [`EndpointConfig::to_network_config`] convert between the two, so the configuration a device
-//! pairs with is the configuration it dials with.
+//! pairs with is the configuration it dials with. The one exception is the HTTP proxy
+//! ([`ProxyUrl`]): how this machine reaches the network is its own choice, so no invitation
+//! carries it.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -145,6 +147,80 @@ pub struct EndpointConfig {
     /// authority pins that authority here; the public anchors stay in force alongside it, so this
     /// adds trust rather than replacing it. An empty list is the ordinary case.
     pub relay_ca_roots: Vec<Vec<u8>>,
+    /// The HTTP proxy this endpoint's own web requests go through: the relay connection, the
+    /// relay latency probe and captive-portal check, and the Pkarr publisher and resolver.
+    ///
+    /// It is this machine's own choice. A pairing invitation and a host bundle never carry it, and
+    /// nothing reads it from the environment. `None` sends the relay connection and the Pkarr
+    /// requests directly.
+    pub proxy_url: Option<ProxyUrl>,
+}
+
+/// The HTTP proxy an endpoint's own web requests go through, named by its origin.
+///
+/// An `http` or `https` scheme, a host and an optional port, and nothing after them. A proxy URL
+/// that names a user or a password cannot be built: a proxy that needs credentials is not
+/// supported, and a credential is never dropped to use the proxy without it, because the proxy
+/// would then turn every request away. So a value of this type carries no credential, and
+/// printing one prints none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProxyUrl(Url);
+
+impl ProxyUrl {
+    /// Returns the proxy's URL.
+    #[must_use]
+    pub fn as_url(&self) -> &Url {
+        &self.0
+    }
+}
+
+impl std::str::FromStr for ProxyUrl {
+    type Err = ProxyUrlError;
+
+    /// Reads a proxy's origin.
+    ///
+    /// A credential is refused before anything else is decided about the address, so the refusal
+    /// says why even when something else is wrong with it too.
+    fn from_str(value: &str) -> std::result::Result<Self, ProxyUrlError> {
+        let url = Url::parse(value).map_err(ProxyUrlError::Unparsable)?;
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(ProxyUrlError::Credentials);
+        }
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(ProxyUrlError::Scheme);
+        }
+        if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+            return Err(ProxyUrlError::NotAnOrigin);
+        }
+        Ok(Self(url))
+    }
+}
+
+impl std::fmt::Display for ProxyUrl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Why an address is not a usable proxy.
+///
+/// None of these repeats the address. Whatever an owner wrote may carry a credential, so a
+/// refusal names what is wrong with it rather than quoting it.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ProxyUrlError {
+    /// The address is not a URL at all.
+    #[error("{0}")]
+    Unparsable(url::ParseError),
+    /// The URL names a user or a password.
+    #[error("a proxy that needs credentials is not supported")]
+    Credentials,
+    /// The scheme is neither `http` nor `https`.
+    #[error("the scheme must be http or https")]
+    Scheme,
+    /// Something follows the host and port.
+    #[error("a proxy is named by its scheme, host and port, with nothing after them")]
+    NotAnOrigin,
 }
 
 impl EndpointConfig {
@@ -236,13 +312,14 @@ impl EndpointConfig {
             bind_addr: None,
             relay_only: false,
             relay_ca_roots: Vec::new(),
+            proxy_url: None,
         })
     }
 
     /// Builds the configuration a pairing invitation or host bundle carries.
     ///
-    /// Local discovery and the Mainline DHT are deliberately absent: they are a local choice on
-    /// each device, not something one device selects on another's behalf.
+    /// Local discovery, the Mainline DHT and the HTTP proxy are deliberately absent: they are a
+    /// local choice on each device, not something one device selects on another's behalf.
     ///
     /// # Errors
     ///
@@ -365,7 +442,88 @@ mod tests {
             bind_addr: None,
             relay_only: false,
             relay_ca_roots: Vec::new(),
+            proxy_url: None,
         }
+    }
+
+    /// KR-REQ-10.02: the proxy is this machine's own choice. A pairing invitation carries the
+    /// selection a device dials with, and never the proxy the inviting machine reaches the network
+    /// through.
+    #[test]
+    fn no_invitation_carries_the_proxy() {
+        let mut config = sample();
+        config.proxy_url = Some("http://proxy.example.com:3128".parse().expect("a proxy"));
+        let wire = config.to_network_config().expect("a network configuration");
+        assert_eq!(
+            wire,
+            sample()
+                .to_network_config()
+                .expect("a network configuration"),
+            "the invitation is the one the same selection without a proxy writes"
+        );
+        let parsed = EndpointConfig::from_network_config(&wire).expect("a parsed configuration");
+        assert_eq!(parsed.proxy_url, None);
+    }
+
+    /// KR-REQ-10.02: a proxy is named by its origin and names no credential. A user or a password
+    /// is refused as a proxy that needs credentials, before anything else about the address is
+    /// decided, and no refusal repeats the address.
+    #[test]
+    fn a_proxy_is_an_origin_that_carries_no_credential() {
+        for accepted in [
+            "http://proxy.example.com:3128",
+            "http://proxy.example.com:3128/",
+            "https://proxy.example.com",
+            "http://127.0.0.1:8080",
+            "http://[::1]:3128",
+        ] {
+            let proxy: ProxyUrl = accepted.parse().unwrap_or_else(|error| {
+                panic!("{accepted}: {error}");
+            });
+            assert!(proxy.as_url().username().is_empty() && proxy.as_url().password().is_none());
+        }
+        let secret = "hunter2";
+        for (refused, expected) in [
+            (
+                format!("http://user:{secret}@proxy.example.com:3128"),
+                ProxyUrlError::Credentials,
+            ),
+            (
+                format!("http://{secret}@proxy.example.com"),
+                ProxyUrlError::Credentials,
+            ),
+            (
+                format!("socks5://user:{secret}@proxy.example.com:1080"),
+                ProxyUrlError::Credentials,
+            ),
+            (
+                format!("socks5://{secret}.example.com:1080"),
+                ProxyUrlError::Scheme,
+            ),
+            (
+                format!("http://proxy.example.com:3128/{secret}"),
+                ProxyUrlError::NotAnOrigin,
+            ),
+            (
+                format!("http://proxy.example.com:3128/?{secret}"),
+                ProxyUrlError::NotAnOrigin,
+            ),
+            (
+                format!("http://proxy.example.com:3128/#{secret}"),
+                ProxyUrlError::NotAnOrigin,
+            ),
+            (format!("{secret}.example.com:3128"), ProxyUrlError::Scheme),
+        ] {
+            let error = refused
+                .parse::<ProxyUrl>()
+                .expect_err("an address that is not a usable proxy");
+            assert_eq!(error, expected, "{refused}");
+            assert!(!error.to_string().contains(secret), "{refused}: {error}");
+        }
+        assert!(matches!(
+            format!("http://{secret}.example.com:99999").parse::<ProxyUrl>(),
+            Err(ProxyUrlError::Unparsable(_))
+        ));
     }
 
     /// KR-REQ-10.02: a pairing invitation carries the selected network configuration.

@@ -10,16 +10,18 @@
 //! ([`NetworkSelection`]), which is validated with the rest of the document and reported by
 //! `kr doctor` with its source. The daemon reads it once, when it starts, because that is when its
 //! endpoint is built. No environment variable reaches any of it: section 26 keeps provider origins
-//! and trust decisions out of reach of whatever a process happened to inherit.
+//! and trust decisions out of reach of whatever a process happened to inherit. That includes the
+//! HTTP proxy the endpoint reaches its relays and discovery servers through, which is this
+//! machine's own choice and travels in no invitation.
 //!
 //! A daemon that selects nothing serves its local endpoint alone. That is a supported deployment,
 //! not a degraded one: a host on the same machine as its clients needs no network at all.
 
 use kr_protocol::hostinfo::configuration::{
     self, NETWORK_BIND_ADDRESS, NETWORK_PKARR_PUBLISHER_URL, NETWORK_PKARR_RESOLVER_URL,
-    NETWORK_RELAY_TRUST_ANCHORS, NETWORK_RELAY_URLS, NetworkSelection,
+    NETWORK_PROXY_URL, NETWORK_RELAY_TRUST_ANCHORS, NETWORK_RELAY_URLS, NetworkSelection,
 };
-use kr_transport::config::{EndpointConfig, Url};
+use kr_transport::config::{EndpointConfig, ProxyUrl, Url};
 use kr_transport::preauth::PreAuthLimits;
 use kr_transport::scheduler::SendLimits;
 
@@ -78,6 +80,14 @@ impl NetworkSettings {
         settings.endpoint.discovery.local_discovery = selection.local_discovery();
         settings.endpoint.discovery.mainline_dht = selection.mainline_dht();
         settings.endpoint.relay_ca_roots = read_trust_anchors(selection.relay_trust_anchors())?;
+        settings.endpoint.proxy_url = selection
+            .proxy_url()
+            .map(|value| {
+                value
+                    .parse::<ProxyUrl>()
+                    .map_err(|error| invalid(NETWORK_PROXY_URL.key, None, &error))
+            })
+            .transpose()?;
         Ok(Some(settings))
     }
 }
@@ -239,9 +249,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn every_selection_reaches_the_endpoint_it_builds() {
-        let settings = NetworkSettings::from_selection(&joined(NetworkSelection {
+    /// Every key of the section that selects something, with each value the endpoint is built
+    /// with. The trust anchors are left out: they are files, which the next test reads.
+    fn everything() -> NetworkSelection {
+        joined(NetworkSelection {
             bind_address: Nullable::some("127.0.0.1:0".to_owned()),
             relay_urls: Nullable::some(vec!["https://relay.example.com".to_owned()]),
             pkarr_publisher_url: Nullable::some("https://discovery.example.com/pkarr".to_owned()),
@@ -250,10 +261,17 @@ mod tests {
             relay_only: Nullable::some(true),
             local_discovery: Nullable::some(true),
             mainline_dht: Nullable::some(true),
+            proxy_url: Nullable::some("http://proxy.example.com:3128".to_owned()),
             ..NetworkSelection::default()
-        }))
-        .expect("a usable selection")
-        .expect("this host joins");
+        })
+    }
+
+    /// KR-REQ-10.02: every selection reaches the endpoint it builds, the proxy included.
+    #[test]
+    fn every_selection_reaches_the_endpoint_it_builds() {
+        let settings = NetworkSettings::from_selection(&everything())
+            .expect("a usable selection")
+            .expect("this host joins");
         let endpoint = &settings.endpoint;
         assert_eq!(
             endpoint.bind_addr,
@@ -270,5 +288,116 @@ mod tests {
         assert!(endpoint.discovery.local_discovery);
         assert!(endpoint.discovery.mainline_dht);
         assert!(endpoint.relay_ca_roots.is_empty());
+        assert_eq!(
+            endpoint
+                .proxy_url
+                .as_ref()
+                .map(|proxy| proxy.as_url().as_str()),
+            Some("http://proxy.example.com:3128/")
+        );
+    }
+
+    /// KR-REQ-10.02: a document that names no proxy builds exactly the endpoint the same document
+    /// built before the proxy was a selection. The proxy changes its own field and nothing else,
+    /// and without it the endpoint has none.
+    #[test]
+    fn a_document_without_a_proxy_builds_the_endpoint_it_built_before() {
+        let with = NetworkSettings::from_selection(&everything())
+            .expect("a usable selection")
+            .expect("this host joins")
+            .endpoint;
+        let without = NetworkSettings::from_selection(&NetworkSelection {
+            proxy_url: Nullable::null(),
+            ..everything()
+        })
+        .expect("a usable selection")
+        .expect("this host joins")
+        .endpoint;
+        assert_eq!(without.proxy_url, None);
+        assert_eq!(
+            without,
+            EndpointConfig {
+                proxy_url: None,
+                ..with
+            }
+        );
+    }
+
+    /// KR-REQ-10.02: a proxy that names a user or a password, a path or another scheme is refused
+    /// when the daemon starts, with the key named and the value not repeated. A credential is
+    /// refused as a proxy that needs credentials, which is not supported.
+    #[test]
+    fn a_proxy_with_a_credential_a_path_or_another_scheme_is_refused_by_its_key() {
+        let secret = "hunter2";
+        for (value, credential) in [
+            (format!("http://user:{secret}@proxy.example.com:3128"), true),
+            (format!("http://{secret}@proxy.example.com:3128"), true),
+            (format!("http://proxy.example.com:3128/{secret}"), false),
+            (format!("socks5://{secret}.example.com:1080"), false),
+            (format!("{secret}.example.com:3128"), false),
+        ] {
+            let error = NetworkSettings::from_selection(&joined(NetworkSelection {
+                proxy_url: Nullable::some(value.clone()),
+                ..NetworkSelection::default()
+            }))
+            .expect_err("a proxy the endpoint cannot use");
+            let said = error.to_string();
+            assert!(said.contains("network.proxy_url"), "{value}: {said}");
+            assert!(!said.contains(secret), "{value}: {said}");
+            assert_eq!(
+                said.ends_with("a proxy that needs credentials is not supported"),
+                credential,
+                "{value}: {said}"
+            );
+        }
+    }
+
+    /// KR-REQ-26.14: a document that validates never stops the daemon over its proxy's syntax.
+    ///
+    /// Every proxy the configuration schema accepts is one the endpoint accepts. The ones the
+    /// schema refuses are here too, so a rule loosened on one side and not the other fails this.
+    #[test]
+    fn every_proxy_the_document_accepts_is_one_the_endpoint_accepts() {
+        use kr_protocol::hostinfo::configuration::ConfigurationDocument;
+
+        let corpus = [
+            "http://proxy.example.com:3128",
+            "https://proxy.example.com",
+            "http://127.0.0.1:8080",
+            "http://[::1]:3128",
+            "https://[2001:db8::1]:8443",
+            "http://proxy.example.com:3128/",
+            "http://proxy.example.com:80",
+            "http://proxy.example.com:03128",
+            "http://proxy.example.com:99999",
+            "http://Proxy.example.com:3128",
+            "http://127.1:3128",
+            "http://[0:0:0:0:0:0:0:1]:3128",
+            "https://xn--zz.example",
+            "http://user@proxy.example.com:3128",
+            "socks5://proxy.example.com:1080",
+        ];
+        let mut accepted = 0;
+        for address in corpus {
+            let mut document = ConfigurationDocument::empty();
+            document.network = joined(NetworkSelection {
+                proxy_url: Nullable::some(address.to_owned()),
+                ..NetworkSelection::default()
+            });
+            if configuration::validate(&document).is_err() {
+                continue;
+            }
+            accepted += 1;
+            let settings = NetworkSettings::from_selection(&document.network)
+                .unwrap_or_else(|error| {
+                    panic!("{address} validated and the endpoint refused it: {error}")
+                })
+                .expect("this host joins");
+            assert!(settings.endpoint.proxy_url.is_some(), "{address}");
+        }
+        assert_eq!(
+            accepted, 5,
+            "the first five addresses are the ones the schema accepts"
+        );
     }
 }

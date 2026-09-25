@@ -311,6 +311,15 @@ const FORMER_SELECTIONS: [(&str, &str); 11] = [
     ("KR_VOICE_BROKER_ORIGIN", "https://voice.invalid"),
 ];
 
+/// The proxy variables other programs read, each naming a proxy. The document selects the
+/// endpoint's proxy, and none of these does.
+#[cfg(unix)]
+const PROXY_VARIABLES: [(&str, &str); 3] = [
+    ("HTTP_PROXY", "http://proxy.invalid:3128"),
+    ("HTTPS_PROXY", "http://proxy.invalid:3128"),
+    ("ALL_PROXY", "http://proxy.invalid:3128"),
+];
+
 /// The daemon binary this test launches, and the process it becomes.
 #[cfg(unix)]
 struct Daemon(Option<std::process::Child>);
@@ -318,7 +327,7 @@ struct Daemon(Option<std::process::Child>);
 #[cfg(unix)]
 impl Daemon {
     /// Starts the daemon binary, copied to the internal disk, on `host`'s own directories, with
-    /// every former selection variable in its environment.
+    /// every former selection variable and every proxy variable in its environment.
     fn start(program: &std::path::Path, host: &kr_ipc::testing::TempHost) -> Self {
         let home = host.root().join("home");
         std::fs::create_dir_all(&home).expect("a home directory");
@@ -342,7 +351,7 @@ impl Daemon {
             .stdin(std::process::Stdio::null())
             .stdout(log.try_clone().expect("duplicates the log"))
             .stderr(log);
-        for (variable, value) in FORMER_SELECTIONS {
+        for (variable, value) in FORMER_SELECTIONS.into_iter().chain(PROXY_VARIABLES) {
             command.env(variable, value);
         }
         Self(Some(command.spawn().expect("the daemon starts")))
@@ -411,12 +420,13 @@ fn selection(result: &HostDoctorResult, key: &str) -> (String, ValueSource, Valu
     (row.value().to_owned(), row.source, row.effect)
 }
 
-/// KR-REQ-26.14: no inherited variable selects this host's network or its voice broker; the
-/// configuration document does, and what it selects is what is in force.
+/// KR-REQ-26.14, KR-REQ-10.02: no inherited variable selects this host's network, its proxy or its
+/// voice broker; the configuration document does, and what it selects is what is in force.
 ///
 /// The real daemon binary, started with every variable that used to select them set in its
-/// environment. With no document it selects nothing: it does not join the network, it names no
-/// voice broker, and it does not even read the trust anchor file those variables name. With a
+/// environment, and with `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` naming a proxy. With no
+/// document it selects nothing: it does not join the network, it names no voice broker and no
+/// proxy, and it does not even read the trust anchor file those variables name. With a
 /// document that selects a network and a broker, those are what it starts with, and each is
 /// reported with the document as its source and as applying at the next start.
 #[cfg(unix)]
@@ -445,6 +455,11 @@ async fn the_network_and_the_voice_broker_are_the_documents_and_no_variables() {
         "KR_NETWORK=1 in the environment joins nothing"
     );
     assert_eq!(selection(&result, "network.relay_urls").0, "none");
+    assert_eq!(
+        selection(&result, "network.proxy_url").0,
+        "none",
+        "HTTP_PROXY, HTTPS_PROXY and ALL_PROXY in the environment select no proxy"
+    );
     assert_eq!(selection(&result, "voice.broker_origin").0, "none");
     let network = result
         .checks
@@ -514,6 +529,7 @@ async fn the_network_and_the_voice_broker_are_the_documents_and_no_variables() {
         "network.dns_origin",
         "network.relay_trust_anchors",
         "network.relay_only",
+        "network.proxy_url",
     ] {
         let (_, source, _) = selection(&result, key);
         assert_eq!(
