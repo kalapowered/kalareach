@@ -2360,7 +2360,8 @@
       "type": "object"
     },
     "AttachmentSummary": {
-      "description": "One attachment of a session.\n\nRead-only metadata: it describes an attachment in the answers of `session.attach` and\n`events.snapshot`, a field a newer host adds is explicitly optional, and a reader whose schema\npredates it ignores it rather than refusing the answer. Nothing here is signed or covered by a\nmutation digest, which is what lets a field be dropped unread.",
+      "additionalProperties": false,
+      "description": "One attachment of a session.\n\nClosed, as every object a write result reaches is: `session.attach` answers with one, and\nsection 23 keeps a mutation's schema closed for the negotiated version, so a field this build\ndoes not declare is refused rather than ignored.",
       "properties": {
         "attached_at_ms": {
           "$ref": "#/$defs/TimestampMs",
@@ -2446,8 +2447,7 @@
         "granted",
         "attached_at_ms"
       ],
-      "type": "object",
-      "x-kalareach-read-only-metadata": true
+      "type": "object"
     },
     "AttachmentViewportParams": {
       "additionalProperties": false,

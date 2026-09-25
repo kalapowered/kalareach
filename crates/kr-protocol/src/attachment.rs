@@ -226,12 +226,11 @@ pub struct GeometryState {
 
 /// One attachment of a session.
 ///
-/// Read-only metadata: it describes an attachment in the answers of `session.attach` and
-/// `events.snapshot`, a field a newer host adds is explicitly optional, and a reader whose schema
-/// predates it ignores it rather than refusing the answer. Nothing here is signed or covered by a
-/// mutation digest, which is what lets a field be dropped unread.
+/// Closed, as every object a write result reaches is: `session.attach` answers with one, and
+/// section 23 keeps a mutation's schema closed for the negotiated version, so a field this build
+/// does not declare is refused rather than ignored.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[schemars(extend("x-kalareach-read-only-metadata" = true))]
+#[serde(deny_unknown_fields)]
 pub struct AttachmentSummary {
     /// The attachment identity, independent of the device behind it.
     pub attachment_id: AttachmentId,
@@ -612,10 +611,10 @@ mod tests {
         }
     }
 
-    /// Read-only metadata: a field a later host adds to a summary is ignored by this build, and the
-    /// summary it was added to is read whole.
+    /// A summary is part of a write result, so it stays closed: a field this build does not declare
+    /// is refused by this build's reader too, as section 23 keeps every mutation's schema.
     #[test]
-    fn a_field_a_later_host_adds_to_a_summary_is_ignored() {
+    fn a_field_this_build_does_not_declare_is_refused() {
         let later = LaterSummary {
             summary: summary(
                 TerminalPresentationMode::Viewport,
@@ -623,8 +622,9 @@ mod tests {
             ),
             a_later_field: "something a later build knows".to_owned(),
         };
-        let read: AttachmentSummary =
-            read(&wire(&later)).expect("an unknown optional field is ignored");
-        assert_eq!(read, later.summary);
+        assert!(matches!(
+            read::<AttachmentSummary>(&wire(&later)),
+            Err(kr_cbor::CborError::UnknownField { .. })
+        ));
     }
 }
